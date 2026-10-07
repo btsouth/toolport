@@ -731,9 +731,6 @@ fn gateway_capabilities(
                 "version": "1.0.0",
                 "discoveryMode": mode.as_str(),
                 "codeMode": host.code_mode_enabled(),
-                "agentControl": reg.allow_agent_control,
-                "destructiveConfirmation": reg.confirm_destructive
-                    && !reg.human_approval_effective(),
                 "humanApproval": reg.human_approval_effective()
             }),
         );
@@ -1437,24 +1434,6 @@ fn call_tool_def() -> Value {
     })
 }
 
-fn confirm_tool_def() -> Value {
-    json!({
-        "name": "toolport_confirm",
-        "description": "Confirm and execute a destructive tool call that was intercepted for review. \
-            When Toolport blocks a destructive call, it returns a preview with a `token`. \
-            Call this with that token to proceed. The original arguments are replayed exactly \
-            — you cannot change them. The token expires after 60 seconds.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "token": { "type": "string", "description": "The confirmation token from the intercepted call's response." }
-            },
-            "required": ["token"],
-            "additionalProperties": false
-        }
-    })
-}
-
 /// What `server/discover` puts in its built-in instruction text.
 const DISCOVER_INSTRUCTIONS_PREAMBLE: &str = "Toolport aggregates every configured MCP server behind one endpoint. In lazy discovery mode the catalog is reached through toolport_search_tools / toolport_call_tool rather than a full tools/list.";
 
@@ -1552,40 +1531,56 @@ fn fetch_result_tool_def() -> Value {
     })
 }
 
-fn enable_server_tool_def() -> Value {
-    json!({
-        "name": "toolport_enable_server",
-        "description": "Turn ON an MCP server in Toolport so its tools become available to you. \
-            Pass the server's id or name (run toolport_status to see the list). Takes effect within \
-            about a second. Only works when the user has allowed agent control in Toolport; the \
-            global block on destructive tools stays under the user's control and cannot be changed here.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "server": { "type": "string", "description": "The server id or name to enable, e.g. \"github\"." }
-            },
-            "required": ["server"],
-            "additionalProperties": false
-        }
-    })
+/// The fixed 2.0 agent-facing floor: the meta-tools every connection advertises,
+/// plus `toolport_run_script` only when Code Mode is on. Grouped discovery adds a
+/// per-server `help_<server>` browse tool on top of this.
+fn floor_tool_defs(host: &HostState) -> Vec<Value> {
+    let mut tools = vec![
+        status_tool_def(),
+        search_tool_def(),
+        call_tool_def(),
+        fetch_result_tool_def(),
+    ];
+    if host.code_mode_enabled() {
+        tools.push(run_script_tool_def());
+    }
+    tools
 }
 
-fn disable_server_tool_def() -> Value {
-    json!({
-        "name": "toolport_disable_server",
-        "description": "Turn OFF an MCP server in Toolport so its tools are no longer loaded. Pass the \
-            server's id or name (run toolport_status to see the list). Takes effect within about a \
-            second. Only works when the user has allowed agent control in Toolport.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "server": { "type": "string", "description": "The server id or name to disable." }
-            },
-            "required": ["server"],
-            "additionalProperties": false
-        }
-    })
+/// The floor, named in the error a client gets when it calls a meta-tool that 2.0
+/// removed. Kept as one string so every refusal reads the same.
+const AGENT_FACING_FLOOR: &str = "toolport_search_tools, toolport_call_tool, \
+    toolport_fetch_result and toolport_status";
+
+/// A meta-tool name that Toolport 2.0 no longer advertises: the cut confirm and
+/// agent-control tools, plus the legacy `conduit_*` aliases that were dropped with
+/// them. A client that still calls one by name gets a clear refusal naming the
+/// floor instead of a routing error.
+fn is_removed_meta_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "toolport_confirm"
+            | "toolport_enable_server"
+            | "toolport_disable_server"
+            | "conduit_status"
+            | "conduit_search_tools"
+            | "conduit_call_tool"
+            | "conduit_fetch_result"
+            | "conduit_confirm"
+            | "conduit_enable_server"
+            | "conduit_disable_server"
+    )
 }
+
+/// The refusal text for a removed meta-tool.
+fn removed_meta_tool_error(name: &str) -> String {
+    format!(
+        "Toolport: '{name}' was removed in Toolport 2.0. The agent-facing tools are \
+         {AGENT_FACING_FLOOR}. Use toolport_search_tools to find a tool and \
+         toolport_call_tool to run it."
+    )
+}
+
 
 // --- Grouped discovery mode (CONDUIT_DISCOVERY=grouped) ---
 //
@@ -1797,32 +1792,11 @@ fn help_tool_def(prefix: &str, tool_count: usize) -> Value {
     })
 }
 
-/// The tool set advertised in grouped mode: the lazy meta-tools (so cross-server
-/// search and call still work) plus one `help_<server>` browse tool per server.
-/// `catalog` must already be scoped to the calling client. Takes the two registry
-/// flags directly so callers needn't hold the registry lock across the router lock.
-fn grouped_tool_defs(
-    host: &HostState,
-    allow_agent_control: bool,
-    confirm_destructive: bool,
-    catalog: &[Value],
-) -> Vec<Value> {
-    let mut tools = vec![
-        status_tool_def(),
-        search_tool_def(),
-        call_tool_def(),
-        fetch_result_tool_def(),
-    ];
-    if host.code_mode_enabled() {
-        tools.push(run_script_tool_def());
-    }
-    if allow_agent_control {
-        tools.push(enable_server_tool_def());
-        tools.push(disable_server_tool_def());
-    }
-    if confirm_destructive {
-        tools.push(confirm_tool_def());
-    }
+/// The tool set advertised in lazy mode: the fixed agent-facing floor, plus
+/// (in grouped mode) one `help_<server>` browse tool per server. `catalog` must
+/// already be scoped to the calling client.
+fn grouped_tool_defs(host: &HostState, catalog: &[Value]) -> Vec<Value> {
+    let mut tools = floor_tool_defs(host);
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for t in catalog {
         if let Some(p) = namespaced_prefix(t) {
@@ -1840,189 +1814,6 @@ fn grouped_tool_defs(
 /// tools/call handler rewrites it into a server-scoped `toolport_search_tools`.
 fn grouped_help_target(name: &str) -> Option<&str> {
     name.strip_prefix("help_").filter(|p| !p.is_empty())
-}
-
-/// Apply an agent-initiated enable/disable of a server. Gated behind the user's
-/// `allow_agent_control` opt-in (re-checked against a fresh on-disk copy to close
-/// the toggle-off-mid-request window), resolves the target by id or name, writes
-/// the registry, and lets the gateway's own watcher rebuild and connect it. The
-/// `deny_destructive` safety switch is intentionally NOT reachable from here.
-fn set_server_enabled_via_agent(
-    reg: &Registry,
-    profile: Option<&str>,
-    path: &Path,
-    target: &str,
-    enable: bool,
-    // A registered HTTP client's allowed-server set (None = unscoped local/stdio). A
-    // scoped client can only resolve and toggle servers in its scope, and the
-    // "Known servers" list is filtered to it, so agent control can't toggle another
-    // tenant's server or enumerate the full registry across tenants.
-    allowed: Option<&std::collections::HashSet<String>>,
-    // The calling client (a registered HTTP client's label), for the audit record.
-    client: Option<&str>,
-) -> Result<String, String> {
-    // Every resolved outcome is stamped into the audit log so it carries proof of the
-    // scope decision, not just the resulting behavior (see audit::record_agent_toggle).
-    let action = if enable { "enable" } else { "disable" };
-    let scoped = allowed.is_some();
-    let toggle_profile = || profile.or(reg.active_profile_id.as_deref()).unwrap_or("");
-
-    if !reg.allow_agent_control {
-        audit::record_agent_toggle(
-            client,
-            toggle_profile(),
-            action,
-            target.trim(),
-            None,
-            "agent_control_off",
-            scoped,
-        );
-        return Err(
-            "Toolport: agent control is off. The user must turn on \"Allow agent control\" \
-            in Toolport before an agent can enable or disable servers."
-                .to_string(),
-        );
-    }
-    let target = target.trim();
-    if target.is_empty() {
-        return Err(
-            "Toolport: pass the `server` id or name to change (run toolport_status for the list)."
-                .to_string(),
-        );
-    }
-    // A scoped client sees (and can toggle) only servers in its allowed set; an
-    // out-of-scope server is indistinguishable from a non-existent one.
-    let in_scope = |s: &ServerEntry| allowed.map_or(true, |set| set.contains(&s.id));
-    let server = match reg.servers.iter().find(|s| {
-        in_scope(s) && (s.id.eq_ignore_ascii_case(target) || s.name.eq_ignore_ascii_case(target))
-    }) {
-        Some(s) => s,
-        None => {
-            // Denied/not-found: resolved_server_id stays null, so the record can't
-            // reveal whether an out-of-scope server with this name exists.
-            audit::record_agent_toggle(
-                client,
-                toggle_profile(),
-                action,
-                target,
-                None,
-                "unresolved",
-                scoped,
-            );
-            let known: Vec<&str> = reg
-                .servers
-                .iter()
-                .filter(|s| in_scope(s))
-                .map(|s| s.name.as_str())
-                .collect();
-            return Err(format!(
-                "Toolport: no server matches \"{target}\". Known servers: {}.",
-                known.join(", ")
-            ));
-        }
-    };
-    let server_id = server.id.clone();
-    let server_name = server.name.clone();
-    let profile_id = profile
-        .map(str::to_string)
-        .or_else(|| reg.active_profile_id.clone())
-        .ok_or_else(|| "Toolport: no active profile to change.".to_string())?;
-
-    // Hold the cross-process registry lock across the whole load-modify-save so a concurrent
-    // app or team-sync write can't land between our read and our save and be reverted
-    // (SOU-23). Held until this function returns. Also re-check the opt-in on the fresh copy
-    // (the user may have just turned it off).
-    let lock = registry::lock_at(path).map_err(|e| format!("Toolport: {e}"))?;
-    let mut fresh = registry::load_from_locked(path, &lock)
-        .map_err(|e| format!("Toolport: could not read the registry ({e})."))?;
-    if !fresh.allow_agent_control {
-        audit::record_agent_toggle(
-            client,
-            &profile_id,
-            action,
-            target,
-            Some(&server_id),
-            "agent_control_off",
-            scoped,
-        );
-        return Err("Toolport: agent control is off.".to_string());
-    }
-    if fresh.is_enabled(&profile_id, &server_id) == enable {
-        audit::record_agent_toggle(
-            client,
-            &profile_id,
-            action,
-            target,
-            Some(&server_id),
-            "noop_already",
-            scoped,
-        );
-        return Ok(format!(
-            "{server_name} is already {}.",
-            if enable { "on" } else { "off" }
-        ));
-    }
-    // A team server still pending the member's review is the user's call alone. Checked on
-    // the fresh copy so a team sync landing mid-request cannot slip a new definition past it.
-    let pending_review = fresh
-        .servers
-        .iter()
-        .find(|s| s.id == server_id)
-        .is_some_and(|s| s.check_enable_allowed(false).is_err());
-    if enable && pending_review {
-        audit::record_agent_toggle(
-            client,
-            &profile_id,
-            action,
-            target,
-            Some(&server_id),
-            "team_review_required",
-            scoped,
-        );
-        return Err(format!(
-            "Toolport: {server_name} is a team server waiting for the user's review, so an agent \
-            cannot enable it. Ask the user to review it and turn it on in Toolport's Teams page."
-        ));
-    }
-    fresh.set_server_enabled(&profile_id, &server_id, enable)?;
-    registry::save_to(path, &fresh)
-        .map_err(|e| format!("Toolport: could not save the registry ({e})."))?;
-    audit::record_agent_toggle(
-        client,
-        &profile_id,
-        action,
-        target,
-        Some(&server_id),
-        if enable { "enabled" } else { "disabled" },
-        scoped,
-    );
-    glog(&format!(
-        "agent control: {} server '{server_id}' in profile '{profile_id}'",
-        if enable { "ENABLED" } else { "DISABLED" }
-    ));
-    Ok(format!(
-        "Turned {} \"{server_name}\". Its tools will be {} within about a second.",
-        if enable { "on" } else { "off" },
-        if enable { "available" } else { "removed" }
-    ))
-}
-
-/// Map a legacy `conduit_*` meta-tool name to its renamed `toolport_*` form, so the
-/// old names keep working as aliases after the Conduit -> Toolport rebrand. Returns
-/// `None` for anything that isn't one of the 7 legacy meta-tool names, so renamed
-/// `toolport_*` names and downstream `server__tool` names pass through unchanged at
-/// the call site.
-fn canonical_meta(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "conduit_status" => "toolport_status",
-        "conduit_search_tools" => "toolport_search_tools",
-        "conduit_call_tool" => "toolport_call_tool",
-        "conduit_fetch_result" => "toolport_fetch_result",
-        "conduit_confirm" => "toolport_confirm",
-        "conduit_enable_server" => "toolport_enable_server",
-        "conduit_disable_server" => "toolport_disable_server",
-        _ => return None,
-    })
 }
 
 /// Unwrap a `toolport_call_tool` payload into (inner tool name, inner arguments).
@@ -3160,125 +2951,25 @@ impl SearchGuard {
     }
 }
 
-/// Per-call confirmation state for destructive tools. When `confirm_destructive`
-/// is on, the first call to a destructive tool returns a preview with a token;
-/// `toolport_confirm { token }` replays the stored call. Entries expire after 60s.
-///
-/// Session-scoped (one-gateway-per-host P1.2): a confirmation is issued to one
-/// conversation and redeemed inside it, so the pending set belongs to that
-/// session ([`SessionGuards`]) rather than to the gateway process. The `owner`
-/// check below still refuses a token presented by a different principal, which is
-/// what makes a shared host safe when two sessions do reach the same set.
-struct ConfirmGuard {
-    /// Pending confirmations: token → the exact call to replay. Behind a Mutex so the
-    /// HTTP workers of one session share ONE confirm set: a token stored by one
-    /// request must be redeemable by a later `toolport_confirm` that may land on a
-    /// different worker.
-    pending: Mutex<std::collections::HashMap<String, PendingCall>>,
-}
-
-/// A stored destructive call awaiting confirmation.
-struct PendingCall {
-    /// The full tool name (e.g. `stripe__delete_customer`).
-    name: String,
-    /// The exact arguments from the preview call (serialized for replay).
-    arguments: Value,
-    /// Stable security principal that created this confirmation (e.g.
-    /// `client:{id}`), never a display label. `None` covers stdio and the
-    /// legacy unscoped HTTP bearer, which each have one shared caller.
-    owner: Option<String>,
-    /// When this entry was created (for expiry).
-    created: Instant,
-}
-
-const CONFIRM_TTL: Duration = Duration::from_secs(60);
-
-impl ConfirmGuard {
-    fn new() -> Self {
-        Self {
-            pending: Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-
-    /// Generate a cryptographically random 32-char hex token (128 bits of
-    /// entropy via `getrandom`'s OS CSPRNG). Consistent with the codebase's
-    /// own bearer-token convention. No silent fallback: a CSPRNG failure is a
-    /// hard system error, not something to paper over on a security gate.
-    fn new_token() -> String {
-        let mut buf = [0u8; 16];
-        getrandom::getrandom(&mut buf).expect("CSPRNG unavailable");
-        buf.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
-    /// Lock the pending set. Held only for the brief store/take, never across dispatch.
-    fn pending(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, PendingCall>> {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Store a pending call for one client and return its confirmation token.
-    fn store(&self, name: String, arguments: Value, owner: Option<&str>) -> String {
-        let mut pending = self.pending();
-        // Evict expired entries to prevent unbounded growth.
-        let cutoff = Instant::now() - CONFIRM_TTL;
-        pending.retain(|_, v| v.created > cutoff);
-        let token = Self::new_token();
-        pending.insert(
-            token.clone(),
-            PendingCall {
-                name,
-                arguments,
-                owner: owner.map(str::to_string),
-                created: Instant::now(),
-            },
-        );
-        token
-    }
-
-    /// Consume a confirmation token only for the client that created it. A
-    /// wrong-client attempt does not consume the entry, so it cannot deny the
-    /// rightful owner. Returns None when the token is missing, expired, or owned
-    /// by a different client; callers intentionally expose the same error for all.
-    fn take(&self, token: &str, owner: Option<&str>) -> Option<(String, Value)> {
-        let mut pending = self.pending();
-        let entry = pending.get(token)?;
-        if entry.created.elapsed() > CONFIRM_TTL {
-            pending.remove(token);
-            return None;
-        }
-        if entry.owner.as_deref() != owner {
-            return None;
-        }
-        let entry = pending.remove(token)?;
-        Some((entry.name, entry.arguments))
-    }
-}
-
 /// The cross-request guard state one client conversation owns
 /// (one-gateway-per-host P1.2).
 ///
-/// Both halves are session state, not host state. The search-thrash streak counts
-/// one conversation's consecutive searches, so another client's searches must not
-/// push it toward escalation. A pending destructive confirmation was previewed for
-/// one conversation and must be redeemable in that same one; the `owner` check
-/// inside [`ConfirmGuard::take`] refuses a foreign principal on top of that.
+/// The search-thrash streak counts one conversation's consecutive searches, so
+/// another client's searches must not push it toward escalation.
 ///
-/// Held behind `Arc`s because a dispatch borrows them for the whole call: a
-/// tools/call can hold its `&SearchGuard`/`&ConfirmGuard` across a downstream call
-/// or a human-approval hold while the session record they came from stays
-/// reachable from other threads.
+/// Held behind an `Arc` because a dispatch borrows it for the whole call: a
+/// tools/call can hold its `&SearchGuard` across a downstream call or a
+/// human-approval hold while the session record it came from stays reachable from
+/// other threads.
 #[derive(Clone)]
 struct SessionGuards {
     search: Arc<SearchGuard>,
-    confirm: Arc<ConfirmGuard>,
 }
 
 impl SessionGuards {
     fn new() -> Self {
         Self {
             search: Arc::new(SearchGuard::default()),
-            confirm: Arc::new(ConfirmGuard::new()),
         }
     }
 }
@@ -3578,7 +3269,7 @@ fn preserve_collapsed_servers(
     guarded
 }
 
-/// Whether the exposed tool `name` is destructive, for the HITL / confirm gate. Resolves
+/// Whether the exposed tool `name` is destructive, for the HITL gate. Resolves
 /// from the cached catalog first, then the LIVE router if the cache doesn't list it (a
 /// cold or stale cache, or a tool whose `destructiveHint` was just added by drift). If
 /// NEITHER can resolve the tool, it's treated as destructive - a gate that can't see a
@@ -3705,10 +3396,7 @@ fn is_fixed_meta_tool(name: &str) -> bool {
         "toolport_status"
             | "toolport_search_tools"
             | "toolport_call_tool"
-            | "toolport_confirm"
             | "toolport_fetch_result"
-            | "toolport_enable_server"
-            | "toolport_disable_server"
             | "toolport_run_script"
     )
 }
@@ -3734,7 +3422,7 @@ struct McpSessionOwner {
 ///
 /// * `audit_label` — human-readable name for Activity / audit display only.
 /// * `session_owner.identity` — stable security principal (`client:{id}`) for
-///   MCP sessions, confirm tokens, and shaped-result stash isolation (SOU-324).
+///   MCP sessions and shaped-result stash isolation (SOU-324).
 ///   Two clients may share a display label; they must never share this identity.
 struct HttpCaller {
     audit_label: Option<String>,
@@ -4219,16 +3907,12 @@ impl RoutedCallProfiler {
 /// path both a direct `toolport_call_tool` dispatch and a code-mode script's
 /// `toolport.call()` binding go through, so every gate applies identically to both: the
 /// per-client scope guard, the placeholder guard, the typed human-approval gate with
-/// content-binding, the per-call destructive confirmation, live inspection, result shaping,
-/// and audit. A script therefore never reaches a tool the client couldn't already call, nor
-/// skips a gate a direct call would hit.
+/// content-binding, live inspection, result shaping, and audit. A script therefore never
+/// reaches a tool the client couldn't already call, nor skips a gate a direct call would hit.
 ///
-/// `confirm` is `Some` only on the interactive direct path, where a destructive tool can be
-/// held for the agent's `toolport_confirm` token replay. Inside a script that two-step
-/// handshake can't happen, so `confirm` is `None` and such a call fails closed rather than
-/// running unconfirmed. `opts.confirmed` is true only when the call already came back through
-/// `toolport_confirm` (skips the approval + confirm gates so it isn't re-intercepted).
-/// `opts.shape` controls byte-budget shaping (see [`CallOpts`]).
+/// `opts.direct` is true only on the interactive direct path. Inside a script the modern
+/// MRTR approval handshake can't happen, so a modern client's HITL gate falls back to the
+/// legacy broker there. `opts.shape` controls byte-budget shaping (see [`CallOpts`]).
 #[allow(clippy::too_many_arguments)]
 fn execute_call(
     reg: &Registry,
@@ -4238,7 +3922,6 @@ fn execute_call(
     client_name: Option<&str>,
     allowed: Option<&std::collections::HashSet<String>>,
     cancel: Option<downstream::CancelContext>,
-    confirm: Option<&ConfirmGuard>,
     name: &str,
     arguments: Value,
     // The upstream client's `params._meta`, relayed to the downstream server
@@ -4254,7 +3937,7 @@ fn execute_call(
     // `None` only in test wrappers that lack `GatewayState`.
     live_router: Option<&Arc<Mutex<Arc<Router>>>>,
 ) -> Value {
-    let mut confirmed = opts.confirmed;
+    let mut confirmed = false;
     let shape = opts.shape;
     if !opts.allow_app_only && !named_tool_is_model_visible(name, cached, router) {
         return json!({
@@ -4264,9 +3947,8 @@ fn execute_call(
     }
     // Direct modern calls can use MRTR even on their first round, before any
     // requestState exists. Code-mode steps deliberately keep the legacy broker
-    // because they cannot surface an intermediate result to the upstream client;
-    // `confirm` is present only on the direct call path.
-    let modern_direct_call = serving_modern_client() && confirm.is_some();
+    // because they cannot surface an intermediate result to the upstream client.
+    let modern_direct_call = serving_modern_client() && opts.direct;
     let resuming_modern_hitl = modern_direct_call
         && mrtr
             .and_then(|retry| retry.request_state.as_ref())
@@ -4357,8 +4039,7 @@ fn execute_call(
     // Human-in-the-loop approval: gate a destructive or untrusted call until a
     // person approves it in the Toolport app. Legacy clients hold this request;
     // modern clients receive input_required and re-enter on a fresh request.
-    // Takes precedence over the agent-facing confirm below, and is fail-closed
-    // (no broker / no answer / timeout all deny). Skipped once `confirmed`.
+    // Fail-closed (no broker / no answer / timeout all deny). Skipped once `confirmed`.
     if (reg.human_approval_effective() || resuming_modern_hitl) && !confirmed {
         // Resolve destructiveness robustly: cache, then live router, else
         // fail-closed (an unknown tool must not skip the human gate).
@@ -4589,7 +4270,7 @@ fn execute_call(
             if audit_approval {
                 pending_approval_audit = Some((reason_str, held_ms));
             }
-            // Skip the agent-confirm step and route the call.
+            // Route the call.
             confirmed = true;
         } else if resuming_modern_hitl {
             let token = mrtr
@@ -4606,7 +4287,7 @@ fn execute_call(
 
     let exec_router: &Router = exec_router_owned.as_deref().unwrap_or(router);
 
-    // SOU-478: bind every post-gate consumer (confirm, progress, audit, content
+    // SOU-478: bind every post-gate consumer (progress, audit, content
     // defense, inspect) to the route identity on the router that will execute.
     // After HITL, that is the live Arc revalidated above; otherwise it is the
     // request snapshot and this rebind is a no-op. Owner flips during a hold are
@@ -4629,58 +4310,6 @@ fn execute_call(
             &arguments,
             Some(held_ms),
         );
-    }
-
-    // Per-call confirmation for destructive tools: intercept the first
-    // call with these arguments, store it, and return a preview. The
-    // agent calls toolport_confirm { token } to replay the stored call.
-    // This runs AFTER the placeholder guard (so a placeholder never
-    // gets a token) and BEFORE the actual route_call (so a destructive
-    // call never reaches the downstream server unconfirmed).
-    // Skip when `confirmed` is true: the call arrived via toolport_confirm
-    // and was already reviewed (prevents re-interception loop).
-    if reg.safety_level.is_none() && reg.confirm_destructive && !confirmed {
-        // Resolve destructiveness robustly (cache, then live router, else
-        // fail-closed), so a cold/stale cache can't skip the confirm step for a
-        // destructive tool.
-        let dest = tool_is_destructive_fail_closed(name, cached, exec_router);
-        if dest {
-            match confirm {
-                Some(confirm) => {
-                    let token = confirm.store(name.to_string(), arguments.clone(), client);
-                    let args_pretty = serde_json::to_string_pretty(&arguments).unwrap_or_default();
-                    let msg = format!(
-                        "⚠️ Destructive action intercepted.\n\nTool: {name}\nArguments:\n{args_pretty}\n\n\
-                         Review the arguments above carefully. If correct, call toolport_confirm \
-                         with token: {token}\n\
-                         The token expires in 60 seconds. The original arguments will be replayed \
-                         exactly."
-                    );
-                    // Held for confirmation, not a failure: record as held (ok), so the
-                    // confirm-destructive feature doesn't inflate the error rate.
-                    audit::record_held(srv, tool, client);
-                    return json!({
-                        "content": [{ "type": "text", "text": msg }],
-                        "isError": true
-                    });
-                }
-                None => {
-                    // Code mode: the agent-token replay handshake can't happen inside a
-                    // script (it needs a second round-trip). Fail closed rather than run
-                    // an unconfirmed destructive call.
-                    audit::record_held(srv, tool, client);
-                    return json!({
-                        "content": [{ "type": "text", "text": format!(
-                            "Toolport: {name} is a destructive tool that requires per-call \
-                             confirmation, which is not available inside a code-mode script. Call \
-                             it directly with toolport_call_tool, or enable human approval so it \
-                             can be approved in the app."
-                        ) }],
-                        "isError": true
-                    });
-                }
-            }
-        }
     }
 
     // Live inspection (opt-in, off by default): capture the raw request
@@ -4875,8 +4504,9 @@ fn execute_call(
 /// Flags for [`execute_call`] that would otherwise be adjacent bools (easy to swap).
 #[derive(Clone, Copy)]
 struct CallOpts {
-    /// True after a successful `toolport_confirm` replay (skip re-approval/confirm).
-    confirmed: bool,
+    /// True on the interactive direct call path (not a code-mode script step). A
+    /// modern client can use MRTR for the human-approval handshake here.
+    direct: bool,
     /// When false, content defense still runs but result-shaping is skipped. Code-mode
     /// intermediate calls pass full bodies into the sandbox (they never enter model
     /// context); only the script's final aggregate is shaped for the client.
@@ -5137,8 +4767,8 @@ fn with_pii_session<T>(client: Option<&str>, f: impl FnOnce(&mut pii::SessionMap
 /// Resolve pseudonyms on the owned dispatch copy only, for a call bound to `server`.
 ///
 /// Callers must retain the original tokenized value for every model-facing or
-/// persisted preflight surface (HITL, destructive confirmation, inspect and
-/// audit hashing), and invoke this only at the final downstream boundary.
+/// persisted preflight surface (HITL, inspect and audit hashing), and invoke this
+/// only at the final downstream boundary.
 ///
 /// `Err` when the arguments carry a token another server minted. That is the
 /// exfiltration shape from SBS-605 — an injected result talking the model into
@@ -5415,8 +5045,7 @@ fn rehydrate_mrtr_for_downstream(
 ///
 /// Deliberately not applied to `arguments` itself. Everything else that reads them
 /// before dispatch is model-facing -- the modern HITL elicitation is relayed back
-/// through the model host, the destructive-confirm preview is returned to the
-/// model as a tool result, and live inspect writes them to disk -- so resolving
+/// through the model host, and live inspect writes them to disk -- so resolving
 /// them in place would push real PII into exactly the places this feature exists
 /// to keep it out of. The local broker is loopback-only and unpersisted, which is
 /// the one audience that should see real values before the wire does.
@@ -5927,8 +5556,7 @@ fn execute_script_dispatch(
 ) -> Value {
     // Owned handles so the sandbox's call binding can be `'static`. Each toolport.call()
     // re-enters execute_call with these, applying the identical scope + approval gates a
-    // direct call would. `confirm = None` fails closed on the agent-token confirmation path,
-    // which can't complete inside a single script round-trip.
+    // direct call would.
     let reg_owned = reg.clone();
     let router_owned = Arc::clone(router_arc);
     let live_owned = live_router.cloned();
@@ -5961,7 +5589,6 @@ fn execute_script_dispatch(
                 client_name_owned.as_deref(),
                 allowed_owned.as_ref(),
                 Some(host_call.context.clone()),
-                None,
                 name,
                 args,
                 // A script step is Toolport's own call, not a relay of a client
@@ -5969,7 +5596,7 @@ fn execute_script_dispatch(
                 None,
                 None,
                 CallOpts {
-                    confirmed: false,
+                    direct: false,
                     shape: false,
                     allow_app_only: false,
                 },
@@ -6249,7 +5876,6 @@ fn handle_request(
     lazy: bool,
     profile: Option<&str>,
     guard: &SearchGuard,
-    confirm: &ConfirmGuard,
     allowed: Option<&std::collections::HashSet<String>>,
     // The client this request is attributed to (a registered HTTP client's audit
     // label), threaded in rather than stored on the shared router so concurrent
@@ -6275,7 +5901,6 @@ fn handle_request(
         mode,
         profile,
         guard,
-        confirm,
         allowed,
         None,
         client,
@@ -6310,9 +5935,6 @@ fn tool_surface(
             if host.code_mode_enabled() {
                 tools.push(run_script_tool_def());
             }
-            if reg.confirm_destructive {
-                tools.push(confirm_tool_def());
-            }
             if !relays_mcp_app_html_to_active_client(router, allowed) {
                 scoped.retain(mcp_app_tool_is_model_visible);
             }
@@ -6323,8 +5945,6 @@ fn tool_surface(
         DiscoveryMode::Lazy | DiscoveryMode::Grouped => {
             let mut tools = grouped_tool_defs(
                 host,
-                reg.allow_agent_control,
-                reg.confirm_destructive,
                 if mode == DiscoveryMode::Grouped {
                     &scoped
                 } else {
@@ -6349,7 +5969,6 @@ fn handle_request_with_cancel(
     mode: DiscoveryMode,
     profile: Option<&str>,
     guard: &SearchGuard,
-    confirm: &ConfirmGuard,
     allowed: Option<&std::collections::HashSet<String>>,
     cancel: Option<downstream::CancelContext>,
     // The client this request is attributed to (a registered HTTP client's audit
@@ -6492,29 +6111,27 @@ fn handle_request_with_cancel(
         }
         "tools/call" => {
             let params = req.get("params");
-            // `name`/`arguments` are mutable so the toolport_confirm handler
-            // below can swap in the stored (confirmed) call and fall through to
-            // the normal routing code instead of returning early.
             let mut name = params
                 .and_then(|p| p.get("name"))
                 .and_then(|n| n.as_str())
                 .unwrap_or("")
                 .to_string();
-            // Accept the legacy conduit_* meta-tool names as aliases for the renamed
-            // toolport_* names, so a client/model still using the old names keeps
-            // working. Only the 7 known meta names are rewritten; downstream
-            // `server__tool` names and the new toolport_* names pass through.
-            if let Some(canon) = canonical_meta(&name) {
-                name = canon.to_string();
-            }
             let mut arguments = params
                 .and_then(|p| p.get("arguments"))
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            // True when this call arrived via toolport_confirm (the stored call
-            // was already reviewed). Skips the destructive-interception check
-            // below so the confirmed call isn't re-intercepted in a loop.
-            let mut confirmed = false;
+            // A client that still calls a meta-tool 2.0 removed (including the
+            // legacy `conduit_*` aliases) gets a clear refusal naming the floor
+            // rather than a routing error.
+            if is_removed_meta_tool(&name) {
+                return Some(success(
+                    id,
+                    json!({
+                        "content": [{ "type": "text", "text": removed_meta_tool_error(&name) }],
+                        "isError": true
+                    }),
+                ));
+            }
 
             // Grouped mode: a per-server browse tool `help_<server>` is the enumerable
             // alternative to inventing a search query. Rewrite it into a server-scoped
@@ -6551,42 +6168,6 @@ fn handle_request_with_cancel(
                     id,
                     shaping::fetch_result(cursor, offset, len, client, projection),
                 ));
-            }
-
-            // toolport_confirm: replay a previously-intercepted destructive call.
-            // On a valid token, overwrite `name`/`arguments` with the stored call
-            // and fall through to the normal routing below (no early return).
-            if name == "toolport_confirm" {
-                let token = arguments
-                    .get("token")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if token.is_empty() {
-                    return Some(success(
-                        id,
-                        json!({
-                            "content": [{ "type": "text", "text": "Toolport: pass the `token` from the intercepted call's preview." }],
-                            "isError": true
-                        }),
-                    ));
-                }
-                match confirm.take(token, client) {
-                    Some((confirmed_name, confirmed_args)) => {
-                        name = confirmed_name;
-                        arguments = confirmed_args;
-                        // An agent token never substitutes for human approval.
-                        confirmed = !reg.human_approval_effective();
-                    }
-                    None => {
-                        return Some(success(
-                            id,
-                            json!({
-                                "content": [{ "type": "text", "text": "Toolport: token expired or invalid. Call the tool again to get a new preview." }],
-                                "isError": true
-                            }),
-                        ));
-                    }
-                }
             }
 
             if name == "toolport_status" {
@@ -6924,28 +6505,6 @@ fn handle_request_with_cancel(
                 ));
             }
 
-            if name == "toolport_enable_server" || name == "toolport_disable_server" {
-                let enable = name == "toolport_enable_server";
-                let target = arguments
-                    .get("server")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let result = match registry::resolved_path() {
-                    Some(p) => set_server_enabled_via_agent(
-                        reg, profile, &p, target, enable, allowed, client,
-                    ),
-                    None => Err("Toolport: could not locate the registry file.".to_string()),
-                };
-                let (text, is_error) = match result {
-                    Ok(msg) => (msg, false),
-                    Err(msg) => (msg, true),
-                };
-                return Some(success(
-                    id,
-                    json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }),
-                ));
-            }
-
             // toolport_run_script: server-side "code mode". Run one agent script that calls
             // many downstream tools via toolport.call(), collapsing an N-step task into one
             // round-trip; intermediate results never enter model context. Opt-in, and needs
@@ -7005,7 +6564,7 @@ fn handle_request_with_cancel(
 
             // toolport_call_tool dispatches a discovered tool: unwrap to its real
             // name + arguments, then run it through the shared execute path (scope,
-            // approval, confirm, shaping) that a code-mode toolport.call() also uses.
+            // approval, shaping) that a code-mode toolport.call() also uses.
             let model_facing_meta_call = name == "toolport_call_tool";
             let (name, arguments) = if model_facing_meta_call {
                 unwrap_call_tool(&arguments)
@@ -7026,14 +6585,13 @@ fn handle_request_with_cancel(
                 client_name,
                 allowed,
                 cancel,
-                Some(confirm),
                 name.as_str(),
                 arguments,
                 // Relay the client's request metadata downstream (SOU-444).
                 req.get("params").and_then(|p| p.get("_meta")),
                 (!mrtr.is_empty()).then_some(&mrtr),
                 CallOpts {
-                    confirmed,
+                    direct: true,
                     shape: true,
                     allow_app_only,
                 },
@@ -11704,11 +11262,11 @@ impl GatewayState {
     /// there is no session record (a modern request, which is self-contained, or an
     /// OpenAPI tool call, which carries no MCP session at all).
     ///
-    /// Guards are session state (P1.2): the search-thrash streak and the pending
-    /// destructive confirmations belong to the conversation that created them, so a
-    /// host serving several clients must not fold two of them into one pair. The
-    /// caller falls back to the listener-level pair only when no session record
-    /// exists, which is the behavior those requests already had.
+    /// Guards are session state (P1.2): the search-thrash streak belongs to the
+    /// conversation that created it, so a host serving several clients must not
+    /// fold two of them into one pair. The caller falls back to the listener-level
+    /// guard only when no session record exists, which is the behavior those
+    /// requests already had.
     fn session_guards(&self, session: Option<&str>) -> Option<SessionGuards> {
         let session = session?;
         self.mcp_sessions
@@ -12111,7 +11669,7 @@ struct SessionState {
     /// stdio client, which has no bearer identity.
     owner: Option<McpSessionOwner>,
     /// Cross-request guard state this conversation owns: the search-thrash streak
-    /// and the pending destructive confirmations (P1.2).
+    /// (P1.2).
     guards: SessionGuards,
     /// Once this stdio peer sends a 2026-07-28 request, unsolicited legacy
     /// notifications must stop; modern notifications travel only through its
@@ -13742,7 +13300,6 @@ fn process_request(
     state: &GatewayState,
     req: &Value,
     guard: &SearchGuard,
-    confirm: &ConfirmGuard,
     allowed: Option<&std::collections::HashSet<String>>,
     adapter_profile: Option<&str>,
     // The profile an HTTP caller is scoped to (`HttpCaller::profile`); `None` on stdio.
@@ -14011,7 +13568,6 @@ fn process_request(
         discovery,
         profile_snapshot.as_deref(),
         guard,
-        confirm,
         allowed,
         cancel,
         client,
@@ -14054,8 +13610,7 @@ fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
     // that is running this request and nothing else.
     let cancel_registry = state.stdio_upstream.cancellations();
     let cancel_context = cancel_registry.context(request_key.clone());
-    // The guards are the stdio session's own: one connection, one search streak,
-    // one set of pending confirmations (P1.2).
+    // The guards are the stdio session's own: one connection, one search streak (P1.2).
     let guards = state.stdio_upstream.guards();
     // A panic in a handler must not kill the gateway: catch it, log it, and
     // return a JSON-RPC internal error for this request unless the client
@@ -14065,7 +13620,6 @@ fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
             &state,
             &req,
             &guards.search,
-            &guards.confirm,
             None,
             None,
             None,
@@ -14199,21 +13753,13 @@ fn state_prefix_owners(state: &GatewayState) -> HashMap<String, String> {
     unique_prefix_owners(&reg)
 }
 
-/// The tools the HTTP surface exposes, mirroring `tools/list`: the meta-tools
+/// The tools the HTTP surface exposes, mirroring `tools/list`: the fixed floor
 /// in lazy mode, or status + fetch + the full namespaced catalog in full mode.
-/// Agent-control tools appear only when the registry opts in.
 fn http_tool_defs(
     state: &GatewayState,
     allowed: Option<&std::collections::HashSet<String>>,
     discovery: DiscoveryMode,
 ) -> Vec<Value> {
-    let (allow_agent, confirm_destructive) = {
-        let r = state
-            .registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (r.allow_agent_control, r.confirm_destructive)
-    };
     // The namespaced catalog (cached, or live on a cold cache).
     let catalog = || {
         let cached = state
@@ -14232,20 +13778,7 @@ fn http_tool_defs(
         }
     };
     if matches!(discovery, DiscoveryMode::Lazy) {
-        let mut tools = vec![
-            status_tool_def(),
-            search_tool_def(),
-            call_tool_def(),
-            fetch_result_tool_def(),
-        ];
-        if state.code_mode_enabled() {
-            tools.push(run_script_tool_def());
-        }
-        if allow_agent {
-            tools.push(enable_server_tool_def());
-            tools.push(disable_server_tool_def());
-        }
-        tools
+        floor_tool_defs(state)
     } else if matches!(discovery, DiscoveryMode::Grouped) {
         // Grouped: the meta-tools plus a per-server help_<server> browse tool. Scope
         // the catalog to this client FIRST so the help tools (which read as meta-tools
@@ -14262,12 +13795,7 @@ fn http_tool_defs(
             owner_of_exposed_tool(Some(&router), &owners, n)
         });
         drop(router);
-        grouped_tool_defs(
-            state,
-            allow_agent,
-            confirm_destructive,
-            &scoped,
-        )
+        grouped_tool_defs(state, &scoped)
     } else {
         let mut tools = vec![status_tool_def(), fetch_result_tool_def()];
         if state.code_mode_enabled() {
@@ -14475,8 +14003,9 @@ fn openapi_tool_is_known(
     name: &str,
     allowed: Option<&std::collections::HashSet<String>>,
 ) -> bool {
-    let canonical = canonical_meta(name).unwrap_or(name);
-    if is_fixed_meta_tool(canonical) {
+    // A removed meta-tool still counts as "known" so its clear floor refusal
+    // reaches the client as a 400, not a 404 that hides the reason.
+    if is_fixed_meta_tool(name) || is_removed_meta_tool(name) {
         return true;
     }
     let routed_in_scope = state
@@ -14845,7 +14374,6 @@ fn modern_http_status(resp: &Value) -> u16 {
 fn handle_mcp_http(
     state: &GatewayState,
     guard: &SearchGuard,
-    confirm: &ConfirmGuard,
     method: &str,
     body: &str,
     headers: McpHttpRequestHeaders<'_>,
@@ -15089,15 +14617,14 @@ fn handle_mcp_http(
                 }
             }
 
-            // A legacy MCP session owns its own guard pair (P1.2): one search
-            // streak and one set of pending confirmations per conversation. A
-            // request with no session record keeps the listener-level pair passed
-            // in, which is what a modern (self-contained) request and every
+            // A legacy MCP session owns its own search guard (P1.2). A request
+            // with no session record keeps the listener-level guard passed in,
+            // which is what a modern (self-contained) request and every
             // pre-session request already used.
             let session_guards = state.session_guards(session_id.as_deref());
-            let (guard, confirm) = match &session_guards {
-                Some(guards) => (guards.search.as_ref(), guards.confirm.as_ref()),
-                None => (guard, confirm),
+            let guard = match &session_guards {
+                Some(guards) => guards.search.as_ref(),
+                None => guard,
             };
 
             // Notifications / JSON-RPC responses: 202 with empty body.
@@ -15107,7 +14634,6 @@ fn handle_mcp_http(
                     state,
                     &req,
                     guard,
-                    confirm,
                     allowed,
                     session_owner.and_then(|owner| owner.profile.as_deref()),
                     connection_profile,
@@ -15128,7 +14654,6 @@ fn handle_mcp_http(
                 state,
                 &req,
                 guard,
-                confirm,
                 allowed,
                 session_owner.and_then(|owner| owner.profile.as_deref()),
                 connection_profile,
@@ -15174,7 +14699,6 @@ fn handle_mcp_http(
 fn handle_http_with_headers(
     state: &GatewayState,
     guard: &SearchGuard,
-    confirm: &ConfirmGuard,
     method: &str,
     path: &str,
     body: &str,
@@ -15182,9 +14706,9 @@ fn handle_http_with_headers(
     allowed: Option<&std::collections::HashSet<String>>,
     caller: Option<&HttpCaller>,
 ) -> HttpOut {
-    // SOU-324: confirm tokens and shaped-result stash must key on stable client
-    // identity, not the display label (labels are not unique across HTTP clients).
-    // Audit still receives this same id string; Activity may show `client:{id}`.
+    // SOU-324: the shaped-result stash must key on stable client identity, not the
+    // display label (labels are not unique across HTTP clients). Audit still
+    // receives this same id string; Activity may show `client:{id}`.
     let client = caller.map(|value| value.session_owner.identity.as_str());
     let client_name = caller.and_then(|value| value.audit_label.as_deref());
     let session_owner = caller.map(|value| &value.session_owner);
@@ -15290,7 +14814,6 @@ fn handle_http_with_headers(
         return handle_mcp_http(
             state,
             guard,
-            confirm,
             method,
             body,
             headers,
@@ -15352,7 +14875,6 @@ fn handle_http_with_headers(
                 return handle_mcp_http(
                     state,
                     guard,
-                    confirm,
                     method,
                     body,
                     headers,
@@ -15384,7 +14906,6 @@ fn handle_http_with_headers(
                 state,
                 &req,
                 guard,
-                confirm,
                 allowed,
                 caller.and_then(|caller| caller.session_owner.profile.as_deref()),
                 connection_profile,
@@ -15430,7 +14951,6 @@ fn handle_http_with_headers(
 fn handle_http(
     state: &GatewayState,
     guard: &SearchGuard,
-    confirm: &ConfirmGuard,
     method: &str,
     path: &str,
     body: &str,
@@ -15442,7 +14962,6 @@ fn handle_http(
     handle_http_with_headers(
         state,
         guard,
-        confirm,
         method,
         path,
         body,
@@ -16289,7 +15808,6 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
             state,
             Some(token),
             Arc::new(SearchGuard::default()),
-            Arc::new(ConfirmGuard::new()),
             false,
             Arc::new(AtomicUsize::new(0)),
         );
@@ -16317,7 +15835,6 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
         compat.fingerprint()
     ));
     let search = Arc::new(SearchGuard::default());
-    let confirm = Arc::new(ConfirmGuard::new());
     state.touch_activity();
     let inflight = Arc::new(AtomicUsize::new(0));
     spawn_daemon_idle_watchdog(
@@ -16327,7 +15844,7 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
         descriptor.clone(),
         conduit_lib::daemon::idle_grace(),
     );
-    serve_http_loop_with_inflight(server, state, Some(token), search, confirm, false, inflight);
+    serve_http_loop_with_inflight(server, state, Some(token), search, false, inflight);
     // Land any queued telemetry before returning; the process exits right after.
     conduit_lib::telemetry::flush();
     conduit_lib::daemon::clear_descriptor(&descriptor_path);
@@ -16400,15 +15917,12 @@ fn serve_http(state: GatewayState, port: u16) {
         );
     }
 
-    // The listener-level guard pair. A request that carries an MCP session id
-    // uses that session's own pair (see GatewayState::session_guards); this one
+    // The listener-level search guard. A request that carries an MCP session id
+    // uses that session's own guard (see GatewayState::session_guards); this one
     // is the fallback for requests that have no session record: a modern
     // (self-contained) request, an OpenAPI tool call, and the pre-session
-    // `initialize`. It is per listener rather than per worker because a confirm
-    // token stored by one request is redeemed by a later one, which may land on a
-    // different worker.
+    // `initialize`.
     let search = Arc::new(SearchGuard::default());
-    let confirm = Arc::new(ConfirmGuard::new());
 
     // When binding the default IPv4 loopback, ALSO listen on the IPv6 loopback
     // (best-effort). Many systems resolve "localhost" to ::1 first, and clients
@@ -16418,22 +15932,10 @@ fn serve_http(state: GatewayState, port: u16) {
         if let Ok((server6, ingress6, _)) =
             bind_deadline_http_server(("::1", port), HttpReadDeadlines::default())
         {
-            let (state6, token6, search6, confirm6) = (
-                state.clone(),
-                token.clone(),
-                search.clone(),
-                confirm.clone(),
-            );
+            let (state6, token6, search6) = (state.clone(), token.clone(), search.clone());
             std::thread::spawn(move || {
                 let _ingress = ingress6;
-                serve_http_loop(
-                    server6,
-                    state6,
-                    token6,
-                    search6,
-                    confirm6,
-                    allow_insecure_open,
-                )
+                serve_http_loop(server6, state6, token6, search6, allow_insecure_open)
             });
             glog(&format!(
                 "HTTP/OpenAPI also listening on http://[::1]:{port}"
@@ -16458,7 +15960,7 @@ fn serve_http(state: GatewayState, port: u16) {
     eprintln!(
         "toolport-gateway: HTTP on http://localhost:{port}  (OpenAPI /openapi.json, MCP POST /mcp)"
     );
-    serve_http_loop(server, state, token, search, confirm, allow_insecure_open);
+    serve_http_loop(server, state, token, search, allow_insecure_open);
 }
 
 struct HttpProxyState {
@@ -16827,7 +16329,6 @@ fn serve_http_loop(
     state: GatewayState,
     token: Option<String>,
     search: Arc<SearchGuard>,
-    confirm: Arc<ConfirmGuard>,
     allow_insecure_open: bool,
 ) {
     serve_http_loop_with_inflight(
@@ -16835,7 +16336,6 @@ fn serve_http_loop(
         state,
         token,
         search,
-        confirm,
         allow_insecure_open,
         Arc::new(AtomicUsize::new(0)),
     );
@@ -16846,7 +16346,6 @@ fn serve_http_loop_with_inflight(
     state: GatewayState,
     token: Option<String>,
     search: Arc<SearchGuard>,
-    confirm: Arc<ConfirmGuard>,
     allow_insecure_open: bool,
     inflight: Arc<AtomicUsize>,
 ) {
@@ -16873,22 +16372,10 @@ fn serve_http_loop_with_inflight(
             respond_http_overloaded(request);
             continue;
         };
-        let (state, token, search, confirm) = (
-            state.clone(),
-            token.clone(),
-            Arc::clone(&search),
-            Arc::clone(&confirm),
-        );
+        let (state, token, search) = (state.clone(), token.clone(), Arc::clone(&search));
         std::thread::spawn(move || {
             let _permit = guard;
-            handle_connection(
-                request,
-                &state,
-                &token,
-                &search,
-                &confirm,
-                allow_insecure_open,
-            );
+            handle_connection(request, &state, &token, &search, allow_insecure_open);
             // Stamp on completion too, so a request that ran longer than the grace
             // still gives the daemon a full grace after it finished.
             state.touch_activity();
@@ -16958,7 +16445,6 @@ fn handle_connection(
     state: &GatewayState,
     token: &Option<String>,
     search: &SearchGuard,
-    confirm: &ConfirmGuard,
     allow_insecure_open: bool,
 ) {
     let method = request.method().to_string().to_uppercase();
@@ -17236,7 +16722,6 @@ fn handle_connection(
                     handle_http_with_headers(
                         state,
                         search,
-                        confirm,
                         &method,
                         &path,
                         &body,
@@ -17998,8 +17483,8 @@ fn main() {
     }
 
     let stdin = std::io::stdin();
-    // Every stdio client's cross-request state (search streak, pending
-    // confirmations) lives on its session, so the loop holds no guards of its own.
+    // Every stdio client's cross-request state (the search streak) lives on its
+    // session, so the loop holds no guard of its own.
     // This connection's own cancellation registry and worker counter. Both are keyed
     // by, or bound to, one client's requests, so they live on the session rather than
     // in `main`: two stdio clients would otherwise share one registry and one cap.
@@ -18056,7 +17541,6 @@ fn main() {
                 &state,
                 &req,
                 &guards.search,
-                &guards.confirm,
                 None,
                 None,
                 None,
@@ -18861,7 +18345,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -19677,13 +19160,12 @@ mod tests {
             None,
             None,
             None,
-            Some(&ConfirmGuard::new()),
             "s__delete",
             json!({ "id": 7 }),
             None,
             None,
             CallOpts {
-                confirmed: false,
+                direct: false,
                 shape: true,
                 allow_app_only: false,
             },
@@ -20869,43 +20351,6 @@ mod tests {
         assert_eq!(result["structuredContent"]["result"], "Alice");
     }
 
-    /// Safety: a destructive tool called INSIDE a script fails closed when per-call
-    /// confirmation is on but human approval isn't. The agent-token replay handshake can't
-    /// complete in a single script round-trip, so rather than run an unconfirmed destructive
-    /// call, the call is refused - nothing destructive executes.
-    #[test]
-    fn run_script_destructive_call_fails_closed_without_confirmation() {
-        let _data_env =
-            DataDirTestEnv::new("run_script_destructive_call_fails_closed_without_confirmation");
-        let mut reg = Registry {
-            safety_level: None,
-            ..Registry::default()
-        };
-        reg.confirm_destructive = true;
-        let router = Arc::new(paging_router("x".to_string()));
-        // Mark the tool destructive via the cached catalog the fail-closed resolver checks.
-        let cached = vec![json!({ "name": "s__big", "annotations": { "destructiveHint": true } })];
-        let args = json!({ "script": "return toolport.call('s__big', {});" });
-        let result = run_script_dispatch(
-            &reg,
-            Some(&router),
-            &cached,
-            None,
-            None,
-            None,
-            None,
-            &args,
-            None,
-        );
-        assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
-        let call_result = &result["structuredContent"]["result"];
-        assert_eq!(call_result["isError"].as_bool(), Some(true));
-        assert!(call_result["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("approval service was unreachable"));
-    }
-
     /// An empty/whitespace script is rejected before the engine runs.
     #[test]
     fn run_script_rejects_empty_script() {
@@ -21566,7 +21011,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -21601,7 +21045,6 @@ mod tests {
                 true,
                 None,
                 &SearchGuard::default(),
-                &ConfirmGuard::new(),
                 None,
                 None,
             )
@@ -21651,7 +21094,6 @@ mod tests {
             DiscoveryMode::Lazy,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
             None,
@@ -21677,7 +21119,6 @@ mod tests {
             DiscoveryMode::Lazy,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
             None,
@@ -21752,7 +21193,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -21785,7 +21225,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -22498,8 +21937,7 @@ mod tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
         let search = Arc::new(SearchGuard::default());
-        let confirm = Arc::new(ConfirmGuard::new());
-        std::thread::spawn(move || serve_http_loop(server, state, None, search, confirm, true));
+        std::thread::spawn(move || serve_http_loop(server, state, None, search, true));
         std::thread::sleep(Duration::from_millis(50)); // let the listener come up
 
         // Kick off the slow (blocking) call on its own thread. `slow_done` flips only once
@@ -22620,7 +22058,6 @@ mod tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
         let search = Arc::new(SearchGuard::default());
-        let confirm = Arc::new(ConfirmGuard::new());
         let inflight = Arc::new(AtomicUsize::new(0));
 
         // Hold every permit without creating 256 slow OS threads. The listener
@@ -22638,7 +22075,6 @@ mod tests {
                 state,
                 None,
                 search,
-                confirm,
                 true,
                 listener_inflight,
             )
@@ -22692,7 +22128,6 @@ mod tests {
                 state,
                 Some("daemon-bearer".to_string()),
                 Arc::new(SearchGuard::default()),
-                Arc::new(ConfirmGuard::new()),
                 false,
                 listener_inflight,
             )
@@ -22791,8 +22226,10 @@ mod tests {
         for code in ["200", "400", "401", "404", "500"] {
             assert!(responses.contains_key(code), "missing response {code}");
         }
-        // Agent-control tools stay hidden unless the registry opts in.
+        // The removed agent-control and confirm tools are never in the spec.
         assert!(!paths.contains_key("/toolport_enable_server"));
+        assert!(!paths.contains_key("/toolport_disable_server"));
+        assert!(!paths.contains_key("/toolport_confirm"));
         assert_eq!(spec.get("openapi").unwrap(), "3.1.0");
         // A relative servers entry so clients can resolve the base URL.
         assert_eq!(spec.pointer("/servers/0/url").unwrap(), "/");
@@ -22978,9 +22415,8 @@ mod tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
         let search = Arc::new(SearchGuard::default());
-        let confirm = Arc::new(ConfirmGuard::new());
         // Started open: loopback, `--insecure-loopback`, and a clean empty registry.
-        std::thread::spawn(move || serve_http_loop(server, state, None, search, confirm, true));
+        std::thread::spawn(move || serve_http_loop(server, state, None, search, true));
         std::thread::sleep(Duration::from_millis(50)); // let the listener come up
 
         let body = modern_http_body(1, "tools/list", json!({}));
@@ -23327,12 +22763,10 @@ mod tests {
         swap_router(&state, router);
 
         let search = SearchGuard::default();
-        let confirm = ConfirmGuard::new();
 
         let init = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &json!({
@@ -23361,7 +22795,6 @@ mod tests {
         let call = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &json!({
@@ -23458,31 +22891,9 @@ mod tests {
     }
 
     #[test]
-    fn confirm_tokens_are_scoped_to_stable_identity_not_display_label() {
-        // SOU-324: two clients can share the label "Open WebUI"; tokens must not.
-        let confirm = ConfirmGuard::new();
-        let token = confirm.store(
-            "stripe__delete_customer".into(),
-            json!({ "id": "cus_x" }),
-            Some("client:c1"),
-        );
-        // Peer with a different stable id cannot redeem (and does not consume).
-        assert!(
-            confirm.take(&token, Some("client:c2")).is_none(),
-            "same display label must not unlock another client's confirm token"
-        );
-        // Rightful owner still redeems.
-        let (name, args) = confirm
-            .take(&token, Some("client:c1"))
-            .expect("owner must redeem");
-        assert_eq!(name, "stripe__delete_customer");
-        assert_eq!(args["id"], "cus_x");
-    }
-
-    #[test]
     fn http_security_owner_for_dispatch_is_stable_identity() {
         // handle_http must pass session_owner.identity (not audit_label) into
-        // process_request so confirm/shaping match ConfirmGuard + shaping stash.
+        // process_request so shaping matches the shaping stash.
         let mut reg = Registry::default();
         reg.http_clients.push(registry::HttpClient {
             id: "alpha".into(),
@@ -23574,7 +22985,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             Some(&allowed),
             Some("bravo-client"),
         ).unwrap();
@@ -23722,7 +23132,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             Some(&allowed),
             None,
         )
@@ -23757,7 +23166,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             Some(&allowed),
             None,
         )
@@ -23826,7 +23234,6 @@ mod tests {
         let out = handle_http(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "OPTIONS",
             "/toolport_search_tools",
             "",
@@ -23872,10 +23279,9 @@ mod tests {
         let state = http_state(true);
         swap_router(&state, router);
         let search = SearchGuard::default();
-        let confirm = ConfirmGuard::new();
         let post = |path: &str| {
             handle_http(
-                &state, &search, &confirm, "POST", path, "{}", None, None, None, None,
+                &state, &search, "POST", path, "{}", None, None, None, None,
             )
         };
 
@@ -23895,7 +23301,6 @@ mod tests {
         let hidden = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/s__work",
             "{}",
@@ -23910,7 +23315,6 @@ mod tests {
         let missing = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/no_such_tool",
             "{}",
@@ -23936,12 +23340,10 @@ mod tests {
         // Streamable-HTTP MCP: initialize → session id → tools/list → tools/call.
         let state = http_state(true);
         let search = SearchGuard::default();
-        let confirm = ConfirmGuard::new();
 
         let init = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &json!({
@@ -23974,7 +23376,6 @@ mod tests {
         let note = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }).to_string(),
@@ -23988,7 +23389,6 @@ mod tests {
         let list = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }).to_string(),
@@ -24010,7 +23410,6 @@ mod tests {
         let call = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &json!({
@@ -24034,7 +23433,6 @@ mod tests {
         let missing = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/list" }).to_string(),
@@ -24049,7 +23447,6 @@ mod tests {
         let dead = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list" }).to_string(),
@@ -24064,7 +23461,6 @@ mod tests {
         let del = handle_http(
             &state,
             &search,
-            &confirm,
             "DELETE",
             "/mcp",
             "",
@@ -24077,7 +23473,6 @@ mod tests {
         let after = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &json!({ "jsonrpc": "2.0", "id": 6, "method": "tools/list" }).to_string(),
@@ -24143,7 +23538,6 @@ mod tests {
         let no_session = handle_http(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }).to_string(),
@@ -24162,7 +23556,6 @@ mod tests {
         let init = handle_http(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &json!({
@@ -24189,7 +23582,6 @@ mod tests {
         let out = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &modern_http_body(1, "tools/list", json!({})),
@@ -24223,7 +23615,6 @@ mod tests {
             let out = handle_http_with_headers(
                 state,
                 &SearchGuard::default(),
-                &ConfirmGuard::new(),
                 "GET",
                 "/openapi.json",
                 "",
@@ -24335,8 +23726,7 @@ mod tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
         let search = Arc::new(SearchGuard::default());
-        let confirm = Arc::new(ConfirmGuard::new());
-        std::thread::spawn(move || serve_http_loop(server, state, None, search, confirm, true));
+        std::thread::spawn(move || serve_http_loop(server, state, None, search, true));
 
         let body = modern_http_body(1, "tools/list", json!({}));
         let response = http_post_with_headers(
@@ -24378,7 +23768,6 @@ mod tests {
         let missing_headers = handle_http(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &body,
@@ -24404,7 +23793,6 @@ mod tests {
         let missing_method = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &missing_method_body,
@@ -24425,7 +23813,6 @@ mod tests {
         let wrong_method = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &body,
@@ -24445,7 +23832,6 @@ mod tests {
         let wrong_name = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &named_body,
@@ -24463,7 +23849,6 @@ mod tests {
         let absent_name = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &modern_http_body(3, "tools/call", json!({ "arguments": {} })),
@@ -24507,7 +23892,6 @@ mod tests {
         let unsupported = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &unsupported_body,
@@ -24529,7 +23913,6 @@ mod tests {
         let unknown = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &modern_http_body(4, "made/up", json!({})),
@@ -24545,7 +23928,6 @@ mod tests {
             let out = handle_http_with_headers(
                 &state,
                 &SearchGuard::default(),
-                &ConfirmGuard::new(),
                 method,
                 "/mcp",
                 "",
@@ -24567,7 +23949,6 @@ mod tests {
             let unsupported_verb = handle_http_with_headers(
                 &state,
                 &SearchGuard::default(),
-                &ConfirmGuard::new(),
                 method,
                 "/mcp",
                 "",
@@ -24585,7 +23966,6 @@ mod tests {
             let legacy_verb = handle_http_with_headers(
                 &state,
                 &SearchGuard::default(),
-                &ConfirmGuard::new(),
                 method,
                 "/mcp",
                 "",
@@ -24624,7 +24004,6 @@ mod tests {
             handle_http_with_headers(
                 &state,
                 &SearchGuard::default(),
-                &ConfirmGuard::new(),
                 "POST",
                 "/mcp",
                 &request,
@@ -24663,7 +24042,6 @@ mod tests {
         let out = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &modern_http_body(
@@ -24683,7 +24061,6 @@ mod tests {
     fn mcp_http_session_is_bound_to_client_identity_and_scope() {
         let state = http_state(true);
         let search = SearchGuard::default();
-        let confirm = ConfirmGuard::new();
         let caller = |identity: &str, scope: &[&str]| test_caller(identity, Some(scope));
         let owner = caller("client:cursor", &["github"]);
         let intruder = caller("client:webui", &["github"]);
@@ -24692,7 +24069,6 @@ mod tests {
         let init = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &json!({
@@ -24715,7 +24091,6 @@ mod tests {
         let wrong_post = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &list_body,
@@ -24728,7 +24103,6 @@ mod tests {
         let wrong_get = handle_http(
             &state,
             &search,
-            &confirm,
             "GET",
             "/mcp",
             "",
@@ -24741,7 +24115,6 @@ mod tests {
         let wrong_delete = handle_http(
             &state,
             &search,
-            &confirm,
             "DELETE",
             "/mcp",
             "",
@@ -24756,7 +24129,6 @@ mod tests {
         let wrong_scope = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &list_body,
@@ -24772,7 +24144,6 @@ mod tests {
         let owner_post = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &list_body,
@@ -24785,7 +24156,6 @@ mod tests {
         let owner_delete = handle_http(
             &state,
             &search,
-            &confirm,
             "DELETE",
             "/mcp",
             "",
@@ -24801,11 +24171,9 @@ mod tests {
     fn mcp_http_get_opens_listen_stream() {
         let state = http_state(true);
         let search = SearchGuard::default();
-        let confirm = ConfirmGuard::new();
         let init = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &json!({
@@ -24828,7 +24196,6 @@ mod tests {
         let out = handle_http(
             &state,
             &search,
-            &confirm,
             "GET",
             "/mcp",
             "",
@@ -24846,11 +24213,9 @@ mod tests {
     fn mcp_http_get_without_sse_accept_returns_406() {
         let state = http_state(true);
         let search = SearchGuard::default();
-        let confirm = ConfirmGuard::new();
         let init = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &json!({
@@ -24873,7 +24238,6 @@ mod tests {
         let out = handle_http(
             &state,
             &search,
-            &confirm,
             "GET",
             "/mcp",
             "",
@@ -24889,12 +24253,10 @@ mod tests {
     fn modern_http_subscription_listen_is_sessionless_tagged_and_filtered() {
         let state = http_state(true);
         let search = SearchGuard::default();
-        let confirm = ConfirmGuard::new();
         let caller = test_caller("client:modern", None);
         let mut out = handle_http_with_headers(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &modern_http_body(
@@ -25015,7 +24377,6 @@ mod tests {
         let out = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &modern_http_body(
@@ -25041,7 +24402,6 @@ mod tests {
         let out = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &modern_http_body(
@@ -25075,7 +24435,6 @@ mod tests {
         let first = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &body,
@@ -25091,7 +24450,6 @@ mod tests {
         let second = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &body,
@@ -25411,7 +24769,6 @@ mod tests {
         let out = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &modern_http_body(1, "tools/list", json!({})),
@@ -25443,7 +24800,6 @@ mod tests {
         let out = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &modern_http_body(1, "tools/list", json!({})),
@@ -25480,13 +24836,12 @@ mod tests {
             None,
             Some(&personal),
             None,
-            Some(&ConfirmGuard::new()),
             &team_name,
             json!({}),
             None,
             None,
             CallOpts {
-                confirmed: true,
+                direct: true,
                 shape: false,
                 allow_app_only: true,
             },
@@ -25506,13 +24861,12 @@ mod tests {
             None,
             Some(&personal),
             None,
-            Some(&ConfirmGuard::new()),
             &personal_name,
             json!({}),
             None,
             None,
             CallOpts {
-                confirmed: true,
+                direct: true,
                 shape: false,
                 allow_app_only: true,
             },
@@ -25564,13 +24918,12 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(&ConfirmGuard::new()),
                 name,
                 json!({}),
                 None,
                 None,
                 CallOpts {
-                    confirmed: true,
+                    direct: true,
                     shape: false,
                     allow_app_only: true,
                 },
@@ -25667,13 +25020,12 @@ mod tests {
                 None,
                 Some(&allowed),
                 None,
-                Some(&ConfirmGuard::new()),
                 name,
                 json!({}),
                 None,
                 None,
                 CallOpts {
-                    confirmed: true,
+                    direct: true,
                     shape: false,
                     allow_app_only: true,
                 },
@@ -25818,13 +25170,12 @@ mod tests {
             None,
             Some(&personal),
             None,
-            Some(&ConfirmGuard::new()),
             "no_such_tool",
             json!({}),
             None,
             None,
             CallOpts {
-                confirmed: true,
+                direct: true,
                 shape: false,
                 allow_app_only: true,
             },
@@ -25848,13 +25199,12 @@ mod tests {
                 None,
                 Some(&personal),
                 None,
-                Some(&ConfirmGuard::new()),
                 exposed,
                 json!({}),
                 None,
                 None,
                 CallOpts {
-                    confirmed: true,
+                    direct: true,
                     shape: false,
                     allow_app_only: true,
                 },
@@ -26025,7 +25375,6 @@ mod tests {
             let out = handle_http_with_headers(
                 &state,
                 &SearchGuard::default(),
-                &ConfirmGuard::new(),
                 "POST",
                 "/mcp",
                 &initialize,
@@ -26072,7 +25421,6 @@ mod tests {
         let out = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &initialize,
@@ -26203,7 +25551,6 @@ mod tests {
         let out = handle_http(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "GET",
             "/mcp",
             "",
@@ -26221,7 +25568,6 @@ mod tests {
         let out = handle_http(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &json!({ "jsonrpc": "2.0", "id": 10, "method": "tools/list" }).to_string(),
@@ -26239,7 +25585,6 @@ mod tests {
         let out = handle_http(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "DELETE",
             "/mcp",
             "",
@@ -26278,7 +25623,6 @@ mod tests {
         let out = handle_http(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "OPTIONS",
             "/mcp",
             "",
@@ -26294,11 +25638,9 @@ mod tests {
     fn mcp_http_sse_when_accept_prefers_event_stream() {
         let state = http_state(true);
         let search = SearchGuard::default();
-        let confirm = ConfirmGuard::new();
         let init = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &json!({
@@ -26330,7 +25672,6 @@ mod tests {
         let list = handle_http(
             &state,
             &search,
-            &confirm,
             "POST",
             "/mcp",
             &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }).to_string(),
@@ -26349,7 +25690,6 @@ mod tests {
         let out = handle_http(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "GET",
             "/",
             "",
@@ -26361,157 +25701,6 @@ mod tests {
         assert_eq!(out.status, 200);
         assert!(out.body.contains("POST /mcp"), "body={}", out.body);
         assert!(out.body.contains("/openapi.json"));
-    }
-
-    #[test]
-    fn agent_control_gates_then_persists() {
-        let _data_env = DataDirTestEnv::new("agent_control_gates_then_persists");
-        // Two servers, only Alpha enabled, agent control OFF.
-        let path =
-            std::env::temp_dir().join(format!("conduit-ac-test-{}.json", std::process::id()));
-        let json = r#"{"version":1,
-            "servers":[
-                {"id":"a","name":"Alpha","transport":"stdio","command":"x","args":[],"env":[]},
-                {"id":"b","name":"Beta","transport":"stdio","command":"x","args":[],"env":[]}],
-            "profiles":[{"id":"p","name":"P","enabledServerIds":["a"]}],
-            "activeProfileId":"p","allowAgentControl":false}"#;
-        std::fs::write(&path, json).unwrap();
-        let reg = registry::load_from(&path).unwrap();
-
-        // Gated off: refused, and nothing on disk changes.
-        assert!(
-            set_server_enabled_via_agent(&reg, Some("p"), &path, "Beta", true, None, None).is_err()
-        );
-        assert!(!registry::load_from(&path).unwrap().is_enabled("p", "b"));
-
-        // Opt in (persisting it so the fresh-copy re-check passes), then enable
-        // Beta by name, case-insensitively.
-        let mut reg2 = reg.clone();
-        reg2.allow_agent_control = true;
-        registry::save_to(&path, &reg2).unwrap();
-        let ok = set_server_enabled_via_agent(&reg2, Some("p"), &path, "beta", true, None, None);
-        assert!(ok.is_ok(), "enable should succeed: {ok:?}");
-        assert!(registry::load_from(&path).unwrap().is_enabled("p", "b"));
-        // The destructive-tool safety switch is never reachable from agent control.
-        assert!(!registry::load_from(&path).unwrap().deny_destructive);
-
-        // Unknown server: helpful error naming the known ones.
-        let bad = set_server_enabled_via_agent(&reg2, Some("p"), &path, "nope", true, None, None);
-        assert!(bad.as_ref().is_err());
-        assert!(bad.unwrap_err().contains("Alpha"));
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn agent_control_respects_the_client_scope() {
-        let _data_env = DataDirTestEnv::new("agent_control_respects_the_client_scope");
-        let path =
-            std::env::temp_dir().join(format!("conduit-ac-scope-{}.json", std::process::id()));
-        let json = r#"{"version":1,
-            "servers":[
-                {"id":"a","name":"Alpha","transport":"stdio","command":"x","args":[],"env":[]},
-                {"id":"b","name":"Beta","transport":"stdio","command":"x","args":[],"env":[]}],
-            "profiles":[{"id":"p","name":"P","enabledServerIds":["a"]}],
-            "activeProfileId":"p","allowAgentControl":true}"#;
-        std::fs::write(&path, json).unwrap();
-        let reg = registry::load_from(&path).unwrap();
-
-        // A registered HTTP client scoped to only server "a" (Alpha).
-        let allowed: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
-
-        // Toggling Beta (out of scope) by name is refused, and Beta stays untouched.
-        let refused = set_server_enabled_via_agent(
-            &reg,
-            Some("p"),
-            &path,
-            "Beta",
-            true,
-            Some(&allowed),
-            None,
-        );
-        assert!(refused.is_err(), "out-of-scope toggle must be refused");
-        assert!(
-            !registry::load_from(&path).unwrap().is_enabled("p", "b"),
-            "out-of-scope server must not be toggled"
-        );
-
-        // The "Known servers" list on a miss must not enumerate out-of-scope servers:
-        // a non-matching target so Beta only appears if it leaked from the list.
-        let miss =
-            set_server_enabled_via_agent(&reg, Some("p"), &path, "zzz", true, Some(&allowed), None);
-        let msg = miss.unwrap_err();
-        assert!(
-            msg.contains("Alpha"),
-            "in-scope server should be listed: {msg}"
-        );
-        assert!(
-            !msg.contains("Beta"),
-            "out-of-scope name leaked in Known servers: {msg}"
-        );
-
-        // An in-scope server still resolves (Alpha is already on -> idempotent OK).
-        let ok = set_server_enabled_via_agent(
-            &reg,
-            Some("p"),
-            &path,
-            "Alpha",
-            true,
-            Some(&allowed),
-            None,
-        );
-        assert!(ok.is_ok(), "in-scope toggle should resolve: {ok:?}");
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn agent_control_cannot_enable_a_team_server_pending_review() {
-        let _data_env =
-            DataDirTestEnv::new("agent_control_cannot_enable_a_team_server_pending_review");
-        let path =
-            std::env::temp_dir().join(format!("conduit-ac-review-{}.json", std::process::id()));
-        // A team-pushed local command and a changed team remote both await member review; a
-        // public team remote (an IP literal, so no DNS lookup) does not.
-        let json = r#"{"version":1,
-            "servers":[
-                {"id":"cmd","name":"Team Tool","transport":"stdio","command":"x","args":[],
-                 "env":[],"source":"team:acme"},
-                {"id":"changed","name":"Team Changed","transport":"http",
-                 "url":"https://mcp.example.com/changed","env":[],"source":"team:acme",
-                 "teamEnableReview":true},
-                {"id":"remote","name":"Team Remote","transport":"http",
-                 "url":"https://8.8.8.8/mcp","env":[],"source":"team:acme"}],
-            "profiles":[{"id":"p","name":"P","enabledServerIds":[]}],
-            "activeProfileId":"p","allowAgentControl":true}"#;
-        std::fs::write(&path, json).unwrap();
-        let reg = registry::load_from(&path).unwrap();
-
-        for target in ["Team Tool", "changed"] {
-            let refused =
-                set_server_enabled_via_agent(&reg, Some("p"), &path, target, true, None, None)
-                    .expect_err("a pending team server must not be enabled by an agent");
-            assert!(
-                refused.contains("waiting for the user's review"),
-                "{refused}"
-            );
-            assert!(refused.contains("Teams"), "{refused}");
-        }
-        let saved = registry::load_from(&path).unwrap();
-        assert!(!saved.is_enabled("p", "cmd"));
-        assert!(!saved.is_enabled("p", "changed"));
-
-        let ok =
-            set_server_enabled_via_agent(&reg, Some("p"), &path, "Team Remote", true, None, None);
-        assert!(
-            ok.is_ok(),
-            "a reviewed-safe team remote still enables: {ok:?}"
-        );
-        assert!(registry::load_from(&path)
-            .unwrap()
-            .is_enabled("p", "remote"));
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -26531,7 +25720,6 @@ mod tests {
             false,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -27213,7 +26401,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -27380,8 +26567,6 @@ mod tests {
         assert_eq!(toolport["version"], "1.0.0");
         assert_eq!(toolport["discoveryMode"], "lazy");
         assert!(toolport["codeMode"].is_boolean());
-        assert_eq!(toolport["agentControl"], false);
-        assert_eq!(toolport["destructiveConfirmation"], false);
         assert_eq!(toolport["humanApproval"], true);
     }
 
@@ -27430,7 +26615,6 @@ mod tests {
             true,
             profile,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -27546,7 +26730,6 @@ mod tests {
             http_instructions(&handle_http(
                 &state,
                 &SearchGuard::default(),
-                &ConfirmGuard::new(),
                 "POST",
                 "/mcp",
                 &initialize_req().to_string(),
@@ -27575,7 +26758,6 @@ mod tests {
         let discover = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &modern_http_body(2, "server/discover", json!({})),
@@ -27607,7 +26789,6 @@ mod tests {
         let out = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &initialize_req().to_string(),
@@ -27628,7 +26809,6 @@ mod tests {
                 state,
                 &initialize_req(),
                 &SearchGuard::default(),
-                &ConfirmGuard::new(),
                 None,
                 None,
                 None,
@@ -27656,8 +26836,6 @@ mod tests {
             safety_level: None,
             ..Registry::default()
         };
-        reg.allow_agent_control = true;
-        reg.confirm_destructive = true;
         let router = Router::new();
         let request = modern_req(1, "server/discover", json!({}));
         let response = handle_request(
@@ -27669,7 +26847,6 @@ mod tests {
             false,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -27678,8 +26855,6 @@ mod tests {
             &response["result"]["capabilities"]["extensions"][TOOLPORT_GATEWAY_EXTENSION];
         assert_eq!(settings["discoveryMode"], "full");
         assert_eq!(settings["codeMode"], true);
-        assert_eq!(settings["agentControl"], true);
-        assert_eq!(settings["destructiveConfirmation"], false);
         assert_eq!(settings["humanApproval"], true);
 
         reg.human_approval = true;
@@ -27692,14 +26867,12 @@ mod tests {
             false,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
         .unwrap();
         let human_settings =
             &human_gated["result"]["capabilities"]["extensions"][TOOLPORT_GATEWAY_EXTENSION];
-        assert_eq!(human_settings["destructiveConfirmation"], false);
         assert_eq!(human_settings["humanApproval"], true);
 
         // No client extension opt-in is required: the extension describes the
@@ -27713,7 +26886,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -27724,9 +26896,17 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
-        assert!(names.contains(&"toolport_search_tools"));
-        assert!(names.contains(&"toolport_run_script"));
-        assert!(names.contains(&"toolport_confirm"));
+        assert_eq!(
+            names,
+            vec![
+                "toolport_status",
+                "toolport_search_tools",
+                "toolport_call_tool",
+                "toolport_fetch_result",
+                "toolport_run_script",
+            ],
+            "the exact agent-facing floor with Code Mode on"
+        );
     }
 
     #[test]
@@ -27787,7 +26967,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -27818,7 +26997,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             Some(&allowed),
             None,
         )
@@ -27965,7 +27143,6 @@ mod tests {
         );
         let cached = router.aggregated_tools();
         let guard = SearchGuard::default();
-        let confirm = ConfirmGuard::new();
 
         let discovered = handle_request(
             &host,
@@ -27976,7 +27153,6 @@ mod tests {
             true,
             None,
             &guard,
-            &confirm,
             None,
             None,
         )
@@ -27995,7 +27171,6 @@ mod tests {
             true,
             None,
             &guard,
-            &confirm,
             None,
             None,
         )
@@ -28028,7 +27203,6 @@ mod tests {
             false,
             None,
             &guard,
-            &confirm,
             None,
             None,
         )
@@ -28052,7 +27226,6 @@ mod tests {
             true,
             None,
             &guard,
-            &confirm,
             None,
             None,
         )
@@ -28080,7 +27253,6 @@ mod tests {
             true,
             None,
             &guard,
-            &confirm,
             None,
             None,
         )
@@ -28107,7 +27279,6 @@ mod tests {
         );
         let cached = router.aggregated_tools();
         let guard = SearchGuard::default();
-        let confirm = ConfirmGuard::new();
 
         let ordinary_full = handle_request(
             &host,
@@ -28118,7 +27289,6 @@ mod tests {
             false,
             None,
             &guard,
-            &confirm,
             None,
             None,
         )
@@ -28138,7 +27308,6 @@ mod tests {
             false,
             None,
             &guard,
-            &confirm,
             None,
             None,
         )
@@ -28165,7 +27334,6 @@ mod tests {
             true,
             None,
             &guard,
-            &confirm,
             None,
             None,
         )
@@ -28188,7 +27356,6 @@ mod tests {
             true,
             None,
             &guard,
-            &confirm,
             None,
             None,
         )
@@ -28212,7 +27379,6 @@ mod tests {
             true,
             None,
             &guard,
-            &confirm,
             None,
             None,
         )
@@ -28245,7 +27411,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -28273,7 +27438,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -28335,7 +27499,6 @@ mod tests {
         let reg = Registry::default();
         let router = cache_router();
         let guard = SearchGuard::default();
-        let confirm = ConfirmGuard::new();
         let cases = [
             ("tools/list", json!({}), 50_000_u64),
             ("resources/list", json!({}), 40_000),
@@ -28358,7 +27521,6 @@ mod tests {
                 false,
                 None,
                 &guard,
-                &confirm,
                 None,
                 None,
             )
@@ -28381,7 +27543,6 @@ mod tests {
             false,
             Some("client-profile"),
             &guard,
-            &confirm,
             None,
             None,
         )
@@ -28402,7 +27563,6 @@ mod tests {
             false,
             None,
             &guard,
-            &confirm,
             None,
             None,
         )
@@ -29194,7 +28354,6 @@ mod tests {
             false,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -29215,7 +28374,6 @@ mod tests {
             false,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -29269,7 +28427,6 @@ mod tests {
             false,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -29293,7 +28450,6 @@ mod tests {
             false,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -29328,7 +28484,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -29339,15 +28494,62 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str())
             .collect();
-        // Default registry has agent control off, so it's the four core
-        // meta-tools: status, search, call, fetch_result (no downstream tools).
-        assert_eq!(names.len(), 4);
-        assert!(names.contains(&"toolport_status"));
-        assert!(names.contains(&"toolport_search_tools"));
-        assert!(names.contains(&"toolport_call_tool"));
-        assert!(names.contains(&"toolport_fetch_result"));
+        // The exact agent-facing floor with Code Mode off: status, search, call,
+        // fetch_result, and no downstream tools.
+        assert_eq!(
+            names,
+            vec![
+                "toolport_status",
+                "toolport_search_tools",
+                "toolport_call_tool",
+                "toolport_fetch_result",
+            ]
+        );
         assert!(!names.contains(&"resend__send_email"));
         assert!(!names.contains(&"toolport_run_script"));
+        assert!(!names.contains(&"toolport_confirm"));
+        assert!(!names.contains(&"toolport_enable_server"));
+    }
+
+    #[test]
+    fn removed_meta_tools_are_refused_with_the_floor() {
+        let host = dispatch_host(false);
+        let reg = Registry::default();
+        for name in [
+            "toolport_confirm",
+            "toolport_enable_server",
+            "toolport_disable_server",
+            "conduit_status",
+            "conduit_search_tools",
+            "conduit_call_tool",
+            "conduit_fetch_result",
+        ] {
+            let req = json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": name, "arguments": {} }
+            });
+            let resp = handle_request(
+                &host,
+                &req,
+                &reg,
+                &router(),
+                &catalog(),
+                true,
+                None,
+                &SearchGuard::default(),
+                None,
+                None,
+            )
+            .unwrap();
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+            assert_eq!(resp["result"]["isError"], true, "{name}: {resp}");
+            assert!(
+                text.contains("removed in Toolport 2.0"),
+                "{name} must be refused with a clear error, got: {text}"
+            );
+            assert!(text.contains("toolport_search_tools"), "{name}: {text}");
+            assert!(text.contains("toolport_call_tool"), "{name}: {text}");
+        }
     }
 
     #[test]
@@ -29375,96 +28577,88 @@ mod tests {
             ..Registry::default()
         };
         let guard = SearchGuard::default();
-        let confirm = ConfirmGuard::new();
         let req = json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"});
         let allowed = std::collections::HashSet::from(["alpha".to_string()]);
         let scoped_client = format!("scoped-{}", new_correlation_id());
         for code in [false, true] {
             host.set_code_mode(code);
-            for confirm_on in [false, true] {
-                reg.confirm_destructive = confirm_on;
-                reg.allow_agent_control = confirm_on;
-                host.set_discovery_mode(DiscoveryMode::Full);
-                let full = handle_request(
+            host.set_discovery_mode(DiscoveryMode::Full);
+            let full = handle_request(
+                &host,
+                &req,
+                &reg,
+                &router,
+                &cached,
+                false,
+                None,
+                &guard,
+                Some(&allowed),
+                Some(&scoped_client),
+            )
+            .unwrap();
+            let full_tools = full["result"]["tools"].as_array().unwrap();
+            let has = |tools: &[Value], name: &str| tools.iter().any(|tool| tool["name"] == name);
+            assert!(full_tools.iter().any(|tool| tool["name"] == "alpha__work"));
+            assert!(!full_tools.iter().any(|tool| tool["name"] == "beta__work"));
+            assert_eq!(has(full_tools, "toolport_run_script"), code);
+            let scoped_rows = || {
+                savings::entries()
+                    .into_iter()
+                    .filter(|row| {
+                        row["kind"] == "catalog_exposure" && row["client"] == scoped_client
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = scoped_rows().len();
+            for mode in [DiscoveryMode::Lazy, DiscoveryMode::Grouped] {
+                host.set_discovery_mode(mode);
+                let exposed = handle_request(
                     &host,
                     &req,
                     &reg,
                     &router,
                     &cached,
-                    false,
+                    mode == DiscoveryMode::Lazy,
                     None,
                     &guard,
-                    &confirm,
                     Some(&allowed),
                     Some(&scoped_client),
                 )
                 .unwrap();
-                let full_tools = full["result"]["tools"].as_array().unwrap();
-                let has =
-                    |tools: &[Value], name: &str| tools.iter().any(|tool| tool["name"] == name);
-                assert!(full_tools.iter().any(|tool| tool["name"] == "alpha__work"));
-                assert!(!full_tools.iter().any(|tool| tool["name"] == "beta__work"));
-                assert_eq!(has(full_tools, "toolport_run_script"), code);
-                assert_eq!(has(full_tools, "toolport_confirm"), confirm_on);
-                let scoped_rows = || {
-                    savings::entries()
-                        .into_iter()
-                        .filter(|row| {
-                            row["kind"] == "catalog_exposure" && row["client"] == scoped_client
-                        })
-                        .collect::<Vec<_>>()
-                };
-                let before = scoped_rows().len();
-                for mode in [DiscoveryMode::Lazy, DiscoveryMode::Grouped] {
-                    host.set_discovery_mode(mode);
-                    let exposed = handle_request(
-                        &host,
-                        &req,
-                        &reg,
-                        &router,
-                        &cached,
-                        mode == DiscoveryMode::Lazy,
-                        None,
-                        &guard,
-                        &confirm,
-                        Some(&allowed),
-                        Some(&scoped_client),
-                    )
-                    .unwrap();
-                    let exposed_tools = exposed["result"]["tools"].as_array().unwrap();
-                    assert_eq!(has(exposed_tools, "toolport_run_script"), code);
-                    assert_eq!(has(exposed_tools, "toolport_confirm"), confirm_on);
-                    assert_eq!(has(exposed_tools, "toolport_enable_server"), confirm_on);
-                    if mode == DiscoveryMode::Grouped {
-                        assert!(has(exposed_tools, "help_alpha"));
-                        assert!(!has(exposed_tools, "help_beta"));
-                    }
-                    let row = scoped_rows().pop().unwrap();
-                    let full_bytes = savings::surface_bytes(full_tools);
-                    let exposed_bytes = savings::surface_bytes(exposed_tools);
-                    assert_eq!(row["fullSurfaceBytes"], full_bytes);
-                    assert_eq!(row["exposedSurfaceBytes"], exposed_bytes);
-                    assert_eq!(
-                        row["avoidedSurfaceBytes"],
-                        full_bytes.saturating_sub(exposed_bytes)
-                    );
-                    assert_eq!(row["fullToolCount"], full_tools.len());
-                    assert_eq!(row["exposedToolCount"], exposed_tools.len());
-                    assert_eq!(row["client"], scoped_client);
-                    assert_eq!(row["byServerBytes"].as_object().unwrap().len(), 1);
-                    assert!(row["byServerBytes"].get("alpha").is_some());
-                    assert!(row["byServerBytes"].get("beta").is_none());
-                    assert_eq!(
-                        row["mode"],
-                        if mode == DiscoveryMode::Lazy {
-                            "lazy"
-                        } else {
-                            "grouped"
-                        }
-                    );
+                let exposed_tools = exposed["result"]["tools"].as_array().unwrap();
+                assert_eq!(has(exposed_tools, "toolport_run_script"), code);
+                // The removed agent-control and confirm tools are never exposed.
+                assert!(!has(exposed_tools, "toolport_confirm"));
+                assert!(!has(exposed_tools, "toolport_enable_server"));
+                if mode == DiscoveryMode::Grouped {
+                    assert!(has(exposed_tools, "help_alpha"));
+                    assert!(!has(exposed_tools, "help_beta"));
                 }
-                assert_eq!(scoped_rows().len(), before + 2);
+                let row = scoped_rows().pop().unwrap();
+                let full_bytes = savings::surface_bytes(full_tools);
+                let exposed_bytes = savings::surface_bytes(exposed_tools);
+                assert_eq!(row["fullSurfaceBytes"], full_bytes);
+                assert_eq!(row["exposedSurfaceBytes"], exposed_bytes);
+                assert_eq!(
+                    row["avoidedSurfaceBytes"],
+                    full_bytes.saturating_sub(exposed_bytes)
+                );
+                assert_eq!(row["fullToolCount"], full_tools.len());
+                assert_eq!(row["exposedToolCount"], exposed_tools.len());
+                assert_eq!(row["client"], scoped_client);
+                assert_eq!(row["byServerBytes"].as_object().unwrap().len(), 1);
+                assert!(row["byServerBytes"].get("alpha").is_some());
+                assert!(row["byServerBytes"].get("beta").is_none());
+                assert_eq!(
+                    row["mode"],
+                    if mode == DiscoveryMode::Lazy {
+                        "lazy"
+                    } else {
+                        "grouped"
+                    }
+                );
             }
+            assert_eq!(scoped_rows().len(), before + 2);
         }
         reg.deny_destructive = true;
         host.set_discovery_mode(DiscoveryMode::Full);
@@ -29477,7 +28671,6 @@ mod tests {
             false,
             None,
             &guard,
-            &confirm,
             Some(&allowed),
             Some(&scoped_client),
         )
@@ -29497,7 +28690,6 @@ mod tests {
             true,
             None,
             &guard,
-            &confirm,
             Some(&allowed),
             Some(&scoped_client),
         )
@@ -29534,7 +28726,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -29622,7 +28813,6 @@ mod tests {
             false,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -29670,62 +28860,6 @@ mod tests {
         );
         // A pinned/semantic-only surface (no lexical overlap) yields no explanation.
         assert!(explain_match("", &tool).is_empty());
-    }
-
-    #[test]
-    fn canonical_meta_aliases_legacy_names() {
-        // The 7 legacy conduit_* meta names map to their toolport_* forms.
-        assert_eq!(canonical_meta("conduit_status"), Some("toolport_status"));
-        assert_eq!(
-            canonical_meta("conduit_search_tools"),
-            Some("toolport_search_tools")
-        );
-        assert_eq!(
-            canonical_meta("conduit_call_tool"),
-            Some("toolport_call_tool")
-        );
-        assert_eq!(
-            canonical_meta("conduit_fetch_result"),
-            Some("toolport_fetch_result")
-        );
-        assert_eq!(canonical_meta("conduit_confirm"), Some("toolport_confirm"));
-        // New names, downstream tools, and non-meta conduit_* pass through (None).
-        assert_eq!(canonical_meta("toolport_search_tools"), None);
-        assert_eq!(canonical_meta("resend__send_email"), None);
-        assert_eq!(canonical_meta("conduit_lib"), None);
-    }
-
-    #[test]
-    fn legacy_conduit_alias_dispatches_like_toolport() {
-        let _data_env = DataDirTestEnv::new("legacy_conduit_alias_dispatches_like_toolport");
-        let host = dispatch_host(false);
-        // A tools/call under the OLD conduit_* name must route identically to the
-        // renamed toolport_* name, so nothing that still uses the old names breaks.
-        let reg = Registry::default();
-        let call = |nm: &str| {
-            handle_request(
-                &host,
-                &json!({
-                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                    "params": { "name": nm, "arguments": { "query": "email" } }
-                }),
-                &reg,
-                &router(),
-                &catalog(),
-                true,
-                None,
-                &SearchGuard::default(),
-                &ConfirmGuard::new(),
-                None,
-                None,
-            )
-            .unwrap()
-        };
-        assert_eq!(
-            call("conduit_search_tools")["result"],
-            call("toolport_search_tools")["result"],
-            "legacy conduit_search_tools alias should dispatch identically to toolport_search_tools"
-        );
     }
 
     #[test]
@@ -31254,7 +30388,6 @@ mod tests {
                 false,
                 None,
                 &SearchGuard::default(),
-                &ConfirmGuard::new(),
                 None,
                 None,
             )
@@ -32081,7 +31214,6 @@ mod tests {
                 true,
                 None,
                 &SearchGuard::default(),
-                &ConfirmGuard::new(),
                 None,
                 None,
             )
@@ -32125,7 +31257,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -32190,7 +31321,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -32235,7 +31365,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -32271,7 +31400,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -32302,7 +31430,6 @@ mod tests {
             true,
             None,
             guard,
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -32348,7 +31475,6 @@ mod tests {
             true,
             None,
             &guard,
-            &ConfirmGuard::new(),
             None,
             None,
         );
@@ -32409,12 +31535,12 @@ mod tests {
             json!({ "name": "github__list_repos", "description": "List repos", "inputSchema": {} }),
             json!({ "name": "stripe__create_charge", "description": "Create a charge", "inputSchema": {} }),
         ];
-        let defs = grouped_tool_defs(&host, false, false, &catalog);
+        let defs = grouped_tool_defs(&host, &catalog);
         let names: Vec<&str> = defs
             .iter()
             .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
             .collect();
-        // The lazy meta-tools are present (so search/call still work)...
+        // The floor is present (so search/call still work)...
         for m in [
             "toolport_status",
             "toolport_search_tools",
@@ -32436,24 +31562,9 @@ mod tests {
         // The github help tool states its tool count so the model knows the scope.
         let gh = defs.iter().find(|t| t["name"] == "help_github").unwrap();
         assert!(gh["description"].as_str().unwrap().contains("2 tool"));
-        // Agent-control and confirm tools stay gated off when their flags are off.
+        // The removed agent-control and confirm tools are never advertised.
         assert!(!names.contains(&"toolport_enable_server"));
         assert!(!names.contains(&"toolport_confirm"));
-    }
-
-    #[test]
-    fn grouped_mode_gates_agent_and_confirm_tools() {
-        let host = dispatch_host(false);
-        let catalog = vec![json!({ "name": "s__t", "description": "x", "inputSchema": {} })];
-        let defs = grouped_tool_defs(&host, true, true, &catalog);
-        let names: Vec<&str> = defs
-            .iter()
-            .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
-            .collect();
-        assert!(names.contains(&"toolport_enable_server"));
-        assert!(names.contains(&"toolport_disable_server"));
-        assert!(names.contains(&"toolport_confirm"));
-        assert!(names.contains(&"help_s"));
     }
 
     #[test]
@@ -33065,7 +32176,6 @@ mod tests {
                 true,
                 None,
                 &SearchGuard::default(),
-                &ConfirmGuard::new(),
                 None,
                 None,
             )
@@ -33102,326 +32212,6 @@ mod tests {
         ]
     }
 
-    /// Build a registry with confirm_destructive enabled.
-    fn registry_with_confirm() -> Registry {
-        let mut reg = Registry::default();
-        reg.set_confirm_destructive(true);
-        reg
-    }
-
-    /// SBS-614: rehydration must stay the LAST step before dispatch.
-    ///
-    /// The destructive-confirm preview is returned to the model as a tool result, so
-    /// it has to show the token. That placement already regressed once (#657), and
-    /// nothing failed when it did — the `pii.rs` unit tests pass either way, because
-    /// they never exercise the gateway's ordering. This is the test that fails if
-    /// `rehydrate_for_downstream` ever moves back above the intercept.
-    #[test]
-    fn destructive_confirm_preview_shows_the_token_not_the_real_value() {
-        let _data_env =
-            DataDirTestEnv::new("destructive_confirm_preview_shows_the_token_not_the_real_value");
-        let host = dispatch_host(false);
-        let client = None;
-        let token = with_pii_session(client, |map| {
-            *map = pii::SessionMap::new();
-            map.pseudonymize("stripe", "ada@example.com").text
-        });
-        assert_eq!(token, "⟦EMAIL_1⟧");
-
-        let mut reg = registry_with_confirm();
-        reg.pii_redaction = true;
-        let req = json!({
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {
-                "name": "stripe__delete_customer",
-                "arguments": { "id": "⟦EMAIL_1⟧" }
-            }
-        });
-
-        let resp = handle_request(
-            &host,
-            &req,
-            &reg,
-            &router(),
-            &catalog_with_destructive(),
-            true,
-            None,
-            &SearchGuard::default(),
-            &ConfirmGuard::new(),
-            None,
-            client,
-        )
-        .unwrap();
-
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("approval service was unreachable"),
-            "expected the intercept: {text}"
-        );
-        assert!(
-            !text.contains("ada@example.com"),
-            "the preview is returned to the model, so it must not carry the real \
-             value -- rehydration has moved too early: {text}"
-        );
-    }
-
-    #[test]
-    fn confirm_destructive_intercepts_destructive_call() {
-        let _data_env = DataDirTestEnv::new("confirm_destructive_intercepts_destructive_call");
-        let host = dispatch_host(false);
-        let reg = registry_with_confirm();
-        let req = json!({
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": { "name": "stripe__delete_customer", "arguments": { "id": "cus_123" } }
-        });
-        let resp = handle_request(
-            &host,
-            &req,
-            &reg,
-            &router(),
-            &catalog_with_destructive(),
-            true,
-            None,
-            &SearchGuard::default(),
-            &ConfirmGuard::new(),
-            None,
-            None,
-        )
-        .unwrap();
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("approval service was unreachable"),
-            "should intercept: {text}"
-        );
-        assert!(text.contains("stripe__delete_customer"));
-        assert!(!text.contains("toolport_confirm"));
-        assert_eq!(resp["result"]["isError"], true);
-    }
-
-    #[test]
-    fn confirm_destructive_does_not_intercept_safe_call() {
-        let _data_env = DataDirTestEnv::new("confirm_destructive_does_not_intercept_safe_call");
-        let host = dispatch_host(false);
-        let reg = registry_with_confirm();
-        let req = json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": { "name": "stripe__list_charges", "arguments": {} }
-        });
-        let resp = handle_request(
-            &host,
-            &req,
-            &reg,
-            &router(),
-            &catalog_with_destructive(),
-            true,
-            None,
-            &SearchGuard::default(),
-            &ConfirmGuard::new(),
-            None,
-            None,
-        )
-        .unwrap();
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        // list_charges is not a real server in the test router, so it'll error —
-        // but it should NOT be intercepted by the confirm guard.
-        assert!(
-            !text.contains("Destructive action intercepted"),
-            "safe call should not be intercepted"
-        );
-    }
-
-    #[test]
-    fn confirm_destructive_off_does_not_intercept() {
-        let _data_env = DataDirTestEnv::new("confirm_destructive_off_does_not_intercept");
-        let host = dispatch_host(false);
-        let reg = Registry::default(); // confirm_destructive = false
-        let req = json!({
-            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": { "name": "stripe__delete_customer", "arguments": { "id": "cus_123" } }
-        });
-        let resp = handle_request(
-            &host,
-            &req,
-            &reg,
-            &router(),
-            &catalog_with_destructive(),
-            true,
-            None,
-            &SearchGuard::default(),
-            &ConfirmGuard::new(),
-            None,
-            None,
-        )
-        .unwrap();
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            !text.contains("Destructive action intercepted"),
-            "should not intercept when feature is off"
-        );
-    }
-
-    #[test]
-    fn confirm_destructive_cannot_be_bypassed_via_toolport_call_tool() {
-        let _data_env =
-            DataDirTestEnv::new("confirm_destructive_cannot_be_bypassed_via_toolport_call_tool");
-        let host = dispatch_host(false);
-        let reg = registry_with_confirm();
-        // Agent tries to call the destructive tool via toolport_call_tool instead
-        // of directly — the interceptor should still catch it because
-        // toolport_call_tool unwraps before the interception check.
-        let req = json!({
-            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-            "params": {
-                "name": "toolport_call_tool",
-                "arguments": {
-                    "name": "stripe__delete_customer",
-                    "arguments": { "id": "cus_456" }
-                }
-            }
-        });
-        let resp = handle_request(
-            &host,
-            &req,
-            &reg,
-            &router(),
-            &catalog_with_destructive(),
-            true,
-            None,
-            &SearchGuard::default(),
-            &ConfirmGuard::new(),
-            None,
-            None,
-        )
-        .unwrap();
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("approval service was unreachable"),
-            "should intercept even via toolport_call_tool"
-        );
-        assert_eq!(resp["result"]["isError"], true);
-    }
-
-    #[test]
-    fn confirm_destructive_invalid_token_fails() {
-        let host = dispatch_host(false);
-        let reg = registry_with_confirm();
-        let req = json!({
-            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
-            "params": { "name": "toolport_confirm", "arguments": { "token": "deadbeef" } }
-        });
-        let resp = handle_request(
-            &host,
-            &req,
-            &reg,
-            &router(),
-            &catalog_with_destructive(),
-            true,
-            None,
-            &SearchGuard::default(),
-            &ConfirmGuard::new(),
-            None,
-            None,
-        )
-        .unwrap();
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("expired or invalid"),
-            "invalid token should error"
-        );
-        assert_eq!(resp["result"]["isError"], true);
-    }
-
-    #[test]
-    fn confirm_destructive_empty_token_fails() {
-        let host = dispatch_host(false);
-        let reg = registry_with_confirm();
-        let req = json!({
-            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
-            "params": { "name": "toolport_confirm", "arguments": { "token": "" } }
-        });
-        let resp = handle_request(
-            &host,
-            &req,
-            &reg,
-            &router(),
-            &catalog_with_destructive(),
-            true,
-            None,
-            &SearchGuard::default(),
-            &ConfirmGuard::new(),
-            None,
-            None,
-        )
-        .unwrap();
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("pass the"),
-            "empty token should give guidance"
-        );
-    }
-
-    #[test]
-    fn confirm_destructive_tools_list_includes_toolport_confirm() {
-        let host = dispatch_host(false);
-        let reg = registry_with_confirm();
-        let req = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/list" });
-        let resp = handle_request(
-            &host,
-            &req,
-            &reg,
-            &router(),
-            &catalog_with_destructive(),
-            true,
-            None,
-            &SearchGuard::default(),
-            &ConfirmGuard::new(),
-            None,
-            None,
-        )
-        .unwrap();
-        let names: Vec<&str> = resp["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
-        assert!(
-            names.contains(&"toolport_confirm"),
-            "tools/list should include toolport_confirm when feature is on"
-        );
-    }
-
-    #[test]
-    fn confirm_destructive_tools_list_excludes_toolport_confirm_when_off() {
-        let host = dispatch_host(false);
-        let reg = Registry::default(); // confirm_destructive = false
-        let req = json!({ "jsonrpc": "2.0", "id": 8, "method": "tools/list" });
-        let resp = handle_request(
-            &host,
-            &req,
-            &reg,
-            &router(),
-            &catalog_with_destructive(),
-            true,
-            None,
-            &SearchGuard::default(),
-            &ConfirmGuard::new(),
-            None,
-            None,
-        )
-        .unwrap();
-        let names: Vec<&str> = resp["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
-        assert!(
-            !names.contains(&"toolport_confirm"),
-            "should not include toolport_confirm when feature is off"
-        );
-    }
-
     #[test]
     fn confirm_and_deny_destructive_are_mutually_exclusive() {
         let mut reg = Registry::default();
@@ -33438,91 +32228,6 @@ mod tests {
         assert!(
             !reg.confirm_destructive,
             "enabling deny must turn off confirm"
-        );
-    }
-
-    #[test]
-    fn confirm_guard_token_is_consumed_on_use() {
-        let guard = ConfirmGuard::new();
-        let token = guard.store("srv__delete".into(), json!({"id": "x"}), Some("cursor"));
-        // First take succeeds.
-        let (name, args) = guard.take(&token, Some("cursor")).unwrap();
-        assert_eq!(name, "srv__delete");
-        assert_eq!(args["id"], "x");
-        // Second take fails (token consumed).
-        assert!(
-            guard.take(&token, Some("cursor")).is_none(),
-            "token should be single-use"
-        );
-    }
-
-    #[test]
-    fn confirm_destructive_token_is_client_scoped_and_does_not_loop() {
-        let _data_env =
-            DataDirTestEnv::new("confirm_destructive_token_is_client_scoped_and_does_not_loop");
-        let host = dispatch_host(false);
-        // The critical test: a destructive call is intercepted, then confirmed
-        // via toolport_confirm. A different client cannot redeem or consume it,
-        // and the rightful owner's confirmed call must NOT be re-intercepted.
-        let reg = registry_with_confirm();
-        let confirm = ConfirmGuard::new();
-        let cat = catalog_with_destructive();
-
-        // A token issued before the safety change remains client-scoped, but
-        // redeeming it must still pass the human approval gate.
-        let token = confirm.store(
-            "stripe__delete_customer".to_string(),
-            json!({ "id": "cus_999" }),
-            Some("cursor"),
-        );
-
-        // Step 2: a different client cannot redeem the token.
-        let req2 = json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": { "name": "toolport_confirm", "arguments": { "token": token } }
-        });
-        let resp2 = handle_request(
-            &host,
-            &req2,
-            &reg,
-            &router(),
-            &cat,
-            true,
-            None,
-            &SearchGuard::default(),
-            &confirm,
-            None,
-            Some("claude"),
-        )
-        .unwrap();
-        let text2 = resp2["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text2.contains("expired or invalid"),
-            "another client must not redeem the token: {text2}"
-        );
-
-        // Step 3: the wrong-client attempt did not consume the token, so its
-        // owner can still confirm. This falls through to normal routing and is
-        // NOT re-intercepted.
-        let resp3 = handle_request(
-            &host,
-            &req2,
-            &reg,
-            &router(),
-            &cat,
-            true,
-            None,
-            &SearchGuard::default(),
-            &confirm,
-            None,
-            Some("cursor"),
-        )
-        .unwrap();
-        let text3 = resp3["result"]["content"][0]["text"].as_str().unwrap();
-        // Agent confirmation cannot bypass the human approval service.
-        assert!(
-            text3.contains("approval service was unreachable"),
-            "confirmed call must not be re-intercepted (would loop). Got: {text3}"
         );
     }
 
@@ -33555,7 +32260,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -33612,7 +32316,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -33654,7 +32357,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -33692,7 +32394,6 @@ mod tests {
             true,
             None,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             None,
             None,
         )
@@ -33737,33 +32438,6 @@ mod tests {
         assert!(
             !search_text(&reg, &b_guard, "charges").contains(ESCALATION_MARK),
             "b is on its own second search, still polite"
-        );
-    }
-
-    /// P1.2: a pending destructive confirmation is issued to one conversation and
-    /// is redeemable only there. Cross-session redemption is what the guard's
-    /// `owner` check would already refuse for a foreign principal; this asserts the
-    /// stronger session boundary underneath it.
-    #[test]
-    fn a_confirmation_belongs_to_the_session_that_stored_it() {
-        let a = test_stdio_session();
-        let b = test_stdio_session();
-        let owner = Some("client:a");
-        let token = a.guards().confirm.store(
-            "stripe__delete_customer".to_string(),
-            json!({ "id": "cus_1" }),
-            owner,
-        );
-
-        assert!(
-            b.guards().confirm.take(&token, owner).is_none(),
-            "another session must not redeem a token it never minted, even for the same principal"
-        );
-        let redeemed = a.guards().confirm.take(&token, owner);
-        assert_eq!(
-            redeemed.map(|(name, _)| name).as_deref(),
-            Some("stripe__delete_customer"),
-            "the owning session still redeems its own token"
         );
     }
 
@@ -33834,10 +32508,9 @@ mod tests {
         );
     }
 
-    /// P1.2: an HTTP request that carries a session id uses that session's guards,
-    /// so a confirmation minted in one session is invisible to another. A request
-    /// with no session record (a modern request, or an OpenAPI call) falls back to
-    /// the listener-level pair.
+    /// P1.2: an HTTP request that carries a session id uses that session's search
+    /// guard. A request with no session record (a modern request, or an OpenAPI
+    /// call) falls back to the listener-level guard.
     #[test]
     fn http_requests_use_the_guards_of_their_session() {
         let state = http_state(false);
@@ -33849,24 +32522,13 @@ mod tests {
         let second = state
             .session_guards(Some(&s2))
             .expect("a minted session has guards");
-        let owner = Some("client:c1");
-        let token = second.confirm.store(
-            "stripe__delete_customer".to_string(),
-            json!({ "id": "cus_1" }),
-            owner,
-        );
-
         assert!(
-            first.confirm.take(&token, owner).is_none(),
-            "s1 must not redeem a token minted by s2"
-        );
-        assert!(
-            second.confirm.take(&token, owner).is_some(),
-            "the minting session redeems it"
+            !Arc::ptr_eq(&first.search, &second.search),
+            "each session owns its own search guard"
         );
         assert!(
             state.session_guards(Some("no-such-session")).is_none(),
-            "an unknown session id falls back to the listener-level pair"
+            "an unknown session id falls back to the listener-level guard"
         );
     }
 
@@ -33930,7 +32592,6 @@ mod tests {
             handle_http_with_headers(
                 state,
                 &SearchGuard::default(),
-                &ConfirmGuard::new(),
                 "GET",
                 conduit_lib::daemon::IDENTITY_PATH,
                 "",
@@ -33956,7 +32617,6 @@ mod tests {
         let bridge_topology = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "GET",
             conduit_lib::daemon::TOPOLOGY_PATH,
             "",
@@ -33974,7 +32634,6 @@ mod tests {
         let registered_topology = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
-            &ConfirmGuard::new(),
             "GET",
             conduit_lib::daemon::TOPOLOGY_PATH,
             "",

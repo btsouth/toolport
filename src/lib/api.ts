@@ -362,11 +362,6 @@ export function setClientDiscovery(
   return invoke<Registry>("set_client_discovery", { clientId, mode });
 }
 
-/** Opt into agent control: let an agent enable/disable servers via the gateway. */
-export function setAllowAgentControl(allow: boolean): Promise<Registry> {
-  return invoke<Registry>("set_allow_agent_control", { allow });
-}
-
 export interface HttpBridgeStatus {
   running: boolean;
   port: number | null;

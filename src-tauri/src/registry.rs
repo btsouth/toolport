@@ -1120,21 +1120,15 @@ pub struct Registry {
     /// One toggle to keep agents read-only across every connected server.
     #[serde(default)]
     pub deny_destructive: bool,
-    /// Per-call confirmation for destructive tools: when true, the gateway
-    /// intercepts each call to a destructive-hinted tool, returns a preview
-    /// with a confirmation token, and requires `conduit_confirm { token }` to
-    /// proceed. The original arguments are replayed exactly — the agent cannot
-    /// change them. Unlike `deny_destructive` (which hides tools entirely),
-    /// this lets agents use destructive tools — but forces a conscious review
-    /// of every call first.
+    /// Legacy per-call confirmation for destructive tools. Toolport 2.0 removed
+    /// the agent-token confirm flow, so this is retained only so the v2 migration
+    /// can map an existing true value to the Ask safety level.
     #[serde(default)]
     pub confirm_destructive: bool,
     /// Human-in-the-loop approval: when true, a *gated* tool call (destructive-hinted, or
     /// from an untrusted-provenance server) is held and surfaced to the Toolport app for a
-    /// person to approve or deny before it runs. Unlike `confirm_destructive` (which the
-    /// AGENT re-confirms with a token), this puts a HUMAN in the loop: the call blocks until
-    /// a decision or a fail-closed timeout. Off by default. Takes precedence over
-    /// `confirm_destructive` for the tools it gates (a human decision supersedes the agent's).
+    /// person to approve or deny before it runs. The call blocks until a decision or a
+    /// fail-closed timeout. Off by default.
     #[serde(default)]
     pub human_approval: bool,
     /// Tools the user chose to "always allow" past human approval, so the HITL gate skips
@@ -1218,11 +1212,7 @@ pub struct Registry {
     // 2.0: unused, dropped by the v2 migration
     #[serde(default)]
     pub allow_routine_writes: bool,
-    /// Opt-in agent control: when true, an agent may turn servers on or off via
-    /// the gateway's `conduit_enable_server` / `conduit_disable_server` tools.
-    /// Off by default. The `deny_destructive` safety switch is never agent-
-    /// writable regardless, so granting this cannot let an agent escalate past
-    /// the user's governance, only flip which servers are connected.
+    // 2.0: unused, dropped by the v2 migration
     #[serde(default)]
     pub allow_agent_control: bool,
     /// Tool-definition integrity: fingerprint each connected tool and flag when a

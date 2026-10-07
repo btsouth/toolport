@@ -123,7 +123,7 @@ Owned once per adapter/native connection and removed on disconnect or TTL:
 - project roots and the resolved `${ROOT}` context;
 - upstream request correlation and outbound queue;
 - cancellation registry, modern subscription filters, and resource subscriptions;
-- search-thrash guard and pending destructive confirmations;
+- search-thrash guard;
 - connection-local notification eligibility and stdio/HTTP transport kind.
 
 PII maps and shaped-result cursors remain keyed by stable client principal to preserve the

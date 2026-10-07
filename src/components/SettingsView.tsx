@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import {
   Activity,
-  Bot,
   Braces,
   Check,
   ChevronRight,
@@ -40,7 +39,6 @@ import {
   releaseQuarantine,
   revokeAllowedTool,
   removeHttpClient,
-  setAllowAgentControl,
   setCodeMode,
   setSafetyLevel,
   setLazyDiscovery,
@@ -305,7 +303,6 @@ type SettingKey =
   | "quarantine-on-drift"
   | "block-on-injection"
   | "pii-redaction"
-  | "allow-agent-control"
   | "live-inspect";
 
 type RegistrySettingKey = Exclude<SettingKey, "autostart">;
@@ -319,7 +316,6 @@ const REGISTRY_FIELD_BY_SETTING = {
   "quarantine-on-drift": "quarantineOnDrift",
   "block-on-injection": "blockOnInjection",
   "pii-redaction": "piiRedaction",
-  "allow-agent-control": "allowAgentControl",
   "live-inspect": "liveInspect",
 } as const satisfies Record<RegistrySettingKey, keyof Registry>;
 
@@ -505,7 +501,6 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   const lazyDiscovery = registry?.lazyDiscovery ?? true;
   // Match the registry default when the field is absent or still loading.
   const codeMode = registry?.codeMode ?? false;
-  const allowAgentControl = registry?.allowAgentControl ?? false;
   const piiRedaction = registry?.piiRedaction ?? false;
   const liveInspect = registry?.liveInspect ?? false;
   const [safetyBusy, setSafetyBusy] = useState(false);
@@ -1080,15 +1075,6 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. A value only goes back to the server it came from, so a call that would send one server's data to another is refused. Real data stays on this machine and is forgotten when the conversation ends. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
             apply("pii-redaction", setPiiRedaction),
             "pii-redaction",
-          )}
-          {toggle(
-            Bot,
-            allowAgentControl,
-            "text-success",
-            "Allow agent control",
-            "Let an agent turn servers on/off; your destructive-tool block always stays yours",
-            apply("allow-agent-control", setAllowAgentControl),
-            "allow-agent-control",
           )}
           {toggle(
             Activity,

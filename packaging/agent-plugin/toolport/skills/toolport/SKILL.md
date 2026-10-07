@@ -50,12 +50,8 @@ returns the plan without executing. If a script fails partway,
   result was cut for context, not lost. Page the rest with
   `toolport_fetch_result` using the marker's `cursor`/`offset`, or pass
   `projection` (a dot path like `data.items.0.name`) to pull one field.
-- **Destructive calls:** Toolport may intercept a destructive call and return a
-  preview with a `token`. Confirm with `toolport_confirm` within 60 seconds to
-  execute it unchanged, or a human approves it in the Toolport app. A denied
-  call is a decision, not an error, so don't retry it verbatim.
-- **Server management:** when the user has allowed agent control,
-  `toolport_enable_server` / `toolport_disable_server` turn servers on or off
-  by id or name (see `toolport_status` for the list).
+- **Destructive calls:** at the Ask or Strict safety level, Toolport holds a
+  destructive call until a human approves it in the Toolport app. A denied call
+  is a decision, not an error, so don't retry it verbatim.
 - **Gateway not found:** if the Toolport server itself fails to start, the
   desktop app isn't installed. The user can get it at https://toolport.app.

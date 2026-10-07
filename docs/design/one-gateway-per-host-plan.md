@@ -251,14 +251,12 @@ routing that P1.3 takes.
   live behind a `SessionStore` with explicit TTL and cap. Landed: `session_store::SessionStore`
   (#894) plus the PII map, shaped-result cursors, and modern HITL approvals moved onto it,
   with reap-on-close and reap-on-TTL/cap tests, owned by `SessionTables`.
-- Guards: the search-thrash streak and the pending destructive confirmations are session
-  state. Landed: `SessionState` owns them for both faces, a request with an MCP session id
-  on the HTTP bridge uses that session's pair, and only a request with no session record
-  keeps the listener-level pair. Tests cover a second session neither inheriting the streak
-  nor redeeming the token. Consequence worth knowing: a confirmation is now redeemable only
-  from the session that minted it (a session closed or re-initialized inside the
-  confirmation window loses its pending token) and only on the surface that minted it
-  (`/mcp` with a session id vs. the OpenAPI path, which mints against the listener pair).
+- Guards: the search-thrash streak is session state. Landed: `SessionState` owns it for
+  both faces, a request with an MCP session id on the HTTP bridge uses that session's
+  guard, and only a request with no session record keeps the listener-level guard. Tests
+  cover a second session not inheriting the streak. (The pending destructive
+  confirmations the guard pair once also held were removed in 2.0 with the agent-token
+  confirm flow.)
 - Known duplication: `watch_registry`/`watch_tick` still take the stdio session and its
   `${ROOT}` separately, although the root is a field of that session since #898. Harmless
   (both come from the same startup resolution) and it collapses with the `HostState` move.

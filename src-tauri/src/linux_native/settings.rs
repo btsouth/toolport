@@ -23,7 +23,6 @@ pub(super) struct SettingsPage {
     pinned_section: gtk::Box,
     pinned_list: gtk::Box,
     code_mode: gtk::Switch,
-    allow_agent_control: gtk::Switch,
     live_inspect: gtk::Switch,
     pii_redaction: gtk::Switch,
     launch_at_login: gtk::Switch,
@@ -234,11 +233,6 @@ impl SettingsPage {
             "Replace detected personal values before results reach the model.",
         );
         protection.append(&pii_row);
-        let (agent_row, allow_agent_control) = setting_switch_row(
-            "Allow agent control",
-            "Let agents turn servers on or off. Destructive-tool blocking stays user-controlled.",
-        );
-        protection.append(&agent_row);
         let (inspect_row, live_inspect) = setting_switch_row(
             "Live request/response inspection",
             "Capture the last 50 tool calls locally for Activity. Turning this off clears the buffer.",
@@ -499,7 +493,6 @@ impl SettingsPage {
             pinned_section,
             pinned_list,
             code_mode,
-            allow_agent_control,
             live_inspect,
             pii_redaction,
             launch_at_login,
@@ -1243,11 +1236,6 @@ impl SettingsPage {
                 "code mode",
             ),
             (
-                self.allow_agent_control.clone(),
-                crate::registry_controller::EssentialSetting::AllowAgentControl,
-                "agent control",
-            ),
-            (
                 self.live_inspect.clone(),
                 crate::registry_controller::EssentialSetting::LiveInspect,
                 "live inspection",
@@ -1469,8 +1457,6 @@ impl SettingsPage {
         self.pinned_section.set_visible(settings.lazy_discovery);
         set_switch(&self.code_mode, settings.code_mode);
         self.code_mode.set_sensitive(true);
-        set_switch(&self.allow_agent_control, settings.allow_agent_control);
-        self.allow_agent_control.set_sensitive(true);
         set_switch(&self.live_inspect, settings.live_inspect);
         self.live_inspect.set_sensitive(true);
         self.safety_level.set_selected(match settings.safety_level {
