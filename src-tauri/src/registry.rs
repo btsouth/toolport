@@ -1094,7 +1094,9 @@ pub enum SafetyLevel {
 }
 
 impl Default for SafetyLevel {
-    fn default() -> Self { Self::Ask }
+    fn default() -> Self {
+        Self::Ask
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2397,6 +2399,14 @@ impl Registry {
 
     pub fn set_safety_level(&mut self, level: SafetyLevel) {
         self.safety_level = Some(level);
+    }
+
+    pub fn requires_human_approval(&self, destructive: bool, untrusted: bool) -> bool {
+        match self.safety_level_effective() {
+            SafetyLevel::Off => false,
+            SafetyLevel::Ask => destructive,
+            SafetyLevel::Strict => destructive || untrusted,
+        }
     }
 
     pub fn human_approval_effective(&self) -> bool {
@@ -7843,6 +7853,15 @@ mod safety_level_tests {
                 level == SafetyLevel::Strict
             );
             assert!(registry.content_defense_effective());
+            assert!(!registry.requires_human_approval(false, false));
+            assert_eq!(
+                registry.requires_human_approval(true, false),
+                level >= SafetyLevel::Ask
+            );
+            assert_eq!(
+                registry.requires_human_approval(false, true),
+                level == SafetyLevel::Strict
+            );
             registry.team_forced_human_approval = true;
             assert_eq!(
                 registry.safety_level_effective(),

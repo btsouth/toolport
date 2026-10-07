@@ -651,14 +651,25 @@ describe("SettingsView restart check", () => {
   });
 });
 
- it("selects and persists one safety level", async () => {
-    const user = userEvent.setup();
-    const onRegistryChange = vi.fn();
-    vi.mocked(setSafetyLevel).mockResolvedValueOnce({ ...registry, safetyLevel: "strict" });
-    render(<ThemeProvider><SettingsView registry={{ ...registry, safetyLevel: "ask" }} onRegistryChange={onRegistryChange} /></ThemeProvider>);
-    expect(screen.getByRole("combobox", { name: "Safety" })).toHaveValue("ask");
-    await user.selectOptions(screen.getByRole("combobox", { name: "Safety" }), "strict");
-    expect(setSafetyLevel).toHaveBeenCalledWith("strict");
-    await waitFor(() => expect(onRegistryChange).toHaveBeenCalledWith({ ...registry, safetyLevel: "strict" }));
-    expect(screen.queryByRole("switch", { name: /block destructive tools/i })).not.toBeInTheDocument();
- });
+it("selects and persists one safety level", async () => {
+  const user = userEvent.setup();
+  const onRegistryChange = vi.fn();
+  vi.mocked(setSafetyLevel).mockResolvedValueOnce({ ...registry, safetyLevel: "strict" });
+  render(
+    <ThemeProvider>
+      <SettingsView
+        registry={{ ...registry, safetyLevel: "ask" }}
+        onRegistryChange={onRegistryChange}
+      />
+    </ThemeProvider>,
+  );
+  expect(screen.getByRole("combobox", { name: "Safety" })).toHaveValue("ask");
+  await user.selectOptions(screen.getByRole("combobox", { name: "Safety" }), "strict");
+  expect(setSafetyLevel).toHaveBeenCalledWith("strict");
+  await waitFor(() =>
+    expect(onRegistryChange).toHaveBeenCalledWith({ ...registry, safetyLevel: "strict" }),
+  );
+  expect(
+    screen.queryByRole("switch", { name: /block destructive tools/i }),
+  ).not.toBeInTheDocument();
+});

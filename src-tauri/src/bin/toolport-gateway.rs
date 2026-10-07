@@ -4575,7 +4575,7 @@ fn execute_call(
             confirmed = true;
         }
         let gate_reason = (!confirmed)
-            .then(|| approval::gate_reason(true, is_dest, untrusted && reg.safety_level_effective() == conduit_lib::registry::SafetyLevel::Strict))
+            .then(|| approval::gate_reason(reg.requires_human_approval(is_dest, untrusted), is_dest, untrusted))
             .flatten()
             .or_else(|| {
                 resuming_modern_hitl
@@ -4826,7 +4826,7 @@ fn execute_call(
     // call never reaches the downstream server unconfirmed).
     // Skip when `confirmed` is true: the call arrived via toolport_confirm
     // and was already reviewed (prevents re-interception loop).
-    if reg.confirm_destructive && !confirmed {
+    if reg.safety_level.is_none() && reg.confirm_destructive && !confirmed {
         // Resolve destructiveness robustly (cache, then live router, else
         // fail-closed), so a cold/stale cache can't skip the confirm step for a
         // destructive tool.

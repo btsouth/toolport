@@ -17,7 +17,6 @@ import {
   Pin,
   Power,
   RefreshCw,
-  ShieldAlert,
   ShieldX,
   Sun,
   Trash2,
@@ -1234,124 +1233,158 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         </h2>
         <label className="flex items-center gap-3 text-sm">
           Safety
-          <select aria-label="Safety" value={registry?.safetyLevel ?? (registry?.denyDestructive || registry?.quarantineOnDrift || registry?.blockOnInjection ? "strict" : registry?.humanApproval || registry?.confirmDestructive ? "ask" : "off")}
+          <select
+            aria-label="Safety"
+            value={
+              registry?.safetyLevel ??
+              (registry?.denyDestructive ||
+              registry?.quarantineOnDrift ||
+              registry?.blockOnInjection
+                ? "strict"
+                : registry?.humanApproval || registry?.confirmDestructive
+                  ? "ask"
+                  : "off")
+            }
             onChange={async (event) => {
               try {
-                const updated = await setSafetyLevel(event.target.value as "off" | "ask" | "strict");
-                const reconciled = { ...latestRegistry.current!, safetyLevel: updated.safetyLevel };
+                const updated = await setSafetyLevel(
+                  event.target.value as "off" | "ask" | "strict",
+                );
+                const reconciled = {
+                  ...latestRegistry.current!,
+                  safetyLevel: updated.safetyLevel,
+                };
                 latestRegistry.current = reconciled;
                 onRegistryChange(reconciled);
-              } catch (error) { toastError(`Couldn't update safety: ${error}`); }
-            }}>
-            <option value="off">Off</option><option value="ask">Ask</option><option value="strict">Strict</option>
+              } catch (error) {
+                toastError(`Couldn't update safety: ${error}`);
+              }
+            }}
+          >
+            <option value="off">Off</option>
+            <option value="ask">Ask</option>
+            <option value="strict">Strict</option>
           </select>
         </label>
-        <p className="text-xs text-muted-foreground">Off runs without approval or blocking. Ask holds destructive calls for human approval. Strict hides destructive tools, quarantines risky drift, blocks high-confidence injection and asks before untrusted calls. Labeling and integrity recording stay on.</p>
-        {(registry?.teamForcedHumanApproval || registry?.teamForcedDenyDestructive || registry?.teamForcedQuarantineOnDrift || registry?.teamForcedBlockOnInjection) && <p className="text-xs">Team policy raises the effective safety level.</p>}
-        <details><summary>Advanced</summary>
-        {toggle(
-          EyeOff,
-          piiRedaction,
-          "text-info",
-          "Hide personal data from the model",
-          "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. A value only goes back to the server it came from, so a call that would send one server's data to another is refused. Real data stays on this machine and is forgotten when the conversation ends. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
-          apply("pii-redaction", setPiiRedaction),
-          "pii-redaction",
+        <p className="text-xs text-muted-foreground">
+          Off runs without approval or blocking. Ask holds destructive calls for human
+          approval. Strict hides destructive tools, quarantines risky drift, blocks
+          high-confidence injection and asks before untrusted calls. Labeling and
+          integrity recording stay on.
+        </p>
+        {(registry?.teamForcedHumanApproval ||
+          registry?.teamForcedDenyDestructive ||
+          registry?.teamForcedQuarantineOnDrift ||
+          registry?.teamForcedBlockOnInjection) && (
+          <p className="text-xs">Team policy raises the effective safety level.</p>
         )}
-        {toggle(
-          Bot,
-          allowAgentControl,
-          "text-success",
-          "Allow agent control",
-          "Let an agent turn servers on/off; your destructive-tool block always stays yours",
-          apply("allow-agent-control", setAllowAgentControl),
-          "allow-agent-control",
-        )}
-        {toggle(
-          Activity,
-          liveInspect,
-          "text-info",
-          "Live request/response inspection",
-          "Off by default. While on, Toolport captures each tool call's arguments and results to a small local, ephemeral buffer (the last 50 calls) so you can inspect them in Activity. This is separate from the audit log, never leaves your machine, and is cleared when you turn it off or restart the gateway.",
-          applyLiveInspect,
-          "live-inspect",
-        )}
-        {quarantined.length === 0 && quarantineError && (
-          <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
-            <ShieldX className="size-4 shrink-0 text-destructive" />
-            <span>Couldn&apos;t read quarantine status. Retrying every 15s.</span>
-          </div>
-        )}
-        {quarantined.length > 0 && (
-          <div className="flex flex-col gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
-            <div className="flex items-center gap-2">
+        <details>
+          <summary>Advanced</summary>
+          {toggle(
+            EyeOff,
+            piiRedaction,
+            "text-info",
+            "Hide personal data from the model",
+            "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. A value only goes back to the server it came from, so a call that would send one server's data to another is refused. Real data stays on this machine and is forgotten when the conversation ends. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
+            apply("pii-redaction", setPiiRedaction),
+            "pii-redaction",
+          )}
+          {toggle(
+            Bot,
+            allowAgentControl,
+            "text-success",
+            "Allow agent control",
+            "Let an agent turn servers on/off; your destructive-tool block always stays yours",
+            apply("allow-agent-control", setAllowAgentControl),
+            "allow-agent-control",
+          )}
+          {toggle(
+            Activity,
+            liveInspect,
+            "text-info",
+            "Live request/response inspection",
+            "Off by default. While on, Toolport captures each tool call's arguments and results to a small local, ephemeral buffer (the last 50 calls) so you can inspect them in Activity. This is separate from the audit log, never leaves your machine, and is cleared when you turn it off or restart the gateway.",
+            applyLiveInspect,
+            "live-inspect",
+          )}
+          {quarantined.length === 0 && quarantineError && (
+            <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
               <ShieldX className="size-4 shrink-0 text-destructive" />
-              <span className="text-sm font-medium">Quarantined tools</span>
-              <span className="text-xs text-muted-foreground">
-                {quarantineError ? "status may be stale" : "blocked until you re-approve"}
-              </span>
+              <span>Couldn&apos;t read quarantine status. Retrying every 15s.</span>
             </div>
-            <ul className="flex flex-col gap-1.5">
-              {quarantined.map((q) => (
-                <li
-                  key={`${q.profile}:${q.tool}`}
-                  className="flex items-center gap-2 text-xs"
-                >
-                  <span className="min-w-0 truncate font-mono">{q.tool}</span>
-                  <span
-                    className="min-w-0 truncate text-muted-foreground"
-                    title={q.detail || q.reason}
+          )}
+          {quarantined.length > 0 && (
+            <div className="flex flex-col gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <ShieldX className="size-4 shrink-0 text-destructive" />
+                <span className="text-sm font-medium">Quarantined tools</span>
+                <span className="text-xs text-muted-foreground">
+                  {quarantineError
+                    ? "status may be stale"
+                    : "blocked until you re-approve"}
+                </span>
+              </div>
+              <ul className="flex flex-col gap-1.5">
+                {quarantined.map((q) => (
+                  <li
+                    key={`${q.profile}:${q.tool}`}
+                    className="flex items-center gap-2 text-xs"
                   >
-                    {q.detail ? q.detail : q.reason}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => reapprove(q)}
-                    className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
-                  >
-                    Re-approve
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-        {allowedTools.length === 0 && allowedError && (
-          <div className="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-            <UserCheck className="size-4 shrink-0 text-info" />
-            <span>Couldn&apos;t read the allowed-tools list. Retrying every 10s.</span>
-          </div>
-        )}
-        {allowedTools.length > 0 && (
-          <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/20 px-3 py-2.5">
-            <div className="flex items-center gap-2">
+                    <span className="min-w-0 truncate font-mono">{q.tool}</span>
+                    <span
+                      className="min-w-0 truncate text-muted-foreground"
+                      title={q.detail || q.reason}
+                    >
+                      {q.detail ? q.detail : q.reason}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => reapprove(q)}
+                      className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
+                    >
+                      Re-approve
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {allowedTools.length === 0 && allowedError && (
+            <div className="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
               <UserCheck className="size-4 shrink-0 text-info" />
-              <span className="text-sm font-medium">Allowed tools</span>
-              <span className="text-xs text-muted-foreground">
-                {allowedError ? "list may be stale" : "skip human approval"}
-              </span>
+              <span>Couldn&apos;t read the allowed-tools list. Retrying every 10s.</span>
             </div>
-            <ul className="flex flex-col gap-1.5">
-              {allowedTools.map((t) => (
-                <li key={t.key} className="flex items-center gap-2 text-xs">
-                  <span className="min-w-0 truncate font-mono">
-                    {t.server}/{t.tool}
-                  </span>
-                  <span className="shrink-0 text-muted-foreground">
-                    {t.persistent ? "always" : "this session"}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => void revokeAllowed(t.key)}
-                    className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
-                  >
-                    Revoke
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
+          )}
+          {allowedTools.length > 0 && (
+            <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/20 px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <UserCheck className="size-4 shrink-0 text-info" />
+                <span className="text-sm font-medium">Allowed tools</span>
+                <span className="text-xs text-muted-foreground">
+                  {allowedError ? "list may be stale" : "skip human approval"}
+                </span>
+              </div>
+              <ul className="flex flex-col gap-1.5">
+                {allowedTools.map((t) => (
+                  <li key={t.key} className="flex items-center gap-2 text-xs">
+                    <span className="min-w-0 truncate font-mono">
+                      {t.server}/{t.tool}
+                    </span>
+                    <span className="shrink-0 text-muted-foreground">
+                      {t.persistent ? "always" : "this session"}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void revokeAllowed(t.key)}
+                      className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
+                    >
+                      Revoke
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </details>
       </section>
       <section className="flex flex-col gap-2">
