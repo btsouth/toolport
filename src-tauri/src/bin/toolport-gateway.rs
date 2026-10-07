@@ -23979,7 +23979,9 @@ mod tests {
             serde_json::from_str(r#"{"version":1,"servers":[],"profiles":[],"codeMode":false}"#)
                 .unwrap();
         assert!(!explicit_off.code_mode);
-        let explicit_on: Registry = serde_json::from_str(r#"{"version":1,"servers":[],"profiles":[],"codeMode":true}"#).unwrap();
+        let explicit_on: Registry =
+            serde_json::from_str(r#"{"version":1,"servers":[],"profiles":[],"codeMode":true}"#)
+                .unwrap();
         assert!(explicit_on.code_mode);
     }
 

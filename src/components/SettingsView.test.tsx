@@ -683,9 +683,11 @@ it("keeps Code Mode off by default under Advanced and persists opt-in", async ()
   const absent = { ...registry, codeMode: undefined };
   vi.mocked(setCodeMode).mockResolvedValueOnce({ ...absent, codeMode: true });
   render(<ThemeProvider><SettingsView registry={absent} onRegistryChange={onRegistryChange} /></ThemeProvider>);
-  expect(screen.queryByRole("switch", { name: /code mode/i })).not.toBeInTheDocument();
+  const advanced = screen.getByText("Advanced").closest("details");
+  expect(advanced).not.toHaveAttribute("open");
   await user.click(screen.getByText("Advanced"));
-  const control = screen.getByRole("switch", { name: /code mode/i });
+  expect(advanced).toHaveAttribute("open");
+  const control = within(advanced!).getByRole("switch", { name: /code mode/i });
   expect(control).not.toBeChecked();
   await user.click(control);
   expect(setCodeMode).toHaveBeenCalledWith(true);

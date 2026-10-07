@@ -71,7 +71,9 @@ impl Gateway {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        if force_code_mode { command.env("TOOLPORT_CODE_MODE", "1"); }
+        if force_code_mode {
+            command.env("TOOLPORT_CODE_MODE", "1");
+        }
         let http_port = http_token.map(|_| {
             let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             socket.local_addr().unwrap().port()
@@ -718,7 +720,11 @@ fn http_client_memory_failure_does_not_stop_other_clients_and_scope_stays_enforc
 fn code_mode_default_is_hidden_and_refused_without_override() {
     let mut gateway = Gateway::configured_with_code_mode(|_, _| {}, None, false);
     let listed = gateway.request("tools/list", json!({}));
-    assert!(!listed["result"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "toolport_run_script"));
+    assert!(!listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "toolport_run_script"));
     let refused = gateway.run(json!({"script": "return 42;"}));
     assert_eq!(refused["isError"], true);
     assert!(refused.to_string().contains("code mode is disabled"));
@@ -728,7 +734,11 @@ fn code_mode_default_is_hidden_and_refused_without_override() {
 fn code_mode_env_override_lists_and_executes_with_registry_off() {
     let mut gateway = Gateway::configured(|reg, _| reg.code_mode = false, None);
     let listed = gateway.request("tools/list", json!({}));
-    assert!(listed["result"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "toolport_run_script"));
+    assert!(listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "toolport_run_script"));
     let allowed = gateway.run(json!({"script": "return 42;"}));
     assert_eq!(allowed["isError"], false);
     assert_eq!(allowed["structuredContent"]["result"], 42);
