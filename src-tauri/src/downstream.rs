@@ -1708,7 +1708,15 @@ pub fn resolve_command(command: &str) -> String {
     if command.contains('/') {
         return command.to_string();
     }
-    for dir in augmented_path().split(':').filter(|d| !d.is_empty()) {
+    resolve_command_in_path(command, augmented_path())
+}
+
+#[cfg(not(windows))]
+fn resolve_command_in_path(command: &str, path: &str) -> String {
+    if command.contains('/') {
+        return command.to_string();
+    }
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
         let candidate = Path::new(dir).join(command);
         if candidate.is_file() {
             return candidate.to_string_lossy().into_owned();
@@ -4748,7 +4756,6 @@ impl StdioTransport {
         };
         let container_args = inject_container_env(spawn_command, spawn_args, env);
         let spawn_args = container_args.as_slice();
-        let resolved = resolve_command(spawn_command);
         // Start the child from a cleared environment (SEC-04): a downstream server
         // is third-party code that can read its own process environment, so it must
         // not inherit the client's cloud credentials or API keys. `child_environment`
@@ -4762,6 +4769,19 @@ impl StdioTransport {
             process_env_map()
         };
         let child_env = child_environment(&parent_env, env, inherit_env);
+        #[cfg(not(windows))]
+        let resolved = if inherit_env {
+            let path = child_env
+                .iter()
+                .find(|(name, _)| name == "PATH")
+                .map(|(_, value)| value.as_str())
+                .unwrap_or("");
+            resolve_command_in_path(spawn_command, path)
+        } else {
+            resolve_command(spawn_command)
+        };
+        #[cfg(windows)]
+        let resolved = resolve_command(spawn_command);
         let mut cmd = Command::new(&resolved);
         cmd.env_clear();
         cmd.args(spawn_args)
@@ -15164,7 +15184,7 @@ mod login_environment_tests {
     }
 
     #[test]
-    fn login_shell_timeout_falls_back_and_reaps_descendants() {
+    fn login_shell_timeout_falls_back_promptly() {
         let fixture = ShellFixture::new("sleep 30 &\necho $! > \"$(dirname \"$0\")/pid\"\nwait");
         let parent = fixture.parent();
         let started = Instant::now();

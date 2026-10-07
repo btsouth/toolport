@@ -72,14 +72,14 @@ fn inherit_env_uses_one_login_snapshot_until_registry_reload() {
     let value = scratch.join("login-value");
     std::fs::write(&value, "first").unwrap();
     std::fs::write(&shell, format!(
-        "#!/bin/sh\n[ \"$1\" = -lc ] || exit 1\necho run >> '{}'\nprintf 'LOGIN_KEY=%s\\000PATH=/usr/bin:/bin\\000' \"$(cat '{}')\"\n", count.display(), value.display()
+        "#!/bin/sh\n[ \"$1\" = -lc ] || exit 1\necho run >> '{}'\nprintf 'LOGIN_KEY=%s\\000PATH={}:/usr/bin:/bin\\000' \"$(cat '{}')\"\n", count.display(), scratch.path().display(), value.display()
     )).unwrap();
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
     let entries: Vec<_> = ["one", "two", "three"].iter().map(|id| {
         let launcher = scratch.join(&format!("{id}.sh"));
         std::fs::write(&launcher, format!("#!/bin/sh\nenv > '{}'\nexec '{}'\n", scratch.join(&format!("{id}.env")).display(), MOCK)).unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
-        json!({ "id": id, "name": id, "transport": "stdio", "command": launcher.display().to_string(), "args": [], "env": [], "inheritEnv": true, "source": "manual", "disabledTools": [] })
+        json!({ "id": id, "name": id, "transport": "stdio", "command": format!("{id}.sh"), "args": [], "env": [], "inheritEnv": true, "source": "manual", "disabledTools": [] })
     }).collect();
     write_registry(scratch.path(), &entries[..2], &["one", "two"]);
     let _daemon = start_daemon_with_env(
