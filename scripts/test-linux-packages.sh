@@ -8,7 +8,11 @@ smoke() {
   test "$(readlink -f /usr/bin/conduit)" = /usr/bin/toolport-gtk
   cmp /usr/bin/toolport-gtk /packages/toolport-gtk
   test -x /usr/bin/toolport-gateway
+  for binary in /usr/bin/toolport-gtk /usr/bin/toolport-gateway /usr/share/toolport/toolport-preview-rollback.sh; do
+    test "$(stat -c '%a' "$binary")" = 755
+  done
   test -f /usr/share/applications/com.tsout.Toolport.desktop
+  test "$(stat -c '%a' /usr/share/applications/com.tsout.Toolport.desktop)" = 644
   grep -qx 'Exec=toolport-gtk %U' /usr/share/applications/com.tsout.Toolport.desktop
   grep -qx 'Icon=toolport' /usr/share/applications/com.tsout.Toolport.desktop
   grep -qx 'Categories=Development;' /usr/share/applications/com.tsout.Toolport.desktop

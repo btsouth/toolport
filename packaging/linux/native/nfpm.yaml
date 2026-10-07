@@ -17,33 +17,59 @@ description: |
 contents:
   - src: src-tauri/target/release/toolport-gtk
     dst: /usr/bin/toolport-gtk
+    file_info:
+      mode: 0o755
   - src: src-tauri/target/release/toolport-gateway
     dst: /usr/bin/toolport-gateway
+    file_info:
+      mode: 0o755
   # Preserve CLI and existing 1.x launch-at-login paths during the same-name upgrade.
   - src: /usr/bin/toolport-gtk
     dst: /usr/bin/toolport
+    file_info:
+      mode: 0o777
     type: symlink
   - src: /usr/bin/toolport-gtk
     dst: /usr/bin/conduit
+    file_info:
+      mode: 0o777
     type: symlink
   - src: packaging/linux/native/com.tsout.Toolport.desktop
     dst: /usr/share/applications/com.tsout.Toolport.desktop
+    file_info:
+      mode: 0o644
   - src: packaging/linux/native/com.tsout.Toolport.metainfo.xml
     dst: /usr/share/metainfo/com.tsout.Toolport.metainfo.xml
+    file_info:
+      mode: 0o644
   - src: src-tauri/icons/32x32.png
     dst: /usr/share/icons/hicolor/32x32/apps/toolport.png
+    file_info:
+      mode: 0o644
   - src: src-tauri/icons/128x128.png
     dst: /usr/share/icons/hicolor/128x128/apps/toolport.png
+    file_info:
+      mode: 0o644
   - src: src-tauri/icons/128x128@2x.png
     dst: /usr/share/icons/hicolor/256x256/apps/toolport.png
+    file_info:
+      mode: 0o644
   - src: .verify/native-packages/toolport-agent-plugin.zip
     dst: /usr/share/toolport/agent-plugin/toolport-agent-plugin.zip
+    file_info:
+      mode: 0o644
   - src: scripts/toolport-preview-rollback.sh
     dst: /usr/share/toolport/toolport-preview-rollback.sh
+    file_info:
+      mode: 0o755
   - src: LICENSE
     dst: /usr/share/licenses/toolport/LICENSE
+    file_info:
+      mode: 0o644
   - src: LICENSE
     dst: /usr/share/doc/toolport/copyright
+    file_info:
+      mode: 0o644
     packager: deb
 overrides:
   deb:
