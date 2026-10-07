@@ -13802,11 +13802,34 @@ fn process_request(
     let adapter_root = daemon_adapter
         .then(|| state.active_adapter_root())
         .flatten();
-    let rooted_router = if daemon_adapter {
+    let mut rooted_router = if daemon_adapter {
         state.router_for_root(base_router, &reg, adapter_root.as_deref(), allowed)
     } else {
         base_router
     };
+    // Root-specific uncached discovery has the same bounded first-list wait as
+    // ordinary servers. A cached rooted catalog remains immediately readable.
+    if method == "tools/list" && daemon_adapter && rooted_router.aggregated_tools().is_empty() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while rooted_router
+            .any_starting(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
+            && Instant::now() < deadline
+        {
+            if cancel
+                .as_ref()
+                .is_some_and(downstream::CancelContext::is_cancelled)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+            let base = state
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            rooted_router = state.router_for_root(base, &reg, adapter_root.as_deref(), allowed);
+        }
+    }
     let (router, adapter_catalog) = if state.daemon_mode.load(Ordering::SeqCst) {
         adapter_profile
             .map(|profile| state.router_for_adapter_profile(rooted_router.clone(), &reg, profile))
