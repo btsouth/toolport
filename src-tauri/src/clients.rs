@@ -6074,14 +6074,11 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
 pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) -> Result<(), String> {
     let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
     let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
-    restore::finish(
-        client_id,
-        Path::new(&outcome.path),
-        outcome.revision.as_deref(),
-    )?;
+    restore::check_finished(client_id, Path::new(&outcome.path), outcome.revision.as_deref())?;
     if outcome.used_move_record {
         moved::forget(client_id)?;
     }
+    restore::finish(client_id, Path::new(&outcome.path), outcome.revision.as_deref())?;
     Ok(())
 }
 

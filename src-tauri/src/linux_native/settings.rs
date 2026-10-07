@@ -570,7 +570,8 @@ impl SettingsPage {
                                 let message = if results.is_empty() { "No client connections to remove.".into() } else { results.iter().map(|result| format!("{}: {}", result.client_id, result.error.as_deref().unwrap_or("Client configuration restored"))).collect::<Vec<_>>().join("\n") };
                                 page.feedback.set_label(&message);
                                 page.feedback.set_wrap(true);
-                                page.refresh();
+                                page.begin_mutation();
+                                page.refresh_quietly();
                             }
                             Ok(Err(error)) => page.show_error(&error),
                             Err(_) => page.show_error("Client removal stopped unexpectedly"),

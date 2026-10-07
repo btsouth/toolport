@@ -253,6 +253,7 @@ fn run_inner<T>(
                 original.as_deref(),
                 original.as_deref(),
                 pending.disconnecting,
+                jsonc_settings,
             )?;
             return Ok(result);
         }
@@ -289,6 +290,7 @@ fn run_inner<T>(
                 original.as_deref(),
                 output.as_deref(),
                 pending.disconnecting,
+                jsonc_settings,
             )?;
             let commit = crate::registry::client_file::commit(path, &revision, output.as_deref());
             if commit.is_err() {

@@ -19,7 +19,12 @@ struct Snapshot {
     created_parents: Vec<PathBuf>,
     exact_eligible: bool,
     preexisting_gateways: Vec<String>,
+    #[serde(default)]
     disconnected: bool,
+    #[serde(default)]
+    jsonc_settings: bool,
+    #[serde(default)]
+    disconnect_before: Option<String>,
 }
 
 pub(super) fn record_path(client_id: &str, path: &Path) -> Result<PathBuf, String> {
@@ -89,6 +94,7 @@ pub(super) fn remember(
     before: Option<&str>,
     after: Option<&str>,
     disconnecting: bool,
+    jsonc_settings: bool,
 ) -> Result<Receipt, String> {
     let file = record_path(client_id, path)?;
     let previous = match std::fs::read_to_string(&file) {
@@ -121,6 +127,8 @@ pub(super) fn remember(
                 exact_eligible: preexisting_gateways.is_empty(),
                 preexisting_gateways,
                 disconnected: false,
+                jsonc_settings,
+                disconnect_before: None,
             }
         }
     };
@@ -142,6 +150,11 @@ pub(super) fn remember(
     if disconnecting {
         record.baseline = mutation::value(format, after)?;
     }
+    record.disconnect_before = if disconnecting {
+        before.map(str::to_string)
+    } else {
+        None
+    };
     record.disconnected = disconnecting;
     record.last_written = after.map(str::to_string);
     record.last_written_hash = after.map(crate::registry::sha256_hex);
@@ -322,13 +335,20 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
         return Ok(false);
     };
     mutation::disconnecting();
-    if record.disconnected {
-        return Ok(true);
-    }
     let current = if mutation::exists(path) {
         Some(read_config_file(path)?)
     } else {
         None
+    };
+    if record.disconnected
+        && current.as_deref().map(crate::registry::sha256_hex) == record.last_written_hash
+    {
+        return Ok(true);
+    }
+    let written_text = if record.disconnected {
+        record.disconnect_before.as_deref()
+    } else {
+        record.last_written.as_deref()
     };
     if record.exact_eligible
         && current.as_deref().map(crate::registry::sha256_hex) == record.last_written_hash
@@ -379,7 +399,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
             }
         }
     }
-    let mut written = mutation::value(format, record.last_written.as_deref())?;
+    let mut written = mutation::value(format, written_text)?;
     let mut latest = mutation::value(format, current.as_deref())?;
     let list = matches!(format, Format::YamlMcpServersList);
     let order: Vec<String> = if list {
@@ -489,7 +509,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
         }
         _ => {
             let original_root = record.baseline.clone();
-            let written_root = mutation::value(format, record.last_written.as_deref())?;
+            let written_root = mutation::value(format, written_text)?;
             let keys: std::collections::BTreeSet<_> = original_root
                 .as_object()
                 .into_iter()
@@ -537,11 +557,34 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
     Ok(true)
 }
 
+pub(super) fn check_finished(
+    client_id: &str,
+    path: &Path,
+    expected: Option<&str>,
+) -> Result<(), String> {
+    if load(client_id, path)?.is_some_and(|record| record.last_written_hash.as_deref() != expected)
+    {
+        return Err("Client was changed by another Toolport operation before disconnect finished; recovery retained".into());
+    }
+    Ok(())
+}
+
+pub(super) fn run<T>(
+    client_id: &str,
+    path: &Path,
+    format: Format,
+    edit: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    if load(client_id, path)?.is_some_and(|record| record.jsonc_settings) {
+        mutation::settings(client_id, path, edit)
+    } else {
+        mutation::run(client_id, path, format, edit)
+    }
+}
+
 pub(super) fn finish(client_id: &str, path: &Path, expected: Option<&str>) -> Result<(), String> {
+    check_finished(client_id, path, expected)?;
     if let Some(record) = load(client_id, path)? {
-        if record.last_written_hash.as_deref() != expected {
-            return Err("Client was changed by another Toolport operation before disconnect finished; recovery retained".into());
-        }
         for parent in record.created_parents {
             let _ = std::fs::remove_dir(parent);
         } // Empty directories only.
@@ -562,6 +605,7 @@ pub(crate) fn after_rollback(
         return Err("Client rollback recovery path mismatch".into());
     }
     record.disconnected = false;
+    record.disconnect_before = None;
     record.last_written = written.map(str::to_string);
     record.last_written_hash = written.map(crate::registry::sha256_hex);
     crate::registry::atomic_write(
@@ -923,6 +967,97 @@ mod tests {
             disconnect("vscode", &path, format).unwrap();
             assert!(read_config_file(&path).unwrap().contains("newly annotated"));
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn interrupted_disconnect_and_completed_cleanup_retry_are_safe() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-disconnect-journal-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("config.json");
+        let original = "{ \"mcpServers\": {\"native\": {\"command\": \"native\"}} }";
+        std::fs::write(&path, original).unwrap();
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            moved::record("fixture", Format::JsonMcpServers, &path)?;
+            write_format(Format::JsonMcpServers, &path, &[entry()], true)
+        })
+        .unwrap();
+        let connected = read_config_file(&path).unwrap();
+        // Crash after recovery was persisted, before the config rename.
+        remember(
+            "fixture",
+            &path,
+            Format::JsonMcpServers,
+            Some(&connected),
+            Some(original),
+            true,
+            false,
+        )
+        .unwrap();
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            apply("fixture", Format::JsonMcpServers, &path)?;
+            moved::restore("fixture", Format::JsonMcpServers, &path)?;
+            Ok(())
+        })
+        .unwrap();
+        let restored = read_config_file(&path).unwrap();
+        assert_eq!(
+            parse_json_value(&restored).unwrap(),
+            parse_json_value(original).unwrap()
+        );
+        // Cleanup failed after a completed config write. Retrying cannot remove
+        // the entries that the preceding disconnect just restored.
+        disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
+        assert_eq!(read_config_file(&path).unwrap(), restored);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn jsonc_settings_recovery_keeps_comments_and_owner_only_provenance() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-settings-recovery-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("settings.json");
+        let original = "{ // setting\n \"theme\": \"dark\",\n}";
+        std::fs::write(&path, original).unwrap();
+        let mut root = parse_json_value(original).unwrap();
+        root["hooks"] = serde_json::json!({"fixture": ["toolport"]});
+        write_settings_key(&path, Some(original), &root, "hooks").unwrap();
+        let snapshot = record_path("claude-code", &path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&snapshot).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(snapshot.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        assert!(recorded_paths()
+            .iter()
+            .any(|(id, recorded, _)| id == "claude-code" && recorded == &path));
+        run("claude-code", &path, Format::JsonMcpServers, || {
+            apply("claude-code", Format::JsonMcpServers, &path).map(|_| ())
+        })
+        .unwrap();
+        assert_eq!(read_config_file(&path).unwrap(), original);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
