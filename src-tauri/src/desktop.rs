@@ -6463,6 +6463,7 @@ mod tests {
                 label: format!("Client: {client_id}"),
                 token_sha256: registry::sha256_hex("leftover-bearer"),
                 profile: String::new(),
+                unknown_fields: Default::default(),
             });
             registry::save(&reg).unwrap();
             Self {
