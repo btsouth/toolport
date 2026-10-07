@@ -742,7 +742,9 @@ mod tests {
                     let path = dir.join(format!("config-{index}-{ending}-{moved}"));
                     std::fs::write(&path, &original).unwrap();
                     // Import's read-only inventory must leave original bytes intact.
-                    mutation::value(format, Some(&read_config_file(&path).unwrap())).unwrap();
+                    let imported =
+                        parse_client_content(format, &read_config_file(&path).unwrap()).unwrap();
+                    assert!(imported.iter().any(|server| server.name == "native"));
                     assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
                     mutation::run(&id, &path, format, || {
                         edit_format(format, &path, Some(&entry()), true)
