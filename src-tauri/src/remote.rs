@@ -798,11 +798,34 @@ pub fn refresh_token(server_id: &str) -> Result<String, String> {
     refresh_token_with_expiry(server_id).map(|token| token.access_token)
 }
 
+fn refresh_token_for_connect(server_id: &str) -> Result<Option<String>, String> {
+    let update = credential_update(server_id);
+    let mut pending = update
+        .lock()
+        .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
+    connect_refresh_result(
+        refresh_token_with_pending(
+            server_id,
+            || lock_oauth_refresh(server_id),
+            &mut pending,
+            false,
+        )
+        .map(|token| token.access_token),
+    )
+}
+
 /// Refresh before the known expiry. A legacy/provider state with no expiry is a
 /// no-op and continues to use the 401/403 fallback. If the deadline is close but
 /// no refresh token exists, return an auth-classified error so the existing
 /// per-server "Needs sign-in" UI appears before a failed tool call.
 fn refresh_token_if_needed(server_id: &str) -> Result<Option<String>, String> {
+    if credential_update(server_id)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+    {
+        return refresh_token_for_connect(server_id);
+    }
     // Same pre-expiry rule for the headless flow, minus the "no refresh token"
     // branch: reacquiring needs no user interaction, so a near-deadline token is
     // simply replaced rather than surfaced as "needs sign-in".
@@ -813,7 +836,7 @@ fn refresh_token_if_needed(server_id: &str) -> Result<Option<String>, String> {
             // straight from here left the proactive headless path as the one arm of the
             // call graph still able to mint concurrently (SBS-479). Matches the shape of
             // the refresh-token arm below.
-            return connect_refresh_result(refresh_token(server_id));
+            return refresh_token_for_connect(server_id);
         }
         return Ok(None);
     }
@@ -826,7 +849,7 @@ fn refresh_token_if_needed(server_id: &str) -> Result<Option<String>, String> {
         RefreshDecision::NotNeeded => Ok(None),
         // Report contention and persistence failures rather than silently using
         // an old credential and immediately attempting another exchange on 401.
-        RefreshDecision::Refresh => connect_refresh_result(refresh_token(server_id)),
+        RefreshDecision::Refresh => refresh_token_for_connect(server_id),
         RefreshDecision::Reauthenticate => Err(
             "OAuth access token expires soon and no refresh token is available; needs authentication"
                 .to_string(),
@@ -1566,6 +1589,7 @@ mod tests {
             std::thread::scope(|scope| {
                 let endpoint = RotatingEndpoint::new();
                 endpoint.seed();
+                // Separate pending memory models a holder in another process.
                 let holder = scope.spawn(|| {
                     refresh_token_with_pending(
                         "rotation",
@@ -1757,6 +1781,10 @@ mod tests {
                     .as_deref(),
                 Some("rt-0")
             );
+            assert_eq!(
+                refresh_token_if_needed("rotation").unwrap().as_deref(),
+                Some("token-2")
+            );
             assert_eq!(request_auth(&mut transport), "Bearer token-2");
             assert_eq!(
                 load_state("rotation")
@@ -1831,6 +1859,8 @@ mod tests {
             )
             .unwrap();
             assert_eq!(refresh_token_if_needed("rotation").unwrap(), None);
+            let mut transport = rotation_transport(&endpoint);
+            assert_eq!(request_auth(&mut transport), "Bearer token-0");
             assert_eq!(endpoint.count(), 0);
             assert_eq!(
                 secrets::get_secret("rotation", secrets::HTTP_AUTH_KEY).as_deref(),
