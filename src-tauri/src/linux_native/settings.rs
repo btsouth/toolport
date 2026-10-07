@@ -1182,6 +1182,8 @@ impl SettingsPage {
                     .build(),
             );
             let profile = if client.profile.is_empty() {
+                "Full connected set".to_string()
+            } else if client.profile == crate::registry::ALL_ENABLED_ACCESS {
                 "All enabled servers".to_string()
             } else {
                 settings
