@@ -18,6 +18,12 @@ impl From<String> for Completion {
     }
 }
 
+impl From<&str> for Completion {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
 pub(super) fn review(
     parent: &gtk::Window,
     title: &str,
