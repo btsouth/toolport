@@ -12547,6 +12547,11 @@ for line in sys.stdin:
             Some(registry.context("c-9".to_string())),
         );
         fixture.wait_for_pending(1);
+        // A call cancelled before it is written never reaches the server, so
+        // there is nothing to cancel downstream. Cancel after the write.
+        fixture.wait_for_frame("slow tools/call written", |frame| {
+            frame["method"] == "tools/call" && frame["params"]["name"] == "slow"
+        });
         assert!(registry.cancel("c-9", Some("user pressed stop")));
         assert!(matches!(
             cancelled.join().unwrap(),
