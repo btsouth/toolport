@@ -275,18 +275,12 @@ impl ClientConfigReceipt {
     fn rollback(&self) -> Result<(), String> {
         let dir = registry::conduit_dir().ok_or("Could not resolve data dir")?;
         let _lock = registry::lock_at(&dir.join("client-config-mutation"))?;
-        let check = || {
-            let current = std::fs::read(&self.target).map_err(|e| e.to_string())?;
-            if current != self.written { return Err("the client config changed again, so Toolport left the newer file untouched".into()); }
-            Ok(())
-        };
-        match &self.backup {
-            Some(backup) => {
-                let original = std::fs::read_to_string(backup).map_err(|e| e.to_string())?;
-                registry::atomic_write_checked(&self.target, &original, check)
-            }
-            None => registry::remove_file_checked(&self.target, check),
+        let revision = registry::client_file::read(&self.target)?;
+        if revision.text.as_deref().map(str::as_bytes) != Some(self.written.as_slice()) {
+            return Err("the client config changed again, so Toolport left the newer file untouched".into());
         }
+        let original = self.backup.as_ref().map(std::fs::read_to_string).transpose().map_err(|e| e.to_string())?;
+        registry::client_file::commit(&self.target, &revision, original.as_deref())
     }
 }
 

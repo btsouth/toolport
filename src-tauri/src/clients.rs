@@ -3726,7 +3726,7 @@ fn atomic_write_json_config(
 ) -> Result<(), String> {
     if mutation::strict_json(path) {
         if let Some(text) = original.filter(|text| !text.trim().is_empty()) {
-            serde_json::from_str::<serde_json::Value>(text).map_err(|_| {
+            serde_json::from_str::<serde_json::Value>(text.strip_prefix('\u{feff}').unwrap_or(text)).map_err(|_| {
                 "Strict JSON config contains comments or trailing commas; leaving it untouched."
                     .to_string()
             })?;
@@ -3734,7 +3734,7 @@ fn atomic_write_json_config(
     }
     let output = render_json_config(original, root, changed_key)?;
     if mutation::strict_json(path) {
-        serde_json::from_str::<serde_json::Value>(&output).map_err(|_| {
+        serde_json::from_str::<serde_json::Value>(output.strip_prefix('\u{feff}').unwrap_or(&output)).map_err(|_| {
             "Client writer produced non-strict JSON; leaving config untouched".to_string()
         })?;
     }
