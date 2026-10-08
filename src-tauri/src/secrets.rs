@@ -9,7 +9,7 @@ const INTERNAL_SERVER_ID: &str = "__toolport_internal__";
 const TASK_HANDLE_KEY: &str = "__task_handle_key__";
 
 /// Vault reference for a reviewed endpoint containing inline credentials.
-pub(crate) const IMPORTED_URL_KEY: &str = "__imported_url__";
+pub(crate) const IMPORTED_URL_KEY: &str = "IMPORTED_URL";
 
 /// Reserved secret key for an http server's bearer token (Tier A auth, and where
 /// the OAuth flow stores its access token).
@@ -1303,12 +1303,30 @@ fn get_secret_result_raw(server_id: &str, key: &str) -> Result<Option<String>, S
 /// Inspect only the managed identity's vault, never environment overrides or aliases.
 pub(crate) fn has_own_credentials(server: &crate::registry::ServerEntry) -> Result<bool, String> {
     let mut keys: Vec<&str> = server.env.iter().map(|e| e.key.as_str()).collect();
-    if let Some(launch) = &server.launch { keys.extend(launch.inputs.iter().filter(|i| i.secret).map(|i| i.key.as_str())); }
-    keys.extend([HTTP_AUTH_KEY, CLIENT_SECRET_KEY, "__oauth_state__", "__oauth_cc_state__"]);
+    if let Some(launch) = &server.launch {
+        keys.extend(
+            launch
+                .inputs
+                .iter()
+                .filter(|i| i.secret)
+                .map(|i| i.key.as_str()),
+        );
+    }
+    keys.extend([
+        HTTP_AUTH_KEY,
+        CLIENT_SECRET_KEY,
+        "__oauth_state__",
+        "__oauth_cc_state__",
+    ]);
     for key in keys {
-        let value = if file::active() { file::get_secret_result(&server.id, key) }
-            else { platform::get_secret_result(&server.id, key) }?;
-        if value.is_some() { return Ok(true); }
+        let value = if file::active() {
+            file::get_secret_result(&server.id, key)
+        } else {
+            platform::get_secret_result(&server.id, key)
+        }?;
+        if value.is_some() {
+            return Ok(true);
+        }
     }
     Ok(false)
 }
@@ -1655,7 +1673,10 @@ pub(crate) mod tests {
         struct Cleanup(std::path::PathBuf, Option<std::ffi::OsString>);
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                match &self.1 { Some(value) => std::env::set_var("TOOLPORT_SECRET_KEY", value), None => std::env::remove_var("TOOLPORT_SECRET_KEY") }
+                match &self.1 {
+                    Some(value) => std::env::set_var("TOOLPORT_SECRET_KEY", value),
+                    None => std::env::remove_var("TOOLPORT_SECRET_KEY"),
+                }
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }

@@ -209,7 +209,11 @@ pub(super) fn review(
             row_choices.borrow_mut().push(choice.downgrade());
             let refresh = refresh_state.clone();
             choice.connect_toggled(move |_| refresh());
-            choice.set_sensitive(item.unsupported.is_none() && !env.key.starts_with("__"));
+            choice.set_sensitive(
+                item.unsupported.is_none()
+                    && !env.key.starts_with("__")
+                    && env.key != crate::secrets::IMPORTED_URL_KEY,
+            );
             let value_row = adw::ActionRow::builder()
                 .title(&env.key)
                 .subtitle(if env.present { "Found" } else { "Missing" })
@@ -684,6 +688,62 @@ mod tests {
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::Label>())
             .any(|label| label.text() == "Found, goes to keychain"));
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn reviewed_missing_value_and_existing_update_are_explicit() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        review(
+            &parent,
+            "Update fixture",
+            vec![SetupItem {
+                key: "one".into(),
+                name: "One".into(),
+                transport: "stdio".into(),
+                command: Some("fixture".into()),
+                args: Vec::new(),
+                url: None,
+                env_keys: vec!["PAT".into()],
+                is_new: false,
+                credentials: vec![crate::registry_controller::CredentialReview {
+                    key: "PAT".into(),
+                    secret: true,
+                    present: false,
+                }],
+                unsupported: None,
+                updates: vec!["Environment".into(), "Launch settings".into()],
+            }],
+            "Fixture",
+            "Connect",
+            |_, _, _| Err("fixture".into()),
+            || {},
+            None,
+        );
+        let window = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Update fixture"))
+            .unwrap();
+        let widgets = descendants(window.upcast_ref());
+        assert!(widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Button>())
+            .any(|b| b.label().as_deref() == Some("Enter value")));
+        assert!(!widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Button>())
+            .any(|b| b.label().as_deref() == Some("Open Credentials")));
+        assert!(widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .any(|l| l.text() == "Updates existing server"));
+        assert!(widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .any(|l| l.text() == "Environment, Launch settings"));
         window.close();
     }
 
