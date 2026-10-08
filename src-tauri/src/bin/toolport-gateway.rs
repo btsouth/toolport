@@ -37060,7 +37060,7 @@ mod tests {
         ) -> Result<Value, downstream::TransportError> {
             match method {
                 "initialize" => Ok(json!({"protocolVersion": "2025-06-18"})),
-                "tools/list" => Ok(json!({"tools": [{"name": "write", "inputSchema": {
+                "tools/list" => Ok(json!({"tools": [{"name": "echo", "inputSchema": {
                     "type": "object", "properties": {"'x-Cwd'": {"type": "string"}}, "required": ["'x-Cwd'"]
                 }}]})),
                 "tools/call" => {
@@ -37099,10 +37099,10 @@ mod tests {
         let guard = SearchGuard::default();
         let request = |name: &str, arguments: Value| json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}});
         for req in [
-            request("s__write", json!({"x-Cwd": "/direct"})),
+            request("s__echo", json!({"x-Cwd": "/direct"})),
             request(
                 "toolport_call_tool",
-                json!({"name": "s__write", "arguments": {"x-Cwd": "/meta"}}),
+                json!({"name": "s__echo", "arguments": {"x-Cwd": "/meta"}}),
             ),
         ] {
             let result = handle_request(
@@ -37120,7 +37120,7 @@ mod tests {
             .unwrap();
             assert_ne!(result["result"]["isError"], true, "{result}");
         }
-        let script = json!({"script": "return toolport.call('s__write', {'x-Cwd': '/script'});"});
+        let script = json!({"script": "return toolport.call('s__echo', {'x-Cwd': '/script'});"});
         let result = run_script_dispatch(
             &reg,
             Some(&router),
@@ -37142,7 +37142,7 @@ mod tests {
         ));
         router
             .route_call_with_cancel_and_mrtr(
-                "s__write",
+                "s__echo",
                 json!({"x-Cwd": "/resume"}),
                 None,
                 None,
@@ -37152,7 +37152,7 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 4);
         for (call, expected) in calls.iter().zip(["/direct", "/meta", "/script", "/resume"]) {
-            assert_eq!(call["name"], "write");
+            assert_eq!(call["name"], "echo");
             assert_eq!(call["arguments"], json!({"'x-Cwd'": expected}));
         }
     }
