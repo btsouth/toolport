@@ -25,7 +25,9 @@ export function CollectionReviewDialog({
       await addCollection(
         entries.filter((_, i) => keys.includes(String(i))),
         new Set(
-          collection.servers.filter((e) => installed(have, e)).map((e) => e.name.toLowerCase()),
+          collection.servers
+            .filter((e) => installed(have, e))
+            .map((e) => e.name.toLowerCase()),
         ),
         onAdded,
       );
