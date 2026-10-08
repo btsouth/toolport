@@ -99,45 +99,23 @@ fn load(client_id: &str) -> Result<Option<Record>, String> {
     }
 }
 
-/// The record file's bytes before [`record`] changed it, so a failed migration
-/// can put it back.
-pub(super) struct Previous {
-    client_id: String,
-    bytes: Option<String>,
-}
-
-impl Previous {
-    pub(super) fn revert(self) {
-        let Ok(path) = record_path(&self.client_id) else {
-            return;
-        };
-        let _ = match self.bytes {
-            Some(bytes) => crate::registry::atomic_write(&path, &bytes),
-            None => std::fs::remove_file(&path).map_err(|e| e.to_string()),
-        };
-    }
-}
-
 /// Copy every non-gateway entry in `path` into the client's move record before
 /// migration strips them. Entries already recorded by an earlier move are kept;
 /// a name moved again takes its newest definition.
-pub(super) fn record(client_id: &str, format: Format, path: &Path) -> Result<Previous, String> {
+pub(super) fn record(client_id: &str, format: Format, path: &Path) -> Result<(), String> {
     let record_file = record_path(client_id)?;
-    let previous = Previous {
-        client_id: client_id.to_string(),
-        bytes: match std::fs::read_to_string(&record_file) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(format!("could not read {}: {e}", record_file.display())),
-        },
+    let previous = match std::fs::read_to_string(&record_file) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("could not read {}: {e}", record_file.display())),
     };
-    let entries = if path.exists() {
+    let entries = if mutation::exists(path) {
         extract(container(format), &read_config_file(path)?)?
     } else {
         Vec::new()
     };
     let config_path = path.display().to_string();
-    let mut record = match previous.bytes.as_deref() {
+    let mut record = match previous.as_deref() {
         Some(text) => serde_json::from_str::<Record>(text)
             .map_err(|e| format!("could not read {}: {e}", record_file.display()))?,
         None => Record::default(),
@@ -149,7 +127,7 @@ pub(super) fn record(client_id: &str, format: Format, path: &Path) -> Result<Pre
         };
     }
     if entries.is_empty() && record.entries.is_empty() {
-        return Ok(previous);
+        return Ok(());
     }
     for entry in entries {
         record
@@ -158,8 +136,8 @@ pub(super) fn record(client_id: &str, format: Format, path: &Path) -> Result<Pre
         record.entries.push(entry);
     }
     let text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
-    crate::registry::atomic_write(&record_file, &text)?;
-    Ok(previous)
+    atomic_write(&record_file, &text)?;
+    Ok(())
 }
 
 /// What [`restore`] put back.
@@ -321,7 +299,7 @@ fn insert_missing(
     let mut names = Vec::new();
     match container {
         Container::Json { key, nested } => {
-            let original = if path.exists() {
+            let original = if mutation::exists(path) {
                 Some(read_config_file(path)?)
             } else {
                 None

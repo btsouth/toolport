@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 pub(crate) static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+pub(crate) mod client_file;
 mod v2_migration;
 mod v3_migration;
 
@@ -357,15 +358,21 @@ fn transient_rename_error(_error: &std::io::Error) -> bool {
 /// Bounded on both axes - at most [`RENAME_ATTEMPTS`] tries and a capped backoff - so a
 /// destination that is genuinely locked forever still reports its error instead of hanging.
 /// A non-retryable error returns on the first attempt, unchanged and undelayed.
-fn rename_with_retry(ops: &impl AtomicWriteOps, from: &Path, to: &Path) -> std::io::Result<()> {
+fn rename_with_retry(
+    ops: &impl AtomicWriteOps,
+    from: &Path,
+    to: &Path,
+    check: impl Fn() -> Result<(), String>,
+) -> Result<(), String> {
     let mut delay = RENAME_BACKOFF_START;
     let mut attempt = 1;
     loop {
+        check()?;
         match ops.rename(from, to) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 if attempt >= RENAME_ATTEMPTS || !ops.rename_is_retryable(&error) {
-                    return Err(error);
+                    return Err(error.to_string());
                 }
                 std::thread::sleep(delay);
                 delay = (delay * 2).min(RENAME_BACKOFF_CAP);
@@ -520,6 +527,15 @@ fn atomic_write_with_ops(
     contents: &str,
     ops: &impl AtomicWriteOps,
 ) -> Result<(), String> {
+    atomic_write_checked_with_ops(path, contents, ops, || Ok(()))
+}
+
+fn atomic_write_checked_with_ops(
+    path: &Path,
+    contents: &str,
+    ops: &impl AtomicWriteOps,
+    check: impl Fn() -> Result<(), String>,
+) -> Result<(), String> {
     // SBS-886: rename(2) replaces a destination symlink. Resolve first so the
     // temp file and rename land next to the real target.
     let dest = resolve_atomic_write_dest(path)?;
@@ -550,7 +566,7 @@ fn atomic_write_with_ops(
     // leave a truncated registry.json. `fs::write` + `rename` alone did not.
     ops.sync_all(&f).map_err(|e| e.to_string())?;
     drop(f);
-    rename_with_retry(ops, &tmp, &dest).map_err(|e| e.to_string())?;
+    rename_with_retry(ops, &tmp, &dest, check)?;
     cleanup.disarm();
     // Best-effort: fsync the containing directory so the rename entry itself is durable
     // (Unix). Opening a directory as a File fails on Windows, where NTFS journals the
