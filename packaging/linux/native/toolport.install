@@ -1,4 +1,6 @@
 pre_remove() {
+  # pacman also calls this when a conflicting package replaces toolport. It
+  # supplies no replacement flag, so that transaction disconnects clients too.
   if [ -x /usr/share/toolport/disconnect-users.sh ]; then
     /usr/share/toolport/disconnect-users.sh || true
   else

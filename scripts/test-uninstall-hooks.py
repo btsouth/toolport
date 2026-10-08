@@ -25,6 +25,12 @@ class RemovalHooks(unittest.TestCase):
         for name, body in {
             "getent": f'cat "{self.passwd}"',
             "runuser": 'test "$1" = -u && test "$3" = -- || exit 99\nshift 3\nexec "$@"',
+            "stat": f'''path=""; for arg do path=$arg; done
+test -d "$path" || {{ echo 'No such file or directory' >&2; exit 1; }}
+while IFS=: read -r user password uid gid gecos home shell; do
+  case "$path" in "$home"/.config/*) printf '%s:directory\\n' "$uid"; exit 0 ;; esac
+done < "{self.passwd}"
+exit 1''',
         }.items():
             path = self.bin / name
             path.write_text("#!/bin/sh\n" + body + "\n")
@@ -94,7 +100,37 @@ class RemovalHooks(unittest.TestCase):
         self.run_script(self.helper)
         calls = marker.read_text().splitlines()
         self.assertEqual(calls[0], "-k 2 5 getent passwd")
-        self.assertTrue(calls[1].startswith("-k 2 30 runuser -u alice -- env -i "))
+        self.assertTrue(calls[1].startswith("-k 2 5 stat -L -c %u:%F -- "))
+        self.assertTrue(calls[2].startswith("-k 2 30 runuser -u alice -- env -i "))
+
+    def test_foreign_owned_state_and_shared_system_homes_are_skipped(self):
+        self.accounts(["alice", "system"])
+        (self.root / "alice/.config/Toolport").mkdir(parents=True)
+        self.passwd.write_text(self.passwd.read_text().replace(str(self.root / "system") + ":", str(self.root / "alice") + ":"))
+        self.run_script(self.helper)
+        self.assertEqual(len(self.calls.read_text().splitlines()), 1)
+        self.assertIn("alice|unset", self.calls.read_text())
+        self.calls.unlink()
+        (self.bin / "stat").write_text('#!/bin/sh\necho 9999:directory\n')
+        self.run_script(self.helper)
+        self.assertFalse(self.calls.exists())
+
+    def test_timeout_and_root_squash_are_logged_without_blocking_removal(self):
+        self.accounts(["alice"])
+        for message, status in [("Permission denied", 1), ("", 124)]:
+            (self.bin / "stat").write_text(f'#!/bin/sh\necho "{message}" >&2\nexit {status}\n')
+            result = self.run_script(self.helper)
+            self.assertIn("root_squashed", result.stderr)
+            self.assertIn(f"inspection failed ({status})", result.stderr)
+            self.assertFalse(self.calls.exists())
+
+    def test_cleanup_cannot_consume_the_next_account_from_stdin(self):
+        self.accounts(["alice", "bob"])
+        for name in ["alice", "bob"]:
+            (self.root / f"{name}/.config/Toolport").mkdir(parents=True)
+        self.gateway.write_text('#!/bin/sh\nif read -r line; then exit 99; fi\nprintf "%s\\n" "$USER" >> "' + str(self.calls) + '"\n')
+        self.run_script(self.helper)
+        self.assertEqual(self.calls.read_text().splitlines(), ["alice", "bob"])
 
     def test_missing_binary_prints_recovery_and_succeeds(self):
         self.accounts(["empty"])
@@ -107,7 +143,7 @@ class RemovalHooks(unittest.TestCase):
         marker = self.root / "wrapper-calls"
         self.helper.write_text(f'#!/bin/sh\necho called >> "{marker}"\nexit 9\n')
         for format, actions in {
-            "deb": [("upgrade", "2.0"), ("deconfigure",), ("failed-upgrade",), ("purge",), (), ("remove",)],
+            "deb": [("upgrade", "2.0"), ("deconfigure",), ("failed-upgrade",), ("purge",), ("remove", "in-favour", "toolport-bin"), (), ("remove",)],
             "rpm": [("1",), ("2",), (), ("0",)],
         }.items():
             script = self.root / format
@@ -130,6 +166,18 @@ class RemovalHooks(unittest.TestCase):
         self.run_script(script)
         self.assertEqual(marker.read_text(), "called\n")
         self.assertNotIn("pre_upgrade", script.read_text())
+
+    def test_nsis_recovers_updates_and_checks_running_app_before_cleanup(self):
+        hooks = (ROOT / "src-tauri/nsis-hooks.nsh").read_text()
+        preinstall = hooks.split("!macro NSIS_HOOK_PREINSTALL", 1)[1].split("!macroend", 1)[0]
+        self.assertIn("/TIMEOUT=60000", preinstall)
+        self.assertIn('StrCpy $1 "Toolport could not finish', preinstall)
+        recovery = preinstall.split("${If} $UpdateMode = 1", 1)[1].split("${EndIf}", 1)[0]
+        self.assertIn("${OrIf} $PassiveMode = 1", recovery)
+        self.assertLess(recovery.index("Exec '"), recovery.index("IfSilent"))
+        self.assertIn("MessageBox MB_OK", recovery)
+        uninstall = hooks.split("!macro NSIS_HOOK_PREUNINSTALL", 1)[1].split("!macroend", 1)[0]
+        self.assertLess(uninstall.index("!insertmacro CheckIfAppIsRunning"), uninstall.index("--disconnect-all"))
 
 
 if __name__ == "__main__":

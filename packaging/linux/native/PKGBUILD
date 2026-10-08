@@ -27,8 +27,8 @@ source=("toolport-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "toolport.install"
         "disconnect-users.sh")
 sha256sums=('d521eb818d9d4da9cab43c792291a21108e1ab874aedecb01804655c004d2af0'
-            '6e088daf3a4c3ecae0dde8c0b5def3431b55f676c6a86df3f9b30f6befc0272d'
-            'a4995be7006e8a852715ae9a7bbf383bd9106e918acc10fffccb0a1bd4a58708')
+            '0083ee13186ff966eb3c5379a75e2f1107e4f51fbeb9cd213ffa807acc7b97ab'
+            '21222580a18e27e7a8e9ea614e9b8dd083980d686274ec48944bc83283e29b8b')
 
 build() {
   cd "toolport-$pkgver/src-tauri"

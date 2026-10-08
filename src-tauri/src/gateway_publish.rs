@@ -1026,11 +1026,118 @@ fn installer_owns_process(
 
 fn installer_blockers(processes: &[GatewayProcess]) -> Vec<String> {
     processes.iter().map(|process| {
+        if process.path.is_none() || process.is_host_daemon.is_none() {
+            return format!("Could not inspect {} to determine whether its session is idle. Installation is deferred; retry when process inspection is available", label_process(process));
+        }
         let client = process.parent.as_ref()
             .map(|parent| format!("{} (pid {})", parent.basename, parent.pid))
             .unwrap_or_else(|| "an unidentified client or service".into());
         format!("{client}: {}. Close this client's MCP session, then retry; cancel to defer installation", label_process(process))
     }).collect()
+}
+
+fn installer_targets_process(
+    process: &GatewayProcess,
+    same_user_session: Option<bool>,
+    install_dir: &Path,
+    data_dir: Option<&Path>,
+) -> bool {
+    process.pid != std::process::id()
+        && same_user_session == Some(true)
+        && (process.path.is_none() || installer_owns_process(process, install_dir, data_dir))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn installer_same_user_session(pid: u32) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(format!("/proc/{pid}")).ok()?.uid();
+    // SAFETY: geteuid takes no arguments and has no failure mode.
+    Some(owner == unsafe { libc::geteuid() })
+}
+
+#[cfg(target_os = "macos")]
+fn installer_same_user_session(pid: u32) -> Option<bool> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "uid="])
+        .output()
+        .ok()?;
+    let owner = std::str::from_utf8(&output.stdout)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    // SAFETY: geteuid takes no arguments and has no failure mode.
+    Some(owner == unsafe { libc::geteuid() })
+}
+
+#[cfg(windows)]
+fn installer_same_user_session(pid: u32) -> Option<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        EqualSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe fn user_token(process: HANDLE) -> Option<Vec<usize>> {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let mut size = 0;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut size);
+        let mut buffer = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+        let ok = size != 0
+            && GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                size,
+                &mut size,
+            ) != 0;
+        CloseHandle(token);
+        ok.then_some(buffer)
+    }
+    // SAFETY: valid output buffers and handles; both tokens and the process handle
+    // are closed, and SID pointers stay inside their aligned buffers during comparison.
+    unsafe {
+        let mut current_session = 0;
+        let mut session = 0;
+        if ProcessIdToSessionId(std::process::id(), &mut current_session) == 0
+            || ProcessIdToSessionId(pid, &mut session) == 0
+        {
+            return None;
+        }
+        if current_session != session {
+            return Some(false);
+        }
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let user = user_token(process);
+        CloseHandle(process);
+        let user = user?;
+        let current = user_token(GetCurrentProcess())?;
+        Some(
+            EqualSid(
+                (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid,
+                (*(current.as_ptr().cast::<TOKEN_USER>())).User.Sid,
+            ) != 0,
+        )
+    }
+}
+
+fn installer_process_inventory() -> Vec<GatewayProcess> {
+    #[cfg(windows)]
+    {
+        windows_list_gateway_processes()
+    }
+    #[cfg(not(windows))]
+    {
+        list_gateway_processes()
+    }
 }
 
 /// Refuse manual installation while a client gateway is open. Only authenticated
@@ -1041,19 +1148,27 @@ pub fn installer_preflight(install_dir: &Path) -> Result<(), Vec<String>> {
     }
     let data_dir = crate::registry::conduit_dir();
     let inventory = || {
-        list_gateway_processes()
+        installer_process_inventory()
             .into_iter()
             .filter(|process| {
-                process.pid != std::process::id()
-                    && (process.path.is_none()
-                        || installer_owns_process(process, install_dir, data_dir.as_deref()))
+                installer_targets_process(
+                    process,
+                    installer_same_user_session(process.pid),
+                    install_dir,
+                    data_dir.as_deref(),
+                )
             })
             .collect::<Vec<_>>()
     };
-    let initial = inventory();
+    #[allow(unused_mut)]
+    let mut initial = inventory();
     if initial.is_empty() {
         return Ok(());
     }
+    // Probe command lines once. Subsequent native inventories only verify exit;
+    // cold PowerShell/CIM startup must not consume every shutdown poll's budget.
+    #[cfg(windows)]
+    windows_assign_daemon_roles(&mut initial);
     // A stdio adapter, private host or old gateway is an open client connection.
     // Unknown command lines cannot be treated as idle.
     if initial
@@ -1069,7 +1184,15 @@ pub fn installer_preflight(install_dir: &Path) -> Result<(), Vec<String>> {
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
-        let remaining = inventory();
+        let mut remaining = inventory();
+        for process in &mut remaining {
+            if let Some(previous) = initial
+                .iter()
+                .find(|previous| previous.pid == process.pid && previous.path == process.path)
+            {
+                process.is_host_daemon = previous.is_host_daemon;
+            }
+        }
         if remaining.is_empty() {
             return Ok(());
         }
@@ -1578,7 +1701,18 @@ fn daemon_roles_from_cim_json(
 
 #[cfg(windows)]
 fn list_gateway_processes() -> Vec<GatewayProcess> {
-    windows_list_gateway_processes()
+    let mut processes = windows_list_gateway_processes();
+    windows_assign_daemon_roles(&mut processes);
+    processes
+}
+
+#[cfg(windows)]
+fn windows_assign_daemon_roles(processes: &mut [GatewayProcess]) {
+    let pids: Vec<u32> = processes.iter().map(|process| process.pid).collect();
+    let roles = windows_gateway_daemon_roles(&pids);
+    for process in processes {
+        process.is_host_daemon = roles.get(&process.pid).copied().flatten();
+    }
 }
 
 #[cfg(windows)]
@@ -1644,13 +1778,10 @@ fn windows_list_gateway_processes() -> Vec<GatewayProcess> {
             }
         }
         CloseHandle(snap);
-        let candidate_pids: Vec<u32> = out.iter().map(|(proc, _)| proc.pid).collect();
-        let roles = windows_gateway_daemon_roles(&candidate_pids);
         // Resolve after the walk: a parent can appear later in the snapshot than
         // its child, so this cannot be done inline.
         out.into_iter()
             .map(|(mut proc, ppid)| {
-                proc.is_host_daemon = roles.get(&proc.pid).copied().flatten();
                 proc.parent = names
                     .get(&ppid)
                     .filter(|_| windows_parent_predates_child(ppid, proc.pid))
@@ -2215,6 +2346,67 @@ mod tests {
         let blockers = installer_blockers(&[owned]);
         assert!(blockers[0].contains("Cursor (pid 42)"));
         assert!(blockers[0].contains("cancel to defer"));
+    }
+
+    #[test]
+    fn installer_ignores_other_users_and_sessions_even_when_paths_are_unreadable() {
+        let install = std::env::temp_dir().join("toolport-installer-scope");
+        let unreadable = proc(41, "toolport-gateway.exe", None);
+        assert!(!installer_targets_process(
+            &unreadable,
+            Some(false),
+            &install,
+            None
+        ));
+        assert!(installer_targets_process(
+            &unreadable,
+            Some(true),
+            &install,
+            None
+        ));
+        assert!(!installer_targets_process(
+            &unreadable,
+            None,
+            &install,
+            None
+        ));
+        let installed = proc(
+            42,
+            "toolport-gateway",
+            install
+                .join(format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX))
+                .to_str(),
+        );
+        assert!(!installer_targets_process(
+            &installed,
+            Some(false),
+            &install,
+            None
+        ));
+        assert!(installer_targets_process(
+            &installed,
+            Some(true),
+            &install,
+            None
+        ));
+        assert_eq!(installer_same_user_session(std::process::id()), Some(true));
+    }
+
+    #[test]
+    fn failed_role_inspection_does_not_claim_an_idle_client_is_open() {
+        let mut unknown = proc_with_parent(
+            41,
+            "toolport-gateway",
+            Some("/opt/toolport/toolport-gateway"),
+            42,
+            "Cursor",
+        );
+        unknown.is_host_daemon = None;
+        let blockers = installer_blockers(&[unknown]);
+        assert!(blockers[0].contains("Could not inspect"));
+        assert!(!blockers[0].contains("Close this client's MCP session"));
+        assert!(!blockers[0].contains("Cursor"));
+        assert!(daemon_roles_from_cim_json(&serde_json::Value::Null).is_empty());
     }
 
     #[test]

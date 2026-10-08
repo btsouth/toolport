@@ -16,6 +16,12 @@ Unicode true
 !include FileFunc.nsh
 !include "$tmp/hooks.nsh"
 !define ARCH "$arch"
+!define MAINBINARYNAME "conduit"
+!define PRODUCTNAME "Toolport"
+; The real bundle compiles Tauri's macro. This fixture checks hook ordering.
+!macro CheckIfAppIsRunning executableName productName
+  DetailPrint "Check running app: \${executableName}"
+!macroend
 Name "Toolport hook compile test"
 OutFile "$tmp/$arch.exe"
 InstallDir "\$LOCALAPPDATA\\ToolportHookTest"

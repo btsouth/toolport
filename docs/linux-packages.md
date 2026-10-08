@@ -13,8 +13,12 @@ The `.deb` keeps the 1.x Tauri package name `toolport`. Its higher 2.0 version
 causes an ordinary apt upgrade to replace 1.x without `Conflicts` or `Replaces`
 against itself. dpkg removes the old `Toolport.desktop` and `conduit.png` files.
 `/usr/bin/toolport` and `/usr/bin/conduit` become symlinks to `toolport-gtk` to
-preserve CLI and launch-at-login paths. Both shells use `~/.config/Toolport`;
-there are no maintainer scripts that rewrite user data or access a keyring.
+preserve CLI and launch-at-login paths. Both shells use `~/.config/Toolport`.
+Native package removal restores client configs through a bounded per-user
+cleanup helper; upgrades preserve connections. Debian's `remove in-favour`
+replacement also preserves connections. pacman supplies no replacement flag to
+`pre_remove`, so replacing `toolport` with a conflicting package such as
+`toolport-bin` disconnects clients too. Reconnect them in the replacement app.
 For a `.deb` update, download the new file from the release page and run
 `sudo apt install ./<file>.deb`; for an `.rpm`, run
 `sudo dnf install ./<file>.rpm`. There is no Toolport apt or dnf repository.

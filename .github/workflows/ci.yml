@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main, next/2.0]
+  workflow_dispatch:
 
 # A new push to a PR cancels the in-flight run for that ref.
 concurrency:
@@ -15,6 +16,42 @@ permissions:
   contents: read
 
 jobs:
+  windows-installer:
+    name: Windows NSIS bundle validation
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+          cache-bin: "false"
+          save-if: false
+      - run: npm ci
+      # Same bundle command as Release; artifacts stay in CI and are not published.
+      - name: Build the real NSIS installer
+        run: npx tauri build --config src-tauri/tauri.bundle.conf.json --bundles nsis -- --bin conduit
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      - name: Check shipped contents
+        shell: bash
+        run: node .github/scripts/package-contents.mjs src-tauri/target/release/bundle/nsis/*-setup.exe
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-nsis-validation
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe*
+          if-no-files-found: error
+          retention-days: 7
+
   linux-packages:
     name: GTK deb and rpm install tests
     needs: changes

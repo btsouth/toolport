@@ -24,15 +24,24 @@
     File /oname=$PLUGINSDIR\toolport-preflight.exe "${TOOLPORT_HOOK_DIR}\binaries\toolport-gateway-i686-pc-windows-msvc.exe"
   !endif
   toolport_preflight_retry:
-    nsExec::ExecToStack /TIMEOUT=15000 '"$PLUGINSDIR\toolport-preflight.exe" --installer-preflight "$INSTDIR"'
+    nsExec::ExecToStack /TIMEOUT=60000 '"$PLUGINSDIR\toolport-preflight.exe" --installer-preflight "$INSTDIR"'
     Pop $0
     Pop $1
     ${If} $0 != 0
+      ${If} $1 == ""
+        StrCpy $1 "Toolport could not finish checking client sessions ($0). Installation has been deferred. Try again after closing affected clients."
+      ${EndIf}
       DetailPrint "$1"
-      IfSilent toolport_preflight_defer
-      ${If} $PassiveMode = 1
+      ; The updater has already exited Toolport. Restore it on every deferred
+      ; update/passive run, including silent mode, before leaving the installer.
+      ${If} $UpdateMode = 1
+      ${OrIf} $PassiveMode = 1
+        Exec '"$INSTDIR\${MAINBINARYNAME}.exe"'
+        IfSilent toolport_preflight_defer
+        MessageBox MB_OK|MB_ICONEXCLAMATION "$1$\r$\nInstallation has been deferred and Toolport has been reopened."
         Goto toolport_preflight_defer
       ${EndIf}
+      IfSilent toolport_preflight_defer
       MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "$1$\r$\nClose the affected clients and Retry, or Cancel to install later." IDRETRY toolport_preflight_retry
       toolport_preflight_defer:
         SetErrorLevel 1
@@ -51,6 +60,9 @@
     Goto toolport_cleanup_done
   ${EndIf}
   ${If} $UpdateMode != 1
+    ; The template checks again after this hook, but cancellation must precede
+    ; disconnecting clients while the gateway binary still exists.
+    !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
     nsExec::ExecToLog /TIMEOUT=30000 '"$INSTDIR\toolport-gateway.exe" --disconnect-all'
     Pop $0
     ${If} $0 != 0
