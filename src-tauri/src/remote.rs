@@ -2238,8 +2238,8 @@ mod tests {
             secrets::tests::with_isolated_vault(|| {
                 let endpoint = RotatingEndpoint::new();
                 endpoint.seed();
+                let barrier = std::sync::Barrier::new(3);
                 std::thread::scope(|scope| {
-                    let barrier = std::sync::Barrier::new(3);
                     let callers: Vec<_> = (0..2)
                         .map(|_| {
                             let barrier = &barrier;
