@@ -490,7 +490,7 @@ fn build_window(
     state.attach(&window);
     approval_page.attach(&window);
     teams_page.attach_background_sync(&window);
-    onboarding::install(app, &window, client_page);
+    onboarding::install(app, &window);
     if std::env::var_os("TOOLPORT_DEBUG_MEASURE").is_none() {
         start_startup_reap(app, bridge_for_reap, server_page_for_reap);
     }

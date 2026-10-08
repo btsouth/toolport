@@ -287,6 +287,11 @@ pub(super) fn connect(
                 .await;
         match preview {
             Ok(Ok(preview)) => {
+                let client_name = crate::clients::detect_clients()
+                    .into_iter()
+                    .find(|client| client.id == client_id)
+                    .map(|client| client.name)
+                    .unwrap_or_else(|| "Client".into());
                 let disclosure = format!("Config: {}\nBackup directory: {}\nSelected entries move after gateway verification. Unchecked entries and plugin servers stay in place.{}", preview.config_path, preview.backup_dir, if force { " This replaces the customized Toolport entry." } else { "" });
                 review(
                     &parent,
@@ -303,7 +308,9 @@ pub(super) fn connect(
                             &preview.revision,
                         )?;
                         Ok(Completion {
-                            message: "Client connected. Restart it to load Toolport.".into(),
+                            message: format!(
+                                "{client_name} connected. Restart it to load Toolport."
+                            ),
                             servers: outcome.servers,
                             tools: outcome.tools,
                             backup: outcome.result.outcome.backup,
