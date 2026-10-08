@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ClientDetail } from "./ClientDetail";
+import { importServers, previewImportServers } from "@/lib/api";
 import type { DetectedClient, Registry } from "@/lib/types";
 
 const installGateway = vi.fn();
@@ -75,11 +76,40 @@ function emptyRegistry(): Registry {
 }
 
 beforeEach(() => {
+  vi.mocked(importServers).mockReset();
+  vi.mocked(previewImportServers).mockReset().mockResolvedValue([]);
   installGateway.mockReset();
   uninstallGateway.mockReset();
   migrateClient.mockReset();
   toastSuccess.mockReset();
   toastError.mockReset();
+});
+
+it("imports the reviewed definition when another client has the same server name", async () => {
+  const server = {
+    name: "calendar",
+    transport: "stdio",
+    command: "calendar-mcp",
+    args: ["--workspace", "reviewed"],
+    envKeys: [],
+    url: null,
+  };
+  vi.mocked(previewImportServers).mockResolvedValue([
+    { ...server, args: ["--workspace", "other"], key: "other-client", isNew: true },
+    { ...server, key: "reviewed-client", isNew: true },
+  ]);
+  vi.mocked(importServers).mockResolvedValue(emptyRegistry());
+  render(
+    <ClientDetail
+      client={client({ servers: [server] })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await userEvent.click(screen.getByRole("button", { name: /^Import$/ }));
+  await userEvent.click(screen.getByRole("button", { name: /^Import 1 server$/ }));
+  await waitFor(() => expect(importServers).toHaveBeenCalledWith(["reviewed-client"]));
 });
 
 describe("ClientDetail detection errors", () => {

@@ -264,7 +264,13 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
 
   async function importOne(server: McpServer) {
     const review = await previewImportServers();
-    const candidate = review.find((item) => item.name === server.name);
+    const candidate = review.find(
+      (item) =>
+        item.name === server.name &&
+        item.command === server.command &&
+        item.url === server.url &&
+        JSON.stringify(item.args) === JSON.stringify(server.args),
+    );
     if (!candidate?.key)
       throw new Error("Server changed. Refresh the client and review again.");
     const next = await importServers([candidate.key]);
