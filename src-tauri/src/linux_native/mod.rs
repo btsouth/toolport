@@ -9487,6 +9487,16 @@ mod tests {
     }
 
     #[test]
+    fn p08b_r1_hyphenated_activity_filter_uses_one_server() {
+        let _env = crate::registry::DataDirTestEnv::new("p08b-r1-gtk-filter");
+        crate::audit::record_routed_call(&crate::registry::Registry::default(), "team-slack", "read", true, Some(850), None, Some("adapter:claude-code"), None, None, None, None);
+        crate::audit::record_decision("team-slack", "delete", Some("adapter:claude-code"), None, "destructive", "denied", &serde_json::json!({}), Some(1500));
+        let snapshot = state::load_activity_snapshot().unwrap();
+        assert_eq!(activity_server_filter_options(&snapshot.recent), vec!["All servers", "team_slack"]);
+        assert_eq!(filter_calls(&snapshot.recent, Some("team_slack"), false).len(), snapshot.recent.len());
+    }
+
+    #[test]
     fn call_filters_compose_server_and_errors_only() {
         let calls = [
             call("github", true),
