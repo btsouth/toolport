@@ -242,6 +242,8 @@ pub(super) fn review(
                         .icon_name("emblem-ok-symbolic")
                         .title(&outcome.message)
                         .build();
+                    status.add_css_class("compact");
+                    status.set_vexpand(false);
                     body.prepend(&status);
                     let results = gtk::ListBox::new();
                     results.add_css_class("boxed-list");
