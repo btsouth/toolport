@@ -1634,11 +1634,9 @@ impl ServerPage {
             return;
         }
 
-        let mut servers = snapshot.servers.iter().collect::<Vec<_>>();
-        servers.sort_by_key(|server| server_order_key(server));
         // Turned-off servers get their own group below the running ones, so a
         // disabled server never reads as one that is merely still loading.
-        let (on, off): (Vec<_>, Vec<_>) = servers.into_iter().partition(|server| server.enabled);
+        let (on, off) = server_groups(&snapshot.servers);
         let mut rows = Vec::with_capacity(on.len() + off.len());
         for server in on {
             let card = server_card(server, &snapshot.active_profile_id, self.clone());
@@ -6837,7 +6835,13 @@ fn posture_line(ready: usize, auth: usize, errors: usize, pending: usize, total:
     parts.join(" · ")
 }
 
-/// Enabling or probing servers must not move the next toggle target.
+fn server_groups(servers: &[state::ServerView]) -> (Vec<&state::ServerView>, Vec<&state::ServerView>) {
+    let mut servers = servers.iter().collect::<Vec<_>>();
+    servers.sort_by_key(|server| server_order_key(server));
+    servers.into_iter().partition(|server| server.enabled)
+}
+
+/// Keep alphabetical order within each group regardless of review or probe state.
 fn server_order_key(server: &state::ServerView) -> (String, String) {
     (server.name.to_lowercase(), server.id.clone())
 }
@@ -9957,6 +9961,23 @@ mod tests {
             probe_status_line(&probe(false, 0, false)),
             ("Error".to_string(), "error")
         );
+    }
+
+    #[test]
+    fn server_groups_keep_enabled_and_turned_off_alphabetical() {
+        let zulu = server("Zulu", "Remote HTTP");
+        let mut beta = server("beta", "Local command");
+        beta.enabled = false;
+        beta.requires_review = true;
+        let alpha = server("Alpha", "Remote HTTP");
+        let mut aardvark = server("Aardvark", "Remote HTTP");
+        aardvark.enabled = false;
+        let servers = [zulu, beta, alpha, aardvark];
+        let (on, off) = server_groups(&servers);
+        let on_names = on.iter().map(|server| server.name.as_str()).collect::<Vec<_>>();
+        let off_names = off.iter().map(|server| server.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(on_names, ["Alpha", "Zulu"]);
+        assert_eq!(off_names, ["Aardvark", "beta"]);
     }
 
     #[test]
