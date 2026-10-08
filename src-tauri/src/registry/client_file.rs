@@ -283,13 +283,19 @@ pub(crate) fn commit(path: &Path, expected: &Revision, output: Option<&str>) -> 
     if use_exchange && exchange(&tmp, &dest, &displaced)? {
         // From here cleanup must never delete unverified displaced bytes.
         cleanup.disarm();
-        let old = read(&displaced)?;
-        if old.text != expected.text {
+        let matches = fs::symlink_metadata(&displaced).is_ok_and(|meta| meta.is_file())
+            && read(&displaced).is_ok_and(|old| old.text == expected.text);
+        if !matches {
             #[cfg(windows)]
             let rollback_displaced = sibling(&dest);
             #[cfg(not(windows))]
             let rollback_displaced = displaced.clone();
-            if !exchange(&displaced, &dest, &rollback_displaced)? {
+            if !exchange(&displaced, &dest, &rollback_displaced).map_err(|error| {
+                format!(
+                    "Could not reverse exchange: {error}; config retained at {}",
+                    displaced.display()
+                )
+            })? {
                 return Err(format!(
                     "Could not reverse exchange; config retained at {}",
                     displaced.display()
@@ -342,7 +348,7 @@ fn remove(dest: &Path, expected: &Revision) -> Result<(), String> {
         }
     })?;
     // No cleanup guard: unreadable or conflicting bytes must stay recoverable.
-    if read(&tombstone)?.text != expected.text {
+    if !read(&tombstone).is_ok_and(|old| old.text == expected.text) {
         // A no-clobber restore also preserves a new save at the original path.
         match fs::hard_link(&tombstone, dest) {
             Ok(()) => {
@@ -432,6 +438,34 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), "client save");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn replacement_during_final_read_is_detected_by_exchange() {
+        let (dir, path) = fixture();
+        let revision = read(&path).unwrap();
+        HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(("read", Box::new(|path| replace(path, "client save"))))
+        });
+        assert_eq!(
+            commit(&path, &revision, Some("toolport edit")).unwrap_err(),
+            CHANGED
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "client save");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn interrupted_native_utf8_save_is_restored_after_exchange() {
+        let (dir, path) = fixture();
+        let revision = read(&path).unwrap();
+        HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(("commit", Box::new(|path| fs::write(path, [0xff]).unwrap())))
+        });
+        assert_eq!(
+            commit(&path, &revision, Some("toolport edit")).unwrap_err(),
+            CHANGED
+        );
+        assert_eq!(fs::read(&path).unwrap(), [0xff]);
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
