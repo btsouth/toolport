@@ -91,7 +91,11 @@ impl CatalogPage {
             .hexpand(true)
             .css_classes(["toolport-search"])
             .build();
-        page.append(&search);
+        // A layout-managed parent allocates the popover's native surface.
+        // SearchEntry allocates only its own text and icons.
+        let search_row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        search_row.append(&search);
+        page.append(&search_row);
         let suggestion_list = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let suggestion_popover = gtk::Popover::new();
         suggestion_popover.add_css_class("toolport-catalog-suggestions");
@@ -103,7 +107,7 @@ impl CatalogPage {
         // typing or Backspace from their entry.
         suggestion_popover.set_autohide(false);
         suggestion_popover.set_child(Some(&suggestion_list));
-        suggestion_popover.set_parent(&search);
+        suggestion_popover.set_parent(&search_row);
         let feedback = gtk::Label::builder()
             .halign(gtk::Align::Fill)
             .xalign(0.0)
