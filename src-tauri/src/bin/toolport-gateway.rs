@@ -26142,6 +26142,7 @@ mod tests {
 
         assert_eq!(entry["client"], "client:c1");
         assert_eq!(entry["clientName"], "Cursor");
+        assert_eq!(entry["clientLabel"], "test 0");
 
         drop(_data_dir);
         assert!(conduit_lib::telemetry::retire_dir_for_test(
