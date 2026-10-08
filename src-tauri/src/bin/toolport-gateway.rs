@@ -15098,18 +15098,18 @@ fn process_request_wire(
                 base
             };
             (router, cache_snapshot) = catalog_for_view(rooted);
-            // Profile snapshots already reflect the live router. Only repair the
-            // shared cache when publication has not yet added this server's tools.
-            if !daemon_adapter
-                && search_server.is_some_and(|server| {
-                    let prefix = format!("{}__", sanitize_segment(server));
-                    !cache_snapshot.tools.iter().any(|tool| {
-                        tool.get("name")
-                            .and_then(Value::as_str)
-                            .is_some_and(|name| name.starts_with(&prefix))
-                    })
+            // Profile snapshots already reflect the live router. Cold lists need
+            // the shared cache's live fallback; warm scoped search only needs it
+            // when publication has not yet added this server's tools.
+            let search_cache_lag = search_server.is_some_and(|server| {
+                let prefix = format!("{}__", sanitize_segment(server));
+                !cache_snapshot.tools.iter().any(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.starts_with(&prefix))
                 })
-            {
+            });
+            if !daemon_adapter && (cold && method == "tools/list" || search_cache_lag) {
                 cache_snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
             }
             // Do not wait on rebuild_lock after the deadline: a slow publisher
