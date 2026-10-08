@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { Check, Globe, Loader2, Monitor, ShieldAlert, Trash2, X } from "lucide-react";
+import { Check, Globe, Loader2, ShieldAlert, Trash2, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { decideApproval, listPendingApprovals, type ApprovalScope } from "@/lib/api";
 import type { PendingApproval } from "@/lib/types";
 import { openExternal } from "@/lib/openUrl";
+import { trustedClientName, shortenClientLabel } from "@/lib/clientIdentity";
 import { toastError } from "@/lib/toast";
 
 /** Fail-closed window (must match approval::DEFAULT_TIMEOUT_SECS on the gateway). A
@@ -179,6 +180,8 @@ export function PendingApprovals() {
         <ul className="max-h-[70vh] divide-y divide-border/60 overflow-auto">
           {pending.map((a) => {
             const reason = REASON[a.reason];
+            const clientName = trustedClientName(a);
+            const reportedLabel = a.clientLabel && a.clientLabel !== clientName ? a.clientLabel : null;
             const urlElicitation = a.urlElicitation;
             const piiRelease = a.piiRelease;
             // Count down to the broker's authoritative deadline; fall back to
@@ -215,22 +218,21 @@ export function PendingApprovals() {
                         </>
                       )}
                     </div>
-                    <div className="mt-1 min-w-0 text-xs text-muted-foreground">
-                      {a.client && (
-                        <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
-                          <Monitor className="size-3" />
-                          Requested by {a.client}
-                        </div>
-                      )}
-                      {a.clientLabel && (
-                        <div
-                          className="mt-1 break-words [overflow-wrap:anywhere]"
-                          dir="auto"
-                        >
-                          {a.clientLabel}
-                        </div>
-                      )}
+                    <div
+                      className="mt-1 text-xs"
+                      title={a.client ?? undefined}
+                    >
+                      {clientName} wants to run this · {a.reason === "destructive" ? "destructive tool" : a.reason === "destructive_and_untrusted" ? "destructive tool from an untrusted source" : a.reason === "pii_cross_server" ? "cross-server data release" : "untrusted source"}
                     </div>
+                    {reportedLabel && (
+                      <div
+                        className="mt-1 break-words text-xs text-muted-foreground [overflow-wrap:anywhere]"
+                        title={reportedLabel}
+                        dir="auto"
+                      >
+                        Reports itself as: {shortenClientLabel(reportedLabel, 60)}
+                      </div>
+                    )}
                   </div>
                   {urlElicitation ? (
                     <Badge className="bg-warning/15 text-warning">

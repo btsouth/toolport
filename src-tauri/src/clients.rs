@@ -1461,6 +1461,27 @@ fn scan_roo_code_plugins() -> Vec<McpServer> {
         .unwrap_or_default()
 }
 
+/// Resolve display identity only from Toolport-owned names, never clientInfo.
+/// Recorded friendly names remain authoritative for historical Activity rows.
+pub fn trusted_client_name(client: Option<&str>, recorded_name: Option<&str>) -> String {
+    if let Some(name) = recorded_name.filter(|name| !name.is_empty()) {
+        return name.to_string();
+    }
+    if let Some(id) = client.and_then(|client| client.strip_prefix("adapter:")) {
+        if let Some(def) = defs().into_iter().find(|def| def.id == id) {
+            return def.name.to_string();
+        }
+    }
+    if let Some(id) = client.and_then(|client| client.strip_prefix("client:")) {
+        if let Ok(registry) = crate::registry::load() {
+            if let Some(client) = registry.http_clients.iter().find(|client| client.id == id) {
+                return client.label.clone();
+            }
+        }
+    }
+    "An AI client".to_string()
+}
+
 fn defs() -> Vec<ClientDef> {
     vec![
         ClientDef {

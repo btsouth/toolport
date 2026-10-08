@@ -288,7 +288,8 @@ fn decision_entry(
     // `ok:true` throughout keeps governance outcomes (a deny, a timeout) out of the error rate.
     let mut entry = json!({
         "ts": epoch_millis() as u64,
-        "server": server,
+        "server": crate::router::sanitize_segment(server),
+        "serverId": server,
         "tool": tool,
         "ok": true,
         "held": decision != "approved",
@@ -500,7 +501,16 @@ pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|row| row["kind"] != "telemetry_gap")
         .take(limit)
+        .map(activity_client_name)
         .collect())
+}
+
+pub fn activity_client_name(mut entry: Value) -> Value {
+    entry["clientName"] = json!(crate::clients::trusted_client_name(
+        entry.get("client").and_then(Value::as_str),
+        entry.get("clientName").and_then(Value::as_str),
+    ));
+    entry
 }
 
 /// Average and 95th-percentile of a duration sample, in ms. `None` when the
@@ -822,6 +832,52 @@ fn csv_cell(value: Option<&Value>) -> String {
 mod tests {
 
     #[test]
+    fn p08b_r1_hyphenated_call_and_approval_share_activity_server() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("toolport-p08b-r1-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        record_routed_call(
+            &crate::registry::Registry::default(),
+            "team-slack",
+            "read",
+            true,
+            Some(850),
+            None,
+            Some("adapter:claude-code"),
+            None,
+            None,
+            None,
+            None,
+        );
+        record_decision(
+            "team-slack",
+            "delete",
+            Some("adapter:claude-code"),
+            None,
+            "destructive",
+            "denied",
+            &json!({}),
+            Some(1500),
+        );
+        let rows = read_recent(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row["server"], "team_slack");
+            assert_eq!(row["serverId"], "team-slack");
+            assert_eq!(row["clientName"], "Claude Code");
+        }
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["server"].as_str().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn retained_telemetry_gaps_warn_after_daemon_exit_without_fake_calls() {
         let _lock = crate::registry::data_dir_test_lock();
         let dir = std::env::temp_dir().join(format!("toolport-gap-history-{}", std::process::id()));
@@ -1129,9 +1185,7 @@ mod tests {
         );
         // This storage-content test must confirm its FIFO barrier before claiming
         // completion. It does not exercise the interactive reader's 500ms budget.
-        assert!(crate::telemetry::flush_for_test(
-            std::time::Duration::from_secs(5)
-        ));
+        assert!(crate::telemetry::flush_for_test(std::time::Duration::from_secs(5)));
         std::fs::write(done, "done").expect("signal sentinel append complete");
     }
 
@@ -1232,9 +1286,7 @@ mod tests {
             }
             // The parent reads only after this process exits, so land every queued
             // line here instead of relying on the writer's next interval.
-            assert!(crate::telemetry::flush_for_test(
-                std::time::Duration::from_secs(5)
-            ));
+            assert!(crate::telemetry::flush_for_test(std::time::Duration::from_secs(5)));
             return;
         }
 

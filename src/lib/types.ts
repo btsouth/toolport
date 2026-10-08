@@ -458,6 +458,7 @@ export interface FolderProfile {
 /** A tool call held awaiting a human decision (the HITL approval queue). */
 export interface PendingApproval {
   id: string;
+  clientName?: string;
   client: string | null;
   /** Untrusted initialize clientInfo label. */
   clientLabel?: string | null;

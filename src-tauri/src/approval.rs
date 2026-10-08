@@ -95,14 +95,55 @@ pub struct PiiReleaseValue {
     pub origins: Vec<String>,
 }
 
-/// Client-reported text is display-only. Strip controls and direction changes and
-/// bound Unicode characters before it reaches a prompt, notification, or audit row.
+/// Client-reported text is display-only. Bound both its stored bytes and visible
+/// characters, and remove formatting that can disguise the trusted requester.
 pub fn sanitize_client_label(text: &str) -> Option<String> {
-    let label: String = text.chars().filter(|c| {
-        !c.is_control() && !matches!(*c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
-    }).take(120).collect();
-    let label = label.trim();
+    static FORMAT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let format =
+        FORMAT.get_or_init(|| regex::Regex::new(r"\p{Cf}").expect("Unicode format category"));
+    let mut label = String::new();
+    let mut chars = 0;
+    let mut marks = 0;
+    for mut c in text.chars() {
+        if c.is_whitespace() {
+            c = ' ';
+        } else if c.is_control() || format.is_match(c.encode_utf8(&mut [0; 4])) {
+            continue;
+        }
+        if c == ' ' && (label.is_empty() || label.ends_with(' ')) {
+            continue;
+        }
+        if unicode_normalization::char::is_combining_mark(c) {
+            marks += 1;
+            if marks > 2 {
+                continue;
+            }
+        } else {
+            marks = 0;
+        }
+        if chars == 120 || label.len() + c.len_utf8() > 200 {
+            break;
+        }
+        label.push(c);
+        chars += 1;
+    }
+    let label = label.trim_end();
     (!label.is_empty()).then(|| label.to_string())
+}
+
+/// Truncate display text without splitting a Unicode character.
+pub fn shorten_client_label(label: &str, limit: usize) -> String {
+    if label.chars().count() <= limit {
+        label.to_string()
+    } else {
+        format!(
+            "{}…",
+            label
+                .chars()
+                .take(limit.saturating_sub(1))
+                .collect::<String>()
+        )
+    }
 }
 
 pub fn client_info_label(params: Option<&serde_json::Value>) -> Option<String> {
@@ -1078,7 +1119,8 @@ mod client_label_tests {
         let long = "界".repeat(1000);
         let label =
             client_info_label(Some(&json!({"clientInfo":{"name":long,"version":"evil"}}))).unwrap();
-        assert_eq!(label.chars().count(), 120);
+        assert_eq!(label.chars().count(), 66);
+        assert!(label.len() <= 200);
         assert_eq!(
             client_info_label(Some(
                 &json!({"clientInfo":{"name":"\u{202e}\0","version":"1"}})
@@ -1099,5 +1141,69 @@ mod client_label_tests {
         let wire = serde_json::to_string(&req).unwrap();
         assert!(wire.contains("\\\"1\\\""));
         assert!(!wire.contains('\u{202e}'));
+    }
+}
+
+#[cfg(test)]
+mod p08b_revision_tests {
+    use super::*;
+
+    #[test]
+    fn p08b_r1_all_whitespace_collapses_and_format_characters_disappear() {
+        for c in [
+            '\t', '\n', '\r', '\u{85}', '\u{a0}', '\u{2028}', '\u{2029}', '\u{3000}',
+        ] {
+            assert_eq!(
+                sanitize_client_label(&format!("Claude{c}{c}Code")),
+                Some("Claude Code".into())
+            );
+        }
+        for c in [
+            '\u{ad}',
+            '\u{180e}',
+            '\u{fff9}',
+            '\u{fffa}',
+            '\u{fffb}',
+            '\u{e0001}',
+            '\u{e0020}',
+            '\u{e007f}',
+            '\u{202e}',
+            '\u{200b}',
+        ] {
+            assert_eq!(
+                sanitize_client_label(&format!("Claude{c} Code")),
+                Some("Claude Code".into())
+            );
+        }
+    }
+
+    #[test]
+    fn p08b_r1_combining_marks_and_utf8_bytes_are_bounded() {
+        assert_eq!(
+            sanitize_client_label("a\u{301}\u{302}\u{303}b\u{301}\u{302}\u{303}"),
+            Some("a\u{301}\u{302}b\u{301}\u{302}".into())
+        );
+        for c in ['a', '界', '🦀'] {
+            let label = sanitize_client_label(&c.to_string().repeat(300)).unwrap();
+            assert!(label.len() <= 200);
+            assert!(label.chars().count() <= 120);
+            assert_eq!(label.chars().count(), (200 / c.len_utf8()).min(120));
+        }
+    }
+
+    #[test]
+    fn p08b_r1_adapter_names_come_from_client_definitions() {
+        assert_eq!(
+            crate::clients::trusted_client_name(Some("adapter:claude-code"), None),
+            "Claude Code"
+        );
+        assert_eq!(
+            crate::clients::trusted_client_name(Some("adapter:unknown"), None),
+            "An AI client"
+        );
+        assert_eq!(
+            crate::clients::trusted_client_name(Some("adapter:claude-code"), Some("Recorded name")),
+            "Recorded name"
+        );
     }
 }

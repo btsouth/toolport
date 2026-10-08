@@ -130,15 +130,29 @@ describe("PendingApprovals refresh ordering", () => {
 describe("PendingApprovals client identity", () => {
   it("shows the authenticated client before an escaped secondary label", async () => {
     listPendingApprovals.mockResolvedValue([
-      { ...approval({ client: "client:c1" }), clientLabel: "<b>Claude Code</b> 1" },
+      { ...approval({ client: "client:c1", clientName: "Claude Code" }), clientLabel: "<b>Claude Code</b> 1" },
     ]);
     const { container } = render(<PendingApprovals />);
     await act(async () => {});
-    expect(screen.getByText("Requested by client:c1")).toBeInTheDocument();
-    expect(screen.getByText("<b>Claude Code</b> 1")).toBeInTheDocument();
+    expect(screen.getByText("Claude Code wants to run this · destructive tool")).toBeInTheDocument();
+    expect(screen.getByText("Reports itself as: <b>Claude Code</b> 1")).toBeInTheDocument();
     expect(container.querySelector("b")).toBeNull();
-    expect(container.textContent!.indexOf("client:c1")).toBeLessThan(
+    expect(container.textContent!.indexOf("Claude Code wants")).toBeLessThan(
       container.textContent!.indexOf("<b>Claude Code"),
     );
   });
+});
+
+
+it("omits a redundant report and limits long reports with a full tooltip", async () => {
+  const label = "界".repeat(70);
+  listPendingApprovals.mockResolvedValue([
+    approval({ id: "same", clientName: "Claude Code", clientLabel: "Claude Code" }),
+    approval({ id: "long", clientName: "Claude Code", clientLabel: label }),
+  ]);
+  render(<PendingApprovals />);
+  await act(async () => {});
+  const report = screen.getByText(/Reports itself as:/);
+  expect(report).toHaveAttribute("title", label);
+  expect(report.textContent).toBe(`Reports itself as: ${"界".repeat(59)}…`);
 });

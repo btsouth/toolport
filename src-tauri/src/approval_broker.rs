@@ -42,6 +42,7 @@ use crate::approval::{
 pub struct PendingView {
     pub id: String,
     pub client: Option<String>,
+    pub client_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_label: Option<String>,
     pub server: String,
@@ -746,6 +747,7 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, host: BrokerHost) {
     let view = PendingView {
         id: req.id.clone(),
         client: req.client.clone(),
+        client_name: crate::clients::trusted_client_name(req.client.as_deref(), None),
         client_label: req.client_label.clone(),
         server: req.server.clone(),
         tool: req.tool.clone(),
@@ -888,10 +890,39 @@ fn notification_host(host: BrokerHost, show: ShowPendingNotification) -> BrokerH
 }
 
 pub fn approval_requester(view: &PendingView) -> String {
-    let client = view.client.as_deref().unwrap_or("An AI client");
-    match view.client_label.as_deref() {
-        Some(label) => format!("{client} · {label}"),
-        None => client.to_string(),
+    let client =
+        crate::clients::trusted_client_name(view.client.as_deref(), Some(&view.client_name));
+    match view
+        .client_label
+        .as_deref()
+        .filter(|label| *label != client)
+    {
+        Some(label) => format!(
+            "{client} (reports: {})",
+            crate::approval::shorten_client_label(label, 40)
+        ),
+        None => client,
+    }
+}
+
+pub fn approval_notification(view: &PendingView) -> (&'static str, String) {
+    let who = approval_requester(view);
+    if let Some(elicitation) = &view.url_elicitation {
+        (
+            "Toolport: browser action required",
+            format!(
+                "{} needs a browser action. Requested by {who}. Review it in Toolport.",
+                elicitation.origin
+            ),
+        )
+    } else {
+        (
+            "Toolport: approval required",
+            format!(
+                "{} / {} needs approval. Requested by {who}.",
+                view.server, view.tool
+            ),
+        )
     }
 }
 
@@ -901,24 +932,7 @@ pub fn approval_requester(view: &PendingView) -> String {
 /// force-focus so we don't yank the user out of what they're doing.
 #[cfg(feature = "desktop")]
 fn notify_pending(app: &AppHandle, view: &PendingView, resolved: std::sync::mpsc::Receiver<()>) {
-    let who = approval_requester(view);
-    let (title, body) = if let Some(elicitation) = &view.url_elicitation {
-        (
-            "Toolport: browser action required",
-            format!(
-                "{who} requested a browser action for {}. Review it in Toolport.",
-                elicitation.origin
-            ),
-        )
-    } else {
-        (
-            "Toolport: approval required",
-            format!(
-                "{who} wants to run {} / {} - approve or deny it in Toolport.",
-                view.server, view.tool
-            ),
-        )
-    };
+    let (title, body) = approval_notification(view);
     show_pending_os_toast(
         cfg!(target_os = "linux"),
         resolved,
@@ -1062,6 +1076,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn p08b_r1_notification_puts_action_before_bounded_report() {
+        let view = PendingView {
+            id: "1".into(),
+            client: Some("adapter:claude-code".into()),
+            client_name: "Claude Code".into(),
+            client_label: Some("Claude Code 2.1.0".into()),
+            server: "github".into(),
+            tool: "delete_issue".into(),
+            tool_fingerprint: None,
+            reason: ApprovalReason::Destructive,
+            arguments: serde_json::json!({}),
+            url_elicitation: None,
+            pii_release: None,
+            deadline_ms: 0,
+        };
+        assert_eq!(approval_notification(&view).1, "github / delete_issue needs approval. Requested by Claude Code (reports: Claude Code 2.1.0).");
+        let mut view = view;
+        view.client_label = Some("Claude Code".into());
+        assert_eq!(approval_requester(&view), "Claude Code");
+        view.client_label = Some("界".repeat(80));
+        assert_eq!(
+            approval_requester(&view),
+            format!("Claude Code (reports: {}…)", "界".repeat(39))
+        );
+    }
+
+    #[test]
     fn p08_broker_read_timeout_is_timeout_and_eof_is_denied() {
         struct Timeout;
         impl Read for Timeout {
@@ -1109,6 +1150,7 @@ mod tests {
         other.id = "other".into();
         let view = |req: ApprovalRequest| PendingView {
             id: req.id,
+            client_name: crate::clients::trusted_client_name(req.client.as_deref(), None),
             client: req.client,
             client_label: req.client_label,
             server: req.server,
@@ -1205,6 +1247,7 @@ mod tests {
             id: id.into(),
             client: None,
             client_label: None,
+            client_name: "An AI client".into(),
             server: "s".into(),
             tool: "drop".into(),
             tool_fingerprint: Some("v2:abc".into()),

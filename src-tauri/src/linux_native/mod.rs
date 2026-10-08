@@ -4904,6 +4904,7 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     copy.append(
         &gtk::Label::builder()
             .label(detail.join(" · "))
+            .tooltip_text(activity.client_id.as_deref().unwrap_or(""))
             .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
@@ -5505,11 +5506,13 @@ fn approval_card(
     title_row.append(&deadline);
     card.append(&title_row);
 
-    let requester = view.client.as_deref().unwrap_or("An AI client");
+    let requester =
+        crate::clients::trusted_client_name(view.client.as_deref(), Some(&view.client_name));
     card.append(
         &gtk::Label::builder()
+            .tooltip_text(view.client.as_deref().unwrap_or(""))
             .label(format!(
-                "{requester} requested this action · {}",
+                "{requester} wants to run this · {}",
                 approval_reason(view.reason)
             ))
             .halign(gtk::Align::Start)
@@ -5519,10 +5522,15 @@ fn approval_card(
             .build(),
     );
 
-    if let Some(label) = view.client_label.as_deref() {
+    if let Some(label) = view
+        .client_label
+        .as_deref()
+        .filter(|label| *label != requester)
+    {
         card.append(
             &gtk::Label::builder()
-                .label(label)
+                .label(format!("Reports itself as: {}", crate::approval::shorten_client_label(label, 60)))
+                .tooltip_text(label)
                 .xalign(0.0)
                 .wrap(true)
                 .wrap_mode(gtk::pango::WrapMode::WordChar)
@@ -6766,23 +6774,8 @@ fn maybe_show_tray_hint(app: &adw::Application) {
 /// wording: a URL-elicitation request must say a browser interaction was asked
 /// for, not disguise itself as an ordinary tool call.
 fn approval_notification(view: &crate::approval_broker::PendingView) -> (String, String) {
-    let requester = crate::approval_broker::approval_requester(view);
-    if let Some(elicitation) = &view.url_elicitation {
-        return (
-            "Toolport: browser action required".to_string(),
-            format!(
-                "{requester} requested a browser action for {}. Review it in Toolport.",
-                elicitation.origin
-            ),
-        );
-    }
-    (
-        "Toolport: approval required".to_string(),
-        format!(
-            "{requester} wants to run {} / {} - approve or deny it in Toolport.",
-            view.server, view.tool
-        ),
-    )
+    let (title, body) = crate::approval_broker::approval_notification(view);
+    (title.to_string(), body)
 }
 
 fn approval_queue_notification(
@@ -9483,6 +9476,7 @@ mod tests {
             tool: "tool".to_string(),
             client: None,
             client_label: None,
+            client_id: None,
             ok,
             held: false,
             duration_ms: None,
@@ -9684,6 +9678,7 @@ mod tests {
             id: "1".into(),
             client: Some("claude".into()),
             client_label: None,
+            client_name: "Claude Code".into(),
             server: "github".into(),
             tool: "create_issue".into(),
             tool_fingerprint: None,
@@ -9697,8 +9692,7 @@ mod tests {
             approval_notification(&view),
             (
                 "Toolport: approval required".to_string(),
-                "claude wants to run github / create_issue - approve or deny it in Toolport."
-                    .to_string()
+                "github / create_issue needs approval. Requested by Claude Code.".to_string()
             )
         );
         view.url_elicitation = Some(crate::approval::UrlElicitationRequest {
@@ -9710,7 +9704,8 @@ mod tests {
             approval_notification(&view),
             (
                 "Toolport: browser action required".to_string(),
-                "claude requested a browser action for github. Review it in Toolport.".to_string()
+                "github needs a browser action. Requested by Claude Code. Review it in Toolport."
+                    .to_string()
             )
         );
 
@@ -9727,7 +9722,7 @@ mod tests {
             approval_queue_notification(&queue),
             Some((
                 "Toolport: 2 approvals required".to_string(),
-                "claude requested a browser action for github. Review it in Toolport. 1 more is waiting."
+                "github needs a browser action. Requested by Claude Code. Review it in Toolport. 1 more is waiting."
                     .to_string()
             ))
         );
