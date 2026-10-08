@@ -989,7 +989,10 @@ fn install_star_prompt(container: &gtk::Box) {
                         registry
                             .servers
                             .iter()
-                            .filter(|server| registry.is_enabled(&profile, &server.id))
+                            .filter(|server| {
+                                !crate::clients::is_gateway_server(server)
+                                    && registry.is_enabled(&profile, &server.id)
+                            })
                             .count()
                     })
                     .map(|enabled| {
