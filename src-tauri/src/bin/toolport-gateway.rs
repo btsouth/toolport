@@ -1556,6 +1556,7 @@ fn fetch_result_tool_def() -> Value {
 /// The fixed 2.0 agent-facing floor: the meta-tools every connection advertises,
 /// plus `toolport_run_script` only when Code Mode is on. Grouped discovery adds a
 /// per-server `help_<server>` browse tool on top of this.
+#[cfg(test)]
 fn floor_tool_defs(host: &HostState) -> Vec<Value> {
     floor_tool_defs_with_code_mode(host.code_mode_enabled())
 }
@@ -1819,6 +1820,7 @@ fn help_tool_def(prefix: &str, tool_count: usize) -> Value {
 /// The tool set advertised in lazy mode: the fixed agent-facing floor, plus
 /// (in grouped mode) one `help_<server>` browse tool per server. `catalog` must
 /// already be scoped to the calling client.
+#[cfg(test)]
 fn grouped_tool_defs(host: &HostState, catalog: &[Value]) -> Vec<Value> {
     grouped_tool_defs_with_code_mode(host.code_mode_enabled(), catalog)
 }
@@ -4216,18 +4218,7 @@ fn execute_call(
                     conduit_lib::rate_limits::check_and_count(&team.rate_limits, server_id, tool)
                 {
                     // Count as a failed call with a clear reason so Activity / export show the block.
-                    audit::record_routed_call(
-                        reg,
-                        server_id,
-                        tool,
-                        false,
-                        None,
-                        Some("rate_limit"),
-                        client,
-                        client_name,
-                        None,
-                        None,
-                    );
+                    audit::record_routed_call(reg, server_id, tool, false, None, Some("rate_limit"), client, client_name, None, None);
                     return json!({
                         "content": [{ "type": "text", "text": msg }],
                         "isError": true
@@ -9335,9 +9326,8 @@ type IntegrityCheckFailure = (String, BTreeSet<String>);
 /// prove the drifted definition is never published in the first place. Registered and
 /// consumed on one thread, so a parallel test's gate cannot trigger it.
 #[cfg(test)]
-static INTEGRITY_GATE_OBSERVER: Mutex<
-    Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>,
-> = Mutex::new(None);
+static INTEGRITY_GATE_OBSERVER: Mutex<Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>> =
+    Mutex::new(None);
 
 #[cfg(test)]
 fn observe_integrity_gate() {
@@ -14815,6 +14805,10 @@ fn process_request_wire(
                 .map(|hint| CacheHint::local(LOCAL_CACHE_TTL_MS).merge(hint))
                 .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS))
         };
+        gtrace(&format!(
+            "tools/list -> {} tools ({discovery:?}, serialized cache)",
+            exposed.tool_count()
+        ));
         let envelope = success(
             req["id"].clone(),
             cacheable_for_upstream(
@@ -17892,7 +17886,12 @@ fn proxy_public_http_connection(
     }
     // The daemon detects the public caller's full socket close. Keep the write
     // side open during the relay so waiting callers do not appear abandoned.
-    let _ = relay_http_response(&mut client, &mut upstream, Arc::new(|| {}), Arc::new(|| {}));
+    let _ = relay_http_response(
+        &mut client,
+        &mut upstream,
+        Arc::new(|| {}),
+        Arc::new(|| {}),
+    );
 }
 
 /// The desktop keeps this lightweight public listener as its child. The heavy
@@ -18686,10 +18685,7 @@ fn handle_connection(
         ),
         (b"Access-Control-Allow-Headers", allow_headers.as_bytes()),
         // Browser clients need session identity and untrusted-data provenance.
-        (
-            b"Access-Control-Expose-Headers",
-            EXPOSED_HTTP_HEADERS.as_bytes(),
-        ),
+        (b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()),
     ];
     for (name, value) in cors {
         // Skip a header that won't encode rather than panicking the thread.
@@ -18966,13 +18962,11 @@ fn main() {
                         "{}",
                         serde_json::to_string(&results).expect("serializable disconnect results")
                     );
-                    conduit_lib::telemetry::exit_with(
-                        if results.iter().any(|result| result.error.is_some()) {
-                            1
-                        } else {
-                            0
-                        },
-                    );
+                    conduit_lib::telemetry::exit_with(if results.iter().any(|result| result.error.is_some()) {
+                        1
+                    } else {
+                        0
+                    });
                 }
                 Err(error) => {
                     eprintln!("toolport-gateway --disconnect-all: {error}");
@@ -25732,7 +25726,14 @@ mod tests {
 
         let listener_inflight = Arc::clone(&inflight);
         std::thread::spawn(move || {
-            serve_http_loop_with_inflight(server, state, None, search, true, listener_inflight)
+            serve_http_loop_with_inflight(
+                server,
+                state,
+                None,
+                search,
+                true,
+                listener_inflight,
+            )
         });
         std::thread::sleep(Duration::from_millis(50));
 
@@ -34532,11 +34533,7 @@ mod tests {
             (**guard).clone()
         };
 
-        fail_closed_integrity_catalog(
-            &mut live,
-            Some("sbs714-gateway"),
-            set_of(&["srv__new_drift"]),
-        );
+        fail_closed_integrity_catalog(&mut live, Some("sbs714-gateway"), set_of(&["srv__new_drift"]));
 
         assert_eq!(
             live.quarantined(),
