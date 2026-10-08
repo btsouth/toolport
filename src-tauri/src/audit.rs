@@ -152,6 +152,7 @@ pub fn record_routed_call(
     error: Option<&str>,
     client: Option<&str>,
     client_name: Option<&str>,
+    client_label: Option<&str>,
     args_hash: Option<&str>,
     pii: Option<PiiPass>,
 ) {
@@ -166,6 +167,9 @@ pub fn record_routed_call(
         args_hash,
         pii,
     );
+    if let Some(label) = client_label.and_then(crate::approval::sanitize_client_label) {
+        entry["clientLabel"] = json!(label);
+    }
     if let Err(error) = crate::team_activity::record(reg, server_id, ok) {
         eprintln!("Toolport: Teams activity could not be persisted: {error}");
     }
@@ -284,7 +288,8 @@ fn decision_entry(
     // `ok:true` throughout keeps governance outcomes (a deny, a timeout) out of the error rate.
     let mut entry = json!({
         "ts": epoch_millis() as u64,
-        "server": server,
+        "server": crate::router::sanitize_segment(server),
+        "serverId": server,
         "tool": tool,
         "ok": true,
         "held": decision != "approved",
@@ -307,16 +312,18 @@ fn decision_entry(
 /// Record a gated HITL decision (the human approved/denied it, it timed out, or the
 /// broker was unreachable). Replaces the flat `record_held` on the approval path so the
 /// audit can distinguish the outcomes. Hashes the arguments; never stores them raw.
+#[allow(clippy::too_many_arguments)]
 pub fn record_decision(
     server: &str,
     tool: &str,
     client: Option<&str>,
+    client_label: Option<&str>,
     reason: &str,
     decision: &str,
     args: &Value,
     held_ms: Option<u64>,
 ) {
-    write_line(&decision_entry(
+    let mut entry = decision_entry(
         server,
         tool,
         client,
@@ -324,7 +331,12 @@ pub fn record_decision(
         decision,
         &args_hash(args),
         held_ms,
-    ));
+    );
+    if let Some(label) = client_label.and_then(crate::approval::sanitize_client_label) {
+        entry["clientLabel"] = json!(label);
+    }
+    entry["serverId"] = json!(server);
+    write_line(&entry);
 }
 
 /// A stable SHA-256 (hex) of a call's arguments over a canonical JSON serialization
@@ -489,7 +501,19 @@ pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|row| row["kind"] != "telemetry_gap")
         .take(limit)
+        .map(activity_client_name)
         .collect())
+}
+
+pub fn activity_client_name(mut entry: Value) -> Value {
+    if !entry.is_object() {
+        return entry;
+    }
+    entry["clientName"] = json!(crate::clients::trusted_client_name(
+        entry.get("client").and_then(Value::as_str),
+        entry.get("clientName").and_then(Value::as_str),
+    ));
+    entry
 }
 
 /// Average and 95th-percentile of a duration sample, in ms. `None` when the
@@ -767,6 +791,7 @@ const CSV_COLUMNS: &[&str] = &[
     "piiReplaced",
     "piiIncomplete",
     "clientName",
+    "clientLabel",
 ];
 
 /// Render audit `entries` as CSV (RFC-4180-ish: CRLF rows, quoted cells, doubled
@@ -808,6 +833,52 @@ fn csv_cell(value: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn p08b_r1_hyphenated_call_and_approval_share_activity_server() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("toolport-p08b-r1-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        record_routed_call(
+            &crate::registry::Registry::default(),
+            "team-slack",
+            "read",
+            true,
+            Some(850),
+            None,
+            Some("adapter:claude-code"),
+            None,
+            None,
+            None,
+            None,
+        );
+        record_decision(
+            "team-slack",
+            "delete",
+            Some("adapter:claude-code"),
+            None,
+            "destructive",
+            "denied",
+            &json!({}),
+            Some(1500),
+        );
+        let rows = read_recent(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row["server"], "team_slack");
+            assert_eq!(row["serverId"], "team-slack");
+            assert_eq!(row["clientName"], "Claude Code");
+        }
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["server"].as_str().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn retained_telemetry_gaps_warn_after_daemon_exit_without_fake_calls() {
@@ -928,7 +999,7 @@ mod tests {
         })];
         let csv = to_csv(&entries);
         assert!(csv.starts_with(
-            "ts,server,tool,client,ok,held,kind,reason,decision,argsHash,durationMs,heldMs,action,error,piiReplaced,piiIncomplete,clientName\r\n"
+            "ts,server,tool,client,ok,held,kind,reason,decision,argsHash,durationMs,heldMs,action,error,piiReplaced,piiIncomplete,clientName,clientLabel\r\n"
         ));
         assert!(csv.contains("\"gh\""));
         assert!(csv.contains("\"search\""));

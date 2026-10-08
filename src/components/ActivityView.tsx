@@ -1,3 +1,4 @@
+import { trustedClientName } from "@/lib/clientIdentity";
 import { useWindowVisible } from "@/lib/windowVisible";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -798,7 +799,12 @@ function CallRow({ e }: { e: AuditEntry }) {
             className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
             title={e.client ? `Client: ${e.client}` : "Client that made this call"}
           >
-            {e.clientName ?? e.client}
+            {trustedClientName(e)}
+          </span>
+        )}
+        {e.clientLabel && (
+          <span className="min-w-0 truncate text-xs text-muted-foreground" dir="auto">
+            {e.clientLabel}
           </span>
         )}
         <PiiBadge entry={e} />

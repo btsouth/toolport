@@ -690,3 +690,24 @@ describe("telemetry health", () => {
     ).toBeInTheDocument();
   });
 });
+
+it("uses one server option for hyphenated call and approval identities", async () => {
+  getAuditLog.mockResolvedValue([
+    {
+      ...entry({
+        server: "team_slack",
+        serverId: "team-slack",
+        clientName: "Claude Code",
+      }),
+      kind: "approval",
+      decision: "denied",
+    },
+    entry({ server: "team_slack", serverId: "team-slack", clientName: "Claude Code" }),
+  ]);
+  render(<ActivityView refreshKey={0} registry={null} />);
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  await user.click(screen.getByRole("combobox"));
+  expect(screen.getAllByRole("option", { name: /^team_slack$/ })).toHaveLength(1);
+  expect(screen.queryByRole("option", { name: /^team-slack$/ })).not.toBeInTheDocument();
+});

@@ -42,6 +42,9 @@ use crate::approval::{
 pub struct PendingView {
     pub id: String,
     pub client: Option<String>,
+    pub client_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_label: Option<String>,
     pub server: String,
     pub tool: String,
     pub tool_fingerprint: Option<String>,
@@ -744,6 +747,8 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, host: BrokerHost) {
     let view = PendingView {
         id: req.id.clone(),
         client: req.client.clone(),
+        client_name: crate::clients::trusted_client_name(req.client.as_deref(), None),
+        client_label: req.client_label.clone(),
         server: req.server.clone(),
         tool: req.tool.clone(),
         tool_fingerprint: req.tool_fingerprint.clone(),
@@ -884,22 +889,29 @@ fn notification_host(host: BrokerHost, show: ShowPendingNotification) -> BrokerH
     }
 }
 
-/// Notify the human that a call is held: an OS notification plus
-/// taskbar attention on the main window. Best-effort and non-blocking - if either fails (permission
-/// off, no window) the in-app overlay is still the source of truth. We flash rather than
-/// force-focus so we don't yank the user out of what they're doing.
-#[cfg(feature = "desktop")]
-fn notify_pending(app: &AppHandle, view: &PendingView, resolved: std::sync::mpsc::Receiver<()>) {
-    let who = view
-        .client
+pub fn approval_requester(view: &PendingView) -> String {
+    let client =
+        crate::clients::trusted_client_name(view.client.as_deref(), Some(&view.client_name));
+    match view
+        .client_label
         .as_deref()
-        .map(|c| format!("{c} wants to run "))
-        .unwrap_or_default();
-    let (title, body) = if let Some(elicitation) = &view.url_elicitation {
+        .filter(|label| *label != client)
+    {
+        Some(label) => format!(
+            "{client} (reports: {})",
+            crate::approval::shorten_client_label(label, 40)
+        ),
+        None => client,
+    }
+}
+
+pub fn approval_notification(view: &PendingView) -> (&'static str, String) {
+    let who = approval_requester(view);
+    if let Some(elicitation) = &view.url_elicitation {
         (
             "Toolport: browser action required",
             format!(
-                "{} requested an external browser interaction. Review it in Toolport.",
+                "{} needs a browser action. Requested by {who}. Review it in Toolport.",
                 elicitation.origin
             ),
         )
@@ -907,11 +919,20 @@ fn notify_pending(app: &AppHandle, view: &PendingView, resolved: std::sync::mpsc
         (
             "Toolport: approval required",
             format!(
-                "{who}{}/{} - approve or deny it in Toolport.",
+                "{} / {} needs approval. Requested by {who}.",
                 view.server, view.tool
             ),
         )
-    };
+    }
+}
+
+/// Notify the human that a call is held: an OS notification plus
+/// taskbar attention on the main window. Best-effort and non-blocking - if either fails (permission
+/// off, no window) the in-app overlay is still the source of truth. We flash rather than
+/// force-focus so we don't yank the user out of what they're doing.
+#[cfg(feature = "desktop")]
+fn notify_pending(app: &AppHandle, view: &PendingView, resolved: std::sync::mpsc::Receiver<()>) {
+    let (title, body) = approval_notification(view);
     show_pending_os_toast(
         cfg!(target_os = "linux"),
         resolved,
@@ -995,7 +1016,7 @@ fn notify_until_resolved_at_destination(
                         id,
                         "toolport",
                         title,
-                        body,
+                        gio::glib::markup_escape_text(body).as_str(),
                         Vec::<String>::new(),
                         hints,
                         expiry,
@@ -1055,6 +1076,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn p08b_r1_notification_puts_action_before_bounded_report() {
+        let view = PendingView {
+            id: "1".into(),
+            client: Some("adapter:claude-code".into()),
+            client_name: "Claude Code".into(),
+            client_label: Some("Claude Code 2.1.0".into()),
+            server: "github".into(),
+            tool: "delete_issue".into(),
+            tool_fingerprint: None,
+            reason: ApprovalReason::Destructive,
+            arguments: serde_json::json!({}),
+            url_elicitation: None,
+            pii_release: None,
+            deadline_ms: 0,
+        };
+        assert_eq!(approval_notification(&view).1, "github / delete_issue needs approval. Requested by Claude Code (reports: Claude Code 2.1.0).");
+        let mut view = view;
+        view.client_label = Some("Claude Code".into());
+        assert_eq!(approval_requester(&view), "Claude Code");
+        view.client_label = Some("界".repeat(80));
+        assert_eq!(
+            approval_requester(&view),
+            format!("Claude Code (reports: {}…)", "界".repeat(39))
+        );
+    }
+
+    #[test]
     fn p08_broker_read_timeout_is_timeout_and_eof_is_denied() {
         struct Timeout;
         impl Read for Timeout {
@@ -1102,7 +1150,9 @@ mod tests {
         other.id = "other".into();
         let view = |req: ApprovalRequest| PendingView {
             id: req.id,
+            client_name: crate::clients::trusted_client_name(req.client.as_deref(), None),
             client: req.client,
+            client_label: req.client_label,
             server: req.server,
             tool: req.tool,
             reason: req.reason,
@@ -1196,6 +1246,8 @@ mod tests {
         let view = PendingView {
             id: id.into(),
             client: None,
+            client_label: None,
+            client_name: "An AI client".into(),
             server: "s".into(),
             tool: "drop".into(),
             tool_fingerprint: Some("v2:abc".into()),
@@ -1431,6 +1483,7 @@ mod tests {
             token: token.into(),
             id: "req-1".into(),
             client: None,
+            client_label: None,
             server: "db".into(),
             tool: "drop_table".into(),
             reason: ApprovalReason::Destructive,

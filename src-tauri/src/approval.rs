@@ -95,6 +95,77 @@ pub struct PiiReleaseValue {
     pub origins: Vec<String>,
 }
 
+/// Client-reported text is display-only. Bound both its stored bytes and visible
+/// characters, and remove formatting that can disguise the trusted requester.
+pub fn sanitize_client_label(text: &str) -> Option<String> {
+    static FORMAT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let format =
+        FORMAT.get_or_init(|| regex::Regex::new(r"\p{Cf}").expect("Unicode format category"));
+    let mut label = String::new();
+    let mut chars = 0;
+    let mut marks = 0;
+    for mut c in text.chars() {
+        if c.is_whitespace() {
+            c = ' ';
+        } else if c.is_control() || format.is_match(c.encode_utf8(&mut [0; 4])) {
+            continue;
+        }
+        if c == ' ' && (label.is_empty() || label.ends_with(' ')) {
+            continue;
+        }
+        if unicode_normalization::char::is_combining_mark(c) {
+            marks += 1;
+            if marks > 2 {
+                continue;
+            }
+        } else {
+            marks = 0;
+        }
+        if chars == 120 || label.len() + c.len_utf8() > 200 {
+            break;
+        }
+        label.push(c);
+        chars += 1;
+    }
+    let label = label.trim_end();
+    (!label.is_empty()).then(|| label.to_string())
+}
+
+/// Truncate display text without splitting a Unicode character.
+pub fn shorten_client_label(label: &str, limit: usize) -> String {
+    if label.chars().count() <= limit {
+        label.to_string()
+    } else {
+        format!(
+            "{}…",
+            label
+                .chars()
+                .take(limit.saturating_sub(1))
+                .collect::<String>()
+        )
+    }
+}
+
+pub fn client_info_label(params: Option<&serde_json::Value>) -> Option<String> {
+    let info = params?.get("clientInfo")?;
+    let name = sanitize_client_label(info.get("name")?.as_str()?)?;
+    let version = info
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .and_then(sanitize_client_label);
+    sanitize_client_label(&match version {
+        Some(version) => format!("{name} {version}"),
+        None => name,
+    })
+}
+
+fn deserialize_client_label<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let label = Option::<String>::deserialize(deserializer)?;
+    Ok(label.as_deref().and_then(sanitize_client_label))
+}
+
 /// A request from a gateway to the broker: "a human should approve this call." The arguments
 /// are included so the person can review them; they stay in memory on both ends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +178,13 @@ pub struct ApprovalRequest {
     /// Which client/agent triggered it (for display + attribution), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
+    /// Untrusted initialize clientInfo label. Never an access principal.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_client_label"
+    )]
+    pub client_label: Option<String>,
     /// The downstream server the tool belongs to.
     pub server: String,
     /// The tool name.
@@ -652,6 +730,7 @@ mod tests {
             token: "tok".into(),
             id: "p08-outcomes".into(),
             client: None,
+            client_label: None,
             server: "s".into(),
             tool: "t".into(),
             reason: ApprovalReason::Destructive,
@@ -734,6 +813,7 @@ mod tests {
             token: "tok".into(),
             id: "abc".into(),
             client: Some("cursor".into()),
+            client_label: None,
             server: "db".into(),
             tool: "drop_table".into(),
             reason: ApprovalReason::Destructive,
@@ -843,6 +923,7 @@ mod tests {
             token: "tok".into(),
             id: "abc".into(),
             client: None,
+            client_label: None,
             server: "db".into(),
             tool: "drop_table".into(),
             reason: ApprovalReason::Destructive,
@@ -1019,5 +1100,120 @@ mod tests {
         ));
         let stream = dial_broker(&d).expect("falls back to the loopback listener");
         assert!(matches!(stream, BrokerStream::Tcp(_)));
+    }
+}
+
+#[cfg(test)]
+mod client_label_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn p08b_labels_are_bounded_and_strip_controls_and_bidi() {
+        assert_eq!(
+            client_info_label(Some(
+                &json!({"clientInfo":{"name":"  Claude\n\r\t\u{202e} Code\u{2066}","version":"1\0"}})
+            )),
+            Some("Claude Code 1".into())
+        );
+        let long = "界".repeat(1000);
+        let label =
+            client_info_label(Some(&json!({"clientInfo":{"name":long,"version":"evil"}}))).unwrap();
+        assert!(label.chars().count() <= 120);
+        assert!(label.len() <= 200);
+        assert_eq!(
+            client_info_label(Some(
+                &json!({"clientInfo":{"name":"\u{202e}\0","version":"1"}})
+            )),
+            None
+        );
+        assert_eq!(
+            client_info_label(Some(&json!({"clientInfo":{"name":false}}))),
+            None
+        );
+    }
+
+    #[test]
+    fn p08b_request_label_is_sanitized_and_json_escaped() {
+        let req: ApprovalRequest = serde_json::from_value(json!({"token":"t","id":"1","client":"client:real","clientLabel":"<b>Fake</b>\n\u{202e} \"1\"","server":"s","tool":"t","reason":"destructive","arguments":{}})).unwrap();
+        assert_eq!(req.client.as_deref(), Some("client:real"));
+        assert_eq!(req.client_label.as_deref(), Some("<b>Fake</b> \"1\""));
+        let wire = serde_json::to_string(&req).unwrap();
+        assert!(wire.contains("\\\"1\\\""));
+        assert!(!wire.contains('\u{202e}'));
+    }
+}
+
+#[cfg(test)]
+mod p08b_revision_tests {
+    use super::*;
+
+    #[test]
+    fn p08b_r1_all_whitespace_collapses_and_format_characters_disappear() {
+        for c in [
+            '\t', '\n', '\r', '\u{85}', '\u{a0}', '\u{2028}', '\u{2029}', '\u{3000}',
+        ] {
+            assert_eq!(
+                sanitize_client_label(&format!("Claude{c}{c}Code")),
+                Some("Claude Code".into())
+            );
+        }
+        for c in [
+            '\u{ad}',
+            '\u{180e}',
+            '\u{fff9}',
+            '\u{fffa}',
+            '\u{fffb}',
+            '\u{e0001}',
+            '\u{e0020}',
+            '\u{e007f}',
+            '\u{202e}',
+            '\u{200b}',
+        ] {
+            assert_eq!(
+                sanitize_client_label(&format!("Claude{c} Code")),
+                Some("Claude Code".into())
+            );
+        }
+    }
+
+    #[test]
+    fn p08b_r1_combining_marks_and_utf8_bytes_are_bounded() {
+        assert_eq!(
+            sanitize_client_label("a\u{301}\u{302}\u{303}b\u{301}\u{302}\u{303}"),
+            Some("a\u{301}\u{302}b\u{301}\u{302}".into())
+        );
+        for c in ['a', '界', '🦀'] {
+            let label = sanitize_client_label(&c.to_string().repeat(300)).unwrap();
+            assert!(label.len() <= 200);
+            assert!(label.chars().count() <= 120);
+            assert_eq!(label.chars().count(), (200 / c.len_utf8()).min(120));
+        }
+    }
+
+    #[test]
+    fn p08b_r1_registered_clients_use_registry_labels() {
+        let _env = crate::registry::DataDirTestEnv::new("p08b-r1-registry-label");
+        let mut registry = crate::registry::Registry::default();
+        registry.http_clients.push(crate::registry::HttpClient { id: "real".into(), label: "My assistant".into(), token_sha256: "unused".into(), profile: String::new(), unknown_fields: Default::default() });
+        crate::registry::save(&registry).unwrap();
+        assert_eq!(crate::clients::trusted_client_name(Some("client:real"), None), "My assistant");
+        assert_eq!(crate::clients::trusted_client_name(Some("client:unknown"), None), "An AI client");
+    }
+
+    #[test]
+    fn p08b_r1_adapter_names_come_from_client_definitions() {
+        assert_eq!(
+            crate::clients::trusted_client_name(Some("adapter:claude-code"), None),
+            "Claude Code"
+        );
+        assert_eq!(
+            crate::clients::trusted_client_name(Some("adapter:unknown"), None),
+            "An AI client"
+        );
+        assert_eq!(
+            crate::clients::trusted_client_name(Some("adapter:claude-code"), Some("Recorded name")),
+            "Recorded name"
+        );
     }
 }

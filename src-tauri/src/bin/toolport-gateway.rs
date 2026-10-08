@@ -151,6 +151,8 @@ struct ActiveRequestContext {
     /// Unique per upstream request, so two sessionless requests are never taken
     /// for one client. Nested work for the same request keeps it.
     request_nonce: u64,
+    /// Untrusted display label, separate from connection_identity.
+    client_label: Option<String>,
 }
 
 thread_local! {
@@ -164,7 +166,27 @@ thread_local! {
             connection_profile: None,
             connection_identity: None,
             request_nonce: 0,
+            client_label: None,
         }) };
+}
+
+struct ClientLabelGuard(Option<String>);
+
+impl ClientLabelGuard {
+    fn enter(label: Option<String>) -> Self {
+        Self(
+            ACTIVE_REQUEST_CONTEXT
+                .with(|cell| std::mem::replace(&mut cell.borrow_mut().client_label, label)),
+        )
+    }
+}
+impl Drop for ClientLabelGuard {
+    fn drop(&mut self) {
+        ACTIVE_REQUEST_CONTEXT.with(|cell| cell.borrow_mut().client_label = self.0.take());
+    }
+}
+fn active_client_label() -> Option<String> {
+    ACTIVE_REQUEST_CONTEXT.with(|cell| cell.borrow().client_label.clone())
 }
 
 type DispatchScopeCheck = dyn Fn(&Router, DispatchTarget<'_>) -> bool + Send + Sync;
@@ -4247,7 +4269,19 @@ fn execute_call(
                     conduit_lib::rate_limits::check_and_count(&team.rate_limits, server_id, tool)
                 {
                     // Count as a failed call with a clear reason so Activity / export show the block.
-                    audit::record_routed_call(reg, server_id, tool, false, None, Some("rate_limit"), client, client_name, None, None);
+                    audit::record_routed_call(
+                        reg,
+                        server_id,
+                        tool,
+                        false,
+                        None,
+                        Some("rate_limit"),
+                        client,
+                        client_name,
+                        active_client_label().as_deref(),
+                        None,
+                        None,
+                    );
                     return json!({
                         "content": [{ "type": "text", "text": msg }],
                         "isError": true
@@ -4322,7 +4356,8 @@ fn execute_call(
                 token: String::new(),
                 id: new_correlation_id(),
                 client: client.map(str::to_string),
-                server: srv.to_string(),
+                client_label: active_client_label(),
+                server: server_id.to_string(),
                 tool: tool.to_string(),
                 reason,
                 // Real values, for THIS path only (SBS-346). The local broker is a
@@ -4449,9 +4484,10 @@ fn execute_call(
                 // exact call - never the raw args. Replaces the flat record_held so
                 // the failure modes are no longer indistinguishable in the log.
                 audit::record_decision(
-                    srv,
+                    server_id,
                     tool,
                     client,
+                    active_client_label().as_deref(),
                     reason_str,
                     decision_token(decision),
                     &arguments,
@@ -4465,9 +4501,10 @@ fn execute_call(
             if let Some(stale) = content_binding_decision(&approved_args_hash, &arguments) {
                 finish_modern_hitl(active_modern_hitl.as_deref());
                 audit::record_decision(
-                    srv,
+                    server_id,
                     tool,
                     client,
+                    active_client_label().as_deref(),
                     reason_str,
                     decision_token(stale),
                     &arguments,
@@ -4485,9 +4522,10 @@ fn execute_call(
                 {
                     finish_modern_hitl(active_modern_hitl.as_deref());
                     audit::record_decision(
-                        srv,
+                        server_id,
                         tool,
                         client,
+                        active_client_label().as_deref(),
                         reason_str,
                         decision_token(stale),
                         &arguments,
@@ -4533,9 +4571,10 @@ fn execute_call(
     // the server/tool that will actually run (and that content defense uses).
     if let Some((reason_str, held_ms)) = pending_approval_audit {
         audit::record_decision(
-            srv,
+            server_id,
             tool,
             client,
+            active_client_label().as_deref(),
             reason_str,
             "approved",
             &arguments,
@@ -4580,7 +4619,7 @@ fn execute_call(
     // Scoped to the executing server (SBS-605): a token only resolves for a server
     // that already produced that value. Anything else is refused here rather than
     // dispatched, which is what closes the cross-server exfiltration path.
-    let arguments = match rehydrate_for_downstream(client, srv, name, arguments) {
+    let arguments = match rehydrate_for_downstream(client, server_id, name, arguments) {
         Ok(args) => args,
         Err(msg) => {
             return json!({
@@ -4597,7 +4636,7 @@ fn execute_call(
     // rehydration on the same leg. A host that answers an elicitation from model
     // context puts `⟦EMAIL_1⟧` in `inputResponses`, and the server would receive a
     // pseudonym where an address belongs (SBS-606).
-    let rehydrated_mrtr = match rehydrate_mrtr_for_downstream(client, srv, name, effective_mrtr) {
+    let rehydrated_mrtr = match rehydrate_mrtr_for_downstream(client, server_id, name, effective_mrtr) {
         Ok(m) => m,
         Err(msg) => {
             return json!({
@@ -4682,6 +4721,7 @@ fn execute_call(
                 err.as_deref(),
                 client,
                 client_name,
+                active_client_label().as_deref(),
                 Some(&call_args_hash),
                 pii,
             );
@@ -4730,6 +4770,7 @@ fn execute_call(
                 Some(&defended_err),
                 client,
                 client_name,
+                active_client_label().as_deref(),
                 Some(&call_args_hash),
                 pii,
             );
@@ -5107,6 +5148,7 @@ fn approve_pii_release(
         token: String::new(),
         id: new_correlation_id(),
         client: client.map(str::to_string),
+        client_label: active_client_label(),
         server: server.to_string(),
         tool: tool.to_string(),
         reason: approval::ApprovalReason::PiiCrossServer,
@@ -5128,6 +5170,7 @@ fn approve_pii_release(
         server,
         tool,
         client,
+        active_client_label().as_deref(),
         "pii_cross_server",
         decision_token(decision),
         arguments,
@@ -12719,6 +12762,7 @@ struct SessionState {
     listener_active: AtomicBool,
     wait: (Mutex<()>, Condvar),
     client_upstream: Mutex<ClientUpstreamCaps>,
+    client_label: Mutex<Option<String>>,
     upstream_pending: Mutex<HashMap<String, std::sync::mpsc::Sender<Value>>>,
     next_upstream_id: AtomicI64,
     /// The upstream client's project root for the `${ROOT}` cwd token (issue #239),
@@ -12811,6 +12855,7 @@ impl SessionState {
             listener_active: AtomicBool::new(false),
             wait: (Mutex::new(()), Condvar::new()),
             client_upstream: Mutex::new(ClientUpstreamCaps::default()),
+            client_label: Mutex::new(None),
             upstream_pending: Mutex::new(HashMap::new()),
             next_upstream_id: AtomicI64::new(1),
             client_root: Arc::new(Mutex::new(None)),
@@ -13474,6 +13519,7 @@ fn broker_url_elicitation(
         token: String::new(),
         id: format!("toolport-url-{}", new_correlation_id()),
         client: None,
+        client_label: None,
         server: screened.origin.clone(),
         tool: "browser interaction".to_string(),
         reason: approval::ApprovalReason::UntrustedSource,
@@ -14540,6 +14586,12 @@ fn process_request_wire(
     }
 
     if method == "initialize" && !state.http {
+        *state
+            .stdio_upstream
+            .client_label
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            approval::client_info_label(req.get("params"));
         if let Ok(mut caps) = state.stdio_upstream.client_upstream.lock() {
             capture_client_upstream_from_init(&mut caps, req.get("params"));
         }
@@ -14548,6 +14600,33 @@ fn process_request_wire(
         let st = state.clone();
         std::thread::spawn(move || refresh_client_root(&st));
     }
+
+    let session_label = if state.http {
+        active_mcp_session()
+            .and_then(|sid| {
+                state
+                    .mcp_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&sid)
+                    .cloned()
+            })
+            .and_then(|session| {
+                session
+                    .client_label
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            })
+    } else {
+        state
+            .stdio_upstream
+            .client_label
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    };
+    let _label = ClientLabelGuard::enter(session_label);
 
     let wait = match method {
         "tools/list" if discovery == DiscoveryMode::Full => true,
@@ -16072,6 +16151,11 @@ fn handle_mcp_http(
                             if let Ok(mut caps) = sess.client_upstream.lock() {
                                 capture_client_upstream_from_init(&mut caps, req.get("params"));
                             }
+                            *sess
+                                .client_label
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                approval::client_info_label(req.get("params"));
                         }
                     }
                 }
@@ -20134,6 +20218,55 @@ mod tests {
     }
 
     #[test]
+    fn p08b_pii_prompt_keeps_the_canonical_destination_and_client_identity() {
+        let env = pii_test_env("p08b-pii-identity");
+        let asked = stub_broker(&env.dir, approval::ApprovalDecision::Approved);
+        let client = Some("client:real");
+        let _label = ClientLabelGuard::enter(Some("Claude Code 2.1".into()));
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+        let reg = Registry::default();
+        let router = routed_router("team-slack", "read");
+        let _ = execute_call(
+            &reg,
+            &router,
+            &router.aggregated_tools(),
+            client,
+            None,
+            None,
+            None,
+            "team_slack__read",
+            json!({"to":"⟦EMAIL_1⟧"}),
+            None,
+            None,
+            CallOpts {
+                direct: true,
+                shape: true,
+                allow_app_only: false,
+            },
+            None,
+        );
+        let request = asked.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(request.client.as_deref(), client);
+        assert_eq!(request.client_label.as_deref(), Some("Claude Code 2.1"));
+        assert_eq!(request.server, "team-slack");
+        assert_eq!(request.pii_release.unwrap().server, "team-slack");
+        let decisions = audit::read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row["kind"] == "approval")
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0]["serverId"], "team-slack");
+        with_pii_session(client, |map| {
+            assert!(map.rehydrate("team_slack", "⟦EMAIL_1⟧").refused.is_empty());
+            assert!(!map.rehydrate("other", "⟦EMAIL_1⟧").refused.is_empty());
+        });
+    }
+
+    #[test]
     fn a_denied_release_refuses_and_grants_nothing() {
         let env = pii_test_env("pii-release-denied");
         let _asked = stub_broker(&env.dir, approval::ApprovalDecision::Denied);
@@ -23232,6 +23365,7 @@ mod tests {
             token: String::new(),
             id: "id".into(),
             client: None,
+            client_label: None,
             server: "db".into(),
             tool: "drop".into(),
             reason: approval::ApprovalReason::Destructive,
@@ -23288,6 +23422,7 @@ mod tests {
             token: String::new(),
             id: "id".into(),
             client: None,
+            client_label: None,
             server: "crm".into(),
             tool: "export_all".into(),
             reason: approval::ApprovalReason::Destructive,
@@ -26685,6 +26820,7 @@ mod tests {
 
         assert_eq!(entry["client"], "client:c1");
         assert_eq!(entry["clientName"], "Cursor");
+        assert_eq!(entry["clientLabel"], "test 0");
 
         drop(_data_dir);
         assert!(conduit_lib::telemetry::retire_dir_for_test(
@@ -26692,6 +26828,61 @@ mod tests {
             std::time::Duration::from_secs(5)
         ));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn p08b_spoofed_initialize_label_cannot_select_identity_or_permissions() {
+        let env = DataDirTestEnv::new("p08b-spoof");
+        let state = http_state(true);
+        state.registry.lock().unwrap().human_approval = true;
+        let (router, calls, _) = counting_router(true);
+        swap_router(&state, router);
+        let mut reg = Registry::default();
+        reg.http_clients.push(registry::HttpClient {
+            id: "real".into(),
+            label: "Real".into(),
+            token_sha256: registry::sha256_hex("token"),
+            profile: String::new(),
+            unknown_fields: Default::default(),
+        });
+        let (_, caller) = resolve_http_caller(&reg, None, Some("token"), false, true).unwrap();
+        let guard = SearchGuard::default();
+        let init = handle_http(&state, &guard, "POST", "/mcp", &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"client:admin","version":"99"}}}).to_string(), None, None, None, Some(&caller));
+        let sid = mcp_session_of(&init);
+        let observed = stub_broker(&env.dir, approval::ApprovalDecision::Denied);
+        let request = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"s__work","arguments":{}}}).to_string();
+        let reply = handle_http(
+            &state,
+            &guard,
+            "POST",
+            "/mcp",
+            &request,
+            Some(&sid),
+            None,
+            None,
+            Some(&caller),
+        );
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.contains("denied"), "{}", reply.body);
+        let approval = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(approval.client.as_deref(), Some("client:real"));
+        assert_eq!(approval.client_label.as_deref(), Some("client:admin 99"));
+        assert_eq!(approval.server, "s");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let denied_scope = std::collections::HashSet::new();
+        let reply = handle_http(
+            &state,
+            &guard,
+            "POST",
+            "/mcp",
+            &request,
+            Some(&sid),
+            None,
+            Some(&denied_scope),
+            Some(&caller),
+        );
+        assert!(reply.body.contains("not available"), "{}", reply.body);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -32210,6 +32401,7 @@ mod tests {
         // Two sessionless modern requests on the daemon that agree on everything
         // the server-request handler reads: era, capabilities, root and profile.
         let modern = |identity: &str, nonce: u64| ActiveRequestContext {
+            client_label: None,
             upstream_version: Some(MODERN_PROTOCOL_VERSION.to_string()),
             upstream_capabilities: Some(Arc::new(json!({ "elicitation": {}, "roots": {} }))),
             mcp_session: None,
@@ -34114,6 +34306,7 @@ mod tests {
                     token: String::new(),
                     id: "1".into(),
                     client: None,
+                    client_label: None,
                     server: "s".into(),
                     tool: "t".into(),
                     reason: approval::ApprovalReason::Destructive,

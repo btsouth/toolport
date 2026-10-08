@@ -99,7 +99,7 @@ impl ApprovalNotification {
             self.shown.get(),
             "toolport",
             title,
-            body,
+            glib::markup_escape_text(body).as_str(),
             vec!["default".to_string(), "Review".to_string()],
             hints,
             -1i32,

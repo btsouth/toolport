@@ -68,6 +68,8 @@ export interface MigrateResult {
 export interface AuditEntry {
   ts: number;
   server: string;
+  /** Canonical routed ID, separate from the Activity display prefix. */
+  serverId?: string;
   tool: string;
   ok: boolean;
   /** How long the call took, ms. Absent for records logged before timing. */
@@ -84,6 +86,8 @@ export interface AuditEntry {
   client?: string;
   /** Human-readable name of the registered HTTP client, when known. */
   clientName?: string;
+  /** Untrusted client-reported name/version, for display only. */
+  clientLabel?: string;
   /** How many values this call's result had pseudonymized. Absent when PII redaction was
    * off for the call — which is deliberately distinct from `0` ("it ran, found nothing").
    * A count only; the values themselves never enter the audit log. */
@@ -461,7 +465,10 @@ export interface FolderProfile {
 /** A tool call held awaiting a human decision (the HITL approval queue). */
 export interface PendingApproval {
   id: string;
+  clientName?: string;
   client: string | null;
+  /** Untrusted initialize clientInfo label. */
+  clientLabel?: string | null;
   server: string;
   tool: string;
   toolFingerprint?: string | null;
