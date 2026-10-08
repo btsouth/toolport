@@ -564,7 +564,12 @@ impl AdapterClient {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let message = self
                 .observed_message(remaining.max(Duration::from_millis(1)))
-                .unwrap_or_else(|| panic!("no {method} notification before the deadline"));
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no {method} notification before the deadline\n{}",
+                        self.diagnostics()
+                    )
+                });
             if message.get("method").is_some() && message.get("id").is_none() {
                 assert_eq!(
                     message["method"], method,
@@ -1224,6 +1229,24 @@ fn warm_initial_catalog(dir: &Path, servers: &[&str]) -> AdapterClient {
         eprintln!("confirmed {mode} initial catalog path for {servers:?}");
     }
     warmup
+}
+
+fn tool_publication_count(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("gateway.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.ends_with("downstream tool catalog publication completed"))
+        .count()
+}
+
+/// Start the delivery deadline after this refresh has published and fanned out.
+/// The tool-call reply precedes persistence, which can take longer under load.
+fn wait_for_tool_publication(dir: &Path, previous: usize) {
+    wait_until(
+        || tool_publication_count(dir) > previous,
+        "the downstream tool catalog publication",
+        RESPONSE_TIMEOUT,
+    );
 }
 
 fn text_of(result: &Value) -> String {
@@ -3532,7 +3555,9 @@ fn matrix_routing_tool_change_notifies_only_profiles_that_can_see_it() {
     let grow_tool = grow.wait_for_tool("__grow", Duration::from_secs(30));
     echo.wait_for_tool("__echo", Duration::from_secs(30));
 
+    let publications = tool_publication_count(&dir);
     grow.call_tool(&grow_tool, json!({}));
+    wait_for_tool_publication(&dir, publications);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -3691,7 +3716,9 @@ fn matrix_routing_server_change_notifies_only_authorized_sessions() {
 
     // A and B share the same downstream server. Its catalog change belongs to
     // both of them; C is scoped to another server and must not learn about it.
+    let publications = tool_publication_count(&dir);
     session_a.call_tool(&grow, json!({}));
+    wait_for_tool_publication(&dir, publications);
     session_a.next_notification("notifications/tools/list_changed", Duration::from_secs(10));
     session_b.next_notification("notifications/tools/list_changed", Duration::from_secs(10));
     session_b.wait_for_tool("__greet", Duration::from_secs(30));

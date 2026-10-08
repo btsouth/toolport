@@ -7921,7 +7921,7 @@ fn notify_tools_changed_for_catalog_diff(
     previous_router: &Router,
     current_router: &Router,
     reg: &Registry,
-    previous_adapter_tools: Option<&HashMap<McpSessionOwner, Vec<Value>>>,
+    previous_adapter_tools: Option<&HashMap<String, Vec<Value>>>,
 ) {
     notify_list_changed(stdio, None, "notifications/tools/list_changed");
     let Some(sessions) = mcp_sessions else {
@@ -7945,7 +7945,6 @@ fn notify_tools_changed_for_catalog_diff(
             let Some(owner) = owner else {
                 return previous != current;
             };
-            let prior_owner = owner.clone();
             let Some(scope) = owner.scope else {
                 return previous != current;
             };
@@ -7961,21 +7960,16 @@ fn notify_tools_changed_for_catalog_diff(
                     .into_iter()
                     .map(|(server, tools)| (server, tools.into_iter().collect()))
                     .collect();
-                let before_router = previous_router.with_tool_allow(prior_allow);
-                let after_router = current_router.with_tool_allow(current_allow);
-                let before_tools = previous_adapter_tools
-                    .and_then(|by_owner| by_owner.get(&prior_owner))
+                let before = previous_adapter_tools
+                    .and_then(|by_profile| by_profile.get(profile))
                     .cloned()
-                    .unwrap_or_else(|| before_router.aggregated_tools());
-                let before = if previous_adapter_tools
-                    .is_some_and(|by_owner| by_owner.contains_key(&prior_owner))
-                {
-                    before_tools
-                } else {
-                    scope_tools(&before_tools, Some(&allowed), |name| {
-                        owner_of_exposed_tool(Some(&before_router), &owners, name)
-                    })
-                };
+                    .unwrap_or_else(|| {
+                        let before_router = previous_router.with_tool_allow(prior_allow);
+                        scope_tools(&before_router.aggregated_tools(), Some(&allowed), |name| {
+                            owner_of_exposed_tool(Some(&before_router), &owners, name)
+                        })
+                    });
+                let after_router = current_router.with_tool_allow(current_allow);
                 let after = scope_tools(&after_router.aggregated_tools(), Some(&allowed), |name| {
                     owner_of_exposed_tool(Some(&after_router), &owners, name)
                 });
@@ -9458,43 +9452,41 @@ fn cached_tool_is_destructive(tool: &Value, exposed: &str) -> bool {
 }
 
 impl HostState {
-    /// Freeze each adapter's visible catalog before a downstream refresh mutates
-    /// the shared ServerSlot. Cloning Router alone would keep the same slot.
-    fn adapter_tools_before_refresh(
-        &self,
-        router: &Router,
-    ) -> HashMap<McpSessionOwner, Vec<Value>> {
+    /// Freeze every access profile before a refresh mutates the shared slots.
+    /// A session can initialize during the refresh, so freezing only registered
+    /// owners leaves its prior view unavailable at fanout time.
+    fn adapter_tools_before_refresh(&self, router: &Router) -> HashMap<String, Vec<Value>> {
         let reg = self
             .registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let owners = unique_prefix_owners(&reg);
-        let sessions: Vec<McpSessionOwner> = self
-            .mcp_sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .filter_map(|session| session.owner.clone())
-            .collect();
+        let profiles = reg
+            .profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .chain([reg.default_access_id(), reg.all_access_id()]);
         let mut catalogs = HashMap::new();
-        for owner in sessions {
-            let (Some(scope), Some(tool_scope)) = (&owner.scope, &owner.tool_scope) else {
-                continue;
-            };
-            if catalogs.contains_key(&owner) {
+        for profile in profiles {
+            let profile = reg.resolve_profile_id(&profile);
+            if catalogs.contains_key(&profile) {
                 continue;
             }
-            let allow = tool_scope
-                .iter()
-                .map(|(server, tools)| (server.clone(), tools.iter().cloned().collect()))
+            let allow = adapter_tool_scope(&reg, &profile)
+                .into_iter()
+                .map(|(server, tools)| (server, tools.into_iter().collect()))
                 .collect();
             let view = router.with_tool_allow(allow);
-            let allowed: HashSet<String> = scope.iter().cloned().collect();
+            let allowed: HashSet<String> = reg
+                .enabled_servers_for(&profile)
+                .iter()
+                .map(|server| server.id.clone())
+                .collect();
             let tools = scope_tools(&view.aggregated_tools(), Some(&allowed), |name| {
                 owner_of_exposed_tool(Some(&view), &owners, name)
             });
-            catalogs.insert(owner, tools);
+            catalogs.insert(profile, tools);
         }
         catalogs
     }
@@ -9510,7 +9502,7 @@ impl HostState {
         mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
         profile: Option<&str>,
         scope_diff_only: bool,
-        previous_adapter_tools: Option<&HashMap<McpSessionOwner, Vec<Value>>>,
+        previous_adapter_tools: Option<&HashMap<String, Vec<Value>>>,
     ) {
         let live = router
             .lock()
@@ -10292,6 +10284,7 @@ fn watch_tick(
                 true,
                 Some(&previous_adapter_tools),
             );
+            glog("downstream tool catalog publication completed");
             eprintln!("toolport: downstream tools/list_changed, refreshed + sent");
         }
         if downstream_changed & downstream::change::RESOURCES != 0 {
@@ -27646,6 +27639,122 @@ mod tests {
             session.outbound.lock().unwrap().len(),
             MCP_SESSION_OUTBOUND_MAX
         );
+    }
+
+    #[test]
+    fn catalog_refresh_notifies_sessions_registered_after_the_snapshot() {
+        let _env = DataDirTestEnv::new("joining-catalog-session");
+        struct GrowingCatalog(Arc<AtomicBool>);
+        impl conduit_lib::downstream::Transport for GrowingCatalog {
+            fn request(
+                &mut self,
+                method: &str,
+                _params: Value,
+            ) -> Result<Value, conduit_lib::downstream::TransportError> {
+                Ok(match method {
+                    "initialize" => json!({"protocolVersion": "2025-06-18"}),
+                    "tools/list" => {
+                        let mut tools = vec![json!({"name": "echo"})];
+                        if self.0.load(Ordering::SeqCst) {
+                            tools.push(json!({"name": "greet"}));
+                        }
+                        json!({"tools": tools})
+                    }
+                    _ => json!({}),
+                })
+            }
+            fn notify(
+                &mut self,
+                _method: &str,
+                _params: Value,
+            ) -> Result<(), conduit_lib::downstream::TransportError> {
+                Ok(())
+            }
+        }
+
+        let state = http_state(false);
+        let mut reg = Registry::default();
+        reg.servers = vec![stub_server("one", "One"), stub_server("two", "Two")];
+        for server in &mut reg.servers {
+            server.enabled = true;
+        }
+        reg.profiles = [
+            ("one", vec!["one"], HashMap::new()),
+            ("two", vec!["two"], HashMap::new()),
+            ("both", vec!["one", "two"], HashMap::new()),
+            (
+                "echo",
+                vec!["one"],
+                HashMap::from([("one".to_string(), vec!["echo".to_string()])]),
+            ),
+        ]
+        .into_iter()
+        .map(|(id, servers, tool_scope)| registry::Profile {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled_server_ids: servers.into_iter().map(str::to_string).collect(),
+            tool_scope,
+            instructions: None,
+            unknown_fields: Default::default(),
+        })
+        .collect();
+        *state.registry.lock().unwrap() = reg.clone();
+        let grown = Arc::new(AtomicBool::new(false));
+        let mut previous_router = Router::new();
+        previous_router.add(
+            DownstreamServer::connect("one".into(), Box::new(GrowingCatalog(Arc::clone(&grown))))
+                .unwrap(),
+        );
+        previous_router.add(
+            DownstreamServer::connect(
+                "two".into(),
+                Box::new(MockRoute {
+                    tools: vec![json!({"name": "echo"})],
+                }),
+            )
+            .unwrap(),
+        );
+        let previous = previous_router.aggregated_tools();
+        let connect = |id, profile| {
+            let (_, caller) = resolve_adapter_caller(&reg, id, Some(profile), None);
+            let sid = mint_mcp_session(&state, Some(&caller.session_owner))
+                .unwrap_or_else(|_| panic!("mint fixture session"));
+            Arc::clone(state.mcp_sessions.lock().unwrap().get(&sid).unwrap())
+        };
+        let existing = connect("existing", "one");
+        let frozen = state.host.adapter_tools_before_refresh(&previous_router);
+        // Register while publication is in flight, before any fanout snapshot.
+        // Include a profile with no prior session and one that hides the new tool.
+        let joining = connect("joining", "one");
+        let first_in_profile = connect("first-in-profile", "both");
+        let unrelated = connect("unrelated", "two");
+        let restricted = connect("restricted", "echo");
+        grown.store(true, Ordering::SeqCst);
+        let mut current_router = previous_router.clone();
+        current_router.refresh_tools();
+        let current = current_router.aggregated_tools();
+        notify_tools_changed_for_catalog_diff(
+            &state.stdio_upstream,
+            Some(&state.mcp_sessions),
+            &previous,
+            &current,
+            &previous_router,
+            &current_router,
+            &reg,
+            Some(&frozen),
+        );
+        for session in [existing, joining, first_in_profile] {
+            let queue = session.outbound.lock().unwrap();
+            assert_eq!(
+                queue.len(),
+                1,
+                "every authorized session must learn about the change"
+            );
+            let notification: Value = serde_json::from_str(&queue[0].json).unwrap();
+            assert_eq!(notification["method"], "notifications/tools/list_changed");
+        }
+        assert!(unrelated.outbound.lock().unwrap().is_empty());
+        assert!(restricted.outbound.lock().unwrap().is_empty());
     }
 
     #[test]
