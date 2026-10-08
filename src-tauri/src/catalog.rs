@@ -644,7 +644,7 @@ pub fn server_identity(
 }
 
 fn secret_query_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
+    let key = key.to_ascii_lowercase().replace('-', "_");
     key == "key"
         || key == "sig"
         || [
@@ -960,7 +960,6 @@ fn registry_search_url(query: &str) -> String {
     }
 }
 
-/// Search the official MCP Registry. Empty query lists popular/recent servers.
 fn registry_failure(error: &(dyn std::error::Error + 'static)) -> RegistryStatus {
     let mut current = Some(error);
     while let Some(error) = current {
@@ -977,6 +976,7 @@ fn registry_failure(error: &(dyn std::error::Error + 'static)) -> RegistryStatus
     RegistryStatus::Unavailable
 }
 
+/// Search the official MCP Registry with a bounded deadline.
 pub fn search_registry(query: &str) -> Result<Vec<CatalogEntry>, RegistryStatus> {
     let url = registry_search_url(query);
     use std::io::Read;

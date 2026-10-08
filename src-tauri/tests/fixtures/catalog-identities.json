@@ -214,5 +214,23 @@
       "url": null
     },
     "equal": false
+  },
+  {
+    "case": "secret query spelling and userinfo",
+    "catalog": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://user:secret@example.com/mcp?x-api-key=first&project=a"
+    },
+    "server": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://example.com/mcp/?project=a&x-api-key=second"
+    },
+    "equal": true
   }
 ]

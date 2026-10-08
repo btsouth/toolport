@@ -34,16 +34,18 @@ export function catalogIdentity(
       url.username = "";
       url.password = "";
       url.hash = "";
-      for (const key of [...url.searchParams.keys()]) {
+      const params = new URLSearchParams(url.search);
+      for (const key of [...params.keys()]) {
         if (
           key.toLowerCase() === "key" ||
           key.toLowerCase() === "sig" ||
-          /token|secret|password|credential|api_key|apikey|authorization|signature/i.test(
+          /token|secret|password|credential|api[-_]?key|authorization|signature/i.test(
             key,
           )
         )
-          url.searchParams.delete(key);
+          params.delete(key);
       }
+      url.search = params.toString();
       url.pathname = url.pathname.replace(/\/+$/, "") || "/";
       return `remote:${url.href}`;
     } catch {
@@ -290,7 +292,9 @@ export function CatalogView({ registry, onAdded }: Props) {
       <div className="flex items-center justify-between text-xs text-muted-foreground">
         <span>
           {results !== null
-            ? `${shown.length} result${shown.length === 1 ? "" : "s"} (popular picks first, then the MCP Registry)`
+            ? registryStatus === "unavailable" || registryStatus === "timedOut"
+              ? `${shown.length} curated match${shown.length === 1 ? "" : "es"}`
+              : `${shown.length} result${shown.length === 1 ? "" : "s"} (popular picks first, then the MCP Registry)`
             : "Popular servers"}
         </span>
         {results !== null && shown.length > 0 && (

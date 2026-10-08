@@ -1,7 +1,7 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { addServer, listStacks, popularCatalog, searchCatalog } from "@/lib/api";
+import { addCatalogServer, listStacks, popularCatalog, searchCatalog } from "@/lib/api";
 import type { CatalogEntry, Registry, Stack } from "@/lib/types";
 import identities from "../../src-tauri/tests/fixtures/catalog-identities.json";
 import { catalogIdentity, CatalogView } from "./CatalogView";
@@ -10,7 +10,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
   return {
     ...actual,
-    addServer: vi.fn(),
+    addCatalogServer: vi.fn(),
     listStacks: vi.fn(),
     popularCatalog: vi.fn(),
     searchCatalog: vi.fn(),
@@ -61,7 +61,7 @@ beforeEach(() => {
     entries: [],
     registryStatus: "available",
   });
-  vi.mocked(addServer).mockResolvedValue(registry);
+  vi.mocked(addCatalogServer).mockResolvedValue(registry);
 });
 
 describe("CatalogView collection loading", () => {
@@ -217,4 +217,33 @@ describe("CatalogView search and installed identity", () => {
       }
     },
   );
+  it("adds only missing Collection identities after a server is renamed", async () => {
+    const other = { ...entry, name: "Other", args: ["-y", "other-mcp"] };
+    vi.mocked(listStacks).mockResolvedValue([{ ...collection, servers: [entry, other] }]);
+    const user = userEvent.setup();
+    render(
+      <CatalogView
+        registry={{
+          ...registry,
+          servers: [
+            {
+              id: "renamed",
+              name: "My repositories",
+              enabled: false,
+              transport: "stdio",
+              command: "npx",
+              args: entry.args,
+              env: [],
+              url: null,
+              source: "manual",
+            },
+          ],
+        }}
+        onAdded={vi.fn()}
+      />,
+    );
+    await user.click(await screen.findByRole("button", { name: "Add 1" }));
+    await waitFor(() => expect(addCatalogServer).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(addCatalogServer).mock.calls[0][0].name).toBe("Other");
+  });
 });
