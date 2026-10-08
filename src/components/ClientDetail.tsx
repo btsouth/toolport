@@ -215,14 +215,18 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     }
     setBusy(true);
     try {
-      await installGateway(client.id, profile || undefined, false);
+      const outcome = await installGateway(client.id, profile || undefined, false);
       // Rescope rewrites the client's MCP config the same way Connect does; without a
       // restart hint the change is invisible until the next cold start (SOU-317).
       toast.success(
         profile
           ? `${client.name} access set to "${accessLabel(profile)}".`
           : `${client.name} now uses the default access.`,
-        { description: clientRestartHint(client.name) },
+        {
+          description: [clientRestartHint(client.name), ...(outcome.warnings ?? [])].join(
+            " ",
+          ),
+        },
       );
       noteRestartNeeded("applied");
       onChanged();
@@ -237,13 +241,15 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   async function resetToDefault() {
     setBusy(true);
     try {
-      await installGateway(client.id, profile || undefined, true);
+      const outcome = await installGateway(client.id, profile || undefined, true);
       toast.success(
         legacyBearer
           ? `Migrated ${client.name} to stdio`
           : `Reset ${client.name} to the default Toolport gateway`,
         {
-          description: clientRestartHint(client.name),
+          description: [clientRestartHint(client.name), ...(outcome.warnings ?? [])].join(
+            " ",
+          ),
         },
       );
       noteRestartNeeded("applied");
@@ -380,7 +386,12 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           restored > 0
             ? `Disconnected Toolport from ${client.name} and put back ${restored} server${restored === 1 ? "" : "s"}`
             : `Disconnected Toolport from ${client.name}`,
-          { description: clientRestartHintAfterRemoval(client.name) },
+          {
+            description: [
+              clientRestartHintAfterRemoval(client.name),
+              ...(outcome.warnings ?? []),
+            ].join(" "),
+          },
         );
         noteRestartNeeded("removed");
       } else {
@@ -391,6 +402,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           description: connectSuccessDescription(client.name, [
             profile ? `Access: ${accessLabel(profile)}.` : null,
             !profile && outcome.backup ? "Previous config backed up." : null,
+            ...(outcome.warnings ?? []),
           ]),
         });
         noteRestartNeeded("applied");

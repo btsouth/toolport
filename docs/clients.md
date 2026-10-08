@@ -141,7 +141,9 @@ under its data directory's `backups/<client>/original-<path hash>.json`. The rec
 includes the path, content hash, capture time and Toolport version. It is separate
 from the rotating backups and uses owner-only permissions (Unix modes or a
 private Windows ACL). Original provenance is retained after disconnect, so
-repeated removal and a later uninstaller preserve the restored config.
+repeated removal and a later uninstaller preserve the restored config. Reconnecting
+captures a fresh original and replaces the completed snapshot payloads. Client
+config writes and restoration preserve the existing file mode.
 
 Disconnect restores exact original bytes when the config still matches Toolport's
 last write and no intervening native edits were observed. Otherwise it preserves
