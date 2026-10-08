@@ -94,7 +94,7 @@ jobs:
             # with a bare "could not resolve all dependencies".
             echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
             chmod 440 /etc/sudoers.d/builder
-            cp /src/packaging/linux/native/PKGBUILD /src/packaging/linux/native/toolport.install /build/
+            cp /src/packaging/linux/native/{PKGBUILD,toolport.install,disconnect-users.sh} /build/
             chown -R builder /build /out
             sudo -u builder makepkg --noconfirm --nocheck --syncdeps
             namcap PKGBUILD || true

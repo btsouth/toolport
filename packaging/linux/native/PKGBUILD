@@ -24,9 +24,11 @@ conflicts=('toolport-bin' 'toolport-native-preview')
 replaces=('toolport-native-preview')
 options=('!lto')
 source=("toolport-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
-        "toolport.install")
+        "toolport.install"
+        "disconnect-users.sh")
 sha256sums=('d521eb818d9d4da9cab43c792291a21108e1ab874aedecb01804655c004d2af0'
-            '6e088daf3a4c3ecae0dde8c0b5def3431b55f676c6a86df3f9b30f6befc0272d')
+            '6e088daf3a4c3ecae0dde8c0b5def3431b55f676c6a86df3f9b30f6befc0272d'
+            '56c88bf705ac294ac636b2796886160276d156479d07f9d02997e87d99788412')
 
 build() {
   cd "toolport-$pkgver/src-tauri"
@@ -59,7 +61,7 @@ package() {
   install -d "$pkgdir/usr/share/toolport/agent-plugin"
   (cd packaging/agent-plugin && zip -qr \
     "$pkgdir/usr/share/toolport/agent-plugin/toolport-agent-plugin.zip" toolport)
-  install -Dm755 packaging/linux/native/disconnect-users.sh \
+  install -Dm755 "$srcdir/disconnect-users.sh" \
     "$pkgdir/usr/share/toolport/disconnect-users.sh"
   install -Dm755 scripts/toolport-preview-rollback.sh \
     "$pkgdir/usr/share/toolport/toolport-preview-rollback.sh"
