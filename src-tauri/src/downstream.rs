@@ -6279,6 +6279,9 @@ impl HttpTransport {
     }
 
     fn record_refresh_failure(&self, token: Option<String>, error: String) {
+        if crate::remote::is_refresh_lock_error(&error) {
+            return;
+        }
         *self
             .refresh_failure
             .lock()
@@ -6293,11 +6296,12 @@ impl HttpTransport {
         let Some(owner) = &self.auth_owner else {
             return Ok(false);
         };
-        let stored = crate::secrets::get_secret_result(owner, crate::secrets::HTTP_AUTH_KEY)
-            .map_err(|error| {
-                TransportError::Fatal(format!("could not read the vaulted auth token: {error}"))
-            })?;
-        if let Some(token) = stored.filter(|token| rejected.as_ref() != Some(token)) {
+        let stored = match rejected.as_deref() {
+            Some(rejected) => crate::remote::newer_credential(owner, rejected),
+            None => crate::remote::current_credential(owner),
+        }
+        .map_err(TransportError::Fatal)?;
+        if let Some(token) = stored {
             self.publish_refreshed_auth(token);
             *self
                 .refresh_failure
@@ -6338,11 +6342,6 @@ impl HttpTransport {
         code: u16,
         rejected: Option<String>,
     ) -> Result<(), TransportError> {
-        let Some(refresh) = self.refresh.as_ref() else {
-            return Err(TransportError::Fatal(format!(
-                "HTTP {code} (needs authentication): no refresh callback configured"
-            )));
-        };
         let rejected_at = Instant::now();
         // Lock order: auth gate, auth, budget/failure. Recheck after taking
         // the callback gate: siblings rejected with the old bearer share its result.
@@ -6355,6 +6354,9 @@ impl HttpTransport {
         if current != rejected {
             return Ok(());
         }
+        if self.reuse_stored_auth(&rejected)? {
+            return Ok(());
+        }
         if let Some(failure) = self
             .refresh_failure
             .lock()
@@ -6365,9 +6367,11 @@ impl HttpTransport {
                 return Err(TransportError::Fatal(failure.error.clone()));
             }
         }
-        if self.reuse_stored_auth(&rejected)? {
-            return Ok(());
-        }
+        let Some(refresh) = self.refresh.as_ref() else {
+            return Err(TransportError::Fatal(format!(
+                "HTTP {code} (needs authentication): no refresh callback configured"
+            )));
+        };
         if self.forced_refresh_spent() {
             return Err(TransportError::Fatal(format!(
                 "HTTP {code} (needs authentication): refreshed token rejected"
@@ -14648,7 +14652,7 @@ mod tests {
                 let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
                 let url = format!("http://{}/", server.server_addr());
                 let wire = std::thread::spawn(move || {
-                    for _ in 0..if proactive { 1 } else { 2 } {
+                    for _ in 0..if proactive { 1 } else { 3 } {
                         let mut request = server
                             .recv_timeout(Duration::from_secs(5))
                             .unwrap()
@@ -14697,6 +14701,39 @@ mod tests {
                 assert_eq!(callbacks.load(Ordering::SeqCst), 1);
             }
         });
+    }
+
+    #[test]
+    fn http_lock_contention_is_never_cached() {
+        let mut transport = HttpTransport::with_auth_refresh(
+            "http://127.0.0.1:1/",
+            Some("old".into()),
+            Some(Box::new(|_| {
+                Err(
+                    "OAuth refresh is busy or its cross-process lock is unavailable; try again."
+                        .into(),
+                )
+            })),
+        );
+        transport.refresh_before_send().unwrap();
+        assert!(transport.refresh_failure.lock().unwrap().is_none());
+        assert!(transport.force_refresh_after_auth_error(401).is_err());
+        assert!(transport.refresh_failure.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn http_later_rejection_retries_after_cached_refresh_failure() {
+        let mut transport = HttpTransport::with_auth_refresh(
+            "http://127.0.0.1:1/",
+            Some("old".into()),
+            Some(Box::new(|force| {
+                assert!(force);
+                Ok(Some("fresh".into()))
+            })),
+        );
+        transport.record_refresh_failure(Some("old".into()), "temporary provider failure".into());
+        transport.force_refresh_after_auth_error(401).unwrap();
+        assert_eq!(transport.auth.lock().unwrap().as_deref(), Some("fresh"));
     }
 
     #[test]
