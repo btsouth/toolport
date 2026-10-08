@@ -109,11 +109,10 @@ pub(super) fn review(
             .map(|c| format!("{c} {}", item.args.join(" ")))
             .or(item.url.clone())
             .unwrap_or_else(|| "Needs an endpoint URL".into());
-        let row = adw::ExpanderRow::builder()
+        let row = adw::ActionRow::builder()
             .title(&item.name)
             .subtitle(&command)
             .build();
-        row.add_css_class("toolport-setup-expander");
         row.set_subtitle_lines(1);
         middle_ellipsize(row.upcast_ref(), &command);
         let check = gtk::CheckButton::builder()
@@ -122,7 +121,11 @@ pub(super) fn review(
             .build();
         row.add_prefix(&check);
         check.set_sensitive(item.unsupported.is_none());
-        row.set_enable_expansion(!item.credentials.is_empty() || !item.updates.is_empty());
+        row.set_activatable_widget(Some(&check));
+        let (settings, content) = details_expander("Credentials and settings");
+        let credential_rows = gtk::ListBox::new();
+        credential_rows.set_selection_mode(gtk::SelectionMode::None);
+        content.append(&credential_rows);
         let tag = gtk::Label::new(Some(if !item.updates.is_empty() {
             "Updates existing server"
         } else if item.is_new {
@@ -135,7 +138,7 @@ pub(super) fn review(
                 .title("Changes")
                 .subtitle(item.updates.join(", "))
                 .build();
-            row.add_row(&changes);
+            credential_rows.append(&changes);
         }
         tag.add_css_class("dim-label");
         row.add_suffix(&tag);
@@ -220,7 +223,7 @@ pub(super) fn review(
                 .build();
             value_row.add_suffix(&choice);
             value_row.set_activatable_widget(Some(&choice));
-            row.add_row(&value_row);
+            credential_rows.append(&value_row);
             if !env.present {
                 let open = gtk::Button::with_label("Enter value");
                 let owner = dialog.clone();
@@ -252,6 +255,9 @@ pub(super) fn review(
             credential_choices.push((item.name.clone(), env.key, choice));
         }
         rows.append(&row);
+        if credential_rows.first_child().is_some() {
+            rows.append(&settings);
+        }
         selected.push((check, row, spinner, item.key, item.name));
     }
     body.append(&rows);
