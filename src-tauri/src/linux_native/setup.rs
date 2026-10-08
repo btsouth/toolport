@@ -144,7 +144,9 @@ pub(super) fn review(
         } else {
             None
         };
-        let row_choices = std::rc::Rc::new(std::cell::RefCell::new(Vec::<gtk::CheckButton>::new()));
+        let row_choices = std::rc::Rc::new(std::cell::RefCell::new(Vec::<
+            gtk::glib::WeakRef<gtk::CheckButton>,
+        >::new()));
         let fields = std::rc::Rc::new(item.credentials.clone());
         let refresh_state: std::rc::Rc<dyn Fn()> = std::rc::Rc::new({
             let (state, fields, choices, inputs, name) = (
@@ -166,7 +168,12 @@ pub(super) fn review(
                     });
                     state.set_label(if !found {
                         "Missing"
-                    } else if choices.borrow().iter().any(|choice| choice.is_active()) {
+                    } else if choices
+                        .borrow()
+                        .iter()
+                        .filter_map(|choice| choice.upgrade())
+                        .any(|choice| choice.is_active())
+                    {
                         "Found, goes to keychain"
                     } else {
                         "Found"
@@ -185,7 +192,7 @@ pub(super) fn review(
                 .label(format!("Keep {} in keychain", env.key))
                 .active(env.secret)
                 .build();
-            row_choices.borrow_mut().push(choice.clone());
+            row_choices.borrow_mut().push(choice.downgrade());
             let refresh = refresh_state.clone();
             choice.connect_toggled(move |_| refresh());
             choice.set_sensitive(item.unsupported.is_none() && !env.key.starts_with("__"));
@@ -341,8 +348,13 @@ pub(super) fn review(
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || action(chosen, choices, inputs)).await;
             busy.set(false);
-            for (_, _, choice) in credential_choices.iter() {
-                choice.set_sensitive(true);
+            for (name, key, choice) in credential_choices.iter() {
+                choice.set_sensitive(
+                    !key.starts_with("__")
+                        && selected.iter().any(|(_, row, _, _, server)| {
+                            server == name && !row.subtitle().starts_with("Unsupported:")
+                        }),
+                );
             }
             cancel.set_sensitive(true);
             button.set_sensitive(true);
