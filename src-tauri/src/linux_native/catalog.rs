@@ -6,6 +6,13 @@ use adw::prelude::*;
 
 const SUGGESTION_BATCH: usize = 4;
 
+#[cfg(test)]
+type RegistryFetch = std::sync::Arc<
+    dyn Fn(&str) -> Result<Vec<crate::catalog::CatalogEntry>, crate::catalog::RegistryStatus>
+        + Send
+        + Sync,
+>;
+
 #[derive(Clone, PartialEq, Eq)]
 struct CatalogSnapshot {
     entries: Vec<crate::catalog::CatalogEntry>,
@@ -43,6 +50,10 @@ pub(super) struct CatalogPage {
     /// Self-hosted entries are configured in the Add server editor rather than
     /// added in one click, so Catalog needs the page that owns it.
     server_page: super::ServerPage,
+    #[cfg(test)]
+    registry_fetch: Rc<RefCell<Option<RegistryFetch>>>,
+    #[cfg(test)]
+    completed_suggestions: Rc<Cell<u64>>,
 }
 
 impl CatalogPage {
@@ -170,6 +181,10 @@ impl CatalogPage {
             pending_notice: Rc::new(RefCell::new(None)),
             feedback_timer: Rc::new(RefCell::new(None)),
             server_page,
+            #[cfg(test)]
+            registry_fetch: Default::default(),
+            #[cfg(test)]
+            completed_suggestions: Default::default(),
         };
         let page_for_activate = catalog.clone();
         catalog.search.connect_activate(move |entry| {
@@ -211,7 +226,7 @@ impl CatalogPage {
     }
 
     pub(super) fn refresh(&self) {
-        self.search("");
+        self.load_popular();
     }
 
     fn cancel_suggestion_timer(&self) {
@@ -279,21 +294,24 @@ impl CatalogPage {
 
     fn load_registry_suggestions(&self, query: String, generation: u64) {
         let page = self.clone();
+        #[cfg(test)]
+        let fetch = self.registry_fetch.borrow().clone();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || {
+                #[cfg(test)]
+                let result = crate::catalog::search_with_registry(&query, |query| {
+                    fetch.map_or_else(
+                        || crate::catalog::search_registry(query),
+                        |fetch| fetch(query),
+                    )
+                });
+                #[cfg(not(test))]
                 let result = crate::catalog::search(&query);
                 let registry = crate::registry::load()?;
                 let existing = registry
                     .servers
                     .into_iter()
-                    .filter_map(|server| {
-                        crate::catalog::server_identity(
-                            &server.transport,
-                            server.command.as_deref(),
-                            &server.args,
-                            server.url.as_deref(),
-                        )
-                    })
+                    .flat_map(|server| crate::catalog::installed_server_identities(&server))
                     .collect::<HashSet<_>>();
                 Ok::<_, String>(SuggestionState {
                     entries: result.entries,
@@ -302,6 +320,9 @@ impl CatalogPage {
                 })
             })
             .await;
+            #[cfg(test)]
+            page.completed_suggestions
+                .set(page.completed_suggestions.get() + 1);
             if generation != page.suggestion_generation.get() {
                 return;
             }
@@ -365,6 +386,15 @@ impl CatalogPage {
                     .css_classes(["toolport-suggestion-message", "error"])
                     .build(),
             );
+            let retry = gtk::Button::with_label("Try again");
+            retry.add_css_class("flat");
+            retry.set_halign(gtk::Align::Start);
+            let page = self.clone();
+            retry.connect_clicked(move |_| {
+                page.cancel_suggestion_timer();
+                page.load_suggestions(page.search.text().as_str());
+            });
+            self.suggestion_list.append(&retry);
         }
         if state.entries.is_empty() {
             if state
@@ -417,82 +447,35 @@ impl CatalogPage {
         self.open_suggestions();
     }
 
-    fn search(&self, query: &str) {
+    fn load_popular(&self) {
         let generation = self.request_generation.get().wrapping_add(1);
         self.request_generation.set(generation);
-        self.feedback.set_label(if query.trim().is_empty() {
-            "Loading curated servers…"
-        } else {
-            "Searching the MCP Registry…"
-        });
+        self.feedback.set_label("Loading curated servers…");
         self.feedback.remove_css_class("error");
         self.feedback.remove_css_class("success");
         self.feedback.set_visible(true);
-        let query = query.to_string();
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || {
-                let result = if query.trim().is_empty() {
-                    crate::catalog::CatalogSearch {
-                        entries: crate::catalog::popular(),
-                        registry_status: crate::catalog::RegistryStatus::NotQueried,
-                    }
-                } else {
-                    crate::catalog::search(&query)
-                };
-                let entries = result.entries;
+                let entries = crate::catalog::popular();
                 let registry = crate::registry::load()?;
                 let existing = registry
                     .servers
-                    .into_iter()
-                    .filter_map(|server| {
-                        crate::catalog::server_identity(
-                            &server.transport,
-                            server.command.as_deref(),
-                            &server.args,
-                            server.url.as_deref(),
-                        )
-                    })
-                    .collect::<HashSet<_>>();
-                let stacks = query.trim().is_empty().then(crate::stacks::stacks);
-                Ok::<_, String>((entries, existing, stacks, result.registry_status))
+                    .iter()
+                    .flat_map(crate::catalog::installed_server_identities)
+                    .collect();
+                Ok::<_, String>((entries, existing, Some(crate::stacks::stacks())))
             })
             .await;
             if generation != page.request_generation.get() {
                 return;
             }
             match result {
-                Ok(Ok((entries, existing, stacks, status))) => {
-                    page.render_search(
-                        crate::catalog::CatalogSearch {
-                            entries,
-                            registry_status: status,
-                        },
-                        existing,
-                        stacks,
-                    );
-                }
+                Ok(Ok((entries, existing, stacks))) => page.render(entries, existing, stacks),
                 Ok(Err(error)) => page.show_error(&error),
                 Err(_) => page.show_error("the catalog search stopped unexpectedly"),
             }
         });
-    }
-
-    fn render_search(
-        &self,
-        result: crate::catalog::CatalogSearch,
-        existing: HashSet<String>,
-        stacks: Option<Vec<crate::stacks::Stack>>,
-    ) {
-        self.render(result.entries, existing, stacks);
-        if let Some(notice) = result.registry_status.notice() {
-            if let Some(timer) = self.feedback_timer.borrow_mut().take() {
-                timer.remove();
-            }
-            self.feedback.set_label(notice);
-            self.feedback.add_css_class("error");
-            self.feedback.set_visible(true);
-        }
     }
 
     fn render(
@@ -620,7 +603,9 @@ fn suggestion_row(
     );
     row.append(&copy);
 
-    if crate::catalog::entry_identity(&entry).is_some_and(|identity| existing.contains(&identity)) {
+    if crate::catalog::installed_entry_identity(&entry)
+        .is_some_and(|identity| existing.contains(&identity))
+    {
         let added = gtk::Label::new(Some("Added"));
         added.set_size_request(72, -1);
         added.set_valign(gtk::Align::Center);
@@ -729,7 +714,7 @@ fn stack_card(
         .servers
         .iter()
         .filter(|entry| {
-            !crate::catalog::entry_identity(&entry)
+            !crate::catalog::installed_entry_identity(&entry)
                 .is_some_and(|identity| existing.contains(&identity))
         })
         .count();
@@ -826,7 +811,7 @@ fn stack_card(
         .servers
         .iter()
         .filter(|entry| {
-            !crate::catalog::entry_identity(entry)
+            !crate::catalog::installed_entry_identity(entry)
                 .is_some_and(|identity| existing.contains(&identity))
         })
         .cloned()
@@ -946,7 +931,9 @@ fn catalog_card(
 
     let action_slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     action_slot.set_size_request(72, -1);
-    if crate::catalog::entry_identity(&entry).is_some_and(|identity| existing.contains(&identity)) {
+    if crate::catalog::installed_entry_identity(&entry)
+        .is_some_and(|identity| existing.contains(&identity))
+    {
         let added = gtk::Label::new(Some("Added"));
         added.set_valign(gtk::Align::Center);
         added.set_size_request(72, -1);
@@ -1044,6 +1031,18 @@ mod tests {
         result
     }
 
+    fn wait_until(ready: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GTK async state did not settle"
+            );
+            gtk::glib::MainContext::default().iteration(false);
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn catalog_outage_and_installed_states() {
@@ -1082,21 +1081,17 @@ mod tests {
         window.add_css_class("toolport-native");
         let theme = super::super::theme::ThemeController::new();
         theme.attach(&window);
-        // Cancel the production debounce in this fixture before it can start
-        // network work, then render the same suggestion state as a failed search.
+        let _lock = crate::registry::data_dir_test_lock();
+        let scratch = tempfile::tempdir().unwrap();
+        let _data = crate::registry::DataDirOverride::set(scratch.path());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        page.registry_fetch
+            .replace(Some(std::sync::Arc::new(move |_| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(crate::catalog::RegistryStatus::Unavailable)
+            })));
         page.search.set_search_delay(0);
-        let offline_page = page.clone();
-        page.search.connect_search_changed(move |search| {
-            offline_page.cancel_suggestion_timer();
-            if !search.text().is_empty() {
-                offline_page.suggestion_state.replace(SuggestionState {
-                    entries: crate::catalog::search_curated(search.text().as_str()),
-                    existing: HashSet::new(),
-                    registry_status: Some(crate::catalog::RegistryStatus::Unavailable),
-                });
-                offline_page.render_suggestions();
-            }
-        });
         let entries: Vec<_> = crate::catalog::popular()
             .into_iter()
             .filter(|entry| matches!(entry.name.as_str(), "GitHub" | "Memory" | "Redis"))
@@ -1118,14 +1113,7 @@ mod tests {
             ("outage", HashSet::new()),
             ("installed", HashSet::from([identity])),
         ] {
-            page.render_search(
-                crate::catalog::CatalogSearch {
-                    entries: entries.clone(),
-                    registry_status: crate::catalog::RegistryStatus::NotQueried,
-                },
-                existing,
-                None,
-            );
+            page.render(entries.clone(), existing, None);
             if state == "normal" {
                 window.present();
             }
@@ -1157,7 +1145,10 @@ mod tests {
             let drawn_page = page.clone();
             window.add_tick_callback(move |_, _| {
                 if !ready.get()
-                    || (state == "outage" && !drawn_page.suggestion_popover.is_visible())
+                    || (state == "outage"
+                        && (!drawn_page.suggestion_popover.is_visible()
+                            || drawn_page.suggestion_state.borrow().registry_status
+                                != Some(crate::catalog::RegistryStatus::Unavailable)))
                 {
                     return gtk::glib::ControlFlow::Continue;
                 }
@@ -1184,6 +1175,9 @@ mod tests {
                 assert!(page.suggestion_popover.is_visible());
                 assert!(labels(&page.suggestion_list)
                     .iter()
+                    .any(|label| label == "Try again"));
+                assert!(labels(&page.suggestion_list)
+                    .iter()
                     .any(|label| label.contains("curated matches only")));
                 assert!(labels(&page.suggestion_list)
                     .iter()
@@ -1201,6 +1195,23 @@ mod tests {
                     .status()
                     .unwrap()
                     .success());
+            }
+            if state == "outage" {
+                let retry = page
+                    .suggestion_list
+                    .first_child()
+                    .unwrap()
+                    .next_sibling()
+                    .unwrap()
+                    .downcast::<gtk::Button>()
+                    .unwrap();
+                let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+                retry.emit_clicked();
+                wait_until(|| {
+                    page.suggestion_state.borrow().registry_status
+                        == Some(crate::catalog::RegistryStatus::Unavailable)
+                });
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), before + 1);
             }
         }
         for status in [
@@ -1228,6 +1239,42 @@ mod tests {
                 .iter()
                 .any(|label| label.contains("No trusted matches")));
         }
+        page.close_suggestions();
+        // The old worker completes after the new generation has rendered.
+        let (release, stalled) = std::sync::mpsc::channel();
+        let stalled = std::sync::Mutex::new(stalled);
+        let (started, waiting) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        page.registry_fetch
+            .replace(Some(std::sync::Arc::new(move |query| {
+                if query == "old" {
+                    started.send(()).unwrap();
+                    stalled.lock().unwrap().recv().unwrap();
+                    finished.send(()).unwrap();
+                    Err(crate::catalog::RegistryStatus::Unavailable)
+                } else {
+                    Err(crate::catalog::RegistryStatus::TimedOut)
+                }
+            })));
+        let completed = page.completed_suggestions.get();
+        page.load_suggestions("old");
+        wait_until(|| waiting.try_recv().is_ok());
+        page.load_suggestions("github");
+        wait_until(|| {
+            page.suggestion_state.borrow().registry_status
+                == Some(crate::catalog::RegistryStatus::TimedOut)
+        });
+        release.send(()).unwrap();
+        done.recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        wait_until(|| page.completed_suggestions.get() == completed + 2);
+        assert_eq!(
+            page.suggestion_state.borrow().registry_status,
+            Some(crate::catalog::RegistryStatus::TimedOut)
+        );
+        assert!(labels(&page.suggestion_list)
+            .iter()
+            .any(|label| label.contains("took too long")));
         page.close_suggestions();
         window.close();
     }

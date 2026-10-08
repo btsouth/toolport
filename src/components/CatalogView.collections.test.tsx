@@ -2,9 +2,14 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { addCatalogServer, listStacks, popularCatalog, searchCatalog } from "@/lib/api";
-import type { CatalogEntry, Registry, Stack } from "@/lib/types";
+import type { CatalogEntry, CatalogSearch, Registry, Stack } from "@/lib/types";
 import identities from "../../src-tauri/tests/fixtures/catalog-identities.json";
-import { catalogIdentity, CatalogView } from "./CatalogView";
+import {
+  catalogIdentity,
+  catalogInstalledIdentities,
+  installed,
+} from "@/lib/catalogIdentity";
+import { CatalogView } from "./CatalogView";
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
@@ -139,9 +144,16 @@ describe("CatalogView collection loading", () => {
 });
 
 describe("CatalogView search and installed identity", () => {
-  it.each(identities)("$case", ({ catalog, server, equal }) => {
+  it.each(identities)("$case", (fixture) => {
+    const { catalog, server, equal } = fixture;
     const a = catalogIdentity(catalog as CatalogEntry);
     expect(a !== null && a === catalogIdentity(server as CatalogEntry)).toBe(equal);
+    expect(
+      installed(
+        new Set(catalogInstalledIdentities(server as Registry["servers"][number])),
+        { ...entry, source: "", ...catalog } as CatalogEntry,
+      ),
+    ).toBe("installedEqual" in fixture ? fixture.installedEqual : equal);
   });
 
   it.each(["unavailable", "timedOut"] as const)(
@@ -155,6 +167,13 @@ describe("CatalogView search and installed identity", () => {
       render(<CatalogView registry={registry} onAdded={vi.fn()} />);
       await user.type(screen.getByRole("textbox"), "github");
       expect(await screen.findByText(/Showing curated matches only/)).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          registryStatus === "timedOut"
+            ? /took too long to respond/
+            : /Registry is unavailable/,
+        ),
+      ).toBeInTheDocument();
       expect(screen.getByText("GitHub")).toBeInTheDocument();
       expect(screen.queryByText(/No catalog results/)).not.toBeInTheDocument();
       await user.click(screen.getByRole("button", { name: "Try again" }));
@@ -166,6 +185,39 @@ describe("CatalogView search and installed identity", () => {
       );
     },
   );
+
+  it("keeps search results visible while a new query and retry are pending", async () => {
+    vi.mocked(listStacks).mockResolvedValue([collection]);
+    const pendingSearch = deferred<CatalogSearch>();
+    const pendingRetry = deferred<CatalogSearch>();
+    const result = { ...entry, name: "Search-only result" };
+    vi.mocked(searchCatalog)
+      .mockResolvedValueOnce({ entries: [result], registryStatus: "available" })
+      .mockReturnValueOnce(pendingSearch.promise)
+      .mockReturnValueOnce(pendingRetry.promise);
+    const user = userEvent.setup();
+    render(<CatalogView registry={registry} onAdded={vi.fn()} />);
+    await user.type(screen.getByRole("textbox"), "github");
+    await screen.findByText(result.name);
+    await user.type(screen.getByRole("textbox"), "x");
+    await waitFor(() => expect(searchCatalog).toHaveBeenCalledTimes(2));
+    expect(screen.getByText(result.name)).toBeInTheDocument();
+    expect(screen.queryByText("Developer")).not.toBeInTheDocument();
+    expect(screen.getByText("Searching the MCP Registry…")).toBeInTheDocument();
+    await act(async () =>
+      pendingSearch.resolve({ entries: [result], registryStatus: "timedOut" }),
+    );
+    await user.click(await screen.findByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(searchCatalog).toHaveBeenCalledTimes(3));
+    expect(screen.getByText(result.name)).toBeInTheDocument();
+    expect(screen.queryByText("Developer")).not.toBeInTheDocument();
+    expect(screen.queryByText(/took too long/)).not.toBeInTheDocument();
+    expect(screen.getByText("Searching the MCP Registry…")).toBeInTheDocument();
+    await act(async () =>
+      pendingRetry.resolve({ entries: [result], registryStatus: "available" }),
+    );
+    expect(screen.getByText(/1 result/)).toBeInTheDocument();
+  });
 
   it("does not call an outage with no curated matches no results", async () => {
     vi.mocked(listStacks).mockResolvedValue([]);

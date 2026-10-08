@@ -232,5 +232,398 @@
       "url": "https://example.com/mcp/?project=a&x-api-key=second"
     },
     "equal": true
+  },
+  {
+    "case": "uvx at versions",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["acme_mcp@1"],
+      "url": null
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["acme-mcp@2"],
+      "url": null
+    },
+    "equal": true
+  },
+  {
+    "case": "uvx equals and at versions",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["acme_mcp==1"],
+      "url": null
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["acme-mcp@2"],
+      "url": null
+    },
+    "equal": true
+  },
+  {
+    "case": "uvx from package versions",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["--from", "acme_mcp@1", "serve"],
+      "url": null
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "uvx.exe",
+      "args": ["--from", "acme-mcp==2", "serve"],
+      "url": null
+    },
+    "equal": true
+  },
+  {
+    "case": "uvx different ['other@1']",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["acme@1"],
+      "url": null
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["other@1"],
+      "url": null
+    },
+    "equal": false
+  },
+  {
+    "case": "uvx different ['--from', 'other@1', 'serve']",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["--from", "acme@1", "serve"],
+      "url": null
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["--from", "other@1", "serve"],
+      "url": null
+    },
+    "equal": false
+  },
+  {
+    "case": "uvx different ['--from', 'acme@1', 'other']",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["--from", "acme@1", "serve"],
+      "url": null
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["--from", "acme@1", "other"],
+      "url": null
+    },
+    "equal": false
+  },
+  {
+    "case": "scoped npm without version",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@acme/mcp"],
+      "url": null
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["--yes", "@acme/mcp@2"],
+      "url": null
+    },
+    "equal": true
+  },
+  {
+    "case": "windows npx launcher",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@acme/mcp@1"],
+      "url": null
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "C:\\tools\\npx.cmd",
+      "args": ["--yes", "@acme/mcp@2"],
+      "url": null
+    },
+    "equal": true
+  },
+  {
+    "case": "docker tags preserve registry port",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "docker",
+      "args": ["run", "--rm", "-i", "registry.example:5000/acme/mcp:1"],
+      "url": null
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "/usr/bin/docker",
+      "args": ["run", "--rm", "-i", "registry.example:5000/acme/mcp:2"],
+      "url": null
+    },
+    "equal": true
+  },
+  {
+    "case": "docker digest and tag",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "docker",
+      "args": ["run", "--rm", "ghcr.io/acme/mcp:1"],
+      "url": null
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "docker",
+      "args": ["run", "--rm", "ghcr.io/acme/mcp@sha256:abcdef"],
+      "url": null
+    },
+    "equal": true
+  },
+  {
+    "case": "docker env flag before image",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "docker",
+      "args": ["run", "-e", "MODE=test", "ghcr.io/acme/mcp:1"],
+      "url": null
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "docker",
+      "args": ["run", "-e", "MODE=test", "ghcr.io/acme/mcp:2"],
+      "url": null
+    },
+    "equal": true
+  },
+  {
+    "case": "docker different images",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "docker",
+      "args": ["run", "ghcr.io/acme/mcp:1"],
+      "url": null
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "docker",
+      "args": ["run", "ghcr.io/other/mcp:1"],
+      "url": null
+    },
+    "equal": false
+  },
+  {
+    "case": "docker different registry hosts",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "docker",
+      "args": ["run", "ghcr.io/acme/mcp:1"],
+      "url": null
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "stdio",
+      "command": "docker",
+      "args": ["run", "registry.example/acme/mcp:1"],
+      "url": null
+    },
+    "equal": false
+  },
+  {
+    "case": "tokenizer selects endpoint",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://example.com/mcp?tokenizer=a"
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://example.com/mcp?tokenizer=b"
+    },
+    "equal": false
+  },
+  {
+    "case": "nonsecret query order is irrelevant",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://example.com/mcp?z=2&a=1&a=0"
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://example.com/mcp?a=0&a=1&z=2"
+    },
+    "equal": true
+  },
+  {
+    "case": "exact case insensitive secret keys",
+    "catalog": {
+      "name": "Fixture",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://example.com/mcp?TOKEN=a&ACCESS_TOKEN=a&AUTH=a&CLIENT_SECRET=a&API_KEY=a&APIKEY=a&KEY=a&SECRET=a&PASSWORD=a&AUTHORIZATION=a&SIG=a&SIGNATURE=a&X-API-KEY=a&CREDENTIAL=a"
+    },
+    "server": {
+      "name": "Fixture",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://example.com/mcp?token=b&access_token=b&auth=b&client_secret=b&api_key=b&apikey=b&key=b&secret=b&password=b&authorization=b&sig=b&signature=b&x-api-key=b&credential=b"
+    },
+    "equal": true
+  },
+  {
+    "case": "n8n curated self hosted installed",
+    "catalog": {
+      "name": "n8n",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": null,
+      "source": "curated"
+    },
+    "server": {
+      "name": "n8n",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://self.example/mcp",
+      "source": "catalog:curated"
+    },
+    "equal": false,
+    "installedEqual": true
+  },
+  {
+    "case": "n8n manual same name is different",
+    "catalog": {
+      "name": "n8n",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": null,
+      "source": "curated"
+    },
+    "server": {
+      "name": "n8n",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://self.example/mcp",
+      "source": "manual"
+    },
+    "equal": false,
+    "installedEqual": false
+  },
+  {
+    "case": "Langfuse curated self hosted installed",
+    "catalog": {
+      "name": "Langfuse",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": null,
+      "source": "curated"
+    },
+    "server": {
+      "name": "Langfuse",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://self.example/mcp",
+      "source": "catalog:curated"
+    },
+    "equal": false,
+    "installedEqual": true
+  },
+  {
+    "case": "Langfuse manual same name is different",
+    "catalog": {
+      "name": "Langfuse",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": null,
+      "source": "curated"
+    },
+    "server": {
+      "name": "Langfuse",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://self.example/mcp",
+      "source": "manual"
+    },
+    "equal": false,
+    "installedEqual": false
+  },
+  {
+    "case": "curated fallback exact name",
+    "catalog": {
+      "name": "n8n",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": null,
+      "source": "curated"
+    },
+    "server": {
+      "name": "N8N",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://self.example/mcp",
+      "source": "catalog:curated"
+    },
+    "equal": false,
+    "installedEqual": false
   }
 ]

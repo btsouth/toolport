@@ -11,6 +11,7 @@ use crate::registry::{ArgBinding, ArgPart, LaunchConfig, LaunchInput};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const REGISTRY_SEARCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 const REGISTRY_URL: &str = "https://registry.modelcontextprotocol.io/v0.1/servers";
 
 /// One addable server: enough to create a registry entry, plus display metadata.
@@ -516,8 +517,12 @@ pub enum RegistryStatus {
 impl RegistryStatus {
     pub fn notice(self) -> Option<&'static str> {
         match self {
-            Self::Unavailable => Some("The live MCP Registry is unavailable. Showing curated matches only. Try again."),
-            Self::TimedOut => Some("The live MCP Registry took too long to respond. Showing curated matches only. Try again."),
+            Self::Unavailable => {
+                Some("The live MCP Registry is unavailable. Showing curated matches only.")
+            }
+            Self::TimedOut => Some(
+                "The live MCP Registry took too long to respond. Showing curated matches only.",
+            ),
             _ => None,
         }
     }
@@ -534,7 +539,7 @@ pub fn search(query: &str) -> CatalogSearch {
     search_with_registry(query, search_registry)
 }
 
-fn search_with_registry(
+pub(crate) fn search_with_registry(
     query: &str,
     live: impl FnOnce(&str) -> Result<Vec<CatalogEntry>, RegistryStatus>,
 ) -> CatalogSearch {
@@ -589,11 +594,12 @@ pub fn server_identity(
         url.set_username("").ok()?;
         url.set_password(None).ok()?;
         url.set_fragment(None);
-        let query: Vec<_> = url
+        let mut query: Vec<_> = url
             .query_pairs()
             .filter(|(key, _)| !secret_query_key(key))
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
             .collect();
+        query.sort();
         url.set_query(None);
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query);
@@ -629,11 +635,46 @@ pub fn server_identity(
                 }
             } else {
                 *spec = spec
-                    .split("==")
+                    .split(['@', '='])
                     .next()
                     .unwrap_or(spec)
                     .replace('_', "-")
                     .to_ascii_lowercase();
+            }
+        }
+        runner
+    } else if runner == "docker" && args.first().is_some_and(|arg| arg == "run") {
+        let value_flags = [
+            "-e",
+            "--env",
+            "--env-file",
+            "-v",
+            "--volume",
+            "-p",
+            "--publish",
+            "--name",
+            "--network",
+            "--entrypoint",
+            "-w",
+            "--workdir",
+            "-u",
+            "--user",
+            "--mount",
+        ];
+        let mut index = 1;
+        while args.get(index).is_some_and(|arg| arg.starts_with('-')) {
+            index += if value_flags.contains(&args[index].as_str()) {
+                2
+            } else {
+                1
+            };
+        }
+        if let Some(image) = args.get_mut(index) {
+            *image = image.split("@sha256:").next().unwrap().to_string();
+            if let Some(colon) = image.rfind(':') {
+                if image.rfind('/').is_none_or(|slash| colon > slash) {
+                    image.truncate(colon);
+                }
             }
         }
         runner
@@ -643,22 +684,46 @@ pub fn server_identity(
     Some(serde_json::to_string(&(command, args)).expect("launch identity"))
 }
 
+pub fn installed_entry_identity(entry: &CatalogEntry) -> Option<String> {
+    entry_identity(entry)
+        .or_else(|| (entry.source == "curated").then(|| format!("curated:{}", entry.name)))
+}
+
+pub fn installed_server_identities(server: &crate::registry::ServerEntry) -> Vec<String> {
+    let mut identities: Vec<_> = server_identity(
+        &server.transport,
+        server.command.as_deref(),
+        &server.args,
+        server.url.as_deref(),
+    )
+    .into_iter()
+    .collect();
+    if server.source.as_deref() == Some("catalog:curated") {
+        identities.push(format!("curated:{}", server.name));
+    }
+    identities
+}
+
 fn secret_query_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase().replace('-', "_");
-    key == "key"
-        || key == "sig"
-        || [
-            "token",
-            "secret",
-            "password",
-            "credential",
-            "api_key",
-            "apikey",
-            "authorization",
-            "signature",
-        ]
-        .iter()
-        .any(|part| key.contains(part))
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "token"
+            | "access_token"
+            | "api_key"
+            | "apikey"
+            | "key"
+            | "secret"
+            | "client_secret"
+            | "password"
+            | "auth"
+            | "authorization"
+            | "sig"
+            | "signature"
+            | "x-api-key"
+            | "credential"
+            | "credentials"
+            | "api-key"
+    )
 }
 
 fn rank_search_results(entries: &mut [CatalogEntry], query: &str) {
@@ -979,8 +1044,30 @@ fn registry_failure(error: &(dyn std::error::Error + 'static)) -> RegistryStatus
 /// Search the official MCP Registry with a bounded deadline.
 pub fn search_registry(query: &str) -> Result<Vec<CatalogEntry>, RegistryStatus> {
     let url = registry_search_url(query);
+    bounded_registry_fetch(REGISTRY_SEARCH_BUDGET, move || fetch_registry(&url))
+}
+
+fn bounded_registry_fetch(
+    budget: std::time::Duration,
+    fetch: impl FnOnce() -> Result<Vec<CatalogEntry>, RegistryStatus> + Send + 'static,
+) -> Result<Vec<CatalogEntry>, RegistryStatus> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    // The worker owns only request data. Expired receivers drop late results.
+    std::thread::Builder::new()
+        .name("catalog-registry".into())
+        .spawn(move || {
+            let _ = sender.send(fetch());
+        })
+        .map_err(|_| RegistryStatus::Unavailable)?;
+    receiver.recv_timeout(budget).map_err(|error| match error {
+        std::sync::mpsc::RecvTimeoutError::Timeout => RegistryStatus::TimedOut,
+        std::sync::mpsc::RecvTimeoutError::Disconnected => RegistryStatus::Unavailable,
+    })?
+}
+
+fn fetch_registry(url: &str) -> Result<Vec<CatalogEntry>, RegistryStatus> {
     use std::io::Read;
-    let resp = ureq::get(&url)
+    let resp = ureq::get(url)
         .timeout(std::time::Duration::from_secs(5))
         .call()
         .map_err(|error| registry_failure(&error))?;
@@ -1009,6 +1096,26 @@ pub fn search_registry(query: &str) -> Result<Vec<CatalogEntry>, RegistryStatus>
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn registry_deadline_bounds_a_stalled_fetch_and_drops_late_results() {
+        let (release, stalled) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let budget = REGISTRY_SEARCH_BUDGET;
+        let start = std::time::Instant::now();
+        let result = bounded_registry_fetch(budget, move || {
+            stalled.recv().unwrap();
+            finished.send(()).unwrap();
+            Ok(popular())
+        });
+        assert_eq!(result, Err(RegistryStatus::TimedOut));
+        assert!(start.elapsed() >= budget);
+        assert!(start.elapsed() < budget + std::time::Duration::from_secs(1));
+        release.send(()).unwrap();
+        done.recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(result, Err(RegistryStatus::TimedOut));
+    }
 
     #[test]
     fn live_timeout_is_classified_without_message_matching() {
@@ -1045,6 +1152,27 @@ mod tests {
                 a.is_some() && a == identity(&fixture["server"]),
                 fixture["equal"].as_bool().unwrap(),
                 "{}",
+                fixture["case"]
+            );
+            let mut catalog =
+                json!({"description": "", "envKeys": [], "source": "", "homepage": null});
+            catalog
+                .as_object_mut()
+                .unwrap()
+                .extend(fixture["catalog"].as_object().unwrap().clone());
+            let catalog: CatalogEntry = serde_json::from_value(catalog).unwrap();
+            let server: crate::registry::ServerEntry =
+                serde_json::from_value(fixture["server"].clone()).unwrap();
+            assert_eq!(
+                installed_entry_identity(&catalog).is_some_and(|identity| {
+                    installed_server_identities(&server).contains(&identity)
+                }),
+                fixture
+                    .get("installedEqual")
+                    .unwrap_or(&fixture["equal"])
+                    .as_bool()
+                    .unwrap(),
+                "installed: {}",
                 fixture["case"]
             );
         }

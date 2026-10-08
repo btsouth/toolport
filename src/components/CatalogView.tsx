@@ -4,6 +4,11 @@ import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
 import { openExternal } from "@/lib/openUrl";
 import { addCatalogServer, listStacks, popularCatalog, searchCatalog } from "@/lib/api";
+import {
+  catalogIdentity,
+  catalogInstalledIdentities,
+  installed,
+} from "@/lib/catalogIdentity";
 import { addCollection } from "@/lib/collections";
 import type { CatalogEntry, CatalogSearch, Registry, Stack } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -21,60 +26,6 @@ const CATEGORY_ORDER = [
   "Apps & productivity",
   "Local tools",
 ];
-
-/** Launch/endpoint identity shared with catalog.rs. Names never imply installed. */
-export function catalogIdentity(
-  entry: Pick<CatalogEntry, "transport" | "command" | "args" | "url">,
-): string | null {
-  if (entry.transport !== "stdio") {
-    if (!entry.url) return null;
-    try {
-      const url = new URL(entry.url.trim());
-      if (!["http:", "https:"].includes(url.protocol)) return null;
-      url.username = "";
-      url.password = "";
-      url.hash = "";
-      const params = new URLSearchParams(url.search);
-      for (const key of [...params.keys()]) {
-        if (
-          key.toLowerCase() === "key" ||
-          key.toLowerCase() === "sig" ||
-          /token|secret|password|credential|api[-_]?key|authorization|signature/i.test(
-            key,
-          )
-        )
-          params.delete(key);
-      }
-      url.search = params.toString();
-      url.pathname = url.pathname.replace(/\/+$/, "") || "/";
-      return `remote:${url.href}`;
-    } catch {
-      return null;
-    }
-  }
-  const command = entry.command?.trim();
-  if (!command) return null;
-  const runner = command
-    .split(/[\\/]/)
-    .at(-1)!
-    .replace(/\.(cmd|exe)$/, "");
-  const args = [...entry.args];
-  if (runner === "npx" || runner === "uvx") {
-    if (runner === "npx" && ["-y", "--yes"].includes(args[0])) args.shift();
-    const index = runner === "uvx" && args[0] === "--from" ? 1 : 0;
-    if (args[index]) {
-      if (runner === "npx") args[index] = args[index].replace(/(.+)@[^@]+$/, "$1");
-      else args[index] = args[index].split("==")[0].replace(/_/g, "-").toLowerCase();
-    }
-    return JSON.stringify([runner, args]);
-  }
-  return JSON.stringify([command, args]);
-}
-
-function installed(have: Set<string>, entry: CatalogEntry): boolean {
-  const identity = catalogIdentity(entry);
-  return identity !== null && have.has(identity);
-}
 
 interface Props {
   registry: Registry | null;
@@ -101,11 +52,7 @@ export function CatalogView({ registry, onAdded }: Props) {
   const [collectionBusy, setCollectionBusy] = useState<string | null>(null);
   const [configEntry, setConfigEntry] = useState<CatalogEntry | null>(null);
 
-  const have = new Set(
-    (registry?.servers ?? [])
-      .map(catalogIdentity)
-      .filter((id): id is string => id !== null),
-  );
+  const have = new Set((registry?.servers ?? []).flatMap(catalogInstalledIdentities));
 
   const reloadCollections = useCallback(() => {
     setCollectionsLoading(true);
@@ -146,7 +93,6 @@ export function CatalogView({ registry, onAdded }: Props) {
     }
     setLoading(true);
     setSearchError(false);
-    setResults(null);
     setRegistryStatus("notQueried");
     let cancelled = false;
     const t = setTimeout(() => {
@@ -244,7 +190,7 @@ export function CatalogView({ registry, onAdded }: Props) {
   }
 
   const shown = results ?? popular;
-  const browsing = results === null;
+  const browsing = !query.trim();
 
   // Browse view: group the popular picks into category sections. Search results
   // stay flat (they're query-driven, including the long-tail registry).
@@ -291,10 +237,12 @@ export function CatalogView({ registry, onAdded }: Props) {
 
       <div className="flex items-center justify-between text-xs text-muted-foreground">
         <span>
-          {results !== null
-            ? registryStatus === "unavailable" || registryStatus === "timedOut"
-              ? `${shown.length} curated match${shown.length === 1 ? "" : "es"}`
-              : `${shown.length} result${shown.length === 1 ? "" : "s"} (popular picks first, then the MCP Registry)`
+          {!browsing
+            ? loading
+              ? "Searching the MCP Registry…"
+              : registryStatus === "unavailable" || registryStatus === "timedOut"
+                ? `${shown.length} curated match${shown.length === 1 ? "" : "es"}`
+                : `${shown.length} result${shown.length === 1 ? "" : "s"} (popular picks first, then the MCP Registry)`
             : "Popular servers"}
         </span>
         {results !== null && shown.length > 0 && (

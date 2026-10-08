@@ -1,3 +1,4 @@
+import { catalogInstalledIdentities, installed } from "@/lib/catalogIdentity";
 import { useCallback, useEffect, useState } from "react";
 import {
   ArrowLeft,
@@ -546,7 +547,7 @@ function AddServers({
     reloadCollections();
   }, [reloadCollections]);
 
-  const have = new Set(registry.servers.map((s) => s.name.toLowerCase()));
+  const have = new Set(registry.servers.flatMap(catalogInstalledIdentities));
   const collection = collections.find((s) => s.id === selected) ?? null;
 
   async function doImport() {
@@ -589,7 +590,11 @@ function AddServers({
   /** Add every server in the chosen Collection that isn't already in Toolport. */
   async function applyCollection(s: Stack) {
     setApplying(true);
-    const existing = new Set(registry.servers.map((x) => x.name.toLowerCase()));
+    const existing = new Set(
+      s.servers
+        .filter((entry) => installed(have, entry))
+        .map((entry) => entry.name.toLowerCase()),
+    );
     try {
       const {
         added,
@@ -681,7 +686,7 @@ function AddServers({
             <div className="flex flex-col gap-1">
               {collection.servers.map((e) => (
                 <div key={e.name} className="flex items-center gap-1.5 text-[11px]">
-                  {have.has(e.name.toLowerCase()) ? (
+                  {installed(have, e) ? (
                     <Check className="size-3 shrink-0 text-success" />
                   ) : (
                     <span className="inline-block size-3 shrink-0" />
