@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
@@ -7,6 +7,8 @@ import { toastError } from "@/lib/toast";
 import { SettingsView } from "./SettingsView";
 import {
   clientsNeedingRestart,
+  disconnectAllClients,
+  getRegistry,
   isAutostartEnabled,
   listServerTools,
   setCodeMode,
@@ -26,6 +28,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
 
   return {
     ...actual,
+    disconnectAllClients: vi.fn(),
+    getRegistry: vi.fn(),
     listServerTools: vi.fn(),
     isAutostartEnabled: vi.fn(),
     enableAutostart: vi.fn().mockResolvedValue(undefined),
@@ -524,4 +528,68 @@ it("shows the expand affordance for an empty access set", async () => {
   await userEvent.click(toggle);
   expect(toggle).toHaveAttribute("aria-expanded", "true");
   expect(screen.getByRole("checkbox", { name: /GitHub/ })).not.toBeChecked();
+});
+
+describe("Remove Toolport from all clients", () => {
+  beforeEach(() => {
+    vi.mocked(disconnectAllClients).mockReset();
+    vi.mocked(getRegistry).mockReset();
+    vi.mocked(toastError).mockClear();
+  });
+
+  it("keeps removal results when refreshing the registry fails", async () => {
+    const user = userEvent.setup();
+    vi.mocked(disconnectAllClients).mockResolvedValue([
+      { clientId: "codex", path: "/fixture/config.toml", dryRun: false, error: null },
+    ]);
+    vi.mocked(getRegistry).mockRejectedValue(new Error("refresh failed"));
+    renderSettings();
+    await user.click(
+      screen.getByRole("button", { name: "Remove Toolport from all clients" }),
+    );
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: "Remove from all clients",
+      }),
+    );
+    await screen.findByText("codex: Client configuration restored");
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "Client removal finished, but could not refresh settings: Error: refresh failed",
+      ),
+    );
+  });
+
+  it("requires confirmation and reports a partial failure per client", async () => {
+    const user = userEvent.setup();
+    vi.mocked(disconnectAllClients).mockResolvedValue([
+      { clientId: "codex", path: "/fixture/config.toml", dryRun: false, error: null },
+      {
+        clientId: "cursor",
+        path: "/fixture/mcp.json",
+        dryRun: false,
+        error: "Client config conflict",
+      },
+    ]);
+    vi.mocked(getRegistry).mockResolvedValue(registry);
+    renderSettings();
+    await user.click(
+      screen.getByRole("button", { name: "Remove Toolport from all clients" }),
+    );
+    const dialog = screen.getByRole("dialog");
+    expect(disconnectAllClients).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(disconnectAllClients).not.toHaveBeenCalled();
+    await user.click(
+      screen.getByRole("button", { name: "Remove Toolport from all clients" }),
+    );
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: "Remove from all clients",
+      }),
+    );
+    await screen.findByText("codex: Client configuration restored");
+    expect(screen.getByText("cursor: Client config conflict")).toBeInTheDocument();
+    expect(disconnectAllClients).toHaveBeenCalledTimes(1);
+  });
 });

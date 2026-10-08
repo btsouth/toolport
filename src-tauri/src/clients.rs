@@ -15,8 +15,15 @@ use serde::Serialize;
 
 use crate::registry::{ManagedEntry, ServerEntry};
 
+#[cfg(windows)]
+mod backup_permissions;
+mod disconnect;
+pub use disconnect::{all as disconnect_all, ClientResult as DisconnectResult};
 mod moved;
 mod mutation;
+mod restore;
+pub(crate) use restore::after_rollback as record_config_rollback;
+pub(crate) use restore::after_capture_conflict as record_config_capture_conflict;
 mod zcode;
 
 /// One MCP server, normalized across every client format.
@@ -79,7 +86,7 @@ pub struct DetectedClient {
 }
 
 /// How a given client stores its server list.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, serde::Deserialize)]
 enum Format {
     /// JSON with a top-level `mcpServers` object (Claude Desktop, Cursor, Windsurf).
     JsonMcpServers,
@@ -2179,9 +2186,7 @@ fn parse_json_snippet(
                 .get("command")
                 .is_some_and(|command| command.is_string() || command.is_array())
                 && !servers.get("url").is_some_and(serde_json::Value::is_string)
-                && !servers
-                    .get("type")
-                    .is_some_and(serde_json::Value::is_string)
+                && !servers.get("type").is_some_and(serde_json::Value::is_string)
                 && !servers
                     .get("enabled")
                     .is_some_and(serde_json::Value::is_boolean)
@@ -2994,23 +2999,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         return build(config_path, true, Vec::new(), None);
     }
 
-    let parsed = match def.format {
-        Format::JsonMcpServers => parse_json(&content, "mcpServers"),
-        Format::JsonCopilotMcpServers => parse_json(&content, "mcpServers"),
-        Format::JsonDroidMcpServers => parse_json(&content, "mcpServers"),
-        Format::JsonAmpMcpServers => parse_json(&content, "amp.mcpServers"),
-        Format::JsonQwenMcpServers => parse_qwen_json(&content),
-        Format::JsonKimiMcpServers => parse_json(&content, "mcpServers"),
-        Format::JsonZCodeMcp => zcode::parse(&content),
-        Format::JsonServers => parse_json(&content, "servers"),
-        Format::JsonMcp => parse_json(&content, "mcp"),
-        Format::JsonOpenCodeMcp => parse_opencode_json(&content),
-        Format::JsonContextServers => parse_json(&content, "context_servers"),
-        Format::TomlMcpServers => parse_toml(&content),
-        Format::YamlExtensions => parse_yaml_extensions(&content),
-        Format::YamlMcpServers => parse_hermes_yaml_servers(&content),
-        Format::YamlMcpServersList => parse_continue_yaml_servers(&content),
-    };
+    let parsed = parse_client_content(def.format, &content);
 
     match parsed {
         Ok(servers) => build(config_path, true, servers, None),
@@ -3044,6 +3033,27 @@ pub(crate) fn validate_client_import(
 /// Whether a detected gateway slot matches the ownership record we last wrote.
 /// Auth headers / bearer args are stripped before compare so shared-HTTP entries
 /// still match without storing tokens on the registry (SOU-406/407).
+fn parse_client_content(format: Format, content: &str) -> Result<Vec<McpServer>, String> {
+    match format {
+        Format::JsonMcpServers => parse_json(content, "mcpServers"),
+        Format::JsonCopilotMcpServers => parse_json(content, "mcpServers"),
+        Format::JsonDroidMcpServers => parse_json(content, "mcpServers"),
+        Format::JsonAmpMcpServers => parse_json(content, "amp.mcpServers"),
+        Format::JsonQwenMcpServers => parse_qwen_json(content),
+        Format::JsonKimiMcpServers => parse_json(content, "mcpServers"),
+        Format::JsonZCodeMcp => zcode::parse(content),
+        Format::JsonServers => parse_json(content, "servers"),
+        Format::JsonMcp => parse_json(content, "mcp"),
+        Format::JsonOpenCodeMcp => parse_opencode_json(content),
+        Format::JsonContextServers => parse_json(content, "context_servers"),
+        Format::TomlMcpServers => parse_toml(content),
+        Format::YamlExtensions => parse_yaml_extensions(content),
+        Format::YamlMcpServers => parse_hermes_yaml_servers(content),
+        Format::YamlMcpServersList => parse_continue_yaml_servers(content),
+    }
+
+}
+
 fn managed_matches_detected(server: &McpServer, rec: &ManagedEntry) -> bool {
     let cmd = server.command.as_deref().unwrap_or("");
     // A command that differs only by *which of our gateway binaries* it names is
@@ -3153,10 +3163,44 @@ pub struct WriteOutcome {
     /// Servers Disconnect put back from the "Move into gateway" record (UX-03).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub restored: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// Disconnect used this client's move record. The caller drops it with
     /// [`finish_uninstall`] once the whole Disconnect has succeeded.
     #[serde(skip)]
     pub used_move_record: bool,
+    #[serde(skip)]
+    pub revision: Option<String>,
+    #[serde(skip)]
+    pub recovery_path: Option<PathBuf>,
+}
+
+fn revision_outcome(client_id: &str, result: Result<WriteOutcome, String>) -> Result<WriteOutcome, String> {
+    let mut outcome = result?;
+    let path = Path::new(&outcome.path);
+    outcome.recovery_path = Some(restore::record_path(client_id, path)?);
+    outcome.revision = if mutation::exists(path) {
+        Some(crate::registry::sha256_hex(&read_config_file(path)?))
+    } else {
+        None
+    };
+    Ok(outcome)
+}
+
+fn disconnect_warnings(format: Format, path: &Path) -> Result<Vec<String>, String> {
+    if !mutation::exists(path) {
+        return Ok(Vec::new());
+    }
+    let kept = parse_client_content(format, &read_config_file(path)?)?
+        .iter()
+        .any(|server| {
+            server.name.eq_ignore_ascii_case(GATEWAY_ENTRY_NAME) || detected_is_gateway(server)
+        });
+    Ok(if kept {
+        vec!["kept your edited toolport entry; remove it by hand if you uninstall".into()]
+    } else {
+        Vec::new()
+    })
 }
 
 /// Result of launch-time re-point (SOU-405/406).
@@ -3261,6 +3305,19 @@ fn backup_file(client_id: &str, path: &Path) -> Result<Option<PathBuf>, String> 
     backup_file_named(client_id, path, name)
 }
 
+fn secure_backup_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    backup_permissions::secure(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn backup_file_named(
     client_id: &str,
     path: &Path,
@@ -3285,7 +3342,7 @@ fn backup_file_named(
         }
     }
     let dir = backup_dir(client_id).ok_or("Could not resolve backup dir")?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    secure_backup_dir(&dir)?;
     let mut stamp = epoch_millis();
     let dest = loop {
         let candidate = dir.join(format!("{stamp}-{backup_name}"));
@@ -3294,7 +3351,7 @@ fn backup_file_named(
         }
         stamp += 1;
     };
-    std::fs::copy(path, &dest).map_err(|e| e.to_string())?;
+    crate::registry::atomic_write(&dest, &read_config_file(path)?)?;
     prune_backups(&dir, backup_name);
     Ok(Some(dest))
 }
@@ -3726,7 +3783,10 @@ fn atomic_write_json_config(
 ) -> Result<(), String> {
     if mutation::strict_json(path) {
         if let Some(text) = original.filter(|text| !text.trim().is_empty()) {
-            serde_json::from_str::<serde_json::Value>(text.strip_prefix('\u{feff}').unwrap_or(text)).map_err(|_| {
+            serde_json::from_str::<serde_json::Value>(
+                text.strip_prefix('\u{feff}').unwrap_or(text),
+            )
+            .map_err(|_| {
                 "Strict JSON config contains comments or trailing commas; leaving it untouched."
                     .to_string()
             })?;
@@ -3734,7 +3794,10 @@ fn atomic_write_json_config(
     }
     let output = render_json_config(original, root, changed_key)?;
     if mutation::strict_json(path) {
-        serde_json::from_str::<serde_json::Value>(output.strip_prefix('\u{feff}').unwrap_or(&output)).map_err(|_| {
+        serde_json::from_str::<serde_json::Value>(
+            output.strip_prefix('\u{feff}').unwrap_or(&output),
+        )
+        .map_err(|_| {
             "Client writer produced non-strict JSON; leaving config untouched".to_string()
         })?;
     }
@@ -4397,6 +4460,112 @@ fn patch_yaml_map(
     Ok(Some(output))
 }
 
+// Keep unchanged Continue list items verbatim, including native annotations.
+fn yaml_list_indent(span: &str) -> Option<String> {
+    for line in span.split_inclusive('\n').skip(1) {
+        let content = line.trim_start();
+        if content.trim().is_empty() || content.starts_with('#') {
+            continue;
+        }
+        if content.starts_with("- ") || content.trim_end() == "-" {
+            return Some(line[..line.len() - content.len()].to_string());
+        }
+        break;
+    }
+    None
+}
+
+fn yaml_list_nodes(span: &str, values: &[serde_yaml::Value]) -> Option<(String, Vec<String>)> {
+    let (_, body) = span.split_once('\n')?;
+    let indent = yaml_list_indent(span)?;
+    let body = body
+        .split_inclusive('\n')
+        .map(|line| line.strip_prefix(&indent).unwrap_or(line))
+        .collect::<String>();
+    let mut starts = Vec::new();
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        if line.starts_with("- ") || line.trim_end() == "-" {
+            starts.push(offset);
+        }
+        offset += line.len();
+    }
+    if starts.len() != values.len() {
+        return None;
+    }
+    let prefix = body[..starts.first().copied().unwrap_or(body.len())].to_string();
+    let mut nodes = Vec::new();
+    for (index, start) in starts.iter().enumerate() {
+        nodes.push(body[*start..starts.get(index + 1).copied().unwrap_or(body.len())].to_string());
+    }
+    Some((prefix, nodes))
+}
+
+fn patch_yaml_list(
+    span: &str,
+    before: &[serde_yaml::Value],
+    after: &[serde_yaml::Value],
+    seed: Option<(&str, &[serde_yaml::Value])>,
+) -> Result<Option<String>, String> {
+    if after.is_empty() {
+        return Ok(None);
+    }
+    let Some((prefix, nodes)) = yaml_list_nodes(span, before) else {
+        return Ok(None);
+    };
+    let seed = seed
+        .and_then(|(span, values)| yaml_list_nodes(span, values).map(|(_, nodes)| (values, nodes)));
+    let header = span.split_once('\n').unwrap().0;
+    let mut body = prefix;
+    let mut used = std::collections::BTreeSet::new();
+    for value in after {
+        let raw = before
+            .iter()
+            .enumerate()
+            .find(|(index, item)| !used.contains(index) && *item == value)
+            .map(|(index, _)| {
+                used.insert(index);
+                nodes[index].clone()
+            })
+            .or_else(|| {
+                seed.as_ref().and_then(|(values, nodes)| {
+                    values
+                        .iter()
+                        .position(|item| item == value)
+                        .map(|index| nodes[index].clone())
+                })
+            });
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&match raw {
+            Some(raw) => raw,
+            None => serde_yaml::to_string(&vec![value]).map_err(|e| e.to_string())?,
+        });
+    }
+    let indent = yaml_list_indent(span).unwrap_or_default();
+    let mut output = format!("{header}\n");
+    for line in body.split_inclusive('\n') {
+        if !line.trim().is_empty() {
+            output.push_str(&indent);
+        }
+        output.push_str(line);
+    }
+    Ok(Some(output))
+}
+
+fn remove_yaml_key_preserving(original: &str, key: &str) -> Result<String, String> {
+    reject_duplicate_top_level_yaml_key(original, key)?;
+    let mut output = original.to_string();
+    if let Some((_, start, end)) = top_level_yaml_key_spans(original)
+        .into_iter()
+        .find(|(name, _, _)| name == key)
+    {
+        output.replace_range(start..end, "");
+    }
+    Ok(output)
+}
+
 /// Rewrite a single top-level mapping key in `original` YAML text, preserving
 /// comments, anchors, aliases, and formatting of everything else. Used so
 /// Goose/Hermes/Continue Connect no longer strips user annotations (SBS-884).
@@ -4406,6 +4575,15 @@ fn rewrite_yaml_key_preserving(
     original: &str,
     key: &str,
     new_value: &serde_yaml::Value,
+) -> Result<String, String> {
+    rewrite_yaml_key_preserving_seed(original, key, new_value, None)
+}
+
+fn rewrite_yaml_key_preserving_seed(
+    original: &str,
+    key: &str,
+    new_value: &serde_yaml::Value,
+    seed: Option<&str>,
 ) -> Result<String, String> {
     let spans = top_level_yaml_key_spans(original);
     let hits: Vec<&(String, usize, usize)> = spans.iter().filter(|(k, _, _)| k == key).collect();
@@ -4425,11 +4603,32 @@ fn rewrite_yaml_key_preserving(
         let anchor = split_yaml_mapping_key(span.lines().next().unwrap_or_default())
             .and_then(|(_, rest)| yaml_value_anchor(rest));
         let before = parse_existing_yaml_content(original)?;
-        let patched = match (before.get(key).and_then(serde_yaml::Value::as_mapping), new_value.as_mapping()) {
-            (Some(before), Some(after)) => patch_yaml_map(span, before, after)?,
+        let patched = match (before.get(key), new_value) {
+            (Some(serde_yaml::Value::Mapping(before)), serde_yaml::Value::Mapping(after)) => {
+                patch_yaml_map(span, before, after)?
+            }
+            (Some(serde_yaml::Value::Sequence(before)), serde_yaml::Value::Sequence(after)) => {
+                let seed_root = seed.map(parse_existing_yaml_content).transpose()?;
+                let seed_span = seed.and_then(|seed| {
+                    top_level_yaml_key_spans(seed)
+                        .into_iter()
+                        .find(|(name, _, _)| name == key)
+                        .map(|(_, start, end)| &seed[start..end])
+                });
+                let seed = seed_span.zip(
+                    seed_root
+                        .as_ref()
+                        .and_then(|root| root.get(key)?.as_sequence())
+                        .map(Vec::as_slice),
+                );
+                patch_yaml_list(span, before, after, seed)?
+            }
             _ => None,
         };
-        let block = match patched { Some(block) => block, None => format_yaml_key_block(key, new_value, anchor, &yaml_child_indent(span))? };
+        let block = match patched {
+            Some(block) => block,
+            None => format_yaml_key_block(key, new_value, anchor, &yaml_child_indent(span))?,
+        };
         let mut out = String::with_capacity(original.len() + block.len());
         out.push_str(&original[..*start]);
         out.push_str(&block);
@@ -4466,6 +4665,7 @@ fn atomic_write_yaml_config(
             reject_duplicate_top_level_yaml_key(src, changed_key)?;
             rewrite_yaml_key_preserving(src, changed_key, val)?
         }
+        (Some(src), None) if !src.trim().is_empty() => remove_yaml_key_preserving(src, changed_key)?,
         _ => pretty()?,
     };
     parse_existing_yaml_content(&out)?;
@@ -5294,7 +5494,7 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
-        write_servers_inner(client_id, servers)
+        revision_outcome(client_id, write_servers_inner(client_id, servers))
     })
 }
 
@@ -5303,23 +5503,7 @@ fn write_servers_inner(client_id: &str, servers: &[ServerEntry]) -> Result<Write
     let path = resolved_definition_path(&def)?;
     let backup = backup_file(client_id, &path)?;
     let lenient = config_is_whole_app_state(client_id);
-    match def.format {
-        Format::JsonMcpServers => write_json(&path, "mcpServers", servers, lenient)?,
-        Format::JsonCopilotMcpServers => write_copilot_json(&path, servers)?,
-        Format::JsonDroidMcpServers => write_droid_json(&path, servers)?,
-        Format::JsonAmpMcpServers => write_json(&path, "amp.mcpServers", servers, true)?,
-        Format::JsonQwenMcpServers => write_qwen_json(&path, servers)?,
-        Format::JsonKimiMcpServers => write_kimi_json(&path, servers)?,
-        Format::JsonZCodeMcp => zcode::write_servers(&path, servers)?,
-        Format::JsonServers => write_json(&path, "servers", servers, lenient)?,
-        Format::JsonMcp => write_crush_json(&path, servers)?,
-        Format::JsonOpenCodeMcp => write_opencode_json(&path, servers)?,
-        Format::JsonContextServers => write_json(&path, "context_servers", servers, true)?,
-        Format::TomlMcpServers => write_toml(&path, servers)?,
-        Format::YamlExtensions => write_yaml_extensions(&path, servers)?,
-        Format::YamlMcpServers => write_hermes_yaml_servers(&path, servers)?,
-        Format::YamlMcpServersList => write_continue_yaml_servers(&path, servers)?,
-    }
+    write_format(def.format, &path, servers, lenient)?;
     // migrate_to_gateway writes a single gateway entry; capture ownership when so.
     let managed = servers
         .iter()
@@ -5333,7 +5517,36 @@ fn write_servers_inner(client_id: &str, servers: &[ServerEntry]) -> Result<Write
         managed,
         restored: Vec::new(),
         used_move_record: false,
+        revision: None,
+        warnings: Vec::new(),
+        recovery_path: None,
     })
+}
+
+fn write_format(
+    format: Format,
+    path: &Path,
+    servers: &[ServerEntry],
+    lenient: bool,
+) -> Result<(), String> {
+    match format {
+        Format::JsonMcpServers => write_json(path, "mcpServers", servers, lenient)?,
+        Format::JsonCopilotMcpServers => write_copilot_json(path, servers)?,
+        Format::JsonDroidMcpServers => write_droid_json(path, servers)?,
+        Format::JsonAmpMcpServers => write_json(path, "amp.mcpServers", servers, true)?,
+        Format::JsonQwenMcpServers => write_qwen_json(path, servers)?,
+        Format::JsonKimiMcpServers => write_kimi_json(path, servers)?,
+        Format::JsonZCodeMcp => zcode::write_servers(path, servers)?,
+        Format::JsonServers => write_json(path, "servers", servers, lenient)?,
+        Format::JsonMcp => write_crush_json(path, servers)?,
+        Format::JsonOpenCodeMcp => write_opencode_json(path, servers)?,
+        Format::JsonContextServers => write_json(path, "context_servers", servers, true)?,
+        Format::TomlMcpServers => write_toml(path, servers)?,
+        Format::YamlExtensions => write_yaml_extensions(path, servers)?,
+        Format::YamlMcpServers => write_hermes_yaml_servers(path, servers)?,
+        Format::YamlMcpServersList => write_continue_yaml_servers(path, servers)?,
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -5909,7 +6122,7 @@ fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<Wri
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
-        install_or_remove_inner(client_id, entry)
+        revision_outcome(client_id, install_or_remove_inner(client_id, entry))
     })
 }
 
@@ -5924,30 +6137,43 @@ fn install_or_remove_inner(
     // Build the snapshot before writing so the ownership record matches the bytes
     // we put on disk (SOU-406). Strip secrets for the registry record.
     let managed = entry.map(ManagedEntry::from_gateway_entry);
-    match def.format {
-        Format::JsonMcpServers => edit_json_gateway(&path, "mcpServers", entry, lenient)?,
-        Format::JsonCopilotMcpServers => edit_copilot_json_gateway(&path, entry)?,
-        Format::JsonDroidMcpServers => edit_droid_json_gateway(&path, entry)?,
-        Format::JsonAmpMcpServers => edit_json_gateway(&path, "amp.mcpServers", entry, true)?,
-        Format::JsonQwenMcpServers => edit_qwen_json_gateway(&path, entry)?,
-        Format::JsonKimiMcpServers => edit_kimi_json_gateway(&path, entry)?,
-        Format::JsonZCodeMcp => zcode::edit_gateway(&path, entry)?,
-        Format::JsonServers => edit_json_gateway(&path, "servers", entry, lenient)?,
-        Format::JsonMcp => edit_crush_gateway(&path, entry)?,
-        Format::JsonOpenCodeMcp => edit_opencode_gateway(&path, entry)?,
-        Format::JsonContextServers => edit_json_gateway(&path, "context_servers", entry, true)?,
-        Format::TomlMcpServers => edit_toml_gateway(&path, entry)?,
-        Format::YamlExtensions => edit_yaml_gateway(&path, entry)?,
-        Format::YamlMcpServers => edit_hermes_yaml_gateway(&path, entry)?,
-        Format::YamlMcpServersList => edit_continue_yaml_gateway(&path, entry)?,
-    }
+    edit_format(def.format, &path, entry, lenient)?;
     Ok(WriteOutcome {
         path: path.display().to_string(),
         backup: backup.map(|b| b.display().to_string()),
         managed,
         restored: Vec::new(),
         used_move_record: false,
+        revision: None,
+        warnings: Vec::new(),
+        recovery_path: None,
     })
+}
+
+fn edit_format(
+    format: Format,
+    path: &Path,
+    entry: Option<&ServerEntry>,
+    lenient: bool,
+) -> Result<(), String> {
+    match format {
+        Format::JsonMcpServers => edit_json_gateway(path, "mcpServers", entry, lenient)?,
+        Format::JsonCopilotMcpServers => edit_copilot_json_gateway(path, entry)?,
+        Format::JsonDroidMcpServers => edit_droid_json_gateway(path, entry)?,
+        Format::JsonAmpMcpServers => edit_json_gateway(path, "amp.mcpServers", entry, true)?,
+        Format::JsonQwenMcpServers => edit_qwen_json_gateway(path, entry)?,
+        Format::JsonKimiMcpServers => edit_kimi_json_gateway(path, entry)?,
+        Format::JsonZCodeMcp => zcode::edit_gateway(path, entry)?,
+        Format::JsonServers => edit_json_gateway(path, "servers", entry, lenient)?,
+        Format::JsonMcp => edit_crush_gateway(path, entry)?,
+        Format::JsonOpenCodeMcp => edit_opencode_gateway(path, entry)?,
+        Format::JsonContextServers => edit_json_gateway(path, "context_servers", entry, true)?,
+        Format::TomlMcpServers => edit_toml_gateway(path, entry)?,
+        Format::YamlExtensions => edit_yaml_gateway(path, entry)?,
+        Format::YamlMcpServers => edit_hermes_yaml_gateway(path, entry)?,
+        Format::YamlMcpServersList => edit_continue_yaml_gateway(path, entry)?,
+    }
+    Ok(())
 }
 
 /// Add Toolport's stdio gateway entry to a client's config (preserves existing servers).
@@ -5964,14 +6190,50 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
-        uninstall_gateway_inner(client_id)
+        let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
+        outcome.warnings.extend(disconnect_warnings(def.format, &path)?);
+        Ok(outcome)
     })
 }
 
 fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
+    mutation::disconnecting();
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
+    let backup = backup_file(client_id, &path)?;
+    let mut restored_names = moved::missing_names(client_id, def.format, &path)?;
+    if restore::apply(client_id, def.format, &path)? {
+        if restore::needs_moved(client_id, &path)? {
+            moved::restore(client_id, def.format, &path)?;
+        }
+        let restored = read_client(&def).servers;
+        restored_names.retain(|name| restored.iter().any(|server| server.name.eq_ignore_ascii_case(name)));
+        return Ok(WriteOutcome {
+            path: path.display().to_string(),
+            backup: backup.map(|p| p.display().to_string()),
+            managed: None,
+            restored: restored_names,
+            used_move_record: moved::matches_path(client_id, &path)?,
+            revision: None,
+        warnings: Vec::new(),
+        recovery_path: None,
+        });
+    }
+    let current = crate::registry_controller::registry_for_disconnect()?;
+    restore::check_legacy_gateway(def.format, &path, current.client_managed_entries.get(client_id))?;
     let restored = moved::restore(client_id, def.format, &path)?;
+    if restored.is_none() && (!mutation::exists(&path) || !read_client(&def).gateway_installed) {
+        return Ok(WriteOutcome {
+            path: path.display().to_string(),
+            backup: backup.map(|p| p.display().to_string()),
+            managed: None,
+            restored: Vec::new(),
+            used_move_record: false,
+            revision: None,
+        warnings: Vec::new(),
+        recovery_path: None,
+        });
+    }
     let mut outcome = install_or_remove(client_id, None)?;
     if let Some(restored) = restored {
         // A rollback must undo the restore too, so point at the copy taken before it.
@@ -5987,10 +6249,15 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
 /// Drop the move record a Disconnect used. Call it only after the registry
 /// update succeeded: a failed update rolls the config back to before the restore,
 /// and the record is then the only copy of the moved entries.
-pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) {
+pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) -> Result<(), String> {
+    let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
+    let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
+    restore::check_finished(client_id, Path::new(&outcome.path), outcome.revision.as_deref())?;
     if outcome.used_move_record {
-        moved::forget(client_id);
+        moved::forget(client_id)?;
     }
+    restore::finish(client_id, Path::new(&outcome.path), outcome.revision.as_deref())?;
+    Ok(())
 }
 
 /// Replace a client's entire server list with just the Toolport gateway. Used by
@@ -6002,7 +6269,7 @@ pub fn migrate_to_gateway(client_id: &str, profile: Option<&str>) -> Result<Writ
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
-        migrate_to_gateway_inner(client_id, profile)
+        revision_outcome(client_id, migrate_to_gateway_inner(client_id, profile))
     })
 }
 

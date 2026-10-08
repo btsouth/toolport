@@ -400,3 +400,30 @@ headless and Docker configs do not break on upgrade.
   hits the same scope and approval gates. Shared multi-tenant gateways that do
   not want the surface should set `"codeMode": false` in the registry.
 - Open WebUI details: [openwebui.md](./openwebui.md).
+
+## Remove client connections
+
+Run `toolport-gateway --disconnect-all` before removing the gateway binary. The
+app does not need to be running. The command prints one JSON result per client
+and exits with status 1 if any client fails, while continuing with the others.
+`--disconnect-all --dry-run` lists the affected paths without writing them.
+
+Unchanged configs return to their original bytes, including an originally absent
+file. Native or user edits are preserved when Toolport reverses its entries. A
+concurrent edit to the same entry stops that client with a conflict. Review any
+failed result before continuing an uninstall.
+
+Run `toolport-gateway --disconnect-all [--dry-run]` as the desktop user whose
+Toolport installation you are removing. Running as root reads root's data dir
+and can return `[]`. The command prints a hint to stderr when no data dir exists.
+Per-client `warnings` report keychain cleanup failures or edited Toolport entries
+kept for manual removal. Warnings do not make successfully restored configs fail.
+
+Client-config publication uses Linux `renameat2(RENAME_EXCHANGE)`, macOS
+`renamex_np(RENAME_SWAP)`, and Windows `ReplaceFileW` with a backup pathname.
+Toolport verifies the displaced bytes and reverses conflicting swaps before
+retrying its merge. Unsupported kernels or filesystems fall back to an immediate
+file-identity check (device, inode/file ID, modification time and size) before
+rename; an external writer can still race in the interval after that check.
+Removal verifies a same-directory tombstone before deleting it. If another save
+prevents safe recovery, Toolport retains the displaced file and reports its path.

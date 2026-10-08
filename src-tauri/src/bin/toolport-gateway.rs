@@ -17561,6 +17561,9 @@ enum ArgAction {
     Guard(String),
     /// Nothing that changes startup mode; fall through to normal gateway
     /// startup.
+    DisconnectAll {
+        dry_run: bool,
+    },
     Run,
 }
 
@@ -17578,6 +17581,17 @@ fn parse_args(args: &[String]) -> ArgAction {
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         return ArgAction::Version;
+    }
+    if args.iter().any(|arg| arg == "--disconnect-all") {
+        if let Some(arg) = args
+            .iter()
+            .find(|arg| !matches!(arg.as_str(), "--disconnect-all" | "--dry-run"))
+        {
+            return ArgAction::Unknown(arg.clone());
+        }
+        return ArgAction::DisconnectAll {
+            dry_run: args.iter().any(|arg| arg == "--dry-run"),
+        };
     }
     // Checked before the unknown-flag scan, and never added to KNOWN_FLAGS: falling
     // through to `Run` would start a whole gateway for a flag that must exit at once.
@@ -17648,6 +17662,7 @@ fn usage() -> String {
          \x20                        the in-process gateway (Phase 2; opt-in)\n\
          \x20   --private-gateway    One adapter's own gateway while the host daemon is\n\
          \x20                        unresponsive (internal)\n\
+         \x20   --disconnect-all [--dry-run] Restore all client configs and exit; JSON per-client results\n\
          \x20   --selftest-secrets    Diagnostic: read every vaulted secret and report\n\
          \x20   --toolport-hook EVENT Deprecated no-op accepted so hook entries an\n\
          \x20                         earlier version installed do not error; exits 0\n\
@@ -17744,6 +17759,28 @@ fn main() {
             // answer allow, then exit 0. No gateway startup, no registry read, no policy.
             println!("{}", conduit_lib::guard_cleanup::run_no_op_hook());
             conduit_lib::telemetry::exit_with(0);
+        }
+        ArgAction::DisconnectAll { dry_run } => {
+            if conduit_lib::registry::conduit_dir().is_none_or(|dir| !dir.exists()) {
+                eprintln!("No Toolport data dir found. Run --disconnect-all as the desktop user; root reads root's data dir.");
+            }
+            match conduit_lib::clients::disconnect_all(dry_run) {
+                Ok(results) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&results).expect("serializable disconnect results")
+                    );
+                    conduit_lib::telemetry::exit_with(if results.iter().any(|result| result.error.is_some()) {
+                        1
+                    } else {
+                        0
+                    });
+                }
+                Err(error) => {
+                    eprintln!("toolport-gateway --disconnect-all: {error}");
+                    conduit_lib::telemetry::exit_with(1);
+                }
+            }
         }
         ArgAction::Run => {}
     }
@@ -18313,6 +18350,14 @@ mod tests {
     /// tools out of the catalog. The destructive fallback scans the tool name for
     /// verbs, and a cached entry carries the namespaced `server__tool` form, so
     /// judging it whole lets the prefix decide for every tool on that server.
+    #[test]
+    fn disconnect_all_is_a_standalone_role_and_dry_run_cannot_start_gateway() {
+        assert_eq!(parse_args(&["--disconnect-all".into()]), ArgAction::DisconnectAll { dry_run: false });
+        assert_eq!(parse_args(&["--disconnect-all".into(), "--dry-run".into()]), ArgAction::DisconnectAll { dry_run: true });
+        assert!(matches!(parse_args(&["--dry-run".into()]), ArgAction::Unknown(_)));
+        assert!(matches!(parse_args(&["--disconnect-all".into(), "--daemon".into()]), ArgAction::Unknown(_)));
+    }
+
     #[test]
     fn a_server_named_after_a_write_verb_keeps_its_read_only_tools() {
         let cached = vec![

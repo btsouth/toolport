@@ -45,6 +45,7 @@ export interface DetectedClient {
 }
 
 export interface WriteOutcome {
+  warnings?: string[];
   path: string;
   backup: string | null;
   /** Servers Disconnect put back after an earlier "Move into gateway". */

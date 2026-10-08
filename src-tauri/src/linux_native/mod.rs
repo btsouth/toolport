@@ -2879,7 +2879,7 @@ fn run_client_mutation(
                 // The config write is not live until the client restarts; saying
                 // only "Connected" would misstate what the running client does.
                 let restored = result.outcome.restored.len();
-                page.refresh_with_confirmation(if connect {
+                let message = if connect {
                     format!(
                         "Connected {client_name} to Toolport. Restart {client_name} to apply it."
                     )
@@ -2892,7 +2892,8 @@ fn run_client_mutation(
                     format!(
                         "Disconnected {client_name} from Toolport. Restart {client_name} to apply it."
                     )
-                });
+                };
+                page.refresh_with_confirmation(std::iter::once(message).chain(result.outcome.warnings).collect::<Vec<_>>().join(" "));
             }
             Ok(Err(error)) => page.show_error(&format!("{client_name}: {error}")),
             Err(_) => page.show_error(&format!("{client_name}: the operation stopped")),

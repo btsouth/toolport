@@ -502,6 +502,17 @@ impl SettingsPage {
         );
         page.append(&quarantine_list);
 
+        page.append(&settings_heading(
+            "Client connections",
+            "Restore client configurations before removing Toolport.",
+        ));
+        let remove_clients = gtk::Button::with_label("Remove Toolport from all clients");
+        remove_clients.set_halign(gtk::Align::Start);
+        page.append(&remove_clients);
+        let removal_results = gtk::Label::new(None);
+        removal_results.set_xalign(0.0);
+        removal_results.set_wrap(true);
+        page.append(&removal_results);
         scroller.set_child(Some(&page));
         root.append(&scroller);
         let settings_page = Self {
@@ -541,6 +552,42 @@ impl SettingsPage {
             mutation_generation: Rc::new(Cell::new(0)),
         };
         settings_page.connect_switches();
+        let remove_page = settings_page.clone();
+        remove_clients.connect_clicked(move |button| {
+            let parent = remove_page.root.root().and_downcast::<gtk::Window>();
+            let dialog = adw::MessageDialog::new(parent.as_ref(), Some("Remove Toolport from all clients?"), Some("Unchanged configs return to their original bytes. Your edits are preserved and moved entries are restored. Each client result is reported here."));
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("remove", "Remove from all clients");
+            dialog.set_close_response("cancel");
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+            let page = remove_page.clone();
+            let results_label = removal_results.clone();
+            let button = button.clone();
+            dialog.connect_response(None, move |dialog, response| {
+                if response == "remove" {
+                    button.set_sensitive(false);
+                    let page = page.clone();
+                    let results_label = results_label.clone();
+                    let button = button.clone();
+                    gtk::glib::spawn_future_local(async move {
+                        match gtk::gio::spawn_blocking(|| crate::clients::disconnect_all(false)).await {
+                            Ok(Ok(results)) => {
+                                let message = if results.is_empty() { "No client connections to remove.".into() } else { results.iter().map(|result| format!("{}: {}", result.client_id, result.error.clone().unwrap_or_else(|| std::iter::once("Client configuration restored".to_string()).chain(result.warnings.iter().cloned()).collect::<Vec<_>>().join("; ")))).collect::<Vec<_>>().join("\n") };
+                                results_label.set_label(&message);
+                                page.begin_mutation();
+                                page.refresh_quietly();
+                            }
+                            Ok(Err(error)) => page.show_error(&error),
+                            Err(_) => page.show_error("Client removal stopped unexpectedly"),
+                        }
+                        button.set_sensitive(true);
+                    });
+                }
+                dialog.close();
+            });
+            dialog.present();
+        });
         let page_for_endpoint = settings_page.clone();
         settings_page
             .endpoint_button
