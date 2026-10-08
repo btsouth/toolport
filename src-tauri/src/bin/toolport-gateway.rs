@@ -17954,7 +17954,11 @@ fn main() {
         }
         Err(e) => {
             eprintln!("toolport-gateway: {e} Refusing to start serving tools from this registry.");
-            glog(&format!("load_resolved ERR: {e}"));
+            if registry::is_newer_version_error(&e) {
+                glog(&format!("load_resolved ERR (newer schema): {e}"));
+            } else {
+                glog(&format!("load_resolved ERR: {e}"));
+            }
             conduit_lib::telemetry::exit_with(1);
         }
     };
