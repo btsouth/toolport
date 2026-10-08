@@ -5203,6 +5203,8 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    const WRITER_TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// One `secrets_generation` increment, retrying the way a real caller would.
     ///
     /// `lock_for` gives up after a bounded wait and returns "The registry is locked
@@ -5220,7 +5222,7 @@ pub(crate) mod tests {
         // Bound the retries by wall clock, not by a count: each attempt already
         // spins inside `lock_for` for its own deadline, so a fixed attempt count
         // would multiply out to minutes before the test admitted defeat.
-        let give_up_at = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let give_up_at = std::time::Instant::now() + WRITER_TEST_BUDGET;
         loop {
             match update_at(path, |r| {
                 r.secrets_generation += 1;
@@ -5257,19 +5259,36 @@ pub(crate) mod tests {
         // flock is not fair: a fast winner can reacquire for all 30 fsync-backed
         // writes while a peer exhausts its contention budget. Contend once per
         // round so no writer can start another increment before its peers finish.
-        let round = std::sync::Arc::new(std::sync::Barrier::new(THREADS as usize));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut starts = Vec::new();
         let handles: Vec<_> = (0..THREADS)
             .map(|_| {
                 let p = path.clone();
-                let round = std::sync::Arc::clone(&round);
+                let (start_tx, start_rx) = std::sync::mpsc::channel();
+                starts.push(start_tx);
+                let done_tx = done_tx.clone();
                 std::thread::spawn(move || {
                     for _ in 0..PER {
-                        round.wait();
+                        start_rx
+                            .recv_timeout(WRITER_TEST_BUDGET)
+                            .expect("writer round must start within the contention budget");
                         increment_with_retry(&p);
+                        done_tx.send(()).unwrap();
                     }
                 })
             })
             .collect();
+        for _ in 0..PER {
+            let deadline = std::time::Instant::now() + WRITER_TEST_BUDGET;
+            for start in &starts {
+                start.send(()).unwrap();
+            }
+            for _ in 0..THREADS {
+                done_rx
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .expect("every writer must finish the round within the contention budget");
+            }
+        }
         for h in handles {
             h.join().unwrap();
         }
