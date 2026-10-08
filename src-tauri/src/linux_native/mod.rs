@@ -4879,18 +4879,32 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     card.add_css_class("toolport-card");
     let outcome = activity.approval_decision.as_deref().map(approval_outcome);
-    let icon =
-        gtk::Image::from_icon_name(outcome.map(|(_, icon, _)| icon).unwrap_or(if activity.ok {
+    let icon = gtk::Image::from_icon_name(outcome.map(|(_, icon, _, _)| icon).unwrap_or(
+        if activity.ok {
             "emblem-ok-symbolic"
         } else {
             "dialog-error-symbolic"
-        }));
-    if let Some((_, _, tone)) = outcome {
+        },
+    ));
+    if let Some((_, _, tone, _)) = outcome {
         icon.add_css_class(tone);
     }
     icon.add_css_class("toolport-card-icon");
     icon.set_valign(gtk::Align::Center);
-    card.append(&icon);
+    if let Some((_, _, tone, Some(emblem))) = outcome {
+        let overlay = gtk::Overlay::new();
+        overlay.set_valign(gtk::Align::Center);
+        overlay.set_child(Some(&icon));
+        let emblem = gtk::Image::from_icon_name(emblem);
+        emblem.set_pixel_size(8);
+        emblem.set_halign(gtk::Align::Center);
+        emblem.set_valign(gtk::Align::Center);
+        emblem.add_css_class(tone);
+        overlay.add_overlay(&emblem);
+        card.append(&overlay);
+    } else {
+        card.append(&icon);
+    }
 
     let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
     copy.set_hexpand(true);
@@ -4945,7 +4959,7 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
         badge.set_tooltip_text(Some(tooltip));
         card.append(&badge);
     }
-    let (status, class) = if let Some((label, _, tone)) = outcome {
+    let (status, class) = if let Some((label, _, tone, _)) = outcome {
         (label, tone)
     } else if activity.held {
         ("Held", "review")
@@ -4962,24 +4976,53 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     card
 }
 
-fn approval_outcome(decision: &str) -> (&'static str, &'static str, &'static str) {
+fn approval_outcome(
+    decision: &str,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+) {
     // Adwaita symbolic icons, also available in Omarchy's inherited icon theme.
     match decision {
-        "approved" => ("Approved", "emblem-ok-symbolic", "success"),
-        "denied" => ("Denied", "action-unavailable-symbolic", "approval-denied"),
-        "no_response" => ("No answer", "appointment-soon-symbolic", "approval-warning"),
-        "withdrawn" => ("Withdrawn", "edit-undo-symbolic", "disabled"),
+        "approved" => (
+            "Approved",
+            "security-low-symbolic",
+            "success",
+            Some("object-select-symbolic"),
+        ),
+        "denied" => (
+            "Denied",
+            "security-low-symbolic",
+            "approval-denied",
+            Some("window-close-symbolic"),
+        ),
+        "no_response" => (
+            "No answer",
+            "appointment-soon-symbolic",
+            "approval-warning",
+            None,
+        ),
+        "withdrawn" => ("Withdrawn", "edit-undo-symbolic", "disabled", None),
         "stale_state" => (
             "Changed after approval",
             "dialog-warning-symbolic",
             "approval-warning",
+            None,
         ),
         "unreachable" => (
             "No approver available",
             "dialog-warning-symbolic",
             "approval-warning",
+            None,
         ),
-        _ => ("Approval event", "dialog-information-symbolic", "disabled"),
+        _ => (
+            "Approval event",
+            "dialog-information-symbolic",
+            "disabled",
+            None,
+        ),
     }
 }
 
@@ -4987,10 +5030,8 @@ fn format_duration(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms} ms")
     } else if ms < 60000 {
-        {
         let tenths = (ms + 50) / 100;
-        format!("{}.{:01} s", tenths / 10, tenths % 10)
-        }
+        format!("{}.{} s", tenths / 10, tenths % 10)
     } else {
         let seconds = ms.saturating_add(500) / 1000;
         format!("{}m {}s", seconds / 60, seconds % 60)
