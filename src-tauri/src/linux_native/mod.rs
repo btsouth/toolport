@@ -4891,7 +4891,7 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
         overlay.set_valign(gtk::Align::Center);
         overlay.set_child(Some(&icon));
         let emblem = gtk::Image::from_icon_name(emblem);
-        emblem.set_pixel_size(8);
+        emblem.set_pixel_size(10);
         emblem.set_halign(gtk::Align::Center);
         emblem.set_valign(gtk::Align::Center);
         emblem.add_css_class(tone);
@@ -4983,13 +4983,13 @@ fn approval_outcome(
     match decision {
         "approved" => (
             "Approved",
-            "security-low-symbolic",
+            "security-medium-symbolic",
             "success",
             Some("object-select-symbolic"),
         ),
         "denied" => (
             "Denied",
-            "security-low-symbolic",
+            "security-medium-symbolic",
             "approval-denied",
             Some("window-close-symbolic"),
         ),
