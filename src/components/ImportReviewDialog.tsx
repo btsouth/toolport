@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Check, Loader2, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -167,35 +167,43 @@ function ImportReviewContent({
                     })
                   }
                 >
-                  <ImportRow item={item} selected={isSelected} />
-                  {!!item.credentials?.length && (
-                    <p className="px-3 pb-2 text-xs text-muted-foreground">
-                      {item.credentials.some(
-                        (env) =>
-                          env.required &&
-                          !env.present &&
-                          !credentialInputs[item.name]?.[env.key],
-                      )
-                        ? "Needs input"
-                        : item.credentials.some(
+                  <ImportRow
+                    item={item}
+                    selected={isSelected}
+                    status={
+                      <>
+                        {!!item.credentials?.length && (
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            {item.credentials.some(
                               (env) =>
-                                !env.present && !credentialInputs[item.name]?.[env.key],
+                                env.required &&
+                                !env.present &&
+                                !credentialInputs[item.name]?.[env.key],
                             )
-                          ? "Optional"
-                          : item.credentials.some(
-                                (env) =>
-                                  secretChoices[item.name]?.[env.key] ?? env.secret,
-                              )
-                            ? "Found, goes to keychain"
-                            : "Found"}
-                    </p>
-                  )}
-                  {busy && isSelected && (
-                    <p role="status" className="flex gap-2 px-3 pb-2 text-xs">
-                      <Loader2 className="size-3 animate-spin" />
-                      Checking {item.name}...
-                    </p>
-                  )}
+                              ? "Needs input"
+                              : item.credentials.some(
+                                    (env) =>
+                                      !env.present &&
+                                      !credentialInputs[item.name]?.[env.key],
+                                  )
+                                ? "Optional"
+                                : item.credentials.some(
+                                      (env) =>
+                                        secretChoices[item.name]?.[env.key] ?? env.secret,
+                                    )
+                                  ? "Found, goes to keychain"
+                                  : "Found"}
+                          </p>
+                        )}
+                        {busy && isSelected && (
+                          <p role="status" className="mt-1 flex gap-2 text-xs">
+                            <Loader2 className="size-3 animate-spin" />
+                            Checking {item.name}...
+                          </p>
+                        )}
+                      </>
+                    }
+                  />
                 </button>
                 {!!item.credentials?.length && (
                   <details className="px-3 pb-3 text-xs">
@@ -347,7 +355,15 @@ function ImportReviewContent({
 }
 
 /** One reviewable server: name, what it runs, and the relevant safety flags. */
-export function ImportRow({ item, selected }: { item: ImportItem; selected?: boolean }) {
+export function ImportRow({
+  item,
+  selected,
+  status,
+}: {
+  item: ImportItem;
+  selected?: boolean;
+  status?: ReactNode;
+}) {
   const runs =
     item.command != null ? [item.command, ...item.args].join(" ") : (item.url ?? "");
   const shell = runsShell(item.command, item.args);
@@ -412,6 +428,7 @@ export function ImportRow({ item, selected }: { item: ImportItem; selected?: boo
           Connects to a private or internal address. Only import setups you trust.
         </p>
       )}
+      {status}
     </div>
   );
 }
