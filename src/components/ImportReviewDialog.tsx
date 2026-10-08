@@ -184,7 +184,20 @@ export function ImportRow({ item, selected }: { item: ImportItem; selected?: boo
         }
       </div>
       {runs && (
-        <p className="mt-1 font-mono text-xs break-all text-muted-foreground">{runs}</p>
+        <p
+          title={runs}
+          aria-label={runs}
+          className="mt-1 flex min-w-0 font-mono text-xs text-muted-foreground"
+        >
+          {runs.length > 72 ? (
+            <>
+              <span className="min-w-0 truncate">{runs.slice(0, -28)}</span>
+              <span className="shrink-0">{runs.slice(-28)}</span>
+            </>
+          ) : (
+            runs
+          )}
+        </p>
       )}
       {!!item.envKeys?.length && (
         <p className="mt-1 text-xs text-warning">

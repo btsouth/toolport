@@ -24,6 +24,21 @@ impl From<&str> for Completion {
     }
 }
 
+fn middle_ellipsize(widget: &gtk::Widget, text: &str) {
+    if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+        if label.text() == text {
+            label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            label.set_single_line_mode(true);
+            label.set_tooltip_text(Some(text));
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        middle_ellipsize(&widget, text);
+    }
+}
+
 pub(super) fn review(
     parent: &gtk::Window,
     title: &str,
@@ -77,6 +92,7 @@ pub(super) fn review(
             .subtitle(&command)
             .subtitle_lines(1)
             .build();
+        middle_ellipsize(row.upcast_ref(), &command);
         row.set_subtitle_selectable(true);
         let check = gtk::CheckButton::builder()
             .active(true)

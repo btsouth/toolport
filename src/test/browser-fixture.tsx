@@ -199,6 +199,7 @@ const savingsSummary: SavingsSummary = {
 };
 const setupFixture = new URLSearchParams(location.search).has("setup");
 const setupFailure = new URLSearchParams(location.search).get("setup-failure");
+const setupVerifying = new URLSearchParams(location.search).has("setup-verifying");
 let setupConnected = false;
 const setupCatalog = [
   {
@@ -258,6 +259,7 @@ mockIPC(
           items: setupItems,
         };
       case "migrate_client":
+        if (setupVerifying) return new Promise(() => {});
         if (setupFailure)
           throw new Error(
             setupFailure === "credential"
