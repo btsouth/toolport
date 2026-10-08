@@ -40,7 +40,10 @@ export function ConnectReviewDialog({
       active = false;
     };
   }, [clientId, attempt]);
-  async function connect(selected: string[]) {
+  async function connect(
+    selected: string[],
+    secretChoices?: Record<string, Record<string, boolean>>,
+  ) {
     if (!review) return;
     setBusy(true);
     setError("");
@@ -51,6 +54,7 @@ export function ConnectReviewDialog({
         force,
         selected,
         review.revision,
+        ...(secretChoices ? [secretChoices] : []),
       );
       setResult(next);
       onConnected(next.registry);

@@ -1369,28 +1369,73 @@ pub fn connect_remote_with_handler(
 }
 
 /// Keep provider errors from echoing a credential-bearing endpoint after connect.
-struct ImportedTransport(Box<dyn Transport>);
-struct ImportedConcurrent(Arc<dyn crate::downstream::ConcurrentTransport>);
-fn opaque_transport_error(
-    error: crate::downstream::TransportError,
-) -> crate::downstream::TransportError {
-    use crate::downstream::TransportError as E;
-    let message = if is_auth_error(&error.to_string()) {
-        "HTTP 401. Imported credentials were rejected."
-    } else {
-        "Imported server request failed. Check its endpoint and credentials."
+struct ImportedTransport(Box<dyn Transport>, Redaction);
+struct ImportedConcurrent(Arc<dyn crate::downstream::ConcurrentTransport>, Redaction);
+#[derive(Clone)]
+struct Redaction(Vec<String>);
+impl Redaction {
+    fn for_server(server: &ServerEntry) -> Self {
+        let mut values = Vec::new();
+        if let Some(url) = &server.url {
+            values.push(url.clone());
+            if let Ok(parsed) = url::Url::parse(url) {
+                values.extend(parsed.query_pairs().map(|(_, value)| value.into_owned()));
+                if let Some(password) = parsed.password() {
+                    values.push(password.into());
+                }
+            }
+        }
+        for env in server.env.iter().filter(|e| e.secret) {
+            if let Some(value) = env.value.clone().or_else(|| {
+                secrets::get_secret_result(&server.id, &env.key)
+                    .ok()
+                    .flatten()
+            }) {
+                values.push(value);
+            }
+        }
+        values.retain(|value| !value.is_empty());
+        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        values.dedup();
+        Self(values)
     }
-    .to_string();
-    match error {
-        E::Fatal(_) => E::Fatal(message),
-        E::Unavailable(_) => E::Unavailable(message),
-        E::Retry { retry_after, .. } => E::Retry {
-            retry_after,
-            message,
-        },
-        E::Cancelled(_) => E::Cancelled(message),
-        E::Busy(_) => E::Busy(message),
-        E::Rpc(value) => E::Rpc(serde_json::json!({"code":value["code"],"message":message})),
+    fn text(&self, mut message: String) -> String {
+        for value in &self.0 {
+            message = message.replace(value, "<redacted>");
+        }
+        message
+    }
+    fn value(&self, value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::String(value) => serde_json::Value::String(self.text(value)),
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.into_iter().map(|v| self.value(v)).collect())
+            }
+            serde_json::Value::Object(values) => serde_json::Value::Object(
+                values
+                    .into_iter()
+                    .map(|(k, v)| (self.text(k), self.value(v)))
+                    .collect(),
+            ),
+            value => value,
+        }
+    }
+    fn error(&self, error: crate::downstream::TransportError) -> crate::downstream::TransportError {
+        use crate::downstream::TransportError as E;
+        match error {
+            E::Fatal(message) => E::Fatal(self.text(message)),
+            E::Unavailable(message) => E::Unavailable(self.text(message)),
+            E::Retry {
+                retry_after,
+                message,
+            } => E::Retry {
+                retry_after,
+                message: self.text(message),
+            },
+            E::Cancelled(message) => E::Cancelled(self.text(message)),
+            E::Busy(message) => E::Busy(self.text(message)),
+            E::Rpc(value) => E::Rpc(self.value(value)),
+        }
     }
 }
 impl crate::downstream::ConcurrentTransport for ImportedConcurrent {
@@ -1403,7 +1448,7 @@ impl crate::downstream::ConcurrentTransport for ImportedConcurrent {
     ) -> Result<serde_json::Value, crate::downstream::TransportError> {
         self.0
             .request_with_cancel_and_headers(method, params, cancel, headers)
-            .map_err(opaque_transport_error)
+            .map_err(|error| self.1.error(error))
     }
     fn is_closed(&self) -> bool {
         self.0.is_closed()
@@ -1420,7 +1465,7 @@ impl Transport for ImportedTransport {
     ) -> Result<serde_json::Value, crate::downstream::TransportError> {
         self.0
             .request(method, params)
-            .map_err(opaque_transport_error)
+            .map_err(|error| self.1.error(error))
     }
     fn notify(
         &mut self,
@@ -1429,7 +1474,7 @@ impl Transport for ImportedTransport {
     ) -> Result<(), crate::downstream::TransportError> {
         self.0
             .notify(method, params)
-            .map_err(opaque_transport_error)
+            .map_err(|error| self.1.error(error))
     }
     fn request_with_cancel(
         &mut self,
@@ -1439,7 +1484,7 @@ impl Transport for ImportedTransport {
     ) -> Result<serde_json::Value, crate::downstream::TransportError> {
         self.0
             .request_with_cancel(method, params, cancel)
-            .map_err(opaque_transport_error)
+            .map_err(|error| self.1.error(error))
     }
     fn request_with_cancel_and_headers(
         &mut self,
@@ -1450,7 +1495,7 @@ impl Transport for ImportedTransport {
     ) -> Result<serde_json::Value, crate::downstream::TransportError> {
         self.0
             .request_with_cancel_and_headers(method, params, cancel, headers)
-            .map_err(opaque_transport_error)
+            .map_err(|error| self.1.error(error))
     }
     fn cancel_matching_pending_request(
         &mut self,
@@ -1470,7 +1515,7 @@ impl Transport for ImportedTransport {
     ) -> Result<(), crate::downstream::TransportError> {
         self.0
             .set_subscription_listener(filter)
-            .map_err(opaque_transport_error)
+            .map_err(|error| self.1.error(error))
     }
     fn supports_request_headers(&self) -> bool {
         self.0.supports_request_headers()
@@ -1495,7 +1540,7 @@ impl Transport for ImportedTransport {
     }
     fn concurrent(&self) -> Option<Arc<dyn crate::downstream::ConcurrentTransport>> {
         self.0.concurrent().map(|transport| {
-            Arc::new(ImportedConcurrent(transport))
+            Arc::new(ImportedConcurrent(transport, self.1.clone()))
                 as Arc<dyn crate::downstream::ConcurrentTransport>
         })
     }
@@ -1508,7 +1553,10 @@ impl Transport for ImportedTransport {
 }
 fn reviewed_transport(server: &ServerEntry, transport: HttpTransport) -> Box<dyn Transport> {
     if has_imported_credentials(server) {
-        Box::new(ImportedTransport(Box::new(transport)))
+        Box::new(ImportedTransport(
+            Box::new(transport),
+            Redaction::for_server(server),
+        ))
     } else {
         Box::new(transport)
     }
@@ -1518,11 +1566,7 @@ fn safe_imported_error(server: &ServerEntry, error: String) -> String {
     if !has_imported_credentials(server) {
         return error;
     }
-    if is_auth_error(&error) {
-        "HTTP 401. Imported credentials were rejected. Open Credentials and retry.".into()
-    } else {
-        "Could not connect using imported credentials. Check the endpoint and unlock the keychain, then retry.".into()
-    }
+    Redaction::for_server(server).text(error)
 }
 
 fn has_imported_credentials(server: &ServerEntry) -> bool {
@@ -1728,8 +1772,29 @@ mod tests {
             let error = connect_remote(&server).err().unwrap();
             worker.join().unwrap();
             assert!(!error.contains("synthetic-imported-pat"));
-            assert!(error.contains("imported credentials"));
+            assert!(error.contains("500"));
         });
+    }
+
+    #[test]
+    fn reviewed_transport_preserves_rpc_errors_and_redacts_only_private_values() {
+        let redact = Redaction(vec![
+            "synthetic-pat".into(),
+            "https://example.invalid/mcp?token=secret".into(),
+        ]);
+        let error = redact.error(crate::downstream::TransportError::Rpc(serde_json::json!({"code":-32602,"message":"Invalid argument near synthetic-pat","data":{"endpoint":"https://example.invalid/mcp?token=secret","field":"limit"}})));
+        if let crate::downstream::TransportError::Rpc(value) = error {
+            assert_eq!(value["code"], -32602);
+            assert_eq!(value["message"], "Invalid argument near <redacted>");
+            assert_eq!(value["data"]["field"], "limit");
+            assert_eq!(value["data"]["endpoint"], "<redacted>");
+        } else {
+            panic!("RPC error category must survive");
+        }
+        assert_eq!(
+            redact.text("HTTP 429: rate limit exceeded".into()),
+            "HTTP 429: rate limit exceeded"
+        );
     }
 
     #[test]

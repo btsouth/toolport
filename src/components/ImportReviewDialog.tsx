@@ -21,7 +21,10 @@ interface Props {
   details?: string;
   error?: string;
   onOpenChange: (open: boolean) => void;
-  onConfirm: (keys: string[]) => void;
+  onConfirm: (
+    keys: string[],
+    secretChoices?: Record<string, Record<string, boolean>>,
+  ) => void;
 }
 
 /** Review and choose detected client servers before adding them to Toolport. */
@@ -75,9 +78,20 @@ function ImportReviewContent({
     key: item.key ?? `${item.name}-${index}`,
   }));
   const [selected, setSelected] = useState<Set<string>>(
-    () => new Set(keyedItems.map(({ key }) => key)),
+    () =>
+      new Set(keyedItems.filter(({ item }) => !item.unsupported).map(({ key }) => key)),
   );
 
+  const [secretChoices, setSecretChoices] = useState<
+    Record<string, Record<string, boolean>>
+  >(() =>
+    Object.fromEntries(
+      items.map((item) => [
+        item.name,
+        Object.fromEntries((item.credentials ?? []).map((env) => [env.key, env.secret])),
+      ]),
+    ),
+  );
   const selectedCount = selected.size;
   return (
     <DialogContent className="sm:max-w-lg">
@@ -106,36 +120,68 @@ function ImportReviewContent({
           {keyedItems.map(({ item, key }) => {
             const isSelected = selected.has(key);
             return (
-              <button
-                key={key}
-                type="button"
-                aria-pressed={isSelected}
-                disabled={busy}
-                data-failed={!!error?.includes(item.name)}
-                className={`rounded-md text-left transition-colors ${
-                  error?.includes(item.name)
-                    ? "ring-1 ring-warning"
-                    : isSelected
-                      ? "ring-1 ring-success/60"
-                      : "opacity-60"
-                }`}
-                onClick={() =>
-                  setSelected((previous) => {
-                    const next = new Set(previous);
-                    if (isSelected) next.delete(key);
-                    else next.add(key);
-                    return next;
-                  })
-                }
-              >
-                <ImportRow item={item} selected={isSelected} />
-                {busy && isSelected && (
-                  <p role="status" className="flex gap-2 px-3 pb-2 text-xs">
-                    <Loader2 className="size-3 animate-spin" />
-                    Checking {item.name}...
+              <div key={key}>
+                <button
+                  type="button"
+                  aria-pressed={isSelected}
+                  disabled={busy || !!item.unsupported}
+                  data-failed={!!error?.includes(item.name)}
+                  className={`w-full rounded-md text-left transition-colors ${
+                    error?.includes(item.name)
+                      ? "ring-1 ring-warning"
+                      : isSelected
+                        ? "ring-1 ring-success/60"
+                        : "opacity-60"
+                  }`}
+                  onClick={() =>
+                    setSelected((previous) => {
+                      const next = new Set(previous);
+                      if (isSelected) next.delete(key);
+                      else next.add(key);
+                      return next;
+                    })
+                  }
+                >
+                  <ImportRow item={item} selected={isSelected} />
+                  {busy && isSelected && (
+                    <p role="status" className="flex gap-2 px-3 pb-2 text-xs">
+                      <Loader2 className="size-3 animate-spin" />
+                      Checking {item.name}...
+                    </p>
+                  )}
+                </button>
+                {!!item.credentials?.length && (
+                  <div className="flex flex-col gap-2 px-3 pb-3 text-xs">
+                    {item.credentials.map((env) => (
+                      <label key={env.key} className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          disabled={busy || !!item.unsupported}
+                          checked={secretChoices[item.name]?.[env.key] ?? env.secret}
+                          onChange={(e) =>
+                            setSecretChoices((previous) => ({
+                              ...previous,
+                              [item.name]: {
+                                ...previous[item.name],
+                                [env.key]: e.target.checked,
+                              },
+                            }))
+                          }
+                        />
+                        Keep {env.key} in keychain{" "}
+                        <span className="ml-auto text-muted-foreground">
+                          {env.present ? "Found" : "Missing"}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+                {item.unsupported && (
+                  <p className="px-3 pb-2 text-xs text-warning">
+                    Unsupported: {item.unsupported}
                   </p>
                 )}
-              </button>
+              </div>
             );
           })}
         </div>
@@ -145,7 +191,11 @@ function ImportReviewContent({
           Cancel
         </Button>
         <Button
-          onClick={() => onConfirm(Array.from(selected))}
+          onClick={() => {
+            if (items.some((item) => item.credentials?.length))
+              onConfirm(Array.from(selected), secretChoices);
+            else onConfirm(Array.from(selected));
+          }}
           disabled={busy || (!allowEmpty && selectedCount === 0)}
         >
           <Check className="size-4" />
@@ -199,7 +249,7 @@ export function ImportRow({ item, selected }: { item: ImportItem; selected?: boo
           )}
         </p>
       )}
-      {!!item.envKeys?.length && (
+      {!!item.envKeys?.length && !item.credentials?.length && (
         <p className="mt-1 text-xs text-warning">
           Credentials: {item.envKeys.join(", ")}. Review their status before connecting.
         </p>

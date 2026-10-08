@@ -53,8 +53,15 @@ pub(super) fn review(
     items: Vec<SetupItem>,
     disclosure: &str,
     confirm_label: &str,
-    action: impl Fn(Vec<String>) -> Result<Completion, String> + Send + Sync + 'static,
+    action: impl Fn(
+            Vec<String>,
+            std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+        ) -> Result<Completion, String>
+        + Send
+        + Sync
+        + 'static,
     finished: impl Fn() + 'static,
+    credential_page: Option<super::ServerPage>,
 ) {
     let dialog = adw::Window::builder()
         .transient_for(parent)
@@ -88,6 +95,7 @@ pub(super) fn review(
     rows.set_selection_mode(gtk::SelectionMode::None);
     rows.add_css_class("boxed-list");
     let mut selected = Vec::new();
+    let mut credential_choices = Vec::new();
     for item in items {
         let command = item
             .command
@@ -95,29 +103,55 @@ pub(super) fn review(
             .map(|c| format!("{c} {}", item.args.join(" ")))
             .or(item.url.clone())
             .unwrap_or_else(|| "Needs an endpoint URL".into());
-        let row = adw::ActionRow::builder()
+        let row = adw::ExpanderRow::builder()
             .title(&item.name)
             .subtitle(&command)
-            .subtitle_lines(1)
             .build();
+        row.set_subtitle_lines(1);
         middle_ellipsize(row.upcast_ref(), &command);
-        row.set_subtitle_selectable(true);
         let check = gtk::CheckButton::builder()
-            .active(true)
+            .active(item.unsupported.is_none())
             .valign(gtk::Align::Center)
             .build();
         row.add_prefix(&check);
-        row.set_activatable_widget(Some(&check));
+        check.set_sensitive(item.unsupported.is_none());
+        row.set_enable_expansion(!item.credentials.is_empty());
         let tag = gtk::Label::new(Some(if item.is_new { "New" } else { "In Toolport" }));
         tag.add_css_class("dim-label");
         row.add_suffix(&tag);
         let spinner = gtk::Spinner::new();
         spinner.set_visible(false);
         row.add_suffix(&spinner);
-        if !item.env_keys.is_empty() {
-            let state = gtk::Label::new(Some("Needs input"));
+        if !item.credentials.is_empty() {
+            let found = item.credentials.iter().all(|env| env.present);
+            let secret = item.credentials.iter().any(|env| env.secret);
+            let state = gtk::Label::new(Some(if !found {
+                "Missing"
+            } else if secret {
+                "Found, goes to keychain"
+            } else {
+                "Found"
+            }));
             state.add_css_class("warning");
             row.add_suffix(&state);
+        }
+        if let Some(reason) = &item.unsupported {
+            row.set_subtitle(&format!("Unsupported: {reason}"));
+        }
+        for env in item.credentials {
+            let choice = gtk::CheckButton::builder()
+                .label(format!("Keep {} in keychain", env.key))
+                .active(env.secret)
+                .build();
+            choice.set_sensitive(item.unsupported.is_none());
+            let value_row = adw::ActionRow::builder()
+                .title(&env.key)
+                .subtitle(if env.present { "Found" } else { "Missing" })
+                .build();
+            value_row.add_suffix(&choice);
+            value_row.set_activatable_widget(Some(&choice));
+            row.add_row(&value_row);
+            credential_choices.push((item.name.clone(), env.key, choice));
         }
         rows.append(&row);
         selected.push((check, row, spinner, item.key, item.name));
@@ -177,6 +211,7 @@ pub(super) fn review(
         return;
     }
     let selected = std::rc::Rc::new(selected);
+    let credential_choices = std::rc::Rc::new(credential_choices);
     let action = std::sync::Arc::new(action);
     let finished = std::rc::Rc::new(finished);
     let completed = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -191,6 +226,15 @@ pub(super) fn review(
             .filter(|(check, _, _, _, _)| check.is_active())
             .map(|(_, _, _, key, _)| key.clone())
             .collect::<Vec<_>>();
+        let mut choices =
+            std::collections::BTreeMap::<String, std::collections::BTreeMap<String, bool>>::new();
+        for (name, key, choice) in credential_choices.iter() {
+            choices
+                .entry(name.clone())
+                .or_default()
+                .insert(key.clone(), choice.is_active());
+            choice.set_sensitive(false);
+        }
         busy.set(true);
         button.set_sensitive(false);
         cancel.set_sensitive(false);
@@ -209,6 +253,8 @@ pub(super) fn review(
             busy.clone(),
             completed.clone(),
         );
+        let credential_choices = credential_choices.clone();
+        let credential_page = credential_page.clone();
         let (feedback, button, cancel, body, rows, details, lede) = (
             feedback.clone(),
             button.clone(),
@@ -219,8 +265,11 @@ pub(super) fn review(
             lede.clone(),
         );
         gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || action(chosen)).await;
+            let result = gtk::gio::spawn_blocking(move || action(chosen, choices)).await;
             busy.set(false);
+            for (_, _, choice) in credential_choices.iter() {
+                choice.set_sensitive(true);
+            }
             cancel.set_sensitive(true);
             button.set_sensitive(true);
             for (check, _, spinner, _, _) in selected.iter() {
@@ -257,6 +306,28 @@ pub(super) fn review(
                             .title(&server.name)
                             .subtitle(format!("{} tools · {}", server.tool_count, credential))
                             .build();
+                        if server.credential_state != "none" {
+                            if let Some(page) = &credential_page {
+                                let button = gtk::Button::with_label("Open Credentials");
+                                let page = page.clone();
+                                let name = server.name.clone();
+                                button.connect_clicked(move |_| {
+                                    if let Ok(registry) =
+                                        crate::registry_controller::registry_for_disconnect()
+                                    {
+                                        if let Some(server) =
+                                            super::state::RegistrySnapshot::from_registry(registry)
+                                                .servers
+                                                .into_iter()
+                                                .find(|s| s.name == name)
+                                        {
+                                            super::open_credentials_editor(server, page.clone());
+                                        }
+                                    }
+                                });
+                                row.add_suffix(&button);
+                            }
+                        }
                         results.append(&row);
                     }
                     body.append(&results);
@@ -308,6 +379,7 @@ pub(super) fn connect(
     profile: Option<String>,
     force: bool,
     finished: impl Fn() + 'static,
+    credential_page: super::ServerPage,
 ) {
     let parent = parent.clone();
     gtk::glib::spawn_future_local(async move {
@@ -329,13 +401,14 @@ pub(super) fn connect(
                     preview.items,
                     &disclosure,
                     "Connect to Toolport",
-                    move |selected| {
-                        let outcome = crate::registry_controller::migrate_client_reviewed(
+                    move |selected, choices| {
+                        let outcome = crate::registry_controller::migrate_client_reviewed_choices(
                             &client_id,
                             profile.as_deref(),
                             force,
                             &selected,
                             &preview.revision,
+                            &choices,
                         )?;
                         Ok(Completion {
                             message: format!(
@@ -347,6 +420,7 @@ pub(super) fn connect(
                         })
                     },
                     finished,
+                    Some(credential_page),
                 );
             }
             Ok(Err(error)) => review(
@@ -355,8 +429,9 @@ pub(super) fn connect(
                 Vec::new(),
                 &error,
                 "Close",
-                |_| Err("Fix the client config and retry.".into()),
+                |_, _| Err("Fix the client config and retry.".into()),
                 || {},
+                None,
             ),
             Err(_) => review(
                 &parent,
@@ -364,8 +439,9 @@ pub(super) fn connect(
                 Vec::new(),
                 "Client review stopped.",
                 "Close",
-                |_| Err("Retry from Clients.".into()),
+                |_, _| Err("Retry from Clients.".into()),
                 || {},
+                None,
             ),
         }
     });
@@ -398,13 +474,15 @@ pub(super) fn collection(
                 )
                 .collect(),
             is_new: true,
+            credentials: Vec::new(),
+            unsupported: None,
         })
         .collect();
-    review(parent,&format!("Review {name}"),items,"Review what each server runs. Valid servers turn on. Servers needing credentials or launch values stay off until setup is complete.","Add selected servers",move |keys| {
+    review(parent,&format!("Review {name}"),items,"Review what each server runs. Valid servers turn on. Servers needing credentials or launch values stay off until setup is complete.","Add selected servers",move |keys,_choices| {
         let selected=entries.iter().enumerate().filter(|(i,_)|keys.contains(&i.to_string())).map(|(_,e)|e.clone()).collect();
         let (_,added)=crate::registry_controller::add_catalog_stack(selected)?;
         Ok(format!("Added {added} servers. Check status and complete any missing setup inputs under Servers.").into())
-    },finished);
+    },finished,None);
 }
 
 #[cfg(test)]

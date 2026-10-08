@@ -608,11 +608,13 @@ export function migrateClient(
   force?: boolean,
   selected: string[] = [],
   revision = "",
+  secretChoices?: Record<string, Record<string, boolean>>,
 ): Promise<MigrateResult> {
   return invoke<MigrateResult>("migrate_client", {
     clientId,
     selected,
     revision,
+    secretChoices,
     profile: profile ?? null,
     force: force ?? false,
   });
@@ -966,6 +968,13 @@ export function previewClientSetup(
   return invoke("preview_client_setup", { clientId });
 }
 
-export function addSnippetServers(text: string, selected: string[]): Promise<Registry> {
-  return invoke("add_snippet_servers", { text, selected });
+export function addSnippetServers(
+  text: string,
+  selected: string[],
+  secretChoices?: Record<string, Record<string, boolean>>,
+): Promise<{
+  registry: Registry;
+  servers: { name: string; status: string; missing: string[] }[];
+}> {
+  return invoke("add_snippet_servers", { text, selected, secretChoices });
 }

@@ -206,17 +206,15 @@ async fn add_snippet_servers(
     state: State<'_, RegistryState>,
     text: String,
     selected: Vec<String>,
-) -> Result<Registry, String> {
+    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
+) -> Result<serde_json::Value, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::add_snippet_servers(&text, &selected)
+        crate::registry_controller::add_snippet_servers_choices(&text,&selected,&secret_choices.unwrap_or_default())
     })
     .await
     .map_err(|_| "Paste import stopped".to_string())??;
     let registry = reload_into_state(state.inner())?;
-    if !outcome.failed.is_empty() {
-        return Err("Servers added, but the keychain could not save credentials. Open Credentials and retry.".into());
-    }
-    Ok(registry)
+    Ok(serde_json::json!({"registry":registry,"servers":outcome.servers}))
 }
 
 /// Parse a pasted config snippet and return the detected server(s) with
@@ -651,14 +649,16 @@ async fn migrate_client(
     force: Option<bool>,
     selected: Vec<String>,
     revision: String,
+    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
 ) -> Result<MigrateResult, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::migrate_client_reviewed(
+        crate::registry_controller::migrate_client_reviewed_choices(
             &client_id,
             profile.as_deref(),
             force.unwrap_or(false),
             &selected,
             &revision,
+            &secret_choices.unwrap_or_default(),
         )
     })
     .await

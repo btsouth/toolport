@@ -303,7 +303,7 @@ fn build_window(
     let (content, server_page, approval_page) = build_content(app, broker.clone());
     let bridge_for_reap = bridge.clone();
     let server_page_for_reap = server_page.clone();
-    let client_page = ClientPage::new(app);
+    let client_page = ClientPage::new(app, server_page.clone());
     let activity_page = ActivityPage::new(app);
     let catalog_page = CatalogPage::new(server_page.clone());
     let teams_page = TeamsPage::new(app);
@@ -1856,6 +1856,7 @@ impl ServerPage {
 
 #[derive(Clone)]
 struct ClientPage {
+    credential_page: ServerPage,
     app: adw::Application,
     root: gtk::Box,
     list: gtk::Box,
@@ -1872,7 +1873,7 @@ struct ClientPage {
 }
 
 impl ClientPage {
-    fn new(app: &adw::Application) -> Self {
+    fn new(app: &adw::Application, credential_page: ServerPage) -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("toolport-content");
         let header = adw::HeaderBar::new();
@@ -1955,6 +1956,7 @@ impl ClientPage {
         root.append(&scroller);
 
         let client_page = Self {
+            credential_page,
             app: app.clone(),
             root,
             list,
@@ -2550,7 +2552,8 @@ fn confirm_client_migrate(client: &state::ClientView, page: ClientPage) {
         client.id.clone(),
         client.scope_id.clone(),
         client.gateway_state == state::ClientGatewayState::Customized,
-        move || page.refresh(),
+        { let page = page.clone(); move || page.refresh() },
+        page.credential_page.clone(),
     );
 }
 
@@ -8610,12 +8613,12 @@ fn open_server_editor_prefilled(
                 Ok(servers) => {
                     if servers.len() > 1 {
                         let Some(parent) = fill.root().and_downcast::<gtk::Window>() else { return; };
-                        let items = servers.iter().enumerate().map(|(i, s)| crate::registry_controller::SetupItem {key:i.to_string(),name:s.name.clone(),transport:s.transport.clone(),command:s.command.clone(),args:s.args.clone(),url:s.url.clone(),env_keys:s.env.iter().map(|e| e.key.clone()).collect(),is_new:true}).collect();
-                        setup::review(&parent, "Review pasted servers", items, "Review each command and URL. Credentials go to the keychain. Missing inputs stay off.", "Add selected servers", move |selected| {
+                        let items = servers.iter().enumerate().map(|(i, s)| crate::registry_controller::SetupItem {key:i.to_string(),name:s.name.clone(),transport:s.transport.clone(),command:s.command.clone(),args:s.args.clone(),url:s.url.clone(),env_keys:s.env.iter().map(|e| e.key.clone()).collect(),is_new:true,credentials:Vec::new(),unsupported:None}).collect();
+                        setup::review(&parent, "Review pasted servers", items, "Review each command and URL. Credentials go to the keychain. Missing inputs stay off.", "Add selected servers", move |selected,_choices| {
                             let outcome = crate::registry_controller::add_snippet_servers(&text, &selected)?;
                             if !outcome.failed.is_empty() { return Err("Could not save credentials. Open Credentials and retry.".into()); }
                             Ok("Added selected servers. Check their status under Servers.".into())
-                        }, { let page = page_for_fill.clone(); move || run_profile_mutation(page.clone(), "Added selected servers", crate::registry_controller::registry_for_disconnect) });
+                        }, { let page = page_for_fill.clone(); move || run_profile_mutation(page.clone(), "Added selected servers", crate::registry_controller::registry_for_disconnect) }, None);
                         return;
                     }
                     let Some(first) = servers.first() else {

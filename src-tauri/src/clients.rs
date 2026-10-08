@@ -6384,6 +6384,15 @@ pub fn setup_revision(client_id: &str) -> Result<String, String> {
     )))
 }
 
+/// Stage registry changes against the reviewed server container, then release
+/// the config lock before any vault read, unlock prompt or transport verification.
+pub(crate) fn stage_reviewed<T>(client_id: &str, revision: &str, stage: impl FnOnce() -> Result<T,String>) -> Result<T,String> {
+    let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
+    let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
+    if setup_revision(client_id)? != revision { return Err("Client config changed. Review it again before connecting. Config unchanged.".into()); }
+    stage()
+}
+
 /// Hold the existing config transaction while the reviewed servers are imported
 /// and verified. No native definition is removed until verification succeeds.
 pub(crate) fn migrate_reviewed(

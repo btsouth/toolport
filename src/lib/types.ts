@@ -336,6 +336,8 @@ export interface AuthInfo {
 
 /** One server a shared setup would add, shown for review before importing. */
 export interface ImportItem {
+  credentials?: { key: string; secret: boolean; present: boolean }[];
+  unsupported?: string | null;
   envKeys?: string[];
   /** Opaque key used to confirm a detected-client import. Absent for shared setups. */
   key?: string;

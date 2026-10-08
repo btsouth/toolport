@@ -443,11 +443,14 @@ export function ServerDialog({
         onOpenChange={(open) => {
           if (!open && !busy) setPasteReview(null);
         }}
-        onConfirm={async (keys) => {
+        onConfirm={async (keys, choices) => {
           setBusy(true);
           try {
-            const next = await addSnippetServers(reviewText, keys);
-            onSaved(next);
+            const next = await addSnippetServers(reviewText, keys, choices);
+            onSaved(next.registry);
+            toast.success(
+              next.servers.map((server) => `${server.name}: ${server.status}`).join("; "),
+            );
             setPasteReview(null);
             setReviewText("");
             onOpenChange(false);

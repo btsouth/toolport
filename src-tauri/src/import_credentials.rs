@@ -10,10 +10,109 @@ const VAULT_FAILURE: &str =
 
 pub(crate) fn provided(value: &str) -> bool {
     let value = value.trim();
+    let placeholder = regex::Regex::new(
+        r"^(\$\{[A-Za-z_][A-Za-z0-9_]*\}|<(?i:your[-_ ]|replace[-_ ])[A-Za-z0-9_ -]+>)$",
+    )
+    .unwrap();
     !value.is_empty()
-        && !value.starts_with(['$', '<', '{'])
-        && !value.to_ascii_uppercase().starts_with("YOUR_")
-        && !value.to_ascii_uppercase().starts_with("REPLACE_")
+        && !placeholder.is_match(value)
+        && !matches!(
+            value.to_ascii_uppercase().as_str(),
+            "YOUR_API_KEY" | "YOUR_TOKEN" | "REPLACE_ME"
+        )
+}
+
+pub(crate) fn secret_env(key: &str, value: Option<&str>) -> bool {
+    let key = key.to_ascii_uppercase();
+    if [
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASS",
+        "AUTH",
+        "CREDENTIAL",
+        "BEARER",
+        "COOKIE",
+        "PRIVATE",
+        "PAT",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+    {
+        return true;
+    }
+    let Some(value) = value else {
+        return false;
+    };
+    if ["sk-", "ghp_", "github_pat_", "xox", "AKIA", "-----BEGIN"]
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+    {
+        return true;
+    }
+    if value.len() < 20 || value.contains(char::is_whitespace) {
+        return false;
+    }
+    let mut counts = std::collections::HashMap::new();
+    for byte in value.bytes() {
+        *counts.entry(byte).or_insert(0usize) += 1;
+    }
+    let entropy = counts
+        .values()
+        .map(|count| {
+            let p = *count as f64 / value.len() as f64;
+            -p * p.log2()
+        })
+        .sum::<f64>();
+    entropy >= 4.0
+}
+
+/// Vault changes are prepared before registry/config locks and undone on every error.
+#[derive(Default)]
+pub(crate) struct VaultWrites {
+    receipts: Vec<(String, String, Option<String>, String)>,
+}
+impl VaultWrites {
+    fn write(&mut self, id: &str, key: &str, value: &str) -> Result<(), String> {
+        let previous = secrets::get_vault_secret_result(id, key).map_err(|_| VAULT_FAILURE)?;
+        self.receipts
+            .push((id.into(), key.into(), previous, value.into()));
+        secrets::set_secret(id, key, value).map_err(|_| VAULT_FAILURE.into())
+    }
+    fn rollback(&mut self) -> Result<(), String> {
+        let mut failed = false;
+        for (id, key, previous, written) in self.receipts.drain(..).rev() {
+            match secrets::get_vault_secret_result(&id, &key) {
+                Ok(current) if current.as_deref() == Some(&written) => {
+                    let result = match previous {
+                        Some(value) => secrets::set_secret(&id, &key, &value),
+                        None => secrets::delete_secret(&id, &key),
+                    };
+                    failed |= result.is_err();
+                }
+                Ok(current) if current == previous => {}
+                _ => failed = true,
+            }
+        }
+        if failed {
+            Err("Could not undo every keychain change. Unlock Credentials and review before retrying.".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+pub(crate) fn transaction<T>(
+    action: impl FnOnce(&mut VaultWrites) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut writes = VaultWrites::default();
+    match action(&mut writes) {
+        Ok(result) => Ok(result),
+        Err(error) => match writes.rollback() {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(format!("{error} {rollback}")),
+        },
+    }
 }
 
 pub(crate) fn shown_url(value: &str) -> String {
@@ -78,8 +177,16 @@ pub(crate) struct Import {
 
 impl Import {
     pub(crate) fn prepare(
+        entry: ServerEntry,
+        definition: Option<&serde_json::Value>,
+    ) -> Result<Self, String> {
+        Self::prepare_with_choices(entry, definition, None)
+    }
+
+    pub(crate) fn prepare_with_choices(
         mut entry: ServerEntry,
         definition: Option<&serde_json::Value>,
+        choices: Option<&std::collections::BTreeMap<String, bool>>,
     ) -> Result<Self, String> {
         if entry
             .command
@@ -127,6 +234,7 @@ impl Import {
             }
         }
         let mut values = Vec::new();
+        let mut plain = Vec::new();
         for env in &entry.env {
             let value = definition
                 .and_then(|d| {
@@ -140,7 +248,24 @@ impl Import {
                     serde_json::Value::Bool(b) => Some(b.to_string()),
                     _ => None,
                 });
-            values.push((env.key.clone(), value));
+            let secret = choices
+                .and_then(|c| c.get(&env.key))
+                .copied()
+                .unwrap_or_else(|| {
+                    if definition.is_none() {
+                        env.secret
+                    } else {
+                        secret_env(&env.key, value.as_deref())
+                    }
+                });
+            if secret || env.key.eq_ignore_ascii_case("authorization") {
+                values.push((env.key.clone(), value));
+            } else {
+                let mut env = env.clone();
+                env.secret = false;
+                env.value = value.filter(|v| provided(v));
+                plain.push(env);
+            }
         }
         if entry.transport != "stdio" {
             // Arbitrary header schemes have no equivalent in Toolport's bearer
@@ -233,6 +358,7 @@ impl Import {
                 unknown_fields: Default::default(),
             })
             .collect();
+        entry.env.extend(plain);
         if !had_launch {
             launch.required_env = entry.env.iter().map(|e| e.key.clone()).collect();
         }
@@ -242,8 +368,52 @@ impl Import {
         Ok(Self { entry, values })
     }
 
-    pub(crate) fn transfer(&self, id: &str) -> Result<Vec<String>, String> {
-        self.transfer_with(id, secrets::get_vault_secret_result, secrets::set_secret)
+    pub(crate) fn matches(&self, existing: &ServerEntry) -> Result<bool, String> {
+        if existing.command != self.entry.command || existing.transport != self.entry.transport {
+            return Ok(false);
+        }
+        let args = |server: &ServerEntry, imported: bool| {
+            crate::launch_inputs::resolve_args_with(server, |id, key| {
+                if imported {
+                    if let Some((_, value)) = self.values.iter().find(|(name, _)| name == key) {
+                        return Ok(value.clone());
+                    }
+                }
+                secrets::get_vault_secret_result(id, key)
+            })
+            .map(|args| args.args)
+        };
+        if args(existing, false)? != args(&self.entry, true)? {
+            return Ok(false);
+        }
+        let existing_url = if existing
+            .env
+            .iter()
+            .any(|e| e.key == secrets::IMPORTED_URL_KEY)
+        {
+            secrets::get_vault_secret_result(&existing.id, secrets::IMPORTED_URL_KEY)
+                .map_err(|_| VAULT_FAILURE)?
+                .or(existing.url.clone())
+        } else {
+            existing.url.clone()
+        };
+        let imported_url = self
+            .values
+            .iter()
+            .find(|(key, _)| key == secrets::IMPORTED_URL_KEY)
+            .and_then(|(_, value)| value.clone())
+            .or(self.entry.url.clone());
+        Ok(existing_url == imported_url)
+    }
+
+    pub(crate) fn transfer_into(
+        &self,
+        id: &str,
+        writes: &mut VaultWrites,
+    ) -> Result<Vec<String>, String> {
+        self.transfer_with(id, secrets::get_vault_secret_result, |id, key, value| {
+            writes.write(id, key, value)
+        })
     }
 
     fn transfer_with(
@@ -269,10 +439,7 @@ impl Import {
                 }
                 continue;
             };
-            if let Some(current) = current {
-                if current != value {
-                    return Err("Imported credentials differ from the saved values. Resolve them in Credentials and review again. Client config unchanged.".into());
-                }
+            if current.as_deref() == Some(value) {
                 continue;
             }
             write(id, key, value).map_err(|_| VAULT_FAILURE.to_string())?;
@@ -328,14 +495,27 @@ mod tests {
 
     #[test]
     fn exact_placeholders_do_not_reject_real_secret_prefixes() {
-        for value in ["$actual-secret", "{real-secret}", "<actual-secret>"] { assert!(provided(value), "{value}"); }
-        for value in ["${TOKEN}", "<your-key>", ""] { assert!(!provided(value), "{value}"); }
+        for value in ["$actual-secret", "{real-secret}", "<actual-secret>"] {
+            assert!(provided(value), "{value}");
+        }
+        for value in ["${TOKEN}", "<your-key>", ""] {
+            assert!(!provided(value), "{value}");
+        }
     }
 
     #[test]
     fn ordinary_environment_values_stay_plain() {
-        let import = Import::prepare(entry(false), Some(&json!({"env":{"PAT":"synthetic-pat-secret","PORT":3000}}))).unwrap();
-        let port = import.entry.env.iter().find(|env| env.key == "PORT").unwrap();
+        let import = Import::prepare(
+            entry(false),
+            Some(&json!({"env":{"PAT":"synthetic-pat-secret","PORT":3000}})),
+        )
+        .unwrap();
+        let port = import
+            .entry
+            .env
+            .iter()
+            .find(|env| env.key == "PORT")
+            .unwrap();
         assert!(!port.secret);
         assert_eq!(port.value.as_deref(), Some("3000"));
     }
