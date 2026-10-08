@@ -5822,7 +5822,7 @@ impl HttpTransport {
     /// Persistence failures reach the caller without an unlocked exchange.
     fn refresh_before_send(&mut self) -> Result<(), TransportError> {
         if let Some(refresh) = &self.refresh {
-            if let Ok(refresh) = refresh.lock() {
+            if let Ok(refresh) = refresh.try_lock() {
                 match refresh(false) {
                     Ok(Some(token)) => {
                         *self
@@ -13804,6 +13804,20 @@ mod tests {
         assert!(result.is_some());
         assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
         assert_eq!(*seen_auth.lock().unwrap(), "Bearer fresh");
+    }
+
+    #[test]
+    fn proactive_refresh_busy_callback_keeps_current_token() {
+        let mut transport = HttpTransport::with_auth_refresh(
+            "http://127.0.0.1:1/mcp",
+            Some("pending-token".into()),
+            Some(Box::new(|_| panic!("a held callback must not be invoked"))),
+        );
+        let callback = transport.refresh.as_ref().unwrap().clone();
+        let _holder = callback.lock().unwrap();
+        // Waiting for this guard would deadlock: a listener may hold it across I/O.
+        transport.refresh_before_send().unwrap();
+        assert_eq!(transport.auth.lock().unwrap().as_deref(), Some("pending-token"));
     }
 
     #[test]

@@ -763,10 +763,12 @@ fn refresh_token_under_lock(
     let vaulted_state = credentials.vaulted_state.clone();
     if had_pending && (changed_before || changed_after || (!force && credentials.pending.is_none()))
     {
-        // A peer's sign-in supersedes the unsaved pair, even without lock contention.
+        // A peer's sign-in or our completed save supersedes the unsaved pair.
         if let Some(state) = load_state(server_id)? {
             if let Some(access_token) = credentials.token.clone() {
-                if refresh_decision(&state, now_epoch_seconds()) == RefreshDecision::NotNeeded {
+                if refresh_decision(&state, now_epoch_seconds()) == RefreshDecision::NotNeeded
+                    && (!force || rejected != Some(access_token.as_str()))
+                {
                     return Ok(RefreshedToken {
                         access_token,
                         expires_at: state.expires_at,
@@ -922,8 +924,8 @@ fn reauthorize_for_scope(
 
 /// Force a refresh after rejection, or reuse a different current credential under
 /// the credential-update and cross-process locks. `None` disables rejected-token
-/// coalescing. Pass the bearer actually rejected by the
-/// server to coalesce concurrent failures. Vault read errors propagate; callers
+/// coalescing. Pass the bearer actually rejected by the server to coalesce
+/// concurrent failures. Vault read errors propagate; callers
 /// should report the storage failure rather than request sign-in or exchange again.
 pub fn refresh_token(server_id: &str, rejected: Option<&str>) -> Result<String, String> {
     refresh_token_with_expiry(server_id, rejected).map(|token| token.access_token)
