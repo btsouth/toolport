@@ -6220,13 +6220,10 @@ pub(crate) mod tests {
 
     #[test]
     fn update_saves_to_the_same_resolved_path_it_locked() {
+        let _data_dir = DataDirTestEnv::new("update-path");
         let _guard = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Resolves the data dir indirectly through save/load/update, so it owes
-        // the same lock every other resolver takes. Without it this ran beside a
-        // test holding a DataDirOverride and each saw the other's path.
-        let _data_dir = data_dir_test_lock();
         let dir = std::env::temp_dir().join(format!("toolport-update-path-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let locked_path = dir.join("locked.json");
