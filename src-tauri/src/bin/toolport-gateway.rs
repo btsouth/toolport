@@ -33178,7 +33178,9 @@ mod tests {
         for key in ["active", "retained"] {
             assert!(registry.begin_client_request(key.into()));
             let seen = cancelled.clone();
-            hooks.push(registry.context(key.into()).on_cancel(Arc::new(move |_| { seen.fetch_add(1, Ordering::SeqCst); })));
+            hooks.push(registry.context(key.into()).on_cancel(Arc::new(move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            })));
         }
         registry.finish_client_request("retained");
         for id in 0..100 {
