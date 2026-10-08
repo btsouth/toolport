@@ -790,6 +790,16 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_environment_matching_does_not_widen_endpoint_paths() {
+        for path in ["/author/mcp", "/tokenizer/mcp", "/monkey/mcp"] {
+            assert!(!secret_url_path(&url::Url::parse(&format!("https://example.invalid{path}")).unwrap()), "harmless path widened: {path}");
+        }
+        for path in ["/oauth/token/mcp", "/auth/mcp", "/sk-private-path"] {
+            assert!(secret_url_path(&url::Url::parse(&format!("https://example.invalid{path}")).unwrap()), "existing path protection lost: {path}");
+        }
+    }
+
+    #[test]
     fn reviewed_path_only_endpoint_is_vaulted_and_masked() {
         let mut raw = entry(true);
         raw.env.clear();
