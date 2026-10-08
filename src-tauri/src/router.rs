@@ -290,6 +290,11 @@ fn match_simple_pattern(mut pattern: &str, mut text: &str) -> bool {
     }
 }
 
+/// Normalize client input schemas when reading a legacy catalog snapshot.
+pub fn normalize_tool_schema(schema: &mut Value) {
+    crate::schema_compat::normalize(schema);
+}
+
 /// Inline local `$ref` pointers into a self-contained JSON Schema, so a downstream
 /// consumer that can't resolve refs gets a complete schema. Handles `#/$defs/X`,
 /// `#/definitions/X`, AND any in-document JSON Pointer (`#/properties/a/b`, which
@@ -1517,6 +1522,8 @@ pub struct Router {
     tools: Vec<Value>,
     /// Exposed tool name -> (server id, original downstream tool name).
     routes: HashMap<String, (String, String)>,
+    /// Argument aliases compiled alongside the published tool definitions.
+    schema_arguments: HashMap<String, Arc<crate::schema_compat::ArgumentMap>>,
     /// Routes kept across a guarded catalog collapse. Profile views recheck
     /// these under their own allowlist after indexing the shared live slots.
     restored_candidates: Vec<RestoredTool>,
@@ -1566,6 +1573,7 @@ struct RestoredTool {
     server: String,
     original: String,
     source_revision: u64,
+    schema_arguments: Option<Arc<crate::schema_compat::ArgumentMap>>,
 }
 
 impl Router {
@@ -1843,7 +1851,12 @@ impl Router {
             }
             t["name"] = json!(exposed);
             if let Some(schema) = t.get_mut("inputSchema") {
+                let arguments = crate::schema_compat::normalize(schema);
                 inline_refs(schema);
+                if !arguments.is_empty() {
+                    self.schema_arguments
+                        .insert(exposed.clone(), Arc::new(arguments));
+                }
             }
             self.tools.push(t);
             self.routes
@@ -2937,6 +2950,7 @@ impl Router {
                     server: server_id.to_string(),
                     original: original.to_string(),
                     source_revision: self.tool_revision(server_id).unwrap_or(0),
+                    schema_arguments: previous.schema_arguments.get(exposed).cloned(),
                 });
             }
         }
@@ -2984,6 +2998,7 @@ impl Router {
                         server: server_id.to_string(),
                         original: original.to_string(),
                         source_revision: self.tool_revision(server_id).unwrap_or(0),
+                        schema_arguments: unrestricted.schema_arguments.get(exposed).cloned(),
                     });
                 }
             }
@@ -3017,6 +3032,10 @@ impl Router {
                 candidate.exposed.clone(),
                 (candidate.server.clone(), candidate.original.clone()),
             );
+            if let Some(arguments) = &candidate.schema_arguments {
+                self.schema_arguments
+                    .insert(candidate.exposed.clone(), Arc::clone(arguments));
+            }
             self.tools.push(candidate.definition.clone());
             self.seen.insert(candidate.exposed.clone());
         }
@@ -3049,6 +3068,7 @@ impl Router {
         self.tools.clear();
         self.catalog_servers.clear();
         self.routes.clear();
+        self.schema_arguments.clear();
         self.seen.clear();
         // A restored route keeps its exposed name until a fresh tool catalog
         // confirms its removal. Reserve that name before indexing new slots,
@@ -3525,6 +3545,10 @@ impl Router {
             .routes
             .get(exposed_name)
             .ok_or_else(|| self.no_route_message(exposed_name))?;
+        let mut arguments = arguments;
+        if let Some(plan) = self.schema_arguments.get(exposed_name) {
+            plan.restore(&mut arguments)?;
+        }
         let slot = self.authorized_slot(server_id)?;
         let (result, downstream_supports_tasks) = self.call_with_retry(
             &slot,
@@ -4056,6 +4080,66 @@ mod tests {
         assert!(!serde_json::to_string(&schema).unwrap().contains("$ref"));
     }
     use crate::downstream::{CancelRegistry, DownstreamServer, Transport};
+
+    #[test]
+    fn schema_compat_recursive_arguments_restore_below_cycles() {
+        let mut server = mock_server("s");
+        server.tools = vec![json!({"name": "echo", "inputSchema": {
+            "$ref": "#/$defs/Node",
+            "$defs": {"Node": {"properties": {
+                "a b": {"type": "string"},
+                "kids": {"type": "array", "items": {"$ref": "#/$defs/Node"}}
+            }}}
+        }})];
+        let mut router = Router::new();
+        router.add(server);
+        let mut args = json!({"a_b": "top", "kids": [
+            {"a_b": "child", "kids": [{"a_b": "grandchild"}]}
+        ]});
+        router.schema_arguments["s__echo"]
+            .restore(&mut args)
+            .unwrap();
+        assert_eq!(
+            args,
+            json!({"a b": "top", "kids": [
+                {"a b": "child", "kids": [{"a b": "grandchild"}]}
+            ]})
+        );
+        let published = router.aggregated_tools();
+        assert!(!published[0]["inputSchema"].to_string().contains("$ref"));
+    }
+
+    #[test]
+    fn schema_compat_maps_survive_guarded_restoration_and_reindexing() {
+        let mut server = mock_server("s");
+        server.tools = vec![
+            json!({"name": "echo", "inputSchema": {"properties": {"'x-Cwd'": {"type": "string"}}}}),
+        ];
+        let raw = server.tools.clone();
+        let mut previous = Router::new();
+        previous.add(server);
+        let plan = Arc::clone(&previous.schema_arguments["s__echo"]);
+        for _ in 0..3 {
+            assert_eq!(
+                previous.aggregated_tools()[0]["inputSchema"]["properties"]["x-Cwd"],
+                json!({"type": "string"})
+            );
+            assert!(Arc::ptr_eq(&plan, &previous.schema_arguments["s__echo"]));
+        }
+        assert_eq!(previous.raw_catalogs().unwrap()["s"], raw);
+        let reindexed = previous.reindexed();
+        let mut restored = Router::new();
+        let mut empty = mock_server("s");
+        empty.tools.clear();
+        restored.add(empty);
+        restored.adopt_restored_routes(&previous, &previous.aggregated_tools());
+        assert!(Arc::ptr_eq(&plan, &restored.schema_arguments["s__echo"]));
+        for view in [reindexed, restored.reindexed()] {
+            let mut args = json!({"x-Cwd": "/tmp"});
+            view.schema_arguments["s__echo"].restore(&mut args).unwrap();
+            assert_eq!(args, json!({"'x-Cwd'": "/tmp"}));
+        }
+    }
 
     /// A fake downstream server: advertises `echo` + `add`, echoes calls back.
     struct MockTransport {

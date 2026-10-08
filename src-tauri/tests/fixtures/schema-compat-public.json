@@ -1,0 +1,287 @@
+[
+  {
+    "name": "clerk__call_admin_portal_link_token",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "object",
+          "properties": {
+            "organization_id": {
+              "type": "string",
+              "pattern": "^org_\\w{27}$"
+            },
+            "it_contact_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "scopes": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "seconds_until_expiration": {
+              "type": "integer",
+              "minimum": 0,
+              "exclusiveMinimum": true,
+              "maximum": 86400,
+              "default": 3600
+            }
+          },
+          "additionalProperties": false,
+          "description": "JSON request body."
+        }
+      },
+      "required": ["body"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "cloudflare__list_dns_records",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "zone_id": {
+          "description": "Identifier.",
+          "example": "023e105f4ecef8ad9ca31a8372d0c353",
+          "maxLength": 32,
+          "type": "string",
+          "x-auditable": true
+        },
+        "name": {
+          "description": "Exact value of the DNS record name. This is a convenience alias for `name.exact`.\n",
+          "example": "www.example.com",
+          "type": "string"
+        },
+        "name.exact": {
+          "description": "Exact value of the DNS record name. Name filters are case-insensitive.\n",
+          "example": "www.example.com",
+          "type": "string"
+        },
+        "name.contains": {
+          "description": "Substring of the DNS record name. Name filters are case-insensitive.\n",
+          "example": "w.example.",
+          "type": "string"
+        },
+        "name.startswith": {
+          "description": "Prefix of the DNS record name. Name filters are case-insensitive.\n",
+          "example": "www.example",
+          "type": "string"
+        },
+        "name.endswith": {
+          "description": "Suffix of the DNS record name. Name filters are case-insensitive.\n",
+          "example": ".example.com",
+          "type": "string"
+        },
+        "type": {
+          "description": "Record type.",
+          "enum": [
+            "A",
+            "AAAA",
+            "CAA",
+            "CERT",
+            "CNAME",
+            "DNSKEY",
+            "DS",
+            "HTTPS",
+            "LOC",
+            "MX",
+            "NAPTR",
+            "NS",
+            "OPENPGPKEY",
+            "PTR",
+            "SMIMEA",
+            "SRV",
+            "SSHFP",
+            "SVCB",
+            "TLSA",
+            "TXT",
+            "URI"
+          ],
+          "example": "A",
+          "type": "string",
+          "x-auditable": true
+        },
+        "content": {
+          "description": "Exact value of the DNS record content. This is a convenience alias for `content.exact`.\n",
+          "example": "127.0.0.1",
+          "type": "string"
+        },
+        "content.exact": {
+          "description": "Exact value of the DNS record content. Content filters are case-insensitive.\n",
+          "example": "127.0.0.1",
+          "type": "string"
+        },
+        "content.contains": {
+          "description": "Substring of the DNS record content. Content filters are case-insensitive.\n",
+          "example": "7.0.0.",
+          "type": "string"
+        },
+        "content.startswith": {
+          "description": "Prefix of the DNS record content. Content filters are case-insensitive.\n",
+          "example": "127.0.",
+          "type": "string"
+        },
+        "content.endswith": {
+          "description": "Suffix of the DNS record content. Content filters are case-insensitive.\n",
+          "example": ".0.1",
+          "type": "string"
+        },
+        "proxied": {
+          "default": false,
+          "description": "Whether the record is receiving the performance and security benefits of Cloudflare.",
+          "example": true,
+          "type": "boolean",
+          "x-auditable": true
+        },
+        "match": {
+          "default": "all",
+          "description": "Whether to match all search requirements or at least one (any). If set to `all`, acts like a logical AND between filters. If set to `any`, acts like a logical OR instead. Note that the interaction between tag filters is controlled by the `tag-match` parameter instead.\n",
+          "enum": ["any", "all"],
+          "example": "any",
+          "type": "string"
+        },
+        "comment": {
+          "description": "Exact value of the DNS record comment. This is a convenience alias for `comment.exact`.\n",
+          "example": "Hello, world",
+          "type": "string"
+        },
+        "comment.present": {
+          "description": "If this parameter is present, only records *with* a comment are returned.\n",
+          "type": "string"
+        },
+        "comment.absent": {
+          "description": "If this parameter is present, only records *without* a comment are returned.\n",
+          "type": "string"
+        },
+        "comment.exact": {
+          "description": "Exact value of the DNS record comment. Comment filters are case-insensitive.\n",
+          "example": "Hello, world",
+          "type": "string"
+        },
+        "comment.contains": {
+          "description": "Substring of the DNS record comment. Comment filters are case-insensitive.\n",
+          "example": "ello, worl",
+          "type": "string"
+        },
+        "comment.startswith": {
+          "description": "Prefix of the DNS record comment. Comment filters are case-insensitive.\n",
+          "example": "Hello, w",
+          "type": "string"
+        },
+        "comment.endswith": {
+          "description": "Suffix of the DNS record comment. Comment filters are case-insensitive.\n",
+          "example": "o, world",
+          "type": "string"
+        },
+        "tag": {
+          "description": "Condition on the DNS record tag.\n\nParameter values can be of the form `<tag-name>:<tag-value>` to search for an exact `name:value` pair, or just `<tag-name>` to search for records with a specific tag name regardless of its value.\n\nThis is a convenience shorthand for the more powerful `tag.<predicate>` parameters.\nExamples:\n- `tag=important` is equivalent to `tag.present=important`\n- `tag=team:DNS` is equivalent to `tag.exact=team:DNS`\n",
+          "example": "team:DNS",
+          "type": "string"
+        },
+        "tag.present": {
+          "description": "Name of a tag which must be present on the DNS record. Tag filters are case-insensitive.\n",
+          "example": "important",
+          "type": "string"
+        },
+        "tag.absent": {
+          "description": "Name of a tag which must *not* be present on the DNS record. Tag filters are case-insensitive.\n",
+          "example": "important",
+          "type": "string"
+        },
+        "tag.exact": {
+          "description": "A tag and value, of the form `<tag-name>:<tag-value>`. The API will only return DNS records that have a tag named `<tag-name>` whose value is `<tag-value>`. Tag filters are case-insensitive.\n",
+          "example": "greeting:Hello, world",
+          "type": "string"
+        },
+        "tag.contains": {
+          "description": "A tag and value, of the form `<tag-name>:<tag-value>`. The API will only return DNS records that have a tag named `<tag-name>` whose value contains `<tag-value>`. Tag filters are case-insensitive.\n",
+          "example": "greeting:ello, worl",
+          "type": "string"
+        },
+        "tag.startswith": {
+          "description": "A tag and value, of the form `<tag-name>:<tag-value>`. The API will only return DNS records that have a tag named `<tag-name>` whose value starts with `<tag-value>`. Tag filters are case-insensitive.\n",
+          "example": "greeting:Hello, w",
+          "type": "string"
+        },
+        "tag.endswith": {
+          "description": "A tag and value, of the form `<tag-name>:<tag-value>`. The API will only return DNS records that have a tag named `<tag-name>` whose value ends with `<tag-value>`. Tag filters are case-insensitive.\n",
+          "example": "greeting:o, world",
+          "type": "string"
+        },
+        "search": {
+          "description": "Allows searching in multiple properties of a DNS record simultaneously. This parameter is intended for human users, not automation. Its exact behavior is intentionally left unspecified and is subject to change in the future. This parameter works independently of the `match` setting. For automated searches, please use the other available parameters.\n",
+          "example": "www.cloudflare.com",
+          "type": "string"
+        },
+        "tag_match": {
+          "default": "all",
+          "description": "Whether to match all tag search requirements or at least one (any). If set to `all`, acts like a logical AND between tag filters. If set to `any`, acts like a logical OR instead. Note that the regular `match` parameter is still used to combine the resulting condition with other filters that aren't related to tags.\n",
+          "enum": ["any", "all"],
+          "example": "any",
+          "type": "string"
+        },
+        "page": {
+          "default": 1,
+          "description": "Page number of paginated results.",
+          "minimum": 1,
+          "type": "number"
+        },
+        "per_page": {
+          "default": 100,
+          "description": "Number of DNS records per page.",
+          "example": 5,
+          "maximum": "5e+06",
+          "minimum": 1,
+          "type": "number"
+        },
+        "order": {
+          "default": "type",
+          "description": "Field to order DNS records by.",
+          "enum": ["type", "name", "content", "ttl", "proxied"],
+          "type": "string"
+        },
+        "direction": {
+          "default": "asc",
+          "description": "Direction to order DNS records in.",
+          "enum": ["asc", "desc"],
+          "type": "string"
+        }
+      },
+      "required": ["zone_id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "vercel__write_session_file",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "'x-Cwd'": {
+          "type": "string",
+          "description": "The target directory where the tarball contents will be extracted. If not specified, files are extracted to the sandbox home directory.",
+          "example": "/home/vercel-sandbox"
+        },
+        "sessionId": {
+          "type": "string",
+          "description": "The unique identifier of the session to write files to.",
+          "example": "sbx_abc123"
+        },
+        "teamId": {
+          "type": "string",
+          "example": "team_1a2b3c4d5e6f7g8h9i0j1k2l",
+          "description": "The Team identifier to perform the request on behalf of."
+        },
+        "slug": {
+          "type": "string",
+          "example": "my-team-url-slug",
+          "description": "The Team slug to perform the request on behalf of."
+        }
+      },
+      "required": ["sessionId"],
+      "additionalProperties": false
+    }
+  }
+]

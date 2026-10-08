@@ -42,6 +42,7 @@ pub mod registry_controller;
 pub mod remote;
 pub mod router;
 pub mod savings;
+pub(crate) mod schema_compat;
 pub mod searchtrace;
 pub mod secrets;
 pub mod semantic;

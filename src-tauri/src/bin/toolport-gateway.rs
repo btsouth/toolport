@@ -9683,14 +9683,20 @@ fn tool_cache_path(profile: Option<&str>) -> Option<PathBuf> {
 const TOOL_CACHE_VERSION: u64 = 2;
 
 fn load_tool_cache(profile: Option<&str>) -> Vec<Value> {
-    tool_cache_path(profile)
+    let mut tools = tool_cache_path(profile)
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         // Only honor a cache written by this catalog version; a bare-array (pre-version)
         // or older-version file has no matching tag and is dropped, forcing a rebuild.
         .filter(|v| v.get("version").and_then(Value::as_u64) == Some(TOOL_CACHE_VERSION))
         .and_then(|v| v.get("tools").and_then(Value::as_array).cloned())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    for tool in &mut tools {
+        if let Some(schema) = tool.get_mut("inputSchema") {
+            conduit_lib::router::normalize_tool_schema(schema);
+        }
+    }
+    tools
 }
 
 fn server_catalog_path(profile: Option<&str>) -> Option<PathBuf> {
@@ -37000,6 +37006,194 @@ mod tests {
             assert_eq!(indexed.low_confidence, rebuilt.low_confidence);
             assert_eq!(indexed.broadened, rebuilt.broadened);
             assert_eq!(indexed.direct_returned, rebuilt.direct_returned);
+        }
+    }
+
+    #[test]
+    fn schema_compat_snapshot_does_not_normalize_again() {
+        // Only ingress upgrades schemas; a snapshot must preserve its input.
+        let tools = vec![json!({"name": "echo", "inputSchema": {
+            "properties": {"a b": {"minimum": "3"}}
+        }})];
+        assert_eq!(CatalogSnapshot::new(tools.clone()).tools, tools);
+    }
+
+    #[test]
+    #[ignore = "release snapshot benchmark"]
+    fn schema_compat_snapshot_build_10k() {
+        let fixture: Vec<Value> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/schema-compat-public.json"
+        ))
+        .unwrap();
+        let tools: Vec<Value> = (0..10_000)
+            .map(|i| {
+                let mut tool = fixture[i % fixture.len()].clone();
+                conduit_lib::router::normalize_tool_schema(&mut tool["inputSchema"]);
+                tool["name"] = json!(format!("tool_{i:05}"));
+                tool
+            })
+            .collect();
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let input = tools.clone();
+            let start = std::time::Instant::now();
+            let snapshot = CatalogSnapshot::new(input);
+            samples.push(start.elapsed().as_micros());
+            assert_eq!(snapshot.tools.len(), 10_000);
+            std::hint::black_box(snapshot);
+        }
+        samples.sort();
+        println!(
+            "snapshot 10000 tools release median_us={} samples_us={samples:?}",
+            samples[2]
+        );
+    }
+
+    #[test]
+    fn schema_compat_catalog_cache_normalizes_legacy_snapshots_once() {
+        let _data = DataDirTestEnv::new("schema_compat_cache");
+        let tools: Vec<Value> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/schema-compat-public.json"
+        ))
+        .unwrap();
+        save_tool_cache(&tools, None);
+        let snapshot = Arc::new(CatalogSnapshot::new(load_tool_cache(None)));
+        let bytes = serde_json::to_vec(&snapshot.tools).unwrap();
+        assert_eq!(
+            snapshot.tools[0]["inputSchema"]["properties"]["body"]["properties"]
+                ["seconds_until_expiration"]["exclusiveMinimum"],
+            0
+        );
+        assert!(snapshot.tools[2]["inputSchema"]["properties"]
+            .get("x-Cwd")
+            .is_some());
+        let shared = Arc::new(Mutex::new(Arc::clone(&snapshot)));
+        for _ in 0..3 {
+            let read = shared.lock().unwrap().clone();
+            assert!(Arc::ptr_eq(&snapshot, &read));
+            assert!(read.search.matches_catalog(&read.tools));
+            let found = search_catalog_indexed(
+                &read.tools,
+                "write_session_file",
+                None,
+                1,
+                None,
+                Some(&read.search),
+            );
+            assert_eq!(
+                found.matches[0]["inputSchema"],
+                read.tools[2]["inputSchema"]
+            );
+            assert_eq!(serde_json::to_vec(&read.tools).unwrap(), bytes);
+        }
+    }
+
+    struct SchemaCompatRoute {
+        calls: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl downstream::Transport for SchemaCompatRoute {
+        fn request(
+            &mut self,
+            method: &str,
+            params: Value,
+        ) -> Result<Value, downstream::TransportError> {
+            match method {
+                "initialize" => Ok(json!({"protocolVersion": "2025-06-18"})),
+                "tools/list" => Ok(json!({"tools": [{"name": "echo", "inputSchema": {
+                    "type": "object", "properties": {"'x-Cwd'": {"type": "string"}}, "required": ["'x-Cwd'"]
+                }}]})),
+                "tools/call" => {
+                    self.calls.lock().unwrap().push(params.clone());
+                    Ok(
+                        json!({"content": [{"type": "text", "text": "ok"}], "structuredContent": params["arguments"]}),
+                    )
+                }
+                other => Err(downstream::TransportError::Fatal(format!(
+                    "unexpected {other}"
+                ))),
+            }
+        }
+        fn notify(&mut self, _: &str, _: Value) -> Result<(), downstream::TransportError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn schema_compat_round_trip_direct_meta_script_and_resumed_calls() {
+        let _data = DataDirTestEnv::new("schema_compat_round_trip");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let server = DownstreamServer::connect(
+            "s".to_string(),
+            Box::new(SchemaCompatRoute {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .unwrap();
+        let mut router = Router::new();
+        router.add(server);
+        let router = Arc::new(router);
+        let catalog = CatalogSnapshot::new(router.aggregated_tools());
+        let host = dispatch_host(true);
+        let reg = Registry::default();
+        let guard = SearchGuard::default();
+        let request = |name: &str, arguments: Value| json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}});
+        for req in [
+            request("s__echo", json!({"x-Cwd": "/direct"})),
+            request(
+                "toolport_call_tool",
+                json!({"name": "s__echo", "arguments": {"x-Cwd": "/meta"}}),
+            ),
+        ] {
+            let result = handle_request(
+                &host,
+                &req,
+                &reg,
+                &router,
+                &catalog.tools,
+                true,
+                None,
+                &guard,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_ne!(result["result"]["isError"], true, "{result}");
+        }
+        let script = json!({"script": "return toolport.call('s__echo', {'x-Cwd': '/script'});"});
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &catalog.tools,
+            None,
+            None,
+            None,
+            None,
+            &script,
+            None,
+        );
+        assert_eq!(
+            result["structuredContent"]["toolportScript"]["ok"], true,
+            "{result}"
+        );
+        // MRTR/task continuation dispatches the tool through this same boundary.
+        let retry = MrtrRequest::from_params(Some(
+            &json!({"requestState": "resume-fixture", "inputResponses": []}),
+        ));
+        router
+            .route_call_with_cancel_and_mrtr(
+                "s__echo",
+                json!({"x-Cwd": "/resume"}),
+                None,
+                None,
+                Some(&retry),
+            )
+            .unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        for (call, expected) in calls.iter().zip(["/direct", "/meta", "/script", "/resume"]) {
+            assert_eq!(call["name"], "echo");
+            assert_eq!(call["arguments"], json!({"'x-Cwd'": expected}));
         }
     }
 
