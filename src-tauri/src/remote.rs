@@ -1526,10 +1526,12 @@ fn safe_imported_error(server: &ServerEntry, error: String) -> String {
 }
 
 fn has_imported_credentials(server: &ServerEntry) -> bool {
-    server
-        .env
-        .iter()
-        .any(|e| matches!(e.key.as_str(), secrets::IMPORTED_URL_KEY | secrets::HTTP_AUTH_KEY))
+    server.env.iter().any(|e| {
+        matches!(
+            e.key.as_str(),
+            secrets::IMPORTED_URL_KEY | secrets::HTTP_AUTH_KEY
+        )
+    })
 }
 
 fn connect_remote_inner(
@@ -1710,10 +1712,18 @@ mod tests {
                 secret: true,
                 unknown_fields: Default::default(),
             });
-            secrets::set_secret(&server.id, secrets::HTTP_AUTH_KEY, "synthetic-imported-pat").unwrap();
+            secrets::set_secret(&server.id, secrets::HTTP_AUTH_KEY, "synthetic-imported-pat")
+                .unwrap();
             let worker = std::thread::spawn(move || {
-                listener.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()
-                    .respond(tiny_http::Response::from_string("synthetic-imported-pat").with_status_code(500)).unwrap();
+                listener
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .respond(
+                        tiny_http::Response::from_string("synthetic-imported-pat")
+                            .with_status_code(500),
+                    )
+                    .unwrap();
             });
             let error = connect_remote(&server).err().unwrap();
             worker.join().unwrap();

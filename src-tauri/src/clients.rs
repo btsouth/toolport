@@ -92,8 +92,14 @@ pub struct DetectedClient {
     pub error: Option<String>,
 }
 
-fn serialize_config_error<S: serde::Serializer>(error: &Option<String>, serializer: S) -> Result<S::Ok, S::Error> {
-    error.as_ref().map(|_| "Could not read this client config. Check its syntax and file permissions.").serialize(serializer)
+fn serialize_config_error<S: serde::Serializer>(
+    error: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    error
+        .as_ref()
+        .map(|_| "Could not read this client config. Check its syntax and file permissions.")
+        .serialize(serializer)
 }
 
 /// How a given client stores its server list.

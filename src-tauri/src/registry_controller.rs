@@ -513,7 +513,10 @@ pub fn import_client_servers(selected: Vec<String>) -> Result<(Registry, usize),
             .as_deref()
             .and_then(|s| s.strip_prefix("imported:"))
             .ok_or("Missing import source")?;
-        let client = detected.iter().find(|c| c.id == client_id).ok_or("Missing import client")?;
+        let client = detected
+            .iter()
+            .find(|c| c.id == client_id)
+            .ok_or("Missing import client")?;
         let definition = clients::import_definition(client, &entry.name)?;
         prepared.push(crate::import_credentials::Import::prepare(
             entry,
