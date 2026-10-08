@@ -271,7 +271,14 @@ mod tests {
 
     #[test]
     fn deleted_image_remains_identifiable() {
-        let temp = std::env::temp_dir().join(format!("toolport-shell-{}", uuid::Uuid::new_v4()));
+        let temp = std::env::temp_dir().join(format!(
+            "toolport-shell-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir(&temp).unwrap();
         let path = temp.join("shell");
         std::fs::write(&path, b"old").unwrap();
