@@ -2792,7 +2792,16 @@ mod tests {
 
     #[test]
     fn stale_daemon_classification_covers_versions_replacement_and_scope() {
-        let data = Path::new("/data/toolport");
+        let data = if cfg!(windows) {
+            Path::new(r"C:\Data\Toolport")
+        } else {
+            Path::new("/data/toolport")
+        };
+        let other = if cfg!(windows) {
+            Path::new(r"C:\Other\Toolport")
+        } else {
+            Path::new("/other/toolport")
+        };
         let current =
             crate::topology::CompatKey::new("2.0.0-preview.2", data.display().to_string());
         let mut daemon = proc(
@@ -2833,7 +2842,7 @@ mod tests {
             (Some(true), Some(data), false, true),
             (Some(false), Some(data), true, false),
             (None, Some(data), true, false),
-            (Some(true), Some(Path::new("/other/toolport")), true, false),
+            (Some(true), Some(other), true, false),
             (Some(true), None, false, false),
             (Some(true), None, true, true),
         ] {
