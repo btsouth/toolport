@@ -317,7 +317,7 @@ fn reviewed_setup_waits_for_slow_first_catalog() {
     std::fs::write(
         fixture.config(),
         json!({"mcpServers":{"slow":{
-            "command":mock,"env":{"MOCK_MCP_START_DELAY_MS":"3000"}
+            "command":mock,"args":["--start-delay-ms=3000"]
         }}})
         .to_string(),
     )
