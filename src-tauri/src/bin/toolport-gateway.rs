@@ -33165,6 +33165,36 @@ mod tests {
     }
 
     #[test]
+    fn p08_other_owner_traffic_never_reaps_active_or_retained_calls() {
+        let state = http_state(false);
+        let owner = test_caller("client:p08-aged", None).session_owner;
+        let connection = downstream::CancelRegistry::new();
+        let registry = {
+            let _scope = p08_connection_scope(connection.clone());
+            http_call_cancellations(&state, None, Some(&owner))
+        };
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let mut hooks = Vec::new();
+        for key in ["active", "retained"] {
+            assert!(registry.begin_client_request(key.into()));
+            let seen = cancelled.clone();
+            hooks.push(registry.context(key.into()).on_cancel(Arc::new(move |_| { seen.fetch_add(1, Ordering::SeqCst); })));
+        }
+        registry.finish_client_request("retained");
+        for id in 0..100 {
+            let _scope = p08_connection_scope(downstream::CancelRegistry::new());
+            let other = test_caller(&format!("client:other-{id}"), None);
+            http_call_cancellations(&state, None, Some(&other.session_owner));
+        }
+        assert_eq!(cancelled.load(Ordering::SeqCst), 0);
+        assert!(!registry.is_cancelled("active"));
+        assert!(!registry.is_cancelled("retained"));
+        connection.close();
+        assert_eq!(cancelled.load(Ordering::SeqCst), 2);
+        drop(hooks);
+    }
+
+    #[test]
     fn p08_live_adapter_lifetime_survives_session_ttl_and_initialize() {
         let state = http_state(false);
         let owner = test_caller("adapter:p08-long-lived", None).session_owner;
