@@ -693,13 +693,15 @@ describe("telemetry health", () => {
 
 it("uses one server option for hyphenated call and approval identities", async () => {
   getAuditLog.mockResolvedValue([
-    entry({
-      server: "team_slack",
-      serverId: "team-slack",
+    {
+      ...entry({
+        server: "team_slack",
+        serverId: "team-slack",
+        clientName: "Claude Code",
+      }),
       kind: "approval",
       decision: "denied",
-      clientName: "Claude Code",
-    }),
+    },
     entry({ server: "team_slack", serverId: "team-slack", clientName: "Claude Code" }),
   ]);
   render(<ActivityView refreshKey={0} registry={null} />);
