@@ -706,10 +706,6 @@ it("uses one server option for hyphenated call and approval identities", async (
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   await user.click(await screen.findByRole("button", { name: /recent calls/i }));
   await user.click(screen.getByRole("combobox"));
-  expect(screen.getAllByRole("option", { name: "team_slack", exact: true })).toHaveLength(
-    1,
-  );
-  expect(
-    screen.queryByRole("option", { name: "team-slack", exact: true }),
-  ).not.toBeInTheDocument();
+  expect(screen.getAllByRole("option", { name: /^team_slack$/ })).toHaveLength(1);
+  expect(screen.queryByRole("option", { name: /^team-slack$/ })).not.toBeInTheDocument();
 });

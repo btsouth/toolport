@@ -68,6 +68,8 @@ export interface MigrateResult {
 export interface AuditEntry {
   ts: number;
   server: string;
+  /** Canonical routed ID, separate from the Activity display prefix. */
+  serverId?: string;
   tool: string;
   ok: boolean;
   /** How long the call took, ms. Absent for records logged before timing. */
