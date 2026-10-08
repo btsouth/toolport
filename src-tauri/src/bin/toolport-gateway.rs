@@ -34467,6 +34467,7 @@ mod tests {
         .unwrap();
         let (parked_tx, parked_rx) = std::sync::mpsc::channel();
         let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let (late_allow_tx, late_allow_rx) = std::sync::mpsc::channel();
         let broker = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
@@ -34482,6 +34483,10 @@ mod tests {
                 "withdrawal must close the broker socket"
             );
             closed_tx.send(()).unwrap();
+            // EOF confirms socket shutdown, but Windows can still deliver a reply
+            // to its concurrent reader. Wait for the cancelled call to finish so
+            // this answer is unambiguously late, not a received human decision.
+            late_allow_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             let _ = stream.write_all(b"\"approved\"\n");
         });
         let serving = state.clone();
@@ -34511,6 +34516,7 @@ mod tests {
         let out = call.join().unwrap();
         assert!(out.body.contains("isError"), "{}", out.body);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        late_allow_tx.send(()).unwrap();
         let other = handle_http(
             &state,
             &SearchGuard::default(),
