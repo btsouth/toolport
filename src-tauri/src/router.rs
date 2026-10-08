@@ -4084,13 +4084,18 @@ mod tests {
     #[test]
     fn schema_compat_maps_survive_guarded_restoration_and_reindexing() {
         let mut server = mock_server("s");
-        server.tools = vec![json!({"name": "echo", "inputSchema": {"properties": {"'x-Cwd'": {"type": "string"}}}})];
+        server.tools = vec![
+            json!({"name": "echo", "inputSchema": {"properties": {"'x-Cwd'": {"type": "string"}}}}),
+        ];
         let raw = server.tools.clone();
         let mut previous = Router::new();
         previous.add(server);
         let plan = Arc::clone(&previous.schema_arguments["s__echo"]);
         for _ in 0..3 {
-            assert_eq!(previous.aggregated_tools()[0]["inputSchema"]["properties"]["x-Cwd"], json!({"type": "string"}));
+            assert_eq!(
+                previous.aggregated_tools()[0]["inputSchema"]["properties"]["x-Cwd"],
+                json!({"type": "string"})
+            );
             assert!(Arc::ptr_eq(&plan, &previous.schema_arguments["s__echo"]));
         }
         assert_eq!(previous.raw_catalogs().unwrap()["s"], raw);

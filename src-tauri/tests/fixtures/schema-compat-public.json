@@ -34,9 +34,7 @@
           "description": "JSON request body."
         }
       },
-      "required": [
-        "body"
-      ],
+      "required": ["body"],
       "additionalProperties": false
     }
   },
@@ -141,10 +139,7 @@
         "match": {
           "default": "all",
           "description": "Whether to match all search requirements or at least one (any). If set to `all`, acts like a logical AND between filters. If set to `any`, acts like a logical OR instead. Note that the interaction between tag filters is controlled by the `tag-match` parameter instead.\n",
-          "enum": [
-            "any",
-            "all"
-          ],
+          "enum": ["any", "all"],
           "example": "any",
           "type": "string"
         },
@@ -224,10 +219,7 @@
         "tag_match": {
           "default": "all",
           "description": "Whether to match all tag search requirements or at least one (any). If set to `all`, acts like a logical AND between tag filters. If set to `any`, acts like a logical OR instead. Note that the regular `match` parameter is still used to combine the resulting condition with other filters that aren't related to tags.\n",
-          "enum": [
-            "any",
-            "all"
-          ],
+          "enum": ["any", "all"],
           "example": "any",
           "type": "string"
         },
@@ -248,28 +240,17 @@
         "order": {
           "default": "type",
           "description": "Field to order DNS records by.",
-          "enum": [
-            "type",
-            "name",
-            "content",
-            "ttl",
-            "proxied"
-          ],
+          "enum": ["type", "name", "content", "ttl", "proxied"],
           "type": "string"
         },
         "direction": {
           "default": "asc",
           "description": "Direction to order DNS records in.",
-          "enum": [
-            "asc",
-            "desc"
-          ],
+          "enum": ["asc", "desc"],
           "type": "string"
         }
       },
-      "required": [
-        "zone_id"
-      ],
+      "required": ["zone_id"],
       "additionalProperties": false
     }
   },
@@ -299,9 +280,7 @@
           "description": "The Team slug to perform the request on behalf of."
         }
       },
-      "required": [
-        "sessionId"
-      ],
+      "required": ["sessionId"],
       "additionalProperties": false
     }
   }
