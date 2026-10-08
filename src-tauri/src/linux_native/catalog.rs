@@ -1150,8 +1150,11 @@ mod tests {
             let frames = Rc::new(Cell::new(0));
             let observed_frames = frames.clone();
             let finished = main_loop.clone();
+            let drawn_page = page.clone();
             window.add_tick_callback(move |_, _| {
-                if !ready.get() {
+                if !ready.get()
+                    || (state == "outage" && !drawn_page.suggestion_popover.is_visible())
+                {
                     return gtk::glib::ControlFlow::Continue;
                 }
                 frames.set(frames.get() + 1);
@@ -1168,10 +1171,9 @@ mod tests {
                     deadline.quit()
                 });
             main_loop.run();
-            assert!(
-                observed_frames.get() >= 2,
-                "GTK did not produce the fixture frames within five seconds"
-            );
+            assert!(observed_frames.get() >= 2,
+                "GTK fixture {state} did not draw within five seconds: query={}, status={:?}, labels={:?}",
+                page.search.text(), page.suggestion_state.borrow().registry_status, labels(&page.suggestion_list));
             timer.remove();
             assert!(page.root.width() > 0);
             if state == "outage" {
