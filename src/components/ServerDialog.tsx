@@ -13,15 +13,24 @@ import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
 import {
   addServer,
+  addSnippetServers,
+  setServerEnabled,
   parseServerSnippet,
   setSecret,
   setLaunchSecret,
   testServer,
   updateServer,
 } from "@/lib/api";
+import { ImportReviewDialog } from "@/components/ImportReviewDialog";
 import { formatArgs, parseArgs } from "@/lib/args";
 import { isDownloadLauncher } from "@/lib/launcher";
-import type { LaunchConfig, Registry, ServerEntry, Transport } from "@/lib/types";
+import type {
+  LaunchConfig,
+  Registry,
+  ServerEntry,
+  Transport,
+  ParsedSnippetServer,
+} from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -110,6 +119,8 @@ export function ServerDialog({
   );
   const [bindingCleared, setBindingCleared] = useState(false);
   const [touched, setTouched] = useState<Set<string>>(() => new Set());
+  const [pasteReview, setPasteReview] = useState<ParsedSnippetServer[] | null>(null);
+  const [reviewText, setReviewText] = useState("");
   const [busy, setBusy] = useState(false);
   const [test, setTest] = useState<TestState>(IDLE_TEST);
   const testRequestId = useRef(0);
@@ -211,6 +222,11 @@ export function ServerDialog({
         toast.error("No servers found in the pasted config");
         return;
       }
+      if (servers.length > 1) {
+        setPasteReview(servers);
+        setReviewText(pasteText);
+        return;
+      }
       const s = servers[0];
       setForm({
         name: s.name || "",
@@ -231,13 +247,7 @@ export function ServerDialog({
       setLaunchValues({});
       setBindingCleared(false);
       clearTest();
-      if (servers.length > 1) {
-        toast.info(
-          `Found ${servers.length} servers, filled "${s.name}". Add the rest separately.`,
-        );
-      } else {
-        toast.success(`Parsed "${s.name}" from config`);
-      }
+      toast.success(`Parsed "${s.name}" from config`);
       setShowPaste(false);
       setPasteText("");
     } catch (e) {
@@ -401,6 +411,13 @@ export function ServerDialog({
         );
         return;
       }
+      if (!wasEditing && id && declared.every((r) => r.value.trim()))
+        result = await setServerEnabled(
+          result.defaultAccessContextId ?? result.activeProfileId ?? "",
+          id,
+          true,
+        );
+      onSaved(result);
       toast.success(wasEditing ? `Saved ${entry.name}` : `Added ${entry.name}`);
       onOpenChange(false);
     } catch (e) {
@@ -409,6 +426,39 @@ export function ServerDialog({
       setBusy(false);
     }
   }
+
+  if (pasteReview)
+    return (
+      <ImportReviewDialog
+        open
+        items={pasteReview.map((s, i) => ({
+          ...s,
+          key: String(i),
+          envKeys: s.env.map((e) => e.key),
+          isNew: true,
+        }))}
+        busy={busy}
+        title="Review pasted servers"
+        confirmLabel="Add selected servers"
+        onOpenChange={(open) => {
+          if (!open && !busy) setPasteReview(null);
+        }}
+        onConfirm={async (keys) => {
+          setBusy(true);
+          try {
+            const next = await addSnippetServers(reviewText, keys);
+            onSaved(next);
+            setPasteReview(null);
+            setReviewText("");
+            onOpenChange(false);
+          } catch (e) {
+            toastError(String(e));
+          } finally {
+            setBusy(false);
+          }
+        }}
+      />
+    );
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

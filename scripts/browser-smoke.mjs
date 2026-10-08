@@ -238,6 +238,81 @@ try {
   }
   await expect(page.getByText("Claude Code 2.1 · 2m ago · waited 1m 30s")).toBeVisible();
   await page.screenshot({ path: path.join(output, "approval-activity.png") });
+  await page.setViewportSize({ width: 1240, height: 900 });
+  for (const failure of ["", "launch", "credential"]) {
+    await page.goto(
+      `${baseURL}/fixtures/?setup=1${failure ? `&setup-failure=${failure}` : ""}`,
+    );
+    await page.getByRole("button", { name: "Clients", exact: true }).click();
+    await page.getByRole("button", { name: /Codex/ }).click();
+    await page.getByRole("button", { name: "Connect to Toolport", exact: true }).click();
+    await expect(
+      page.getByRole("heading", { name: "Review and connect Codex" }),
+    ).toBeVisible();
+    await expect(page.getByText(/Backup saved to/)).toBeVisible();
+    await page.screenshot({ path: path.join(output, "setup-client-review.png") });
+    await page.getByRole("button", { name: "Connect to Toolport", exact: true }).click();
+    if (failure) {
+      await expect(
+        page.getByRole("alert").filter({ hasText: "Client config unchanged" }),
+      ).toBeVisible();
+      await expect(page.getByRole("heading", { name: "Connected to Codex" })).toHaveCount(
+        0,
+      );
+    } else {
+      await expect(page.getByText("notes__read", { exact: true })).toHaveCount(1);
+      await expect(page.getByText("Gateway tools your agent will see:")).toBeVisible();
+    }
+    await page.screenshot({
+      path: path.join(output, `setup-${failure || "gateway-result"}.png`),
+    });
+    expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
+  }
+  await page.goto(`${baseURL}/fixtures/?setup=1`);
+  await page.getByRole("button", { name: "Add server", exact: true }).click();
+  await page.getByLabel("Name", { exact: true }).fill("Manual notes");
+  await page.getByLabel("Command", { exact: true }).fill("fixture-manual");
+  await page.getByRole("button", { name: "Add server", exact: true }).last().click();
+  await expect(
+    page.getByRole("switch", { name: "Toggle Manual notes", exact: true }),
+  ).toBeChecked();
+  await page.screenshot({ path: path.join(output, "setup-manual-add.png") });
+  await page.getByRole("button", { name: "Add server", exact: true }).click();
+  await page.getByRole("button", { name: "Paste from client config" }).click();
+  await page
+    .locator("textarea")
+    .fill(
+      JSON.stringify({
+        mcpServers: {
+          Alpha: { command: "fixture-alpha" },
+          Beta: { command: "fixture-beta", env: { PAT: "synthetic-secret" } },
+        },
+      }),
+    );
+  await page.getByRole("button", { name: "Parse & fill" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Review pasted servers" }),
+  ).toBeVisible();
+  await expect(page.getByText("synthetic-secret", { exact: true })).toHaveCount(0);
+  await page.screenshot({ path: path.join(output, "setup-multi-paste-review.png") });
+  await page.getByRole("button", { name: "Add selected servers" }).click();
+  await expect(page.getByText("Alpha", { exact: true })).toBeVisible();
+  await expect(page.getByText("Beta", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Catalog", exact: true }).click();
+  await expect(page.getByText("NoteKit", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Add Collection", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Review Local notes" })).toBeVisible();
+  await expect(page.getByText(/Credentials: PAT/)).toBeVisible();
+  await page.screenshot({ path: path.join(output, "setup-collection-review.png") });
+  await page.getByRole("button", { name: "Add selected servers" }).click();
+  await page.getByRole("button", { name: "Servers", exact: true }).click();
+  await expect(
+    page.getByRole("switch", { name: "Toggle NoteKit", exact: true }),
+  ).toBeChecked();
+  await expect(
+    page.getByRole("switch", { name: "Toggle Calendar", exact: true }),
+  ).not.toBeChecked();
+  await page.screenshot({ path: path.join(output, "setup-collection-added.png") });
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   await page.goto(`${baseURL}/fixtures/?logos`);
   await expect(page.getByText("Dark logo fixture")).toBeVisible();

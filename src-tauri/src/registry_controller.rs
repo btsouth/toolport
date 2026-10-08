@@ -595,14 +595,18 @@ pub fn add_snippet_server(
     fields: ServerFields,
     env: Vec<(String, Option<String>)>,
 ) -> Result<SnippetAddOutcome, String> {
-    let (registry, id) = registry::update(|registry| apply_add_server(registry, fields))?;
+    let (registry, id) = registry::update(|registry| {
+        let id = apply_add_server(registry, fields)?;
+        if !env.is_empty() { registry.set_global_server_enabled(&id, false)?; }
+        Ok(id)
+    })?;
     let mut outcome = SnippetAddOutcome {
         registry,
         declared_without_value: Vec::new(),
         failed: Vec::new(),
     };
     for (key, value) in env {
-        match value.as_deref().filter(|value| !value.is_empty()) {
+        match value.as_deref().filter(|value| !value.trim().is_empty() && !value.starts_with("${") && !value.starts_with("<") && !value.starts_with("YOUR_") && !value.starts_with("REPLACE_")) {
             Some(value) => match set_server_secret(&id, &key, value) {
                 Ok(registry) => outcome.registry = registry,
                 Err(_) => outcome.failed.push(key),
@@ -620,6 +624,29 @@ pub fn add_snippet_server(
                 Err(_) => outcome.failed.push(key),
             },
         }
+    }
+    if outcome.failed.is_empty() && outcome.declared_without_value.is_empty() {
+        let (registry, ()) = registry::update(|registry| {
+            let profile = registry.default_access_id();
+            apply_server_enabled(registry, &profile, &id, true, false)?;
+            if registry.access_profile(&profile).is_some() { registry.set_access_server(&profile, &id, true)?; }
+            Ok(())
+        })?;
+        outcome.registry = registry;
+    }
+    Ok(outcome)
+}
+
+/// Shared by both shells. Selection is by index in the exact pasted document;
+/// values never go through the registry or a log.
+pub fn add_snippet_servers(text: &str, selected: &[String]) -> Result<SnippetAddOutcome, String> {
+    let parsed = clients::parse_snippet(text).map_err(|_| "Could not parse the pasted config")?;
+    let mut outcome = SnippetAddOutcome { registry: read_registry_exact_or_default()?, declared_without_value: Vec::new(), failed: Vec::new() };
+    for (i, server) in parsed.into_iter().enumerate() {
+        if !selected.contains(&i.to_string()) { continue; }
+        if outcome.registry.servers.iter().any(|s| s.name.eq_ignore_ascii_case(&server.name)) { continue; }
+        let added = add_snippet_server(ServerFields {name:server.name,transport:server.transport,command:server.command,args:server.args,url:server.url,cwd:None}, server.env.into_iter().map(|e| (e.key,e.value)).collect())?;
+        outcome.registry = added.registry; outcome.failed.extend(added.failed); outcome.declared_without_value.extend(added.declared_without_value);
     }
     Ok(outcome)
 }
@@ -3647,13 +3674,9 @@ mod tests {
         let original = r#"{ "mcpServers": {"native":{"command":"native"}}, "setting": 7 }"#;
         std::fs::write(fixture.claude(), original).unwrap();
         migrate_client("claude-code", None, false).unwrap();
-        disconnect_client_stdio_with("claude-code", false, |_| Err("registry full".into()))
-            .unwrap_err();
+        disconnect_client_stdio_with("claude-code", false, |_| Err("registry full".into())).unwrap_err();
         let result = disconnect_client("claude-code").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&result.outcome.path).unwrap(),
-            original
-        );
+        assert_eq!(std::fs::read_to_string(&result.outcome.path).unwrap(), original);
     }
 
     /// UX-03 for Codex: the moved TOML tables come back (nested env table too) into

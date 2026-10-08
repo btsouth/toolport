@@ -525,37 +525,9 @@ fn render_clients(list: &gtk::Box, feedback: &gtk::Label, snapshot: ClientSnapsh
             let list = list.clone();
             let feedback = feedback.clone();
             connect.connect_clicked(move |button| {
-                button.set_sensitive(false);
-                let button = button.clone();
-                let client_id = client_id.clone();
-                let list = list.clone();
-                let feedback = feedback.clone();
-                gtk::glib::spawn_future_local(async move {
-                    let result = gtk::gio::spawn_blocking(move || {
-                        crate::registry_controller::connect_client_stdio(&client_id, None, false)
-                    })
-                    .await;
-                    match result {
-                        Ok(Ok(_)) => {
-                            show_success(
-                                &feedback,
-                                "Client connected. Restart it if it was already open.",
-                            );
-                            load_clients(&list, &feedback);
-                        }
-                        Ok(Err(error)) => {
-                            button.set_sensitive(true);
-                            show_error(&feedback, &error);
-                        }
-                        Err(_) => {
-                            button.set_sensitive(true);
-                            show_error(
-                                &feedback,
-                                "the client connection task stopped unexpectedly",
-                            );
-                        }
-                    }
-                });
+                let Some(parent) = button.root().and_downcast::<gtk::Window>() else { return; };
+                let list = list.clone();let feedback = feedback.clone();
+                super::setup::connect(&parent, client_id.clone(), None, false, move || load_clients(&list, &feedback));
             });
             row.append(&connect);
         }

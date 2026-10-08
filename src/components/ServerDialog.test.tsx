@@ -5,6 +5,8 @@ import type { ProbeResult, Registry, ServerEntry } from "@/lib/types";
 
 const api = vi.hoisted(() => ({
   addServer: vi.fn(),
+  addSnippetServers: vi.fn(),
+  setServerEnabled: vi.fn(),
   parseServerSnippet: vi.fn(),
   setSecret: vi.fn(),
   setLaunchSecret: vi.fn(),
@@ -80,6 +82,7 @@ async function fillServer(user: ReturnType<typeof userEvent.setup>, command: str
 describe("ServerDialog", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    api.setServerEnabled.mockResolvedValue(savedRegistry("demo"));
   });
 
   it("waits for each field to blur before showing its validation error", async () => {

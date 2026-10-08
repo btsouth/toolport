@@ -120,12 +120,7 @@ pub fn run() {
     let bridge_for_open = bridge.clone();
     let notice_for_open = startup_notice.clone();
     app.connect_open(move |app, files, _hint| {
-        if files
-            .iter()
-            .any(|file| crate::teams::parse_pair_link(file.uri().as_str()).is_some())
-        {
-            let _ = onboarding::mark_complete();
-        }
+        if files.iter().any(|file| crate::teams::parse_pair_link(file.uri().as_str()).is_some()) { let _ = onboarding::mark_complete(); }
         build_window(
             app,
             theme::ThemeController::new(),
@@ -2562,50 +2557,9 @@ fn migrate_feedback(client_name: &str, imported: usize, moved: usize, backup: bo
     message
 }
 
-fn confirm_client_migrate(client: &state::ClientView, button: gtk::Button, page: ClientPage) {
-    let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else {
-        return;
-    };
-    let client = client.clone();
-    button.set_sensitive(false);
-    gtk::glib::spawn_future_local(async move {
-        let client_id = client.id.clone();
-        let preview = gtk::gio::spawn_blocking(move || {
-            crate::registry_controller::preview_client_setup(&client_id)
-        })
-        .await;
-        button.set_sensitive(true);
-        match preview {
-            Ok(Ok(review)) => {
-                let disclosure = format!("Config: {}\nBackup directory: {}\nSelected direct entries move after gateway verification. Unchecked entries and plugin servers stay in place.", review.config_path, review.backup_dir);
-                let revision = review.revision;
-                let id = client.id;
-                let scope = client.scope_id;
-                let force = client.gateway_state == state::ClientGatewayState::Customized;
-                let refresh = page.clone();
-                setup::review(
-                    &parent,
-                    "Review and connect",
-                    review.items,
-                    &disclosure,
-                    "Connect to Toolport",
-                    move |selected| {
-                        let outcome = crate::registry_controller::migrate_client_reviewed(
-                            &id,
-                            scope.as_deref(),
-                            force,
-                            &selected,
-                            &revision,
-                        )?;
-                        Ok(format!("Connected. Restart the client.\nConfig: {}\nBackup: {}\nGateway tools your agent will see:\n{}", outcome.result.outcome.path, outcome.result.outcome.backup.as_deref().unwrap_or("No previous config"), outcome.tools.iter().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>().join("\n")))
-                    },
-                    move || refresh.refresh(),
-                );
-            }
-            Ok(Err(error)) => page.show_error(&error),
-            Err(_) => page.show_error("Could not review client config."),
-        }
-    });
+fn confirm_client_migrate(client: &state::ClientView, _button: gtk::Button, page: ClientPage) {
+    let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else { return; };
+    setup::connect(&parent, client.id.clone(), client.scope_id.clone(), client.gateway_state == state::ClientGatewayState::Customized, move || page.refresh());
 }
 
 fn append_client_discovery_actions(
@@ -5909,8 +5863,7 @@ fn build_content(
     }
     page.append(&summary);
     let short = adw::Breakpoint::new(
-        adw::BreakpointCondition::parse("max-height: 450px")
-            .expect("static short-window condition"),
+        adw::BreakpointCondition::parse("max-height: 450px").expect("static short-window condition"),
     );
     short.add_setter(&intro, "visible", Some(&false.to_value()));
     short.add_setter(&description, "visible", Some(&false.to_value()));
@@ -6067,38 +6020,21 @@ fn build_content(
 
 fn open_shared_setup(url: &str, page: ServerPage) {
     if let Some((origin, team)) = crate::teams::parse_pair_link(url) {
-        if crate::registry::load()
-            .is_ok_and(|reg| crate::teams::pair_target_is_current(&reg, &origin, &team))
-        {
-            if let Some(action) = page.app.lookup_action("show-teams") {
-                action.activate(None);
-            }
-            if let Some(window) = page.app.active_window() {
-                window.present();
-            }
+        if crate::registry::load().is_ok_and(|reg| crate::teams::pair_target_is_current(&reg, &origin, &team)) {
+            if let Some(action) = page.app.lookup_action("show-teams") { action.activate(None); }
+            if let Some(window) = page.app.active_window() { window.present(); }
             return;
         }
-        for window in page.app.windows() {
-            if window.title().as_deref() == Some("Toolport setup") {
-                window.close();
-            }
-        }
-        let (parent_app, connected_app, feedback) =
-            (page.app.clone(), page.app.clone(), page.clone());
+        for window in page.app.windows() { if window.title().as_deref() == Some("Toolport setup") { window.close(); } }
+        let (parent_app, connected_app, feedback) = (page.app.clone(), page.app.clone(), page.clone());
         let hooks = pairing::PairingHooks {
             parent: Box::new(move || parent_app.active_window()),
             feedback: Box::new(move |message, error| feedback.show_feedback(message, error)),
             connected: Box::new(move || {
-                if let Some(action) = connected_app.lookup_action("show-teams") {
-                    action.activate(None);
-                }
-                if let Some(window) = connected_app.active_window() {
-                    window.present();
-                }
+                if let Some(action) = connected_app.lookup_action("show-teams") { action.activate(None); }
+                if let Some(window) = connected_app.active_window() { window.present(); }
             }),
-            open_url: Box::new(|url| {
-                let _ = crate::oauth::open_web_url(url);
-            }),
+            open_url: Box::new(|url| { let _ = crate::oauth::open_web_url(url); }),
         };
         let pair_origin = origin.clone();
         pairing::request(
@@ -8689,6 +8625,16 @@ fn open_server_editor_prefilled(
             feedback_for_fill.set_visible(true);
             match parsed {
                 Ok(servers) => {
+                    if servers.len() > 1 {
+                        let Some(parent) = fill.root().and_downcast::<gtk::Window>() else { return; };
+                        let items = servers.iter().enumerate().map(|(i, s)| crate::registry_controller::SetupItem {key:i.to_string(),name:s.name.clone(),transport:s.transport.clone(),command:s.command.clone(),args:s.args.clone(),url:s.url.clone(),env_keys:s.env.iter().map(|e| e.key.clone()).collect(),is_new:true}).collect();
+                        setup::review(&parent, "Review pasted servers", items, "Review each command and URL. Credentials go to the keychain. Missing inputs stay off.", "Add selected servers", move |selected| {
+                            let outcome = crate::registry_controller::add_snippet_servers(&text, &selected)?;
+                            if !outcome.failed.is_empty() { return Err("Could not save credentials. Open Credentials and retry.".into()); }
+                            Ok("Added selected servers. Check their status under Servers.".into())
+                        }, || {});
+                        return;
+                    }
                     let Some(first) = servers.first() else {
                         feedback_for_fill.set_label("No servers found in the pasted config.");
                         feedback_for_fill.remove_css_class("success");

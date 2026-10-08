@@ -197,6 +197,43 @@ const savingsSummary: SavingsSummary = {
   estimatedTokensAvoided: 41_100,
   estimateMethod: "utf8_bytes_div_4",
 };
+const setupFixture = new URLSearchParams(location.search).has("setup");
+const setupFailure = new URLSearchParams(location.search).get("setup-failure");
+let setupConnected = false;
+const setupCatalog = [
+  {
+    name: "NoteKit",
+    description: "Local note tools",
+    transport: "stdio",
+    command: "fixture-notes",
+    args: [],
+    envKeys: [],
+    url: null,
+    source: "curated",
+    homepage: null,
+    category: "Local tools",
+  },
+];
+const setupItems = ["Notes", "Calendar"].map((name) => ({
+  key: name,
+  name,
+  transport: "stdio",
+  command: `fixture-${name.toLowerCase()}`,
+  args: [],
+  url: null,
+  envKeys: name === "Calendar" ? ["PAT"] : [],
+  isNew: true,
+}));
+function fixtureAdd(entry: ServerEntry) {
+  const saved = {
+    ...entry,
+    id: `added-${registry.servers.length}`,
+    enabled: !(entry.env?.length || entry.launch?.inputs.length),
+  };
+  registry.servers.push(saved);
+  registry.profiles[0].enabledServerIds.push(saved.id);
+  return structuredClone(registry);
+}
 const calls: Record<string, number> = {};
 const missing: string[] = [];
 Object.assign(window, { toolportFixture: { calls, missing } });
@@ -213,6 +250,95 @@ mockIPC(
         : {};
     calls[command] = (calls[command] ?? 0) + 1;
     switch (command) {
+      case "preview_client_setup":
+        return {
+          configPath: "/fixture/codex.toml",
+          backupDir: "/fixture/Toolport/backups/codex",
+          revision: "fixture-review",
+          items: setupItems,
+        };
+      case "migrate_client":
+        if (setupFailure)
+          throw new Error(
+            setupFailure === "credential"
+              ? "Calendar needs credentials. Open Credentials and retry. Client config unchanged."
+              : "Notes could not start. Check its command and retry. Client config unchanged.",
+          );
+        setupConnected = true;
+        return {
+          registry: structuredClone(registry),
+          imported: 1,
+          moved: args.selected,
+          tools: [{ name: "notes__read" }],
+          outcome: {
+            path: "/fixture/codex.toml",
+            backup: "/fixture/Toolport/backups/codex/previous.toml",
+          },
+        };
+      case "popular_catalog":
+      case "search_catalog":
+        return setupCatalog;
+      case "list_stacks":
+        return [
+          {
+            id: "local-notes",
+            name: "Local notes",
+            description: "Notes and Calendar",
+            servers: [
+              ...setupCatalog,
+              { ...setupCatalog[0], name: "Calendar", envKeys: ["PAT"] },
+            ],
+          },
+        ];
+      case "add_server":
+        return fixtureAdd(args.entry as ServerEntry);
+      case "set_secret":
+      case "set_launch_secret":
+        return structuredClone(registry);
+      case "parse_server_snippet": {
+        const parsed = JSON.parse(String(args.text));
+        return Object.entries(parsed.mcpServers).map(([name, value]) => {
+          const s = value as {
+            command: string;
+            args?: string[];
+            env?: Record<string, string>;
+          };
+          return {
+            name,
+            transport: "stdio",
+            command: s.command,
+            args: s.args ?? [],
+            url: null,
+            env: Object.entries(s.env ?? {}).map(([key, value]) => ({ key, value })),
+          };
+        });
+      }
+      case "add_snippet_servers": {
+        const parsed = JSON.parse(String(args.text));
+        Object.entries(parsed.mcpServers).forEach(([name, value], i) => {
+          if (!(args.selected as string[]).includes(String(i))) return;
+          const s = value as {
+            command: string;
+            args?: string[];
+            env?: Record<string, string>;
+          };
+          fixtureAdd({
+            id: "",
+            name,
+            transport: "stdio",
+            command: s.command,
+            args: s.args ?? [],
+            env: Object.keys(s.env ?? {}).map((key) => ({
+              key,
+              value: null,
+              secret: true,
+            })),
+            url: null,
+            source: "manual",
+          });
+        });
+        return structuredClone(registry);
+      }
       case "team_instructions_status":
         return null;
       case "team_review": {
@@ -279,10 +405,10 @@ mockIPC(
             configPath: "/fixture/codex.toml",
             configExists: true,
             appPresent: true,
-            servers: [],
+            servers: setupFixture ? setupItems : [],
             pluginServers: [],
-            gatewayInstalled: true,
-            entryState: "managed",
+            gatewayInstalled: !setupFixture || setupConnected,
+            entryState: !setupFixture || setupConnected ? "managed" : "absent",
             discovery: {
               nativeToolSearch: true,
               toolsListChanged: null,

@@ -965,3 +965,7 @@ export function previewClientSetup(
 ): Promise<import("@/lib/types").ClientSetupReview> {
   return invoke("preview_client_setup", { clientId });
 }
+
+export function addSnippetServers(text: string, selected: string[]): Promise<Registry> {
+  return invoke("add_snippet_servers", { text, selected });
+}

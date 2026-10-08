@@ -14,6 +14,24 @@ vi.mock("@/lib/api", () => ({
   installGateway: (...a: unknown[]) => installGateway(...a),
   uninstallGateway: (...a: unknown[]) => uninstallGateway(...a),
   migrateClient: (...a: unknown[]) => migrateClient(...a),
+  previewClientSetup: vi
+    .fn()
+    .mockResolvedValue({
+      configPath: "/fixture/client.json",
+      backupDir: "/fixture/backups",
+      revision: "fixture-revision",
+      items: [
+        {
+          key: "calendar",
+          name: "calendar",
+          transport: "stdio",
+          command: "calendar-mcp",
+          args: [],
+          url: null,
+          isNew: true,
+        },
+      ],
+    }),
   setClientDiscovery: vi.fn(),
   addServer: vi.fn(),
 }));
@@ -221,7 +239,12 @@ describe("ClientDetail customized entry (SOU-406)", () => {
       { id: "p1", name: "Work", enabledServerIds: [] },
       { id: "p2", name: "Home", enabledServerIds: [] },
     ];
-    migrateClient.mockResolvedValue({ registry: reg, moved: ["calendar"] });
+    migrateClient.mockResolvedValue({
+      registry: reg,
+      moved: ["calendar"],
+      tools: [{ name: "calendar__read" }],
+      outcome: { path: "/fixture/client.json", backup: "/fixture/backups/previous.json" },
+    });
     render(
       <ClientDetail
         client={client({
@@ -244,71 +267,50 @@ describe("ClientDetail customized entry (SOU-406)", () => {
 
     await userEvent.click(screen.getByRole("combobox", { name: "Access" }));
     await userEvent.click(await screen.findByRole("option", { name: /^Home$/i }));
-    await userEvent.click(screen.getByRole("button", { name: /move into gateway/i }));
-    await userEvent.click(screen.getByRole("button", { name: /move 1 into toolport/i }));
+    await userEvent.click(screen.getByRole("button", { name: /connect to toolport/i }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: /connect to toolport/i }),
+    );
 
     await waitFor(() =>
-      expect(migrateClient).toHaveBeenCalledWith("claude-desktop", "p2", undefined),
+      expect(migrateClient).toHaveBeenCalledWith(
+        "claude-desktop",
+        "p2",
+        false,
+        ["calendar"],
+        "fixture-revision",
+      ),
     );
   });
 });
 
-describe("ClientDetail connect toast (SOU-317)", () => {
-  it("tells the user to restart the client after a successful Connect", async () => {
-    // Without this, the UI says "Connected" while Claude Desktop (and most peers)
-    // still has the old MCP config in memory and Toolport looks broken.
-    installGateway.mockResolvedValue({ backup: false });
+describe("ClientDetail reviewed connection", () => {
+  it("requires review and shows actual tools with restart and backup paths", async () => {
+    migrateClient.mockResolvedValue({
+      registry: emptyRegistry(),
+      imported: 1,
+      moved: ["calendar"],
+      tools: [{ name: "calendar__read" }],
+      outcome: { path: "/fixture/client.json", backup: "/fixture/backups/previous.json" },
+    });
     render(
       <ClientDetail
         client={client()}
         registry={emptyRegistry()}
-        onChanged={() => {}}
-        onRegistryChange={() => {}}
+        onChanged={vi.fn()}
+        onRegistryChange={vi.fn()}
       />,
     );
-
     await userEvent.click(screen.getByRole("button", { name: /connect to toolport/i }));
-
-    await waitFor(() =>
-      expect(installGateway).toHaveBeenCalledWith("claude-desktop", undefined, false),
+    expect(await screen.findByText(/Backup saved to/)).toHaveTextContent(
+      "/fixture/backups",
     );
-    expect(toastSuccess).toHaveBeenCalledWith(
-      "Connected Toolport to Claude Desktop",
-      expect.objectContaining({
-        description: "Restart Claude Desktop so it loads Toolport.",
-      }),
-    );
-  });
-
-  it("includes scope detail after the restart nudge when connecting with a profile", async () => {
-    installGateway.mockResolvedValue({ backup: false });
-    // Seed clientScopes so the component's profile state initializes to Work.
-    const reg = emptyRegistry();
-    reg.profiles = [{ id: "p1", name: "Work", enabledServerIds: [] }];
-    reg.clientScopes = { "claude-desktop": "Work" };
-
-    render(
-      <ClientDetail
-        client={client()}
-        registry={reg}
-        onChanged={() => {}}
-        onRegistryChange={() => {}}
-      />,
-    );
-
-    // Already connected would show Disconnect; for connect we need uninstalled.
-    // clientScopes still pre-fills the profile picker for a fresh connect.
+    expect(migrateClient).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole("button", { name: /connect to toolport/i }));
-
-    await waitFor(() =>
-      expect(installGateway).toHaveBeenCalledWith("claude-desktop", "p1", false),
-    );
-    expect(toastSuccess).toHaveBeenCalledWith(
-      "Connected Toolport to Claude Desktop",
-      expect.objectContaining({
-        description: "Restart Claude Desktop so it loads Toolport. Access: Work.",
-      }),
-    );
+    expect(await screen.findByText("calendar__read")).toBeVisible();
+    expect(screen.getByText("Restart Claude Desktop to load Toolport.")).toBeVisible();
+    expect(screen.getByText("Backup: /fixture/backups/previous.json")).toBeVisible();
+    expect(installGateway).not.toHaveBeenCalled();
   });
 });
 

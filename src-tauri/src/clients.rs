@@ -2261,9 +2261,7 @@ fn parse_json_snippet(
                 .get("command")
                 .is_some_and(|command| command.is_string() || command.is_array())
                 && !servers.get("url").is_some_and(serde_json::Value::is_string)
-                && !servers
-                    .get("type")
-                    .is_some_and(serde_json::Value::is_string)
+                && !servers.get("type").is_some_and(serde_json::Value::is_string)
                 && !servers
                     .get("enabled")
                     .is_some_and(serde_json::Value::is_boolean)
@@ -3780,12 +3778,8 @@ fn rewrite_json_key_preserving(
             new_value.as_object(),
         ) {
             patch_json_object(&child, before, after)?;
-        } else {
-            prop.set_value(serde_to_cst_input(new_value));
-        }
-    } else {
-        obj.append(key, serde_to_cst_input(new_value));
-    }
+        } else { prop.set_value(serde_to_cst_input(new_value)); }
+    } else { obj.append(key, serde_to_cst_input(new_value)); }
     Ok(root.to_string())
 }
 
@@ -6281,9 +6275,7 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
         let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
-        outcome
-            .warnings
-            .extend(disconnect_warnings(def.format, &path)?);
+        outcome.warnings.extend(disconnect_warnings(def.format, &path)?);
         Ok(outcome)
     })
 }
@@ -6311,8 +6303,8 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             restored: restored_names,
             used_move_record: moved::matches_path(client_id, &path)?,
             revision: None,
-            warnings: Vec::new(),
-            recovery_path: None,
+        warnings: Vec::new(),
+        recovery_path: None,
         });
     }
     let current = crate::registry_controller::registry_for_disconnect()?;
@@ -6330,8 +6322,8 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             restored: Vec::new(),
             used_move_record: false,
             revision: None,
-            warnings: Vec::new(),
-            recovery_path: None,
+        warnings: Vec::new(),
+        recovery_path: None,
         });
     }
     let mut outcome = install_or_remove(client_id, None)?;
@@ -6374,11 +6366,10 @@ pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) -> Result<(), S
 /// are preserved. Caller is responsible for importing first so nothing is lost.
 /// Explicit migration writes the stdio adapter entry.
 pub fn migrate_to_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOutcome, String> {
-    let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
-    let path = resolved_definition_path(&def)?;
-    mutation::run(client_id, &path, def.format, || {
-        revision_outcome(client_id, migrate_to_gateway_inner(client_id, profile))
-    })
+    let revision = setup_revision(client_id)?;
+    let client = detect_clients().into_iter().find(|c| c.id == client_id).ok_or("Unknown client")?;
+    let names = client.servers.iter().filter(|s| !detected_is_gateway(s)).map(|s| s.name.clone()).collect::<Vec<_>>();
+    migrate_reviewed(client_id, profile, &names, &revision, || Ok(()))
 }
 
 /// Snapshot token binds review to the whole config, including credential changes.
@@ -6441,18 +6432,6 @@ pub(crate) fn migrate_reviewed(
             }),
         )
     })
-}
-
-fn migrate_to_gateway_inner(
-    client_id: &str,
-    profile: Option<&str>,
-) -> Result<WriteOutcome, String> {
-    let entry = gateway_entry(profile, client_id)?;
-    // Keep what this rewrite drops so Disconnect can put it back (UX-03).
-    let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
-    let path = resolved_definition_path(&def)?;
-    moved::record(client_id, def.format, &path)?;
-    write_servers(client_id, &[entry])
 }
 
 /// Whether a stored client-config command is recognizably one of *our* gateway
