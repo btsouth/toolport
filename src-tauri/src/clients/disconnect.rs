@@ -91,7 +91,20 @@ fn restore_path(
             .map(crate::registry::sha256_hex);
         Ok((revision, moved::matches_path(id, path)?))
     })?;
-    let warnings = disconnect_warnings(format, path)?;
+    #[cfg(test)]
+    AFTER_RESTORE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(path);
+        }
+    });
+    let warnings = disconnect_warnings(format, path)
+        .map_err(|error| {
+            eprintln!(
+                "toolport: could not inspect disconnect warnings at {}: {error}",
+                path.display()
+            )
+        })
+        .unwrap_or_default();
     finish_uninstall(
         id,
         &WriteOutcome {
@@ -130,6 +143,11 @@ fn run(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_RESTORE: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -234,6 +252,45 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("last")).unwrap(),
             fixtures[2].2
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn failed_warning_read_does_not_abort_completed_restoration() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-warning-read-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("config.json");
+        let original = r#"{"mcpServers":{"native":{"command":"native"}}}"#;
+        std::fs::write(&path, original).unwrap();
+        let entry: ServerEntry = serde_json::from_value(serde_json::json!({"id":"toolport", "name":"toolport", "transport":"stdio", "command":"/fixture/toolport-gateway"})).unwrap();
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            moved::record("fixture", Format::JsonMcpServers, &path)?;
+            write_format(Format::JsonMcpServers, &path, &[entry.clone()], true)
+        })
+        .unwrap();
+        AFTER_RESTORE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|path| {
+                assert_eq!(
+                    std::fs::read_to_string(path).unwrap(),
+                    r#"{"mcpServers":{"native":{"command":"native"}}}"#
+                );
+                std::fs::write(path, "{ interrupted native save").unwrap();
+            }));
+        });
+        assert!(restore_path("fixture", &path, Format::JsonMcpServers, None)
+            .unwrap()
+            .is_empty());
+        assert!(!moved::has_record("fixture"));
+        assert!(restore::released("fixture", &path).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ interrupted native save"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

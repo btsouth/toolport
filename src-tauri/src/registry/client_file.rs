@@ -141,6 +141,142 @@ fn sync_parent(dest: &Path) {
     }
 }
 
+// ENOTSUP and EOPNOTSUPP are distinct on macOS, but aliases on Linux.
+fn unsupported(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    if error.raw_os_error().is_some_and(|code| {
+        code == libc::ENOSYS || code == libc::ENOTSUP || code == libc::EOPNOTSUPP
+    }) {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(1 | 50 | 120)) {
+        return true;
+    }
+    error.kind() == std::io::ErrorKind::Unsupported
+}
+
+// Prefer atomic no-clobber rename when the volume cannot make hard links.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rename_no_clobber(source: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
+    let dest = std::ffi::CString::new(dest.as_os_str().as_bytes())?;
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            dest.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let result = unsafe { libc::renamex_np(source.as_ptr(), dest.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_no_clobber(source: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>()
+    };
+    // Zero flags omit MOVEFILE_REPLACE_EXISTING.
+    if unsafe { MoveFileExW(wide(source).as_ptr(), wide(dest).as_ptr(), 0) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn rename_no_clobber(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+fn publish_no_clobber(source: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    let link = if FORCE_NO_HARD_LINKS.with(|slot| slot.get()) {
+        Err(std::io::ErrorKind::Unsupported.into())
+    } else {
+        fs::hard_link(source, dest)
+    };
+    #[cfg(not(test))]
+    let link = fs::hard_link(source, dest);
+    match link {
+        Ok(()) => return Ok(()),
+        Err(error) => {
+            // Linux FAT also reports EPERM for unsupported hard links.
+            #[cfg(unix)]
+            let no_links = error.raw_os_error() == Some(libc::EPERM);
+            #[cfg(not(unix))]
+            let no_links = false;
+            if !unsupported(&error) && !no_links {
+                return Err(error);
+            }
+        }
+    }
+    #[cfg(test)]
+    let rename = if FORCE_NO_RENAME.with(|slot| slot.get()) {
+        Err(std::io::ErrorKind::Unsupported.into())
+    } else {
+        rename_no_clobber(source, dest)
+    };
+    #[cfg(not(test))]
+    let rename = rename_no_clobber(source, dest);
+    match rename {
+        Ok(()) => return Ok(()),
+        Err(error) if unsupported(&error) => {}
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {}
+        Err(error) => return Err(error),
+    }
+    // Last resort: reserve the real path without clobbering any native save,
+    // retain the source until all bytes and permissions are durable.
+    let mut input = File::open(source)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(dest)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.set_permissions(input.metadata()?.permissions())?;
+    output.sync_all()
+}
+
+fn cleanup_published(path: &Path) {
+    #[cfg(test)]
+    let result = if FORCE_CLEANUP_ERROR.with(|slot| slot.get()) {
+        Err(std::io::ErrorKind::PermissionDenied.into())
+    } else {
+        fs::remove_file(path)
+    };
+    #[cfg(not(test))]
+    let result = fs::remove_file(path);
+    if let Err(error) = result {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "toolport: could not clean up published config temp {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
 /// Return false only when the OS or filesystem explicitly lacks exchange.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn exchange(replacement: &Path, dest: &Path, displaced: &Path) -> Result<bool, String> {
@@ -163,10 +299,7 @@ fn exchange(replacement: &Path, dest: &Path, displaced: &Path) -> Result<bool, S
     let result = unsafe { libc::renamex_np(source.as_ptr(), target.as_ptr(), libc::RENAME_SWAP) };
     if result != 0 {
         let error = std::io::Error::last_os_error();
-        if matches!(
-            error.raw_os_error(),
-            Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
-        ) {
+        if unsupported(&error) || error.raw_os_error() == Some(libc::EINVAL) {
             return Ok(false);
         }
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -262,13 +395,15 @@ pub(crate) fn commit(path: &Path, expected: &Revision, output: Option<&str>) -> 
     hook("commit", path);
     if expected.text.is_none() {
         // Publishing a first config must never replace one the client just made.
-        fs::hard_link(&tmp, &dest).map_err(|e| {
+        publish_no_clobber(&tmp, &dest).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 CHANGED.into()
             } else {
                 e.to_string()
             }
         })?;
+        cleanup.disarm();
+        cleanup_published(&tmp);
         sync_parent(&dest);
         return Ok(());
     }
@@ -304,7 +439,7 @@ pub(crate) fn commit(path: &Path, expected: &Revision, output: Option<&str>) -> 
             // If a client saved again after our swap, retain that second save
             // rather than deleting it along with our rejected output.
             if read(&rollback_displaced)?.text.as_deref() == Some(output) {
-                fs::remove_file(&rollback_displaced).map_err(|e| e.to_string())?;
+                cleanup_published(&rollback_displaced);
             } else {
                 return Err(format!(
                     "Client saved again during recovery; additional config retained at {}",
@@ -314,11 +449,16 @@ pub(crate) fn commit(path: &Path, expected: &Revision, output: Option<&str>) -> 
             sync_parent(&dest);
             return Err(CHANGED.into());
         }
-        fs::remove_file(&displaced).map_err(|e| e.to_string())?;
+        cleanup_published(&displaced);
     } else {
         // No portable compare-and-swap on unsupported filesystems. Check the
         // identity captured from the original open handle immediately before
         // rename. A residual external-writer window remains after this check.
+        // Removal also has a crash window between dest -> *.conduit-tmp and
+        // tombstone verification/restoration below: the client's bytes remain
+        // under that temp name while the real path is missing. Temp names alone
+        // cannot distinguish tombstones from pending output, so do not sweep
+        // them back automatically.
         if identity(&dest)? != expected.identity {
             return Err(CHANGED.into());
         }
@@ -350,9 +490,11 @@ fn remove(dest: &Path, expected: &Revision) -> Result<(), String> {
     // No cleanup guard: unreadable or conflicting bytes must stay recoverable.
     if !read(&tombstone).is_ok_and(|old| old.text == expected.text) {
         // A no-clobber restore also preserves a new save at the original path.
-        match fs::hard_link(&tombstone, dest) {
+        #[cfg(test)]
+        hook("restore", dest);
+        match publish_no_clobber(&tombstone, dest) {
             Ok(()) => {
-                fs::remove_file(&tombstone).map_err(|e| e.to_string())?;
+                cleanup_published(&tombstone);
             }
             Err(e) => {
                 return Err(format!(
@@ -364,7 +506,7 @@ fn remove(dest: &Path, expected: &Revision) -> Result<(), String> {
         sync_parent(dest);
         return Err(CHANGED.into());
     }
-    fs::remove_file(tombstone).map_err(|e| e.to_string())?;
+    cleanup_published(&tombstone);
     sync_parent(dest);
     Ok(())
 }
@@ -372,6 +514,9 @@ fn remove(dest: &Path, expected: &Revision) -> Result<(), String> {
 #[cfg(test)]
 thread_local! {
     pub(crate) static HOOK: std::cell::RefCell<Option<(&'static str, Box<dyn FnOnce(&Path)>)>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static FORCE_NO_HARD_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FORCE_NO_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FORCE_CLEANUP_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static FORCE_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 #[cfg(test)]
@@ -409,6 +554,171 @@ mod tests {
         #[cfg(windows)]
         fs::remove_file(path).unwrap();
         fs::rename(tmp, path).unwrap();
+    }
+    struct ForcedUnsupported;
+    impl ForcedUnsupported {
+        fn new(no_rename: bool) -> Self {
+            FORCE_NO_HARD_LINKS.with(|slot| slot.set(true));
+            FORCE_NO_RENAME.with(|slot| slot.set(no_rename));
+            Self
+        }
+    }
+    impl Drop for ForcedUnsupported {
+        fn drop(&mut self) {
+            FORCE_NO_HARD_LINKS.with(|slot| slot.set(false));
+            FORCE_NO_RENAME.with(|slot| slot.set(false));
+            FORCE_CLEANUP_ERROR.with(|slot| slot.set(false));
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn enotsup_is_an_unsupported_operation() {
+        assert!(unsupported(&std::io::Error::from_raw_os_error(
+            libc::ENOTSUP
+        )));
+        assert!(unsupported(&std::io::Error::from_raw_os_error(
+            libc::EOPNOTSUPP
+        )));
+        assert!(!unsupported(&std::io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        #[cfg(target_os = "macos")]
+        assert_eq!(libc::ENOTSUP, 45);
+    }
+    #[test]
+    fn first_publication_without_hard_links_creates_the_real_path() {
+        for no_rename in [false, true] {
+            let _forced = ForcedUnsupported::new(no_rename);
+            let (dir, path) = fixture();
+            fs::remove_file(&path).unwrap();
+            let revision = read(&path).unwrap();
+            commit(&path, &revision, Some("toolport edit")).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "toolport edit");
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[test]
+    fn first_publication_without_hard_links_preserves_a_new_native_save() {
+        for no_rename in [false, true] {
+            let _forced = ForcedUnsupported::new(no_rename);
+            let (dir, path) = fixture();
+            fs::remove_file(&path).unwrap();
+            let revision = read(&path).unwrap();
+            HOOK.with(|slot| {
+                *slot.borrow_mut() = Some((
+                    "commit",
+                    Box::new(|path| fs::write(path, "client save").unwrap()),
+                ))
+            });
+            assert_eq!(
+                commit(&path, &revision, Some("toolport edit")).unwrap_err(),
+                CHANGED
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "client save");
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[test]
+    fn removal_without_hard_links_restores_even_non_utf8_native_bytes() {
+        for no_rename in [false, true] {
+            let _forced = ForcedUnsupported::new(no_rename);
+            let (dir, path) = fixture();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            }
+            let revision = read(&path).unwrap();
+            HOOK.with(|slot| {
+                *slot.borrow_mut() =
+                    Some(("remove", Box::new(|path| fs::write(path, [0xff]).unwrap())))
+            });
+            assert_eq!(commit(&path, &revision, None).unwrap_err(), CHANGED);
+            assert_eq!(fs::read(&path).unwrap(), [0xff]);
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o640
+                );
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[test]
+    fn removal_without_hard_links_keeps_both_native_saves() {
+        for no_rename in [false, true] {
+            let _forced = ForcedUnsupported::new(no_rename);
+            let (dir, path) = fixture();
+            let revision = read(&path).unwrap();
+            HOOK.with(|slot| {
+                *slot.borrow_mut() = Some((
+                    "remove",
+                    Box::new(|path| {
+                        fs::write(path, "first save").unwrap();
+                        HOOK.with(|slot| {
+                            *slot.borrow_mut() = Some((
+                                "restore",
+                                Box::new(|path| fs::write(path, "second save").unwrap()),
+                            ))
+                        });
+                    }),
+                ))
+            });
+            assert!(commit(&path, &revision, None)
+                .unwrap_err()
+                .contains("config retained at"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), "second save");
+            let tombstone = fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|entry| entry != &path)
+                .unwrap();
+            assert_eq!(fs::read_to_string(tombstone).unwrap(), "first save");
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[test]
+    fn cleanup_failure_does_not_fail_a_published_write_or_removal() {
+        let _forced = ForcedUnsupported::new(false);
+        for output in [Some("toolport edit"), None] {
+            let (dir, path) = fixture();
+            let revision = read(&path).unwrap();
+            FORCE_CLEANUP_ERROR.with(|slot| slot.set(true));
+            commit(&path, &revision, output).unwrap();
+            assert_eq!(read(&path).unwrap().text.as_deref(), output);
+            assert!(fs::read_dir(&dir)
+                .unwrap()
+                .any(|entry| entry.unwrap().path() != path));
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[test]
+    fn cleanup_failure_does_not_change_a_recovered_conflict() {
+        let _forced = ForcedUnsupported::new(true);
+        let (dir, path) = fixture();
+        let revision = read(&path).unwrap();
+        HOOK.with(|slot| {
+            *slot.borrow_mut() = Some((
+                "remove",
+                Box::new(|path| fs::write(path, "client save").unwrap()),
+            ))
+        });
+        FORCE_CLEANUP_ERROR.with(|slot| slot.set(true));
+        assert_eq!(commit(&path, &revision, None).unwrap_err(), CHANGED);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "client save");
+        fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn replacement_during_read_does_not_turn_old_handle_into_current_revision() {

@@ -359,6 +359,30 @@ mod tests {
         })
     }
     #[test]
+    fn published_cleanup_failure_keeps_original_recovery_record() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (dir, _data) = fixture();
+        let path = dir.join("config.json");
+        let original = r#"{ "session": 1, "mcpServers": {} }"#;
+        std::fs::write(&path, original).unwrap();
+        crate::registry::client_file::FORCE_CLEANUP_ERROR.with(|slot| slot.set(true));
+        let result = connect(&path);
+        crate::registry::client_file::FORCE_CLEANUP_ERROR.with(|slot| slot.set(false));
+        result.unwrap();
+        assert!(
+            parse_json_value(&std::fs::read_to_string(&path).unwrap()).unwrap()["mcpServers"]
+                ["toolport"]
+                .is_object()
+        );
+        run("cursor", &path, Format::JsonMcpServers, || {
+            disconnecting();
+            super::super::restore::apply("cursor", Format::JsonMcpServers, &path)
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn native_unrelated_connect_edit_is_reapplied_without_sleeps() {
         let _lock = crate::registry::data_dir_test_lock();
         let (dir, _data) = fixture();
