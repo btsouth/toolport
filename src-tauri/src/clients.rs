@@ -176,6 +176,31 @@ pub fn is_gateway_server(server: &ServerEntry) -> bool {
     gateway_identity_matches(&server.id, &server.name, server.command.as_deref())
 }
 
+/// An existing Shared HTTP shim with a literal bearer credential needs review.
+pub fn has_legacy_bearer_argv(server: &McpServer) -> bool {
+    detected_is_gateway(server)
+        && server
+            .command
+            .iter()
+            .chain(server.args.iter())
+            .any(|part| part.contains("mcp-remote"))
+        && server.args.iter().any(|arg| {
+            let lower = arg.to_ascii_lowercase();
+            lower
+                .split_once("authorization:")
+                .is_some_and(|(_, value)| {
+                    value
+                        .trim_start()
+                        .strip_prefix("bearer")
+                        .is_some_and(|token| {
+                            token.starts_with(char::is_whitespace)
+                                && !token.trim().is_empty()
+                                && !token.contains("${")
+                        })
+                })
+        })
+}
+
 /// Whether a server read out of a client's own config (a detected [`McpServer`]) is
 /// Toolport's own gateway entry. Recognizes the pre-rename `conduit` name too, so a
 /// "migrate" run doesn't import a legacy gateway entry back into the registry as if
@@ -6327,6 +6352,57 @@ impl Drop for EnvRestore {
 mod tests {
     use super::*;
     use crate::registry::EnvVar;
+
+    #[test]
+    fn legacy_bearer_detection_accepts_whitespace_and_requires_a_token_boundary() {
+        let mut server = gateway_server("toolport", "npx");
+        for separator in [" ", "\t", "\n", "\r\n", "\u{2003}"] {
+            server.args = vec![
+                "mcp-remote".into(),
+                format!("Authorization: Bearer{separator}fixture-canary"),
+            ];
+            assert!(has_legacy_bearer_argv(&server), "{separator:?}");
+        }
+        for value in ["BearerToken", "Bearer\t${TOKEN}", "Bearer\t "] {
+            server.args[1] = format!("Authorization: {value}");
+            assert!(!has_legacy_bearer_argv(&server), "{value}");
+        }
+    }
+
+    #[test]
+    fn legacy_bearer_detection_is_read_only() {
+        let mut server = gateway_server("toolport", "npx");
+        server.args = ["mcp-remote", "Authorization: Bearer fixture-canary"]
+            .map(str::to_string)
+            .to_vec();
+        assert!(has_legacy_bearer_argv(&server));
+        server.args[1] = "Authorization: Bearer ${TOKEN}".into();
+        assert!(!has_legacy_bearer_argv(&server));
+        server.name = "custom remote".into();
+        server.args[1] = "Authorization: Bearer fixture-canary".into();
+        assert!(!has_legacy_bearer_argv(&server));
+    }
+
+    #[test]
+    fn generated_gateway_invocation_never_carries_http_credentials() {
+        // SEC-09: generated connections use our stdio adapter, never an
+        // mcp-remote bridge carrying the Shared HTTP bearer in argv or env.
+        for profile in [None, Some("Billing")] {
+            let entry = gateway_entry(profile, "cursor").unwrap();
+            assert_eq!(entry.transport, "stdio");
+            assert!(entry.args.is_empty());
+            assert!(entry.url.is_none());
+            assert!(!entry.inherit_env);
+            assert!(entry
+                .env
+                .iter()
+                .all(|e| { e.key == crate::brand::CLIENT_ID || e.key == crate::brand::PROFILE }));
+            let config = entry_to_json(&entry);
+            assert!(config.get("headers").is_none());
+            assert!(config.get("url").is_none());
+            assert!(!config.to_string().contains("mcp-remote"));
+        }
+    }
 
     #[test]
     fn claude_code_config_follows_a_relocated_config_dir() {

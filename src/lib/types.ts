@@ -655,6 +655,17 @@ export function isGatewayDetected(server: McpServer): boolean {
   return isGatewayIdentity(server.name, server.name, server.command);
 }
 
+/** Existing HTTP shims are preserved until the owner confirms migration. */
+export function hasLegacyBearerArgv(server: McpServer): boolean {
+  return (
+    isGatewayDetected(server) &&
+    [server.command ?? "", ...server.args].some((part) => part.includes("mcp-remote")) &&
+    server.args.some(
+      (arg) => /authorization:\s*bearer\s+\S+/i.test(arg) && !arg.includes("${"),
+    )
+  );
+}
+
 /** Servers a client has (config + plugins) that Toolport doesn't manage yet.
  * These are the only client-side entries worth surfacing - they're import
  * candidates. Toolport's own gateway entry is never importable. */

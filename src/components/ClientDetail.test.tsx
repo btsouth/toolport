@@ -388,3 +388,44 @@ it("restores Default access with an empty scope and retains the default tool lim
   );
   expect(reg.profiles[0]?.toolScope).toEqual({ s: ["read"] });
 });
+
+describe("ClientDetail legacy bearer migration", () => {
+  it("preserves the connection through render, review and cancel; migrates only on confirmation", async () => {
+    installGateway.mockResolvedValue({ backup: true });
+    const legacy = client({
+      gatewayInstalled: true,
+      entryState: "customized",
+      servers: [
+        {
+          name: "toolport",
+          transport: "stdio",
+          command: "npx",
+          args: ["mcp-remote", "Authorization: Bearer fixture-canary"],
+          envKeys: [],
+          url: null,
+        },
+      ],
+    });
+    render(
+      <ClientDetail
+        client={legacy}
+        registry={emptyRegistry()}
+        onChanged={() => {}}
+        onRegistryChange={() => {}}
+      />,
+    );
+    expect(installGateway).not.toHaveBeenCalled();
+    expect(screen.queryByText(/fixture-canary/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Review migration" }));
+    expect(screen.getByText(/backs up the config/)).toBeInTheDocument();
+    expect(installGateway).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(installGateway).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Review migration" }));
+    await userEvent.click(screen.getByRole("button", { name: "Migrate to stdio" }));
+    await waitFor(() =>
+      expect(installGateway).toHaveBeenCalledWith("claude-desktop", undefined, true),
+    );
+    expect(migrateClient).not.toHaveBeenCalled();
+  });
+});

@@ -24,6 +24,7 @@ import {
 } from "@/lib/api";
 import {
   importableServers,
+  hasLegacyBearerArgv,
   isGatewayServer,
   isGatewayDetected,
   type DetectedClient,
@@ -99,6 +100,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   const [resetOpen, setResetOpen] = useState(false);
   const installed = client.gatewayInstalled;
   const customized = client.entryState === "customized";
+  const legacyBearer = client.servers.some(hasLegacyBearerArgv);
   // Whether the client app is actually on this machine. We allow Disconnect even
   // when absent (to clean up a stale entry), but block a fresh Connect, writing a
   // config into a client that isn't installed just creates a file nothing reads.
@@ -236,9 +238,14 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     setBusy(true);
     try {
       await installGateway(client.id, profile || undefined, true);
-      toast.success(`Reset ${client.name} to the default Toolport gateway`, {
-        description: clientRestartHint(client.name),
-      });
+      toast.success(
+        legacyBearer
+          ? `Migrated ${client.name} to stdio`
+          : `Reset ${client.name} to the default Toolport gateway`,
+        {
+          description: clientRestartHint(client.name),
+        },
+      );
       noteRestartNeeded("applied");
       setResetOpen(false);
       onChanged();
@@ -428,6 +435,13 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                 ? "installed - no MCP config yet"
                 : "not installed on this machine"}
           </p>
+          {legacyBearer && (
+            <p className="mt-1 text-xs text-warning">
+              This older HTTP connection exposes its bearer credential in process
+              arguments. Review migration to stdio below. Your existing connection is
+              preserved until you confirm.
+            </p>
+          )}
           {customized && (
             <p className="mt-1 text-xs text-muted-foreground">
               Toolport is leaving your hand-edited gateway entry as-is. Reset it only if
@@ -479,19 +493,27 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               Apply access
             </Button>
           )}
-          {customized && (
+          {(customized || legacyBearer) && (
             <ConfirmDialog
               open={resetOpen}
               onOpenChange={setResetOpen}
               trigger={
                 <Button size="sm" variant="default" disabled={busy}>
                   <Check className="size-4" />
-                  Reset to default
+                  {legacyBearer ? "Review migration" : "Reset to default"}
                 </Button>
               }
-              title={`Reset ${client.name} to the default Toolport gateway?`}
-              description="This overwrites the hand-edited toolport entry with the standard stdio gateway command. Your other MCP servers are left alone."
-              confirmLabel="Reset to default"
+              title={
+                legacyBearer
+                  ? `Migrate ${client.name} to stdio?`
+                  : `Reset ${client.name} to the default Toolport gateway?`
+              }
+              description={
+                legacyBearer
+                  ? "Toolport backs up the config before replacing the older HTTP connection with its standard stdio command. Other MCP servers stay in place. Any customized Toolport command, arguments and headers will be replaced; review those changes before confirming. Restart the client afterward."
+                  : "This overwrites the hand-edited toolport entry with the standard stdio gateway command. Your other MCP servers are left alone."
+              }
+              confirmLabel={legacyBearer ? "Migrate to stdio" : "Reset to default"}
               onConfirm={resetToDefault}
             />
           )}

@@ -100,6 +100,7 @@ boa_engine = "0.21"
 boa_gc = "0.21"
 base64 = "0.22"
 regex = "1"
+unicode-normalization = "0.1"
 getrandom = "0.2"
 # OS advisory file locking (flock / LockFileEx) for the cross-process registry write
 # lock, so the app, the gateway binary, and the team-sync worker can't revert each

@@ -1048,6 +1048,7 @@ mod tests {
                 movable_server_count: 0,
                 gateway_state: ClientGatewayState::Connected,
                 shared_http: false,
+                legacy_bearer_argv: false,
                 scope_id: None,
                 scope_name: None,
                 discovery_mode: None,

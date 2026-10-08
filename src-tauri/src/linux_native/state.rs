@@ -338,6 +338,7 @@ pub(super) struct ClientView {
     pub(super) movable_server_count: usize,
     pub(super) gateway_state: ClientGatewayState,
     pub(super) shared_http: bool,
+    pub(super) legacy_bearer_argv: bool,
     pub(super) scope_id: Option<String>,
     pub(super) scope_name: Option<String>,
     pub(super) discovery_mode: Option<String>,
@@ -363,6 +364,10 @@ impl ClientView {
                 crate::clients::GatewayEntryState::Customized => ClientGatewayState::Customized,
                 crate::clients::GatewayEntryState::Absent => ClientGatewayState::Disconnected,
             },
+            legacy_bearer_argv: client
+                .servers
+                .iter()
+                .any(crate::clients::has_legacy_bearer_argv),
             shared_http: false,
             scope_id: None,
             scope_name: None,

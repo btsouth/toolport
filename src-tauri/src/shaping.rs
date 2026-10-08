@@ -59,6 +59,7 @@ pub fn budget() -> (usize, Option<String>) {
 }
 
 struct Cached {
+    server: Option<String>,
     body: String,
     structured: Option<Value>,
     /// The entry's total serialized size (`body` + structured JSON), computed once at
@@ -204,6 +205,22 @@ pub fn shape_result_preserving_prefix(
     if budget == 0 {
         return false;
     }
+    let server = result
+        .pointer("/_meta/app.toolport~1provenance/server")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // Callers add the notice after caching, so reserve its exact serialized cost.
+    let budget = if let Some(server) = &server {
+        let mut notice = serde_json::json!({"content":[]});
+        crate::integrity::label_untrusted_result(server, &mut notice);
+        let reserve = value_size(&notice["content"][0]) + 1;
+        budget.saturating_sub(reserve)
+    } else {
+        budget
+    };
+    if budget == 0 {
+        return false;
+    }
     let size = serde_json::to_string(result).map(|s| s.len()).unwrap_or(0);
     if size <= budget {
         return false;
@@ -294,6 +311,9 @@ pub fn shape_result_preserving_prefix(
                 dst.insert(key.clone(), value.clone());
             }
         }
+        if let Some(server) = &server {
+            crate::integrity::label_untrusted_result_with_notice(server, &mut shaped, false);
+        }
         shaped
     };
 
@@ -332,6 +352,10 @@ pub fn shape_result_preserving_prefix(
         store.insert(
             &cursor,
             Cached {
+                server: result
+                    .pointer("/_meta/app.toolport~1provenance/server")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 body,
                 structured,
                 size: new_entry_size,
@@ -357,6 +381,7 @@ pub fn stash_payload(body: String, structured: Option<Value>, owner: Option<&str
     store.insert(
         &cursor,
         Cached {
+            server: None,
             body,
             structured,
             size,
@@ -416,7 +441,11 @@ pub fn fetch_result(
             }
         };
 
-        return text_result(serde_json::to_string(value).unwrap_or_default(), false);
+        let mut result = text_result(serde_json::to_string(value).unwrap_or_default(), false);
+        if let Some(server) = &c.server {
+            crate::integrity::label_untrusted_result(server, &mut result);
+        }
+        return result;
     }
     let total = c.body.chars().count();
     if offset >= total {
@@ -468,7 +497,11 @@ pub fn fetch_result(
     } else {
         format!("\n\n[Toolport: end of result ({total} characters).]")
     };
-    text_result(format!("{slice}{footer}"), false)
+    let mut result = text_result(format!("{slice}{footer}"), false);
+    if let Some(server) = &c.server {
+        crate::integrity::label_untrusted_result(server, &mut result);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -477,6 +510,40 @@ mod tests {
 
     fn big_text_result(n: usize) -> Value {
         json!({ "content": [{ "type": "text", "text": "x".repeat(n) }], "isError": false })
+    }
+
+    #[test]
+    fn fetched_pages_and_projections_keep_the_real_server() {
+        let mut result = serde_json::json!({"content":[{"type":"text", "text":"x".repeat(10_000)}], "structuredContent":{"value":7}});
+        crate::integrity::label_untrusted_result_with_notice("github", &mut result, false);
+        assert!(shape_result(&mut result, 2048, None));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let cursor = text
+            .split("\"cursor\":\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        for path in [None, Some("value")] {
+            let fetched = fetch_result(cursor, 0, 100, None, path);
+            assert_eq!(
+                fetched["_meta"]["app.toolport/provenance"]["server"],
+                "github"
+            );
+            assert!(fetched["content"][1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("from github;"));
+        }
+        crate::integrity::label_untrusted_result("github", &mut result);
+        assert!(
+            value_size(&result) <= 2048,
+            "notice must fit within the original budget"
+        );
+        let cursor = stash_payload("Toolport-owned data".into(), None, None);
+        let fetched = fetch_result(&cursor, 0, 100, None, None);
+        assert!(fetched.get("_meta").is_none());
     }
 
     #[test]
@@ -885,6 +952,7 @@ mod tests {
     // order, so the tests insert oldest first.
     fn cached_entry(size: usize) -> Cached {
         Cached {
+            server: None,
             body: String::new(),
             structured: None,
             size,
