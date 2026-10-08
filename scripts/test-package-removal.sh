@@ -10,7 +10,9 @@ for user in toolport-remove-a toolport-remove-b; do
   chown -R "$user:$user" "/home/$user"
 done
 # Replacing an installed package exercises the real upgrade argument convention.
-if [ "$mode" = fedora ]; then
+if [ "$mode" = arch ]; then
+  pacman -U --noconfirm /packages/upgrade.pkg.tar.zst
+elif [ "$mode" = fedora ]; then
   rpm -U --replacepkgs /packages/new.rpm
 else
   dpkg -i /packages/new.deb
@@ -19,7 +21,9 @@ for user in toolport-remove-a toolport-remove-b; do
   cmp "/tmp/$user-connected" "/home/$user/.cursor/mcp.json"
 done
 echo "PASS: $mode upgrade leaves connected client bytes unchanged"
-if [ "$mode" = fedora ]; then
+if [ "$mode" = arch ]; then
+  pacman -R --noconfirm toolport
+elif [ "$mode" = fedora ]; then
   dnf remove -y toolport
 else
   dpkg --purge toolport
