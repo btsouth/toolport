@@ -1115,6 +1115,27 @@ fn transcript_initialize_count(path: &Path) -> usize {
     transcript_method_count(path, "initialize")
 }
 
+fn demand_root_replacement(
+    client: &mut AdapterClient,
+    transcript: &Path,
+    tool: &str,
+    completed_method: &str,
+    failure: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "{failure}");
+        // Demand once even if the watcher has already started the replacement.
+        // Its initialize frame precedes catalog and subscription restoration.
+        client.call_tool(tool, json!({}));
+        // A successful demand can outlive this scheduling deadline. Observe its
+        // completion before deciding whether to start another RPC.
+        if transcript_method_count(transcript, completed_method) >= 2 {
+            break;
+        }
+    }
+}
+
 fn wait_until(mut predicate: impl FnMut() -> bool, label: &str, within: Duration) {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
@@ -2643,15 +2664,13 @@ fn matrix_pooling_root_restarts_only_when_its_effective_spec_changes() {
         unknown_fields: Default::default(),
     });
     registry::save_to(&path, &reg).expect("change root launch spec");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while transcript_initialize_count(&transcript) < 2 {
-        client.call_tool(&pwd, json!({}));
-        assert!(
-            Instant::now() < deadline,
-            "the old rooted launch survived an effective spec change"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    demand_root_replacement(
+        &mut client,
+        &transcript,
+        &pwd,
+        "initialize",
+        "the old rooted launch survived an effective spec change",
+    );
     assert!(
         client.call_tool(&pwd, json!({}))["isError"] != true,
         "replacement child must remain callable"
@@ -2674,6 +2693,15 @@ fn matrix_pooling_root_restarts_only_when_its_effective_spec_changes() {
 
 #[test]
 fn matrix_pooling_rooted_subscription_survives_an_effective_spec_change() {
+    rooted_subscription_rollover(false);
+}
+
+#[test]
+fn matrix_pooling_rooted_subscription_survives_a_slow_replacement_call() {
+    rooted_subscription_rollover(true);
+}
+
+fn rooted_subscription_rollover(slow_call: bool) {
     let _guard = CASE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2715,21 +2743,32 @@ fn matrix_pooling_rooted_subscription_survives_an_effective_spec_change() {
         secret: false,
         unknown_fields: Default::default(),
     });
-    registry::save_to(&path, &reg).expect("rotate secret generation");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while transcript_initialize_count(&transcript) < 2 {
-        client.call_tool(&pwd, json!({}));
-        assert!(
-            Instant::now() < deadline,
-            "replacement rooted child was not launched"
-        );
-        std::thread::sleep(Duration::from_millis(100));
+    if slow_call {
+        // Delay only the replacement. Its first demand completes after the
+        // rollover deadline, but inside the existing RPC budget.
+        reg.servers[0].env.push(EnvVar {
+            key: "MOCK_MCP_CALL_DELAY_MS".into(),
+            value: Some("11000".into()),
+            secret: false,
+            unknown_fields: Default::default(),
+        });
     }
+    registry::save_to(&path, &reg).expect("rotate secret generation");
+    demand_root_replacement(
+        &mut client,
+        &transcript,
+        &pwd,
+        "resources/subscribe",
+        "replacement rooted child did not resume the subscription",
+    );
     assert_eq!(
         transcript_method_count(&transcript, "resources/subscribe"),
         2,
         "the replacement child did not resume the subscription"
     );
+    if slow_call {
+        return;
+    }
     while client.lines.try_recv().is_ok() {}
 
     client.next_id += 1;
