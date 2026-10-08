@@ -2397,7 +2397,9 @@ mod tests {
             secrets::tests::with_failed_write(STATE_KEY, || {
                 assert_eq!(refresh_token("rotation", None).unwrap(), "token-1");
             });
-            for concurrent in [false, true] {
+            for (concurrent, pending) in
+                [(false, true), (true, true), (false, false), (true, false)]
+            {
                 let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
                 let mut transport = HttpTransport::with_auth_refresh(
                     &format!("http://{}/", server.server_addr()),
@@ -2411,6 +2413,29 @@ mod tests {
                         }
                     })),
                 );
+                if !pending {
+                    // Exercise authed_transport's actual callback with a peer token
+                    // saved after construction, while proactive refresh is not due.
+                    let mut state = load_state("rotation").unwrap().unwrap();
+                    state.expires_at = Some(now_epoch_seconds() + 3600);
+                    secrets::set_secret(
+                        "rotation",
+                        STATE_KEY,
+                        &serde_json::to_string(&state).unwrap(),
+                    )
+                    .unwrap();
+                    secrets::set_secret("rotation", secrets::HTTP_AUTH_KEY, "token-0").unwrap();
+                    transport = authed_transport(
+                        &format!("http://{}/", server.server_addr()),
+                        Some("token-0".into()),
+                        "rotation",
+                        false,
+                        Duration::from_secs(5),
+                    )
+                    .unwrap()
+                    .0;
+                    secrets::set_secret("rotation", secrets::HTTP_AUTH_KEY, "token-1").unwrap();
+                }
                 transport.set_server_id("rotation");
                 let wire = std::thread::spawn(move || {
                     let mut auths = Vec::new();
