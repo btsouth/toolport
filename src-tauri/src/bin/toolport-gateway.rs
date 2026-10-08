@@ -1611,7 +1611,6 @@ fn removed_meta_tool_error(name: &str) -> String {
     )
 }
 
-
 // --- Grouped discovery mode (CONDUIT_DISCOVERY=grouped) ---
 //
 // Between `lazy` (a constant handful of meta-tools; best for a capable model that
@@ -16464,6 +16463,48 @@ impl Drop for HttpRequestEnd {
     }
 }
 
+/// Tiny HTTP gives ordinary replies a Content-Length; SSE streams have none.
+/// Once every finite response byte was delivered, a caller may close immediately,
+/// even before the backend thread returns from respond().
+#[derive(Default)]
+struct HttpResponseProgress {
+    head: Vec<u8>,
+    headers_done: bool,
+    remaining: Option<u64>,
+}
+impl HttpResponseProgress {
+    fn delivered(&mut self, bytes: &[u8]) -> bool {
+        if !self.headers_done {
+            self.head.extend_from_slice(bytes);
+            if let Some(end) = find_http_header_end(&self.head) {
+                let header = String::from_utf8_lossy(&self.head[..end]);
+                let mut length = None;
+                let mut transfer_encoded = false;
+                for line in header.lines() {
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse::<u64>().ok();
+                        }
+                        transfer_encoded |= name.eq_ignore_ascii_case("transfer-encoding");
+                    }
+                }
+                if !transfer_encoded {
+                    self.remaining =
+                        length.map(|n| n.saturating_sub((self.head.len() - end) as u64));
+                }
+                self.headers_done = true;
+                self.head.clear();
+            } else if self.head.len() > MAX_HTTP_HEADER_BYTES {
+                self.headers_done = true;
+                self.head.clear();
+            }
+        } else if let Some(remaining) = &mut self.remaining {
+            *remaining = remaining.saturating_sub(bytes.len() as u64);
+        }
+        self.remaining == Some(0)
+    }
+}
+
 /// Relay a response while observing the caller's socket, including while the
 /// backend is blocked. Unix can wait on both sockets without a watcher thread.
 // A client write-half-close is treated as abandonment, just like full EOF.
@@ -16473,6 +16514,7 @@ fn relay_http_response(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
     disconnected: Arc<dyn Fn() + Send + Sync>,
+    completed: Arc<dyn Fn() + Send + Sync>,
 ) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -16490,6 +16532,7 @@ fn relay_http_response(
             },
         ];
         let mut bytes = [0u8; 8192];
+        let mut progress = HttpResponseProgress::default();
         loop {
             // Both descriptors are borrowed from live TcpStreams for this wait.
             let ready = unsafe { libc::poll(sockets.as_mut_ptr(), sockets.len() as _, -1) };
@@ -16510,6 +16553,10 @@ fn relay_http_response(
                     disconnected();
                     return Err(error);
                 }
+                if progress.delivered(&bytes[..count]) {
+                    completed();
+                    return Ok(());
+                }
             }
             if sockets[0].revents != 0 {
                 let mut byte = [0];
@@ -16527,18 +16574,16 @@ fn relay_http_response(
     {
         let done = Arc::new(AtomicBool::new(false));
         let finished = done.clone();
+        let progress = Arc::new(Mutex::new(HttpResponseProgress::default()));
+        let observed = progress.clone();
         let watched = client.try_clone()?;
         let wake = upstream.try_clone()?;
+        let cancel = disconnected.clone();
         let watcher = std::thread::spawn(move || {
             let _ = watched.set_read_timeout(Some(Duration::from_millis(25)));
             let mut byte = [0];
             while !finished.load(Ordering::SeqCst) {
                 match watched.peek(&mut byte) {
-                    Ok(0) => {
-                        disconnected();
-                        let _ = wake.shutdown(Shutdown::Both);
-                        break;
-                    }
                     Err(error)
                         if matches!(
                             error.kind(),
@@ -16546,16 +16591,45 @@ fn relay_http_response(
                                 | std::io::ErrorKind::TimedOut
                                 | std::io::ErrorKind::Interrupted
                         ) => {}
-                    Err(_) => {
-                        disconnected();
+                    Ok(0) | Err(_) => {
+                        // Wake blocked reads/writes before taking the delivery lock.
                         let _ = wake.shutdown(Shutdown::Both);
+                        let _ = watched.shutdown(Shutdown::Write);
+                        if observed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remaining
+                            != Some(0)
+                        {
+                            cancel();
+                        }
                         break;
                     }
                     Ok(_) => break,
                 }
             }
         });
-        let result = std::io::copy(upstream, client).map(|_| ());
+        let result = (|| {
+            let mut bytes = [0u8; 8192];
+            loop {
+                let count = upstream.read(&mut bytes)?;
+                if count == 0 {
+                    return Ok(());
+                }
+                // Serialize successful delivery and completion with disconnect.
+                let mut progress = progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Err(error) = client.write_all(&bytes[..count]) {
+                    disconnected();
+                    return Err(error);
+                }
+                if progress.delivered(&bytes[..count]) {
+                    completed();
+                    return Ok(());
+                }
+            }
+        })();
         done.store(true, Ordering::SeqCst);
         let _ = client.shutdown(Shutdown::Read);
         let _ = watcher.join();
@@ -16620,10 +16694,12 @@ fn proxy_deadline_http_connection(
         return;
     }
     let _ = upstream.shutdown(Shutdown::Write);
+    let finished = cancellations.clone();
     let _ = relay_http_response(
         &mut client,
         &mut upstream,
         Arc::new(move || cancellations.close()),
+        Arc::new(move || finished.finish_connection()),
     );
     http_connection_cancellations()
         .lock()
@@ -17398,7 +17474,12 @@ fn proxy_public_http_connection(
     };
     drop(pending_read);
     let Some(_active) = try_acquire_inflight(active, http_max_connections()) else {
-        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway busy; retry later");
+        write_ingress_response(
+            &mut client,
+            503,
+            "Service Unavailable",
+            "gateway busy; retry later",
+        );
         return;
     };
     // Authenticate the cached daemon before every new public request. A failed
@@ -17449,7 +17530,7 @@ fn proxy_public_http_connection(
     }
     // The daemon detects the public caller's full socket close. Keep the write
     // side open during the relay so waiting callers do not appear abandoned.
-    let _ = relay_http_response(&mut client, &mut upstream, Arc::new(|| {}));
+    let _ = relay_http_response(&mut client, &mut upstream, Arc::new(|| {}), Arc::new(|| {}));
 }
 
 /// The desktop keeps this lightweight public listener as its child. The heavy
@@ -17518,13 +17599,23 @@ fn serve_http_proxy(port: u16) -> Result<(), String> {
             match listener.accept() {
                 Ok((mut client, _)) => {
                     if client.set_nonblocking(false).is_err() {
-                        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+                        write_ingress_response(
+                            &mut client,
+                            503,
+                            "Service Unavailable",
+                            "gateway unavailable",
+                        );
                         continue;
                     }
                     let Some(pending) =
                         try_acquire_inflight(&pending_reads, http_max_connections())
                     else {
-                        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway busy; retry later");
+                        write_ingress_response(
+                            &mut client,
+                            503,
+                            "Service Unavailable",
+                            "gateway busy; retry later",
+                        );
                         continue;
                     };
                     let state = Arc::clone(&state);
@@ -17636,7 +17727,11 @@ fn respond_mcp_sse_listen(request: tiny_http::Request, mut out: HttpOut, allow_h
         .unwrap(),
         tiny_http::Header::from_bytes(b"Access-Control-Allow-Headers", allow_headers.as_bytes())
             .unwrap(),
-        tiny_http::Header::from_bytes(b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()).unwrap(),
+        tiny_http::Header::from_bytes(
+            b"Access-Control-Expose-Headers",
+            EXPOSED_HTTP_HEADERS.as_bytes(),
+        )
+        .unwrap(),
     ];
     for (name, value) in out.extra {
         let safe = sanitize_header_value(&value);
@@ -24358,7 +24453,6 @@ mod tests {
                 .unwrap();
         assert!(explicit_on.code_mode);
     }
-
 
     /// A failed registry load must not advertise or run Code Mode, even when
     /// a later request snapshot contains an explicit opt-in.
@@ -33096,6 +33190,18 @@ mod tests {
     }
 
     #[test]
+    fn p08_finite_reply_completion_waits_for_its_entire_body_and_sse_stays_live() {
+        let mut reply = HttpResponseProgress::default();
+        assert!(!reply.delivered(b"HTTP/1.1 200 OK\r\nContent-Len"));
+        assert!(!reply.delivered(b"gth: 4\r\n\r\nab"));
+        assert!(!reply.delivered(b"c"));
+        assert!(reply.delivered(b"d"));
+        let mut sse = HttpResponseProgress::default();
+        assert!(!sse.delivered(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"));
+        assert!(!sse.delivered(b"5\r\nhello\r\n"));
+    }
+
+    #[test]
     fn p08_completed_exchange_must_not_fire_retained_hooks() {
         let (server, _ingress, address) =
             bind_deadline_http_server("127.0.0.1:0", HttpReadDeadlines::default()).unwrap();
@@ -33131,6 +33237,7 @@ mod tests {
         });
         for _ in 0..n {
             let mut c = TcpStream::connect(address).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             c.write_all(b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")
                 .unwrap();
             let mut buf = Vec::new();
