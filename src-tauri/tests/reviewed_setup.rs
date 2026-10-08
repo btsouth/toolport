@@ -95,8 +95,8 @@ fn reviewed_fixture_cleanup_preserves_original_panic() {
     );
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
+impl Fixture {
+    fn stop_daemons(&self) {
         if let Ok(files) = std::fs::read_dir(self.dir.join("data")) {
             for file in files.flatten() {
                 let name = file.file_name();
@@ -165,6 +165,12 @@ impl Drop for Fixture {
                 }
             }
         }
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.stop_daemons();
         for (key, value) in self.env.iter().rev() {
             match value {
                 Some(value) => std::env::set_var(key, value),
@@ -323,6 +329,7 @@ fn reviewed_setup_waits_for_slow_first_catalog() {
     .unwrap();
     let warm = controller::preview_client_setup("claude-code").unwrap();
     migrate_fixture(&fixture, &["warm".into()], &warm.revision);
+    fixture.stop_daemons();
     let mut config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(fixture.config()).unwrap()).unwrap();
     config["mcpServers"]["slow"] = json!({"command":mock,"args":["--start-delay-ms=3000"]});
