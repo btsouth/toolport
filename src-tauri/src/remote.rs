@@ -1477,6 +1477,7 @@ impl Redaction {
         use crate::downstream::TransportError as E;
         match error {
             E::Fatal(message) => E::Fatal(self.text(message)),
+            E::FrameRejected(message) => E::FrameRejected(self.text(message)),
             E::Unavailable(message) => E::Unavailable(self.text(message)),
             E::Retry {
                 retry_after,
@@ -1878,6 +1879,13 @@ mod tests {
             "synthetic-pat".into(),
             "https://example.invalid/mcp?token=secret".into(),
         ]);
+        let frame = redact.error(crate::downstream::TransportError::FrameRejected(
+            "oversized frame near synthetic-pat".into(),
+        ));
+        assert!(
+            matches!(frame, crate::downstream::TransportError::FrameRejected(ref message)
+            if message == "oversized frame near <redacted>")
+        );
         let error = redact.error(crate::downstream::TransportError::Rpc(serde_json::json!({"code":-32602,"message":"Invalid argument near synthetic-pat","data":{"endpoint":"https://example.invalid/mcp?token=secret","field":"limit"}})));
         if let crate::downstream::TransportError::Rpc(value) = error {
             assert_eq!(value["code"], -32602);
