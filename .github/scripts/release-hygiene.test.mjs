@@ -122,6 +122,20 @@ test("payload assertions reject test helpers and unexpected binaries on every pl
   assertContents(["conduit.exe", "toolport-gateway.exe", "uninstall.exe"]);
 });
 
+test("NSIS permits the preflight helper only in its temporary plugin directory", () => {
+  const helper = "$PLUGINSDIR/toolport-preflight.exe";
+  assert.throws(() => assertContents([helper]), /Unexpected packaged binary/);
+  assertContents([helper], { nsisInstaller: true });
+  for (const path of [
+    "toolport-preflight.exe",
+    "./usr/bin/toolport-preflight.exe",
+    "$PLUGINSDIR/surprise.exe",
+    "$PLUGINSDIR/mock-mcp-server.exe",
+  ]) {
+    assert.throws(() => assertContents([path], { nsisInstaller: true }));
+  }
+});
+
 test("archive inspection lists a real payload and rejects an added helper", () => {
   const root = mkdtempSync(join(tmpdir(), "toolport-payload-"));
   try {
