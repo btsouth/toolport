@@ -520,7 +520,7 @@ fn basename_from_exe_link(path: &Path) -> String {
         .unwrap_or_else(|| cleaned.to_string())
 }
 
-/// Parse one line of `ps -ax -o pid= -o ppid= -o ucomm=` into `(pid, ppid, name)`.
+/// Parse a live `ps -ax -o pid= -o ppid= -o state= -o ucomm=` row.
 ///
 /// Pure helper for the macOS enumerator line format. Does **not** prove the `ps`
 /// argv itself is correct — a broken `-axo pid= comm=` still needs a macOS
@@ -543,6 +543,11 @@ fn parse_ps_pid_ppid_name_line(line: &str) -> Option<(u32, u32, String)> {
     let mut parts = line.split_whitespace();
     let pid = parts.next()?.parse().ok()?;
     let ppid = parts.next()?.parse().ok()?;
+    // Zombies retain ucomm after releasing the executable. They cannot block
+    // replacement, even while the spawning client has not reaped them yet.
+    if parts.next()?.starts_with('Z') {
+        return None;
+    }
     let name = parts.collect::<Vec<_>>().join(" ");
     if name.is_empty() {
         return None;
@@ -1996,7 +2001,9 @@ fn linux_parent_of(pid: u32) -> Option<ParentProcess> {
 #[cfg(target_os = "macos")]
 fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
     let Ok(out) = std::process::Command::new("ps")
-        .args(["-ax", "-o", "pid=", "-o", "ppid=", "-o", "ucomm="])
+        .args([
+            "-ax", "-o", "pid=", "-o", "ppid=", "-o", "state=", "-o", "ucomm=",
+        ])
         .output()
     else {
         return Vec::new();
@@ -3036,16 +3043,16 @@ mod tests {
         );
     }
 
-    /// WS4-1 / WS4-8: pure parse of `ps -o pid= -o ppid= -o ucomm=` rows.
+    /// WS4-1 / WS4-8: pure parse of pid, ppid, state and ucomm rows.
     /// Does not prove the `ps` argv itself - that still needs a macOS smoke.
     #[test]
     fn parse_ps_pid_ppid_name_line_accepts_padded_columns_and_ucomm() {
         assert_eq!(
-            parse_ps_pid_ppid_name_line("  123   1 toolport-gateway"),
+            parse_ps_pid_ppid_name_line("  123   1 S toolport-gateway"),
             Some((123, 1, "toolport-gateway".into()))
         );
         assert_eq!(
-            parse_ps_pid_ppid_name_line("45678 4321 toolport-gateway-1.9.4"),
+            parse_ps_pid_ppid_name_line("45678 4321 R+ toolport-gateway-1.9.4"),
             Some((45678, 4321, "toolport-gateway-1.9.4".into()))
         );
         assert_eq!(parse_ps_pid_ppid_name_line(""), None);
@@ -3061,7 +3068,7 @@ mod tests {
         // Full-path comm= style still parses; basename filter is applied by the caller.
         assert_eq!(
             parse_ps_pid_ppid_name_line(
-                "  42 7 /Applications/Toolport.app/Contents/MacOS/toolport-gateway"
+                "  42 7 S /Applications/Toolport.app/Contents/MacOS/toolport-gateway"
             ),
             Some((
                 42,
@@ -3069,10 +3076,26 @@ mod tests {
                 "/Applications/Toolport.app/Contents/MacOS/toolport-gateway".into()
             ))
         );
-        // A name with spaces survives, since only the first two columns are positional.
+        // A name with spaces survives after the three positional columns.
         assert_eq!(
-            parse_ps_pid_ppid_name_line("5 2 Some App Helper"),
+            parse_ps_pid_ppid_name_line("5 2 S Some App Helper"),
             Some((5, 2, "Some App Helper".into()))
+        );
+    }
+
+    #[test]
+    fn macos_process_inventory_ignores_exited_gateways_before_the_parent_reaps_them() {
+        assert_eq!(
+            parse_ps_pid_ppid_name_line("123 1 Z toolport-gateway"),
+            None
+        );
+        assert_eq!(
+            parse_ps_pid_ppid_name_line("124 1 Z+ toolport-gateway"),
+            None
+        );
+        assert_eq!(
+            parse_ps_pid_ppid_name_line("125 1 T toolport-gateway"),
+            Some((125, 1, "toolport-gateway".into()))
         );
     }
 

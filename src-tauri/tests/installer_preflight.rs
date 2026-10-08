@@ -142,9 +142,17 @@ fn idle_daemon_exits_gracefully_before_installation() {
             "--installer-preflight",
             installed.parent().unwrap().to_str().unwrap(),
         ])
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
         .unwrap();
-    assert!(status.success());
+    assert!(
+        status.status.success(),
+        "idle preflight failed: {}; {}; daemon status: {:?}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr),
+        daemon.0.try_wait().unwrap()
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = daemon.0.try_wait().unwrap() {
