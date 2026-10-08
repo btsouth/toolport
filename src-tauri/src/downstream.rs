@@ -2169,12 +2169,15 @@ pub trait Transport: Send {
     fn concurrent(&self) -> Option<Arc<dyn ConcurrentTransport>> {
         None
     }
-    /// Inspect shared state without constructing a per-call transport snapshot.
+    /// Transports with direct shared-state getters avoid constructing a snapshot.
+    /// Keep the concurrent-handle fallback for other multiplexed transports.
     fn connection_closed(&self) -> Option<bool> {
-        None
+        self.concurrent().map(|transport| transport.is_closed())
     }
     fn suspended_calls(&self) -> usize {
-        0
+        self.concurrent()
+            .map(|transport| transport.suspended_calls())
+            .unwrap_or(0)
     }
 }
 
