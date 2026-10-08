@@ -2968,23 +2968,35 @@ fn resolve_conduit_dir() -> (Option<PathBuf>, DirResolution) {
             return (Some(p), DirResolution::Direct);
         }
     }
+    // Unit tests must never fall through to the developer's data directory. Binary
+    // fixtures compiled with test-support may supply an explicit directory instead.
+    #[cfg(test)]
+    panic!("data directory resolved without DataDirOverride; hold data_dir_test_lock and install a scratch override");
+    #[cfg(all(feature = "test-support", not(test)))]
+    assert!(
+        crate::brand::env_var("TOOLPORT_DATA_DIR", "CONDUIT_DATA_DIR").is_some(),
+        "data directory resolved without DataDirOverride or an explicit fixture directory"
+    );
+    #[cfg(not(test))]
     {
-        let cached = DATA_DIR_RESOLVED
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((path, resolution)) = cached.as_ref() {
-            // Re-resolve when the cached path was removed (e.g. legacy leaf renamed).
-            let still_valid = path.as_ref().map(|p| p.exists()).unwrap_or(true);
-            if still_valid {
-                return (path.clone(), *resolution);
+        {
+            let cached = DATA_DIR_RESOLVED
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((path, resolution)) = cached.as_ref() {
+                // Re-resolve when the cached path was removed (e.g. legacy leaf renamed).
+                let still_valid = path.as_ref().map(|p| p.exists()).unwrap_or(true);
+                if still_valid {
+                    return (path.clone(), *resolution);
+                }
             }
         }
+        let fresh = compute_conduit_dir();
+        *DATA_DIR_RESOLVED
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fresh.clone());
+        fresh
     }
-    let fresh = compute_conduit_dir();
-    *DATA_DIR_RESOLVED
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fresh.clone());
-    fresh
 }
 
 static DATA_DIR_RESOLVED: std::sync::RwLock<Option<(Option<PathBuf>, DirResolution)>> =
@@ -6484,7 +6496,6 @@ pub(crate) mod tests {
             }
             std::fs::rename(from, to)
         }
-
     }
 
     fn atomic_temp_files(path: &Path) -> Vec<PathBuf> {
