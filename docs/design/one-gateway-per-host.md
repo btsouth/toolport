@@ -361,3 +361,10 @@ delivery shape is four implementation phases plus dogfood, with Phase 1 carrying
 the correctness refactor and Phases 2-3 carrying most of the process/lifecycle risk. The
 work should not be estimated as complete until the cross-session isolation matrix and
 real-machine process-count acceptance run exist.
+
+Abandoned calls cancel their downstream work and withdraw pending approvals. Legacy HTTP
+cancellation targets its MCP session; sessionless HTTP cancellation targets only the same
+connection, never other processes sharing a bearer token. The HTTP ingress treats a client
+write-half-close as abandonment, so callers must keep both halves open until the response
+completes. Private adapters retain cancellation across rounds through a lifetime stream;
+if that stream is unavailable they continue serving and retry tracking on their heartbeat.

@@ -498,7 +498,19 @@ pub fn try_decide_once(
     desc: Option<EndpointDescriptor>,
     req: &mut ApprovalRequest,
 ) -> BrokerAttempt {
+    try_decide_once_with_cancel(desc, req, None)
+}
+
+/// Preserve broker outcome and retry semantics while withdrawing a cancelled call.
+pub fn try_decide_once_with_cancel(
+    desc: Option<EndpointDescriptor>,
+    req: &mut ApprovalRequest,
+    cancel: Option<&crate::downstream::CancelContext>,
+) -> BrokerAttempt {
     use std::io::{BufRead, BufReader, Write};
+    if cancel.is_some_and(crate::downstream::CancelContext::is_cancelled) {
+        return BrokerAttempt::Decided(ApprovalDecision::Denied);
+    }
     let Some(desc) = desc else {
         return BrokerAttempt::Unreachable;
     };
@@ -508,6 +520,24 @@ pub fn try_decide_once(
     let Ok(mut stream) = dial_broker(&desc) else {
         return BrokerAttempt::Unreachable;
     };
+    let withdrawal = match stream.try_clone() {
+        Ok(stream) => stream,
+        Err(_) => return BrokerAttempt::Unreachable,
+    };
+    let _withdraw = cancel.map(|cancel| {
+        cancel.on_cancel(std::sync::Arc::new(move |_| match &withdrawal {
+            BrokerStream::Tcp(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            #[cfg(unix)]
+            BrokerStream::Unix(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }))
+    });
+    if cancel.is_some_and(crate::downstream::CancelContext::is_cancelled) {
+        return BrokerAttempt::Decided(ApprovalDecision::Denied);
+    }
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_read_timeout(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)));
     let Ok(line) = serde_json::to_string(req) else {

@@ -1033,17 +1033,15 @@ pub struct CancelRegistry {
     inner: Arc<Mutex<CancelState>>,
 }
 
+type CancelCallback = Arc<dyn Fn(Option<String>) + Send + Sync>;
+
 #[derive(Default)]
 struct CancelState {
     active: HashSet<String>,
-    cancelled: HashMap<String, CancelledRequest>,
-    in_flight: HashMap<String, CancelEntry>,
-}
-
-#[derive(Clone, Default)]
-struct CancelledRequest {
-    reason: Option<String>,
-    forwarded: bool,
+    cancelled: HashMap<String, Option<String>>,
+    hooks: HashMap<String, HashMap<u64, CancelCallback>>,
+    next_hook: u64,
+    closed: bool,
 }
 
 #[derive(Clone)]
@@ -1054,9 +1052,10 @@ struct CancelEntry {
     /// cancelled call stops waiting instead of holding its thread until the read
     /// timeout. `None` when nothing waits (a suspended legacy MRTR request).
     waiter: Option<Weak<StdioCore>>,
+    forwarded: Arc<AtomicBool>,
 }
 
-/// Cancellation context for one proxied client request.
+/// Cancellation follows the owned call, including suspended multi-round trips.
 #[derive(Clone)]
 pub struct CancelContext {
     client_request_id: String,
@@ -1064,12 +1063,9 @@ pub struct CancelContext {
 }
 
 impl CancelContext {
-    /// Whether the upstream client has cancelled this request.
-    ///
-    /// Request handlers that are waiting before a downstream request is registered (for
-    /// example, a resource-subscription single-flight follower) use this to stop occupying a
-    /// worker as soon as the caller gives up. Once a downstream request exists, the registry's
-    /// normal forwarding path still sends `notifications/cancelled` to that server.
+    pub fn request_key(&self) -> String {
+        self.client_request_id.clone()
+    }
     pub fn is_cancelled(&self) -> bool {
         self.registry.is_cancelled(&self.client_request_id)
     }
@@ -1081,13 +1077,54 @@ impl CancelContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .cancelled
             .get(&self.client_request_id)
-            .and_then(|cancelled| cancelled.reason.clone())
+            .cloned()
+            .flatten()
+    }
+
+    /// Keep an owned resource cancellable after its upstream round returns.
+    pub fn on_cancel(&self, callback: CancelCallback) -> CancelGuard {
+        let (key, cancelled) = {
+            let mut state = self
+                .registry
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.next_hook += 1;
+            let key = state.next_hook;
+            let cancelled = if state.closed || state.cancelled.contains_key(&self.client_request_id)
+            {
+                Some(
+                    state
+                        .cancelled
+                        .get(&self.client_request_id)
+                        .cloned()
+                        .flatten(),
+                )
+            } else {
+                None
+            };
+            state
+                .hooks
+                .entry(self.client_request_id.clone())
+                .or_default()
+                .insert(key, callback.clone());
+            (key, cancelled)
+        };
+        if let Some(reason) = cancelled {
+            callback(reason);
+        }
+        CancelGuard {
+            client_request_id: self.client_request_id.clone(),
+            registry: self.registry.clone(),
+            key,
+        }
     }
 }
 
-struct CancelGuard {
+pub struct CancelGuard {
     client_request_id: String,
     registry: CancelRegistry,
+    key: u64,
 }
 
 impl CancelRegistry {
@@ -1100,9 +1137,10 @@ impl CancelRegistry {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.active.contains(&client_request_id) {
+        if state.closed || state.active.contains(&client_request_id) {
             return false;
         }
+        state.cancelled.remove(&client_request_id);
         state.active.insert(client_request_id);
         true
     }
@@ -1113,8 +1151,9 @@ impl CancelRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.active.remove(client_request_id);
-        state.cancelled.remove(client_request_id);
-        state.in_flight.remove(client_request_id);
+        if !state.hooks.contains_key(client_request_id) {
+            state.cancelled.remove(client_request_id);
+        }
     }
 
     pub fn context(&self, client_request_id: String) -> CancelContext {
@@ -1124,101 +1163,144 @@ impl CancelRegistry {
         }
     }
 
-    /// Mark an active client request as cancelled and, if it has already reached a
-    /// stdio downstream, forward `notifications/cancelled` with that downstream id.
-    /// Returns true when the referenced client request is still active.
     pub fn cancel(&self, client_request_id: &str, reason: Option<&str>) -> bool {
-        let forward = {
+        let (hooks, reason) = {
             let mut state = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !state.active.contains(client_request_id) {
+            if !state.active.contains(client_request_id)
+                && !state.hooks.contains_key(client_request_id)
+            {
                 return false;
             }
-            let reason = normalize_cancel_reason(reason);
-            let cancelled = state
-                .cancelled
-                .entry(client_request_id.to_string())
-                .or_default();
-            if reason.is_some() {
-                cancelled.reason = reason;
+            if state.cancelled.contains_key(client_request_id) {
+                return true;
             }
-            prepare_cancel_forward(&mut state, client_request_id)
+            let reason = normalize_cancel_reason(reason);
+            state
+                .cancelled
+                .insert(client_request_id.to_string(), reason.clone());
+            let hooks = state
+                .hooks
+                .get(client_request_id)
+                .map(|hooks| hooks.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            (hooks, reason)
         };
-        if let Some((entry, reason)) = forward {
-            entry.send_cancel_async(reason);
+        for hook in hooks {
+            hook(reason.clone());
         }
         true
     }
 
-    pub fn is_cancelled(&self, client_request_id: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cancelled
-            .contains_key(client_request_id)
-    }
-
-    fn forward_cancel_if_ready(&self, client_request_id: &str) {
-        let forward = {
+    /// Closing is terminal: even a worker arriving after close cannot dispatch.
+    pub fn close(&self) {
+        let hooks = {
             let mut state = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            prepare_cancel_forward(&mut state, client_request_id)
+            if state.closed {
+                return;
+            }
+            state.closed = true;
+            let ids = state
+                .active
+                .iter()
+                .chain(state.hooks.keys())
+                .cloned()
+                .collect::<HashSet<_>>();
+            let mut hooks = Vec::new();
+            for id in ids {
+                if state.cancelled.contains_key(&id) {
+                    continue;
+                }
+                state
+                    .cancelled
+                    .insert(id.clone(), Some("upstream caller disconnected".into()));
+                if let Some(owned) = state.hooks.get(&id) {
+                    hooks.extend(owned.values().cloned());
+                }
+            }
+            hooks
         };
-        if let Some((entry, reason)) = forward {
-            entry.send_cancel_async(reason);
+        for hook in hooks {
+            hook(Some("upstream caller disconnected".into()));
         }
     }
 
-    fn register(&self, client_request_id: String, entry: CancelEntry) -> CancelGuard {
-        let mut state = self
+    pub fn is_cancelled(&self, client_request_id: &str) -> bool {
+        let state = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.in_flight.insert(client_request_id.clone(), entry);
-        if let Some(cancelled) = state.cancelled.get_mut(&client_request_id) {
-            cancelled.forwarded = false;
-        }
-        CancelGuard {
-            client_request_id,
-            registry: self.clone(),
-        }
+        state.closed || state.cancelled.contains_key(client_request_id)
+    }
+
+    fn register(&self, client_request_id: String, entry: CancelEntry) -> CancelGuard {
+        self.context(client_request_id)
+            .on_cancel(Arc::new(move |reason| entry.send_cancel_async(reason)))
     }
 }
 
-/// Cap on concurrently-forwarding cancellation threads. The forward is a best-effort
-/// `writeln!` to the child's stdin, which blocks if the child isn't draining its pipe.
-/// Without a cap, repeated cancellation of a wedged downstream would leak one blocked
-/// thread per cancel; past the cap we drop the notification instead.
-static CANCEL_THREADS_INFLIGHT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+/// Forwards must never block a drain thread or disappear when writers are busy.
+/// At most 64 writers run; excess work queues until one finishes. Each queued
+/// cancel owns one existing in-flight request, rather than another blocked thread.
+type ForwardWork = Box<dyn FnOnce() + Send>;
+#[derive(Default)]
+struct ForwardQueue {
+    active: usize,
+    pending: VecDeque<ForwardWork>,
+}
 const MAX_CANCEL_THREADS: usize = 64;
+
+fn enqueue_forward(work: ForwardWork) {
+    static QUEUE: OnceLock<Mutex<ForwardQueue>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(Mutex::default);
+    let mut state = queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.active >= MAX_CANCEL_THREADS {
+        state.pending.push_back(work);
+        return;
+    }
+    state.active += 1;
+    drop(state);
+    std::thread::spawn(move || {
+        let mut work = work;
+        loop {
+            work();
+            let mut state = queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match state.pending.pop_front() {
+                Some(next) => {
+                    work = next;
+                }
+                None => {
+                    state.active -= 1;
+                    break;
+                }
+            }
+        }
+    });
+}
 
 impl CancelEntry {
     fn send_cancel_async(&self, reason: Option<String>) {
+        if self.forwarded.swap(true, Ordering::SeqCst) {
+            return;
+        }
         if let Some(core) = self.waiter.as_ref().and_then(Weak::upgrade) {
             core.cancel_waiter(&self.downstream_id);
         }
-        // Reserve a slot; if too many forwards are already blocked (a downstream that
-        // stopped draining its stdin), drop this one rather than leak another thread.
-        if CANCEL_THREADS_INFLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_CANCEL_THREADS {
-            CANCEL_THREADS_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
-            eprintln!(
-                "toolport: dropping cancellation forward (>{MAX_CANCEL_THREADS} already blocked; \
-                 downstream not draining stdin)"
-            );
-            return;
-        }
         let entry = self.clone();
-        std::thread::spawn(move || {
+        enqueue_forward(Box::new(move || {
             if let Err(err) = entry.send_cancel(reason.as_deref()) {
                 eprintln!("toolport: failed to forward cancellation downstream: {err}");
             }
-            CANCEL_THREADS_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
-        });
+        }));
     }
 
     fn send_cancel(&self, reason: Option<&str>) -> Result<(), String> {
@@ -1247,27 +1329,24 @@ fn normalize_cancel_reason(reason: Option<&str>) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
-fn prepare_cancel_forward(
-    state: &mut CancelState,
-    client_request_id: &str,
-) -> Option<(CancelEntry, Option<String>)> {
-    let cancelled = state.cancelled.get_mut(client_request_id)?;
-    if cancelled.forwarded {
-        return None;
-    }
-    let entry = state.in_flight.get(client_request_id)?.clone();
-    cancelled.forwarded = true;
-    Some((entry, cancelled.reason.clone()))
-}
-
 impl Drop for CancelGuard {
     fn drop(&mut self) {
-        self.registry
+        let mut state = self
+            .registry
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .in_flight
-            .remove(&self.client_request_id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(hooks) = state.hooks.get_mut(&self.client_request_id) {
+            hooks.remove(&self.key);
+            if hooks.is_empty() {
+                state.hooks.remove(&self.client_request_id);
+            }
+        }
+        if !state.active.contains(&self.client_request_id)
+            && !state.hooks.contains_key(&self.client_request_id)
+        {
+            state.cancelled.remove(&self.client_request_id);
+        }
     }
 }
 
@@ -3236,6 +3315,8 @@ struct SuspendedLegacyMrtr {
     /// Client context of the suspended call, which owns the server requests
     /// queued for it.
     owner: Option<String>,
+    _cancel_guard: Option<CancelGuard>,
+    forwarded: Arc<AtomicBool>,
 }
 
 /// How a request relates to the suspended legacy MRTR requests.
@@ -3250,6 +3331,7 @@ enum Continuation {
         downstream_id: Value,
         response: Value,
         rx: Receiver<Delivery>,
+        forwarded: Arc<AtomicBool>,
     },
 }
 
@@ -3498,16 +3580,17 @@ impl StdioCore {
         });
         // A legacy connection has no downstream requestState of its own, so one
         // here can only be ours; never replay the call for an unknown one.
-        let (downstream_id, outbound, rx) =
+        let (downstream_id, outbound, rx, forwarded) =
             match self.continuation(method, &params, protocol.is_none())? {
                 Continuation::StillWaiting(input_required) => return Ok(input_required),
                 Continuation::Resume {
                     downstream_id,
                     response,
                     rx,
+                    forwarded,
                 } => {
                     self.resume(&downstream_id);
-                    (downstream_id, response, rx)
+                    (downstream_id, response, rx, forwarded)
                 }
                 Continuation::Fresh => {
                     let downstream_id = json!(self.next_id.fetch_add(1, Ordering::SeqCst));
@@ -3519,7 +3602,7 @@ impl StdioCore {
                         "method": method,
                         "params": params
                     });
-                    (downstream_id, request, rx)
+                    (downstream_id, request, rx, Arc::new(AtomicBool::new(false)))
                 }
             };
         let waiter = WaiterGuard {
@@ -3529,38 +3612,42 @@ impl StdioCore {
         };
 
         // A broken stdin pipe means the child is gone: a health failure, not a protocol error.
-        let mut cancel_after_write = None;
-        let cancel_guard;
+        if cancel.as_ref().is_some_and(CancelContext::is_cancelled) {
+            return Err(TransportError::Cancelled(
+                "caller left before dispatch".into(),
+            ));
+        }
         {
             let mut stdin = self
                 .stdin
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cancel_guard = cancel.map(|ctx| {
-                let guard = ctx.registry.register(
-                    ctx.client_request_id.clone(),
-                    CancelEntry {
-                        stdin: Arc::clone(&self.stdin),
-                        downstream_id: downstream_id.clone(),
-                        waiter: Some(Arc::downgrade(self)),
-                    },
-                );
-                cancel_after_write = Some(ctx);
-                guard
-            });
             writeln!(stdin, "{outbound}")
                 .map_err(|e| TransportError::Unavailable(e.to_string()))?;
             stdin
                 .flush()
                 .map_err(|e| TransportError::Unavailable(e.to_string()))?;
         }
-        if let Some(ctx) = cancel_after_write {
-            if ctx.registry.is_cancelled(&ctx.client_request_id) {
-                ctx.registry.forward_cancel_if_ready(&ctx.client_request_id);
-            }
-        }
-        let _cancel_guard = cancel_guard;
-        self.wait(waiter, rx, method, &params, timeout)
+        let cancel_guard = cancel.map(|ctx| {
+            ctx.registry.register(
+                ctx.client_request_id.clone(),
+                CancelEntry {
+                    stdin: Arc::clone(&self.stdin),
+                    downstream_id: downstream_id.clone(),
+                    waiter: Some(Arc::downgrade(self)),
+                    forwarded: forwarded.clone(),
+                },
+            )
+        });
+        self.wait(
+            waiter,
+            rx,
+            method,
+            &params,
+            timeout,
+            cancel_guard,
+            forwarded,
+        )
     }
 
     /// Wait for this request's response, handling server requests attributed to
@@ -3573,6 +3660,8 @@ impl StdioCore {
         method: &str,
         params: &Value,
         timeout: Duration,
+        cancel_guard: Option<CancelGuard>,
+        forwarded: Arc<AtomicBool>,
     ) -> Result<Value, TransportError> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -3621,8 +3710,23 @@ impl StdioCore {
                                     return Err(e);
                                 }
                             };
+                            if !self
+                                .lock_state()
+                                .pending
+                                .contains_key(&waiter_key(&waiter.downstream_id))
+                            {
+                                self.refuse(&value, CALL_ENDED);
+                                return Err(TransportError::Cancelled(
+                                    "caller left during input request".into(),
+                                ));
+                            }
                             let result = pending.input_required();
-                            self.suspend(&mut waiter, pending, rx);
+                            if !self.suspend(&mut waiter, pending, rx, cancel_guard, forwarded) {
+                                self.refuse(&value, CALL_ENDED);
+                                return Err(TransportError::Cancelled(
+                                    "caller left during input request".into(),
+                                ));
+                            }
                             return Ok(result);
                         }
                         None => {}
@@ -3710,6 +3814,7 @@ impl StdioCore {
                     downstream_id: suspended.pending.downstream_request_id,
                     response,
                     rx: suspended.rx,
+                    forwarded: suspended.forwarded,
                 })
             }
         }
@@ -3865,10 +3970,18 @@ impl StdioCore {
         waiter: &mut WaiterGuard<'_>,
         pending: PendingLegacyMrtr,
         rx: Receiver<Delivery>,
-    ) {
-        waiter.armed = false;
+        cancel_guard: Option<CancelGuard>,
+        forwarded: Arc<AtomicBool>,
+    ) -> bool {
         let evicted = {
             let mut state = self.lock_state();
+            if !state
+                .pending
+                .contains_key(&waiter_key(&waiter.downstream_id))
+            {
+                return false;
+            }
+            waiter.armed = false;
             let mut owner = None;
             if let Some(entry) = state.pending.get_mut(&waiter_key(&waiter.downstream_id)) {
                 entry.active = false;
@@ -3879,6 +3992,8 @@ impl StdioCore {
                 rx,
                 since: Instant::now(),
                 owner,
+                _cancel_guard: cancel_guard,
+                forwarded,
             });
             let overflow = state
                 .suspended
@@ -3898,6 +4013,7 @@ impl StdioCore {
                 Some("Toolport dropped an unanswered input request".to_string()),
             );
         }
+        true
     }
 
     /// A suspended request no retry will resume; its waiter is already gone.
@@ -3909,6 +4025,7 @@ impl StdioCore {
             stdin: Arc::clone(&self.stdin),
             downstream_id: suspended.pending.downstream_request_id.clone(),
             waiter: None,
+            forwarded: suspended.forwarded.clone(),
         }
         .send_cancel_async(reason);
         self.refuse(&suspended.pending.server_request, CALL_ENDED);
@@ -3970,15 +4087,24 @@ impl StdioCore {
 
     /// The client cancelled: stop waiting now. A late response is dropped.
     fn cancel_waiter(&self, downstream_id: &Value) {
-        let (waiter, orphaned) = {
+        let (waiter, orphaned, suspended) = {
             let mut state = self.lock_state();
+            let suspended = state
+                .suspended
+                .iter()
+                .position(|entry| entry.pending.downstream_request_id == *downstream_id)
+                .map(|index| state.suspended.remove(index));
             let waiter = state.pending.remove(&waiter_key(downstream_id));
             let owner = waiter
                 .as_ref()
                 .and_then(|waiter| waiter.context.client().map(str::to_string));
             let orphaned = state.take_orphaned(owner.as_deref());
-            (waiter, orphaned)
+            (waiter, orphaned, suspended)
         };
+        if let Some(suspended) = suspended {
+            self.refuse(&suspended.pending.server_request, CALL_ENDED);
+            self.drain_deliveries(&suspended.rx, suspended.owner.as_deref());
+        }
         if let Some(waiter) = waiter {
             let _ = waiter.tx.send(Delivery::Cancelled);
         }
@@ -4110,19 +4236,13 @@ impl StdioCore {
             "id": request.get("id").cloned().unwrap_or(Value::Null),
             "error": { "code": JSONRPC_INTERNAL_ERROR, "message": message }
         });
-        if CANCEL_THREADS_INFLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_CANCEL_THREADS {
-            CANCEL_THREADS_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
-            return;
-        }
         let stdin = Arc::clone(&self.stdin);
-        std::thread::spawn(move || {
+        enqueue_forward(Box::new(move || {
             let mut stdin = stdin
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = writeln!(stdin, "{reply}").and_then(|()| stdin.flush());
-            drop(stdin);
-            CANCEL_THREADS_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
-        });
+        }));
     }
 
     fn is_closed(&self) -> bool {
@@ -5708,6 +5828,8 @@ impl ConcurrentTransport for HttpCallTransport {
                         Box::new(std::io::Cursor::new(Vec::<u8>::new())),
                     ),
                     bytes_read: request.bytes_read,
+                    cancel_guard: request.cancel_guard.take(),
+                    cancel_signal: request.cancel_signal.take(),
                 });
                 false
             });
@@ -5716,6 +5838,8 @@ impl ConcurrentTransport for HttpCallTransport {
                 // continuation proof. A sessionless retry has a new context nonce.
                 if let Some((since, request)) = pending.remove(token) {
                     suspended_since = Some(since);
+                    let mut request = request;
+                    request.cancel_guard.take();
                     owned.pending_mrtr = Some(request);
                 } else if !owned.is_modern() {
                     continuation_error = Some(TransportError::Rpc(json!({"code":-32602,
@@ -5745,9 +5869,56 @@ impl ConcurrentTransport for HttpCallTransport {
             owned.next_id = Arc::new(AtomicI64::new(id));
             json!(id)
         };
-        let signal = cancel
-            .clone()
-            .map(|cancel| HttpCancelSignal::new(cancel, owned.pending_mrtr.is_some()));
+        let signal = cancel.clone().map(|cancel| {
+            let mut signal = HttpCancelSignal::new(cancel, owned.pending_mrtr.is_some());
+            if let Some(previous) = owned
+                .pending_mrtr
+                .as_ref()
+                .and_then(|pending| pending.cancel_signal.as_ref())
+            {
+                signal.state = previous.state.clone();
+            }
+            signal
+        });
+        let cancel_guard = signal.as_ref().map(|signal| {
+            let signal = signal.clone();
+            let id = downstream_id.clone();
+            let weak = Arc::downgrade(&shared);
+            let mut shell = owned.request_shell();
+            shell.concurrency = Arc::new(HttpConcurrency::default());
+            let shell = Mutex::new(shell);
+            cancel.as_ref().unwrap().on_cancel(Arc::new(move |_| {
+                if signal.cancel() {
+                    shell
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .forward_cancel_async(id.clone(), &signal.context);
+                }
+                if let Some(shared) = weak.upgrade() {
+                    let retired = {
+                        let mut pending = shared
+                            .pending
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let token = pending
+                            .iter()
+                            .find(|(_, (_, p))| p.common.downstream_request_id == id)
+                            .map(|(token, _)| token.clone());
+                        token.and_then(|token| pending.remove(&token))
+                    };
+                    if let Some((_, request)) = retired {
+                        let mut shell = shell
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .request_shell();
+                        std::thread::spawn(move || {
+                            shell.pending_mrtr = Some(request);
+                            shell.retire_http_pending();
+                        });
+                    }
+                }
+            }))
+        });
         let worker_signal = signal.clone();
         let handler = owned.server_handler.clone();
         let cancellation_shell = owned.request_shell();
@@ -5851,13 +6022,16 @@ impl ConcurrentTransport for HttpCallTransport {
                             "HTTP request cancelled by upstream client".into(),
                         ));
                     }
-                    if let Some(request) = outcome.transport.pending_mrtr.take() {
+                    if let Some(mut request) = outcome.transport.pending_mrtr.take() {
+                        request.cancel_guard = cancel_guard;
+                        request.cancel_signal = signal.clone();
                         let mut pending = shared
                             .pending
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if pending.len() >= MAX_SUSPENDED_LEGACY_MRTR
                             || shared.closed.load(Ordering::SeqCst)
+                            || signal.as_ref().is_some_and(HttpCancelSignal::is_cancelled)
                         {
                             drop(pending);
                             outcome.transport.pending_mrtr = Some(request);
@@ -5983,6 +6157,8 @@ struct PendingHttpMrtr {
     common: PendingLegacyMrtr,
     reader: Box<dyn BufRead + Send>,
     bytes_read: u64,
+    cancel_guard: Option<CancelGuard>,
+    cancel_signal: Option<HttpCancelSignal>,
 }
 
 impl HttpTransport {
@@ -6861,6 +7037,8 @@ impl HttpTransport {
                             common,
                             reader,
                             bytes_read,
+                            cancel_guard: None,
+                            cancel_signal: None,
                         });
                         return Ok(Some(json!({
                             "jsonrpc": "2.0",
@@ -11083,6 +11261,8 @@ mod tests {
                     common,
                     reader: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
                     bytes_read: 0,
+                    cancel_guard: None,
+                    cancel_signal: None,
                 },
             ),
         );
@@ -11407,8 +11587,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cancelled = state.cancelled.get("7").expect("cancelled state");
-        assert_eq!(cancelled.reason.as_deref(), Some("too slow"));
-        assert!(!cancelled.forwarded);
+        assert_eq!(cancelled.as_deref(), Some("too slow"));
     }
 
     /// A real child process that records everything written to its stdin, so a
@@ -12143,6 +12322,192 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn p08_stdio_finished_round_remains_cancellable_until_suspended_call_ends() {
+        let fixture = CoreFixture::new("abandoned-suspended", "");
+        *fixture.core.server_handler.lock().unwrap() =
+            Some(Arc::new(|_| Some(ServerRequestAction::InputRequired)));
+        let registry = CancelRegistry::new();
+        assert!(registry.begin_client_request("suspended".into()));
+        let first = fixture.request(
+            "a",
+            json!({"name":"interactive", "arguments":{}}),
+            Some(registry.context("suspended".into())),
+        );
+        fixture.wait_for_pending(1);
+        fixture.server_says(server_request("input", "elicitation/create"));
+        let held = first.join().unwrap().unwrap();
+        assert_eq!(held["resultType"], "input_required");
+        registry.finish_client_request("suspended");
+        assert!(
+            registry.cancel("suspended", Some("caller left")),
+            "finished rounds must retain ownership"
+        );
+        registry.close();
+        assert!(fixture.core.lock_state().suspended.is_empty());
+        let next = fixture.request("b", json!({"name":"other"}), None);
+        fixture.wait_for_pending(1);
+        fixture.server_says(response(2, json!({"other":true})));
+        assert_eq!(next.join().unwrap().unwrap()["other"], true);
+        let retry = fixture.request("a", json!({"name":"interactive", "arguments":{}, "requestState":held["requestState"], "inputResponses":{"input":{"action":"accept"}}}), None);
+        assert!(
+            retry.join().unwrap().is_err(),
+            "late Allow must not resume the abandoned call"
+        );
+        let frames = fixture.finish();
+        let cancellations: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame["method"] == "notifications/cancelled")
+            .collect();
+        assert_eq!(cancellations.len(), 1, "{frames:?}");
+        assert_eq!(cancellations[0]["params"]["requestId"], 1);
+        assert!(frames.iter().any(|frame| refused(frame, "input")));
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["method"] == "tools/call")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn p08_http_suspended_call_is_cancelled_once_and_other_callers_continue() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+        fn read_request(stream: &mut TcpStream) -> Value {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut original, _) = listener.accept().unwrap();
+            let original_request = read_request(&mut original);
+            let data = "data: {\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"elicitation/create\",\"params\":{\"message\":\"Continue?\"}}\n\n";
+            write!(original, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{data}\r\n", data.len()).unwrap();
+            original.flush().unwrap();
+            let mut frames = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                frames.push(read_request(&mut stream));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+            }
+            seen_tx.send((original_request, frames)).unwrap();
+            let (mut next, _) = listener.accept().unwrap();
+            let request = read_request(&mut next);
+            let response =
+                json!({"jsonrpc":"2.0","id":request["id"],"result":{"other":true}}).to_string();
+            write!(next, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+        });
+        let mut transport = HttpTransport::new(&url);
+        transport.server_handler = Some(Arc::new(|_| Some(ServerRequestAction::InputRequired)));
+        let handle = transport.concurrent().unwrap();
+        let registry = CancelRegistry::new();
+        assert!(registry.begin_client_request("held".into()));
+        let held = handle
+            .request_with_cancel(
+                "tools/call",
+                json!({"name":"interactive","arguments":{}}),
+                Some(registry.context("held".into())),
+            )
+            .unwrap();
+        assert_eq!(held["resultType"], "input_required");
+        registry.finish_client_request("held");
+        registry.close();
+        registry.close();
+        let (original, frames) = seen_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let cancels: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame["method"] == "notifications/cancelled")
+            .collect();
+        assert_eq!(cancels.len(), 1, "{frames:?}");
+        assert_eq!(cancels[0]["params"]["requestId"], original["id"]);
+        assert!(frames
+            .iter()
+            .any(|frame| frame["id"] == 99 && frame.get("error").is_some()));
+        assert_eq!(handle.suspended_calls(), 0);
+        let retry = handle.request_with_cancel("tools/call", json!({"name":"interactive","arguments":{},"requestState":held["requestState"],"inputResponses":{}}), None);
+        assert!(
+            retry.is_err(),
+            "late Allow cannot resume or repost the call"
+        );
+        assert_eq!(
+            handle
+                .request_with_cancel("tools/call", json!({"name":"other"}), None)
+                .unwrap()["other"],
+            true
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn p08_closing_owner_cancels_each_blocked_stdio_call_once() {
+        let fixture = CoreFixture::new("cancel-owner", "");
+        let registry = CancelRegistry::new();
+        let mut workers = Vec::new();
+        for id in ["one", "two"] {
+            assert!(registry.begin_client_request(id.into()));
+            workers.push(fixture.request(
+                "a",
+                json!({"name":id}),
+                Some(registry.context(id.into())),
+            ));
+        }
+        fixture.wait_for_pending(2);
+        for name in ["one", "two"] {
+            fixture.wait_for_frame("tools/call written", |frame| {
+                frame["method"] == "tools/call" && frame["params"]["name"] == name
+            });
+        }
+        registry.close();
+        registry.close();
+        for worker in workers {
+            assert!(matches!(
+                worker.join().unwrap(),
+                Err(TransportError::Cancelled(_))
+            ));
+        }
+        let next = fixture.request("b", json!({"name":"other"}), None);
+        fixture.wait_for_pending(1);
+        fixture.server_says(response(3, json!({"other":true})));
+        assert_eq!(next.join().unwrap().unwrap()["other"], true);
+        let frames = fixture.finish();
+        for id in [1, 2] {
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame["method"] == "notifications/cancelled"
+                        && frame["params"]["requestId"] == id)
+                    .count(),
+                1,
+                "{frames:?}"
+            );
+        }
+    }
+
+    #[test]
     fn stdio_cancellation_wakes_the_waiter_and_drops_the_late_response() {
         let fixture = CoreFixture::new("cancel-wakes", "");
         let registry = CancelRegistry::new();
@@ -12641,71 +13006,107 @@ for line in sys.stdin:
         assert_eq!(answered, [&json!("elicit-2"), &json!("elicit-1")]);
     }
 
-    /// SBS-644. The cancel-before-registration race: the client cancels while the
-    /// request is still on its way to the child, so `cancel` finds nothing in
-    /// flight and can only record the mark. The `notifications/cancelled` write
-    /// has to happen afterwards, from the request path itself, once the
-    /// downstream id exists. Driven through the real `request_with_cancel` and
-    /// asserted on the bytes that reached stdin - the registry agreeing with
-    /// itself was never the claim, the frame on the wire is.
-    ///
-    /// The interleaving is forced, not raced: the cancel is issued before the
-    /// request begins, which is exactly the ordering that produces the bug.
+    /// A call cancelled before dispatch has no downstream request to cancel.
     #[test]
-    fn cancel_before_registration_is_forwarded_once_the_request_is_written() {
+    fn pre_cancelled_stdio_call_does_not_reach_downstream() {
         let registry = CancelRegistry::new();
-        assert!(registry.begin_client_request("c-1".to_string()));
-        // Nothing is in flight yet, so this can only leave the mark behind.
+        assert!(registry.begin_client_request("c-1".into()));
         assert!(registry.cancel("c-1", Some("user pressed stop")));
-
-        let recorder = StdinRecorder::new("deferred");
+        let recorder = StdinRecorder::new("pre-cancelled");
         let mut transport = stdio_transport_fixture(
             Arc::clone(&recorder.stdin),
-            &json!({ "jsonrpc": "2.0", "id": 1, "result": { "ok": true } }),
+            &json!({"jsonrpc":"2.0","id":1,"result":{}}),
         );
-
-        // The deferred forward also wakes the waiter, so the call may end as
-        // cancelled before the queued response arrives. Either way the frames
-        // below are what reached the child.
-        match transport.request_with_cancel(
-            "tools/call",
-            json!({ "name": "echo" }),
-            Some(registry.context("c-1".to_string())),
-        ) {
-            Ok(_) | Err(TransportError::Cancelled(_)) => {}
-            Err(other) => panic!("unexpected result: {other}"),
-        }
-
+        assert!(matches!(
+            transport.request_with_cancel(
+                "tools/call",
+                json!({"name":"echo"}),
+                Some(registry.context("c-1".into()))
+            ),
+            Err(TransportError::Cancelled(_))
+        ));
         registry.finish_client_request("c-1");
         drop(transport);
+        assert!(recorder.finish().is_empty());
+    }
 
+    #[test]
+    fn cancel_before_registration_is_forwarded_once_the_request_is_written() {
+        use std::io::Write;
+        let registry = CancelRegistry::new();
+        assert!(registry.begin_client_request("between".into()));
+        let recorder = StdinRecorder::new("between-write-registration");
+        {
+            let mut stdin = recorder.stdin.lock().unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                json!({"jsonrpc":"2.0", "id":41, "method":"tools/call", "params":{}})
+            )
+            .unwrap();
+            stdin.flush().unwrap();
+        }
+        assert!(registry.cancel("between", Some("stop")));
+        let guard = registry.register(
+            "between".into(),
+            super::CancelEntry {
+                stdin: recorder.stdin.clone(),
+                downstream_id: json!(41),
+                waiter: None,
+                forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        registry.cancel("between", None);
+        drop(guard);
         let frames = recorder.finish();
-        assert_eq!(
-            frames.len(),
-            2,
-            "expected the request then its deferred cancellation, got {frames:?}"
-        );
+        assert_eq!(frames.len(), 2, "{frames:?}");
         assert_eq!(frames[0]["method"], "tools/call");
-        let downstream_id = frames[0]["id"].clone();
-        assert!(
-            !downstream_id.is_null(),
-            "the request must carry a downstream id, got {:?}",
-            frames[0]
-        );
+        assert_eq!(frames[1]["method"], "notifications/cancelled");
+        assert_eq!(frames[1]["params"]["requestId"], 41);
+    }
 
-        let cancel = &frames[1];
-        assert_eq!(
-            cancel["method"], "notifications/cancelled",
-            "the deferred forward must actually be written, got {cancel:?}"
-        );
-        assert_eq!(
-            cancel["params"]["requestId"], downstream_id,
-            "the forward must name the DOWNSTREAM id, got {cancel:?}"
-        );
-        assert_eq!(
-            cancel["params"]["reason"], "user pressed stop",
-            "the reason recorded before registration must survive the deferral, got {cancel:?}"
-        );
+    #[test]
+    fn p08_saturated_forwarders_queue_every_cancel_and_refusal() {
+        // Holding the stdin lock makes every existing forwarder block, without
+        // relying on a pipe size or whether a child happened to drain it.
+        let fixture = CoreFixture::new("saturated-forwarders", "");
+        let locked = fixture.recorder.stdin.lock().unwrap();
+        let registry = CancelRegistry::new();
+        let mut guards = Vec::new();
+        for id in 0..80 {
+            let key = id.to_string();
+            assert!(registry.begin_client_request(key.clone()));
+            guards.push(registry.register(
+                key,
+                super::CancelEntry {
+                    stdin: fixture.recorder.stdin.clone(),
+                    downstream_id: json!(id),
+                    waiter: None,
+                    forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
+            ));
+        }
+        registry.close();
+        for id in 80..100 {
+            fixture.core.refuse(
+                &json!({"jsonrpc":"2.0", "id":id, "method":"elicitation/create"}),
+                "caller left",
+            );
+        }
+        drop(locked);
+        for id in 0..100 {
+            fixture.wait_for_frame("queued forward", |frame| {
+                if id < 80 {
+                    frame["method"] == "notifications/cancelled"
+                        && frame["params"]["requestId"] == id
+                } else {
+                    frame["id"] == id && frame.get("error").is_some()
+                }
+            });
+        }
+        drop(guards);
+        let frames = fixture.finish();
+        assert_eq!(frames.len(), 100, "{frames:?}");
     }
 
     /// The `forwarded` latch: once a cancellation has reached the downstream
@@ -12725,6 +13126,7 @@ for line in sys.stdin:
                 stdin: Arc::clone(&recorder.stdin),
                 downstream_id: json!(41),
                 waiter: None,
+                forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
 
@@ -12766,6 +13168,7 @@ for line in sys.stdin:
                 stdin: Arc::clone(&first_recorder.stdin),
                 downstream_id: json!(41),
                 waiter: None,
+                forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
         assert!(registry.cancel("c-3", Some("user pressed stop")));
@@ -12780,11 +13183,11 @@ for line in sys.stdin:
                 stdin: Arc::clone(&second_recorder.stdin),
                 downstream_id: json!(42),
                 waiter: None,
+                forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
         // Same post-write step the stdio request path runs.
         assert!(registry.is_cancelled("c-3"));
-        registry.forward_cancel_if_ready("c-3");
         drop(second_guard);
         registry.finish_client_request("c-3");
 
@@ -15227,6 +15630,8 @@ for line in sys.stdin:
             .unwrap(),
             reader: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
             bytes_read: 0,
+            cancel_guard: None,
+            cancel_signal: None,
         }
     }
 
@@ -16098,7 +16503,6 @@ for line in sys.stdin:
         let url = format!("http://127.0.0.1:{port}/");
         let worker = std::thread::spawn(move || {
             let mut transport = HttpTransport::new(&url);
-            let started = Instant::now();
             // Exercise the headerless trait path used by completion/complete too;
             // HttpTransport must override it rather than inheriting the default
             // cancellation-ignoring implementation.
@@ -16107,12 +16511,14 @@ for line in sys.stdin:
                 json!({ "name": "slow" }),
                 Some(cancel_context),
             );
-            (transport, result, started.elapsed())
+            (transport, result)
         });
 
         let original_id = stalled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let cancelled_at = Instant::now();
         assert!(cancellations.cancel("http-stall", Some("user pressed stop")));
-        let (mut transport, result, elapsed) = worker.join().unwrap();
+        let (mut transport, result) = worker.join().unwrap();
+        let elapsed = cancelled_at.elapsed();
         assert!(matches!(result, Err(TransportError::Cancelled(_))));
         assert!(
             elapsed < Duration::from_millis(500),
@@ -16244,6 +16650,8 @@ for line in sys.stdin:
             common,
             reader: Box::new(Cursor::new(final_frame.to_vec())),
             bytes_read: 0,
+            cancel_guard: None,
+            cancel_signal: None,
         });
 
         let cancellations = CancelRegistry::new();
@@ -16343,6 +16751,8 @@ for line in sys.stdin:
             common,
             reader: Box::new(Cursor::new(Vec::<u8>::new())),
             bytes_read: 0,
+            cancel_guard: None,
+            cancel_signal: None,
         });
         let cancellations = CancelRegistry::new();
         assert!(cancellations.begin_client_request("already-cancelled".to_string()));
@@ -16385,6 +16795,8 @@ for line in sys.stdin:
             common,
             reader: Box::new(Cursor::new(Vec::<u8>::new())),
             bytes_read: 0,
+            cancel_guard: None,
+            cancel_signal: None,
         });
         let cancellations = CancelRegistry::new();
         assert!(cancellations.begin_client_request("unrelated-cancel".to_string()));

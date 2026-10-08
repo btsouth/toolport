@@ -30,8 +30,6 @@ use serde::Serialize;
 use subtle::ConstantTimeEq;
 #[cfg(feature = "desktop")]
 use tauri::{AppHandle, Emitter, Manager};
-#[cfg(feature = "desktop")]
-use tauri_plugin_notification::NotificationExt;
 
 use crate::approval::{
     ApprovalDecision, ApprovalReason, ApprovalRequest, BrokerStream, EndpointDescriptor,
@@ -295,13 +293,16 @@ pub fn start(app: AppHandle) -> ApprovalBroker {
     let allowed_app = app.clone();
     let pending_app = app.clone();
     let resolved_app = app;
+    let notifications = Arc::new(PendingNotifications::default());
+    let resolved_notifications = notifications.clone();
     start_with_host(BrokerHost {
         persistent_allowed: Arc::new(move |key| registry_allows(&allowed_app, key)),
         pending: Arc::new(move |view| {
             let _ = pending_app.emit("approval-pending", view);
-            notify_pending(&pending_app, view);
+            notify_pending(&pending_app, view, notifications.pending(&view.id));
         }),
         resolved: Arc::new(move |id| {
+            resolved_notifications.resolve(id);
             let _ = resolved_app.emit("approval-resolved", id);
         }),
     })
@@ -753,6 +754,27 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, host: BrokerHost) {
     // Surface it to the active shell. The poll-based list remains the source of truth.
     (host.pending)(&view);
 
+    // A broker socket owns exactly one prompt. Watch its read side while the
+    // decision waits, so an abandoned caller withdraws without the 120s timeout.
+    let _ = reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)));
+    let watching = broker.clone();
+    let id = req.id.clone();
+    let disconnected = std::thread::spawn(move || {
+        let mut byte = [0];
+        let _ = reader.read(&mut byte);
+        if let Some(waiter) = watching
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id)
+        {
+            let _ = waiter.decide.send(ApprovalDecision::Denied);
+        }
+    });
+
     // Block for the human decision or the fail-closed timeout.
     let decision = rx
         .recv_timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
@@ -772,6 +794,16 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, host: BrokerHost) {
         "{}",
         serde_json::to_string(&decision).unwrap_or_else(|_| "\"timeout\"".into())
     );
+    match &out {
+        BrokerStream::Tcp(stream) => {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        #[cfg(unix)]
+        BrokerStream::Unix(stream) => {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+    let _ = disconnected.join();
 }
 
 /// Whether the tool `key` is on the registry's persistent always-allow list. Reads the
@@ -787,12 +819,39 @@ fn registry_allows(app: &AppHandle, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A resolution can arrive while the OS is still showing the notification.
+/// Its queued signal closes that late notification as soon as Notify returns.
+#[cfg(any(feature = "desktop", test))]
+#[derive(Default)]
+struct PendingNotifications(Mutex<HashMap<String, std::sync::mpsc::Sender<()>>>);
+#[cfg(any(feature = "desktop", test))]
+impl PendingNotifications {
+    fn pending(&self, id: &str) -> std::sync::mpsc::Receiver<()> {
+        let (tx, rx) = channel();
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.into(), tx);
+        rx
+    }
+    fn resolve(&self, id: &str) {
+        if let Some(tx) = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id)
+        {
+            let _ = tx.send(());
+        }
+    }
+}
+
 /// Notify the human that a call is held: an OS notification plus a taskbar-attention
 /// flash on the main window. Best-effort and non-blocking - if either fails (permission
 /// off, no window) the in-app overlay is still the source of truth. We flash rather than
 /// force-focus so we don't yank the user out of what they're doing.
 #[cfg(feature = "desktop")]
-fn notify_pending(app: &AppHandle, view: &PendingView) {
+fn notify_pending(app: &AppHandle, view: &PendingView, resolved: std::sync::mpsc::Receiver<()>) {
     let who = view
         .client
         .as_deref()
@@ -815,15 +874,141 @@ fn notify_pending(app: &AppHandle, view: &PendingView) {
             ),
         )
     };
-    let _ = app.notification().builder().title(title).body(body).show();
+    #[cfg(target_os = "linux")]
+    std::thread::spawn(move || notify_until_resolved(title, &body, resolved));
+    // The desktop plugin exposes no retractable toast on Windows or macOS.
+    // Keep the pending overlay and taskbar attention there, so an abandoned
+    // approval cannot leave an actionable OS notification behind.
+    #[cfg(not(target_os = "linux"))]
+    let _ = (title, body, resolved);
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.request_user_attention(Some(tauri::UserAttentionType::Critical));
     }
 }
 
+#[cfg(all(feature = "desktop", target_os = "linux"))]
+fn notify_until_resolved(title: &str, body: &str, resolved: std::sync::mpsc::Receiver<()>) {
+    use gio::glib::{self, variant::ToVariant};
+    use gio::prelude::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    const BUS: &str = "org.freedesktop.Notifications";
+    const PATH: &str = "/org/freedesktop/Notifications";
+    let context = glib::MainContext::new();
+    let _ = context.with_thread_default(|| {
+        if resolved.try_recv().is_ok() {
+            return;
+        }
+        let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
+            return;
+        };
+        let shown = Rc::new(Cell::new(0u32));
+        let tracked = shown.clone();
+        let signal = bus.signal_subscribe(
+            Some(BUS),
+            Some(BUS),
+            Some("NotificationClosed"),
+            Some(PATH),
+            None,
+            gio::DBusSignalFlags::NONE,
+            move |_, _, _, _, _, parameters| {
+                if let Some((id, _)) = parameters.get::<(u32, u32)>() {
+                    if tracked.get() == id {
+                        tracked.set(0);
+                    }
+                }
+            },
+        );
+        let notify = |id: u32, title: &str, body: &str, urgency: u8, expiry: i32| {
+            let hints = HashMap::from([("urgency".to_string(), urgency.to_variant())]);
+            bus.call_sync(
+                Some(BUS),
+                PATH,
+                BUS,
+                "Notify",
+                Some(
+                    &(
+                        "Toolport",
+                        id,
+                        "toolport",
+                        title,
+                        body,
+                        Vec::<String>::new(),
+                        hints,
+                        expiry,
+                    )
+                        .to_variant(),
+                ),
+                None,
+                gio::DBusCallFlags::NONE,
+                5000,
+                gio::Cancellable::NONE,
+            )
+            .ok()
+            .and_then(|reply| reply.child_value(0).get::<u32>())
+        };
+        if let Some(id) = notify(0, title, body, 2, -1) {
+            shown.set(id);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(DEFAULT_TIMEOUT_SECS);
+        loop {
+            while context.pending() {
+                context.iteration(false);
+            }
+            if std::time::Instant::now() >= deadline
+                || !matches!(
+                    resolved.recv_timeout(Duration::from_millis(10)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                )
+            {
+                break;
+            }
+        }
+        while context.pending() {
+            context.iteration(false);
+        }
+        if shown.get() != 0 {
+            // Urgent cards can survive CloseNotification. Replace the tracked id
+            // with a short, non-actionable expiry before closing, as GTK does.
+            let id = notify(shown.get(), "Approval handled", "", 0, 1000).unwrap_or(shown.get());
+            let _ = bus.call_sync(
+                Some(BUS),
+                PATH,
+                BUS,
+                "CloseNotification",
+                Some(&(id,).to_variant()),
+                None,
+                gio::DBusCallFlags::NONE,
+                5000,
+                gio::Cancellable::NONE,
+            );
+        }
+        bus.signal_unsubscribe(signal);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p08_tauri_notification_resolution_withdraws_only_its_toast_even_after_late_show() {
+        let notifications = PendingNotifications::default();
+        let first = notifications.pending("first");
+        let other = notifications.pending("other");
+        notifications.resolve("first");
+        // Notify may still be in progress. Its worker must see this signal when
+        // the OS returns the notification id, even after repeated resolution.
+        notifications.resolve("first");
+        first.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            other.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(!notifications.0.lock().unwrap().contains_key("first"));
+        notifications.resolve("other");
+        other.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
 
     fn broker() -> ApprovalBroker {
         ApprovalBroker {
@@ -978,6 +1163,54 @@ mod tests {
             ApprovalDecision::Approved
         );
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn p08_caller_disconnect_withdraws_only_its_pending_approval() {
+        let broker = broker();
+        let (pending_tx, pending_rx) = channel();
+        let (resolved_tx, resolved_rx) = channel();
+        let host = BrokerHost {
+            persistent_allowed: Arc::new(|_| false),
+            pending: Arc::new(move |view| {
+                pending_tx.send(view.id.clone()).unwrap();
+            }),
+            resolved: Arc::new(move |id| {
+                resolved_tx.send(id.to_string()).unwrap();
+            }),
+        };
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut workers = Vec::new();
+        let mut clients = Vec::new();
+        for id in ["abandoned", "other"] {
+            let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (server, _) = listener.accept().unwrap();
+            let serving = broker.clone();
+            let host = host.clone();
+            workers.push(std::thread::spawn(move || {
+                handle_conn(BrokerStream::Tcp(server), serving, host)
+            }));
+            let mut req = request("tok", Some("v2:abc"));
+            req.id = id.to_string();
+            writeln!(client, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(pending_rx.recv_timeout(Duration::from_secs(1)).unwrap(), id);
+            clients.push(client);
+        }
+        clients[0].shutdown(std::net::Shutdown::Both).unwrap();
+        assert_eq!(
+            resolved_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "abandoned"
+        );
+        assert!(broker.decide("abandoned", true).is_err());
+        assert_eq!(broker.list().len(), 1);
+        broker.decide("other", true).unwrap();
+        assert_eq!(
+            resolved_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "other"
+        );
+        for worker in workers {
+            worker.join().unwrap();
+        }
     }
 
     #[test]

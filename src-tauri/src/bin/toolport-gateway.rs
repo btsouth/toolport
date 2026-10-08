@@ -19,7 +19,7 @@
 //! - Records every tool call to a local audit log.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -30,7 +30,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use conduit_lib::approval;
-use conduit_lib::approval::{new_correlation_id, request_human_decision};
+use conduit_lib::approval::new_correlation_id;
 use conduit_lib::audit;
 use conduit_lib::clients;
 use conduit_lib::codemode;
@@ -62,6 +62,53 @@ use conduit_lib::topology::LaunchKey;
 #[cfg(any(unix, windows))]
 #[global_allocator]
 static CODE_MODE_ALLOCATOR: worker::WorkerAllocator = worker::WorkerAllocator;
+
+thread_local! {
+    static APPROVAL_CANCEL: std::cell::RefCell<Option<downstream::CancelContext>> = const { std::cell::RefCell::new(None) };
+}
+
+struct ApprovalCancelGuard(Option<downstream::CancelContext>);
+impl ApprovalCancelGuard {
+    fn enter(cancel: Option<downstream::CancelContext>) -> Self {
+        Self(APPROVAL_CANCEL.with(|current| current.replace(cancel)))
+    }
+}
+impl Drop for ApprovalCancelGuard {
+    fn drop(&mut self) {
+        APPROVAL_CANCEL.with(|current| current.replace(self.0.take()));
+    }
+}
+
+fn request_human_decision(req: approval::ApprovalRequest) -> approval::ApprovalDecision {
+    let cancel = APPROVAL_CANCEL.with(|current| current.borrow().clone());
+    request_human_decision_with_cancel(req, cancel.as_ref())
+}
+
+fn request_human_decision_with_cancel(
+    mut req: approval::ApprovalRequest,
+    cancel: Option<&downstream::CancelContext>,
+) -> approval::ApprovalDecision {
+    let Some(cancel) = cancel else {
+        return approval::request_human_decision(req);
+    };
+    if cancel.is_cancelled() {
+        return approval::ApprovalDecision::Denied;
+    }
+    for _ in 0..2 {
+        let decision = approval::try_decide_once_with_cancel(
+            approval::read_endpoint_descriptor(),
+            &mut req,
+            Some(cancel),
+        );
+        if cancel.is_cancelled() {
+            return approval::ApprovalDecision::Denied;
+        }
+        if let approval::BrokerAttempt::Decided(decision) = decision {
+            return decision;
+        }
+    }
+    approval::ApprovalDecision::Unreachable
+}
 
 /// Context that belongs to the request currently executing on this worker.
 ///
@@ -1563,7 +1610,6 @@ fn removed_meta_tool_error(name: &str) -> String {
          toolport_call_tool to run it."
     )
 }
-
 
 // --- Grouped discovery mode (CONDUIT_DISCOVERY=grouped) ---
 //
@@ -4051,6 +4097,7 @@ fn execute_call(
     // `None` only in test wrappers that lack `GatewayState`.
     live_router: Option<&Arc<Mutex<Arc<Router>>>>,
 ) -> Value {
+    let _approval_cancel = ApprovalCancelGuard::enter(cancel.clone());
     if active_live_router_resolver()
         .is_some_and(|view| (view.stale)(router, DispatchTarget::Tool(name)))
     {
@@ -4158,7 +4205,18 @@ fn execute_call(
                     conduit_lib::rate_limits::check_and_count(&team.rate_limits, server_id, tool)
                 {
                     // Count as a failed call with a clear reason so Activity / export show the block.
-                    audit::record_routed_call(reg, server_id, tool, false, None, Some("rate_limit"), client, client_name, None, None);
+                    audit::record_routed_call(
+                        reg,
+                        server_id,
+                        tool,
+                        false,
+                        None,
+                        Some("rate_limit"),
+                        client,
+                        client_name,
+                        None,
+                        None,
+                    );
                     return json!({
                         "content": [{ "type": "text", "text": msg }],
                         "isError": true
@@ -4334,7 +4392,8 @@ fn execute_call(
                 }
             } else {
                 let t0 = Instant::now();
-                let decision = request_human_decision(approval_request());
+                let decision =
+                    request_human_decision_with_cancel(approval_request(), cancel.as_ref());
                 (
                     decision,
                     t0.elapsed().as_millis() as u64,
@@ -5890,8 +5949,8 @@ fn execute_script_dispatch(
     // (SBS-881). Run the defense here, before the script's own result is returned,
     // so nothing unscanned reaches the model. The failure envelope was defended
     // part by part above and is all Toolport text now.
-    let untrusted = result["isError"] != true
-        && !defend_script_aggregate(reg, client, &owner, &mut result);
+    let untrusted =
+        result["isError"] != true && !defend_script_aggregate(reg, client, &owner, &mut result);
 
     // Intermediate calls were not shaped (full bodies stayed in the sandbox). The
     // script's aggregate can still blow the transport/context budget, so shape only
@@ -6187,9 +6246,9 @@ fn handle_request_with_cancel(
                 // reuse one client's answer for another.
                 "cacheScope": "private"
             });
-            if let Some(text) = server_instructions(reg, profile, || {
-                DISCOVER_INSTRUCTIONS_PREAMBLE.to_string()
-            }) {
+            if let Some(text) =
+                server_instructions(reg, profile, || DISCOVER_INSTRUCTIONS_PREAMBLE.to_string())
+            {
                 result["instructions"] = Value::String(text);
             }
             Some(success(id, result))
@@ -9011,8 +9070,9 @@ type IntegrityCheckFailure = (String, BTreeSet<String>);
 /// prove the drifted definition is never published in the first place. Registered and
 /// consumed on one thread, so a parallel test's gate cannot trigger it.
 #[cfg(test)]
-static INTEGRITY_GATE_OBSERVER: Mutex<Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>> =
-    Mutex::new(None);
+static INTEGRITY_GATE_OBSERVER: Mutex<
+    Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>,
+> = Mutex::new(None);
 
 #[cfg(test)]
 fn observe_integrity_gate() {
@@ -12212,6 +12272,7 @@ struct SessionState {
     /// connection, so in a shared host a second client must not be able to mute or
     /// unmute this one. Always `false` for an HTTP face.
     modern_upstream: AtomicBool,
+    adapter_lifetime: bool,
     last_seen: Mutex<Instant>,
     outbound: Mutex<VecDeque<McpOutboundMessage>>,
     closed: AtomicBool,
@@ -12271,6 +12332,7 @@ struct SessionState {
     /// client-chosen, so two stdio clients on one host would collide. One client
     /// cancelling its id 7 could cancel another's id 7.
     cancellations: downstream::CancelRegistry,
+    owner_cancel_guard: Mutex<Option<downstream::CancelGuard>>,
     /// How many requests this connection is running on workers, against a cap, so a
     /// client cannot spawn unbounded workers. Per connection for the same reason as
     /// the registry: it is this peer's concurrency, not the host's.
@@ -12302,6 +12364,7 @@ impl SessionState {
             owner,
             guards: SessionGuards::new(),
             modern_upstream: AtomicBool::new(false),
+            adapter_lifetime: false,
             last_seen: Mutex::new(Instant::now()),
             outbound: Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
@@ -12321,6 +12384,7 @@ impl SessionState {
             stdio_deferred_list_changed: Mutex::new(Vec::new()),
             stdio_broken: AtomicBool::new(false),
             cancellations: downstream::CancelRegistry::new(),
+            owner_cancel_guard: Mutex::new(None),
             stdio_inflight: Arc::new(AtomicUsize::new(0)),
             modern_subscription: None,
         }
@@ -12575,7 +12639,7 @@ impl SessionState {
         if matches!(self.transport, SessionTransportFace::Stdio(_)) {
             return false;
         }
-        if self.modern_subscription.is_some() {
+        if self.modern_subscription.is_some() || self.adapter_lifetime {
             return false;
         }
         self.last_seen
@@ -12591,6 +12655,7 @@ impl SessionState {
     }
 
     fn close(&self) {
+        self.cancellations.close();
         self.closed.store(true, Ordering::SeqCst);
         self.wait.1.notify_all();
     }
@@ -12676,6 +12741,7 @@ impl SessionState {
 struct McpSseReader {
     session: Arc<SessionState>,
     cleanup: Option<(GatewayState, String)>,
+    cancel_guard: Option<downstream::CancelGuard>,
     buf: Vec<u8>,
     pos: usize,
 }
@@ -12685,6 +12751,7 @@ impl McpSseReader {
         Self {
             session,
             cleanup: None,
+            cancel_guard: None,
             buf: Vec::new(),
             pos: 0,
         }
@@ -12694,6 +12761,7 @@ impl McpSseReader {
         Self {
             session,
             cleanup: Some((state, key)),
+            cancel_guard: None,
             buf: Vec::new(),
             pos: 0,
         }
@@ -12760,7 +12828,7 @@ fn new_mcp_session_id() -> String {
 fn reap_stale_mcp_sessions(state: &GatewayState) {
     // Collect first so we do not hold the sessions lock across cleanup that may
     // call the router.
-    let stale: Vec<String> = {
+    let stale: Vec<(String, Arc<SessionState>)> = {
         let mut sessions = state
             .mcp_sessions
             .lock()
@@ -12770,12 +12838,13 @@ fn reap_stale_mcp_sessions(state: &GatewayState) {
             .filter(|(_, session)| session.is_expired() || session.closed.load(Ordering::SeqCst))
             .map(|(id, _)| id.clone())
             .collect();
-        for id in &stale {
-            sessions.remove(id);
-        }
         stale
+            .into_iter()
+            .filter_map(|id| sessions.remove(&id).map(|session| (id, session)))
+            .collect()
     };
-    for id in stale {
+    for (id, session) in stale {
+        session.close();
         cleanup_resource_subs_for_session(state, &id);
         clear_mcp_session_tables(&id);
     }
@@ -12793,6 +12862,21 @@ fn mint_mcp_session(
 ) -> Result<String, HttpOut> {
     let sid = new_mcp_session_id();
     let session = Arc::new(SessionState::new_http(owner.cloned()));
+    if let Some(lifetime) = adapter_lifetime(state, owner) {
+        let weak = Arc::downgrade(&session);
+        let guard = lifetime
+            .cancellations
+            .context(sid.clone())
+            .on_cancel(Arc::new(move |_| {
+                if let Some(session) = weak.upgrade() {
+                    session.close();
+                }
+            }));
+        *session
+            .owner_cancel_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(guard);
+    }
     reap_stale_mcp_sessions(state);
     let mut sessions = state
         .mcp_sessions
@@ -13012,6 +13096,7 @@ struct ModernHitlApproval {
     downstream: MrtrRequest,
     input_request: Value,
     status: ModernHitlStatus,
+    _cancel_guard: Option<downstream::CancelGuard>,
 }
 
 enum ModernHitlPoll {
@@ -13072,9 +13157,22 @@ fn start_modern_hitl(
     downstream: MrtrRequest,
 ) -> Result<String, approval::ApprovalDecision> {
     let token = format!("toolport-hitl-{}", new_correlation_id());
+    let cancel = APPROVAL_CANCEL.with(|current| current.borrow().clone());
+    let cancel_guard = cancel.as_ref().map(|cancel| {
+        let token = token.clone();
+        cancel.on_cancel(Arc::new(move |_| {
+            session_tables().hitl().remove(&token);
+        }))
+    });
     {
         let mut approvals = session_tables().hitl();
         approvals.reap_expired();
+        if cancel
+            .as_ref()
+            .is_some_and(downstream::CancelContext::is_cancelled)
+        {
+            return Err(approval::ApprovalDecision::Denied);
+        }
         if approvals.len() >= MODERN_HITL_MAX_PENDING {
             return Err(approval::ApprovalDecision::Unreachable);
         }
@@ -13109,6 +13207,7 @@ fn start_modern_hitl(
                     }
                 }),
                 status: ModernHitlStatus::AwaitingClient,
+                _cancel_guard: cancel_guard,
             },
         );
     }
@@ -13923,6 +14022,7 @@ fn process_request(
     client_name: Option<&str>,
     discovery: DiscoveryMode,
 ) -> Option<Value> {
+    let _approval_cancel = ApprovalCancelGuard::enter(cancel.clone());
     let _transport = UpstreamTransportGuard::enter(if state.http {
         UpstreamTransport::Http
     } else {
@@ -14880,6 +14980,7 @@ struct McpHttpRequestHeaders<'a> {
 
 struct McpListen {
     session: Arc<SessionState>,
+    cancel_guard: Option<downstream::CancelGuard>,
     cleanup: Option<(GatewayState, String)>,
 }
 
@@ -14903,6 +15004,7 @@ impl HttpOut {
             mcp_listen: Some(McpListen {
                 session,
                 cleanup: None,
+                cancel_guard: None,
             }),
         }
     }
@@ -14915,6 +15017,7 @@ impl HttpOut {
             extra: Vec::new(),
             mcp_listen: Some(McpListen {
                 session,
+                cancel_guard: None,
                 cleanup: Some((state, key)),
             }),
         }
@@ -15437,6 +15540,49 @@ fn handle_mcp_http(
                 }
             }
 
+            // Sessionless requests belong only to this HTTP connection. A bearer
+            // identifies an owner, not a client instance or its request-id space.
+            // A cancellation POST on another connection cannot target this call.
+            let cancellations =
+                http_call_cancellations(state, session_id.as_deref(), session_owner);
+            if let Some(id) = cancellation_request_id(&req) {
+                cancellations.cancel(&id, cancellation_reason(&req));
+                return HttpOut::new(202, "text/plain", String::new());
+            }
+            let request_key = request_id_key(&req);
+            if let Some(key) = &request_key {
+                if !cancellations.begin_client_request(key.clone()) {
+                    return mcp_rpc_response(
+                        200,
+                        error(req["id"].clone(), -32600, "duplicate or closed request id")
+                            .to_string(),
+                        session_id.as_deref(),
+                        prefer_sse,
+                    );
+                }
+            }
+            let _request_end = HttpRequestEnd {
+                cancellations: cancellations.clone(),
+                key: request_key.clone(),
+            };
+            let cancel = request_key.map(|key| cancellations.context(key));
+            let _connection_cancel = HTTP_CONNECTION_CANCEL.with(|current| {
+                current.borrow().as_ref().map(|connection| {
+                    let owned = cancellations.clone();
+                    let key = cancel.as_ref().map(|context| context.clone());
+                    connection
+                        .context("connection".into())
+                        .on_cancel(Arc::new(move |_| {
+                            if let Some(context) = &key {
+                                owned.cancel(
+                                    &context.request_key(),
+                                    Some("HTTP caller disconnected"),
+                                );
+                            }
+                        }))
+                })
+            });
+
             // A legacy MCP session owns its own search guard (P1.2). A request
             // with no session record keeps the listener-level guard passed in,
             // which is what a modern (self-contained) request and every
@@ -15477,7 +15623,7 @@ fn handle_mcp_http(
                 allowed,
                 session_owner.and_then(|owner| owner.profile.as_deref()),
                 connection_profile,
-                None,
+                cancel,
                 client,
                 client_name,
                 discovery,
@@ -15514,6 +15660,47 @@ fn handle_mcp_http(
     }
 }
 
+fn http_call_cancellations(
+    state: &GatewayState,
+    session_id: Option<&str>,
+    owner: Option<&McpSessionOwner>,
+) -> downstream::CancelRegistry {
+    session_id
+        .and_then(|id| {
+            state
+                .mcp_sessions
+                .lock()
+                .ok()
+                .and_then(|sessions| sessions.get(id).map(|session| session.cancellations()))
+        })
+        .or_else(|| adapter_lifetime(state, owner).map(|session| session.cancellations()))
+        .or_else(|| HTTP_CONNECTION_CANCEL.with(|current| current.borrow().clone()))
+        .unwrap_or_default()
+}
+
+fn adapter_lifetime_key() -> Option<String> {
+    HTTP_ADAPTER_INSTANCE.with(|instance| {
+        instance
+            .borrow()
+            .as_ref()
+            .map(|id| format!("adapter-lifetime:{id}"))
+    })
+}
+fn adapter_lifetime(
+    state: &GatewayState,
+    owner: Option<&McpSessionOwner>,
+) -> Option<Arc<SessionState>> {
+    let key = adapter_lifetime_key()?;
+    let sessions = state
+        .mcp_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    sessions
+        .get(&key)
+        .filter(|session| session.owner.as_ref() == owner)
+        .cloned()
+}
+
 /// Map one HTTP request to status / content-type / body / extra headers.
 #[allow(clippy::too_many_arguments)]
 fn handle_http_with_headers(
@@ -15541,6 +15728,74 @@ fn handle_http_with_headers(
         .unwrap_or_else(|| state.discovery_mode());
     if method == "OPTIONS" {
         return HttpOut::new(204, "text/plain", String::new());
+    }
+
+    if path == "/adapter/lifetime" {
+        if !headers.private_daemon_bearer
+            || !session_owner.is_some_and(|owner| owner.identity.starts_with("adapter:"))
+        {
+            return HttpOut::json_err(401, "private adapter authentication required");
+        }
+        let Some(key) = adapter_lifetime_key() else {
+            return HttpOut::json_err(400, "missing adapter instance");
+        };
+        if method == "DELETE" {
+            if let Some(session) = state
+                .mcp_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .cloned()
+            {
+                if session.owner.as_ref() != session_owner {
+                    return HttpOut::json_err(403, "foreign adapter instance");
+                }
+                session.close();
+            }
+            return HttpOut::new(204, "text/plain", String::new());
+        }
+        if method != "GET" {
+            return HttpOut::json_err(405, "method not allowed");
+        }
+        let Some(connection) = HTTP_CONNECTION_CANCEL.with(|current| current.borrow().clone())
+        else {
+            return HttpOut::json_err(503, "adapter lifetime requires a connection");
+        };
+        reap_stale_mcp_sessions(state);
+        // The open stream owns this row until disconnect, regardless of age.
+        let mut session = SessionState::new_http(session_owner.cloned());
+        session.adapter_lifetime = true;
+        let session = Arc::new(session);
+        {
+            let mut sessions = state
+                .mcp_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if sessions.contains_key(&key) {
+                return HttpOut::json_err(409, "adapter lifetime already open");
+            }
+            if sessions.len() >= MCP_SESSION_MAX {
+                return HttpOut::json_err(503, "too many MCP sessions");
+            }
+            sessions.insert(key.clone(), session.clone());
+        }
+        let weak = Arc::downgrade(&session);
+        let guard = connection
+            .context("connection".into())
+            .on_cancel(Arc::new(move |_| {
+                if let Some(session) = weak.upgrade() {
+                    session.close();
+                }
+            }));
+        session.push_message(
+            json!({"jsonrpc":"2.0","method":"notifications/toolport/connected"}).to_string(),
+            None,
+        );
+        let mut out = HttpOut::modern_mcp_listen(state.clone(), key, session);
+        if let Some(reader) = out.mcp_listen.as_mut() {
+            reader.cancel_guard = Some(guard);
+        }
+        return out;
     }
 
     // Internal rendezvous identity. Daemon mode only, so the user-facing bridge
@@ -16178,6 +16433,134 @@ fn write_ingress_response(stream: &mut TcpStream, status: u16, reason: &str, mes
     let _ = stream.write_all(response.as_bytes());
 }
 
+fn http_connection_cancellations() -> &'static Mutex<HashMap<SocketAddr, downstream::CancelRegistry>>
+{
+    static CONNECTIONS: OnceLock<Mutex<HashMap<SocketAddr, downstream::CancelRegistry>>> =
+        OnceLock::new();
+    CONNECTIONS.get_or_init(Mutex::default)
+}
+thread_local! {
+    static HTTP_ADAPTER_INSTANCE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static HTTP_CONNECTION_CANCEL: std::cell::RefCell<Option<downstream::CancelRegistry>> = const { std::cell::RefCell::new(None) };
+}
+struct HttpConnectionScope(Option<downstream::CancelRegistry>, Option<String>);
+impl Drop for HttpConnectionScope {
+    fn drop(&mut self) {
+        HTTP_CONNECTION_CANCEL.with(|current| current.replace(self.0.take()));
+        HTTP_ADAPTER_INSTANCE.with(|current| current.replace(self.1.take()));
+    }
+}
+struct HttpRequestEnd {
+    cancellations: downstream::CancelRegistry,
+    key: Option<String>,
+}
+impl Drop for HttpRequestEnd {
+    fn drop(&mut self) {
+        if let Some(key) = &self.key {
+            self.cancellations.finish_client_request(key);
+        }
+    }
+}
+
+/// Relay a response while observing the caller's socket, including while the
+/// backend is blocked. Unix can wait on both sockets without a watcher thread.
+// A client write-half-close is treated as abandonment, just like full EOF.
+// This ingress serves one request per connection; callers must keep both halves
+// open until the response completes if they want the call to remain live.
+fn relay_http_response(
+    client: &mut TcpStream,
+    upstream: &mut TcpStream,
+    disconnected: Arc<dyn Fn() + Send + Sync>,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let mut sockets = [
+            libc::pollfd {
+                fd: client.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: upstream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let mut bytes = [0u8; 8192];
+        loop {
+            // Both descriptors are borrowed from live TcpStreams for this wait.
+            let ready = unsafe { libc::poll(sockets.as_mut_ptr(), sockets.len() as _, -1) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                disconnected();
+                return Err(error);
+            }
+            if sockets[0].revents != 0 {
+                let mut byte = [0];
+                match client.peek(&mut byte) {
+                    Ok(0) | Err(_) => {
+                        disconnected();
+                        return Ok(());
+                    }
+                    Ok(_) => sockets[0].fd = -1, // No HTTP pipelining on this ingress.
+                }
+            }
+            if sockets[1].revents != 0 {
+                let count = upstream.read(&mut bytes)?;
+                if count == 0 {
+                    return Ok(());
+                }
+                if let Err(error) = client.write_all(&bytes[..count]) {
+                    disconnected();
+                    return Err(error);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let done = Arc::new(AtomicBool::new(false));
+        let finished = done.clone();
+        let watched = client.try_clone()?;
+        let wake = upstream.try_clone()?;
+        let watcher = std::thread::spawn(move || {
+            let _ = watched.set_read_timeout(Some(Duration::from_millis(25)));
+            let mut byte = [0];
+            while !finished.load(Ordering::SeqCst) {
+                match watched.peek(&mut byte) {
+                    Ok(0) => {
+                        disconnected();
+                        let _ = wake.shutdown(Shutdown::Both);
+                        break;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => {
+                        disconnected();
+                        let _ = wake.shutdown(Shutdown::Both);
+                        break;
+                    }
+                    Ok(_) => break,
+                }
+            }
+        });
+        let result = std::io::copy(upstream, client).map(|_| ());
+        done.store(true, Ordering::SeqCst);
+        let _ = client.shutdown(Shutdown::Read);
+        let _ = watcher.join();
+        result
+    }
+}
+
 fn proxy_deadline_http_connection(
     mut client: TcpStream,
     backend: SocketAddr,
@@ -16211,7 +16594,21 @@ fn proxy_deadline_http_connection(
             return;
         }
     };
+    let peer = match upstream.local_addr() {
+        Ok(peer) => peer,
+        Err(_) => return,
+    };
+    let cancellations = downstream::CancelRegistry::new();
+    cancellations.begin_client_request("connection".into());
+    http_connection_cancellations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(peer, cancellations.clone());
     if upstream.write_all(&request).is_err() {
+        http_connection_cancellations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&peer);
         write_ingress_response(
             &mut client,
             503,
@@ -16221,21 +16618,139 @@ fn proxy_deadline_http_connection(
         return;
     }
     let _ = upstream.shutdown(Shutdown::Write);
-    let _ = std::io::copy(&mut upstream, &mut client);
+    let _ = relay_http_response(
+        &mut client,
+        &mut upstream,
+        Arc::new(move || cancellations.close()),
+    );
+    http_connection_cancellations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&peer);
 }
 
 struct HttpIngressGuard {
     close: Arc<AtomicBool>,
+    wake: SocketAddr,
     accept_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for HttpIngressGuard {
     fn drop(&mut self) {
         self.close.store(true, Ordering::Release);
+        let _ = TcpStream::connect_timeout(&self.wake, Duration::from_secs(1));
         if let Some(thread) = self.accept_thread.take() {
             let _ = thread.join();
         }
     }
+}
+
+/// Rejected peers are drained concurrently on one nonblocking worker. A peer
+/// withholding its body must not hold every later 503 until its read deadline.
+struct RejectedHttpRequest {
+    client: TcpStream,
+    deadline: Instant,
+    received: Vec<u8>,
+    head: Option<ParsedHttpHead>,
+    scan: ChunkedHttpBodyScan,
+}
+impl RejectedHttpRequest {
+    fn poll(&mut self, deadlines: HttpReadDeadlines) -> Result<bool, HttpIngressError> {
+        if Instant::now() >= self.deadline {
+            return Err(HttpIngressError::Timeout);
+        }
+        let mut bytes = [0; 8192];
+        match self.client.read(&mut bytes) {
+            Ok(0) => return Err(HttpIngressError::BadRequest),
+            Ok(count) => self.received.extend_from_slice(&bytes[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(false),
+            Err(_) => return Err(HttpIngressError::BadRequest),
+        }
+        if self.head.is_none() {
+            let Some(end) = find_http_header_end(&self.received) else {
+                return if self.received.len() > MAX_HTTP_HEADER_BYTES {
+                    Err(HttpIngressError::HeaderTooLarge)
+                } else {
+                    Ok(false)
+                };
+            };
+            if end > MAX_HTTP_HEADER_BYTES {
+                return Err(HttpIngressError::HeaderTooLarge);
+            }
+            let head = parse_http_head_with_limit(&self.received[..end - 2], deadlines.max_body)?;
+            if head.send_continue {
+                let _ = self.client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+            }
+            self.received.drain(..end);
+            self.head = Some(head);
+            self.deadline = Instant::now() + deadlines.body;
+        }
+        if self.received.len() > deadlines.max_body as usize + MAX_HTTP_HEADER_BYTES {
+            return Err(HttpIngressError::BodyTooLarge);
+        }
+        match &self.head.as_ref().unwrap().framing {
+            HttpBodyFraming::None => Ok(true),
+            HttpBodyFraming::ContentLength(length) => Ok(self.received.len() >= *length),
+            HttpBodyFraming::Chunked => Ok(chunked_http_body_end_with_limit(
+                &self.received,
+                &mut self.scan,
+                deadlines.max_body,
+            )?
+            .is_some()),
+        }
+    }
+}
+fn spawn_http_overload_responder(
+    deadlines: HttpReadDeadlines,
+    close: Arc<AtomicBool>,
+) -> (
+    std::sync::mpsc::SyncSender<TcpStream>,
+    std::thread::JoinHandle<()>,
+) {
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<TcpStream>(64);
+    let worker = std::thread::spawn(move || {
+        let mut pending: Vec<RejectedHttpRequest> = Vec::new();
+        let mut disconnected = false;
+        while !close.load(Ordering::Acquire) {
+            if !disconnected && pending.len() < 64 {
+                match receiver.recv_timeout(Duration::from_millis(2)) {
+                    Ok(client) => {
+                        let _ = client.set_nonblocking(true);
+                        pending.push(RejectedHttpRequest {
+                            client,
+                            deadline: Instant::now() + deadlines.header,
+                            received: Vec::new(),
+                            head: None,
+                            scan: ChunkedHttpBodyScan::default(),
+                        });
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => disconnected = true,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let mut index = 0;
+            while index < pending.len() {
+                if matches!(pending[index].poll(deadlines), Ok(false)) {
+                    index += 1;
+                } else {
+                    let mut request = pending.swap_remove(index);
+                    write_ingress_response(
+                        &mut request.client,
+                        503,
+                        "Service Unavailable",
+                        "gateway busy; retry later",
+                    );
+                }
+            }
+            if disconnected && pending.is_empty() {
+                break;
+            }
+        }
+    });
+    (sender, worker)
 }
 
 fn bind_deadline_http_server<A: ToSocketAddrs>(
@@ -16246,7 +16761,6 @@ fn bind_deadline_http_server<A: ToSocketAddrs>(
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let listener = TcpListener::bind(addr)?;
-    listener.set_nonblocking(true)?;
     let public_addr = listener.local_addr()?;
     let backend_listener = if public_addr.is_ipv6() {
         TcpListener::bind(("::1", 0))?
@@ -16256,44 +16770,28 @@ fn bind_deadline_http_server<A: ToSocketAddrs>(
     let backend_addr = backend_listener.local_addr()?;
     let server = tiny_http::Server::from_listener(backend_listener, None)?;
     let close = Arc::new(AtomicBool::new(false));
+    let (overloaded, _overload_worker) = spawn_http_overload_responder(deadlines, close.clone());
     let accept_close = Arc::clone(&close);
     let connections = Arc::new(AtomicUsize::new(0));
     let accept_thread = std::thread::spawn(move || {
         while !accept_close.load(Ordering::Acquire) {
             match listener.accept() {
-                Ok((mut client, _)) => {
+                Ok((client, _)) => {
                     if accept_close.load(Ordering::Acquire) {
                         break;
                     }
-                    // The listener is nonblocking so the guard can shut it down.
-                    // Windows propagates that mode to accepted sockets; restore a
-                    // blocking stream so the explicit read deadlines govern it.
-                    if client.set_nonblocking(false).is_err() {
-                        write_ingress_response(
-                            &mut client,
-                            503,
-                            "Service Unavailable",
-                            "gateway unavailable",
-                        );
-                        continue;
-                    }
                     let Some(guard) = try_acquire_inflight(&connections, http_max_connections())
                     else {
-                        write_ingress_response(
-                            &mut client,
-                            503,
-                            "Service Unavailable",
-                            "gateway busy; retry later",
-                        );
+                        // Keep rejection work bounded separately from admitted requests.
+                        // A full rejection queue sheds the socket without another worker.
+                        let _ = overloaded.try_send(client);
                         continue;
                     };
                     std::thread::spawn(move || {
                         proxy_deadline_http_connection(client, backend_addr, deadlines, guard);
                     });
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(err) => {
                     glog(&format!("HTTP deadline ingress accept failed: {err}"));
                     break;
@@ -16306,6 +16804,18 @@ fn bind_deadline_http_server<A: ToSocketAddrs>(
         server,
         HttpIngressGuard {
             close,
+            wake: if public_addr.ip().is_unspecified() {
+                SocketAddr::new(
+                    if public_addr.is_ipv6() {
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                    } else {
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                    },
+                    public_addr.port(),
+                )
+            } else {
+                public_addr
+            },
             accept_thread: Some(accept_thread),
         },
         public_addr,
@@ -16480,7 +16990,9 @@ fn daemon_topology_json(state: &GatewayState) -> String {
         .mcp_sessions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .len();
+        .keys()
+        .filter(|key| !key.starts_with("adapter-lifetime:"))
+        .count();
     let ordinary_launches = state
         .router
         .lock()
@@ -16597,7 +17109,7 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
             conduit_lib::telemetry::exit_with(1);
         }
     };
-    let (server, _ingress, _) = match bind_deadline_http_server(
+    let (server, _ingress, addr) = match bind_deadline_http_server(
         ("127.0.0.1", 0u16),
         HttpReadDeadlines {
             max_body: MAX_DAEMON_HTTP_BODY,
@@ -16609,10 +17121,6 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
             eprintln!("toolport-gateway --daemon: could not bind the internal endpoint: {error}");
             conduit_lib::telemetry::exit_with(1);
         }
-    };
-    let Some(addr) = server.server_addr().to_ip() else {
-        eprintln!("toolport-gateway --daemon: the internal endpoint was not an IP socket");
-        conduit_lib::telemetry::exit_with(1);
     };
     let port = addr.port();
     let descriptor_path = conduit_lib::daemon::descriptor_path(&dir, &compat);
@@ -16888,7 +17396,12 @@ fn proxy_public_http_connection(
     };
     drop(pending_read);
     let Some(_active) = try_acquire_inflight(active, http_max_connections()) else {
-        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway busy; retry later");
+        write_ingress_response(
+            &mut client,
+            503,
+            "Service Unavailable",
+            "gateway busy; retry later",
+        );
         return;
     };
     // Authenticate the cached daemon before every new public request. A failed
@@ -16898,27 +17411,48 @@ fn proxy_public_http_connection(
         Ok(descriptor) => descriptor,
         Err(error) => {
             glog(&format!("HTTP proxy: {error}"));
-            write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+            write_ingress_response(
+                &mut client,
+                503,
+                "Service Unavailable",
+                "gateway unavailable",
+            );
             return;
         }
     };
     let Ok(endpoint) = descriptor.endpoint.parse::<SocketAddr>() else {
-        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+        write_ingress_response(
+            &mut client,
+            503,
+            "Service Unavailable",
+            "gateway unavailable",
+        );
         return;
     };
     let mut upstream = match TcpStream::connect_timeout(&endpoint, Duration::from_secs(2)) {
         Ok(stream) => stream,
         Err(_) => {
-            write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+            write_ingress_response(
+                &mut client,
+                503,
+                "Service Unavailable",
+                "gateway unavailable",
+            );
             return;
         }
     };
     if upstream.write_all(&request).is_err() {
-        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+        write_ingress_response(
+            &mut client,
+            503,
+            "Service Unavailable",
+            "gateway unavailable",
+        );
         return;
     }
-    let _ = upstream.shutdown(Shutdown::Write);
-    let _ = std::io::copy(&mut upstream, &mut client);
+    // The daemon detects the public caller's full socket close. Keep the write
+    // side open during the relay so waiting callers do not appear abandoned.
+    let _ = relay_http_response(&mut client, &mut upstream, Arc::new(|| {}));
 }
 
 /// The desktop keeps this lightweight public listener as its child. The heavy
@@ -16987,13 +17521,23 @@ fn serve_http_proxy(port: u16) -> Result<(), String> {
             match listener.accept() {
                 Ok((mut client, _)) => {
                     if client.set_nonblocking(false).is_err() {
-                        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+                        write_ingress_response(
+                            &mut client,
+                            503,
+                            "Service Unavailable",
+                            "gateway unavailable",
+                        );
                         continue;
                     }
                     let Some(pending) =
                         try_acquire_inflight(&pending_reads, http_max_connections())
                     else {
-                        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway busy; retry later");
+                        write_ingress_response(
+                            &mut client,
+                            503,
+                            "Service Unavailable",
+                            "gateway busy; retry later",
+                        );
                         continue;
                     };
                     let state = Arc::clone(&state);
@@ -17105,7 +17649,11 @@ fn respond_mcp_sse_listen(request: tiny_http::Request, mut out: HttpOut, allow_h
         .unwrap(),
         tiny_http::Header::from_bytes(b"Access-Control-Allow-Headers", allow_headers.as_bytes())
             .unwrap(),
-        tiny_http::Header::from_bytes(b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()).unwrap(),
+        tiny_http::Header::from_bytes(
+            b"Access-Control-Expose-Headers",
+            EXPOSED_HTTP_HEADERS.as_bytes(),
+        )
+        .unwrap(),
     ];
     for (name, value) in out.extra {
         let safe = sanitize_header_value(&value);
@@ -17118,6 +17666,7 @@ fn respond_mcp_sse_listen(request: tiny_http::Request, mut out: HttpOut, allow_h
         Some((state, key)) => McpSseReader::with_cleanup(listen.session, state, key),
         None => McpSseReader::new(listen.session),
     };
+    reader.cancel_guard = listen.cancel_guard;
     let version = request.http_version().clone();
     let mut writer = request.into_writer();
     let _ = write_mcp_sse_response(&mut writer, &version, &headers, &mut reader);
@@ -17603,6 +18152,27 @@ fn handle_connection(
                         })
                         .read_to_string(&mut body);
                 }
+                let connection_cancel = request.remote_addr().and_then(|peer| {
+                    http_connection_cancellations()
+                        .lock()
+                        .ok()
+                        .and_then(|connections| connections.get(peer).cloned())
+                });
+                let previous =
+                    HTTP_CONNECTION_CANCEL.with(|current| current.replace(connection_cancel));
+                let instance = private_daemon_bearer
+                    .then(|| {
+                        request
+                            .headers()
+                            .iter()
+                            .find(|header| header.field.equiv("Toolport-Adapter-Instance"))
+                            .map(|header| header.value.as_str().to_string())
+                            .filter(|id| id.len() <= 128 && valid_mcp_session_id(id))
+                    })
+                    .flatten();
+                let previous_instance =
+                    HTTP_ADAPTER_INSTANCE.with(|current| current.replace(instance));
+                let _connection_scope = HttpConnectionScope(previous, previous_instance);
                 // A panic in a handler must return 500, not kill the listener.
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     handle_http_with_headers(
@@ -17662,7 +18232,10 @@ fn handle_connection(
         ),
         (b"Access-Control-Allow-Headers", allow_headers.as_bytes()),
         // Browser clients need session identity and untrusted-data provenance.
-        (b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()),
+        (
+            b"Access-Control-Expose-Headers",
+            EXPOSED_HTTP_HEADERS.as_bytes(),
+        ),
     ];
     for (name, value) in cors {
         // Skip a header that won't encode rather than panicking the thread.
@@ -17939,11 +18512,13 @@ fn main() {
                         "{}",
                         serde_json::to_string(&results).expect("serializable disconnect results")
                     );
-                    conduit_lib::telemetry::exit_with(if results.iter().any(|result| result.error.is_some()) {
-                        1
-                    } else {
-                        0
-                    });
+                    conduit_lib::telemetry::exit_with(
+                        if results.iter().any(|result| result.error.is_some()) {
+                            1
+                        } else {
+                            0
+                        },
+                    );
                 }
                 Err(error) => {
                     eprintln!("toolport-gateway --disconnect-all: {error}");
@@ -18518,6 +19093,7 @@ fn main() {
             stdio_workers.push(handle);
         }
     }
+    state.stdio_upstream.close();
     for worker in stdio_workers {
         let _ = worker.join();
     }
@@ -18568,10 +19144,22 @@ mod tests {
 
     #[test]
     fn disconnect_all_is_a_standalone_role_and_dry_run_cannot_start_gateway() {
-        assert_eq!(parse_args(&["--disconnect-all".into()]), ArgAction::DisconnectAll { dry_run: false });
-        assert_eq!(parse_args(&["--disconnect-all".into(), "--dry-run".into()]), ArgAction::DisconnectAll { dry_run: true });
-        assert!(matches!(parse_args(&["--dry-run".into()]), ArgAction::Unknown(_)));
-        assert!(matches!(parse_args(&["--disconnect-all".into(), "--daemon".into()]), ArgAction::Unknown(_)));
+        assert_eq!(
+            parse_args(&["--disconnect-all".into()]),
+            ArgAction::DisconnectAll { dry_run: false }
+        );
+        assert_eq!(
+            parse_args(&["--disconnect-all".into(), "--dry-run".into()]),
+            ArgAction::DisconnectAll { dry_run: true }
+        );
+        assert!(matches!(
+            parse_args(&["--dry-run".into()]),
+            ArgAction::Unknown(_)
+        ));
+        assert!(matches!(
+            parse_args(&["--disconnect-all".into(), "--daemon".into()]),
+            ArgAction::Unknown(_)
+        ));
     }
 
     /// A server whose NAME contains a write verb must not drag its read-only
@@ -21866,6 +22454,7 @@ mod tests {
                 downstream: MrtrRequest::default(),
                 input_request: json!({ "method": "elicitation/create" }),
                 status: ModernHitlStatus::AwaitingClient,
+                _cancel_guard: None,
             },
         );
         assert!(matches!(
@@ -21912,6 +22501,7 @@ mod tests {
                         downstream: MrtrRequest::default(),
                         input_request: json!({ "method": "elicitation/create" }),
                         status: ModernHitlStatus::AwaitingClient,
+                        _cancel_guard: None,
                     },
                 );
             }
@@ -23789,7 +24379,6 @@ mod tests {
         assert!(explicit_on.code_mode);
     }
 
-
     /// A failed registry load must not advertise or run Code Mode, even when
     /// a later request snapshot contains an explicit opt-in.
     #[test]
@@ -23805,10 +24394,7 @@ mod tests {
         let host = dispatch_host(seed_code_mode_after_registry_load(Err(())));
         let mut reg = Registry::default();
         reg.code_mode = true;
-        assert!(
-            reg.code_mode,
-            "the request fixture explicitly opts in"
-        );
+        assert!(reg.code_mode, "the request fixture explicitly opts in");
 
         let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
         let list = handle_request(
@@ -24697,14 +25283,7 @@ mod tests {
 
         let listener_inflight = Arc::clone(&inflight);
         std::thread::spawn(move || {
-            serve_http_loop_with_inflight(
-                server,
-                state,
-                None,
-                search,
-                true,
-                listener_inflight,
-            )
+            serve_http_loop_with_inflight(server, state, None, search, true, listener_inflight)
         });
         std::thread::sleep(Duration::from_millis(50));
 
@@ -25937,19 +26516,20 @@ mod tests {
         let state = http_state(true);
         swap_router(&state, router);
         let search = SearchGuard::default();
-        let post = |path: &str| {
-            handle_http(
-                &state, &search, "POST", path, "{}", None, None, None, None,
-            )
-        };
+        let post =
+            |path: &str| handle_http(&state, &search, "POST", path, "{}", None, None, None, None);
 
         let ok = post("/s__work");
         assert_eq!(ok.status, 200, "body={}", ok.body);
         assert_eq!(ok.body, "\"called\"");
-        assert!(ok.extra.contains(&("X-Toolport-Content-Trust".into(), "untrusted".into())));
+        assert!(ok
+            .extra
+            .contains(&("X-Toolport-Content-Trust".into(), "untrusted".into())));
         for (name, _) in &ok.extra {
             assert!(
-                EXPOSED_HTTP_HEADERS.split(", ").any(|exposed| exposed.eq_ignore_ascii_case(name)),
+                EXPOSED_HTTP_HEADERS
+                    .split(", ")
+                    .any(|exposed| exposed.eq_ignore_ascii_case(name)),
                 "browser cannot read provenance header {name}"
             );
         }
@@ -27304,8 +27884,10 @@ mod tests {
         reg.servers.push(stub_server("team-slack", "Team Slack"));
         reg.servers.push(stub_server("team_slack", "slack"));
         let personal = reg.add_profile("Personal");
-        reg.set_access_server(&personal, "team-slack", true).unwrap();
-        reg.set_access_server("default", "team_slack", true).unwrap();
+        reg.set_access_server(&personal, "team-slack", true)
+            .unwrap();
+        reg.set_access_server("default", "team_slack", true)
+            .unwrap();
         reg.set_server_enabled(&personal, "team-slack", true)
             .unwrap();
         reg.set_server_enabled("default", "team_slack", true)
@@ -29933,7 +30515,10 @@ mod tests {
                 .get("instructions")
                 .cloned()
         };
-        assert_eq!(handshake(&state), Some(json!(DISCOVER_INSTRUCTIONS_PREAMBLE)));
+        assert_eq!(
+            handshake(&state),
+            Some(json!(DISCOVER_INSTRUCTIONS_PREAMBLE))
+        );
         *state.profile.lock().unwrap() = Some("media".into());
         assert_eq!(handshake(&state), Some(json!("Media only.")));
         *state.profile.lock().unwrap() = Some("postgres".into());
@@ -31736,7 +32321,11 @@ mod tests {
         let host = dispatch_host(false);
         host.set_code_mode(false);
         let tools = floor_tool_defs(&host);
-        assert_eq!(tools.len(), 4, "Code Mode off means the floor is the core four");
+        assert_eq!(
+            tools.len(),
+            4,
+            "Code Mode off means the floor is the core four"
+        );
         let tools_json = serde_json::to_string(&tools).expect("floor tools serialize");
         let bytes = tools_json.len() + DISCOVER_INSTRUCTIONS_PREAMBLE.len();
         assert!(
@@ -32539,6 +33128,441 @@ mod tests {
     /// peer that asked, plus `!is_cancelled` on the peer that did not, is what fails
     /// when the registry stops being per-connection; a test that only cancelled and
     /// re-checked one session would pass either way.
+    fn p08_connection_scope(registry: downstream::CancelRegistry) -> HttpConnectionScope {
+        HttpConnectionScope(
+            HTTP_CONNECTION_CANCEL.with(|current| current.replace(Some(registry))),
+            HTTP_ADAPTER_INSTANCE.with(|current| current.replace(None)),
+        )
+    }
+
+    #[test]
+    fn p08_sessionless_same_owner_can_start_the_same_id_on_two_connections() {
+        let state = http_state(false);
+        let owner = test_caller("client:shared-token", None).session_owner;
+        let first = downstream::CancelRegistry::new();
+        let second = downstream::CancelRegistry::new();
+        let a = {
+            let _scope = p08_connection_scope(first);
+            http_call_cancellations(&state, None, Some(&owner))
+        };
+        assert!(a.begin_client_request("1".into()));
+        let b = {
+            let _scope = p08_connection_scope(second);
+            http_call_cancellations(&state, None, Some(&owner))
+        };
+        assert!(b.begin_client_request("1".into()));
+        a.close();
+        assert!(!b.is_cancelled("1"));
+    }
+
+    #[test]
+    fn p08_sessionless_cancel_notification_cannot_cross_connections() {
+        let state = http_state(false);
+        let owner = test_caller("client:shared-token", None).session_owner;
+        let first = downstream::CancelRegistry::new();
+        let a = {
+            let _scope = p08_connection_scope(first);
+            http_call_cancellations(&state, None, Some(&owner))
+        };
+        assert!(a.begin_client_request("1".into()));
+        let _scope = p08_connection_scope(downstream::CancelRegistry::new());
+        let out = handle_mcp_http(
+            &state,
+            &SearchGuard::default(),
+            "POST",
+            &json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":1}})
+                .to_string(),
+            modern_http_headers("notifications/cancelled", None, None, None),
+            None,
+            None,
+            None,
+            DiscoveryMode::Lazy,
+            Some(&owner),
+            None,
+        );
+        assert_eq!(out.status, 202);
+        assert!(!a.is_cancelled("1"));
+    }
+
+    #[test]
+    fn p08_live_adapter_lifetime_survives_session_ttl_and_initialize() {
+        let state = http_state(false);
+        let owner = test_caller("adapter:p08-long-lived", None).session_owner;
+        let connection = downstream::CancelRegistry::new();
+        assert!(connection.begin_client_request("connection".into()));
+        let _scope = HttpConnectionScope(
+            HTTP_CONNECTION_CANCEL.with(|current| current.replace(Some(connection.clone()))),
+            HTTP_ADAPTER_INSTANCE.with(|current| current.replace(Some("p08-ttl".into()))),
+        );
+        let mut headers = modern_http_headers("", None, None, None);
+        headers.private_daemon_bearer = true;
+        let out = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            "GET",
+            "/adapter/lifetime",
+            "",
+            headers,
+            None,
+            Some(&test_caller("adapter:p08-long-lived", None)),
+        );
+        assert_eq!(out.status, 200);
+        let lifetime = adapter_lifetime(&state, Some(&owner)).unwrap();
+        assert!(lifetime.cancellations.begin_client_request("held".into()));
+        *lifetime.last_seen.lock().unwrap() =
+            Instant::now() - MCP_SESSION_TTL - Duration::from_secs(1);
+        mint_mcp_session(&state, Some(&owner)).unwrap_or_else(|_| panic!("session capacity"));
+        assert!(!lifetime.closed.load(Ordering::SeqCst));
+        assert!(!lifetime.cancellations.is_cancelled("held"));
+        connection.close();
+        assert!(lifetime.cancellations.is_cancelled("held"));
+        drop(out);
+    }
+
+    #[test]
+    fn p08_stalled_rejected_request_does_not_delay_other_503s() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut stalled = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let (sender, worker) = spawn_http_overload_responder(
+            HttpReadDeadlines {
+                header: Duration::from_secs(5),
+                body: Duration::from_secs(5),
+                ..HttpReadDeadlines::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+        );
+        stalled
+            .write_all(b"POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\nx")
+            .unwrap();
+        sender.send(socket).unwrap();
+        let mut ready = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        ready
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        ready
+            .write_all(b"GET /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        sender.send(socket).unwrap();
+        let mut response = String::new();
+        let result = ready.read_to_string(&mut response);
+        drop(stalled);
+        drop(sender);
+        worker.join().unwrap();
+        result.unwrap();
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    }
+
+    #[test]
+    fn p08_cancel_aware_broker_preserves_unreachable_and_timeout() {
+        let env = DataDirTestEnv::new("p08-broker-outcomes");
+        for reply in ["", "not a decision\n"] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            std::fs::write(
+                env.dir.join(approval::ENDPOINT_FILE),
+                serde_json::to_string(&approval::EndpointDescriptor {
+                    endpoint: listener.local_addr().unwrap().to_string(),
+                    token: "p08-token".into(),
+                    unix_endpoint: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let worker = std::thread::spawn(move || {
+                for _ in 0..if reply.is_empty() { 2 } else { 1 } {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stub_handshake(&mut stream, "p08-token").unwrap();
+                    if !reply.is_empty() {
+                        stream.write_all(reply.as_bytes()).unwrap();
+                    }
+                }
+            });
+            let registry = downstream::CancelRegistry::new();
+            assert!(registry.begin_client_request("1".into()));
+            let decision = request_human_decision_with_cancel(
+                approval::ApprovalRequest {
+                    token: String::new(),
+                    id: "1".into(),
+                    client: None,
+                    server: "s".into(),
+                    tool: "t".into(),
+                    reason: approval::ApprovalReason::Destructive,
+                    arguments: json!({}),
+                    tool_fingerprint: None,
+                    url_elicitation: None,
+                    pii_release: None,
+                },
+                Some(&registry.context("1".into())),
+            );
+            // On the old denial path the second connection never happens.
+            if decision == approval::ApprovalDecision::Denied && reply.is_empty() {
+                let mut unblock =
+                    TcpStream::connect(approval::read_endpoint_descriptor().unwrap().endpoint)
+                        .unwrap();
+                let mut reader = BufReader::new(unblock.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                unblock
+                    .write_all(
+                        approval::answer_challenge(line.as_bytes(), "p08-token")
+                            .unwrap()
+                            .as_bytes(),
+                    )
+                    .unwrap();
+                unblock.write_all(b"\n{}\n").unwrap();
+            }
+            worker.join().unwrap();
+            assert_eq!(
+                decision,
+                if reply.is_empty() {
+                    approval::ApprovalDecision::Unreachable
+                } else {
+                    approval::ApprovalDecision::Timeout
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn p08_http_session_delete_withdraws_approval_and_late_allow_cannot_dispatch() {
+        let env = DataDirTestEnv::new("p08-delete-approval");
+        let state = http_state(false);
+        state.registry.lock().unwrap().confirm_destructive = true;
+        let (router, calls, _) = counting_router(true);
+        swap_router(&state, router);
+        let sid = mint_mcp_session(&state, None).unwrap_or_else(|_| panic!("session capacity"));
+        let other_sid =
+            mint_mcp_session(&state, None).unwrap_or_else(|_| panic!("session capacity"));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        std::fs::write(
+            env.dir.join(approval::ENDPOINT_FILE),
+            serde_json::to_string(&approval::EndpointDescriptor {
+                endpoint: listener.local_addr().unwrap().to_string(),
+                token: "p08-token".into(),
+                unix_endpoint: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let broker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let line = stub_handshake(&mut stream, "p08-token").unwrap();
+            let req: approval::ApprovalRequest = serde_json::from_str(&line).unwrap();
+            parked_tx.send(req).unwrap();
+            let mut byte = [0];
+            assert_eq!(
+                stream.read(&mut byte).unwrap(),
+                0,
+                "withdrawal must close the broker socket"
+            );
+            closed_tx.send(()).unwrap();
+            let _ = stream.write_all(b"\"approved\"\n");
+        });
+        let serving = state.clone();
+        let asking_sid = sid.clone();
+        let call = std::thread::spawn(move || {
+            handle_http(&serving, &SearchGuard::default(), "POST", "/mcp",
+            &json!({"jsonrpc":"2.0", "id":7, "method":"tools/call", "params":{"name":"s__work", "arguments":{}}}).to_string(),
+            Some(&asking_sid), None, None, None)
+        });
+        assert_eq!(
+            parked_rx.recv_timeout(Duration::from_secs(2)).unwrap().tool,
+            "work"
+        );
+        let deleted = handle_http(
+            &state,
+            &SearchGuard::default(),
+            "DELETE",
+            "/mcp",
+            "",
+            Some(&sid),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(deleted.status, 204);
+        closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let out = call.join().unwrap();
+        assert!(out.body.contains("isError"), "{}", out.body);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let other = handle_http(
+            &state,
+            &SearchGuard::default(),
+            "POST",
+            "/mcp",
+            &json!({"jsonrpc":"2.0", "id":7, "method":"ping"}).to_string(),
+            Some(&other_sid),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(other.status, 200);
+        assert!(serde_json::from_str::<Value>(&other.body)
+            .unwrap()
+            .get("result")
+            .is_some());
+        broker.join().unwrap();
+    }
+
+    #[test]
+    fn p08_overload_reply_reads_the_request_before_closing_the_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let (sender, worker) = spawn_http_overload_responder(
+            HttpReadDeadlines::default(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        sender.send(socket).unwrap();
+        let body = vec![b'x'; 64 * 1024];
+        write!(
+            client,
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        client.write_all(&body).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.contains("Retry-After: 1"), "{response}");
+        drop(sender);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn p08_http_disconnect_reaches_the_owned_call_before_a_response_exists() {
+        let (server, _ingress, address) =
+            bind_deadline_http_server("127.0.0.1:0", HttpReadDeadlines::default()).unwrap();
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let request = server.recv().unwrap();
+            let registry = http_connection_cancellations()
+                .lock()
+                .unwrap()
+                .get(request.remote_addr().unwrap())
+                .unwrap()
+                .clone();
+            let (released_tx, released_rx) = std::sync::mpsc::channel();
+            let _guard = registry
+                .context("connection".into())
+                .on_cancel(Arc::new(move |_| {
+                    closed_tx.send(()).unwrap();
+                    released_tx.send(()).unwrap();
+                }));
+            parked_tx.send(()).unwrap();
+            released_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let _ = request.respond(tiny_http::Response::from_string("x"));
+        });
+        // Hold the backend response until the cancellation callback, rather than
+        // allowing a completed request to explain why its socket closed.
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}")
+            .unwrap();
+        parked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        client.shutdown(Shutdown::Both).unwrap();
+        closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn p08_modern_approval_cannot_be_allowed_after_owner_close() {
+        let registry = downstream::CancelRegistry::new();
+        assert!(registry.begin_client_request("modern-approval".into()));
+        let _cancel = ApprovalCancelGuard::enter(Some(registry.context("modern-approval".into())));
+        let hash = audit::args_hash(&json!({}));
+        let token = start_modern_hitl(
+            "s__work",
+            hash.clone(),
+            None,
+            approval::ApprovalReason::Destructive,
+            Some("p08-client"),
+            "s",
+            "work",
+            &json!({}),
+            MrtrRequest::default(),
+        )
+        .unwrap();
+        registry.finish_client_request("modern-approval");
+        registry.close();
+        assert!(matches!(
+            poll_modern_hitl(
+                &token,
+                "s__work",
+                &hash,
+                Some("p08-client"),
+                Some(json!({"toolport_approval":{"action":"accept","content":{"approved":true}}}))
+            ),
+            ModernHitlPoll::Missing
+        ));
+    }
+
+    #[test]
+    fn p08_reopening_a_legacy_session_keeps_the_adapter_live() {
+        let state = http_state(false);
+        let lifetime = Arc::new(SessionState::new_http(None));
+        state
+            .mcp_sessions
+            .lock()
+            .unwrap()
+            .insert("adapter-lifetime:p08-reopen".into(), lifetime.clone());
+        let _scope = HttpConnectionScope(
+            HTTP_CONNECTION_CANCEL.with(|current| current.replace(None)),
+            HTTP_ADAPTER_INSTANCE.with(|current| current.replace(Some("p08-reopen".into()))),
+        );
+        let first = mint_mcp_session(&state, None).unwrap_or_else(|_| panic!("session capacity"));
+        state
+            .mcp_sessions
+            .lock()
+            .unwrap()
+            .get(&first)
+            .unwrap()
+            .close();
+        assert!(!lifetime.cancellations.is_cancelled("new"));
+        let second = mint_mcp_session(&state, None).unwrap_or_else(|_| panic!("session capacity"));
+        let session = state
+            .mcp_sessions
+            .lock()
+            .unwrap()
+            .get(&second)
+            .unwrap()
+            .clone();
+        assert!(session.cancellations.begin_client_request("new".into()));
+        lifetime.close();
+        assert!(session.cancellations.is_cancelled("new"));
+    }
+
+    #[test]
+    fn p08_closing_a_session_cancels_all_and_rejects_late_requests() {
+        let session = SessionState::new_http(None);
+        let other = SessionState::new_http(None);
+        for id in ["blocked", "approval"] {
+            assert!(session.cancellations.begin_client_request(id.into()));
+            assert!(other.cancellations.begin_client_request(id.into()));
+        }
+        session.close();
+        session.close();
+        for id in ["blocked", "approval"] {
+            assert!(session.cancellations.context(id.into()).is_cancelled());
+            assert!(!other.cancellations.context(id.into()).is_cancelled());
+        }
+        assert!(!session.cancellations.begin_client_request("late".into()));
+    }
+
     #[test]
     fn a_cancellation_belongs_to_one_connection() {
         let asking = test_stdio_session();
@@ -32886,7 +33910,11 @@ mod tests {
             (**guard).clone()
         };
 
-        fail_closed_integrity_catalog(&mut live, Some("sbs714-gateway"), set_of(&["srv__new_drift"]));
+        fail_closed_integrity_catalog(
+            &mut live,
+            Some("sbs714-gateway"),
+            set_of(&["srv__new_drift"]),
+        );
 
         assert_eq!(
             live.quarantined(),
@@ -32928,7 +33956,10 @@ mod tests {
     fn team_quarantine_at_member_off_enforces_drift_and_survives_watcher_reconciliation() {
         let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("toolport-team-quarantine-off-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-team-quarantine-off-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
@@ -33194,14 +34225,17 @@ mod tests {
                 let live = live_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let advertises = live.aggregated_tools().iter().any(|t| t["name"] == "srv__read");
-                *seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(advertises);
+                let advertises = live
+                    .aggregated_tools()
+                    .iter()
+                    .any(|t| t["name"] == "srv__read");
+                *seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(advertises);
             }),
         ));
 
-        let published =
-            publish_built_router(&state.registry, &state.router, drifted, profile);
+        let published = publish_built_router(&state.registry, &state.router, drifted, profile);
 
         *INTEGRITY_GATE_OBSERVER
             .lock()
@@ -33224,7 +34258,10 @@ mod tests {
             "the quarantine must be on the router the moment it becomes live"
         );
         assert!(
-            !live.aggregated_tools().iter().any(|t| t["name"] == "srv__read"),
+            !live
+                .aggregated_tools()
+                .iter()
+                .any(|t| t["name"] == "srv__read"),
             "the published router must not advertise the drifted tool"
         );
     }
@@ -36488,7 +37525,11 @@ mod tests {
         let anonymous = probe(&state, None, false);
         assert_eq!(anonymous.status, 401, "body={}", anonymous.body);
         let registered_client = probe(&state, Some(&caller), false);
-        assert_eq!(registered_client.status, 401, "body={}", registered_client.body);
+        assert_eq!(
+            registered_client.status, 401,
+            "body={}",
+            registered_client.body
+        );
         let registered_topology = handle_http_with_headers(
             &state,
             &SearchGuard::default(),

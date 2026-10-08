@@ -454,6 +454,9 @@ struct Session {
     /// Open `subscriptions/listen` requests by id, each with the flag the
     /// client's cancellation sets.
     subscriptions: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    instance: String,
+    closed: Arc<AtomicBool>,
+    lifetime_endpoint: Arc<Mutex<Option<String>>>,
 }
 
 /// Keeps an open subscription cancellable while its reply is relayed.
@@ -524,11 +527,16 @@ impl Session {
             declared_root: Mutex::new(None),
             roots_request_ids: Mutex::new(HashSet::new()),
             subscriptions: Mutex::new(HashMap::new()),
+            instance: crate::approval::new_correlation_id(),
+            closed: Arc::new(AtomicBool::new(false)),
+            lifetime_endpoint: Arc::new(Mutex::new(None)),
         }
     }
 
     fn with_identity(&self, request: ureq::Request) -> ureq::Request {
-        let request = request.set(ADAPTER_CLIENT_ID_HEADER, &self.client_id);
+        let request = request
+            .set(ADAPTER_CLIENT_ID_HEADER, &self.client_id)
+            .set("Toolport-Adapter-Instance", &self.instance);
         let request = match &self.env_profile {
             Some(profile) => request.set(ADAPTER_PROFILE_HEADER, profile),
             None => request,
@@ -914,6 +922,14 @@ impl Session {
                 }
             }
         }
+        let lifetime_endpoint = self
+            .lifetime_endpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if lifetime_endpoint.as_deref() != Some(self.descriptor().endpoint.as_str()) {
+            self.ensure_lifetime_stream();
+        }
         // The old session is gone either way, and `initialize` must not send it.
         if let Ok(mut guard) = self.session_id.lock() {
             *guard = None;
@@ -1001,6 +1017,15 @@ impl Session {
     /// Close the daemon-side session on client EOF so its per-session state is
     /// released immediately rather than waiting for a lease TTL.
     fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        let descriptor = self.descriptor();
+        let _ = self
+            .with_identity(
+                ureq::delete(&format!("http://{}/adapter/lifetime", descriptor.endpoint))
+                    .set("Authorization", &format!("Bearer {}", descriptor.token))
+                    .timeout(Duration::from_secs(5)),
+            )
+            .call();
         let Some(session) = self.session_id() else {
             return;
         };
@@ -1250,6 +1275,7 @@ fn proxy_stdio(
     private: Option<std::process::Child>,
 ) -> Result<(), String> {
     let session = Arc::new(Session::new(rendezvous, descriptor, private));
+    session.ensure_lifetime_stream();
     spawn_listen_stream(Arc::clone(&session));
     spawn_heartbeat(Arc::clone(&session));
 
@@ -1303,8 +1329,8 @@ fn proxy_stdio(
             report_request_error(&session, &request, &error);
         }
     }
-    dispatcher.drain(EOF_GRACE);
     session.close();
+    dispatcher.drain(EOF_GRACE);
     Ok(())
 }
 
@@ -1322,6 +1348,57 @@ fn report_request_error(session: &Session, request: &serde_json::Value, error: &
     }
 }
 
+/// A private connection owns this adapter's calls across sessionless MRTR rounds.
+/// The ingress detects process death on this socket, including after a round ended.
+impl Session {
+    fn ensure_lifetime_stream(&self) {
+        if let Err(error) = self.open_lifetime_stream() {
+            crate::gatewaylog::append(&error);
+        }
+    }
+
+    fn open_lifetime_stream(&self) -> Result<(), String> {
+        let descriptor = self.descriptor();
+        let mut endpoint = self
+            .lifetime_endpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if endpoint.as_deref() == Some(descriptor.endpoint.as_str()) {
+            return Ok(());
+        }
+        let response = self
+            .with_identity(
+                ureq::AgentBuilder::new()
+                    .timeout_connect(Duration::from_secs(2))
+                    .timeout_write(Duration::from_secs(2))
+                    .timeout_read(SUBSCRIPTION_READ_TIMEOUT)
+                    .build()
+                    .get(&format!("http://{}/adapter/lifetime", descriptor.endpoint))
+                    .set("Authorization", &format!("Bearer {}", descriptor.token)),
+            )
+            .call()
+            .map_err(|error| format!("could not open adapter lifetime: {error}"))?;
+        *endpoint = Some(descriptor.endpoint.clone());
+        let lifetime_endpoint = self.lifetime_endpoint.clone();
+        let closed = self.closed.clone();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(response.into_reader());
+            while !closed.load(Ordering::SeqCst) {
+                if !matches!(read_bounded_line(&mut reader, MAX_FRAME_BYTES), Ok(Some(_))) {
+                    break;
+                }
+            }
+            let mut endpoint = lifetime_endpoint
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if endpoint.as_deref() == Some(descriptor.endpoint.as_str()) {
+                *endpoint = None;
+            }
+        });
+        Ok(())
+    }
+}
+
 /// Open the daemon's long-lived `GET /mcp` SSE stream and forward server-initiated
 /// messages to the client, reconnecting if it drops. Frames are POSTed back by the
 /// client through the normal stdin path, so no correlation table is needed here:
@@ -1330,6 +1407,9 @@ fn report_request_error(session: &Session, request: &serde_json::Value, error: &
 /// one whose daemon this session has moved off, is reopened.
 fn spawn_listen_stream(session: Arc<Session>) {
     std::thread::spawn(move || loop {
+        if session.closed.load(Ordering::SeqCst) {
+            break;
+        }
         let Some(session_id) = session.session_id() else {
             std::thread::sleep(LISTEN_POLL);
             continue;
@@ -1391,6 +1471,10 @@ fn spawn_heartbeat(session: Arc<Session>) {
         let mut watched = session.descriptor().endpoint;
         loop {
             std::thread::sleep(interval);
+            if session.closed.load(Ordering::SeqCst) {
+                break;
+            }
+            session.ensure_lifetime_stream();
             let descriptor = session.descriptor();
             if descriptor.endpoint != watched {
                 watched = descriptor.endpoint.clone();
@@ -1894,6 +1978,72 @@ mod tests {
         session.stdout = Mutex::new(Box::new(sink.clone()));
         session.request_timeout = timeout;
         session
+    }
+
+    #[test]
+    fn p08_adapter_lifetime_retries_after_503_and_reopens_after_eof() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let compat = CompatKey::new("test", "p08-lifetime-retry");
+        let session = Session::new(
+            Rendezvous::new(&std::env::temp_dir(), compat.clone()),
+            DaemonDescriptor::new(
+                listener.local_addr().unwrap().to_string(),
+                "test-token",
+                &compat,
+            ),
+            None,
+        );
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (drop_tx, drop_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            for status in [503, 200, 200] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                if status == 503 {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 503 Busy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                } else {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: connected\n\n").unwrap();
+                    opened_tx.send(()).unwrap();
+                    drop_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                }
+            }
+        });
+        // This is the startup/heartbeat path. A 503 must not abort the adapter.
+        session.ensure_lifetime_stream();
+        assert!(session.lifetime_endpoint.lock().unwrap().is_none());
+        session.ensure_lifetime_stream();
+        opened_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(session.lifetime_endpoint.lock().unwrap().is_some());
+        // A heartbeat while live must reuse the stream instead of another GET.
+        session.ensure_lifetime_stream();
+        drop_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.lifetime_endpoint.lock().unwrap().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "dead lifetime stream was not forgotten"
+            );
+            std::thread::yield_now();
+        }
+        session.ensure_lifetime_stream();
+        opened_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        session.closed.store(true, Ordering::SeqCst);
+        drop_tx.send(()).unwrap();
+        worker.join().unwrap();
     }
 
     /// Answers `initialize` with a new session id (`s1`, `s2`, ...) each time and
