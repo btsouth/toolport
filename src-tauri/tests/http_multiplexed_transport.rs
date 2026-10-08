@@ -95,6 +95,8 @@ fn simultaneous_unauthorized_posts_share_one_forced_refresh() {
                 }
                 Err(error) => panic!("{error}"),
             };
+            // Windows accepted sockets inherit the listener's non-blocking mode.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
@@ -215,6 +217,8 @@ fn sse_fixture(calls: usize) -> (String, std::thread::JoinHandle<Vec<Value>>) {
                 }
                 Err(error) => panic!("{error}"),
             };
+            // Windows accepted sockets inherit the listener's non-blocking mode.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
