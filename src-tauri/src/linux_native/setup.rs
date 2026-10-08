@@ -184,3 +184,39 @@ pub(super) fn connect(
         }
     });
 }
+
+pub(super) fn collection(
+    parent: &gtk::Window,
+    name: &str,
+    entries: Vec<crate::catalog::CatalogEntry>,
+    finished: impl Fn() + 'static,
+) {
+    let items = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| SetupItem {
+            key: i.to_string(),
+            name: e.name.clone(),
+            transport: e.transport.clone(),
+            command: e.command.clone(),
+            args: e.args.clone(),
+            url: e.url.clone().or(e.url_hint.clone()),
+            env_keys: e
+                .env_keys
+                .iter()
+                .cloned()
+                .chain(
+                    e.launch
+                        .iter()
+                        .flat_map(|l| l.inputs.iter().map(|i| i.label.clone())),
+                )
+                .collect(),
+            is_new: true,
+        })
+        .collect();
+    review(parent,&format!("Review {name}"),items,"Review what each server runs. Valid servers turn on. Servers needing credentials or launch values stay off until setup is complete.","Add selected servers",move |keys| {
+        let selected=entries.iter().enumerate().filter(|(i,_)|keys.contains(&i.to_string())).map(|(_,e)|e.clone()).collect();
+        let (_,added)=crate::registry_controller::add_catalog_stack(selected)?;
+        Ok(format!("Added {added} servers. Check status and complete any missing setup inputs under Servers."))
+    },finished);
+}

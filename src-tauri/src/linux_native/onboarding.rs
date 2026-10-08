@@ -95,7 +95,7 @@ pub(super) fn mark_complete() -> Result<(), String> {
         .map_err(|error| format!("could not save setup completion: {error}"))
 }
 
-fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page: ClientPage) {
+fn present(app: &adw::Application, parent: &adw::ApplicationWindow, _client_page: ClientPage) {
     if let Some(window) = app
         .windows()
         .into_iter()
@@ -186,7 +186,7 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
 
     let add = wizard_page(
         "Add your first servers",
-        "Choose a Collection, import servers already configured in a client, or continue to the full catalog.",
+        "Choose a Collection, review and connect a client, or continue to the full catalog.",
     );
     let stack_feedback = feedback_label("Choose a Collection or continue when you are ready.");
     add.append(&stack_feedback);
@@ -221,33 +221,13 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
         let entries = starter.servers;
         let name = starter.name;
         let feedback = stack_feedback.clone();
+        let parent = window.clone();
         add_stack.connect_clicked(move |button| {
-            button.set_sensitive(false);
             let button = button.clone();
-            let entries = entries.clone();
-            let name = name.clone();
             let feedback = feedback.clone();
-            gtk::glib::spawn_future_local(async move {
-                let result = gtk::gio::spawn_blocking(move || {
-                    crate::registry_controller::add_catalog_stack(entries)
-                })
-                .await;
-                button.set_sensitive(true);
-                match result {
-                    Ok(Ok((_, count))) => {
-                        button.set_label("Added");
-                        button.set_sensitive(false);
-                        show_success(
-                            &feedback,
-                            &format!(
-                                "Added {count} server{} from {name}. Valid servers turn on. Missing setup inputs stay off.",
-                                if count == 1 { "" } else { "s" }
-                            ),
-                        );
-                    }
-                    Ok(Err(error)) => show_error(&feedback, &error),
-                    Err(_) => show_error(&feedback, "the collection setup task stopped unexpectedly"),
-                }
+            super::setup::collection(parent.upcast_ref(), &name, entries.clone(), move || {
+                button.set_label("Added");
+                show_success(&feedback, "Added selected servers. Check status and complete any missing setup inputs under Servers.");
             });
         });
         row.append(&add_stack);
