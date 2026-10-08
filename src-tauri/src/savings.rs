@@ -774,6 +774,10 @@ mod tests {
             surface.hash,
             <[u8; 32]>::from(Sha256::digest(surface.json.get().as_bytes()))
         );
+        let streamed = SerializedSurface::from_tools(tools.clone());
+        assert_eq!(streamed.json.get(), surface.json.get());
+        assert_eq!(streamed.hash, surface.hash);
+        assert_eq!(streamed.tools, surface.tools);
         let session = CatalogSession::default();
         let exposed = SerializedSurface::new(&[]);
         assert!(session.first_exposure(Some("client"), &surface, &exposed));

@@ -6307,16 +6307,18 @@ fn cached_tool_surfaces(
         .iter()
         .filter(|tool| {
             let name = tool.get("name").and_then(Value::as_str);
-            (snapshot.tools.is_empty() || name.is_none_or(|name| {
-                !router.is_blocked(name)
-                    && !(deny_destructive && cached_tool_is_destructive(tool, name))
-            })) && allowed.is_none_or(|scope| {
-                name.is_some_and(|name| {
-                    tool_in_scope(name, scope, &|name| {
-                        owner_of_exposed_tool(Some(router), &owners, name)
+            (snapshot.tools.is_empty()
+                || name.is_none_or(|name| {
+                    !router.is_blocked(name)
+                        && !(deny_destructive && cached_tool_is_destructive(tool, name))
+                }))
+                && allowed.is_none_or(|scope| {
+                    name.is_some_and(|name| {
+                        tool_in_scope(name, scope, &|name| {
+                            owner_of_exposed_tool(Some(router), &owners, name)
+                        })
                     })
                 })
-            })
         })
         .collect();
     let relays_apps = relays_mcp_app_html_to_active_client(router, allowed);
@@ -6402,7 +6404,6 @@ fn cached_tool_surfaces(
     });
     (full, exposed)
 }
-
 /// Check coldness without cloning a potentially multi-megabyte tool catalog.
 fn has_scoped_tools(
     tools: &[Value],
