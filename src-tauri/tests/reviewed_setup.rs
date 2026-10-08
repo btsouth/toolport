@@ -87,6 +87,34 @@ impl Drop for Fixture {
                             let _ = conduit_lib::daemon::request_shutdown_if_idle(&descriptor);
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
+                        #[cfg(target_os = "linux")]
+                        if file.path().exists() {
+                            let image = std::fs::read_link(format!("/proc/{}/exe", descriptor.pid));
+                            let private_image = std::env::current_exe()
+                                .unwrap()
+                                .parent()
+                                .unwrap()
+                                .join("toolport-gateway");
+                            assert_eq!(image.as_deref(), Ok(private_image.as_path()));
+                            // This daemon belongs to this disposable fixture. An active
+                            // adapter listener can outlive its caller, so reap it before
+                            // removing the executable or its private data.
+                            assert_eq!(
+                                unsafe { libc::kill(descriptor.pid as i32, libc::SIGKILL) },
+                                0
+                            );
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(10);
+                            while std::fs::read_link(format!("/proc/{}/exe", descriptor.pid))
+                                .is_ok()
+                                && std::time::Instant::now() < deadline
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            assert!(std::fs::read_link(format!("/proc/{}/exe", descriptor.pid))
+                                .is_err());
+                            conduit_lib::daemon::clear_descriptor(&file.path());
+                        }
                         assert!(
                             !file.path().exists(),
                             "private fixture daemon {} did not shut down",
