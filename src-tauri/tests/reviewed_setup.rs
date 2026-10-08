@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 struct Fixture {
     dir: PathBuf,
+    sidecar: Option<PathBuf>,
     env: Vec<(String, Option<std::ffi::OsString>)>,
     _data: registry::DataDirOverride,
 }
@@ -24,6 +25,7 @@ impl Fixture {
             _data: registry::DataDirOverride::set(dir.join("data")),
             dir,
             env: vec![],
+            sidecar: None,
         };
         let overrides = std::env::vars_os()
             .filter_map(|(key, _)| key.into_string().ok())
@@ -36,7 +38,19 @@ impl Fixture {
             "CLAUDE_CONFIG_DIR",
             Some(fixture.dir.join("client").into_os_string()),
         );
-        fixture.set("APPIMAGE", Some("disposable-fixture".into()));
+        fixture.set("APPIMAGE", None);
+        let sidecar = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("toolport-gateway");
+        if !sidecar.exists() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_toolport-gateway"), &sidecar).unwrap();
+            #[cfg(not(unix))]
+            std::fs::copy(env!("CARGO_BIN_EXE_toolport-gateway"), &sidecar).unwrap();
+            fixture.sidecar = Some(sidecar);
+        }
         fixture.set(
             "TOOLPORT_DATA_DIR",
             Some(fixture.dir.join("data").into_os_string()),
@@ -67,6 +81,9 @@ impl Drop for Fixture {
                 Some(value) => std::env::set_var(key, value),
                 None => std::env::remove_var(key),
             }
+        }
+        if let Some(sidecar) = &self.sidecar {
+            let _ = std::fs::remove_file(sidecar);
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
