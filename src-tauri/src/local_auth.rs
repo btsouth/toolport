@@ -194,7 +194,7 @@ pub(crate) fn reconcile(reg: &mut Registry, previous: &[ServerEntry]) {
     }
 }
 
-/// Restore only originals whose managed route was still enabled when leaving.
+/// Restore originals whose managed route was enabled, including a temporary review hold.
 pub(crate) fn restore_personal_routes(reg: &mut Registry, team_id: &str) {
     let Ok(mut entries) = bindings(reg) else {
         return;
@@ -203,10 +203,16 @@ pub(crate) fn restore_personal_routes(reg: &mut Registry, team_id: &str) {
         if binding.team_id != team_id || !reg.servers.iter().any(|s| s.id == binding.personal_id) {
             continue;
         }
-        let managed_on = reg.server_enabled(managed);
+        let held = crate::teams::held_server_access(reg, managed);
+        let managed_on = held
+            .as_ref()
+            .map_or_else(|| reg.server_enabled(managed), |(enabled, _)| *enabled);
         for profile in &mut reg.profiles {
             if managed_on
-                && profile.enabled_server_ids.contains(managed)
+                && (profile.enabled_server_ids.contains(managed)
+                    || held
+                        .as_ref()
+                        .is_some_and(|(_, profiles)| profiles.contains(&profile.id)))
                 && !profile.enabled_server_ids.contains(&binding.personal_id)
             {
                 profile.enabled_server_ids.push(binding.personal_id.clone());

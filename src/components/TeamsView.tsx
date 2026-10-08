@@ -554,6 +554,7 @@ export function TeamsView({
                 <div className="flex gap-2">
                   <Button
                     size="sm"
+                    aria-label={`Accept ${change.title}`}
                     onClick={() => void onReview(change, true)}
                     disabled={busy !== null}
                   >
@@ -562,6 +563,7 @@ export function TeamsView({
                   <Button
                     size="sm"
                     variant="outline"
+                    aria-label={`Reject ${change.title}`}
                     onClick={() => void onReview(change, false)}
                     disabled={busy !== null}
                   >

@@ -219,7 +219,9 @@ impl TeamsPage {
         }
         if let Some((notice, is_error)) = notice {
             self.set_status(&notice, is_error);
-            if !is_error { self.feedback.add_css_class("success"); }
+            if !is_error {
+                self.feedback.add_css_class("success");
+            }
             if let Some(team) = registry.team.clone() {
                 self.render_connected(registry, team);
             } else {
@@ -767,7 +769,8 @@ impl TeamsPage {
             }
             crate::teams::SyncResult::Ok { applied, .. } => {
                 let outcome = applied.map(|(_, outcome)| outcome).unwrap_or_default();
-                *self.sync_notice.borrow_mut() = team_review_line(outcome.review, outcome.blocked).map(|message| (message, true));
+                *self.sync_notice.borrow_mut() = team_review_line(outcome.review, outcome.blocked)
+                    .map(|message| (message, true));
             }
         }
         self.refresh();
@@ -1240,7 +1243,11 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
 /// how it relates to the team.
 fn share_choice_label(name: &str, keys: Option<String>, hint: Option<&str>) -> gtk::Box {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    let title = gtk::Label::builder().label(name).xalign(0.0).wrap(true).build();
+    let title = gtk::Label::builder()
+        .label(name)
+        .xalign(0.0)
+        .wrap(true)
+        .build();
     column.append(&title);
     for detail in keys.as_deref().into_iter().chain(hint) {
         let line = gtk::Label::builder()
@@ -1407,6 +1414,11 @@ fn member_review_dialog(
 ) -> adw::MessageDialog {
     let dialog = adw::MessageDialog::new(Some(parent), Some("Review team changes"), Some("Each decision applies to this member and the exact content shown. Held servers stay off. Safety floors can tighten immediately."));
     dialog.add_response("close", "Close");
+    dialog.set_extra_child(Some(&member_review_content(review)));
+    dialog
+}
+
+fn member_review_content(review: &crate::teams::MemberReview) -> gtk::ScrolledWindow {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
     for change in review.pending.values() {
         let section = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -1460,14 +1472,24 @@ fn member_review_dialog(
         section.append(&buttons);
         content.append(&section);
     }
-    let scroll = gtk::ScrolledWindow::builder()
+    gtk::ScrolledWindow::builder()
         .min_content_width(480)
         .max_content_height(520)
         .propagate_natural_height(true)
         .child(&content)
-        .build();
-    dialog.set_extra_child(Some(&scroll));
-    dialog
+        .build()
+}
+
+fn refresh_member_review_dialog(
+    dialog: &adw::MessageDialog,
+    review: &crate::teams::MemberReview,
+) -> bool {
+    if review.pending.is_empty() {
+        dialog.close();
+        return false;
+    }
+    dialog.set_extra_child(Some(&member_review_content(review)));
+    true
 }
 
 fn connect_member_decisions(
@@ -1499,8 +1521,22 @@ fn connect_member_decisions(
                         .await;
                         page.busy.set(false);
                         match result {
-                            Ok(Ok(_)) => {
-                                dialog.close();
+                            Ok(Ok(reg)) => {
+                                match crate::teams::member_review(&reg) {
+                                    Ok(review) => {
+                                        if refresh_member_review_dialog(&dialog, &review) {
+                                            if let Some(content) = dialog.extra_child() {
+                                                connect_member_decisions(
+                                                    &content, &review, &page, &dialog,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        dialog.close();
+                                        page.show_error(&error);
+                                    }
+                                }
                                 page.refresh();
                             }
                             Ok(Err(error)) => {
@@ -1596,7 +1632,32 @@ mod tests {
         parent.close();
     }
 
-    fn selection(name: &str, change: &str, outcome: HandoffOutcome, message: &str) -> ShareSelectionPreview {
+    #[test]
+    fn member_review_native_keeps_remaining_decisions_open() {
+        adw::init().unwrap();
+        let mut reg = crate::registry::Registry::default();
+        reg.team = Some(serde_json::from_value(serde_json::json!({"teamId":"native-review", "serverUrl":"https://teams.toolport.app", "role":"member"})).unwrap());
+        crate::teams::stage_team_config(&mut reg, "native-review", &serde_json::json!({"servers":[], "instructions":{"content":"Pending text"}, "callAuditExport":true}), 1, &[]).unwrap();
+        let mut review = crate::teams::member_review(&reg).unwrap();
+        let parent = adw::ApplicationWindow::builder().build();
+        let dialog = super::member_review_dialog(&parent, &review);
+        review.pending.remove("instructions");
+        assert!(super::refresh_member_review_dialog(&dialog, &review));
+        let mut text = String::new();
+        collect(&dialog.clone().upcast(), &mut text);
+        assert!(text.contains("Call-log export"));
+        assert!(!text.contains("Pending text"));
+        review.pending.clear();
+        assert!(!super::refresh_member_review_dialog(&dialog, &review));
+        parent.close();
+    }
+
+    fn selection(
+        name: &str,
+        change: &str,
+        outcome: HandoffOutcome,
+        message: &str,
+    ) -> ShareSelectionPreview {
         ShareSelectionPreview {
             id: name.to_lowercase(),
             name: name.into(),
@@ -1643,10 +1704,23 @@ mod tests {
 
     #[test]
     fn the_confirm_action_matches_what_the_share_will_do() {
-        let switch = selection("Linear", "Already shared", HandoffOutcome::Switched, "switches");
+        let switch = selection(
+            "Linear",
+            "Already shared",
+            HandoffOutcome::Switched,
+            "switches",
+        );
         let kept = selection("Linear", "Already shared", HandoffOutcome::Kept, "keeps");
-        let blocked = selection("Vercel", "Already shared", HandoffOutcome::Attention, "needs setup");
-        assert_eq!(share_action(&selection_preview(vec![switch.clone(), blocked.clone()])), Some("Use Team copies"));
+        let blocked = selection(
+            "Vercel",
+            "Already shared",
+            HandoffOutcome::Attention,
+            "needs setup",
+        );
+        assert_eq!(
+            share_action(&selection_preview(vec![switch.clone(), blocked.clone()])),
+            Some("Use Team copies")
+        );
         assert_eq!(share_action(&selection_preview(vec![kept, blocked])), None);
         let mut update = selection_preview(vec![switch]);
         update.changed = vec!["Linear".into()];
@@ -1670,7 +1744,10 @@ mod tests {
             same_name,
             selection("Vercel (Full API)", "Already shared", HandoffOutcome::Attention, "This team copy already has its own local credentials. Keep its existing setup and enable it separately. Your personal server stays on in this profile."),
         ]);
-        let parent = gtk::Window::builder().default_width(1000).default_height(760).build();
+        let parent = gtk::Window::builder()
+            .default_width(1000)
+            .default_height(760)
+            .build();
         parent.present();
         let dialog = share_preview_dialog(&parent, &preview);
         let mut text = String::new();
@@ -1696,10 +1773,17 @@ mod tests {
         }
         dialog.close();
 
-        let picker = share_choice_label("Linear", None, Some("Shared. The Team copy is in use in this profile."));
+        let picker = share_choice_label(
+            "Linear",
+            None,
+            Some("Shared. The Team copy is in use in this profile."),
+        );
         let mut text = String::new();
         collect(picker.upcast_ref(), &mut text);
-        assert_eq!(text, "Linear\nShared. The Team copy is in use in this profile.\n");
+        assert_eq!(
+            text,
+            "Linear\nShared. The Team copy is in use in this profile.\n"
+        );
         parent.close();
     }
 

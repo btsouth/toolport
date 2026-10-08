@@ -798,7 +798,9 @@ describe("Teams member review", () => {
         "via dashboard · approved by Bob",
       );
       await userEvent.click(
-        within(dialog).getByRole("button", { name: accept ? "Accept" : "Reject" }),
+        within(dialog).getByRole("button", {
+          name: `${accept ? "Accept" : "Reject"} ${change.title}`,
+        }),
       );
       expect(invoke).toHaveBeenCalledWith("team_review", {
         key: change.key,
@@ -826,7 +828,9 @@ describe("Teams member review", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Review team changes" }));
     await userEvent.click(
-      within(screen.getByRole("dialog")).getByRole("button", { name: "Accept" }),
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: `Accept ${change.title}`,
+      }),
     );
     await waitFor(() =>
       expect(
