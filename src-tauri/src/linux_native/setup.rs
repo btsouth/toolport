@@ -683,6 +683,12 @@ mod tests {
             .filter_map(|w| w.downcast::<gtk::Window>().ok())
             .find(|w| w.title().as_deref() == Some("Credential choice fixture"))
             .unwrap();
+        for expander in descendants(window.upcast_ref())
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Expander>())
+        {
+            expander.set_expanded(true);
+        }
         let widgets = descendants(window.upcast_ref());
         let choice = widgets
             .iter()
