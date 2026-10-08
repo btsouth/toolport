@@ -550,7 +550,10 @@ impl AdapterClient {
 
     fn assert_no_notification(&self, within: Duration, label: &str) {
         if let Some(message) = self.observed_message(within) {
-            panic!("{label}: unexpected message {message}");
+            panic!(
+                "{label}: unexpected message {message}\n{}",
+                self.diagnostics()
+            );
         }
     }
 }
@@ -1089,6 +1092,42 @@ fn wait_until(mut predicate: impl FnMut() -> bool, label: &str, within: Duration
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("timed out waiting for {label}");
+}
+
+/// Finish startup and each server's first publication before opening the
+/// sessions whose later notifications a case attributes to one scoped change.
+/// Seeing a tool in tools/list is insufficient: persistence and SSE fanout can
+/// still be running, and a quiet period cannot prove they finished.
+fn warm_initial_catalog(dir: &Path, servers: &[&str]) -> AdapterClient {
+    let mut warmup = spawn_adapter(
+        dir,
+        &AdapterOptions {
+            profile: Some(registry::ALL_ENABLED_ACCESS),
+            ..AdapterOptions::default()
+        },
+    );
+    warmup.initialize("matrix-catalog-warmup");
+    for server in servers {
+        let prefix = format!("{server}__");
+        warmup.wait_for_tool_where(&prefix, |name| name.starts_with(&prefix), RESPONSE_TIMEOUT);
+    }
+    wait_until(
+        || {
+            let log = std::fs::read_to_string(dir.join("gateway.log")).unwrap_or_default();
+            log.lines()
+                .any(|line| line == "background build: initial catalog announced")
+                && servers.iter().all(|server| {
+                    log.lines().any(|line| {
+                        line.strip_prefix("reconnected ")
+                            .and_then(|rest| rest.split_once(" after retrying;"))
+                            .is_some_and(|(ids, _)| ids.split(", ").any(|id| id == *server))
+                    })
+                })
+        },
+        "the startup and first-server catalog announcements",
+        RESPONSE_TIMEOUT,
+    );
+    warmup
 }
 
 fn text_of(result: &Value) -> String {
@@ -3375,6 +3414,7 @@ fn matrix_routing_tool_change_notifies_only_profiles_that_can_see_it() {
         vec![mock_server_entry("shared", &transcript, None)],
         vec![grow_profile, echo_profile],
     );
+    let _warmup = warm_initial_catalog(&dir, &["shared"]);
     let mut grow = spawn_adapter(
         &dir,
         &AdapterOptions {
@@ -3393,16 +3433,6 @@ fn matrix_routing_tool_change_notifies_only_profiles_that_can_see_it() {
     echo.initialize("matrix-echo-profile");
     let grow_tool = grow.wait_for_tool("__grow", Duration::from_secs(30));
     echo.wait_for_tool("__echo", Duration::from_secs(30));
-    // The daemon may finish its initial catalog fanout after a tools/list
-    // response, especially on Windows. Establish a quiet baseline before
-    // attributing a later notification to the grow call.
-    for client in [&grow, &echo] {
-        while client
-            .observed_message(Duration::from_millis(500))
-            .is_some()
-        {}
-        client.pending_notifications.lock().unwrap().clear();
-    }
 
     grow.call_tool(&grow_tool, json!({}));
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -3538,7 +3568,7 @@ fn matrix_routing_server_change_notifies_only_authorized_sessions() {
             profile("scope-two", &["two"]),
         ],
     );
-
+    let _warmup = warm_initial_catalog(&dir, &["one", "two"]);
     let options = |profile| AdapterOptions {
         profile: Some(profile),
         ..AdapterOptions::default()
@@ -3560,17 +3590,6 @@ fn matrix_routing_server_change_notifies_only_authorized_sessions() {
         |name| name.starts_with("two__"),
         Duration::from_secs(30),
     );
-    // Ignore the initial catalog's own change notifications. Only the grow
-    // below is relevant to this assertion.
-    for client in [&session_a, &session_b, &session_c] {
-        // The catalog notification can trail the first successful tools/list
-        // on slower runners, so wait for a short quiet period before the call.
-        while client
-            .observed_message(Duration::from_millis(500))
-            .is_some()
-        {}
-        client.pending_notifications.lock().unwrap().clear();
-    }
 
     // A and B share the same downstream server. Its catalog change belongs to
     // both of them; C is scoped to another server and must not learn about it.

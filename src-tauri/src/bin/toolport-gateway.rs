@@ -13396,7 +13396,7 @@ fn finish_self_heal_build(
 }
 
 /// Finish the startup background build: publish the freshly built router through the
-/// integrity gate, persist the catalog, and only then mark the gateway ready. Split
+/// integrity gate, mark the gateway ready, then persist and announce the catalog. Split
 /// out of the build thread so a test can drive the exact startup sequence with a
 /// router built in memory instead of spawning downstream processes.
 fn finish_startup_build(
@@ -13475,6 +13475,7 @@ fn finish_startup_build(
         save_tool_cache(&tools, profile);
     }
     notify_tools_changed(stdio, Some(&host.mcp_sessions));
+    glog("background build: initial catalog announced");
 }
 
 /// Fetch the upstream client's roots over stdio, update the shared `${ROOT}` path,
