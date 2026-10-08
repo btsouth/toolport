@@ -779,6 +779,17 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_optional_launch_input_stays_optional() {
+        let mut raw = entry(false);
+        raw.launch = Some(
+            serde_json::from_value(json!({"inputs":[],"bindings":[],"requiredEnv":[]})).unwrap(),
+        );
+        let import = Import::prepare(raw, Some(&json!({"env":{"PAT":"${PAT}"}}))).unwrap();
+        let credentials = import.review_credentials();
+        assert_eq!(credentials, vec![("PAT".into(), true, false, false)]);
+    }
+
+    #[test]
     fn reviewed_path_only_endpoint_is_vaulted_and_masked() {
         let mut raw = entry(true);
         raw.env.clear();

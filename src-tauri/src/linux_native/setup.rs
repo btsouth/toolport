@@ -791,6 +791,64 @@ mod tests {
 
     #[test]
     #[ignore = "requires isolated GTK display"]
+    fn reviewed_optional_value_does_not_block_connection() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        review(
+            &parent,
+            "Optional fixture",
+            vec![SetupItem {
+                key: "one".into(),
+                name: "One".into(),
+                transport: "stdio".into(),
+                command: Some("fixture".into()),
+                args: vec![],
+                url: None,
+                env_keys: vec!["PAT".into()],
+                is_new: true,
+                credentials: vec![crate::registry_controller::CredentialReview {
+                    key: "PAT".into(),
+                    secret: true,
+                    present: false,
+                    required: false,
+                }],
+                unsupported: None,
+                updates: vec![],
+            }],
+            "Fixture",
+            "Connect",
+            true,
+            |_, _, _| Err("fixture".into()),
+            || {},
+            None,
+        );
+        let window = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Optional fixture"))
+            .unwrap();
+        for expander in descendants(window.upcast_ref())
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Expander>())
+        {
+            expander.set_expanded(true);
+        }
+        let widgets = descendants(window.upcast_ref());
+        assert!(widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Button>())
+            .find(|b| b.label().as_deref() == Some("Connect"))
+            .unwrap()
+            .is_sensitive());
+        assert!(widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .any(|l| l.text() == "Optional"));
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
     fn reviewed_missing_value_and_existing_update_are_explicit() {
         adw::init().unwrap();
         let parent = gtk::Window::new();
