@@ -43,6 +43,7 @@ export function ConnectReviewDialog({
   async function connect(
     selected: string[],
     secretChoices?: Record<string, Record<string, boolean>>,
+    credentialInputs?: Record<string, Record<string, string>>,
   ) {
     if (!review) return;
     setBusy(true);
@@ -54,7 +55,11 @@ export function ConnectReviewDialog({
         force,
         selected,
         review.revision,
-        ...(secretChoices ? ([secretChoices] as const) : ([] as const)),
+        ...(credentialInputs
+          ? ([secretChoices, credentialInputs] as const)
+          : secretChoices
+            ? ([secretChoices] as const)
+            : ([] as const)),
       );
       setResult(next);
       onConnected(next.registry);

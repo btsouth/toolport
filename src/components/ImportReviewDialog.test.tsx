@@ -67,6 +67,23 @@ describe("ImportReviewDialog", () => {
     expect(new Set(onConfirm.mock.calls[0][0])).toEqual(new Set(["a", "b", "c"]));
   });
 
+  it("keeps missing credentials in memory for the reviewed connection", async () => {
+    const { onConfirm } = renderDialog({
+      items: [
+        { ...items()[0], credentials: [{ key: "TOKEN", secret: true, present: false }] },
+      ],
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Open Credentials" }));
+    await userEvent.type(screen.getByLabelText("TOKEN"), "synthetic-secret");
+    await userEvent.click(screen.getByRole("button", { name: "Use for connection" }));
+    await userEvent.click(screen.getByRole("button", { name: /import 1 server/i }));
+    expect(onConfirm).toHaveBeenCalledWith(
+      ["a"],
+      { stripe: { TOKEN: true } },
+      { stripe: { TOKEN: "synthetic-secret" } },
+    );
+  });
+
   it("exposes each server row as a pressed toggle", async () => {
     renderDialog();
     const stripe = screen.getByRole("button", { name: /stripe/i });

@@ -683,8 +683,8 @@ pub struct SnippetAddOutcome {
     /// Env keys declared on the entry without a pasted value; the user still has
     /// to store these through the credentials flow.
     pub declared_without_value: Vec<String>,
-    /// Env keys that could not be declared or vaulted (invalid name, locked
-    /// keychain). The server itself was still added.
+    /// Legacy field kept for existing single-paste consumers. Failed writes now
+    /// return an error and roll back the whole batch.
     pub failed: Vec<String>,
     pub servers: Vec<SnippetServerOutcome>,
 }
@@ -699,13 +699,17 @@ pub struct SnippetServerOutcome {
 
 fn add_snippet_imports(
     imports: Vec<crate::import_credentials::Import>,
+    inputs: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 ) -> Result<SnippetAddOutcome, String> {
     crate::import_credentials::transaction(|writes| {
         let current = read_registry_exact_or_default()?;
         let mut registry = current.clone();
         let mut servers = Vec::new();
         let mut missing_all = Vec::new();
-        for import in imports {
+        for mut import in imports {
+            if let Some(values) = inputs.get(&import.entry.name) {
+                import.supply(values)?;
+            }
             let name = import.entry.name.clone();
             if registry
                 .servers
@@ -751,12 +755,8 @@ fn add_snippet_imports(
     })
 }
 
-/// Add a server parsed from a pasted config snippet, vaulting its pasted env
-/// values the same way an explicit credentials save does: the value goes to the
-/// OS keychain and only the key name is declared on the registry entry.
-///
-/// One bad env entry must not abort the rest - the server add has already
-/// committed, so per-key problems are collected and reported instead.
+/// Add a pasted server atomically. Secret values go to the vault; ordinary
+/// environment settings remain in the registry. A failed write restores both.
 pub fn add_snippet_server(
     fields: ServerFields,
     env: Vec<(String, Option<String>)>,
@@ -773,7 +773,7 @@ pub fn add_snippet_server(
         .collect();
     let definition = serde_json::json!({"env": env.into_iter().map(|(key, value)| (key, value.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null))).collect::<serde_json::Map<_, _>>()});
     let import = crate::import_credentials::Import::prepare(entry, Some(&definition))?;
-    add_snippet_imports(vec![import])
+    add_snippet_imports(vec![import], &Default::default())
 }
 
 /// Prepare every selected pasted definition before any registry or vault mutation.
@@ -784,6 +784,15 @@ pub fn add_snippet_servers_choices(
     text: &str,
     selected: &[String],
     choices: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+) -> Result<SnippetAddOutcome, String> {
+    add_snippet_servers_inputs(text, selected, choices, &Default::default())
+}
+
+pub fn add_snippet_servers_inputs(
+    text: &str,
+    selected: &[String],
+    choices: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    inputs: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 ) -> Result<SnippetAddOutcome, String> {
     let parsed = clients::parse_snippet(text).map_err(|_| "Could not parse the pasted config")?;
     let mut imports = Vec::new();
@@ -807,7 +816,7 @@ pub fn add_snippet_servers_choices(
             choice,
         )?);
     }
-    add_snippet_imports(imports)
+    add_snippet_imports(imports, inputs)
 }
 
 fn catalog_server(entry: crate::catalog::CatalogEntry) -> ServerEntry {
@@ -1461,6 +1470,7 @@ fn prepare_client_servers_for_migration(
     client: &clients::DetectedClient,
     writes: &mut crate::import_credentials::VaultWrites,
     choices: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    inputs: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 ) -> Result<(usize, Vec<String>), String> {
     let names = client
         .servers
@@ -1477,11 +1487,14 @@ fn prepare_client_servers_for_migration(
         }
         moved.push(server.name.clone());
         let definition = clients::import_definition(client, &server.name)?;
-        let import = crate::import_credentials::Import::prepare_with_choices(
+        let mut import = crate::import_credentials::Import::prepare_with_choices(
             server_from_detected(server, &client.id),
             definition.as_ref(),
             choices.get(&server.name),
         )?;
+        if let Some(values) = inputs.get(&server.name) {
+            import.supply(values)?;
+        }
         let id = if let Some(existing) = registry
             .servers
             .iter()
@@ -1519,7 +1532,13 @@ fn import_client_servers_for_migration(
     client: &clients::DetectedClient,
 ) -> Result<(usize, Vec<String>), String> {
     crate::import_credentials::transaction(|writes| {
-        prepare_client_servers_for_migration(registry, client, writes, &Default::default())
+        prepare_client_servers_for_migration(
+            registry,
+            client,
+            writes,
+            &Default::default(),
+            &Default::default(),
+        )
     })
 }
 
@@ -1634,39 +1653,12 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
             let (credentials, unsupported) = match prepared {
                 Ok(import) => (
                     import
-                        .entry
-                        .env
-                        .iter()
-                        .map(|env| CredentialReview {
-                            key: env.key.clone(),
-                            secret: env.secret,
-                            present: definition
-                                .as_ref()
-                                .and_then(|d| {
-                                    ["env", "environment", "envs", "headers", "http_headers"]
-                                        .into_iter()
-                                        .find_map(|field| {
-                                            d.get(field)?.get(
-                                                if env.key == crate::secrets::HTTP_AUTH_KEY {
-                                                    "Authorization"
-                                                } else {
-                                                    &env.key
-                                                },
-                                            )
-                                        })
-                                        .or_else(|| {
-                                            if env.key == crate::secrets::IMPORTED_URL_KEY {
-                                                d.get("url")
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                })
-                                .is_some_and(|v| {
-                                    v.as_str()
-                                        .map(crate::import_credentials::provided)
-                                        .unwrap_or(v.is_number() || v.is_boolean())
-                                }),
+                        .review_credentials()
+                        .into_iter()
+                        .map(|(key, secret, present)| CredentialReview {
+                            key,
+                            secret,
+                            present,
                         })
                         .collect(),
                     None,
@@ -1873,6 +1865,27 @@ pub fn migrate_client_reviewed_choices(
     )
 }
 
+pub fn migrate_client_reviewed_inputs(
+    client_id: &str,
+    profile: Option<&str>,
+    force: bool,
+    names: &[String],
+    revision: &str,
+    choices: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    inputs: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+) -> Result<MigrateOutcome, String> {
+    migrate_client_reviewed_inputs_with(
+        client_id,
+        profile,
+        force,
+        names,
+        revision,
+        choices,
+        inputs,
+        verify_setup_gateway,
+    )
+}
+
 fn migrate_client_reviewed_choices_with(
     client_id: &str,
     profile: Option<&str>,
@@ -1880,6 +1893,28 @@ fn migrate_client_reviewed_choices_with(
     names: &[String],
     revision: &str,
     choices: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    verify: impl FnMut(&Registry, &[String], &str, Option<&str>) -> Result<SetupVerification, String>,
+) -> Result<MigrateOutcome, String> {
+    migrate_client_reviewed_inputs_with(
+        client_id,
+        profile,
+        force,
+        names,
+        revision,
+        choices,
+        &Default::default(),
+        verify,
+    )
+}
+
+fn migrate_client_reviewed_inputs_with(
+    client_id: &str,
+    profile: Option<&str>,
+    force: bool,
+    names: &[String],
+    revision: &str,
+    choices: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    inputs: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     mut verify: impl FnMut(
         &Registry,
         &[String],
@@ -1937,8 +1972,13 @@ fn migrate_client_reviewed_choices_with(
     let (mut result, imported, moved, verification) =
         crate::import_credentials::transaction(|writes| {
             let mut prepared = current.clone();
-            let (imported, moved) =
-                prepare_client_servers_for_migration(&mut prepared, &client, writes, choices)?;
+            let (imported, moved) = prepare_client_servers_for_migration(
+                &mut prepared,
+                &client,
+                writes,
+                choices,
+                inputs,
+            )?;
             enable_moved_servers(&mut prepared, profile, &moved)?;
             // Only staged registry writes run under the client mutation lock. Vault and
             // transport work can prompt or block and must run without either lock.
@@ -2958,6 +2998,54 @@ mod tests {
         assert!(!serde_json::to_string(&saved)
             .unwrap()
             .contains("synthetic-value"));
+    }
+
+    #[test]
+    fn reviewed_missing_inputs_are_transactional_and_retryable() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"command":"one","env":{"TOKEN":"${TOKEN}"}}}}"#,
+        )
+        .unwrap();
+        let preview = preview_client_setup("claude-code").unwrap();
+        let inputs = std::collections::BTreeMap::from([(
+            "one".into(),
+            std::collections::BTreeMap::from([("TOKEN".into(), "synthetic-input-secret".into())]),
+        )]);
+        let attempt = |succeed| {
+            migrate_client_reviewed_inputs_with(
+                "claude-code",
+                None,
+                false,
+                &["one".into()],
+                &preview.revision,
+                &Default::default(),
+                &inputs,
+                |_, _, _, _| {
+                    if succeed {
+                        Ok(Vec::new().into())
+                    } else {
+                        Err("one could not start".into())
+                    }
+                },
+            )
+        };
+        assert!(attempt(false).is_err());
+        assert!(crate::secrets::get_vault_secret_result("one", "TOKEN")
+            .unwrap()
+            .is_none());
+        assert!(read_registry_exact().unwrap().servers.is_empty());
+        assert!(attempt(true).is_ok());
+        assert_eq!(
+            crate::secrets::get_vault_secret_result("one", "TOKEN")
+                .unwrap()
+                .as_deref(),
+            Some("synthetic-input-secret")
+        );
+        assert!(!serde_json::to_string(&read_registry_exact().unwrap())
+            .unwrap()
+            .contains("synthetic-input-secret"));
     }
 
     #[test]

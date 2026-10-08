@@ -176,6 +176,45 @@ pub(crate) struct Import {
 }
 
 impl Import {
+    pub(crate) fn review_credentials(&self) -> Vec<(String, bool, bool)> {
+        self.values
+            .iter()
+            .map(|(key, value)| (key.clone(), true, value.as_deref().is_some_and(provided)))
+            .chain(self.entry.env.iter().filter(|env| !env.secret).map(|env| {
+                (
+                    env.key.clone(),
+                    false,
+                    env.value.as_deref().is_some_and(provided),
+                )
+            }))
+            .collect()
+    }
+
+    /// Missing values entered in review stay in memory until the transaction succeeds.
+    pub(crate) fn supply(
+        &mut self,
+        inputs: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        for (key, value) in inputs {
+            if !provided(value) {
+                return Err("Enter a credential value before retrying.".into());
+            }
+            if let Some((_, saved)) = self.values.iter_mut().find(|(name, _)| name == key) {
+                *saved = Some(value.clone());
+            } else if let Some(env) = self
+                .entry
+                .env
+                .iter_mut()
+                .find(|env| &env.key == key && !env.secret && env.value.is_none())
+            {
+                env.value = Some(value.clone());
+            } else {
+                return Err("Credential is not part of this reviewed server. Review again.".into());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare(
         entry: ServerEntry,
         definition: Option<&serde_json::Value>,

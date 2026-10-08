@@ -461,10 +461,15 @@ export function ServerDialog({
         onOpenChange={(open) => {
           if (!open && !busy) setPasteReview(null);
         }}
-        onConfirm={async (keys, choices) => {
+        onConfirm={async (keys, choices, inputs) => {
           setBusy(true);
           try {
-            const next = await addSnippetServers(reviewText, keys, choices);
+            const next = await addSnippetServers(
+              reviewText,
+              keys,
+              choices,
+              ...(inputs ? ([inputs] as const) : ([] as const)),
+            );
             onSaved(next.registry);
             toast.success(
               next.servers.map((server) => `${server.name}: ${server.status}`).join("; "),

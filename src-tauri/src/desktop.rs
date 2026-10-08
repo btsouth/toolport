@@ -207,9 +207,10 @@ async fn add_snippet_servers(
     text: String,
     selected: Vec<String>,
     secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
+    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
 ) -> Result<serde_json::Value, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::add_snippet_servers_choices(&text,&selected,&secret_choices.unwrap_or_default())
+        crate::registry_controller::add_snippet_servers_inputs(&text,&selected,&secret_choices.unwrap_or_default(),&credential_inputs.unwrap_or_default())
     })
     .await
     .map_err(|_| "Paste import stopped".to_string())??;
@@ -651,15 +652,17 @@ async fn migrate_client(
     selected: Vec<String>,
     revision: String,
     secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
+    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
 ) -> Result<MigrateResult, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::migrate_client_reviewed_choices(
+        crate::registry_controller::migrate_client_reviewed_inputs(
             &client_id,
             profile.as_deref(),
             force.unwrap_or(false),
             &selected,
             &revision,
             &secret_choices.unwrap_or_default(),
+            &credential_inputs.unwrap_or_default(),
         )
     })
     .await

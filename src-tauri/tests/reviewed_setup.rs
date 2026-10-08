@@ -183,7 +183,7 @@ impl Drop for Fixture {
 }
 
 fn migrate_fixture(
-    fixture: &Fixture,
+    _fixture: &Fixture,
     names: &[String],
     revision: &str,
 ) -> controller::MigrateOutcome {
@@ -405,6 +405,16 @@ impl HttpFixture {
                             && h.value.as_str() == "Bearer synthetic-setup-pat"
                     });
                 if !authenticated {
+                    eprintln!(
+                        "credential fixture rejected {}: URL matched={}, Authorization matched={}",
+                        request.method(),
+                        request.url() == "/mcp?token=synthetic-url-key",
+                        request
+                            .headers()
+                            .iter()
+                            .any(|h| h.field.equiv("Authorization")
+                                && h.value.as_str() == "Bearer synthetic-setup-pat")
+                    );
                     let _ = request.respond(
                         tiny_http::Response::from_string("missing reviewed credentials")
                             .with_status_code(401),

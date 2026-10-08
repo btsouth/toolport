@@ -56,6 +56,7 @@ pub(super) fn review(
     action: impl Fn(
             Vec<String>,
             std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+            std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
         ) -> Result<Completion, String>
         + Send
         + Sync
@@ -96,6 +97,11 @@ pub(super) fn review(
     rows.add_css_class("boxed-list");
     let mut selected = Vec::new();
     let mut credential_choices = Vec::new();
+    let credential_inputs =
+        std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::<
+            String,
+            std::collections::BTreeMap<String, String>,
+        >::new()));
     for item in items {
         let command = item
             .command
@@ -143,7 +149,7 @@ pub(super) fn review(
                 .label(format!("Keep {} in keychain", env.key))
                 .active(env.secret)
                 .build();
-            choice.set_sensitive(item.unsupported.is_none());
+            choice.set_sensitive(item.unsupported.is_none() && !env.key.starts_with("__"));
             let value_row = adw::ActionRow::builder()
                 .title(&env.key)
                 .subtitle(if env.present { "Found" } else { "Missing" })
@@ -151,6 +157,32 @@ pub(super) fn review(
             value_row.add_suffix(&choice);
             value_row.set_activatable_widget(Some(&choice));
             row.add_row(&value_row);
+            if !env.present {
+                let open = gtk::Button::with_label("Open Credentials");
+                let owner = dialog.clone();
+                let inputs = credential_inputs.clone();
+                let name = item.name.clone();
+                let key = env.key.clone();
+                let value_row = value_row.clone();
+                open.connect_clicked(move |_| {
+                    let prompt = adw::MessageDialog::new(Some(&owner), Some("Missing credential"), Some("This value is used only for the selected server. It goes to the keychain if connection succeeds."));
+                    let entry = gtk::PasswordEntry::builder().show_peek_icon(true).build();
+                    prompt.set_extra_child(Some(&entry));
+                    prompt.add_responses(&[("cancel", "Cancel"), ("save", "Use for connection")]);
+                    prompt.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+                    prompt.set_default_response(Some("save"));
+                    prompt.set_close_response("cancel");
+                    let (inputs, name, key, value_row) = (inputs.clone(), name.clone(), key.clone(), value_row.clone());
+                    prompt.connect_response(None, move |_, response| {
+                        if response == "save" && !entry.text().is_empty() {
+                            inputs.borrow_mut().entry(name.clone()).or_default().insert(key.clone(), entry.text().to_string());
+                            value_row.set_subtitle("Ready for connection");
+                        }
+                    });
+                    prompt.present();
+                });
+                value_row.add_suffix(&open);
+            }
             credential_choices.push((item.name.clone(), env.key, choice));
         }
         rows.append(&row);
@@ -235,6 +267,7 @@ pub(super) fn review(
                 .insert(key.clone(), choice.is_active());
             choice.set_sensitive(false);
         }
+        let inputs = credential_inputs.borrow().clone();
         busy.set(true);
         button.set_sensitive(false);
         cancel.set_sensitive(false);
@@ -265,7 +298,7 @@ pub(super) fn review(
             lede.clone(),
         );
         gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || action(chosen, choices)).await;
+            let result = gtk::gio::spawn_blocking(move || action(chosen, choices, inputs)).await;
             busy.set(false);
             for (_, _, choice) in credential_choices.iter() {
                 choice.set_sensitive(true);
@@ -273,10 +306,7 @@ pub(super) fn review(
             cancel.set_sensitive(true);
             button.set_sensitive(true);
             for (check, row, spinner, _, _) in selected.iter() {
-                check.set_sensitive(
-                    row.subtitle()
-                        .is_none_or(|s| !s.starts_with("Unsupported:")),
-                );
+                check.set_sensitive(!row.subtitle().starts_with("Unsupported:"));
                 spinner.set_spinning(false);
                 spinner.set_visible(false);
             }
@@ -414,14 +444,15 @@ pub(super) fn connect(
                     preview.items,
                     &disclosure,
                     "Connect to Toolport",
-                    move |selected, choices| {
-                        let outcome = crate::registry_controller::migrate_client_reviewed_choices(
+                    move |selected, choices, inputs| {
+                        let outcome = crate::registry_controller::migrate_client_reviewed_inputs(
                             &client_id,
                             profile.as_deref(),
                             force,
                             &selected,
                             &preview.revision,
                             &choices,
+                            &inputs,
                         )?;
                         Ok(Completion {
                             message: format!(
@@ -442,7 +473,7 @@ pub(super) fn connect(
                 Vec::new(),
                 &error,
                 "Close",
-                |_, _| Err("Fix the client config and retry.".into()),
+                |_, _, _| Err("Fix the client config and retry.".into()),
                 || {},
                 None,
             ),
@@ -452,7 +483,7 @@ pub(super) fn connect(
                 Vec::new(),
                 "Client review stopped.",
                 "Close",
-                |_, _| Err("Retry from Clients.".into()),
+                |_, _, _| Err("Retry from Clients.".into()),
                 || {},
                 None,
             ),
@@ -491,7 +522,7 @@ pub(super) fn collection(
             unsupported: None,
         })
         .collect();
-    review(parent,&format!("Review {name}"),items,"Review what each server runs. Valid servers turn on. Servers needing credentials or launch values stay off until setup is complete.","Add selected servers",move |keys,_choices| {
+    review(parent,&format!("Review {name}"),items,"Review what each server runs. Valid servers turn on. Servers needing credentials or launch values stay off until setup is complete.","Add selected servers",move |keys,_choices,_inputs| {
         let selected=entries.iter().enumerate().filter(|(i,_)|keys.contains(&i.to_string())).map(|(_,e)|e.clone()).collect();
         let (_,added)=crate::registry_controller::add_catalog_stack(selected)?;
         Ok(format!("Added {added} servers. Check status and complete any missing setup inputs under Servers.").into())
@@ -528,7 +559,7 @@ mod tests {
             Vec::new(),
             "Invalid fixture config",
             "Close",
-            |_, _| Err("not an import".into()),
+            |_, _, _| Err("not an import".into()),
             || {},
             None,
         );
@@ -585,7 +616,7 @@ mod tests {
             items,
             "Config: /home/sbx/.claude.json\nBackups will be saved in Toolport/backups/claude-code",
             "Connect",
-            move |_, _| {
+            move |_, _, _| {
                 if state == "verifying" {
                     use std::io::Read;
                     let mut file = std::fs::File::open("/home/sbx/setup-release")

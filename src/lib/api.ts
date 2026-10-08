@@ -609,12 +609,14 @@ export function migrateClient(
   selected: string[] = [],
   revision = "",
   secretChoices?: Record<string, Record<string, boolean>>,
+  credentialInputs?: Record<string, Record<string, string>>,
 ): Promise<MigrateResult> {
   return invoke<MigrateResult>("migrate_client", {
     clientId,
     selected,
     revision,
     secretChoices,
+    credentialInputs,
     profile: profile ?? null,
     force: force ?? false,
   });
@@ -972,9 +974,15 @@ export function addSnippetServers(
   text: string,
   selected: string[],
   secretChoices?: Record<string, Record<string, boolean>>,
+  credentialInputs?: Record<string, Record<string, string>>,
 ): Promise<{
   registry: Registry;
   servers: { name: string; status: string; missing: string[] }[];
 }> {
-  return invoke("add_snippet_servers", { text, selected, secretChoices });
+  return invoke("add_snippet_servers", {
+    text,
+    selected,
+    secretChoices,
+    credentialInputs,
+  });
 }
