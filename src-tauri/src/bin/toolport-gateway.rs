@@ -1564,6 +1564,7 @@ fn removed_meta_tool_error(name: &str) -> String {
     )
 }
 
+
 // --- Grouped discovery mode (CONDUIT_DISCOVERY=grouped) ---
 //
 // Between `lazy` (a constant handful of meta-tools; best for a capable model that
@@ -5900,8 +5901,8 @@ fn execute_script_dispatch(
     // (SBS-881). Run the defense here, before the script's own result is returned,
     // so nothing unscanned reaches the model. The failure envelope was defended
     // part by part above and is all Toolport text now.
-    let untrusted =
-        result["isError"] != true && !defend_script_aggregate(reg, client, &owner, &mut result);
+    let untrusted = result["isError"] != true
+        && !defend_script_aggregate(reg, client, &owner, &mut result);
 
     // Intermediate calls were not shaped (full bodies stayed in the sandbox). The
     // script's aggregate can still blow the transport/context budget, so shape only
@@ -18516,22 +18517,10 @@ mod tests {
     /// judging it whole lets the prefix decide for every tool on that server.
     #[test]
     fn disconnect_all_is_a_standalone_role_and_dry_run_cannot_start_gateway() {
-        assert_eq!(
-            parse_args(&["--disconnect-all".into()]),
-            ArgAction::DisconnectAll { dry_run: false }
-        );
-        assert_eq!(
-            parse_args(&["--disconnect-all".into(), "--dry-run".into()]),
-            ArgAction::DisconnectAll { dry_run: true }
-        );
-        assert!(matches!(
-            parse_args(&["--dry-run".into()]),
-            ArgAction::Unknown(_)
-        ));
-        assert!(matches!(
-            parse_args(&["--disconnect-all".into(), "--daemon".into()]),
-            ArgAction::Unknown(_)
-        ));
+        assert_eq!(parse_args(&["--disconnect-all".into()]), ArgAction::DisconnectAll { dry_run: false });
+        assert_eq!(parse_args(&["--disconnect-all".into(), "--dry-run".into()]), ArgAction::DisconnectAll { dry_run: true });
+        assert!(matches!(parse_args(&["--dry-run".into()]), ArgAction::Unknown(_)));
+        assert!(matches!(parse_args(&["--disconnect-all".into(), "--daemon".into()]), ArgAction::Unknown(_)));
     }
 
     #[test]
@@ -23409,6 +23398,7 @@ mod tests {
         assert!(explicit_on.code_mode);
     }
 
+
     /// A failed registry load must not advertise or run Code Mode, even when
     /// a later request snapshot contains an explicit opt-in.
     #[test]
@@ -23424,7 +23414,10 @@ mod tests {
         let host = dispatch_host(seed_code_mode_after_registry_load(Err(())));
         let mut reg = Registry::default();
         reg.code_mode = true;
-        assert!(reg.code_mode, "the request fixture explicitly opts in");
+        assert!(
+            reg.code_mode,
+            "the request fixture explicitly opts in"
+        );
 
         let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
         let list = handle_request(
@@ -25552,14 +25545,10 @@ mod tests {
         let ok = post("/s__work");
         assert_eq!(ok.status, 200, "body={}", ok.body);
         assert_eq!(ok.body, "\"called\"");
-        assert!(ok
-            .extra
-            .contains(&("X-Toolport-Content-Trust".into(), "untrusted".into())));
+        assert!(ok.extra.contains(&("X-Toolport-Content-Trust".into(), "untrusted".into())));
         for (name, _) in &ok.extra {
             assert!(
-                EXPOSED_HTTP_HEADERS
-                    .split(", ")
-                    .any(|exposed| exposed.eq_ignore_ascii_case(name)),
+                EXPOSED_HTTP_HEADERS.split(", ").any(|exposed| exposed.eq_ignore_ascii_case(name)),
                 "browser cannot read provenance header {name}"
             );
         }
@@ -26914,10 +26903,8 @@ mod tests {
         reg.servers.push(stub_server("team-slack", "Team Slack"));
         reg.servers.push(stub_server("team_slack", "slack"));
         let personal = reg.add_profile("Personal");
-        reg.set_access_server(&personal, "team-slack", true)
-            .unwrap();
-        reg.set_access_server("default", "team_slack", true)
-            .unwrap();
+        reg.set_access_server(&personal, "team-slack", true).unwrap();
+        reg.set_access_server("default", "team_slack", true).unwrap();
         reg.set_server_enabled(&personal, "team-slack", true)
             .unwrap();
         reg.set_server_enabled("default", "team_slack", true)
@@ -29420,10 +29407,7 @@ mod tests {
                 .get("instructions")
                 .cloned()
         };
-        assert_eq!(
-            handshake(&state),
-            Some(json!(DISCOVER_INSTRUCTIONS_PREAMBLE))
-        );
+        assert_eq!(handshake(&state), Some(json!(DISCOVER_INSTRUCTIONS_PREAMBLE)));
         *state.profile.lock().unwrap() = Some("media".into());
         assert_eq!(handshake(&state), Some(json!("Media only.")));
         *state.profile.lock().unwrap() = Some("postgres".into());
@@ -31228,11 +31212,7 @@ mod tests {
         let host = dispatch_host(false);
         host.set_code_mode(false);
         let tools = floor_tool_defs(&host);
-        assert_eq!(
-            tools.len(),
-            4,
-            "Code Mode off means the floor is the core four"
-        );
+        assert_eq!(tools.len(), 4, "Code Mode off means the floor is the core four");
         let tools_json = serde_json::to_string(&tools).expect("floor tools serialize");
         let bytes = tools_json.len() + DISCOVER_INSTRUCTIONS_PREAMBLE.len();
         assert!(
@@ -32424,10 +32404,7 @@ mod tests {
     fn team_quarantine_at_member_off_enforces_drift_and_survives_watcher_reconciliation() {
         let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-team-quarantine-off-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("toolport-team-quarantine-off-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
@@ -32693,17 +32670,14 @@ mod tests {
                 let live = live_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let advertises = live
-                    .aggregated_tools()
-                    .iter()
-                    .any(|t| t["name"] == "srv__read");
-                *seen
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(advertises);
+                let advertises = live.aggregated_tools().iter().any(|t| t["name"] == "srv__read");
+                *seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(advertises);
             }),
         ));
 
-        let published = publish_built_router(&state.registry, &state.router, drifted, profile);
+        let published =
+            publish_built_router(&state.registry, &state.router, drifted, profile);
 
         *INTEGRITY_GATE_OBSERVER
             .lock()
@@ -32726,10 +32700,7 @@ mod tests {
             "the quarantine must be on the router the moment it becomes live"
         );
         assert!(
-            !live
-                .aggregated_tools()
-                .iter()
-                .any(|t| t["name"] == "srv__read"),
+            !live.aggregated_tools().iter().any(|t| t["name"] == "srv__read"),
             "the published router must not advertise the drifted tool"
         );
     }
@@ -35994,11 +35965,7 @@ mod tests {
         let anonymous = probe(&state, None, false);
         assert_eq!(anonymous.status, 401, "body={}", anonymous.body);
         let registered_client = probe(&state, Some(&caller), false);
-        assert_eq!(
-            registered_client.status, 401,
-            "body={}",
-            registered_client.body
-        );
+        assert_eq!(registered_client.status, 401, "body={}", registered_client.body);
         let registered_topology = handle_http_with_headers(
             &state,
             &SearchGuard::default(),

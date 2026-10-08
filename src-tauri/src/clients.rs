@@ -2240,9 +2240,7 @@ fn parse_json_snippet(
                 .get("command")
                 .is_some_and(|command| command.is_string() || command.is_array())
                 && !servers.get("url").is_some_and(serde_json::Value::is_string)
-                && !servers
-                    .get("type")
-                    .is_some_and(serde_json::Value::is_string)
+                && !servers.get("type").is_some_and(serde_json::Value::is_string)
                 && !servers
                     .get("enabled")
                     .is_some_and(serde_json::Value::is_boolean)
@@ -3108,6 +3106,7 @@ fn parse_client_content(format: Format, content: &str) -> Result<Vec<McpServer>,
         Format::YamlMcpServers => parse_hermes_yaml_servers(content),
         Format::YamlMcpServersList => parse_continue_yaml_servers(content),
     }
+
 }
 
 fn managed_matches_detected(server: &McpServer, rec: &ManagedEntry) -> bool {
@@ -3759,12 +3758,8 @@ fn rewrite_json_key_preserving(
             new_value.as_object(),
         ) {
             patch_json_object(&child, before, after)?;
-        } else {
-            prop.set_value(serde_to_cst_input(new_value));
-        }
-    } else {
-        obj.append(key, serde_to_cst_input(new_value));
-    }
+        } else { prop.set_value(serde_to_cst_input(new_value)); }
+    } else { obj.append(key, serde_to_cst_input(new_value)); }
     Ok(root.to_string())
 }
 
@@ -6260,9 +6255,7 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
         let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
-        outcome
-            .warnings
-            .extend(disconnect_warnings(def.format, &path)?);
+        outcome.warnings.extend(disconnect_warnings(def.format, &path)?);
         Ok(outcome)
     })
 }
@@ -6290,8 +6283,8 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             restored: restored_names,
             used_move_record: moved::matches_path(client_id, &path)?,
             revision: None,
-            warnings: Vec::new(),
-            recovery_path: None,
+        warnings: Vec::new(),
+        recovery_path: None,
         });
     }
     let current = crate::registry_controller::registry_for_disconnect()?;
@@ -6309,8 +6302,8 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             restored: Vec::new(),
             used_move_record: false,
             revision: None,
-            warnings: Vec::new(),
-            recovery_path: None,
+        warnings: Vec::new(),
+        recovery_path: None,
         });
     }
     let mut outcome = install_or_remove(client_id, None)?;

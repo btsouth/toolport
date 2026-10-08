@@ -6547,6 +6547,7 @@ pub(crate) mod tests {
             }
             std::fs::rename(from, to)
         }
+
     }
 
     fn atomic_temp_files(path: &Path) -> Vec<PathBuf> {

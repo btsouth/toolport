@@ -1865,16 +1865,11 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
             let connected = registry::load().map(|r| r.team.is_some());
             let delay = match connected {
-                Ok(false) => {
-                    failures = 0;
-                    3
-                }
+                Ok(false) => { failures = 0; 3 }
                 Ok(true) => match teams::sync_wait(25) {
                     Ok(result) => {
                         failures = 0;
-                        if stop.load(std::sync::atomic::Ordering::Acquire) {
-                            break;
-                        }
+                        if stop.load(std::sync::atomic::Ordering::Acquire) { break; }
                         let state = handle.state::<RegistryState>();
                         match finish_sync(&handle, state.inner(), result) {
                             Ok(fresh) => {
@@ -1899,9 +1894,7 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
                 }
             };
             for _ in 0..delay {
-                if stop.load(std::sync::atomic::Ordering::Acquire) {
-                    break;
-                }
+                if stop.load(std::sync::atomic::Ordering::Acquire) { break; }
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
@@ -1968,9 +1961,7 @@ async fn team_instructions_status() -> Option<teams::InstructionsStatusView> {
 /// Leave the team: remove its merged servers, clear the connection and the token.
 #[tauri::command]
 async fn team_account_link() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(teams::account_link)
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(teams::account_link).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -3485,7 +3476,7 @@ fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
         cancel
     };
     let pending = TeamPairGuard(std::sync::Arc::clone(&cancel));
-    let handle = app.clone();
+    let handle=app.clone();
     app.dialog().message(format!("Control plane: {origin}\nOnly continue if you trust this origin. Your browser will show the named team and account before approval. Connecting replaces this installation's current team connection."))
         .title("Connect Toolport to Teams?").buttons(MessageDialogButtons::OkCancel).show(move |approved| {
             if !approved { drop(pending); return; }
@@ -3511,10 +3502,7 @@ fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
 #[tauri::command]
 fn team_pair_state() -> Option<TeamPairEvent> {
     team_pairing().as_ref().and_then(|current| {
-        current.check.clone().map(|check| TeamPairEvent {
-            check: Some(check),
-            ..TeamPairEvent::new("pending")
-        })
+        current.check.clone().map(|check| TeamPairEvent { check: Some(check), ..TeamPairEvent::new("pending") })
     })
 }
 
@@ -3522,9 +3510,7 @@ fn team_pair_state() -> Option<TeamPairEvent> {
 #[tauri::command]
 fn team_pair_cancel() {
     if let Some(current) = team_pairing().as_ref() {
-        current
-            .cancel
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        current.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

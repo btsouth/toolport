@@ -1316,14 +1316,9 @@ pub(crate) fn has_own_credentials(server: &crate::registry::ServerEntry) -> Resu
         "__oauth_cc_state__",
     ]);
     for key in keys {
-        let value = if file::active() {
-            file::get_secret_result(&server.id, key)
-        } else {
-            platform::get_secret_result(&server.id, key)
-        }?;
-        if value.is_some() {
-            return Ok(true);
-        }
+        let value = if file::active() { file::get_secret_result(&server.id, key) }
+            else { platform::get_secret_result(&server.id, key) }?;
+        if value.is_some() { return Ok(true); }
     }
     Ok(false)
 }
