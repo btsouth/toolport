@@ -2876,6 +2876,7 @@ fn matrix_routing_live_profile_change_reopens_the_adapter_session() {
             profile("scope-two", &["two"]),
         ],
     );
+    discovery_support::select_full(&dir, "matrix-rescope");
     let mut reg = registry::load_from(&path).expect("load fixture registry");
     reg.client_scopes
         .insert("matrix-rescope".to_string(), "scope-one".to_string());
