@@ -134,6 +134,21 @@ pub(crate) fn transaction<T>(
     }
 }
 
+pub(crate) fn secret_url_path(url: &url::Url) -> bool {
+    let mut after_secret_name = false;
+    url.path_segments().into_iter().flatten().any(|segment| {
+        let decoded = url::form_urlencoded::parse(format!("v={segment}").as_bytes())
+            .next()
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default();
+        let secret = after_secret_name
+            || registry::arg_looks_secret(&decoded)
+            || secret_env("", Some(&decoded));
+        after_secret_name = secret_env(&decoded, None);
+        secret
+    })
+}
+
 pub(crate) fn shown_url(value: &str) -> String {
     let Ok(mut url) = url::Url::parse(value) else {
         return "<endpoint URL>".into();
@@ -142,7 +157,7 @@ pub(crate) fn shown_url(value: &str) -> String {
     let _ = url.set_password(None);
     url.set_query(None);
     url.set_fragment(None);
-    if registry::arg_looks_secret(url.path()) {
+    if secret_url_path(&url) {
         url.set_path("/");
     }
     url.to_string()
@@ -359,7 +374,7 @@ impl Import {
                     parsed.query().is_some()
                         || !parsed.username().is_empty()
                         || parsed.password().is_some()
-                        || registry::arg_looks_secret(parsed.path())
+                        || secret_url_path(&parsed)
                 });
                 if secret {
                     values.push((secrets::IMPORTED_URL_KEY.into(), Some(url.clone())));
@@ -670,6 +685,25 @@ mod tests {
                 "{key} was falsely vaulted"
             );
         }
+    }
+
+    #[test]
+    fn reviewed_path_only_endpoint_is_vaulted_and_masked() {
+        let mut raw = entry(true);
+        raw.env.clear();
+        raw.url = Some("https://example.invalid/sk-private-path".into());
+        let import = Import::prepare(raw, None).unwrap();
+        assert_eq!(
+            import.entry.url.as_deref(),
+            Some("https://example.invalid/")
+        );
+        assert!(import
+            .values
+            .iter()
+            .any(|(key, _)| key == secrets::IMPORTED_URL_KEY));
+        assert!(!serde_json::to_string(&import.entry)
+            .unwrap()
+            .contains("sk-private-path"));
     }
 
     #[test]

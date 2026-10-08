@@ -1399,12 +1399,16 @@ impl Redaction {
                         }
                     }
                 }
+                let mut after_secret_name = false;
                 for segment in parsed.path_segments().into_iter().flatten() {
-                    if crate::registry::arg_looks_secret(segment)
-                        || crate::import_credentials::secret_env("", Some(&decoded(segment)))
+                    let value = decoded(segment);
+                    if after_secret_name
+                        || crate::registry::arg_looks_secret(&value)
+                        || crate::import_credentials::secret_env("", Some(&value))
                     {
                         add(segment);
                     }
+                    after_secret_name = crate::import_credentials::secret_env(&value, None);
                 }
             }
         }
