@@ -40,13 +40,14 @@ if [ "${1:-}" = --container ]; then
   expected_version=${3:?}
   if [ "$mode" = fedora ]; then
     # The Fedora base image omits cmp; this is a test helper, not an app dependency.
-    dnf install -y diffutils
+    dnf install -y diffutils python3
     dnf install -y /packages/new.rpm
     rpm -qlp /packages/new.rpm
     test "$(rpm -qf --qf '%{NAME}' /usr/bin/toolport-gtk)" = toolport
   else
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
+    apt-get install -y python3
     if [ "$mode" = ubuntu ]; then
       test "$(dpkg-deb -f /packages/old.deb Package)" = toolport
       test "$(dpkg-deb -f /packages/old.deb Version)" = 1.24.0
@@ -92,6 +93,7 @@ REGISTRY
     fi
   fi
   smoke "$expected_version"
+  bash /packages/roundtrip.sh "$mode"
   echo "PASS: $mode install"
   exit 0
 fi
@@ -125,6 +127,8 @@ cp "$rpm" "$tmp/new.rpm"
 cp "$old_deb" "$tmp/old.deb"
 cp src-tauri/target/release/toolport-gtk "$tmp/toolport-gtk"
 cp scripts/test-linux-packages.sh "$tmp/test.sh"
+cp scripts/test-package-removal.sh "$tmp/roundtrip.sh"
+cp scripts/package-removal-fixture.py "$tmp/fixture.py"
 chmod 755 "$tmp"
 for mode in ubuntu debian fedora; do
   if [ "$selected" != all ] && [ "$selected" != "$mode" ]; then continue; fi

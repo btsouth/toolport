@@ -15,10 +15,12 @@ const allowed = new Set([
   "uninstall.exe",
   "AppRun",
 ]);
-export function assertContents(paths) {
+export function assertContents(paths, { nsisInstaller = false } = {}) {
   for (const path of paths) {
     if (/mock-mcp-server|\/deps\/|\/examples\//i.test(path))
       throw new Error(`Test artifact shipped: ${path}`);
+    // The installer extracts its incoming gateway here before replacing files.
+    if (nsisInstaller && path === "$PLUGINSDIR/toolport-preflight.exe") continue;
     const name = path.split("/").at(-1);
     if (
       name &&
@@ -106,7 +108,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     if (!paths.some((path) => /(?:^|\/)toolport-gateway(?:\.exe)?$/.test(path)))
       throw new Error(`Gateway missing: ${file}`);
     console.log(`${file}\n${paths.join("\n")}`);
-    assertContents(paths);
+    assertContents(paths, { nsisInstaller: file.endsWith(".exe") });
     console.log(`PASS: ${file} contains only intended app binaries`);
   }
 }

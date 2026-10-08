@@ -305,8 +305,8 @@ fn live_host_daemons_in(data_dir: &Path) -> Vec<crate::daemon::DaemonDescriptor>
 //
 // Two modes:
 //   * stop_stale_gateways — every launch; keep current/resolved paths, kill obsolete
-//   * stop_spawned_gateways — in-app updater; kill every Toolport gateway image so
-//     the installer can replace locked files
+//   * stop_spawned_gateways — in-app updater; defer open sessions and request
+//     authenticated idle shutdown before the installer replaces files
 //
 // Parent agent apps (Cursor, Claude, …) are never touched. Clients that auto-respawn
 // MCP on a dead stdio pipe pick up the repointed binary on the next tool call.
@@ -520,7 +520,7 @@ fn basename_from_exe_link(path: &Path) -> String {
         .unwrap_or_else(|| cleaned.to_string())
 }
 
-/// Parse one line of `ps -ax -o pid= -o ppid= -o ucomm=` into `(pid, ppid, name)`.
+/// Parse a live `ps -ax -o pid= -o ppid= -o state= -o ucomm=` row.
 ///
 /// Pure helper for the macOS enumerator line format. Does **not** prove the `ps`
 /// argv itself is correct — a broken `-axo pid= comm=` still needs a macOS
@@ -543,6 +543,11 @@ fn parse_ps_pid_ppid_name_line(line: &str) -> Option<(u32, u32, String)> {
     let mut parts = line.split_whitespace();
     let pid = parts.next()?.parse().ok()?;
     let ppid = parts.next()?.parse().ok()?;
+    // Zombies retain ucomm after releasing the executable. They cannot block
+    // replacement, even while the spawning client has not reaped them yet.
+    if parts.next()?.starts_with('Z') {
+        return None;
+    }
     let name = parts.collect::<Vec<_>>().join(" ");
     if name.is_empty() {
         return None;
@@ -908,14 +913,9 @@ fn record_restart_client(report: &mut ReapReport, proc: &GatewayProcess) {
     }
 }
 
-fn reap_with_context(ctx: &ReapContext) -> ReapReport {
-    reap_listed(ctx, list_gateway_processes)
-}
-
-/// Body of [`reap_with_context`], taking the enumerator so a caller can bound which
-/// processes the pass may consider.
+/// Reap only processes supplied by the caller's scoped inventory.
 ///
-/// Production always passes [`list_gateway_processes`]. Tests pass an enumerator
+/// Tests pass an enumerator
 /// scoped to their own fixtures: driving the real plan/kill/verify path against the
 /// *global* process table would otherwise mean a real gateway that starts during the
 /// pass (including inside the 150ms verify window below, which re-enumerates) is not
@@ -1005,74 +1005,221 @@ fn log_reap_report(kind: &str, report: &ReapReport) {
     }
 }
 
-/// Terminate every Toolport/Conduit gateway process (all platforms). Used before
-/// in-app update so locked binaries can be replaced. Does not touch parent apps.
-/// Returns the complete shutdown report. The updater must refuse installation
-/// while either `failed` or `remaining` is non-empty.
-pub fn stop_spawned_gateways() -> ReapReport {
-    let daemons = live_host_daemons();
-    for descriptor in &daemons {
-        let _ = crate::daemon::request_shutdown_if_idle(descriptor);
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while daemons
-        .iter()
-        .any(|descriptor| pid_is_running(descriptor.pid))
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    // The process table is global, while descriptors above cover only this
-    // data directory. A daemon from another data directory must still veto
-    // installation rather than fall through to kill-all below.
-    let active: Vec<_> = list_gateway_processes()
-        .into_iter()
-        .filter(|process| {
-            process.pid != std::process::id() && process.is_host_daemon != Some(false)
-        })
-        .collect();
-    if !active.is_empty() {
-        let report = ReapReport {
-            failed: active
-                .iter()
-                .map(|process| {
-                    if process.is_host_daemon == Some(true) {
-                        format!(
-                            "shared gateway daemon (pid {}) is still running; close its MCP sessions and retry the update",
-                            process.pid
-                        )
-                    } else {
-                        format!(
-                            "gateway process (pid {}) could not be inspected; close it and retry the update",
-                            process.pid
-                        )
-                    }
-                })
-                .collect(),
-            ..ReapReport::default()
-        };
-        log_reap_report("updater reaper", &report);
-        return report;
-    }
-    let ctx = ReapContext {
-        current_version: env!("CARGO_PKG_VERSION").to_string(),
-        keep_paths: Vec::new(),
-        // Even the updater's kill-all must not kill the process running it.
-        keep_pids: vec![std::process::id()],
-        kill_all: true,
+/// Manual installers only own their install directory and this user's published
+/// gateways. A same-named process elsewhere is never an installer target.
+fn installer_owns_process(
+    process: &GatewayProcess,
+    install_dir: &Path,
+    data_dir: Option<&Path>,
+) -> bool {
+    let Some(path) = process.path.as_ref() else {
+        return false;
     };
-    let mut report = reap_with_context(&ctx);
-    // A daemon may start after the first inventory. It is never sent a kill
-    // signal, and a final observation must still block the installer.
-    for process in list_gateway_processes() {
-        if process.pid != std::process::id() && process.is_host_daemon != Some(false) {
-            report.remaining.push(format!(
-                "shared or uninspectable gateway (pid {}) is still running",
-                process.pid
-            ));
+    if !path.is_absolute() || !install_dir.is_absolute() {
+        return false;
+    }
+    let installed = ["toolport-gateway", "conduit-gateway"].iter().any(|name| {
+        paths_equal(
+            path,
+            &install_dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+        )
+    });
+    installed
+        || (is_gateway_basename(&process.basename)
+            && data_dir.is_some_and(|dir| in_explicit_reap_scope(process, Some(&dir.join("bin")))))
+}
+
+fn installer_blockers(processes: &[GatewayProcess]) -> Vec<String> {
+    processes.iter().map(|process| {
+        if process.path.is_none() || process.is_host_daemon.is_none() {
+            return format!("Could not inspect {} to determine whether its session is idle. Installation is deferred; retry when process inspection is available", label_process(process));
+        }
+        let client = process.parent.as_ref()
+            .map(|parent| format!("{} (pid {})", parent.basename, parent.pid))
+            .unwrap_or_else(|| "an unidentified client or service".into());
+        format!("{client}: {}. Close this client's MCP session, then retry; cancel to defer installation", label_process(process))
+    }).collect()
+}
+
+fn installer_targets_process(
+    process: &GatewayProcess,
+    same_user_session: Option<bool>,
+    install_dir: &Path,
+    data_dir: Option<&Path>,
+) -> bool {
+    process.pid != std::process::id()
+        && same_user_session == Some(true)
+        && (process.path.is_none() || installer_owns_process(process, install_dir, data_dir))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn installer_same_user_session(pid: u32) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(format!("/proc/{pid}")).ok()?.uid();
+    // SAFETY: geteuid takes no arguments and has no failure mode.
+    Some(owner == unsafe { libc::geteuid() })
+}
+
+#[cfg(target_os = "macos")]
+fn installer_same_user_session(pid: u32) -> Option<bool> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "uid="])
+        .output()
+        .ok()?;
+    let owner = std::str::from_utf8(&output.stdout)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    // SAFETY: geteuid takes no arguments and has no failure mode.
+    Some(owner == unsafe { libc::geteuid() })
+}
+
+#[cfg(windows)]
+fn installer_same_user_session(pid: u32) -> Option<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        EqualSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe fn user_token(process: HANDLE) -> Option<Vec<usize>> {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let mut size = 0;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut size);
+        let mut buffer = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+        let ok = size != 0
+            && GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                size,
+                &mut size,
+            ) != 0;
+        CloseHandle(token);
+        ok.then_some(buffer)
+    }
+    // SAFETY: valid output buffers and handles; both tokens and the process handle
+    // are closed, and SID pointers stay inside their aligned buffers during comparison.
+    unsafe {
+        let mut current_session = 0;
+        let mut session = 0;
+        if ProcessIdToSessionId(std::process::id(), &mut current_session) == 0
+            || ProcessIdToSessionId(pid, &mut session) == 0
+        {
+            return None;
+        }
+        if current_session != session {
+            return Some(false);
+        }
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let user = user_token(process);
+        CloseHandle(process);
+        let user = user?;
+        let current = user_token(GetCurrentProcess())?;
+        Some(
+            EqualSid(
+                (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid,
+                (*(current.as_ptr().cast::<TOKEN_USER>())).User.Sid,
+            ) != 0,
+        )
+    }
+}
+
+fn installer_process_inventory() -> Vec<GatewayProcess> {
+    #[cfg(windows)]
+    {
+        windows_list_gateway_processes()
+    }
+    #[cfg(not(windows))]
+    {
+        list_gateway_processes()
+    }
+}
+
+/// Refuse manual installation while a client gateway is open. Only authenticated
+/// idle shutdown is requested; no process is force-killed, even on older installs.
+pub fn installer_preflight(install_dir: &Path) -> Result<(), Vec<String>> {
+    if !install_dir.is_absolute() {
+        return Err(vec!["Installer path must be absolute".into()]);
+    }
+    let data_dir = crate::registry::conduit_dir();
+    let inventory = || {
+        installer_process_inventory()
+            .into_iter()
+            .filter(|process| {
+                installer_targets_process(
+                    process,
+                    installer_same_user_session(process.pid),
+                    install_dir,
+                    data_dir.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    #[allow(unused_mut)]
+    let mut initial = inventory();
+    if initial.is_empty() {
+        return Ok(());
+    }
+    // Probe command lines once. Subsequent native inventories only verify exit;
+    // cold PowerShell/CIM startup must not consume every shutdown poll's budget.
+    #[cfg(windows)]
+    windows_assign_daemon_roles(&mut initial);
+    // A stdio adapter, private host or old gateway is an open client connection.
+    // Unknown command lines cannot be treated as idle.
+    if initial
+        .iter()
+        .any(|process| process.is_host_daemon != Some(true))
+    {
+        return Err(installer_blockers(&initial));
+    }
+    for descriptor in live_host_daemons() {
+        if initial.iter().any(|process| process.pid == descriptor.pid) {
+            let _ = crate::daemon::request_shutdown_if_idle(&descriptor);
         }
     }
-    log_reap_report("updater reaper", &report);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let mut remaining = inventory();
+        for process in &mut remaining {
+            if let Some(previous) = initial
+                .iter()
+                .find(|previous| previous.pid == process.pid && previous.path == process.path)
+            {
+                process.is_host_daemon = previous.is_host_daemon;
+            }
+        }
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(installer_blockers(&remaining));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// In-app updates use the same close/defer policy as manual installers.
+pub fn stop_spawned_gateways() -> ReapReport {
+    let result = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .ok_or_else(|| vec!["Could not resolve Toolport's install directory".into()])
+        .and_then(|dir| installer_preflight(&dir));
+    let report = ReapReport {
+        failed: result.err().unwrap_or_default(),
+        ..ReapReport::default()
+    };
+    log_reap_report("updater preflight", &report);
     report
 }
 
@@ -1559,7 +1706,18 @@ fn daemon_roles_from_cim_json(
 
 #[cfg(windows)]
 fn list_gateway_processes() -> Vec<GatewayProcess> {
-    windows_list_gateway_processes()
+    let mut processes = windows_list_gateway_processes();
+    windows_assign_daemon_roles(&mut processes);
+    processes
+}
+
+#[cfg(windows)]
+fn windows_assign_daemon_roles(processes: &mut [GatewayProcess]) {
+    let pids: Vec<u32> = processes.iter().map(|process| process.pid).collect();
+    let roles = windows_gateway_daemon_roles(&pids);
+    for process in processes {
+        process.is_host_daemon = roles.get(&process.pid).copied().flatten();
+    }
 }
 
 #[cfg(windows)]
@@ -1625,13 +1783,10 @@ fn windows_list_gateway_processes() -> Vec<GatewayProcess> {
             }
         }
         CloseHandle(snap);
-        let candidate_pids: Vec<u32> = out.iter().map(|(proc, _)| proc.pid).collect();
-        let roles = windows_gateway_daemon_roles(&candidate_pids);
         // Resolve after the walk: a parent can appear later in the snapshot than
         // its child, so this cannot be done inline.
         out.into_iter()
             .map(|(mut proc, ppid)| {
-                proc.is_host_daemon = roles.get(&proc.pid).copied().flatten();
                 proc.parent = names
                     .get(&ppid)
                     .filter(|_| windows_parent_predates_child(ppid, proc.pid))
@@ -1846,7 +2001,9 @@ fn linux_parent_of(pid: u32) -> Option<ParentProcess> {
 #[cfg(target_os = "macos")]
 fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
     let Ok(out) = std::process::Command::new("ps")
-        .args(["-ax", "-o", "pid=", "-o", "ppid=", "-o", "ucomm="])
+        .args([
+            "-ax", "-o", "pid=", "-o", "ppid=", "-o", "state=", "-o", "ucomm=",
+        ])
         .output()
     else {
         return Vec::new();
@@ -2165,6 +2322,98 @@ mod tests {
             }),
             ..proc(pid, basename, path)
         }
+    }
+
+    #[test]
+    fn installer_matches_paths_and_never_a_foreign_basename() {
+        let dir = ScratchDir::new("installer-scope");
+        let install = dir.join("install");
+        let data = dir.join("data");
+        let name = format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX);
+        let owned = proc_with_parent(41, &name, install.join(&name).to_str(), 42, "Cursor");
+        assert!(installer_owns_process(&owned, &install, Some(&data)));
+        let published = proc(
+            43,
+            "toolport-gateway-2.0.0.exe",
+            data.join("bin/toolport-gateway-2.0.0.exe").to_str(),
+        );
+        assert!(installer_owns_process(&published, &install, Some(&data)));
+        let foreign = proc(44, &name, dir.join("other").join(&name).to_str());
+        assert!(!installer_owns_process(&foreign, &install, Some(&data)));
+        assert!(!installer_owns_process(
+            &proc(45, &name, None),
+            &install,
+            Some(&data)
+        ));
+        assert!(!installer_owns_process(
+            &owned,
+            Path::new("relative"),
+            Some(&data)
+        ));
+        let blockers = installer_blockers(&[owned]);
+        assert!(blockers[0].contains("Cursor (pid 42)"));
+        assert!(blockers[0].contains("cancel to defer"));
+    }
+
+    #[test]
+    fn installer_ignores_other_users_and_sessions_even_when_paths_are_unreadable() {
+        let install = std::env::temp_dir().join("toolport-installer-scope");
+        let unreadable = proc(41, "toolport-gateway.exe", None);
+        assert!(!installer_targets_process(
+            &unreadable,
+            Some(false),
+            &install,
+            None
+        ));
+        assert!(installer_targets_process(
+            &unreadable,
+            Some(true),
+            &install,
+            None
+        ));
+        assert!(!installer_targets_process(
+            &unreadable,
+            None,
+            &install,
+            None
+        ));
+        let installed = proc(
+            42,
+            "toolport-gateway",
+            install
+                .join(format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX))
+                .to_str(),
+        );
+        assert!(!installer_targets_process(
+            &installed,
+            Some(false),
+            &install,
+            None
+        ));
+        assert!(installer_targets_process(
+            &installed,
+            Some(true),
+            &install,
+            None
+        ));
+        assert_eq!(installer_same_user_session(std::process::id()), Some(true));
+    }
+
+    #[test]
+    fn failed_role_inspection_does_not_claim_an_idle_client_is_open() {
+        let mut unknown = proc_with_parent(
+            41,
+            "toolport-gateway",
+            Some("/opt/toolport/toolport-gateway"),
+            42,
+            "Cursor",
+        );
+        unknown.is_host_daemon = None;
+        let blockers = installer_blockers(&[unknown]);
+        assert!(blockers[0].contains("Could not inspect"));
+        assert!(!blockers[0].contains("Close this client's MCP session"));
+        assert!(!blockers[0].contains("Cursor"));
+        assert!(daemon_roles_from_cim_json(&serde_json::Value::Null).is_empty());
     }
 
     #[test]
@@ -2794,16 +3043,16 @@ mod tests {
         );
     }
 
-    /// WS4-1 / WS4-8: pure parse of `ps -o pid= -o ppid= -o ucomm=` rows.
+    /// WS4-1 / WS4-8: pure parse of pid, ppid, state and ucomm rows.
     /// Does not prove the `ps` argv itself - that still needs a macOS smoke.
     #[test]
     fn parse_ps_pid_ppid_name_line_accepts_padded_columns_and_ucomm() {
         assert_eq!(
-            parse_ps_pid_ppid_name_line("  123   1 toolport-gateway"),
+            parse_ps_pid_ppid_name_line("  123   1 S toolport-gateway"),
             Some((123, 1, "toolport-gateway".into()))
         );
         assert_eq!(
-            parse_ps_pid_ppid_name_line("45678 4321 toolport-gateway-1.9.4"),
+            parse_ps_pid_ppid_name_line("45678 4321 R+ toolport-gateway-1.9.4"),
             Some((45678, 4321, "toolport-gateway-1.9.4".into()))
         );
         assert_eq!(parse_ps_pid_ppid_name_line(""), None);
@@ -2819,7 +3068,7 @@ mod tests {
         // Full-path comm= style still parses; basename filter is applied by the caller.
         assert_eq!(
             parse_ps_pid_ppid_name_line(
-                "  42 7 /Applications/Toolport.app/Contents/MacOS/toolport-gateway"
+                "  42 7 S /Applications/Toolport.app/Contents/MacOS/toolport-gateway"
             ),
             Some((
                 42,
@@ -2827,10 +3076,26 @@ mod tests {
                 "/Applications/Toolport.app/Contents/MacOS/toolport-gateway".into()
             ))
         );
-        // A name with spaces survives, since only the first two columns are positional.
+        // A name with spaces survives after the three positional columns.
         assert_eq!(
-            parse_ps_pid_ppid_name_line("5 2 Some App Helper"),
+            parse_ps_pid_ppid_name_line("5 2 S Some App Helper"),
             Some((5, 2, "Some App Helper".into()))
+        );
+    }
+
+    #[test]
+    fn macos_process_inventory_ignores_exited_gateways_before_the_parent_reaps_them() {
+        assert_eq!(
+            parse_ps_pid_ppid_name_line("123 1 Z toolport-gateway"),
+            None
+        );
+        assert_eq!(
+            parse_ps_pid_ppid_name_line("124 1 Z+ toolport-gateway"),
+            None
+        );
+        assert_eq!(
+            parse_ps_pid_ppid_name_line("125 1 T toolport-gateway"),
+            Some((125, 1, "toolport-gateway".into()))
         );
     }
 

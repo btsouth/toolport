@@ -2695,10 +2695,8 @@ fn stop_spawned_gateways(bridge: State<HttpBridgeState>) -> UpdateShutdownReport
         }
     };
 
-    // Never launch the kill-all pass when Toolport could not first persist the
-    // exact recovery identity for its owned endpoint. The global enumerator can
-    // see and kill that child too; proceeding would destroy connectivity without
-    // a trustworthy port/token from which to recover it.
+    // Do not proceed with gateway preflight unless the owned endpoint's exact
+    // recovery identity is persisted. Recovery needs its trustworthy port/token.
     if let OwnedBridgeStop::FailedBeforeIntent(error) = &owned_bridge {
         return UpdateShutdownReport {
             reaper: crate::gateway_publish::ReapReport {

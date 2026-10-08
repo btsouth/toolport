@@ -56,6 +56,10 @@ export function needsLinuxPackages(event, files) {
         [
           "scripts/build-linux-packages.sh",
           "scripts/test-linux-packages.sh",
+          "scripts/test-uninstall-hooks.py",
+          "scripts/test-package-removal.sh",
+          "scripts/package-removal-fixture.py",
+          "scripts/test-nsis-hooks.sh",
           "scripts/install-nfpm.sh",
           "scripts/render-aur.sh",
           "scripts/ci-apt-install.sh",

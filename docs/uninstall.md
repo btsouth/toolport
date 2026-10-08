@@ -6,14 +6,32 @@ the clients while Toolport is still installed, then remove the app and its data.
 
 ## 1. Disconnect your clients
 
-Toolport can only take back what it wrote while it is still installed, so do this
-first.
+In **Settings**, choose **Remove Toolport from all clients** while Toolport is
+still installed. Review the per-client results and resolve any errors before
+removing the app or its data. You can also run `toolport-gateway --disconnect-all`
+as your normal user; `--dry-run` lists the affected clients without changing them.
+Do not run this command with sudo. Untouched configs return to their exact original
+bytes; subsequent unrelated edits are preserved or reported as conflicts.
+Turn off **Launch at login** in Settings.
 
-1. Open Toolport and go to **Clients**.
-2. For every client that shows **connected to Toolport**, open it and click
-   **Disconnect**. That removes the Toolport entry from that client's config file
-   and leaves your other servers and the rest of the file untouched.
-3. Turn off **Launch at login** in Settings.
+Windows NSIS and native GTK deb/rpm/Arch packages attempt the same operation before
+removing their gateway. Failure is logged with recovery instructions and removal
+continues. Keep Toolport's data on failure, reinstall it, and retry the action above.
+Linux hooks enumerate accounts with `~/.config/Toolport` or `~/.config/Conduit`
+and switch to each account without a login shell. For a custom `XDG_CONFIG_HOME`
+or `TOOLPORT_DATA_DIR`, use the in-app action or CLI with that environment first.
+Upgrades skip the removal action. Windows installers defer while client gateways
+are open and name the affected clients: close their MCP sessions and retry, or
+cancel to install later. They never force-kill gateways by name.
+
+**AppImage, Tauri .deb, and macOS:** use the in-app action before deleting the app.
+AppImage and dragging a macOS app to Trash have no uninstall hook. The native GTK
+.deb is distinct from the Tauri .deb. The Homebrew tap is `btsouth/homebrew-toolport`;
+its cask also requires the action before uninstall or zap. Homebrew runs uninstall
+preflight blocks during upgrades without exposing an upgrade flag, so the cask
+uses a manual action to preserve client connections during updates. On macOS the
+CLI is `"/Applications/Toolport.app/Contents/MacOS/toolport-gateway" --disconnect-all`
+(adjust the app path if needed).
 
 ## 2. Remove the app
 
@@ -26,6 +44,7 @@ first.
   - pacman repository: `sudo pacman -R toolport`. See
     [Arch and Omarchy](arch-pacman-repo.md) for removing the repo and key.
   - `.deb`: `sudo apt remove toolport` (or `sudo dpkg -r toolport`).
+  - Native GTK `.rpm`: `sudo dnf remove toolport`.
   - AppImage: quit Toolport and delete the `.AppImage` file.
 
 ## 3. Remove Toolport's data

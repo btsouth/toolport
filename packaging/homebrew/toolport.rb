@@ -26,6 +26,15 @@ cask "toolport" do
 
   app "Toolport.app"
 
+  # Homebrew also runs uninstall_preflight on upgrades without exposing the
+  # upgrade flag to that block. Disconnecting there would break live clients.
+  caveats <<~EOS
+    Before brew uninstall or zap, open Toolport Settings and choose
+    "Remove Toolport from all clients". Keep Toolport's data if cleanup fails.
+    Or run "#{appdir}/Toolport.app/Contents/MacOS/toolport-gateway" --disconnect-all
+    as your normal user while the app is still installed.
+  EOS
+
   # The gateway is a nested helper the app manages; no separate binaries to link.
   # Application Support: current leaf is Toolport (brand.rs data_dir_leaf_name);
   # Conduit remains for installs that have not migrated. Cache/pref paths keep

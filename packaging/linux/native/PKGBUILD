@@ -3,6 +3,7 @@
 pkgname=toolport
 pkgver=1.24.0
 pkgrel=1
+install=toolport.install
 pkgdesc='One local MCP gateway for every AI client, with a native GTK shell'
 arch=('x86_64')
 url='https://github.com/btsouth/toolport'
@@ -11,7 +12,7 @@ license=('MIT')
 # to the Secret Service over D-Bus rather than linking libsecret, and namcap
 # confirms neither binary links it. A provider is a runtime choice, and without
 # one Toolport falls back to its own encrypted file backend.
-depends=('gtk4' 'libadwaita' 'glib2' 'dbus' 'hicolor-icon-theme')
+depends=('coreutils' 'util-linux' 'gtk4' 'libadwaita' 'glib2' 'dbus' 'hicolor-icon-theme')
 optdepends=('gnome-keyring: store credentials in the system keyring instead of the encrypted file backend'
             'kwallet: same, on KDE')
 makedepends=('cargo' 'desktop-file-utils' 'appstream' 'zip')
@@ -22,8 +23,12 @@ makedepends=('cargo' 'desktop-file-utils' 'appstream' 'zip')
 conflicts=('toolport-bin' 'toolport-native-preview')
 replaces=('toolport-native-preview')
 options=('!lto')
-source=("toolport-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('d521eb818d9d4da9cab43c792291a21108e1ab874aedecb01804655c004d2af0')
+source=("toolport-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        "toolport.install"
+        "disconnect-users.sh")
+sha256sums=('d521eb818d9d4da9cab43c792291a21108e1ab874aedecb01804655c004d2af0'
+            '0083ee13186ff966eb3c5379a75e2f1107e4f51fbeb9cd213ffa807acc7b97ab'
+            '21222580a18e27e7a8e9ea614e9b8dd083980d686274ec48944bc83283e29b8b')
 
 build() {
   cd "toolport-$pkgver/src-tauri"
@@ -33,7 +38,7 @@ build() {
 
 check() {
   cd "toolport-$pkgver/src-tauri"
-  cargo test --locked --no-default-features --features gtk-desktop \
+  cargo test --locked --no-default-features --features gtk-desktop,test-support \
     --lib linux_native::
 }
 
@@ -56,6 +61,8 @@ package() {
   install -d "$pkgdir/usr/share/toolport/agent-plugin"
   (cd packaging/agent-plugin && zip -qr \
     "$pkgdir/usr/share/toolport/agent-plugin/toolport-agent-plugin.zip" toolport)
+  install -Dm755 "$srcdir/disconnect-users.sh" \
+    "$pkgdir/usr/share/toolport/disconnect-users.sh"
   install -Dm755 scripts/toolport-preview-rollback.sh \
     "$pkgdir/usr/share/toolport/toolport-preview-rollback.sh"
   install -Dm644 LICENSE \
