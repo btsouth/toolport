@@ -375,14 +375,20 @@ pub(super) fn review(
                 choice.set_sensitive(
                     !key.starts_with("__")
                         && selected.iter().any(|(_, row, _, _, server)| {
-                            server == name && !row.subtitle().starts_with("Unsupported:")
+                            server == name
+                                && !row
+                                    .subtitle()
+                                    .is_some_and(|text| text.starts_with("Unsupported:"))
                         }),
                 );
             }
             cancel.set_sensitive(true);
             button.set_sensitive(true);
             for (check, row, spinner, _, _) in selected.iter() {
-                check.set_sensitive(!row.subtitle().starts_with("Unsupported:"));
+                check.set_sensitive(
+                    !row.subtitle()
+                        .is_some_and(|text| text.starts_with("Unsupported:")),
+                );
                 spinner.set_spinning(false);
                 spinner.set_visible(false);
             }
