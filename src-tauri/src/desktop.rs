@@ -624,7 +624,7 @@ struct MigrateResult {
     /// Names of the servers moved out of the client's config.
     moved: Vec<String>,
     tools: Vec<serde_json::Value>,
-    outcome: WriteOutcome,
+    outcome: clients::WriteOutcome,
 }
 
 #[tauri::command]

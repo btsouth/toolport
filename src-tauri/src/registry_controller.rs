@@ -2449,6 +2449,25 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_setup_failure_preserves_a_concurrent_registry_edit() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let original = r#"{"mcpServers":{"one":{"command":"one"}}}"#;
+        std::fs::write(fixture.claude(), original).unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        let error = migrate_client_reviewed_with(
+            "claude-code", None, false, &["one".into()], &review.revision,
+            |_, _, _, _| {
+                registry::update(|registry| { registry.add_server(server("concurrent")); Ok(()) }).unwrap();
+                Err("Launch failed".into())
+            },
+        ).unwrap_err();
+        assert!(error.contains("Registry changed during setup"));
+        assert!(read_registry_exact().unwrap().servers.iter().any(|server| server.name == "concurrent"));
+        assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
+        assert!(!fixture.move_record("claude-code").exists());
+    }
+
+    #[test]
     fn reviewed_setup_refuses_changed_credential_without_importing() {
         let fixture = MoveFixture::new(&Registry::default());
         std::fs::write(
