@@ -2553,7 +2553,7 @@ fn confirm_client_migrate(client: &state::ClientView, page: ClientPage) {
         client.scope_id.clone(),
         client.gateway_state == state::ClientGatewayState::Customized,
         { let page = page.clone(); move || page.refresh() },
-        page.credential_page.clone(),
+        Some(page.credential_page.clone()),
     );
 }
 

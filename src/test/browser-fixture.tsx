@@ -224,6 +224,10 @@ const setupItems = ["Notes", "Calendar"].map((name) => ({
   url: null,
   envKeys: name === "Calendar" ? ["PAT"] : [],
   isNew: true,
+  credentials:
+    name === "Calendar"
+      ? [{ key: "PAT", secret: true, present: setupFailure !== "credential" }]
+      : [],
 }));
 function fixtureAdd(entry: ServerEntry) {
   const saved = {
@@ -269,16 +273,25 @@ mockIPC(
                 : "Notes could not start. Check its command and retry. Client config unchanged.",
           );
         setupConnected = true;
+        fixtureAdd({
+          id: "calendar",
+          name: "Calendar",
+          transport: "stdio",
+          command: "fixture-calendar",
+          args: [],
+          env: [{ key: "PAT", value: null, secret: true }],
+          url: null,
+        });
         return {
           registry: structuredClone(registry),
           imported: 1,
           servers: (args.selected as string[]).map((name) => ({
             name,
             toolCount: 3,
-            credentialState: "none",
+            credentialState: name === "Calendar" ? "stored" : "none",
           })),
           moved: args.selected,
-          tools: [{ name: "notes__read" }],
+          tools: [{ name: "toolport_search_tools" }, { name: "toolport_call_tool" }],
           outcome: {
             path: "/fixture/codex.toml",
             backup: "/fixture/Toolport/backups/codex/previous.toml",

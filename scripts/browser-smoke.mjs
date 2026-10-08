@@ -272,7 +272,9 @@ try {
     } else {
       await expect(page.getByText(/3 tools/)).toHaveCount(2);
       await page.getByText("What your agent sees", { exact: true }).click();
-      await expect(page.getByText("notes__read", { exact: true })).toBeVisible();
+      await expect(
+        page.getByText("toolport_search_tools", { exact: true }),
+      ).toBeVisible();
     }
     await page.screenshot({
       animations: "disabled",

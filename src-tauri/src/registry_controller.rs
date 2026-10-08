@@ -3001,6 +3001,31 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_legacy_secret_arguments_match_without_masked_comparison() {
+        let mut registry = Registry::default();
+        let mut raw = server("one");
+        raw.args = vec!["--api-key".into(), "synthetic-private-argument".into()];
+        registry.add_server(raw);
+        let fixture = MoveFixture::new(&registry);
+        std::fs::write(fixture.claude(), r#"{"mcpServers":{"one":{"command":"one","args":["--api-key","synthetic-private-argument"]}}}"#).unwrap();
+        let preview = preview_client_setup("claude-code").unwrap();
+        migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &preview.revision,
+            |_, _, _, _| Ok(Vec::new().into()),
+        )
+        .unwrap();
+        let saved = read_registry_exact().unwrap();
+        assert_eq!(saved.servers.len(), 1);
+        assert!(!serde_json::to_string(&saved)
+            .unwrap()
+            .contains("synthetic-private-argument"));
+    }
+
+    #[test]
     fn reviewed_missing_inputs_are_transactional_and_retryable() {
         let fixture = MoveFixture::new(&Registry::default());
         std::fs::write(

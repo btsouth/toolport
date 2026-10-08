@@ -49,18 +49,12 @@ export function ConnectReviewDialog({
     setBusy(true);
     setError("");
     try {
-      const next = await migrateClient(
-        clientId,
-        profile,
-        force,
-        selected,
-        review.revision,
-        ...(credentialInputs
-          ? ([secretChoices, credentialInputs] as const)
-          : secretChoices
-            ? ([secretChoices] as const)
-            : ([] as const)),
-      );
+      const args = [clientId, profile, force, selected, review.revision] as const;
+      const next = credentialInputs
+        ? await migrateClient(...args, secretChoices, credentialInputs)
+        : secretChoices
+          ? await migrateClient(...args, secretChoices)
+          : await migrateClient(...args);
       setResult(next);
       onConnected(next.registry);
     } catch (e) {

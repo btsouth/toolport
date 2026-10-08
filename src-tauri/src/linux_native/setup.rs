@@ -163,7 +163,7 @@ pub(super) fn review(
                 let inputs = credential_inputs.clone();
                 let name = item.name.clone();
                 let key = env.key.clone();
-                let value_row = value_row.clone();
+                let value_row_for_input = value_row.clone();
                 open.connect_clicked(move |_| {
                     let prompt = adw::MessageDialog::new(Some(&owner), Some("Missing credential"), Some("This value is used only for the selected server. It goes to the keychain if connection succeeds."));
                     let entry = gtk::PasswordEntry::builder().show_peek_icon(true).build();
@@ -172,7 +172,7 @@ pub(super) fn review(
                     prompt.set_response_appearance("save", adw::ResponseAppearance::Suggested);
                     prompt.set_default_response(Some("save"));
                     prompt.set_close_response("cancel");
-                    let (inputs, name, key, value_row) = (inputs.clone(), name.clone(), key.clone(), value_row.clone());
+                    let (inputs, name, key, value_row) = (inputs.clone(), name.clone(), key.clone(), value_row_for_input.clone());
                     prompt.connect_response(None, move |_, response| {
                         if response == "save" && !entry.text().is_empty() {
                             inputs.borrow_mut().entry(name.clone()).or_default().insert(key.clone(), entry.text().to_string());
@@ -422,7 +422,7 @@ pub(super) fn connect(
     profile: Option<String>,
     force: bool,
     finished: impl Fn() + 'static,
-    credential_page: super::ServerPage,
+    credential_page: Option<super::ServerPage>,
 ) {
     let parent = parent.clone();
     gtk::glib::spawn_future_local(async move {
@@ -464,7 +464,7 @@ pub(super) fn connect(
                         })
                     },
                     finished,
-                    Some(credential_page),
+                    credential_page,
                 );
             }
             Ok(Err(error)) => review(
@@ -583,6 +583,18 @@ mod tests {
         adw::init().unwrap();
         let parent = gtk::Window::new();
         let state = std::env::var("TOOLPORT_SETUP_FIXTURE_STATE").unwrap_or_default();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-gtk-setup-fixture-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&scratch);
+        let mut registry = crate::registry::Registry::default();
+        registry.add_server(serde_json::from_value(serde_json::json!({"id":"calendar", "name":"Calendar", "transport":"stdio", "command":"fixture-calendar", "args":[], "env":[{"key":"PAT", "value":null,"secret":true}]})).unwrap());
+        crate::registry::save(&registry).unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.toolport.SetupFixture")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let broker = crate::approval_broker::start_native();
+        let (_, credential_page, _) = super::super::build_content(&app, broker);
         let items = ["Notes", "Calendar"]
             .into_iter()
             .map(|name| SetupItem {
@@ -652,7 +664,7 @@ mod tests {
                 })
             },
             || {},
-            None,
+            Some(credential_page),
         );
         gtk::glib::MainLoop::new(None, false).run();
     }
