@@ -1626,6 +1626,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn member_review_native_keeps_remaining_decisions_open() {
         adw::init().unwrap();
         let _lock = crate::registry::data_dir_test_lock();
