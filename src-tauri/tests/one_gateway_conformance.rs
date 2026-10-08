@@ -1943,6 +1943,7 @@ fn matrix_pooling_sessionless_modern_requests_keep_a_warm_root_launch() {
         vec![mock_server_entry("rooted", &transcript, Some("${ROOT}"))],
         vec![],
     );
+    discovery_support::select_full(&dir, "sessionless-root");
     let mut bootstrap = spawn_adapter(&dir, &AdapterOptions::default());
     bootstrap.initialize("matrix-sessionless-bootstrap");
     let descriptor = wait_for_descriptor(&dir, Duration::from_secs(10));

@@ -4,9 +4,15 @@
 pub fn select_full(dir: &std::path::Path, client_id: &str) {
     let path = dir.join("registry.json");
     let _lock = conduit_lib::registry::lock_at(&path).expect("lock fixture registry");
+    // Empty-registry lifecycle cases do not inspect downstream schemas and
+    // should continue exercising Auto without creating a registry document.
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => panic!("read fixture registry: {error}"),
+    };
     let mut registry: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).expect("read fixture registry"))
-            .expect("parse fixture registry");
+        serde_json::from_slice(&raw).expect("parse fixture registry");
     if !registry["clientDiscovery"].is_object() {
         registry["clientDiscovery"] = serde_json::json!({});
     }
