@@ -1982,6 +1982,7 @@ mod tests {
 
     #[test]
     fn p08_adapter_lifetime_retries_after_503_and_reopens_after_eof() {
+        let _env = crate::registry::DataDirTestEnv::new("p08-adapter-lifetime-retry");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let compat = CompatKey::new("test", "p08-lifetime-retry");
         let session = Session::new(

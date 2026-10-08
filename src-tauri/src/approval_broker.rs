@@ -292,20 +292,19 @@ impl ApprovalBroker {
 pub fn start(app: AppHandle) -> ApprovalBroker {
     let allowed_app = app.clone();
     let pending_app = app.clone();
-    let resolved_app = app;
-    let notifications = Arc::new(PendingNotifications::default());
-    let resolved_notifications = notifications.clone();
-    start_with_host(BrokerHost {
-        persistent_allowed: Arc::new(move |key| registry_allows(&allowed_app, key)),
-        pending: Arc::new(move |view| {
-            let _ = pending_app.emit("approval-pending", view);
-            notify_pending(&pending_app, view, notifications.pending(&view.id));
-        }),
-        resolved: Arc::new(move |id| {
-            resolved_notifications.resolve(id);
-            let _ = resolved_app.emit("approval-resolved", id);
-        }),
-    })
+    let resolved_app = app.clone();
+    start_with_host(notification_host(
+        BrokerHost {
+            persistent_allowed: Arc::new(move |key| registry_allows(&allowed_app, key)),
+            pending: Arc::new(move |view| {
+                let _ = pending_app.emit("approval-pending", view);
+            }),
+            resolved: Arc::new(move |id| {
+                let _ = resolved_app.emit("approval-resolved", id);
+            }),
+        },
+        Arc::new(move |view, resolved| notify_pending(&app, view, resolved)),
+    ))
 }
 
 #[cfg(all(target_os = "linux", feature = "gtk-desktop"))]
@@ -822,27 +821,35 @@ fn registry_allows(app: &AppHandle, key: &str) -> bool {
 /// A resolution can arrive while the OS is still showing the notification.
 /// Its queued signal closes that late notification as soon as Notify returns.
 #[cfg(any(feature = "desktop", test))]
-#[derive(Default)]
-struct PendingNotifications(Mutex<HashMap<String, std::sync::mpsc::Sender<()>>>);
+type ShowPendingNotification =
+    Arc<dyn Fn(&PendingView, std::sync::mpsc::Receiver<()>) + Send + Sync>;
 #[cfg(any(feature = "desktop", test))]
-impl PendingNotifications {
-    fn pending(&self, id: &str) -> std::sync::mpsc::Receiver<()> {
-        let (tx, rx) = channel();
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id.into(), tx);
-        rx
-    }
-    fn resolve(&self, id: &str) {
-        if let Some(tx) = self
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(id)
-        {
-            let _ = tx.send(());
-        }
+fn notification_host(host: BrokerHost, show: ShowPendingNotification) -> BrokerHost {
+    let notifications = Arc::new(Mutex::new(
+        HashMap::<String, std::sync::mpsc::Sender<()>>::new(),
+    ));
+    let pending = notifications.clone();
+    BrokerHost {
+        persistent_allowed: host.persistent_allowed,
+        pending: Arc::new(move |view| {
+            let (tx, rx) = channel();
+            pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(view.id.clone(), tx);
+            (host.pending)(view);
+            show(view, rx);
+        }),
+        resolved: Arc::new(move |id| {
+            if let Some(tx) = notifications
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(id)
+            {
+                let _ = tx.send(());
+            }
+            (host.resolved)(id);
+        }),
     }
 }
 
@@ -993,20 +1000,46 @@ mod tests {
 
     #[test]
     fn p08_tauri_notification_resolution_withdraws_only_its_toast_even_after_late_show() {
-        let notifications = PendingNotifications::default();
-        let first = notifications.pending("first");
-        let other = notifications.pending("other");
-        notifications.resolve("first");
-        // Notify may still be in progress. Its worker must see this signal when
-        // the OS returns the notification id, even after repeated resolution.
-        notifications.resolve("first");
+        let (shown_tx, shown_rx) = channel();
+        let host = notification_host(
+            BrokerHost {
+                persistent_allowed: Arc::new(|_| false),
+                pending: Arc::new(|_| {}),
+                resolved: Arc::new(|_| {}),
+            },
+            Arc::new(move |view, resolved| {
+                shown_tx.send((view.id.clone(), resolved)).unwrap();
+            }),
+        );
+        let first = request("tok", Some("v2:abc"));
+        let mut other = first.clone();
+        other.id = "other".into();
+        let view = |req: ApprovalRequest| PendingView {
+            id: req.id,
+            client: req.client,
+            server: req.server,
+            tool: req.tool,
+            reason: req.reason,
+            tool_fingerprint: req.tool_fingerprint,
+            arguments: req.arguments,
+            url_elicitation: None,
+            pii_release: None,
+            deadline_ms: deadline_ms_from_now(),
+        };
+        (host.pending)(&view(first));
+        let (_, first) = shown_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        (host.pending)(&view(other));
+        let (_, other) = shown_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // The same resolved callback used by handle_conn must queue withdrawal
+        // while the OS's Notify is still returning its id.
+        (host.resolved)("req-1");
+        (host.resolved)("req-1");
         first.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(matches!(
             other.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
-        assert!(!notifications.0.lock().unwrap().contains_key("first"));
-        notifications.resolve("other");
+        (host.resolved)("other");
         other.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
