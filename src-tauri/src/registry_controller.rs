@@ -1523,10 +1523,14 @@ fn undo_staged_value(
 ) -> bool {
     use serde_json::Value;
     let same_row = |left: &Value, right: &Value| {
-        ["id", "key"]
-            .iter()
-            .any(|field| left.get(field).is_some() && left.get(field) == right.get(field))
-            || left == right
+        for field in ["id", "key"] {
+            let left_key = left.get(field).and_then(Value::as_str);
+            let right_key = right.get(field).and_then(Value::as_str);
+            if left_key.is_some() || right_key.is_some() {
+                return left_key == right_key;
+            }
+        }
+        left == right
     };
     if previous == staged {
         return true;
@@ -2590,6 +2594,30 @@ mod tests {
         assert!(read_registry_exact().unwrap().servers.is_empty());
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
         assert!(!fixture.move_record("claude-code").exists());
+    }
+
+    #[test]
+    fn reviewed_rollback_matches_server_ids_before_unknown_keys() {
+        let previous = serde_json::json!([
+            {"id":"other","key":"shared","enabled":false},
+            {"id":"one","key":"shared","enabled":false}
+        ]);
+        let staged = serde_json::json!([
+            {"id":"other","key":"shared","enabled":false},
+            {"id":"one","key":"shared","enabled":true}
+        ]);
+        let mut latest = serde_json::json!([
+            {"id":"other","key":"shared","enabled":true},
+            {"id":"one","key":"shared","enabled":true}
+        ]);
+        assert!(undo_staged_value(&mut latest, &previous, &staged));
+        assert_eq!(
+            latest,
+            serde_json::json!([
+                {"id":"other","key":"shared","enabled":true},
+                {"id":"one","key":"shared","enabled":false}
+            ])
+        );
     }
 
     #[test]
