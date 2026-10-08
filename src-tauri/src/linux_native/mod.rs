@@ -9154,11 +9154,12 @@ mod tests {
 
     #[test]
     fn star_prompt_is_spent_once_even_without_a_click() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join(".gtk-star-prompt-done");
+        let dir = preview_scratch("star-prompt");
+        let marker = dir.join(".gtk-star-prompt-done");
         assert!(spend_star_prompt(&marker));
         assert!(!spend_star_prompt(&marker));
-        assert!(!spend_star_prompt(&dir.path().join("missing/marker")));
+        assert!(!spend_star_prompt(&dir.join("missing/marker")));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
