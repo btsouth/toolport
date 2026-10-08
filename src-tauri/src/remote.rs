@@ -711,7 +711,9 @@ fn refresh_token_under_lock(
     // Held for the whole function, including the client-credentials branch, so two
     // processes cannot mint two tokens for the same server.
     let refresh_lock = lock();
-    if let Some(winner) = refreshed_while_waiting(server_id, before_access.as_deref())? {
+    if let Some(winner) = refreshed_while_waiting(server_id, before_access.as_deref())?
+        .filter(|winner| !force || rejected != Some(winner.access_token.as_str()))
+    {
         credentials.read_vault(server_id)?;
         credentials.pending = None;
         credentials.token = Some(winner.access_token.clone());
@@ -2231,6 +2233,30 @@ mod tests {
                 "token-2"
             );
             assert_eq!(endpoint.count(), 2);
+        });
+    }
+
+    #[test]
+    fn oauth_forced_refresh_does_not_reuse_rejected_lock_winner() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            endpoint.release.send(()).unwrap();
+            let token = refresh_token_with_lock("rotation", Some("rejected-peer"), || {
+                let lock = lock_oauth_refresh("rotation")?;
+                let mut peer = load_state("rotation")?.unwrap();
+                peer.expires_at = Some(now_epoch_seconds() + 3600);
+                secrets::set_secret(
+                    "rotation",
+                    STATE_KEY,
+                    &serde_json::to_string(&peer).unwrap(),
+                )?;
+                secrets::set_secret("rotation", secrets::HTTP_AUTH_KEY, "rejected-peer")?;
+                Ok(lock)
+            })
+            .unwrap();
+            assert_eq!(token.access_token, "token-1");
+            assert_eq!(endpoint.count(), 1);
         });
     }
 
