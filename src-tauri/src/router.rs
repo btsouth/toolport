@@ -2669,6 +2669,45 @@ impl Router {
             .collect()
     }
 
+    /// Capture app visibility once: reconnects can replace shared slot
+    /// capabilities before the next indexed router is published.
+    pub fn mcp_app_html_visibility(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+    ) -> (bool, Vec<String>) {
+        let mut declaration = None;
+        let mut conflict = false;
+        let mut servers = Vec::new();
+        for slot in &self.servers {
+            if !include_server(&slot.id) {
+                continue;
+            }
+            let server = slot
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(settings) = server.extensions().get(MCP_APPS_EXTENSION) {
+                if declaration.as_ref().is_some_and(|old| old != settings) {
+                    conflict = true;
+                } else if declaration.is_none() {
+                    declaration = Some(settings.clone());
+                }
+            }
+            if supports_mcp_app_html(server.extensions()) {
+                servers.push(slot.id.clone());
+            }
+        }
+        servers.sort();
+        let relays = !conflict
+            && declaration.as_ref().is_some_and(|settings| {
+                settings
+                    .get("mimeTypes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|types| types.iter().any(|mime| mime == MCP_APP_HTML_MIME))
+            });
+        (relays, servers)
+    }
+
     /// One connected server's settings for an extension. Callers that depend on
     /// a particular setting (rather than mere identifier presence) must inspect
     /// this server-local value instead of the aggregate.

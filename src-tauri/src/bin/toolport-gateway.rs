@@ -6203,6 +6203,8 @@ struct ToolSurfaceKey {
     mode: u8,
     code_mode: bool,
     apps: bool,
+    relays_apps: bool,
+    app_servers: Vec<String>,
 }
 
 struct ToolSurfaceEntry {
@@ -6273,6 +6275,14 @@ fn cached_tool_surfaces(
     if let Some(allowed) = &mut allowed_key {
         allowed.sort();
     }
+    let apps = active_client_supports_mcp_app_html();
+    let (relays_apps, app_servers) = if apps {
+        router.mcp_app_html_visibility(|server| {
+            allowed.is_none_or(|scope| server_in_allowed_scope(server, scope))
+        })
+    } else {
+        (false, Vec::new())
+    };
     let key = ToolSurfaceKey {
         catalog: Arc::as_ptr(snapshot) as usize,
         router: Arc::as_ptr(router) as usize,
@@ -6282,7 +6292,9 @@ fn cached_tool_surfaces(
         allowed: allowed_key,
         mode: mode.as_u8(),
         code_mode: host.code_mode_enabled(),
-        apps: active_client_supports_mcp_app_html(),
+        apps,
+        relays_apps,
+        app_servers,
     };
     // Single flight over immutable snapshots. A rebuild publishes different
     // identities; it cannot overwrite or combine this view's surfaces.
@@ -6321,7 +6333,7 @@ fn cached_tool_surfaces(
                 })
         })
         .collect();
-    let relays_apps = relays_mcp_app_html_to_active_client(router, allowed);
+    let relays_apps = key.relays_apps;
     let neutralized = |tool: &Value| {
         let mut tool = tool.clone();
         neutralize_listed_tool(&mut tool);
@@ -6373,14 +6385,20 @@ fn cached_tool_surfaces(
                         .get("name")
                         .and_then(Value::as_str)
                         .and_then(|name| router.route_of(name))
-                        .is_some_and(|(server, _)| server_supports_mcp_app_html(router, server))
+                        .is_some_and(|(server, _)| {
+                            key.app_servers
+                                .binary_search_by(|id| id.as_str().cmp(server))
+                                .is_ok()
+                        })
             })
             .map(neutralized);
         Arc::new(savings::SerializedSurface::from_tools(
             floor.into_iter().chain(apps),
         ))
     };
-    let key_bytes = key.profile.as_ref().map_or(0, String::capacity)
+    let key_bytes = key.app_servers.capacity() * std::mem::size_of::<String>()
+        + key.app_servers.iter().map(String::capacity).sum::<usize>()
+        + key.profile.as_ref().map_or(0, String::capacity)
         + key.connection_profile.as_ref().map_or(0, String::capacity)
         + key.allowed.as_ref().map_or(0, |scope| {
             scope.capacity() * std::mem::size_of::<String>()
@@ -6404,6 +6422,8 @@ fn cached_tool_surfaces(
     });
     (full, exposed)
 }
+
+
 /// Check coldness without cloning a potentially multi-megabyte tool catalog.
 fn has_scoped_tools(
     tools: &[Value],
@@ -37744,6 +37764,85 @@ mod tests {
                 .contains("apps__app_only"));
         }
     }
+    #[test]
+    fn tool_surface_reconnect_capabilities_invalidate_the_same_router_view() {
+        struct ReconnectingApps {
+            inner: McpAppsServer,
+            html: bool,
+        }
+        impl Transport for ReconnectingApps {
+            fn request(
+                &mut self,
+                method: &str,
+                params: Value,
+            ) -> Result<Value, downstream::TransportError> {
+                if method == "tools/call" && self.html {
+                    return Err(downstream::TransportError::Unavailable(
+                        "fixture disconnect".into(),
+                    ));
+                }
+                let mut result = self.inner.request(method, params)?;
+                if method == "server/discover" && !self.html {
+                    result["capabilities"]["extensions"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(MCP_APPS_EXTENSION);
+                }
+                Ok(result)
+            }
+            fn notify(
+                &mut self,
+                method: &str,
+                params: Value,
+            ) -> Result<(), downstream::TransportError> {
+                self.inner.notify(method, params)
+            }
+            fn set_protocol_meta(&mut self, meta: Option<Value>) {
+                self.inner.set_protocol_meta(meta);
+            }
+        }
+        let connect = |html| {
+            DownstreamServer::connect(
+                "apps".into(),
+                Box::new(ReconnectingApps {
+                    inner: McpAppsServer::default(),
+                    html,
+                }),
+            )
+            .unwrap()
+        };
+        let _env = DataDirTestEnv::new("tool-surface-reconnect");
+        let host = dispatch_host(false);
+        let reg = Registry::default();
+        let mut router = Router::new();
+        router.add_with_reconnect(connect(true), Some(Box::new(move || Some(connect(false)))));
+        let router = Arc::new(router);
+        let snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        let request = modern_apps_req(1, "tools/list", json!({}));
+        let _caps = UpstreamCapabilitiesGuard::enter(&request);
+        let get = || {
+            cached_tool_surfaces(
+                &host,
+                &reg,
+                &router,
+                &snapshot,
+                None,
+                None,
+                DiscoveryMode::Grouped,
+            )
+        };
+        let before = get();
+        assert!(before.1.json.get().contains("apps__app_only"));
+        // A call swaps the shared connection without reindexing this Arc.
+        let _ = router.route_call("apps__plain", json!({}));
+        assert!(!router.mcp_app_html_visibility(|_| true).0);
+        let after = get();
+        assert!(!Arc::ptr_eq(&before.1, &after.1));
+        assert!(!after.0.json.get().contains("apps__app_only"));
+        assert!(!after.1.json.get().contains("apps__app_only"));
+        assert!(Arc::ptr_eq(&after.1, &get().1));
+    }
+
     #[test]
     fn tool_surface_cache_invalidates_every_effective_input() {
         let _env = DataDirTestEnv::new("tool-surface-invalidation");
