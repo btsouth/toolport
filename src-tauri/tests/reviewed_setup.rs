@@ -314,14 +314,19 @@ fn reviewed_setup_waits_for_slow_first_catalog() {
         .parent()
         .unwrap()
         .join("mock-mcp-server");
+    // A warm visible catalog keeps the client's initial lazy list instant. The
+    // new server still has to publish its own first catalog during scoped search.
     std::fs::write(
         fixture.config(),
-        json!({"mcpServers":{"slow":{
-            "command":mock,"args":["--start-delay-ms=3000"]
-        }}})
-        .to_string(),
+        json!({"mcpServers":{"warm":{"command":mock}}}).to_string(),
     )
     .unwrap();
+    let warm = controller::preview_client_setup("claude-code").unwrap();
+    migrate_fixture(&fixture, &["warm".into()], &warm.revision);
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.config()).unwrap()).unwrap();
+    config["mcpServers"]["slow"] = json!({"command":mock,"args":["--start-delay-ms=3000"]});
+    std::fs::write(fixture.config(), config.to_string()).unwrap();
     let review = controller::preview_client_setup("claude-code").unwrap();
     let outcome = migrate_fixture(&fixture, &["slow".into()], &review.revision);
     assert!(outcome.servers[0].tool_count > 0);
