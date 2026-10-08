@@ -211,7 +211,9 @@ pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
 /// (nothing to clear) is success, so a caller can honestly confirm it is gone.
 pub fn try_clear() -> std::io::Result<()> {
     // Write anything queued before deleting, so a queued trace cannot reappear.
-    crate::telemetry::flush();
+    if !crate::telemetry::flush() {
+        return Err(std::io::Error::other("Telemetry is still pending; retry clearing Activity"));
+    }
     let mut first_error = None;
     for path in [legacy_trace_path(), trace_path()].into_iter().flatten() {
         let _lock = match crate::registry::lock_at(&path) {

@@ -14,6 +14,7 @@ const getSecurityEvents = vi.fn();
 const getToolIdentities = vi.fn();
 const getInspectLog = vi.fn();
 const getSavingsSummary = vi.fn();
+const getAuditStats = vi.fn();
 
 const clearActivityLogs = vi.fn();
 
@@ -21,7 +22,7 @@ vi.mock("@/lib/api", () => ({
   clearActivityLogs: (...a: unknown[]) => clearActivityLogs(...a),
   exportAuditToPath: vi.fn(),
   getAuditLog: (...a: unknown[]) => getAuditLog(...a),
-  getAuditStats: vi.fn(() => Promise.resolve(null)),
+  getAuditStats: (...a: unknown[]) => getAuditStats(...a),
   getInspectLog: (...a: unknown[]) => getInspectLog(...a),
   getSavingsSummary: (...a: unknown[]) => getSavingsSummary(...a),
   getSearchTraces: (...a: unknown[]) => getSearchTraces(...a),
@@ -59,6 +60,7 @@ const initialLog = [failed, entry()];
 const refreshedLog = [entry({ ts: 1700000002000, tool: "list_issues" }), ...initialLog];
 
 beforeEach(() => {
+  getAuditStats.mockResolvedValue(null);
   windowVisible = true;
   vi.useFakeTimers({ shouldAdvanceTime: true });
   getAuditLog.mockResolvedValue(initialLog);
@@ -622,5 +624,69 @@ describe("ActivityView live inspector", () => {
     );
     await act(async () => {});
     expect(screen.getByText(/No calls captured yet\. Run a tool/)).toBeInTheDocument();
+  });
+});
+
+describe("telemetry health", () => {
+  it("keeps persisted drop evidence visible after the gateway exits", async () => {
+    getAuditLog.mockResolvedValue([]);
+    getAuditStats.mockResolvedValue({
+      total: 0,
+      errors: 0,
+      errorRate: 0,
+      servers: [],
+      telemetry: {
+        queueDropped: 0,
+        writeFailedRecords: 0,
+        writeFailures: 0,
+        incompleteFlushes: 0,
+        retainedDropped: 7,
+      },
+    });
+    render(<ActivityView refreshKey={0} registry={null} />);
+    expect(
+      await screen.findByText(
+        /7 dropped telemetry records are recorded in retained history/,
+      ),
+    ).toBeInTheDocument();
+  });
+  it("shows dropped records and partial persistence even with no calls", async () => {
+    getAuditLog.mockResolvedValue([]);
+    getAuditStats.mockResolvedValue({
+      total: 0,
+      errors: 0,
+      errorRate: 0,
+      servers: [],
+      telemetry: {
+        queueDropped: 3,
+        writeFailedRecords: 2,
+        writeFailures: 1,
+        incompleteFlushes: 1,
+      },
+      gatewayNotes: ["Client configs updated, but ownership state was not saved."],
+    });
+    render(<ActivityView refreshKey={0} registry={null} />);
+    expect(await screen.findByText(/3 records dropped/)).toBeInTheDocument();
+    expect(screen.getByText(/ownership state was not saved/)).toBeInTheDocument();
+  });
+
+  it("shows unavailable shared gateway health instead of healthy zero counters", async () => {
+    getAuditStats.mockResolvedValue({
+      total: 0,
+      errors: 0,
+      errorRate: 0,
+      servers: [],
+      telemetry: {
+        queueDropped: 0,
+        writeFailedRecords: 0,
+        writeFailures: 0,
+        incompleteFlushes: 0,
+        unavailable: true,
+      },
+    });
+    render(<ActivityView refreshKey={0} registry={null} />);
+    expect(
+      await screen.findByText(/Gateway telemetry health is unavailable/),
+    ).toBeInTheDocument();
   });
 });

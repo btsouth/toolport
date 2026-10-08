@@ -2773,7 +2773,10 @@ fn project_budgeted(tools: &[&Value]) -> Vec<Value> {
 /// Append this process's health notes, such as a client moved to a private
 /// gateway, so an agent sees why its gateway behaves differently.
 fn with_status_notes(summary: String) -> String {
-    let notes = conduit_lib::daemon::status_notes();
+    let mut notes = conduit_lib::daemon::status_notes();
+    if let Some(notice) = conduit_lib::telemetry::health().notice() {
+        notes.push(notice);
+    }
     if notes.is_empty() {
         return summary;
     }
@@ -16294,6 +16297,25 @@ fn http_allows_insecure_open(
     loopback && insecure_loopback && !auth_configured && registry_loaded
 }
 
+fn gateway_role(args: &[String], stdin_is_tty: bool) -> conduit_lib::gatewaylog::Role {
+    use conduit_lib::gatewaylog::Role;
+    if daemon_requested(args) {
+        Role::Daemon
+    } else if args.iter().any(|arg| arg == "--http-proxy") {
+        Role::HttpProxy
+    } else if args.iter().any(|arg| arg == "--http") {
+        Role::LegacyHttp
+    } else if conduit_lib::stdio_adapter::adapter_requested(args)
+        || selected_adapter_requested(args, !stdin_is_tty)
+    {
+        Role::Adapter
+    } else if stdin_is_tty {
+        Role::LegacyTty
+    } else {
+        Role::Private
+    }
+}
+
 /// The daemon's identity payload, matching [`conduit_lib::daemon::DaemonIdentity`].
 fn daemon_compat_fingerprint() -> String {
     registry::conduit_dir()
@@ -16313,6 +16335,7 @@ fn daemon_identity_json() -> String {
         "protocol": conduit_lib::daemon::PROTOCOL_GENERATION,
         "pid": std::process::id(),
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
+        "telemetry": conduit_lib::telemetry::health(),
     })
     .to_string()
 }
@@ -16412,11 +16435,10 @@ fn spawn_daemon_idle_watchdog(
         }
         glog("daemon: idle exit");
         // Land any queued audit/savings/search-trace lines before the process exits.
-        conduit_lib::telemetry::flush();
         if let Some(dir) = descriptor_path.parent() {
             conduit_lib::daemon_log::end_run_cleanly(dir);
         }
-        std::process::exit(0);
+        conduit_lib::telemetry::exit_with(0);
     });
 }
 
@@ -16431,7 +16453,7 @@ fn spawn_daemon_idle_watchdog(
 fn serve_daemon(state: GatewayState, private: bool) -> ! {
     let Some(dir) = registry::conduit_dir() else {
         eprintln!("toolport-gateway --daemon: no data directory could be resolved");
-        std::process::exit(1);
+        conduit_lib::telemetry::exit_with(1);
     };
     let compat =
         conduit_lib::topology::CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string());
@@ -16439,28 +16461,25 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
         Ok(token) => token,
         Err(error) => {
             eprintln!("toolport-gateway --daemon: {error}");
-            std::process::exit(1);
+            conduit_lib::telemetry::exit_with(1);
         }
     };
-    let (server, _ingress, _) =
-        match bind_deadline_http_server(
-            ("127.0.0.1", 0u16),
-            HttpReadDeadlines {
-                max_body: MAX_DAEMON_HTTP_BODY,
-                ..HttpReadDeadlines::default()
-            },
-        ) {
-            Ok(bound) => bound,
-            Err(error) => {
-                eprintln!(
-                    "toolport-gateway --daemon: could not bind the internal endpoint: {error}"
-                );
-                std::process::exit(1);
-            }
-        };
+    let (server, _ingress, _) = match bind_deadline_http_server(
+        ("127.0.0.1", 0u16),
+        HttpReadDeadlines {
+            max_body: MAX_DAEMON_HTTP_BODY,
+            ..HttpReadDeadlines::default()
+        },
+    ) {
+        Ok(bound) => bound,
+        Err(error) => {
+            eprintln!("toolport-gateway --daemon: could not bind the internal endpoint: {error}");
+            conduit_lib::telemetry::exit_with(1);
+        }
+    };
     let Some(addr) = server.server_addr().to_ip() else {
         eprintln!("toolport-gateway --daemon: the internal endpoint was not an IP socket");
-        std::process::exit(1);
+        conduit_lib::telemetry::exit_with(1);
     };
     let port = addr.port();
     let descriptor_path = conduit_lib::daemon::descriptor_path(&dir, &compat);
@@ -16484,7 +16503,7 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
             eprintln!(
                 "toolport-gateway --private-gateway: could not announce the endpoint: {error}"
             );
-            std::process::exit(1);
+            conduit_lib::telemetry::exit_with(1);
         }
         std::thread::spawn(|| {
             let mut stdin = std::io::stdin().lock();
@@ -16492,8 +16511,7 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
             while stdin.read(&mut bytes).unwrap_or(0) > 0 {}
             glog("private gateway: adapter closed its pipe, exiting");
             // Land any queued telemetry before the process exits.
-            conduit_lib::telemetry::flush();
-            std::process::exit(0);
+            conduit_lib::telemetry::exit_with(0);
         });
         glog(&format!(
             "private gateway: serving one adapter on http://127.0.0.1:{port}"
@@ -16506,8 +16524,7 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
             false,
             Arc::new(AtomicUsize::new(0)),
         );
-        conduit_lib::telemetry::flush();
-        std::process::exit(0);
+        conduit_lib::telemetry::exit_with(0);
     }
     // Learn how the previous daemon ended and drop pointers to dead ones
     // before advertising this one.
@@ -16523,7 +16540,7 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
     state.daemon_mode.store(true, Ordering::SeqCst);
     if let Err(error) = conduit_lib::daemon::write_descriptor(&descriptor_path, &descriptor) {
         eprintln!("toolport-gateway --daemon: could not publish the descriptor: {error}");
-        std::process::exit(1);
+        conduit_lib::telemetry::exit_with(1);
     }
     glog(&format!(
         "daemon: host runtime on http://127.0.0.1:{port} for {}",
@@ -16541,10 +16558,9 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
     );
     serve_http_loop_with_inflight(server, state, Some(token), search, false, inflight);
     // Land any queued telemetry before returning; the process exits right after.
-    conduit_lib::telemetry::flush();
     conduit_lib::daemon::clear_descriptor(&descriptor_path);
     conduit_lib::daemon_log::end_run_cleanly(&dir);
-    std::process::exit(0);
+    conduit_lib::telemetry::exit_with(0);
 }
 
 fn serve_http(state: GatewayState, port: u16) {
@@ -16603,7 +16619,7 @@ fn serve_http(state: GatewayState, port: u16) {
                  {INSECURE_LOOPBACK_FLAG} is valid only for loopback binds."
             );
         }
-        std::process::exit(1);
+        conduit_lib::telemetry::exit_with(1);
     }
     if allow_insecure_open {
         eprintln!(
@@ -16643,7 +16659,7 @@ fn serve_http(state: GatewayState, port: u16) {
             Ok(bound) => bound,
             Err(e) => {
                 eprintln!("toolport-gateway: could not bind HTTP {host}:{port}: {e}");
-                std::process::exit(1);
+                conduit_lib::telemetry::exit_with(1);
             }
         };
     glog(&format!(
@@ -16869,7 +16885,7 @@ fn serve_http_proxy(port: u16) -> Result<(), String> {
     }
     state.release();
     // stdin closed: land any queued telemetry before returning from the proxy loop.
-    conduit_lib::telemetry::flush();
+    conduit_lib::telemetry::shutdown();
     Ok(())
 }
 
@@ -17720,18 +17736,18 @@ fn main() {
     match parse_args(&cli_args) {
         ArgAction::Help => {
             println!("{}", usage());
-            std::process::exit(0);
+            conduit_lib::telemetry::exit_with(0);
         }
         ArgAction::Version => {
             println!("toolport-gateway {}", env!("CARGO_PKG_VERSION"));
-            std::process::exit(0);
+            conduit_lib::telemetry::exit_with(0);
         }
         ArgAction::Unknown(flag) => {
             eprintln!(
                 "toolport-gateway: unrecognized flag '{flag}'\n\n{}",
                 usage()
             );
-            std::process::exit(1);
+            conduit_lib::telemetry::exit_with(1);
         }
         ArgAction::Hook(_event) => {
             // Deliberately the first thing main can do: no registry load, no keychain,
@@ -17744,16 +17760,20 @@ fn main() {
             // user's work. The payload is drained so the client's write cannot fail or
             // block.
             conduit_lib::hooks::noop_hook(std::io::stdin());
-            std::process::exit(0);
+            conduit_lib::telemetry::exit_with(0);
         }
         ArgAction::Guard(_agent) => {
             // The guard was removed in 2.0. The flag stays so a client hook Toolport
             // installed and never removed does not fail: drain the payload and always
             // answer allow, then exit 0. No gateway startup, no registry read, no policy.
             println!("{}", conduit_lib::guard_cleanup::run_no_op_hook());
-            std::process::exit(0);
+            conduit_lib::telemetry::exit_with(0);
         }
         ArgAction::Run => {}
+    }
+    {
+        use std::io::IsTerminal;
+        conduit_lib::gatewaylog::set_role(gateway_role(&cli_args, std::io::stdin().is_terminal()));
     }
     if let Some(index) = cli_args.iter().position(|arg| arg == "--http-proxy") {
         let port = match cli_args.get(index + 1) {
@@ -17761,14 +17781,14 @@ fn main() {
                 Ok(port) if port > 0 => port,
                 _ => {
                     eprintln!("toolport-gateway: invalid HTTP proxy port: {value}");
-                    std::process::exit(1);
+                    conduit_lib::telemetry::exit_with(1);
                 }
             },
             None => 8765,
         };
         if let Err(error) = serve_http_proxy(port) {
             eprintln!("toolport-gateway --http-proxy: {error}");
-            std::process::exit(1);
+            conduit_lib::telemetry::exit_with(1);
         }
         return;
     }
@@ -17842,7 +17862,7 @@ fn main() {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("selftest-secrets: could not load registry: {e}");
-                std::process::exit(1);
+                conduit_lib::telemetry::exit_with(1);
             }
         };
         let (mut ok, mut unset, mut err) = (0u32, 0u32, 0u32);
@@ -17881,7 +17901,7 @@ fn main() {
         }
         println!("\nselftest-secrets: {ok} read OK, {unset} unset, {err} errors");
         println!("If NO keychain prompt appeared, the gateway has silent access (the ACL works).");
-        std::process::exit(0);
+        conduit_lib::telemetry::exit_with(0);
     }
 
     // Discovery mode resolves from an explicit env override first (per-client), then
@@ -17979,7 +17999,7 @@ fn main() {
             // than fall back to defaults; the app shows the same message.
             eprintln!("toolport-gateway: {e} Refusing to start serving tools from this registry.");
             glog(&format!("load_resolved ERR (newer schema): {e}"));
-            std::process::exit(1);
+            conduit_lib::telemetry::exit_with(1);
         }
         Err(e) => {
             // Always surface this (not only under CONDUIT_DEBUG). A corrupt or
@@ -18311,11 +18331,31 @@ fn main() {
     }
     // Client disconnected (stdin EOF or a broken pipe): land any queued
     // audit/savings/search-trace lines before this gateway exits.
-    conduit_lib::telemetry::flush();
+    conduit_lib::telemetry::shutdown();
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gateway_modes_have_distinct_diagnostic_roles() {
+        use conduit_lib::gatewaylog::Role;
+        for (arg, tty, expected) in [
+            ("--http-proxy", false, Role::HttpProxy),
+            ("--http", false, Role::LegacyHttp),
+            ("", true, Role::LegacyTty),
+            ("--stdio-adapter", true, Role::Adapter),
+            ("--private-gateway", false, Role::Private),
+            ("--daemon", false, Role::Daemon),
+        ] {
+            let args = if arg.is_empty() {
+                Vec::new()
+            } else {
+                vec![arg.to_string()]
+            };
+            assert_eq!(gateway_role(&args, tty), expected);
+        }
+    }
+
     use conduit_lib::approval::decide_via_broker;
 
     /// A server whose NAME contains a write verb must not drag its read-only
@@ -24754,7 +24794,7 @@ mod tests {
         assert_eq!(call.status, 200, "body={}", call.body);
 
         // The audit append is asynchronous now: land it before reading the file.
-        conduit_lib::telemetry::flush();
+        conduit_lib::telemetry::flush_for_test(std::time::Duration::from_secs(5));
         let audit = std::fs::read_to_string(dir.join("audit.jsonl")).expect("audit log exists");
 
         let entry: Value = audit
@@ -32493,6 +32533,9 @@ mod tests {
             effective_quarantine(&registry, profile, &AtomicBool::new(false)),
             Some(BTreeSet::new())
         );
+        assert!(conduit_lib::telemetry::flush_for_test(
+            std::time::Duration::from_secs(5)
+        ));
         assert!(std::fs::read_to_string(dir.join("gateway.log"))
             .unwrap()
             .contains("SECURITY: integrity recording failed:"));

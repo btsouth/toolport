@@ -137,7 +137,10 @@ pub fn run() {
             action.activate(Some(&uri.to_variant()));
         }
     });
-    app.connect_shutdown(|_| crate::oauth_controller::cancel_all_attempts());
+    app.connect_shutdown(|_| {
+        crate::oauth_controller::cancel_all_attempts();
+        crate::telemetry::shutdown();
+    });
     app.run_with_args(&args);
     if let Some(tray) = tray {
         tray.shutdown().wait();
@@ -3473,7 +3476,10 @@ impl ActivityPage {
         self.feedback.set_label("");
         self.feedback.remove_css_class("error");
         self.feedback.remove_css_class("success");
-        self.feedback.set_visible(false);
+        self.feedback
+            .set_label(&snapshot.telemetry_notices.join("\n"));
+        self.feedback
+            .set_visible(!snapshot.telemetry_notices.is_empty());
         self.clear_button.set_sensitive(
             snapshot.call_count > 0
                 || snapshot.savings_list_loads > 0

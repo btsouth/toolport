@@ -2945,7 +2945,7 @@ fn reap_stale_and_restore_bridge(bridge: &HttpBridgeState, advice: &RestartAdvic
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut extra_keep = Vec::new();
-    if let Some(p) = clients::resolve_gateway_path() {
+    if let Some(p) = clients::resolve_gateway_path_readonly() {
         extra_keep.push(p);
     }
     // Port of a bridge that is alive *before* the reap; None means there is nothing
@@ -3992,11 +3992,15 @@ pub fn run() {
                         );
                     }
                 }
-                if let Some(published) = crate::gateway_publish::publish_bundled_gateway() {
-                    eprintln!(
-                        "toolport: published client gateway at {}",
-                        published.display()
-                    );
+                match crate::gateway_publish::publish_bundled_gateway() {
+                    Ok(Some(published)) => eprintln!("toolport: published client gateway at {}", published.display()),
+                    Ok(None) => {}
+                    Err(error) => {
+                        crate::daemon::add_status_note("Gateway publication incomplete. Retry after fixing data directory access.");
+                        eprintln!("toolport: gateway publication incomplete: {error}");
+                        let _ = migrate_handle.notification().builder().title("Gateway publication incomplete")
+                            .body("The gateway manifest could not be saved. Fix data directory access and reopen Toolport.").show();
+                    }
                 }
                 // An in-app update deliberately stops the supervised HTTP child
                 // before replacing files. The durable intent carries its exact
@@ -4041,12 +4045,12 @@ pub fn run() {
                             ids.join(", ")
                         );
                         // Refresh ownership records for everything we rewrote (SOU-406).
-                        let _ = registry::update(|reg| {
-                            for (id, entry) in &repoint.repointed {
-                                reg.set_client_managed_entry(id, entry.clone());
-                            }
-                            Ok(())
-                        });
+                        if let Err(error) = crate::gateway_publish::persist_repointed_ownership(&repoint.repointed) {
+                            crate::daemon::add_status_note("Client configs updated, but ownership state was not saved. Retry after fixing registry access.");
+                            eprintln!("toolport: client configs updated, but ownership state was not saved: {error}");
+                            let _ = migrate_handle.notification().builder().title("Client update incomplete")
+                                .body("Client configs changed, but their ownership state could not be saved. Fix registry access and reopen Toolport.").show();
+                        }
                     }
                     if !repoint.customized.is_empty() {
                         eprintln!(
@@ -4225,7 +4229,7 @@ pub fn run() {
             // (a clean Unreachable) rather than connecting to the dead port we left behind.
             if matches!(event, tauri::RunEvent::Exit) {
                 // Land any queued audit/savings/search-trace lines before the app exits.
-                crate::telemetry::flush();
+                crate::telemetry::shutdown();
                 if let Some(stop) = app_handle.try_state::<TeamLifecycleStop>() {
                     stop.0.store(true, std::sync::atomic::Ordering::Release);
                 }

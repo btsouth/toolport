@@ -15,18 +15,79 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+static ROLE: AtomicU8 = AtomicU8::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Adapter,
+    Daemon,
+    Private,
+    HttpProxy,
+    LegacyHttp,
+    LegacyTty,
+}
+
+pub fn set_role(role: Role) {
+    ROLE.store(
+        match role {
+            Role::Adapter => 1,
+            Role::Daemon => 2,
+            Role::Private => 0,
+            Role::HttpProxy => 3,
+            Role::LegacyHttp => 4,
+            Role::LegacyTty => 5,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+fn format_line(msg: &str, millis: u64, pid: u32, role: &str) -> String {
+    let seconds = millis / 1000 % 86_400;
+    let msg = crate::registry::redact_secret_text(&crate::redact_url_userinfo(msg))
+        .replace(['\n', '\r'], " ");
+    format!(
+        "{}T{:02}:{:02}:{:02}.{:03}Z pid={pid} role={role} {msg}",
+        crate::usage_report::utc_day(millis),
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60,
+        millis % 1000
+    )
+}
 
 /// Keep the always-on gateway log bounded; trimmed to roughly the back half once
 /// it grows past this, so a long-running client can't let it grow without limit.
 pub const GATEWAY_LOG_CAP: u64 = 256 * 1024;
 
-/// Append one line to the gateway log. Best-effort: logging must never take down
-/// a connection, so every failure here is swallowed.
+/// Queue one formatted line without disk IO. Overload and persistence failures
+/// share the telemetry health counters; logging never blocks a connection.
 pub fn append(msg: &str) {
     let Some(path) = crate::registry::gateway_log_path() else {
         return;
     };
-    append_to(&path, msg);
+    queue_at(&path, msg);
+}
+
+pub(crate) fn queue_at(path: &Path, msg: &str) {
+    crate::telemetry::record(path, &line(msg), crate::telemetry::Rotation::Gateway);
+}
+
+pub(crate) fn line(msg: &str) -> String {
+    let role = match ROLE.load(Ordering::Relaxed) {
+        1 => "adapter",
+        2 => "daemon",
+        3 => "http-proxy",
+        4 => "legacy-http",
+        5 => "legacy-tty",
+        _ => "private",
+    };
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    format_line(msg, millis, std::process::id(), role)
 }
 
 /// How long an append waits for the shared log lock before writing without it.
@@ -61,43 +122,48 @@ fn lock_wait() -> std::time::Duration {
 /// both so a concurrent writer cannot land a line that this process's stale
 /// trim snapshot then overwrites (SBS-869). A lock we cannot take degrades to
 /// an unlocked append rather than to a lost line.
+#[cfg(test)]
 pub(crate) fn append_to(path: &Path, msg: &str) {
+    let _ = append_batch_to(path, &[msg.to_string()]);
+}
+
+pub(crate) fn append_batch_to(
+    path: &Path,
+    lines: &[String],
+) -> Result<(), crate::telemetry::AppendError> {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    // Atomic replacement protects readers from an empty window, but only this
-    // shared cross-process critical section prevents a stale trim snapshot
-    // from replacing a line another gateway just appended (SBS-869).
     match crate::registry::lock_at_for(path, lock_wait()) {
         Ok(_lock) => {
-            append_line(path, msg);
-            trim_log_if_large(path);
+            for (index, line) in lines.iter().enumerate() {
+                append_line(path, line).map_err(|message| crate::telemetry::AppendError {
+                    message,
+                    unconfirmed: Some(lines.len() - index),
+                })?;
+            }
+            try_trim_log_if_large(path).map_err(crate::telemetry::AppendError::after_append)
         }
-        // Never trade a line for the lock. This log exists so a diagnostics
-        // bundle still shows the connect failure, and before SBS-869 the append
-        // ran with no lock at all - so a stale lock file or a contended
-        // deadline must not make us quieter than the code we replaced. Write
-        // the line and skip only the trim, which is the half that is unsafe
-        // unserialized; the next append that does win the lock re-bounds the
-        // file.
-        Err(error) => {
-            eprintln!(
-                "toolport: appending to '{}' without the gateway log lock ({error}); trim deferred",
-                path.display()
-            );
-            append_line(path, msg);
+        // A contended diagnostic lock defers only rotation. No caller waits here:
+        // this runs on the telemetry writer, with each whole line in one append.
+        Err(_) => {
+            for (index, line) in lines.iter().enumerate() {
+                append_line(path, line).map_err(|message| crate::telemetry::AppendError {
+                    message,
+                    unconfirmed: Some(lines.len() - index),
+                })?;
+            }
+            Ok(())
         }
     }
 }
 
 /// One `O_APPEND` write of the whole record, so even the unlocked fallback
 /// cannot interleave half a line with another writer's.
-fn append_line(path: &Path, msg: &str) {
-    // Owner-only from creation: this log carries the broker's bound HITL port
-    // (SBS-868).
-    if let Ok(mut f) = crate::registry::open_append_private(path) {
-        let _ = f.write_all(format!("{msg}\n").as_bytes());
-    }
+fn append_line(path: &Path, msg: &str) -> Result<(), String> {
+    let mut file = crate::registry::open_append_private(path).map_err(|error| error.to_string())?;
+    file.write_all(format!("{msg}\n").as_bytes())
+        .map_err(|error| error.to_string())
 }
 
 /// Trim the log to roughly its back half once it exceeds [`GATEWAY_LOG_CAP`],
@@ -110,15 +176,17 @@ fn append_line(path: &Path, msg: &str) {
 /// `append`) keep it across this replace; the function still works without
 /// that lock so the gateway binary's existing trim test can call it directly.
 pub fn trim_log_if_large(path: &Path) {
+    let _ = try_trim_log_if_large(path);
+}
+
+fn try_trim_log_if_large(path: &Path) -> Result<(), String> {
     let over = std::fs::metadata(path)
         .map(|m| m.len() > GATEWAY_LOG_CAP)
         .unwrap_or(false);
     if !over {
-        return;
+        return Ok(());
     }
-    let Ok(data) = std::fs::read(path) else {
-        return;
-    };
+    let data = std::fs::read(path).map_err(|error| error.to_string())?;
     let keep_from = data.len().saturating_sub((GATEWAY_LOG_CAP / 2) as usize);
     let start = data[keep_from..]
         .iter()
@@ -127,7 +195,7 @@ pub fn trim_log_if_large(path: &Path) {
         .unwrap_or(keep_from);
     // Lossy so a non-UTF-8 byte cannot skip the trim: atomic_write takes &str.
     let kept = String::from_utf8_lossy(&data[start..]);
-    let _ = crate::registry::atomic_write(path, &kept);
+    crate::registry::atomic_write(path, &kept)
 }
 
 #[cfg(test)]
@@ -135,6 +203,24 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn log_line_has_timestamp_pid_role_and_redacts_credentials() {
+        for role in [
+            "adapter",
+            "daemon",
+            "private",
+            "http-proxy",
+            "legacy-http",
+            "legacy-tty",
+        ] {
+            let line = format_line("connect https://alice:password@example.com api_key=sk-live-secretvalue1234567890\nforged", 1234, 42, role);
+            assert!(line.starts_with(&format!("1970-01-01T00:00:01.234Z pid=42 role={role} ")));
+            assert!(!line.contains("password"));
+            assert!(!line.contains("secretvalue"));
+            assert!(!line.contains('\n'));
+        }
+    }
 
     static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
 

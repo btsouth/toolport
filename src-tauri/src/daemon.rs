@@ -124,6 +124,8 @@ pub struct DaemonIdentity {
     pub protocol: u32,
     pub pid: u32,
     pub gateway_version: String,
+    #[serde(default)]
+    pub telemetry: Option<crate::telemetry::Health>,
 }
 
 impl DaemonIdentity {
@@ -230,7 +232,7 @@ pub fn clear_dead_descriptors(data_dir: &Path) -> usize {
 /// Whether any process has `pid`. Where that cannot be asked, assume one does,
 /// so nothing is removed.
 #[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
+pub(crate) fn process_exists(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return true;
     };
@@ -240,8 +242,8 @@ fn process_exists(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn process_exists(_pid: u32) -> bool {
-    true
+pub(crate) fn process_exists(pid: u32) -> bool {
+    crate::gateway_publish::pid_is_running(pid)
 }
 
 /// A fresh bearer for the internal endpoint.
@@ -330,7 +332,7 @@ pub fn request_shutdown_if_idle(descriptor: &DaemonDescriptor) -> Result<(), Str
 /// Why an identity probe failed, in the terms the rendezvous decides on: what
 /// may be cleared, and what may spawn.
 #[derive(Debug)]
-enum ProbeFailure {
+pub(crate) enum ProbeFailure {
     /// The endpoint answered, but not as a compatible daemon would: a refused
     /// status or a body that is not an identity. A stale pointer.
     Answered(String),
@@ -407,7 +409,9 @@ fn is_timeout_io_kind(kind: Option<std::io::ErrorKind>) -> bool {
 
 /// One authenticated attempt against `GET /host/identity`, keeping the
 /// failure kind so the rendezvous can decide on it.
-fn attempt_identity_probe(descriptor: &DaemonDescriptor) -> Result<DaemonIdentity, ProbeFailure> {
+pub(crate) fn attempt_identity_probe(
+    descriptor: &DaemonDescriptor,
+) -> Result<DaemonIdentity, ProbeFailure> {
     let url = format!("http://{}{}", descriptor.endpoint, IDENTITY_PATH);
     let response = ureq::get(&url)
         .set("Authorization", &format!("Bearer {}", descriptor.token))
@@ -638,6 +642,7 @@ pub fn serve_identity(
         protocol: PROTOCOL_GENERATION,
         pid: std::process::id(),
         gateway_version: env!("CARGO_PKG_VERSION").to_string(),
+        telemetry: Some(crate::telemetry::health()),
     };
     let descriptor = DaemonDescriptor::new(format!("127.0.0.1:{port}"), token.clone(), compat);
     write_descriptor(descriptor_path, &descriptor)?;
@@ -663,8 +668,11 @@ pub fn serve_identity(
                 } else if !authorized {
                     text_response(401, "unauthorized")
                 } else {
-                    let body =
-                        serde_json::to_string(&identity).unwrap_or_else(|_| "{}".to_string());
+                    let body = serde_json::to_string(&DaemonIdentity {
+                        telemetry: Some(crate::telemetry::health()),
+                        ..identity.clone()
+                    })
+                    .unwrap_or_else(|_| "{}".to_string());
                     tiny_http::Response::from_string(body)
                         .with_status_code(200)
                         .with_header(json_header())
@@ -1076,6 +1084,7 @@ mod tests {
             protocol: PROTOCOL_GENERATION,
             pid: std::process::id(),
             gateway_version: "1.0.0".to_string(),
+            telemetry: Some(crate::telemetry::Health::default()),
         };
         let endpoint = start_delayed_responder(Duration::from_secs(8), identity);
         let descriptor = DaemonDescriptor::new(endpoint, "delayed", &key);
@@ -1120,6 +1129,7 @@ mod tests {
             protocol: PROTOCOL_GENERATION,
             pid: std::process::id(),
             gateway_version: "1.0.0".to_string(),
+            telemetry: Some(crate::telemetry::Health::default()),
         };
         let endpoint = start_delayed_responder(Duration::from_secs(6), identity);
         let descriptor = DaemonDescriptor::new(endpoint, "delayed", &key);

@@ -5172,11 +5172,40 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
 // edit: existing servers (and their secret env values) are left untouched.
 // ---------------------------------------------------------------------------
 
-pub(crate) fn resolve_gateway_path() -> Option<PathBuf> {
-    if let Some(p) = crate::gateway_publish::client_gateway_path() {
-        return Some(p);
+pub(crate) fn resolve_gateway_path() -> Result<Option<PathBuf>, String> {
+    if let Some(path) = crate::gateway_publish::client_gateway_path()? {
+        return Ok(Some(path));
     }
-    resolve_gateway_sidecar()
+    Ok(resolve_gateway_sidecar())
+}
+
+pub(crate) fn resolve_gateway_path_for_launch() -> Result<Option<PathBuf>, String> {
+    gateway_path_after_publish(
+        crate::gateway_publish::client_gateway_path(),
+        std::env::var_os("APPIMAGE").is_some(),
+        resolve_gateway_sidecar,
+    )
+}
+
+fn gateway_path_after_publish(
+    published: Result<Option<PathBuf>, String>,
+    appimage: bool,
+    sidecar: impl FnOnce() -> Option<PathBuf>,
+) -> Result<Option<PathBuf>, String> {
+    match published {
+        Ok(Some(path)) => Ok(Some(path)),
+        Ok(None) if !appimage => Ok(sidecar()),
+        Err(_) if !appimage => {
+            crate::gatewaylog::append(
+                "gateway publication failed; using the install-directory gateway",
+            );
+            Ok(sidecar())
+        }
+        result => Err(format!(
+            "Could not publish a stable AppImage gateway; the temporary mount cannot be used: {}",
+            result.err().unwrap_or_else(|| "gateway unavailable".into())
+        )),
+    }
 }
 
 /// [`resolve_gateway_path`] with every side effect removed: no publish of the bundled
@@ -5415,7 +5444,8 @@ fn files_have_same_bytes(a: &std::path::Path, b: &std::path::Path) -> bool {
 }
 
 fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, String> {
-    let path = resolve_gateway_path().ok_or("Could not locate the toolport-gateway binary")?;
+    let path =
+        resolve_gateway_path_for_launch()?.ok_or("Could not locate the toolport-gateway binary")?;
     let env_var = |k: &str, v: &str| crate::registry::EnvVar {
         key: k.to_string(),
         value: Some(v.to_string()),
@@ -6050,8 +6080,15 @@ fn referenced_gateway_paths_in(clients: &[DetectedClient]) -> Option<Vec<PathBuf
 }
 
 pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> RepointOutcome {
-    let outcome = RepointOutcome::default();
-    let Some(current) = resolve_gateway_path().map(|p| p.to_string_lossy().into_owned()) else {
+    let mut outcome = RepointOutcome::default();
+    let current = match resolve_gateway_path() {
+        Ok(path) => path,
+        Err(error) => {
+            outcome.failed.push(("gateway publication".into(), error));
+            return outcome;
+        }
+    };
+    let Some(current) = current.map(|p| p.to_string_lossy().into_owned()) else {
         return outcome;
     };
     // Never re-point onto a binary that isn't there (resolve_gateway_path returns a
@@ -6350,6 +6387,46 @@ impl Drop for EnvRestore {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn publication_failure_uses_install_gateway_except_in_appimage() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir =
+            std::env::temp_dir().join(format!("toolport-client-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&dir);
+
+        let expected = PathBuf::from("install/toolport-gateway");
+        let resolved = gateway_path_after_publish(Err("manifest failed".into()), false, || {
+            Some(expected.clone())
+        })
+        .unwrap();
+        assert_eq!(resolved, Some(expected));
+        let error = gateway_path_after_publish(Err("manifest failed".into()), true, || {
+            panic!("must not use an AppImage mount")
+        })
+        .unwrap_err();
+        assert!(error.contains("stable AppImage gateway"));
+        assert!(error.contains("temporary mount"));
+        assert!(
+            gateway_path_after_publish(Ok(None), true, || panic!("temporary fallback")).is_err()
+        );
+        assert_eq!(
+            gateway_path_after_publish(Ok(Some(PathBuf::from("published"))), true, || panic!(
+                "already published"
+            ))
+            .unwrap(),
+            Some(PathBuf::from("published"))
+        );
+        assert!(crate::telemetry::flush_for_test(
+            std::time::Duration::from_secs(5)
+        ));
+        assert!(std::fs::read_to_string(dir.join("gateway.log"))
+            .unwrap()
+            .contains("publication failed"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use super::*;
     use crate::registry::EnvVar;
 

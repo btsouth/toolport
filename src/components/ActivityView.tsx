@@ -818,6 +818,43 @@ function CallRow({ e }: { e: AuditEntry }) {
   );
 }
 
+export function TelemetryNotice({ stats }: { stats: AuditStats | null }) {
+  const health = stats?.telemetry;
+  const messages = [...(stats?.gatewayNotes ?? [])];
+  if (
+    health &&
+    (health.queueDropped ||
+      health.writeFailedRecords ||
+      health.writeFailures ||
+      health.incompleteFlushes)
+  ) {
+    messages.push(
+      `Activity, savings, Teams reporting and diagnostics may be incomplete: ${health.queueDropped} records dropped, ${health.writeFailedRecords} records with unconfirmed writes, ${health.writeFailures} write failures, ${health.incompleteFlushes} incomplete flushes since gateway start.`,
+    );
+  }
+  if (health?.retainedDropped) {
+    messages.push(
+      `${health.retainedDropped} dropped telemetry records are recorded in retained history. Activity and savings may be incomplete.`,
+    );
+  }
+  if (health?.unavailable) {
+    messages.push(
+      "Gateway telemetry health is unavailable. Activity and savings may be incomplete.",
+    );
+  }
+  if (messages.length === 0) return null;
+  return (
+    <div
+      role="status"
+      className="mb-4 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs"
+    >
+      {messages.map((message) => (
+        <p key={message}>{message}</p>
+      ))}
+    </div>
+  );
+}
+
 function StatsPanel({ stats }: { stats: AuditStats }) {
   // The three summary cards are the glanceable health check and stay visible; the full
   // per-server table (can be 20+ rows) collapses by default so it stops being a wall
@@ -1776,6 +1813,7 @@ export function ActivityView({
 
   const banner = (
     <>
+      <TelemetryNotice stats={stats} />
       {/* Loud lane: the only thing here that may need a decision. */}
       {securityLoadStatus !== "ready" ? (
         <SecurityLoadNotice status={securityLoadStatus} onRetry={retryLoads} />

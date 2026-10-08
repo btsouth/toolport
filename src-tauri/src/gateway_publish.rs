@@ -156,45 +156,64 @@ pub fn existing_publish_destination() -> Option<PathBuf> {
 }
 
 /// Copy the install-dir gateway into `Toolport/bin` when needed and write the manifest.
-pub fn publish_bundled_gateway() -> Option<PathBuf> {
+pub fn publish_bundled_gateway() -> Result<Option<PathBuf>, String> {
     if !should_publish_client_gateway() {
-        return None;
+        return Ok(None);
     }
-    let src = bundled_gateway_source()?;
-    let version = env!("CARGO_PKG_VERSION").to_string();
-    let base_dest = versioned_dest(&version)?;
-    let src_size = file_size(&src)?;
-    let src_digest = file_sha256(&src).ok()?;
+    let src = bundled_gateway_source().ok_or("Could not locate the bundled gateway")?;
+    let version = env!("CARGO_PKG_VERSION");
+    let base_dest = versioned_dest(version).ok_or("Could not resolve the gateway destination")?;
+    let manifest = manifest_path().ok_or("Could not resolve the gateway manifest")?;
+    publish_from(&src, &base_dest, &manifest, crate::registry::atomic_write).map(Some)
+}
 
-    // Never overwrite a different same-version image in place. Besides being unsafe
-    // for a running executable on Unix, Windows rejects it with a sharing violation.
-    let dest = select_publish_dest(&base_dest, &src_digest);
-    match existing_file_sha256(&dest) {
-        Ok(Some(dest_digest)) if dest_digest == src_digest => {}
-        Ok(Some(_)) | Err(_) => return None,
-        Ok(None) => {
+fn publish_from(
+    src: &Path,
+    base_dest: &Path,
+    manifest_path: &Path,
+    write_manifest: impl FnOnce(&Path, &str) -> Result<(), String>,
+) -> Result<PathBuf, String> {
+    let src_digest = file_sha256(src).map_err(|error| error.to_string())?;
+    let dest = select_publish_dest(base_dest, &src_digest);
+    match existing_file_sha256(&dest).map_err(|error| error.to_string())? {
+        Some(dest_digest) if dest_digest == src_digest => {}
+        Some(_) => return Err("Gateway destination contains a different image".into()),
+        None => {
             if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent).ok()?;
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
             }
-            std::fs::copy(&src, &dest).ok()?;
-            if file_sha256(&dest).ok().as_deref() != Some(src_digest.as_str()) {
-                return None;
+            std::fs::copy(src, &dest).map_err(|error| error.to_string())?;
+            if file_sha256(&dest).map_err(|error| error.to_string())? != src_digest {
+                return Err("Published gateway digest did not match the bundled image".into());
             }
         }
     }
 
     let manifest = GatewayManifest {
-        version: version.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
         path: dest.to_string_lossy().into_owned(),
-        size: file_size(&dest).unwrap_or(src_size),
+        size: file_size(&dest).ok_or("Could not read the published gateway size")?,
     };
-    if let Some(path) = manifest_path() {
-        if let Ok(json) = serde_json::to_string_pretty(&manifest) {
-            let _ = crate::registry::atomic_write(&path, &json);
-        }
-    }
+    let json = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
+    write_manifest(manifest_path, &json).map_err(|error| {
+        format!("Gateway image copied, but its manifest was not saved. Retry publication: {error}")
+    })?;
+    Ok(dest)
+}
 
-    Some(dest)
+/// Client configs have already changed when this runs. Failure is partial success,
+/// not permission to forget their previous saved ownership records.
+pub fn persist_repointed_ownership(
+    repointed: &[(String, crate::registry::ManagedEntry)],
+) -> Result<(), String> {
+    crate::registry::update(|reg| {
+        for (id, entry) in repointed {
+            reg.set_client_managed_entry(id, entry.clone());
+        }
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(|error| format!("Client configs updated, but ownership state was not saved: {error}"))
 }
 
 /// Published client gateway path from the manifest, when it matches this build.
@@ -217,12 +236,12 @@ pub fn published_gateway_path() -> Option<PathBuf> {
 }
 
 /// Resolve the path MCP clients should spawn: publish if needed, else read manifest.
-pub fn client_gateway_path() -> Option<PathBuf> {
+pub fn client_gateway_path() -> Result<Option<PathBuf>, String> {
     if !should_publish_client_gateway() {
-        return None;
+        return Ok(None);
     }
     if let Some(p) = published_gateway_path() {
-        return Some(p);
+        return Ok(Some(p));
     }
     publish_bundled_gateway()
 }
@@ -412,7 +431,7 @@ fn default_keep_paths() -> Vec<PathBuf> {
             paths.push(p);
         }
     };
-    if let Some(p) = client_gateway_path() {
+    if let Some(p) = existing_publish_destination() {
         push(&mut paths, p);
     }
     if let Some(p) = published_gateway_path() {
@@ -1974,6 +1993,67 @@ pub fn is_unversioned_install_gateway_path(stored: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_manifest_publish_preserves_previous_state_and_retries() {
+        let root =
+            std::env::temp_dir().join(format!("toolport-manifest-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("source");
+        let dest = root.join("gateway");
+        let manifest = root.join("manifest.json");
+        std::fs::write(&src, "gateway image").unwrap();
+        std::fs::write(&manifest, "previous manifest").unwrap();
+        use crate::registry::tests::{with_atomic_failure, FailingAtomicWriteStep::*};
+        for step in [Permissions, Write, Rename] {
+            let result = with_atomic_failure(step, || {
+                super::publish_from(&src, &dest, &manifest, crate::registry::atomic_write)
+            });
+            assert!(result.unwrap_err().contains("manifest was not saved"));
+            assert_eq!(
+                std::fs::read_to_string(&manifest).unwrap(),
+                "previous manifest"
+            );
+            assert_eq!(std::fs::read_to_string(&dest).unwrap(), "gateway image");
+        }
+        assert_eq!(
+            super::publish_from(&src, &dest, &manifest, crate::registry::atomic_write).unwrap(),
+            dest
+        );
+        let saved: super::GatewayManifest =
+            serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+        assert_eq!(saved.path, dest.to_string_lossy());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ownership_save_failures_preserve_saved_state_and_report_partial_success() {
+        use crate::registry::tests::{with_atomic_failure, FailingAtomicWriteStep::*};
+        let _lock = crate::registry::data_dir_test_lock();
+        let root =
+            std::env::temp_dir().join(format!("toolport-ownership-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&root);
+        crate::registry::save(&crate::registry::Registry::default()).unwrap();
+        let path = crate::registry::resolved_path().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let entry = serde_json::from_value(serde_json::json!({"command":"new-gateway"})).unwrap();
+        let repointed = vec![("claude".to_string(), entry)];
+        for step in [Permissions, Write, Rename] {
+            let result =
+                with_atomic_failure(step, || super::persist_repointed_ownership(&repointed));
+            assert!(result
+                .unwrap_err()
+                .contains("ownership state was not saved"));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        super::persist_repointed_ownership(&repointed).unwrap();
+        assert!(crate::registry::load()
+            .unwrap()
+            .client_managed_entries
+            .contains_key("claude"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
 
     #[test]

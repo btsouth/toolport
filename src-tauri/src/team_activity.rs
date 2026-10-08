@@ -79,6 +79,28 @@ fn increment(j: &mut Journal, server_id: &str, version: u64, ok: bool) {
     }
     j.revision = j.revision.saturating_add(1);
 }
+
+#[derive(Serialize, Deserialize)]
+struct Event {
+    server_id: String,
+    version: u64,
+    ok: bool,
+}
+
+/// Keep the existing locked atomic journal, with IO confined to the telemetry writer.
+pub(crate) fn append_records_at(path: &Path, lines: &[String]) -> Result<(), String> {
+    let events = lines
+        .iter()
+        .map(|line| serde_json::from_str::<Event>(line).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    mutate(path, |journal| {
+        for event in events {
+            increment(journal, &event.server_id, event.version, event.ok);
+        }
+    })
+}
+
+/// Admission is nonblocking; dropped or unconfirmed updates are exposed by telemetry health.
 pub fn record(reg: &Registry, local_id: &str, ok: bool) -> Result<(), String> {
     let Some(team) = &reg.team else { return Ok(()) };
     let tag = format!("team:{}", team.team_id);
@@ -93,14 +115,82 @@ pub fn record(reg: &Registry, local_id: &str, ok: bool) -> Result<(), String> {
     let Some(server_id) = team.managed_server_ids.get(local_id) else {
         return Ok(());
     };
-    mutate(&path(&team.reporting_device_id)?, |j| {
-        increment(j, server_id, team.last_version.max(0) as u64, ok)
-    })
+    let event = Event {
+        server_id: server_id.clone(),
+        version: team.last_version.max(0) as u64,
+        ok,
+    };
+    crate::telemetry::record(
+        &path(&team.reporting_device_id)?,
+        &serde_json::to_string(&event).map_err(|error| error.to_string())?,
+        crate::telemetry::Rotation::TeamActivity,
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recording_never_waits_for_the_journal_lock_and_failed_batches_keep_saved_counts() {
+        use crate::registry::tests::{with_atomic_failure, FailingAtomicWriteStep::*};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let _lock = registry::data_dir_test_lock();
+        let device = new_device_id().unwrap();
+        let dir = std::env::temp_dir().join(format!("teams-queued-{device}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = registry::DataDirOverride::set(&dir);
+        let path = path(&device).unwrap();
+        mutate(&path, |j| increment(j, "Audit-Echo", 1, true)).unwrap();
+        let guard = registry::lock_at(&path).unwrap();
+        let mut reg = Registry::default();
+        reg.team = Some(
+            serde_json::from_value(serde_json::json!({
+                "serverUrl":"https://teams.example.com", "teamId":"test", "role":"member",
+                "lastVersion":2, "reportingDeviceId":device,
+                "managedServerIds":{"local":"Audit-Echo"}
+            }))
+            .unwrap(),
+        );
+        reg.servers.push(
+            serde_json::from_value(serde_json::json!({
+                "id":"local", "name":"fixture", "transport":"stdio", "source":"team:test"
+            }))
+            .unwrap(),
+        );
+        let (tx, rx) = mpsc::sync_channel(1);
+        let caller = std::thread::spawn(move || {
+            tx.send(record(&reg, "local", false)).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        drop(guard);
+        caller.join().unwrap();
+        result.expect("record waited on the journal lock").unwrap();
+        assert!(crate::telemetry::flush_for_test(Duration::from_secs(5)));
+        let saved = std::fs::read(&path).unwrap();
+        let row = snapshot(&device)
+            .unwrap()
+            .counters
+            .remove("Audit-Echo")
+            .unwrap();
+        assert_eq!((row.successes, row.failures), (1, 1));
+        for step in [Permissions, Write, Rename] {
+            let lines = vec![serde_json::to_string(&Event {
+                server_id: "Audit-Echo".into(),
+                version: 3,
+                ok: true,
+            })
+            .unwrap()];
+            assert!(with_atomic_failure(step, || append_records_at(&path, &lines)).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            assert!(with_atomic_failure(step, || acknowledge(&device, 2)).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn durable_counts_survive_rotation_offline_and_ack_races() {
         let dir = std::env::temp_dir().join(format!("teams-journal-{}", new_device_id().unwrap()));

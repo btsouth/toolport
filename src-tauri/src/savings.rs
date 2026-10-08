@@ -75,7 +75,11 @@ fn v3_path() -> Option<PathBuf> {
 /// total resets to zero and the next serve starts a fresh file.
 pub fn try_clear() -> std::io::Result<()> {
     // Write anything queued before deleting, so a queued line cannot reappear.
-    crate::telemetry::flush();
+    if !crate::telemetry::flush() {
+        return Err(std::io::Error::other(
+            "Telemetry is still pending; retry clearing Activity",
+        ));
+    }
     let mut first_error = None;
     for path in [savings_path(), v2_path(), v3_path()].into_iter().flatten() {
         let _lock = match crate::registry::lock_at(&path) {
@@ -268,6 +272,7 @@ fn append_line_at(
         keep_lines,
         after_snapshot,
     )
+    .map_err(|error| error.message)
 }
 
 /// Append a batch of already-serialized JSONL `lines` under ONE acquisition of the
@@ -279,7 +284,7 @@ pub(crate) fn append_lines_at(
     lines: &[String],
     max_bytes: u64,
     keep_lines: usize,
-) -> Result<(), String> {
+) -> Result<(), crate::telemetry::AppendError> {
     // Deferred texts exist only in the bounded in-memory queue, never on disk.
     let lines: Vec<String> = lines.iter().map(|line| tokenize_line(line)).collect();
     append_lines_at_with_hook(path, &lines, max_bytes, keep_lines, None)
@@ -338,7 +343,7 @@ fn append_lines_at_with_hook(
     max_bytes: u64,
     keep_lines: usize,
     after_snapshot: Option<&mut dyn FnMut()>,
-) -> Result<(), String> {
+) -> Result<(), crate::telemetry::AppendError> {
     let _lock = crate::registry::lock_at(path)?;
     let mut file = crate::registry::open_append_private(path).map_err(|e| e.to_string())?;
     let mut bytes = String::new();
@@ -350,24 +355,29 @@ fn append_lines_at_with_hook(
     }
     file.write_all(bytes.as_bytes())
         .map_err(|e| e.to_string())?;
-    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    let size = file
+        .metadata()
+        .map_err(|e| crate::telemetry::AppendError::after_append(e.to_string()))?
+        .len();
     drop(file);
     if size > max_bytes {
-        rotate_if_large(path, keep_lines, after_snapshot);
+        rotate_if_large(path, keep_lines, after_snapshot)
+            .map_err(crate::telemetry::AppendError::after_append)?;
     }
     Ok(())
 }
 
 /// Collapse old lines into a single carry line once the log exceeds the cap, so
-/// the running total is preserved while the file stays bounded. Best-effort.
-fn rotate_if_large(path: &Path, keep_lines: usize, mut after_snapshot: Option<&mut dyn FnMut()>) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+/// the running total is preserved while the file stays bounded.
+fn rotate_if_large(
+    path: &Path,
+    keep_lines: usize,
+    mut after_snapshot: Option<&mut dyn FnMut()>,
+) -> Result<(), String> {
+    let content = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.len() <= keep_lines {
-        return;
+        return Ok(());
     }
     let Ok(parsed): Result<Vec<Value>, _> = lines
         .iter()
@@ -376,10 +386,10 @@ fn rotate_if_large(path: &Path, keep_lines: usize, mut after_snapshot: Option<&m
     else {
         // Preserve damaged history for explicit recovery instead of folding it
         // away during a later append.
-        return;
+        return Ok(());
     };
     if parsed.iter().any(|row| !row.is_object()) {
-        return;
+        return Ok(());
     }
     let mut details: Vec<Value> = parsed
         .iter()
@@ -387,7 +397,7 @@ fn rotate_if_large(path: &Path, keep_lines: usize, mut after_snapshot: Option<&m
         .cloned()
         .collect();
     if details.len() <= keep_lines {
-        return;
+        return Ok(());
     }
     let retained = details.split_off(details.len() - keep_lines);
     let carry = fold(&details);
@@ -417,7 +427,7 @@ fn rotate_if_large(path: &Path, keep_lines: usize, mut after_snapshot: Option<&m
     }
     // Atomic + unique temp: every client's gateway shares this file, so a
     // bespoke fixed temp name could let two rotations collide.
-    let _ = crate::registry::atomic_write(path, &out);
+    crate::registry::atomic_write(path, &out)
 }
 
 fn merge_team_bucket(buckets: &mut BTreeMap<String, BTreeMap<String, u64>>, row: &Value) {
@@ -678,6 +688,32 @@ fn aggregate(entries: &[Value]) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rotation_failure_is_reported_and_keeps_history() {
+        use crate::registry::tests::{with_atomic_failure, FailingAtomicWriteStep::*};
+        let root = std::env::temp_dir().join(format!(
+            "toolport-savings-rotate-failure-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("savings.jsonl");
+        let old = "{\"v\":2,\"kind\":\"list\",\"tokensSaved\":5}\n";
+        for step in [Permissions, Write, Rename] {
+            std::fs::write(&path, old).unwrap();
+            let result = with_atomic_failure(step, || {
+                super::append_lines_at(&path, &[old.trim().into()], 1, 1)
+            });
+            assert!(result.is_err());
+            let appended = serde_json::from_str::<serde_json::Value>(old).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                format!("{old}{appended}\n")
+            );
+        }
+        super::append_lines_at(&path, &[old.trim().into()], 1, 1).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     use fs2::FileExt;
     use std::collections::HashSet;
