@@ -1527,7 +1527,7 @@ fn prepare_client_servers_for_migration(
 }
 
 #[cfg(test)]
-fn import_client_servers_for_migration(
+pub(crate) fn import_client_servers_for_migration(
     registry: &mut Registry,
     client: &clients::DetectedClient,
 ) -> Result<(usize, Vec<String>), String> {
