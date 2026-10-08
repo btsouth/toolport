@@ -263,7 +263,7 @@ export function CatalogView({ registry, onAdded }: Props) {
 
   const card = (entry: CatalogEntry) => (
     <CatalogCard
-      key={`${entry.source}:${entry.name}`}
+      key={`${entry.source}:${entry.name}:${catalogIdentity(entry)}`}
       entry={entry}
       added={installed(have, entry)}
       busy={busy === entry.name}

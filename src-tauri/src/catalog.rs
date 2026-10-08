@@ -531,16 +531,7 @@ pub struct CatalogSearch {
 }
 
 pub fn search(query: &str) -> CatalogSearch {
-    search_with_registry(query, |query| {
-        search_registry(query).map_err(|error| {
-            let error = error.to_ascii_lowercase();
-            if error.contains("timed out") || error.contains("timeout") {
-                RegistryStatus::TimedOut
-            } else {
-                RegistryStatus::Unavailable
-            }
-        })
-    })
+    search_with_registry(query, search_registry)
 }
 
 fn search_with_registry(
@@ -970,20 +961,36 @@ fn registry_search_url(query: &str) -> String {
 }
 
 /// Search the official MCP Registry. Empty query lists popular/recent servers.
-pub fn search_registry(query: &str) -> Result<Vec<CatalogEntry>, String> {
+fn registry_failure(error: &(dyn std::error::Error + 'static)) -> RegistryStatus {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+        }) {
+            return RegistryStatus::TimedOut;
+        }
+        current = error.source();
+    }
+    RegistryStatus::Unavailable
+}
+
+pub fn search_registry(query: &str) -> Result<Vec<CatalogEntry>, RegistryStatus> {
     let url = registry_search_url(query);
     use std::io::Read;
     let resp = ureq::get(&url)
         .timeout(std::time::Duration::from_secs(5))
         .call()
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| registry_failure(&error))?;
     // Cap the registry response (defense in depth against a huge or MITM'd body).
     let mut buf = Vec::new();
     resp.into_reader()
         .take(8 * 1024 * 1024)
         .read_to_end(&mut buf)
-        .map_err(|e| e.to_string())?;
-    let body: Value = serde_json::from_slice(&buf).map_err(|e| e.to_string())?;
+        .map_err(|error| registry_failure(&error))?;
+    let body: Value = serde_json::from_slice(&buf).map_err(|_| RegistryStatus::Unavailable)?;
 
     let items = body
         .get("servers")
@@ -1002,6 +1009,22 @@ pub fn search_registry(query: &str) -> Result<Vec<CatalogEntry>, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn live_timeout_is_classified_without_message_matching() {
+        assert_eq!(
+            registry_failure(&std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            RegistryStatus::TimedOut
+        );
+        assert_eq!(
+            registry_failure(&std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            RegistryStatus::TimedOut
+        );
+        assert_eq!(
+            registry_failure(&std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+            RegistryStatus::Unavailable
+        );
+    }
 
     #[test]
     fn launch_and_endpoint_identity_fixtures() {
