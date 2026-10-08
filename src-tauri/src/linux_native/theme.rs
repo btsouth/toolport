@@ -940,6 +940,21 @@ button.toolport-activity-filter {{
   background-color: alpha(@toolport_error, 0.08);
 }}
 
+.toolport-badge.approval-denied {{
+  color: @toolport_error;
+  border-color: alpha(@toolport_error, 0.6);
+  background-color: transparent;
+}}
+.toolport-badge.approval-warning {{
+  color: #d9a441;
+  border-color: alpha(#d9a441, 0.4);
+  background-color: alpha(#d9a441, 0.08);
+}}
+image.approval-denied {{ color: @toolport_error; }}
+image.approval-warning {{ color: #d9a441; }}
+image.success {{ color: @toolport_success; }}
+image.disabled {{ color: @toolport_muted; }}
+
 .toolport-catalog-added {{
   min-height: 30px;
   padding: 0 8px;

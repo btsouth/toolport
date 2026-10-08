@@ -1029,7 +1029,7 @@ mod tests {
             serde_json::json!({
                 "kind":"approval", "decision":decision, "server":"github",
                 "tool":"delete_issue", "ok":false, "heldMs":90000,
-                "client":"client:real", "clientLabel":"Claude Code 2.1"
+                "client":"client:real", "clientName":"Claude Code", "clientLabel":"Claude Code 2.1"
             })
         })
         .collect::<Vec<_>>();
@@ -1045,8 +1045,12 @@ mod tests {
         assert_eq!(snapshot.error_count, 1);
         assert_eq!(snapshot.average_duration_ms, Some(20));
         assert_eq!(snapshot.tokens_saved, 0);
-        assert_eq!(snapshot.recent[0].approval_decision.as_deref(), Some("denied"));
-        assert_eq!(snapshot.recent[0].client.as_deref(), Some("client:real"));
+        assert_eq!(
+            snapshot.recent[0].approval_decision.as_deref(),
+            Some("denied")
+        );
+        assert_eq!(snapshot.recent[0].client.as_deref(), Some("Claude Code"));
+        assert_eq!(snapshot.recent[0].client_id.as_deref(), Some("client:real"));
         assert_eq!(snapshot.recent[0].duration_ms, Some(90000));
     }
 

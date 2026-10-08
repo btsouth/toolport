@@ -1,4 +1,4 @@
-import { trustedClientName } from "@/lib/clientIdentity";
+import { activityClientName } from "@/lib/clientIdentity";
 import { useWindowVisible } from "@/lib/windowVisible";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -14,6 +14,9 @@ import {
   Share2,
   ShieldAlert,
   ShieldCheck,
+  ShieldX,
+  Clock,
+  Undo2,
   Sparkles,
   Trash2,
   X,
@@ -22,6 +25,7 @@ import {
 import type { LucideIcon } from "lucide-react";
 import { toast } from "sonner";
 import {
+  fmtAgo,
   fmtBytes,
   fmtMs,
   fmtPercent,
@@ -751,7 +755,10 @@ function PiiBadge({ entry }: { entry: AuditEntry }) {
 
 function CallRow({ e }: { e: AuditEntry }) {
   const [open, setOpen] = useState(false);
-  const approvalOutcome = e.kind === "approval" ? approvalStatus(e.decision) : null;
+  const approvalOutcome = e.kind === "approval" ? (APPROVAL_OUTCOME[e.decision ?? ""] ?? UNKNOWN_APPROVAL) : null;
+  const RowIcon = approvalOutcome?.Icon ?? (e.held ? ShieldAlert : e.ok ? CheckCircle2 : XCircle);
+  const duration = approvalOutcome ? e.heldMs : e.durationMs;
+  const meta = [activityClientName(e), fmtAgo(e.ts), ...(duration == null ? [] : [approvalOutcome ? `waited ${fmtMs(duration)}` : fmtMs(duration)])].join(" · ");
   const hasDetail = !approvalOutcome && !e.ok && !!e.error;
   return (
     <div className="rounded-md border border-border/50 text-sm">
@@ -784,43 +791,20 @@ function CallRow({ e }: { e: AuditEntry }) {
         ) : (
           <span className="inline-block size-3.5 shrink-0" />
         )}
-        {approvalOutcome || e.held ? (
-          <ShieldAlert className="size-4 shrink-0 text-warning" />
-        ) : e.ok ? (
-          <CheckCircle2 className="size-4 shrink-0 text-success" />
-        ) : (
-          <XCircle className="size-4 shrink-0 text-destructive" />
-        )}
-        <span className="min-w-0 truncate font-medium">{e.server}</span>
-        <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
-          {e.tool}
-        </span>
-        {(e.clientName || e.client) && (
-          <span
-            className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
-            title={e.client ? `Client: ${e.client}` : "Client that made this call"}
-          >
-            {trustedClientName(e)}
-          </span>
-        )}
-        {e.clientLabel && (
-          <span className="min-w-0 truncate text-xs text-muted-foreground" dir="auto">
-            {e.clientLabel}
-          </span>
-        )}
+        <RowIcon className={`size-4 shrink-0 ${approvalOutcome?.iconClass ?? (e.held ? "text-warning" : e.ok ? "text-success" : "text-destructive")}`} />
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="min-w-0 truncate font-medium">{e.server}</span>
+            <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">{e.tool}</span>
+          </div>
+          <div className="mt-1 truncate text-xs text-muted-foreground" title={e.client ? `${meta} · Client: ${e.client}` : meta} dir="auto">{meta}</div>
+        </div>
         {approvalOutcome && (
-          <span className="shrink-0 rounded bg-muted px-2 py-0.5 text-xs text-muted-foreground">
-            {approvalOutcome}
+          <span className={`shrink-0 rounded border px-2 py-0.5 text-xs ${approvalOutcome.className}`}>
+            {approvalOutcome.label}
           </span>
         )}
         <PiiBadge entry={e} />
-        <span
-          className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground"
-          title={approvalOutcome ? "Time waiting for approval" : "Call duration"}
-        >
-          {fmtMs(approvalOutcome ? (e.heldMs ?? null) : (e.durationMs ?? null))}
-        </span>
-        <span className="shrink-0 text-xs text-muted-foreground">{fmtTs(e.ts)}</span>
       </div>
       {open && e.error && (
         <div className="border-t border-border/50 bg-destructive/5 px-3 py-2 pl-9">
@@ -833,24 +817,15 @@ function CallRow({ e }: { e: AuditEntry }) {
   );
 }
 
-function approvalStatus(decision?: string): string {
-  switch (decision) {
-    case "approved":
-      return "Approved";
-    case "denied":
-      return "Denied";
-    case "no_response":
-      return "Timed out";
-    case "withdrawn":
-      return "Withdrawn";
-    case "stale_state":
-      return "Stale approval";
-    case "unreachable":
-      return "Approval unavailable";
-    default:
-      return "Approval event";
-  }
-}
+const APPROVAL_OUTCOME: Record<string, { label: string; Icon: LucideIcon; iconClass: string; className: string }> = {
+  approved: { label: "Approved", Icon: ShieldCheck, iconClass: "text-success", className: "border-success/30 bg-success/10 text-success" },
+  denied: { label: "Denied", Icon: ShieldX, iconClass: "text-destructive", className: "border-destructive/50 text-destructive" },
+  no_response: { label: "No answer", Icon: Clock, iconClass: "text-warning", className: "border-warning/30 bg-warning/10 text-warning" },
+  withdrawn: { label: "Withdrawn", Icon: Undo2, iconClass: "text-muted-foreground", className: "border-border text-muted-foreground" },
+  stale_state: { label: "Changed after approval", Icon: AlertTriangle, iconClass: "text-warning", className: "border-warning/30 bg-warning/10 text-warning" },
+  unreachable: { label: "No approver available", Icon: AlertTriangle, iconClass: "text-warning", className: "border-warning/30 bg-warning/10 text-warning" },
+};
+const UNKNOWN_APPROVAL = { label: "Approval event", Icon: ShieldAlert, iconClass: "text-muted-foreground", className: "border-border text-muted-foreground" };
 
 export function TelemetryNotice({ stats }: { stats: AuditStats | null }) {
   const health = stats?.telemetry;

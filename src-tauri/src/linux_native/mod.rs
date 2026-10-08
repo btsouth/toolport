@@ -2934,7 +2934,12 @@ fn run_client_mutation(
                         "Disconnected {client_name} from Toolport. Restart {client_name} to apply it."
                     )
                 };
-                page.refresh_with_confirmation(std::iter::once(message).chain(result.outcome.warnings).collect::<Vec<_>>().join(" "));
+                page.refresh_with_confirmation(
+                    std::iter::once(message)
+                        .chain(result.outcome.warnings)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
             }
             Ok(Err(error)) => page.show_error(&format!("{client_name}: {error}")),
             Err(_) => page.show_error(&format!("{client_name}: the operation stopped")),
@@ -3542,7 +3547,7 @@ impl ActivityPage {
         self.average_latency.set_label(
             &snapshot
                 .average_duration_ms
-                .map(|duration| format!("{duration} ms"))
+                .map(format_duration)
                 .unwrap_or_else(|| "–".to_string()),
         );
         self.tokens_saved
@@ -4704,7 +4709,7 @@ fn inspect_card(capture: &serde_json::Value, expanded_rows: ActivityExpansionSta
     let duration = capture
         .get("durationMs")
         .and_then(serde_json::Value::as_u64)
-        .map(|duration| format!(" · {duration} ms"))
+        .map(|duration| format!(" · {}", format_duration(duration)))
         .unwrap_or_default();
     card.append(
         &gtk::Label::builder()
@@ -4873,13 +4878,16 @@ fn pii_badge(
 fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     card.add_css_class("toolport-card");
-    let icon = gtk::Image::from_icon_name(if activity.approval_decision.is_some() {
-        "dialog-question-symbolic"
-    } else if activity.ok {
-        "emblem-ok-symbolic"
-    } else {
-        "dialog-error-symbolic"
-    });
+    let outcome = activity.approval_decision.as_deref().map(approval_outcome);
+    let icon =
+        gtk::Image::from_icon_name(outcome.map(|(_, icon, _)| icon).unwrap_or(if activity.ok {
+            "emblem-ok-symbolic"
+        } else {
+            "dialog-error-symbolic"
+        }));
+    if let Some((_, _, tone)) = outcome {
+        icon.add_css_class(tone);
+    }
     icon.add_css_class("toolport-card-icon");
     icon.set_valign(gtk::Align::Center);
     card.append(&icon);
@@ -4895,16 +4903,15 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
             .css_classes(["heading"])
             .build(),
     );
-    let mut detail = Vec::new();
-    if let Some(client) = activity.client.as_deref() {
-        detail.push(client.to_string());
-    }
-    detail.push(relative_activity_time(activity.timestamp_ms));
+    let mut detail = vec![
+        activity_client_name(activity),
+        relative_activity_time(activity.timestamp_ms),
+    ];
     if let Some(duration) = activity.duration_ms {
-        detail.push(if activity.approval_decision.is_some() {
-            format!("Waited {duration} ms")
+        detail.push(if outcome.is_some() {
+            format!("waited {}", format_duration(duration))
         } else {
-            format!("{duration} ms")
+            format_duration(duration)
         });
     }
     copy.append(
@@ -4917,17 +4924,6 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
             .css_classes(["toolport-muted"])
             .build(),
     );
-    if let Some(label) = activity.client_label.as_deref() {
-        copy.append(
-            &gtk::Label::builder()
-                .label(label)
-                .xalign(0.0)
-                .wrap(true)
-                .wrap_mode(gtk::pango::WrapMode::WordChar)
-                .css_classes(["toolport-muted"])
-                .build(),
-        );
-    }
     if let Some(error) = activity.error.as_deref() {
         copy.append(
             &gtk::Label::builder()
@@ -4949,8 +4945,8 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
         badge.set_tooltip_text(Some(tooltip));
         card.append(&badge);
     }
-    let (status, class) = if let Some(decision) = activity.approval_decision.as_deref() {
-        (approval_status(decision), "review")
+    let (status, class) = if let Some((label, _, tone)) = outcome {
+        (label, tone)
     } else if activity.held {
         ("Held", "review")
     } else if activity.ok {
@@ -4966,15 +4962,50 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     card
 }
 
-fn approval_status(decision: &str) -> &'static str {
+fn approval_outcome(decision: &str) -> (&'static str, &'static str, &'static str) {
+    // Adwaita symbolic icons, also available in Omarchy's inherited icon theme.
     match decision {
-        "approved" => "Approved",
-        "denied" => "Denied",
-        "no_response" => "Timed out",
-        "withdrawn" => "Withdrawn",
-        "stale_state" => "Stale approval",
-        "unreachable" => "Approval unavailable",
-        _ => "Approval event",
+        "approved" => ("Approved", "emblem-ok-symbolic", "success"),
+        "denied" => ("Denied", "action-unavailable-symbolic", "approval-denied"),
+        "no_response" => ("No answer", "appointment-soon-symbolic", "approval-warning"),
+        "withdrawn" => ("Withdrawn", "edit-undo-symbolic", "disabled"),
+        "stale_state" => (
+            "Changed after approval",
+            "dialog-warning-symbolic",
+            "approval-warning",
+        ),
+        "unreachable" => (
+            "No approver available",
+            "dialog-warning-symbolic",
+            "approval-warning",
+        ),
+        _ => ("Approval event", "dialog-information-symbolic", "disabled"),
+    }
+}
+
+fn format_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else if ms < 60000 {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    } else {
+        let seconds = ms.saturating_add(500) / 1000;
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    }
+}
+
+fn activity_client_name(activity: &state::ActivityView) -> String {
+    let name = activity.client.as_deref().unwrap_or("An AI client");
+    match activity
+        .client_label
+        .as_deref()
+        .filter(|label| *label != name)
+    {
+        Some(label) => match label.strip_prefix(name) {
+            Some(remainder) => format!("{name} {}", remainder.trim()),
+            None => format!("{name} (reports \"{label}\")"),
+        },
+        None => name.to_string(),
     }
 }
 
@@ -4989,10 +5020,10 @@ fn stat_metrics_line(stat: &serde_json::Value) -> String {
         format!("{errors} {}", if errors == 1 { "error" } else { "errors" }),
     ];
     if let Some(avg) = number("avgMs") {
-        parts.push(format!("avg {avg} ms"));
+        parts.push(format!("avg {}", format_duration(avg)));
     }
     if let Some(p95) = number("p95Ms") {
-        parts.push(format!("p95 {p95} ms"));
+        parts.push(format!("p95 {}", format_duration(p95)));
     }
     parts.join(" · ")
 }
@@ -6046,9 +6077,13 @@ fn open_shared_setup(url: &str, page: ServerPage) {
             open_url: Box::new(|url| { let _ = crate::oauth::open_web_url(url); }),
         };
         let pair_origin = origin.clone();
-        pairing::request(hooks, &origin, Box::new(move |cancel, show| {
-            crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
-        }));
+        pairing::request(
+            hooks,
+            &origin,
+            Box::new(move |cancel, show| {
+                crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
+            }),
+        );
         return;
     }
     let Some(id) = crate::sharing_controller::parse_share_url(url) else {
@@ -9540,12 +9575,13 @@ mod tests {
         let mut events = Vec::new();
         for (decision, label) in [
             ("denied", "Denied"),
-            ("no_response", "Timed out"),
+            ("no_response", "No answer"),
             ("withdrawn", "Withdrawn"),
-            ("stale_state", "Stale approval"),
+            ("stale_state", "Changed after approval"),
             ("approved", "Approved"),
+            ("unreachable", "No approver available"),
         ] {
-            assert_eq!(approval_status(decision), label);
+            assert_eq!(approval_outcome(decision).0, label);
             let mut event = call("github", false);
             event.approval_decision = Some(decision.into());
             events.push(event);
@@ -10226,5 +10262,51 @@ mod tests {
         assert!(server_matches_query(&linear, " HTTP "));
         assert!(server_matches_query(&linear, ""));
         assert!(!server_matches_query(&linear, "local stdio"));
+    }
+}
+
+#[cfg(test)]
+mod p10c_r1_presentation_tests {
+    use super::*;
+
+    #[test]
+    fn p10c_r1_duration_and_identity_meta_match_react() {
+        for (ms, text) in [
+            (850, "850 ms"),
+            (1500, "1.5 s"),
+            (59999, "60.0 s"),
+            (60000, "1m 0s"),
+            (90000, "1m 30s"),
+            (119999, "2m 0s"),
+        ] {
+            assert_eq!(format_duration(ms), text);
+        }
+        let mut row = state::ActivityView {
+            timestamp_ms: 0,
+            server: "team_slack".into(),
+            tool: "delete".into(),
+            client: Some("Claude Code".into()),
+            client_id: Some("adapter:claude-code".into()),
+            client_label: Some("Claude Code 2.1".into()),
+            approval_decision: Some("denied".into()),
+            ok: true,
+            held: true,
+            duration_ms: Some(1500),
+            error: None,
+            pii_replaced: None,
+            pii_incomplete: false,
+        };
+        assert_eq!(activity_client_name(&row), "Claude Code 2.1");
+        row.client_label = Some("Someone else".into());
+        assert_eq!(
+            activity_client_name(&row),
+            "Claude Code (reports \"Someone else\")"
+        );
+        assert_eq!(
+            activity_server_filter_options(&[row.clone(), row]),
+            vec!["All servers", "team_slack"]
+        );
+        assert_eq!(approval_outcome("denied").2, "approval-denied");
+        assert_eq!(approval_outcome("withdrawn").2, "disabled");
     }
 }

@@ -243,6 +243,8 @@ pub enum ApprovalDecision {
     /// the seam a decoupled approval (session re-use, or a code-mode script that approves
     /// then replays) must clear before its effect runs.
     StaleState,
+    /// The caller withdrew before a human decision was received. Gateway-only.
+    Withdrawn,
 }
 
 impl ApprovalDecision {
@@ -586,7 +588,7 @@ pub fn try_decide_once_with_cancel(
     cancel: Option<&crate::downstream::CancelContext>,
 ) -> BrokerAttempt {
     if cancel.is_some_and(crate::downstream::CancelContext::is_cancelled) {
-        return BrokerAttempt::Decided(ApprovalDecision::Denied);
+        return BrokerAttempt::Decided(ApprovalDecision::Withdrawn);
     }
     let Some(desc) = desc else {
         return BrokerAttempt::Unreachable;
@@ -613,15 +615,28 @@ pub fn try_decide_once_with_cancel(
         }))
     });
     if cancel.is_some_and(crate::downstream::CancelContext::is_cancelled) {
-        return BrokerAttempt::Decided(ApprovalDecision::Denied);
+        return BrokerAttempt::Decided(ApprovalDecision::Withdrawn);
     }
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_read_timeout(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)));
     let decision = exchange_approval_request(req, stream);
-    if cancel.is_some_and(crate::downstream::CancelContext::is_cancelled) {
-        BrokerAttempt::Decided(ApprovalDecision::Denied)
-    } else {
+    broker_attempt_after_cancel(
+        decision,
+        cancel.is_some_and(crate::downstream::CancelContext::is_cancelled),
+    )
+}
+
+fn broker_attempt_after_cancel(decision: BrokerAttempt, cancelled: bool) -> BrokerAttempt {
+    // A parsed human answer wins even if the client disconnected immediately
+    // after it arrived. Only a transport failure without an answer is withdrawal.
+    if matches!(
+        decision,
+        BrokerAttempt::Decided(ApprovalDecision::Approved | ApprovalDecision::Denied)
+    ) || !cancelled
+    {
         decision
+    } else {
+        BrokerAttempt::Decided(ApprovalDecision::Withdrawn)
     }
 }
 
@@ -1215,5 +1230,23 @@ mod p08b_revision_tests {
             crate::clients::trusted_client_name(Some("adapter:claude-code"), Some("Recorded name")),
             "Recorded name"
         );
+    }
+}
+
+#[cfg(test)]
+mod p10c_decision_tests {
+    use super::*;
+
+    #[test]
+    fn p10c_r1_human_answer_wins_over_immediate_disconnect() {
+        for decision in [ApprovalDecision::Approved, ApprovalDecision::Denied] {
+            assert!(
+                matches!(broker_attempt_after_cancel(BrokerAttempt::Decided(decision), true), BrokerAttempt::Decided(actual) if actual == decision)
+            );
+        }
+        assert!(matches!(
+            broker_attempt_after_cancel(BrokerAttempt::Unreachable, true),
+            BrokerAttempt::Decided(ApprovalDecision::Withdrawn)
+        ));
     }
 }
