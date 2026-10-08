@@ -14238,6 +14238,20 @@ fn process_request(
                 };
                 router = catalog_for_view(rooted).0;
             }
+            // A snapshot shares supervisor state, but not the indexed catalog.
+            // Publication can mark its slots Ready after the last clone, making
+            // the wait stop on an empty old router. Re-read the published view.
+            let base = state
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let rooted = if daemon_adapter {
+                state.router_for_root(base, &reg, adapter_root.as_deref(), allowed)
+            } else {
+                base
+            };
+            router = catalog_for_view(rooted).0;
             // Ready slots can precede disk-cache publication. Read the live view
             // after a cold wait so another client's cache cannot hide new tools.
             cache_snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
