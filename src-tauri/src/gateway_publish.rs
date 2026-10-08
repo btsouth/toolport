@@ -316,6 +316,8 @@ fn live_host_daemons_in(data_dir: &Path) -> Vec<crate::daemon::DaemonDescriptor>
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayProcess {
     pub pid: u32,
+    /// OS creation identity, used with pidfds to reject a reused PID.
+    pub start_time: Option<u64>,
     /// Whether the process was launched in the shared host role. None means
     /// its command line could not be inspected, so reaping must fail closed.
     pub is_host_daemon: Option<bool>,
@@ -342,6 +344,12 @@ pub struct ParentProcess {
 /// need a live process table or a real install layout.
 #[derive(Debug, Clone)]
 pub struct ReapContext {
+    /// Startup only targets processes proven to belong to this user and data dir.
+    /// None is used by the pure, pre-scoped planner fixtures.
+    pub eligible_processes: Option<Vec<GatewayProcess>>,
+    /// Authenticated descriptors in this data dir, including previous builds.
+    pub daemon_descriptors: Vec<crate::daemon::DaemonDescriptor>,
+    pub current_compat: Option<String>,
     pub current_version: String,
     /// Executable paths that must survive a *stale* reap (current published binary,
     /// nested macOS helper, AppImage stable copy, etc.). Compared case-insensitively
@@ -656,7 +664,19 @@ pub fn decide_reap(proc: &GatewayProcess, ctx: &ReapContext) -> ReapDecision {
     if ctx.keep_pids.contains(&proc.pid) {
         return ReapDecision::Keep;
     }
-    if proc.is_host_daemon != Some(false) {
+    if ctx.eligible_processes.as_ref().is_some_and(|processes| {
+        !processes.iter().any(|snapshot| {
+            snapshot.pid == proc.pid
+                && snapshot.start_time == proc.start_time
+                && snapshot.path == proc.path
+                && snapshot.is_host_daemon == proc.is_host_daemon
+        })
+    }) {
+        return ReapDecision::Keep;
+    }
+    if proc.is_host_daemon.is_none()
+        || (proc.is_host_daemon == Some(true) && ctx.eligible_processes.is_none())
+    {
         return ReapDecision::Keep;
     }
     if !is_gateway_basename(&proc.basename) {
@@ -666,9 +686,26 @@ pub fn decide_reap(proc: &GatewayProcess, ctx: &ReapContext) -> ReapDecision {
         return ReapDecision::Kill;
     }
 
+    if ctx.daemon_descriptors.iter().any(|descriptor| {
+        descriptor.pid == proc.pid
+            && (Some(&descriptor.compat) != ctx.current_compat.as_ref()
+                || descriptor.protocol != crate::daemon::PROTOCOL_GENERATION)
+    }) {
+        return ReapDecision::Kill;
+    }
+
     if let Some(ref path) = proc.path {
+        // A replaced inode is old even when its versioned basename is current.
+        if path.to_string_lossy().ends_with(" (deleted)") {
+            return ReapDecision::Kill;
+        }
         if ctx.keep_paths.iter().any(|k| paths_equal(k, path)) {
             return ReapDecision::Keep;
+        }
+        if ctx.eligible_processes.is_some() && !ctx.keep_paths.is_empty() {
+            // Scope and ownership are proven: another image is old even when it
+            // has the current version in its name (a rebuild or relocated copy).
+            return ReapDecision::Kill;
         }
         if is_dev_target_path(path) {
             return ReapDecision::Keep;
@@ -857,6 +894,9 @@ pub fn plan_reap(procs: &[GatewayProcess], ctx: &ReapContext) -> ReapPlan {
             ReapDecision::Kill => plan.to_kill.push(proc.clone()),
         }
     }
+    // Closing old adapters releases their daemon sessions before idle shutdown.
+    plan.to_kill
+        .sort_by_key(|proc| proc.is_host_daemon == Some(true));
     plan
 }
 
@@ -913,23 +953,56 @@ fn record_restart_client(report: &mut ReapReport, proc: &GatewayProcess) {
     }
 }
 
-/// Reap only processes supplied by the caller's scoped inventory.
-///
-/// Tests pass an enumerator
-/// scoped to their own fixtures: driving the real plan/kill/verify path against the
-/// *global* process table would otherwise mean a real gateway that starts during the
-/// pass (including inside the 150ms verify window below, which re-enumerates) is not
-/// in `keep_pids` and gets killed. Pinning pids before the pass narrows that window
-/// but cannot close it, because the verify re-enumeration happens later than any
-/// snapshot the caller can take. Scoping the enumerator closes it by construction.
+const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn stop_reap_process(process: &GatewayProcess, ctx: &ReapContext) -> bool {
+    if let Some(descriptor) = ctx.daemon_descriptors.iter().find(|d| d.pid == process.pid) {
+        if crate::daemon::request_shutdown_if_idle(descriptor).is_ok() {
+            let deadline = std::time::Instant::now() + REAP_GRACE;
+            while std::time::Instant::now() < deadline {
+                if !list_gateway_processes()
+                    .iter()
+                    .any(|p| p.pid == process.pid)
+                {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+    kill_gateway_process(process)
+}
+
+/// Reap only the scoped PIDs, including during verification of the stop plan.
 fn reap_listed(ctx: &ReapContext, list: impl Fn() -> Vec<GatewayProcess>) -> ReapReport {
     let mut report = ReapReport::default();
     let plan = plan_reap(&list(), ctx);
+    // Let existing calls return through their adapters before closing those
+    // pipes. Idle shutdown alone cannot close a daemon's live listen sessions.
+    let draining: Vec<u32> = ctx
+        .daemon_descriptors
+        .iter()
+        .filter(|descriptor| {
+            plan.to_kill
+                .iter()
+                .any(|process| process.pid == descriptor.pid)
+                && crate::daemon::request_shutdown_if_idle(descriptor).is_ok()
+        })
+        .map(|descriptor| descriptor.pid)
+        .collect();
+    if !draining.is_empty() {
+        let deadline = std::time::Instant::now() + REAP_GRACE;
+        while list().iter().any(|process| draining.contains(&process.pid))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
     report.kept = plan.kept;
     report.needs_restart = plan.needs_restart;
     for proc in plan.to_kill {
         let label = label_process(&proc);
-        if kill_gateway_process(&proc) {
+        if stop_reap_process(&proc, ctx) {
             report.killed.push(label);
             if ctx.kill_all {
                 record_restart_client(&mut report, &proc);
@@ -945,7 +1018,7 @@ fn reap_listed(ctx: &ReapContext, list: impl Fn() -> Vec<GatewayProcess>) -> Rea
         for proc in still {
             if decide_reap(&proc, ctx) == ReapDecision::Kill {
                 let label = label_process(&proc);
-                if kill_gateway_process(&proc) {
+                if stop_reap_process(&proc, ctx) {
                     // A first termination attempt may fail transiently. Once the
                     // retry is accepted, do not leave a stale failure that would
                     // incorrectly block the updater; the final observation below
@@ -1018,6 +1091,12 @@ fn installer_owns_process(
     if !path.is_absolute() || !install_dir.is_absolute() {
         return false;
     }
+    // A live package replacement retains the old inode at the installed path.
+    let raw = path.to_string_lossy();
+    let path = raw
+        .strip_suffix(" (deleted)")
+        .map(Path::new)
+        .unwrap_or(path);
     let installed = ["toolport-gateway", "conduit-gateway"].iter().any(|name| {
         paths_equal(
             path,
@@ -1248,32 +1327,155 @@ pub fn reap_stale(extra_keep: &[PathBuf]) -> ReapReport {
             keep.push(p.clone());
         }
     }
+    let Some(data_dir) = crate::registry::conduit_dir() else {
+        return ReapReport::default();
+    };
+    let current_compat =
+        crate::topology::CompatKey::new(env!("CARGO_PKG_VERSION"), data_dir.display().to_string())
+            .fingerprint();
+    let processes = list_gateway_processes();
+    // A descriptor proves data-dir membership only after its bearer-gated identity
+    // matches. Old compatibility domains must not become blanket keep-PIDs.
+    let daemon_descriptors = verified_reap_daemons(&data_dir, &processes);
     let ctx = ReapContext {
+        eligible_processes: Some(
+            processes
+                .iter()
+                .filter(|process| stale_process_in_scope(process, &data_dir, &daemon_descriptors))
+                .cloned()
+                .collect(),
+        ),
+        daemon_descriptors,
+        current_compat: Some(current_compat),
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         keep_paths: keep,
-        keep_pids: std::iter::once(std::process::id())
-            .chain(
-                live_host_daemons()
-                    .into_iter()
-                    .map(|descriptor| descriptor.pid),
-            )
-            .collect(),
+        keep_pids: vec![std::process::id()],
         kill_all: false,
     };
-    // An explicit data directory is commonly used for an isolated dev or
-    // acceptance run. The global process table includes live gateways from
-    // other installations, whose paths are not in this instance's keep set.
-    let scope = crate::brand::env_var_os("TOOLPORT_DATA_DIR", "CONDUIT_DATA_DIR")
-        .map(PathBuf::from)
-        .map(|data_dir| data_dir.join("bin"));
-    let report = reap_listed(&ctx, || {
-        list_gateway_processes()
-            .into_iter()
-            .filter(|proc| in_explicit_reap_scope(proc, scope.as_deref()))
-            .collect()
-    });
+    let report = reap_listed(&ctx, list_gateway_processes);
     log_reap_report("stale reaper", &report);
     report
+}
+
+fn verified_reap_daemons(
+    data_dir: &Path,
+    processes: &[GatewayProcess],
+) -> Vec<crate::daemon::DaemonDescriptor> {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            if !name.starts_with("daemon-") || !name.ends_with(".json") {
+                return None;
+            }
+            let descriptor = crate::daemon::read_descriptor(&entry.path())?;
+            if !processes.iter().any(|process| {
+                process.pid == descriptor.pid && process.is_host_daemon == Some(true)
+            }) || installer_same_user_session(descriptor.pid) != Some(true)
+            {
+                return None;
+            }
+            let identity = crate::daemon::probe_identity(&descriptor).ok()?;
+            (identity.pid == descriptor.pid
+                && identity.compat == descriptor.compat
+                && identity.protocol == descriptor.protocol)
+                .then_some(descriptor)
+        })
+        .collect()
+}
+
+/// An explicit foreign override wins over executable location or a descriptor.
+fn reap_scope_matches(
+    owner: Option<bool>,
+    data_dir: Option<&Path>,
+    expected: &Path,
+    local: bool,
+) -> bool {
+    if owner != Some(true) {
+        return false;
+    }
+    match data_dir {
+        Some(dir) => same_data_dir(dir, expected),
+        None => local,
+    }
+}
+
+fn same_data_dir(a: &Path, b: &Path) -> bool {
+    let a = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let b = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    if !a.is_absolute() || !b.is_absolute() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        paths_equal(&a, &b)
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
+fn stale_process_in_scope(
+    process: &GatewayProcess,
+    data_dir: &Path,
+    descriptors: &[crate::daemon::DaemonDescriptor],
+) -> bool {
+    let local = descriptors.iter().any(|d| d.pid == process.pid)
+        || in_explicit_reap_scope(process, Some(&data_dir.join("bin")));
+    let owner = installer_same_user_session(process.pid);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let Ok(raw) = std::fs::read(format!("/proc/{}/environ", process.pid)) else {
+            return reap_scope_matches(owner, None, data_dir, local);
+        };
+        let value = |key: &str| {
+            raw.split(|byte| *byte == 0).find_map(|entry| {
+                entry
+                    .strip_prefix(key.as_bytes())
+                    .filter(|value| !value.is_empty())
+            })
+        };
+        let explicit = value("TOOLPORT_DATA_DIR=").or_else(|| value("CONDUIT_DATA_DIR="));
+        use std::os::unix::ffi::OsStrExt;
+        if let Some(dir) = explicit {
+            return reap_scope_matches(
+                owner,
+                Some(Path::new(std::ffi::OsStr::from_bytes(dir))),
+                data_dir,
+                local,
+            );
+        }
+        // Installed release gateways without an override use the config root in
+        // their own environment, not the reaper's HOME or XDG_CONFIG_HOME.
+        let config = value("XDG_CONFIG_HOME=")
+            .map(|dir| PathBuf::from(std::ffi::OsStr::from_bytes(dir)))
+            .or_else(|| {
+                value("HOME=")
+                    .map(|home| Path::new(std::ffi::OsStr::from_bytes(home)).join(".config"))
+            });
+        let debug = process
+            .path
+            .as_ref()
+            .is_some_and(|path| normalize_path(path).contains("\\target\\debug\\"));
+        let default = config.is_some_and(|base| {
+            [
+                if debug { "Toolport-dev" } else { "Toolport" },
+                if debug { "Conduit-dev" } else { "Conduit" },
+            ]
+            .iter()
+            .any(|leaf| same_data_dir(&base.join(leaf), data_dir))
+        });
+        reap_scope_matches(owner, None, data_dir, local || default)
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        reap_scope_matches(owner, None, data_dir, local)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1722,7 +1924,7 @@ fn windows_assign_daemon_roles(processes: &mut [GatewayProcess]) {
 
 #[cfg(windows)]
 fn kill_gateway_process(proc: &GatewayProcess) -> bool {
-    windows_kill_pid(proc.pid)
+    installer_same_user_session(proc.pid) == Some(true) && windows_kill_pid(proc.pid)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -1735,9 +1937,54 @@ fn list_gateway_processes() -> Vec<GatewayProcess> {
     macos_list_gateway_processes()
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn kill_gateway_process(proc: &GatewayProcess) -> bool {
-    unix_kill_pid(proc.pid)
+    installer_same_user_session(proc.pid) == Some(true) && unix_kill_pid(proc.pid)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn kill_gateway_process(process: &GatewayProcess) -> bool {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // Pin the target before rechecking its image and owner. A PID reused during
+    // the grace period must never redirect our signal to another process.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) };
+    if fd < 0 {
+        return !pid_is_running(process.pid);
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut poll, 1, 0) } > 0 {
+        return true;
+    }
+    if process.start_time.is_none()
+        || linux_process_start_time(process.pid) != process.start_time
+        || installer_same_user_session(process.pid) != Some(true)
+        || std::fs::read_link(format!("/proc/{}/exe", process.pid)).ok() != process.path
+        || gateway_daemon_role(process.pid) != process.is_host_daemon
+    {
+        return false;
+    }
+    let signal = |signal: i32| unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        ) == 0
+    };
+    if !signal(libc::SIGTERM) {
+        return false;
+    }
+    // pidfds become readable on exit, including before the parent reaps a zombie.
+    if unsafe { libc::poll(&mut poll, 1, REAP_GRACE.as_millis() as i32) } > 0 {
+        return true;
+    }
+    signal(libc::SIGKILL)
 }
 
 #[cfg(windows)]
@@ -1769,6 +2016,7 @@ fn windows_list_gateway_processes() -> Vec<GatewayProcess> {
                     out.push((
                         GatewayProcess {
                             pid,
+                            start_time: windows_process_start_time(pid),
                             is_host_daemon: None,
                             path,
                             basename,
@@ -1947,6 +2195,7 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
             }
             out.push(GatewayProcess {
                 pid,
+                start_time: linux_process_start_time(pid),
                 is_host_daemon: gateway_daemon_role(pid),
                 path: exe,
                 basename: exe_base,
@@ -1957,6 +2206,7 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
         let path = std::fs::read_link(ent.path().join("exe")).ok();
         out.push(GatewayProcess {
             pid,
+            start_time: linux_process_start_time(pid),
             is_host_daemon: gateway_daemon_role(pid),
             path,
             basename,
@@ -1964,6 +2214,19 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
         });
     }
     out
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm may contain spaces and parentheses; fields after its final ')' start
+    // with state (field 3), so starttime (field 22) is at index 19.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }
 
 /// Parent application of a pid, from `/proc/<pid>/status`.
@@ -2055,6 +2318,7 @@ fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
             });
         procs.push(GatewayProcess {
             pid: *pid,
+            start_time: None,
             is_host_daemon: gateway_daemon_role(*pid),
             path,
             basename,
@@ -2089,7 +2353,7 @@ fn macos_proc_pidpath(pid: u32) -> Option<PathBuf> {
     Some(PathBuf::from(s))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn unix_kill_pid(pid: u32) -> bool {
     // SIGTERM first, then SIGKILL — matches polite shutdown without depending on libc.
     let term = std::process::Command::new("kill")
@@ -2108,7 +2372,7 @@ fn unix_kill_pid(pid: u32) -> bool {
             .map(|s| s.success())
             .unwrap_or(false);
     }
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::sleep(REAP_GRACE);
     // Still alive?
     let alive = std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -2290,6 +2554,9 @@ mod tests {
 
     fn ctx(version: &str, keep: &[&str], kill_all: bool) -> ReapContext {
         ReapContext {
+            eligible_processes: None,
+            daemon_descriptors: Vec::new(),
+            current_compat: None,
             current_version: version.into(),
             keep_paths: keep.iter().map(PathBuf::from).collect(),
             keep_pids: Vec::new(),
@@ -2300,6 +2567,7 @@ mod tests {
     fn proc(pid: u32, basename: &str, path: Option<&str>) -> GatewayProcess {
         GatewayProcess {
             pid,
+            start_time: None,
             is_host_daemon: Some(false),
             basename: basename.into(),
             path: path.map(PathBuf::from),
@@ -2332,6 +2600,12 @@ mod tests {
         let name = format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX);
         let owned = proc_with_parent(41, &name, install.join(&name).to_str(), 42, "Cursor");
         assert!(installer_owns_process(&owned, &install, Some(&data)));
+        let deleted = proc(
+            46,
+            &name,
+            Some(&format!("{} (deleted)", install.join(&name).display())),
+        );
+        assert!(installer_owns_process(&deleted, &install, Some(&data)));
         let published = proc(
             43,
             "toolport-gateway-2.0.0.exe",
@@ -2514,6 +2788,88 @@ mod tests {
                 ReapDecision::Kill
             );
         }
+    }
+
+    #[test]
+    fn stale_daemon_classification_covers_versions_replacement_and_scope() {
+        let data = if cfg!(windows) {
+            Path::new(r"C:\Data\Toolport")
+        } else {
+            Path::new("/data/toolport")
+        };
+        let other = if cfg!(windows) {
+            Path::new(r"C:\Other\Toolport")
+        } else {
+            Path::new("/other/toolport")
+        };
+        let current =
+            crate::topology::CompatKey::new("2.0.0-preview.2", data.display().to_string());
+        let mut daemon = proc(
+            42,
+            "toolport-gateway",
+            Some("/opt/toolport/toolport-gateway"),
+        );
+        daemon.is_host_daemon = Some(true);
+        let mut context = ctx(
+            "2.0.0-preview.2",
+            &["/opt/toolport/toolport-gateway"],
+            false,
+        );
+        context.eligible_processes = Some(vec![daemon.clone()]);
+        context.current_compat = Some(current.fingerprint());
+        for version in ["1.24.0", "2.0.0-preview.1", "2.0.0-preview.2"] {
+            let compat = crate::topology::CompatKey::new(version, data.display().to_string());
+            let mut descriptor =
+                crate::daemon::DaemonDescriptor::new("127.0.0.1:1", "fixture", &compat);
+            descriptor.pid = 42;
+            context.daemon_descriptors = vec![descriptor];
+            assert_eq!(
+                decide_reap(&daemon, &context),
+                if version == "2.0.0-preview.2" {
+                    ReapDecision::Keep
+                } else {
+                    ReapDecision::Kill
+                },
+                "version {version}"
+            );
+        }
+        daemon.path = Some(PathBuf::from("/opt/toolport/toolport-gateway (deleted)"));
+        context.eligible_processes = Some(vec![daemon.clone()]);
+        assert_eq!(decide_reap(&daemon, &context), ReapDecision::Kill);
+        daemon.basename = "toolport-gateway-2.0.0-preview.2".into();
+        assert_eq!(decide_reap(&daemon, &context), ReapDecision::Kill);
+        for (owner, dir, local, eligible) in [
+            (Some(true), Some(data), false, true),
+            (Some(false), Some(data), true, false),
+            (None, Some(data), true, false),
+            (Some(true), Some(other), true, false),
+            (Some(true), None, false, false),
+            (Some(true), None, true, true),
+        ] {
+            assert_eq!(reap_scope_matches(owner, dir, data, local), eligible);
+            context.eligible_processes = Some(if eligible {
+                vec![daemon.clone()]
+            } else {
+                vec![]
+            });
+            assert_eq!(
+                decide_reap(&daemon, &context),
+                if eligible {
+                    ReapDecision::Kill
+                } else {
+                    ReapDecision::Keep
+                }
+            );
+        }
+        context.eligible_processes = Some(vec![daemon.clone()]);
+        daemon.start_time = Some(2);
+        assert_eq!(decide_reap(&daemon, &context), ReapDecision::Keep);
+        daemon.start_time = None;
+        context.keep_pids = vec![42];
+        assert_eq!(decide_reap(&daemon, &context), ReapDecision::Keep);
+        daemon.basename = "toolport-gtk".into();
+        context.keep_pids.clear();
+        assert_eq!(decide_reap(&daemon, &context), ReapDecision::Keep);
     }
 
     #[test]
@@ -2951,12 +3307,18 @@ mod tests {
         );
         for ctx in [
             ReapContext {
+                eligible_processes: None,
+                daemon_descriptors: Vec::new(),
+                current_compat: None,
                 current_version: "1.9.6".into(),
                 keep_paths: Vec::new(),
                 keep_pids: vec![std::process::id()],
                 kill_all: true,
             },
             ReapContext {
+                eligible_processes: None,
+                daemon_descriptors: Vec::new(),
+                current_compat: None,
                 current_version: "1.9.6".into(),
                 keep_paths: default_keep_paths(),
                 keep_pids: vec![std::process::id()],
@@ -3011,6 +3373,9 @@ mod tests {
 
         let keep = PathBuf::from("/home/u/.local/share/toolport/toolport-gateway");
         let c = ReapContext {
+            eligible_processes: None,
+            daemon_descriptors: Vec::new(),
+            current_compat: None,
             current_version: "1.9.6".into(),
             keep_paths: vec![keep.clone()],
             keep_pids: Vec::new(),
@@ -3021,6 +3386,7 @@ mod tests {
             decide_reap(
                 &GatewayProcess {
                     pid: 1,
+                    start_time: None,
                     is_host_daemon: Some(false),
                     path: Some(keep),
                     basename: "toolport-gateway".into(),
@@ -3035,6 +3401,7 @@ mod tests {
             decide_reap(
                 &GatewayProcess {
                     pid: 2,
+                    start_time: None,
                     is_host_daemon: Some(false),
                     path: Some(deleted),
                     basename: "toolport-gateway".into(),
@@ -3584,6 +3951,9 @@ mod tests {
         // The launch path is the current keep-path and the process must still be
         // killed. That is the entire point of leaving the marker on.
         let ctx = ReapContext {
+            eligible_processes: None,
+            daemon_descriptors: Vec::new(),
+            current_compat: None,
             current_version: "9.9.9".into(),
             keep_paths: vec![exe.clone()],
             keep_pids: Vec::new(),
@@ -3692,6 +4062,9 @@ mod tests {
         let mine = [keep.pid(), stale.pid(), upgraded.pid()];
         let report = reap_listed(
             &ReapContext {
+                eligible_processes: None,
+                daemon_descriptors: Vec::new(),
+                current_compat: None,
                 current_version: "9.9.9".into(),
                 keep_paths: vec![keep_exe.clone(), upgraded_exe.clone()],
                 keep_pids: vec![std::process::id()],
@@ -3747,6 +4120,9 @@ mod tests {
     /// A context where anything not at `keep` and not current-version is obsolete.
     fn advice_ctx(keep: &Path) -> ReapContext {
         ReapContext {
+            eligible_processes: None,
+            daemon_descriptors: Vec::new(),
+            current_compat: None,
             current_version: "9.9.9".into(),
             keep_paths: vec![keep.to_path_buf()],
             keep_pids: Vec::new(),
