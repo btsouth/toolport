@@ -1,7 +1,78 @@
 //! Real gateway results and failure guarantees using disposable client configs.
 use conduit_lib::{registry, registry_controller as controller};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn private_fixture_dir(label: &str) -> PathBuf {
+    reserve_private_fixture_dir(
+        label,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    )
+}
+
+fn reserve_private_fixture_dir(label: &str, tick: u128) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "toolport-reviewed-{label}-{}-{tick}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ));
+    // Wall-clock ticks can coincide across threads. Reserve a unique directory,
+    // never accepting another fixture's existing executable or data directory.
+    std::fs::create_dir(&dir)
+        .unwrap_or_else(|error| panic!("could not reserve fixture {}: {error}", dir.display()));
+    dir
+}
+
+fn copy_fixture_image(source: &Path, destination: &Path) {
+    std::fs::copy(source, destination).unwrap_or_else(|error| {
+        panic!(
+            "could not copy fixture image {} to {}: {error}",
+            source.display(),
+            destination.display(),
+        )
+    });
+}
+
+#[test]
+fn reviewed_fixture_parallel_directories_are_private() {
+    let barrier = std::sync::Barrier::new(8);
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dirs = std::thread::scope(|scope| {
+        let threads = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    reserve_private_fixture_dir("parallel", tick)
+                })
+            })
+            .collect::<Vec<_>>();
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        dirs.iter().collect::<std::collections::HashSet<_>>().len(),
+        8
+    );
+    for (index, dir) in dirs.iter().enumerate() {
+        std::fs::write(dir.join("owner"), index.to_string()).unwrap();
+    }
+    for (index, dir) in dirs.iter().enumerate() {
+        assert_eq!(
+            std::fs::read_to_string(dir.join("owner")).unwrap(),
+            index.to_string()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
 
 struct Fixture {
     dir: PathBuf,
@@ -15,14 +86,7 @@ impl Fixture {
             .parent()
             .unwrap()
             .join(format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX));
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-reviewed-setup-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = private_fixture_dir("setup");
         std::fs::create_dir_all(dir.join("client")).unwrap();
         std::fs::create_dir_all(dir.join("data/bin")).unwrap();
         let mut fixture = Self {
@@ -50,14 +114,13 @@ impl Fixture {
             "TOOLPORT_DATA_DIR",
             Some(fixture.dir.join("data").into_os_string()),
         );
-        std::fs::copy(
+        copy_fixture_image(
             &gateway,
-            fixture.dir.join(format!(
+            &fixture.dir.join(format!(
                 "data/bin/toolport-gateway{}",
                 std::env::consts::EXE_SUFFIX
             )),
-        )
-        .unwrap();
+        );
         let mut registry = registry::Registry::default();
         registry.set_client_discovery("claude-code", Some("lazy"));
         registry::save(&registry).unwrap();
@@ -200,40 +263,37 @@ fn run_private_fixture(test: &str) -> bool {
     if std::env::var_os("TOOLPORT_REVIEWED_CHILD").is_some() {
         return false;
     }
-    let dir = std::env::temp_dir().join(format!(
-        "toolport-reviewed-runtime-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let _lock = registry::data_dir_test_lock();
+    let dir = private_fixture_dir("runtime");
     let child = dir.join(format!("reviewed-setup{}", std::env::consts::EXE_SUFFIX));
-    std::fs::copy(std::env::current_exe().unwrap(), &child).unwrap();
+    copy_fixture_image(&std::env::current_exe().unwrap(), &child);
     let gateway = std::env::var_os("TOOLPORT_REVIEWED_TEST_GATEWAY")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_toolport-gateway")));
-    std::fs::copy(
-        gateway,
-        dir.join(format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX)),
-    )
-    .unwrap();
+    copy_fixture_image(
+        &gateway,
+        &dir.join(format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX)),
+    );
     let mock = std::env::var_os("TOOLPORT_REVIEWED_TEST_MOCK")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mock-mcp-server")));
-    std::fs::copy(
-        mock,
-        dir.join(format!("mock-mcp-server{}", std::env::consts::EXE_SUFFIX)),
-    )
-    .unwrap();
+    copy_fixture_image(
+        &mock,
+        &dir.join(format!("mock-mcp-server{}", std::env::consts::EXE_SUFFIX)),
+    );
     let status = std::process::Command::new(&child)
         .env("TOOLPORT_REVIEWED_CHILD", "1")
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .status()
-        .unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
-    assert!(status.success(), "private cold-connect fixture failed");
+        .unwrap_or_else(|error| panic!("could not run {test} at {}: {error}", child.display()));
+    // status() waits for the child to exit before its private images are removed.
+    std::fs::remove_dir_all(&dir)
+        .unwrap_or_else(|error| panic!("could not remove fixture {}: {error}", dir.display()));
+    assert!(
+        status.success(),
+        "private cold-connect fixture {test} at {} failed: {status}",
+        child.display(),
+    );
     true
 }
 
