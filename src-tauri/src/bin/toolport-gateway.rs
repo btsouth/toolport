@@ -2280,12 +2280,6 @@ impl CatalogSnapshot {
                 .and_then(Value::as_str)
                 .cmp(&right.get("name").and_then(Value::as_str))
         });
-        // Upgrade legacy disk snapshots as well as fresh router catalogs.
-        for tool in &mut tools {
-            if let Some(schema) = tool.get_mut("inputSchema") {
-                conduit_lib::router::normalize_tool_schema(schema);
-            }
-        }
         let search = CatalogSearchIndex::build(&tools);
         Self { tools, search }
     }
@@ -9689,14 +9683,20 @@ fn tool_cache_path(profile: Option<&str>) -> Option<PathBuf> {
 const TOOL_CACHE_VERSION: u64 = 2;
 
 fn load_tool_cache(profile: Option<&str>) -> Vec<Value> {
-    tool_cache_path(profile)
+    let mut tools = tool_cache_path(profile)
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         // Only honor a cache written by this catalog version; a bare-array (pre-version)
         // or older-version file has no matching tag and is dropped, forcing a rebuild.
         .filter(|v| v.get("version").and_then(Value::as_u64) == Some(TOOL_CACHE_VERSION))
         .and_then(|v| v.get("tools").and_then(Value::as_array).cloned())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    for tool in &mut tools {
+        if let Some(schema) = tool.get_mut("inputSchema") {
+            conduit_lib::router::normalize_tool_schema(schema);
+        }
+    }
+    tools
 }
 
 fn server_catalog_path(profile: Option<&str>) -> Option<PathBuf> {
@@ -37007,6 +37007,46 @@ mod tests {
             assert_eq!(indexed.broadened, rebuilt.broadened);
             assert_eq!(indexed.direct_returned, rebuilt.direct_returned);
         }
+    }
+
+    #[test]
+    fn schema_compat_snapshot_does_not_normalize_again() {
+        // Only ingress upgrades schemas; a snapshot must preserve its input.
+        let tools = vec![json!({"name": "echo", "inputSchema": {
+            "properties": {"a b": {"minimum": "3"}}
+        }})];
+        assert_eq!(CatalogSnapshot::new(tools.clone()).tools, tools);
+    }
+
+    #[test]
+    #[ignore = "release snapshot benchmark"]
+    fn schema_compat_snapshot_build_10k() {
+        let fixture: Vec<Value> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/schema-compat-public.json"
+        ))
+        .unwrap();
+        let tools: Vec<Value> = (0..10_000)
+            .map(|i| {
+                let mut tool = fixture[i % fixture.len()].clone();
+                conduit_lib::router::normalize_tool_schema(&mut tool["inputSchema"]);
+                tool["name"] = json!(format!("tool_{i:05}"));
+                tool
+            })
+            .collect();
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let input = tools.clone();
+            let start = std::time::Instant::now();
+            let snapshot = CatalogSnapshot::new(input);
+            samples.push(start.elapsed().as_micros());
+            assert_eq!(snapshot.tools.len(), 10_000);
+            std::hint::black_box(snapshot);
+        }
+        samples.sort();
+        println!(
+            "snapshot 10000 tools release median_us={} samples_us={samples:?}",
+            samples[2]
+        );
     }
 
     #[test]

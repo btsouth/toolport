@@ -21,11 +21,14 @@ fn valid_key(key: &str) -> bool {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ArgumentMap {
+    reference: Option<String>,
+    definitions: BTreeMap<String, ArgumentMap>,
+    fallback_patterns: Vec<ArgumentMap>,
     fields: BTreeMap<String, (String, ArgumentMap)>,
     items: Option<Box<ArgumentMap>>,
     tuple: Vec<ArgumentMap>,
     branches: Vec<ArgumentMap>,
-    extra: Option<Box<ArgumentMap>>,
+    extra: Vec<ArgumentMap>,
     patterns: Vec<(regex::Regex, ArgumentMap)>,
     contains: Option<Box<ArgumentMap>>,
     known: BTreeSet<String>,
@@ -33,16 +36,38 @@ pub(crate) struct ArgumentMap {
 
 impl ArgumentMap {
     pub(crate) fn is_empty(&self) -> bool {
-        self.fields.is_empty()
+        self.reference.is_none()
+            && self.fallback_patterns.is_empty()
+            && self.fields.is_empty()
             && self.items.is_none()
             && self.tuple.is_empty()
             && self.branches.is_empty()
-            && self.extra.is_none()
+            && self.extra.is_empty()
             && self.patterns.is_empty()
             && self.contains.is_none()
     }
 
     pub(crate) fn restore(&self, value: &mut Value) -> Result<(), String> {
+        self.restore_node(value, &self.definitions, &mut BTreeSet::new())
+    }
+
+    fn restore_node(
+        &self,
+        value: &mut Value,
+        definitions: &BTreeMap<String, ArgumentMap>,
+        active: &mut BTreeSet<String>,
+    ) -> Result<(), String> {
+        if let Some(reference) = &self.reference {
+            // Pure ref cycles must terminate. Descending into an argument child
+            // starts a new active set, so recursive objects reuse this map.
+            if active.insert(reference.clone()) {
+                if let Some(target) = definitions.get(reference) {
+                    target.restore_node(value, definitions, active)?;
+                }
+                active.remove(reference);
+            }
+            return Ok(());
+        }
         if let Some(object) = value.as_object_mut() {
             for (alias, (original, child)) in &self.fields {
                 if alias != original && object.contains_key(alias) && object.contains_key(original)
@@ -57,17 +82,24 @@ impl ArgumentMap {
                     }
                 }
                 if let Some(value) = object.get_mut(original) {
-                    child.restore(value)?;
+                    child.restore_node(value, definitions, &mut BTreeSet::new())?;
                 }
             }
             for (pattern, child) in &self.patterns {
                 for (key, value) in object.iter_mut() {
                     if pattern.is_match(key) {
-                        child.restore(value)?;
+                        child.restore_node(value, definitions, &mut BTreeSet::new())?;
                     }
                 }
             }
-            if let Some(extra) = &self.extra {
+            for child in &self.fallback_patterns {
+                for (key, value) in object.iter_mut() {
+                    if !self.known.contains(key) {
+                        child.restore_node(value, definitions, &mut BTreeSet::new())?;
+                    }
+                }
+            }
+            for extra in &self.extra {
                 for (key, value) in object.iter_mut() {
                     if !self.known.contains(key)
                         && !self
@@ -75,7 +107,7 @@ impl ArgumentMap {
                             .iter()
                             .any(|(pattern, _)| pattern.is_match(key))
                     {
-                        extra.restore(value)?;
+                        extra.restore_node(value, definitions, &mut BTreeSet::new())?;
                     }
                 }
             }
@@ -83,15 +115,15 @@ impl ArgumentMap {
         if let Some(array) = value.as_array_mut() {
             for (index, value) in array.iter_mut().enumerate() {
                 if let Some(child) = self.tuple.get(index).or(self.items.as_deref()) {
-                    child.restore(value)?;
+                    child.restore_node(value, definitions, &mut BTreeSet::new())?;
                 }
                 if let Some(child) = &self.contains {
-                    child.restore(value)?;
+                    child.restore_node(value, definitions, &mut BTreeSet::new())?;
                 }
             }
         }
         for branch in &self.branches {
-            branch.restore(value)?;
+            branch.restore_node(value, definitions, active)?;
         }
         Ok(())
     }
@@ -124,6 +156,9 @@ fn children(schema: &mut Map<String, Value>, mut visit: impl FnMut(&mut Value)) 
         "items",
         "additionalItems",
         "additionalProperties",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "contentSchema",
         "contains",
         "propertyNames",
         "not",
@@ -168,6 +203,9 @@ fn collect_keys(schema: &mut Value, valid: &mut BTreeSet<String>, invalid: &mut 
 }
 
 pub(crate) fn normalize(schema: &mut Value) -> ArgumentMap {
+    if has_legacy_bounds(schema) {
+        strip_draft04(schema);
+    }
     let mut reserved = BTreeSet::new();
     let mut invalid = BTreeSet::new();
     collect_keys(schema, &mut reserved, &mut invalid);
@@ -201,7 +239,52 @@ pub(crate) fn normalize(schema: &mut Value) -> ArgumentMap {
         }
         aliases.insert(original, alias);
     }
-    normalize_node(schema, &aliases)
+    // Compile local ref targets before normalization changes pointer keys.
+    // Store references by name rather than cyclic owned maps.
+    let mut references = BTreeSet::new();
+    collect_refs(schema, &mut references);
+    let mut definitions = BTreeMap::new();
+    for reference in references {
+        if let Some(target) = reference.strip_prefix('#').and_then(|p| schema.pointer(p)) {
+            definitions.insert(reference, normalize_node(&mut target.clone(), &aliases));
+        }
+    }
+    let mut plan = normalize_node(schema, &aliases);
+    plan.definitions = definitions;
+    plan
+}
+
+fn collect_refs(schema: &mut Value, references: &mut BTreeSet<String>) {
+    if let Some(object) = schema.as_object_mut() {
+        if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+            references.insert(reference.to_string());
+        }
+        children(object, |child| collect_refs(child, references));
+    }
+}
+
+fn has_legacy_bounds(schema: &mut Value) -> bool {
+    let Some(object) = schema.as_object_mut() else {
+        return false;
+    };
+    let mut found = ["exclusiveMinimum", "exclusiveMaximum"]
+        .iter()
+        .any(|key| object.get(*key).is_some_and(Value::is_boolean));
+    children(object, |child| found |= has_legacy_bounds(child));
+    found
+}
+
+fn strip_draft04(schema: &mut Value) {
+    if let Some(object) = schema.as_object_mut() {
+        if object
+            .get("$schema")
+            .and_then(Value::as_str)
+            .is_some_and(|uri| uri.contains("/draft-04/schema"))
+        {
+            object.remove("$schema");
+        }
+        children(object, strip_draft04);
+    }
 }
 
 fn normalize_number(object: &mut Map<String, Value>, key: &str) {
@@ -216,7 +299,20 @@ fn normalize_number(object: &mut Map<String, Value>, key: &str) {
         })
     });
     let number = number.filter(|number| {
-        let value = number.as_f64().unwrap_or(f64::NAN);
+        let parsed = number.as_f64().unwrap_or(f64::NAN);
+        // A nonzero mantissa rounded to zero is not representable.
+        if parsed == 0.0
+            && value.as_str().is_some_and(|s| {
+                s.split(['e', 'E'])
+                    .next()
+                    .unwrap_or(s)
+                    .bytes()
+                    .any(|b| matches!(b, b'1'..=b'9'))
+            })
+        {
+            return false;
+        }
+        let value = parsed;
         if matches!(
             key,
             "minLength"
@@ -290,6 +386,10 @@ fn normalize_node(schema: &mut Value, aliases: &BTreeMap<String, String>) -> Arg
             normalize_number(object, exclusive);
         }
     }
+    let reference = object
+        .get("$ref")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     if let Some(reference) = object.get_mut("$ref") {
         if let Some(pointer) = reference.as_str().and_then(|s| s.strip_prefix("#/")) {
             let mut segments: Vec<String> = pointer.split('/').map(str::to_string).collect();
@@ -311,7 +411,10 @@ fn normalize_node(schema: &mut Value, aliases: &BTreeMap<String, String>) -> Arg
             }
         }
     }
-    let mut plan = ArgumentMap::default();
+    let mut plan = ArgumentMap {
+        reference,
+        ..ArgumentMap::default()
+    };
     if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
         let old = std::mem::take(properties);
         for (original, mut child) in old {
@@ -381,18 +484,20 @@ fn normalize_node(schema: &mut Value, aliases: &BTreeMap<String, String>) -> Arg
             }
         }
     }
-    if plan.items.is_none() {
-        if let Some(child) = object.get_mut("additionalItems") {
+    for keyword in ["additionalItems", "unevaluatedItems"] {
+        if let Some(child) = object.get_mut(keyword) {
             let child = normalize_node(child, aliases);
-            if !child.is_empty() {
+            if !child.is_empty() && plan.items.is_none() {
                 plan.items = Some(Box::new(child));
             }
         }
     }
-    if let Some(child) = object.get_mut("additionalProperties") {
-        let child = normalize_node(child, aliases);
-        if !child.is_empty() {
-            plan.extra = Some(Box::new(child));
+    for keyword in ["additionalProperties", "unevaluatedProperties"] {
+        if let Some(child) = object.get_mut(keyword) {
+            let child = normalize_node(child, aliases);
+            if !child.is_empty() {
+                plan.extra.push(child);
+            }
         }
     }
     // These schemas do not describe a fixed argument position, but still need
@@ -403,11 +508,12 @@ fn normalize_node(schema: &mut Value, aliases: &BTreeMap<String, String>) -> Arg
     {
         for (pattern, child) in map {
             let child = normalize_node(child, aliases);
-            // JSON Schema already requires valid regexes. Keep invalid regexes
-            // unchanged; they cannot define a safe argument mapping.
+            // JSON Schema supports lookaround that Rust regex cannot compile.
+            // Restore the child map for otherwise unknown keys in that case.
             if !child.is_empty() {
-                if let Ok(pattern) = regex::Regex::new(pattern) {
-                    plan.patterns.push((pattern, child));
+                match regex::Regex::new(pattern) {
+                    Ok(pattern) => plan.patterns.push((pattern, child)),
+                    Err(_) => plan.fallback_patterns.push(child),
                 }
             }
         }
@@ -425,12 +531,20 @@ fn normalize_node(schema: &mut Value, aliases: &BTreeMap<String, String>) -> Arg
             }
         }
     }
+    for keyword in ["contentSchema"] {
+        if let Some(child) = object.get_mut(keyword) {
+            let child = normalize_node(child, aliases);
+            if !child.is_empty() {
+                plan.branches.push(child);
+            }
+        }
+    }
     for keyword in ["propertyNames"] {
         if let Some(child) = object.get_mut(keyword) {
             normalize_node(child, aliases);
         }
     }
-    if plan.extra.is_none() {
+    if plan.extra.is_empty() && plan.fallback_patterns.is_empty() {
         plan.known.clear();
     }
     if plan.tuple.iter().all(ArgumentMap::is_empty) && plan.items.is_none() {
@@ -443,6 +557,68 @@ fn normalize_node(schema: &mut Value, aliases: &BTreeMap<String, String>) -> Arg
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn review_lookahead_pattern_restores_unknown_properties() {
+        let mut schema = json!({
+            "properties": {"fixed": {}},
+            "patternProperties": {"^(?!internal)": {"properties": {"a b": {}}}}
+        });
+        let plan = normalize(&mut schema);
+        let mut args = json!({"fixed": {"a_b": 1}, "dynamic": {"a_b": 2}});
+        plan.restore(&mut args).unwrap();
+        assert_eq!(args, json!({"fixed": {"a_b": 1}, "dynamic": {"a b": 2}}));
+    }
+
+    fn check_new_position(keyword: &str, mut args: Value) {
+        let mut schema = json!({keyword: {"properties": {"a b": {"minimum": "3"}}}});
+        let plan = normalize(&mut schema);
+        assert_eq!(schema[keyword]["properties"]["a_b"]["minimum"], 3);
+        plan.restore(&mut args).unwrap();
+        assert!(!args.to_string().contains("a_b"));
+    }
+
+    #[test]
+    fn review_unevaluated_properties() {
+        check_new_position("unevaluatedProperties", json!({"dynamic": {"a_b": 1}}));
+    }
+
+    #[test]
+    fn review_unevaluated_items() {
+        check_new_position("unevaluatedItems", json!([{"a_b": 1}]));
+    }
+
+    #[test]
+    fn review_content_schema() {
+        check_new_position("contentSchema", json!({"a_b": 1}));
+    }
+
+    #[test]
+    fn review_ref_only_cycles_terminate() {
+        let mut schema = json!({"$ref": "#/$defs/A", "$defs": {
+            "A": {"allOf": [{"$ref": "#/$defs/B"}]},
+            "B": {"$ref": "#/$defs/A"}
+        }});
+        let plan = normalize(&mut schema);
+        let mut args = json!({"untouched": 1});
+        plan.restore(&mut args).unwrap();
+        assert_eq!(args, json!({"untouched": 1}));
+    }
+
+    #[test]
+    fn review_draft04_declaration() {
+        let mut schema = json!({"$schema": "http://json-schema.org/draft-04/schema#",
+            "minimum": 3, "exclusiveMinimum": true});
+        normalize(&mut schema);
+        assert!(schema.get("$schema").is_none());
+    }
+
+    #[test]
+    fn review_numeric_underflow() {
+        let mut schema = json!({"minimum": "1e-400"});
+        normalize(&mut schema);
+        assert!(schema.get("minimum").is_none());
+    }
 
     #[test]
     fn draft04_exclusive_bounds_become_numeric() {

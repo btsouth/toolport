@@ -1851,8 +1851,8 @@ impl Router {
             }
             t["name"] = json!(exposed);
             if let Some(schema) = t.get_mut("inputSchema") {
-                inline_refs(schema);
                 let arguments = crate::schema_compat::normalize(schema);
+                inline_refs(schema);
                 if !arguments.is_empty() {
                     self.schema_arguments
                         .insert(exposed.clone(), Arc::new(arguments));
@@ -4080,6 +4080,34 @@ mod tests {
         assert!(!serde_json::to_string(&schema).unwrap().contains("$ref"));
     }
     use crate::downstream::{CancelRegistry, DownstreamServer, Transport};
+
+    #[test]
+    fn schema_compat_recursive_arguments_restore_below_cycles() {
+        let mut server = mock_server("s");
+        server.tools = vec![json!({"name": "echo", "inputSchema": {
+            "$ref": "#/$defs/Node",
+            "$defs": {"Node": {"properties": {
+                "a b": {"type": "string"},
+                "kids": {"type": "array", "items": {"$ref": "#/$defs/Node"}}
+            }}}
+        }})];
+        let mut router = Router::new();
+        router.add(server);
+        let mut args = json!({"a_b": "top", "kids": [
+            {"a_b": "child", "kids": [{"a_b": "grandchild"}]}
+        ]});
+        router.schema_arguments["s__echo"]
+            .restore(&mut args)
+            .unwrap();
+        assert_eq!(
+            args,
+            json!({"a b": "top", "kids": [
+                {"a b": "child", "kids": [{"a b": "grandchild"}]}
+            ]})
+        );
+        let published = router.aggregated_tools();
+        assert!(!published[0]["inputSchema"].to_string().contains("$ref"));
+    }
 
     #[test]
     fn schema_compat_maps_survive_guarded_restoration_and_reindexing() {
