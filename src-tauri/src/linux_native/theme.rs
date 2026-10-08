@@ -793,6 +793,25 @@ button.toolport-activity-filter {{
   border-color: alpha(@toolport_accent, 0.30);
 }}
 
+/* The name is a flat button for opening details; drop button padding so it
+   lines up with the origin and status lines under it. */
+.toolport-card button.toolport-card-title {{
+  padding: 0;
+  margin: 0;
+  min-height: 0;
+  background: none;
+  box-shadow: none;
+}}
+
+.toolport-card button.toolport-card-title:hover label {{
+  text-decoration: underline;
+}}
+
+.toolport-card-off .toolport-card-icon,
+.toolport-card-off button.toolport-card-title {{
+  opacity: 0.6;
+}}
+
 .toolport-details-expander {{
   padding: 11px 14px;
   border: 1px solid alpha(@toolport_fg, 0.10);

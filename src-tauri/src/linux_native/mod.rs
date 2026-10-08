@@ -1523,6 +1523,8 @@ struct ServerPage {
     /// rows without rebuilding them.
     rows: std::rc::Rc<std::cell::RefCell<Vec<(state::ServerView, gtk::Box)>>>,
     no_matches: std::rc::Rc<std::cell::RefCell<Option<gtk::Box>>>,
+    /// Heading above turned-off servers; hidden when the search leaves none.
+    off_heading: std::rc::Rc<std::cell::RefCell<Option<gtk::Box>>>,
     /// Probe results and in-flight probes. Survives re-renders so the list can
     /// group needs-attention servers first, and decides when a server is
     /// launched to check it.
@@ -1614,6 +1616,7 @@ impl ServerPage {
         }
         self.rows.borrow_mut().clear();
         self.no_matches.borrow_mut().take();
+        self.off_heading.borrow_mut().take();
     }
 
     fn render_server_list(&self, snapshot: &state::RegistrySnapshot) {
@@ -1633,9 +1636,23 @@ impl ServerPage {
 
         let mut servers = snapshot.servers.iter().collect::<Vec<_>>();
         servers.sort_by_key(|server| server_order_key(server));
-        let mut rows = Vec::with_capacity(servers.len());
-        for server in servers {
+        // Turned-off servers get their own group below the running ones, so a
+        // disabled server never reads as one that is merely still loading.
+        let (on, off): (Vec<_>, Vec<_>) = servers.into_iter().partition(|server| server.enabled);
+        let mut rows = Vec::with_capacity(on.len() + off.len());
+        for server in on {
             let card = server_card(server, &snapshot.active_profile_id, self.clone());
+            self.list.append(&card);
+            rows.push((server.clone(), card));
+        }
+        if !off.is_empty() {
+            let heading = client_section_title("Turned off", off.len());
+            self.list.append(&heading);
+            *self.off_heading.borrow_mut() = Some(heading);
+        }
+        for server in off {
+            let card = server_card(server, &snapshot.active_profile_id, self.clone());
+            card.add_css_class("toolport-card-off");
             self.list.append(&card);
             rows.push((server.clone(), card));
         }
@@ -1657,10 +1674,15 @@ impl ServerPage {
     fn apply_filter(&self) {
         let query = self.search.text();
         let mut any = false;
+        let mut any_off = false;
         for (server, card) in self.rows.borrow().iter() {
             let visible = server_matches_query(server, query.as_str());
             card.set_visible(visible);
             any |= visible;
+            any_off |= visible && !server.enabled;
+        }
+        if let Some(heading) = self.off_heading.borrow().as_ref() {
+            heading.set_visible(any_off);
         }
         if let Some(no_matches) = self.no_matches.borrow().as_ref() {
             no_matches.set_visible(!any && !self.rows.borrow().is_empty());
@@ -5880,6 +5902,7 @@ fn build_content(
             ),
             rows: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             no_matches: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            off_heading: std::rc::Rc::new(std::cell::RefCell::new(None)),
             health: std::rc::Rc::new(std::cell::RefCell::new(health::HealthCache::default())),
         },
     );
@@ -6896,7 +6919,7 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
     let details = gtk::Button::builder()
         .child(&bounded_title(&server.name))
         .halign(gtk::Align::Fill)
-        .css_classes(["flat", "heading"])
+        .css_classes(["flat", "heading", "toolport-card-title"])
         .tooltip_text(&server.name)
         .build();
     let server_for_details = server.clone();
