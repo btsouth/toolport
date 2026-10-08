@@ -24,8 +24,8 @@ pub use discovery::DiscoveryCapabilities;
 mod moved;
 mod mutation;
 mod restore;
-pub(crate) use restore::after_rollback as record_config_rollback;
 pub(crate) use restore::after_capture_conflict as record_config_capture_conflict;
+pub(crate) use restore::after_rollback as record_config_rollback;
 mod zcode;
 
 /// One MCP server, normalized across every client format.
@@ -3309,7 +3309,7 @@ fn find_def(client_id: &str) -> Option<ClientDef> {
     defs().into_iter().find(|d| d.id == client_id)
 }
 
-fn backup_dir(client_id: &str) -> Option<PathBuf> {
+pub(crate) fn backup_dir(client_id: &str) -> Option<PathBuf> {
     // Anchor to the same home-based dir as the registry (see registry::conduit_dir)
     // so config backups land in one place regardless of whether a packaged or
     // unpackaged process wrote them.
@@ -4741,7 +4741,9 @@ fn atomic_write_yaml_config(
             reject_duplicate_top_level_yaml_key(src, changed_key)?;
             rewrite_yaml_key_preserving(src, changed_key, val)?
         }
-        (Some(src), None) if !src.trim().is_empty() => remove_yaml_key_preserving(src, changed_key)?,
+        (Some(src), None) if !src.trim().is_empty() => {
+            remove_yaml_key_preserving(src, changed_key)?
+        }
         _ => pretty()?,
     };
     parse_existing_yaml_content(&out)?;
@@ -6283,7 +6285,11 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             moved::restore(client_id, def.format, &path)?;
         }
         let restored = read_client(&def).servers;
-        restored_names.retain(|name| restored.iter().any(|server| server.name.eq_ignore_ascii_case(name)));
+        restored_names.retain(|name| {
+            restored
+                .iter()
+                .any(|server| server.name.eq_ignore_ascii_case(name))
+        });
         return Ok(WriteOutcome {
             path: path.display().to_string(),
             backup: backup.map(|p| p.display().to_string()),
@@ -6336,29 +6342,68 @@ pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) -> Result<(), S
     Ok(())
 }
 
-/// Replace a client's entire server list with just the Toolport gateway. Used by
-/// "migrate": after the client's servers are imported into Toolport, this leaves
-/// the client talking only to the gateway. Backs up first; unrelated config keys
-/// are preserved. Caller is responsible for importing first so nothing is lost.
-/// Explicit migration writes the stdio adapter entry.
-pub fn migrate_to_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOutcome, String> {
-    let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
+/// Snapshot token binds review to the server container, including credential changes.
+/// Only its hash crosses the UI boundary.
+pub fn setup_revision(client_id: &str) -> Result<String, String> {
+    let def = find_def(client_id).ok_or("Unknown client")?;
     let path = resolved_definition_path(&def)?;
-    mutation::run(client_id, &path, def.format, || {
-        revision_outcome(client_id, migrate_to_gateway_inner(client_id, profile))
-    })
+    let content = if mutation::exists(&path) {
+        read_config_file(&path)?
+    } else {
+        String::new()
+    };
+    let root = mutation::value(def.format, Some(&content))?;
+    let content = moved::server_container(def.format, &root);
+    Ok(crate::registry::sha256_hex(&format!(
+        "{}:{}:{content}",
+        path.display(),
+        mutation::exists(&path)
+    )))
 }
 
-fn migrate_to_gateway_inner(
+/// Hold the existing config transaction while the reviewed servers are imported
+/// and verified. No native definition is removed until verification succeeds.
+pub(crate) fn migrate_reviewed(
     client_id: &str,
     profile: Option<&str>,
+    names: &[String],
+    revision: &str,
+    mut prepare: impl FnMut() -> Result<(), String>,
 ) -> Result<WriteOutcome, String> {
-    let entry = gateway_entry(profile, client_id)?;
-    // Keep what this rewrite drops so Disconnect can put it back (UX-03).
-    let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
+    let def = find_def(client_id).ok_or("Unknown client")?;
     let path = resolved_definition_path(&def)?;
-    moved::record(client_id, def.format, &path)?;
-    write_servers(client_id, &[entry])
+    mutation::run(client_id, &path, def.format, || {
+        if setup_revision(client_id)? != revision {
+            return Err(
+                "Client config changed. Review it again before connecting. Config unchanged."
+                    .into(),
+            );
+        }
+        prepare()?;
+        let backup = backup_file(client_id, &path)?;
+        moved::record_selected(client_id, def.format, &path, names)?;
+        moved::remove_selected(def.format, &path, names)?;
+        let entry = gateway_entry(profile, client_id)?;
+        edit_format(
+            def.format,
+            &path,
+            Some(&entry),
+            config_is_whole_app_state(client_id),
+        )?;
+        revision_outcome(
+            client_id,
+            Ok(WriteOutcome {
+                path: path.display().to_string(),
+                backup: backup.map(|p| p.display().to_string()),
+                managed: Some(ManagedEntry::from_gateway_entry(&entry)),
+                restored: Vec::new(),
+                used_move_record: false,
+                revision: None,
+                warnings: Vec::new(),
+                recovery_path: None,
+            }),
+        )
+    })
 }
 
 /// Whether a stored client-config command is recognizably one of *our* gateway

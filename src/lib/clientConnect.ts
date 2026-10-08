@@ -19,11 +19,3 @@ export function clientRestartHint(clientName: string): string {
 export function clientRestartHintAfterRemoval(clientName: string): string {
   return `Restart ${clientName} so it stops loading Toolport.`;
 }
-
-/** Connect/rescope toast body: restart first, then optional scope/backup notes. */
-export function connectSuccessDescription(
-  clientName: string,
-  extras: Array<string | undefined | null | false> = [],
-): string {
-  return [clientRestartHint(clientName), ...extras.filter(Boolean)].join(" ");
-}

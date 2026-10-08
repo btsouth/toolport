@@ -6,27 +6,15 @@ use std::time::{Duration, Instant};
 use adw::prelude::*;
 
 use super::state::{self, ClientGatewayState, ClientSnapshot};
-use super::ClientPage;
 
 const MARKER: &str = "gtk-onboarding-complete";
 
-pub(super) fn install(
-    app: &adw::Application,
-    parent: &adw::ApplicationWindow,
-    client_page: ClientPage,
-) {
+pub(super) fn install(app: &adw::Application, parent: &adw::ApplicationWindow) {
     if app.lookup_action("show-onboarding").is_none() {
         let action = gtk::gio::SimpleAction::new("show-onboarding", None);
         let app_for_action = app.clone();
         let parent_for_action = parent.clone();
-        let clients_for_action = client_page.clone();
-        action.connect_activate(move |_, _| {
-            present(
-                &app_for_action,
-                &parent_for_action,
-                clients_for_action.clone(),
-            )
-        });
+        action.connect_activate(move |_, _| present(&app_for_action, &parent_for_action));
         app.add_action(&action);
     }
 
@@ -35,7 +23,7 @@ pub(super) fn install(
     gtk::glib::spawn_future_local(async move {
         let needed = gtk::gio::spawn_blocking(first_run_needed).await;
         if matches!(needed, Ok(Ok(true))) {
-            present(&app, &parent, client_page);
+            present(&app, &parent);
         } else if let Ok(Err(error)) = needed {
             eprintln!("toolport: could not check native onboarding state: {error}");
         }
@@ -95,7 +83,7 @@ pub(super) fn mark_complete() -> Result<(), String> {
         .map_err(|error| format!("could not save setup completion: {error}"))
 }
 
-fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page: ClientPage) {
+fn present(app: &adw::Application, parent: &adw::ApplicationWindow) {
     if let Some(window) = app
         .windows()
         .into_iter()
@@ -186,7 +174,7 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
 
     let add = wizard_page(
         "Add your first servers",
-        "Choose a Collection, import servers already configured in a client, or continue to the full catalog.",
+        "Choose a Collection, review and connect a client, or continue to the full catalog.",
     );
     let stack_feedback = feedback_label("Choose a Collection or continue when you are ready.");
     add.append(&stack_feedback);
@@ -221,40 +209,20 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
         let entries = starter.servers;
         let name = starter.name;
         let feedback = stack_feedback.clone();
+        let parent = window.clone();
         add_stack.connect_clicked(move |button| {
-            button.set_sensitive(false);
             let button = button.clone();
-            let entries = entries.clone();
-            let name = name.clone();
             let feedback = feedback.clone();
-            gtk::glib::spawn_future_local(async move {
-                let result = gtk::gio::spawn_blocking(move || {
-                    crate::registry_controller::add_catalog_stack(entries)
-                })
-                .await;
-                button.set_sensitive(true);
-                match result {
-                    Ok(Ok((_, count))) => {
-                        button.set_label("Added");
-                        button.set_sensitive(false);
-                        show_success(
-                            &feedback,
-                            &format!(
-                                "Added {count} server{} from {name}. They stay disabled until reviewed.",
-                                if count == 1 { "" } else { "s" }
-                            ),
-                        );
-                    }
-                    Ok(Err(error)) => show_error(&feedback, &error),
-                    Err(_) => show_error(&feedback, "the collection setup task stopped unexpectedly"),
-                }
+            super::setup::collection(parent.upcast_ref(), &name, entries.clone(), move || {
+                button.set_label("Added");
+                show_success(&feedback, "Added selected servers. Check status and complete any missing setup inputs under Servers.");
             });
         });
         row.append(&add_stack);
         stack_list.append(&row);
     }
     add.append(&stack_list);
-    let import = gtk::Button::with_label("Import servers from clients");
+    let import = gtk::Button::with_label("Review and connect clients");
     import.add_css_class("toolport-secondary-action");
     add.append(&import);
     let add_nav = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -359,15 +327,12 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
             activate_page(&app_for_catalog, "show-catalog");
         }
     });
-    let app_for_import = app.clone();
-    let window_for_import = window.clone();
-    let feedback_for_import = stack_feedback.clone();
-    let client_page_for_import = client_page.clone();
+    let stack_for_import = stack.clone();
+    let list_for_import = connect_list.clone();
+    let feedback_for_import = connect_feedback.clone();
     import.connect_clicked(move |_| {
-        if complete_and_close(&window_for_import, &feedback_for_import) {
-            activate_page(&app_for_import, "show-clients");
-            client_page_for_import.preview_imports();
-        }
+        load_clients(&list_for_import, &feedback_for_import);
+        stack_for_import.set_visible_child_name("connect");
     });
     let list_for_rescan = connect_list.clone();
     let feedback_for_rescan = connect_feedback.clone();
@@ -525,36 +490,13 @@ fn render_clients(list: &gtk::Box, feedback: &gtk::Label, snapshot: ClientSnapsh
             let list = list.clone();
             let feedback = feedback.clone();
             connect.connect_clicked(move |button| {
-                button.set_sensitive(false);
-                let button = button.clone();
-                let client_id = client_id.clone();
+                let Some(parent) = button.root().and_downcast::<gtk::Window>() else {
+                    return;
+                };
                 let list = list.clone();
                 let feedback = feedback.clone();
-                gtk::glib::spawn_future_local(async move {
-                    let result = gtk::gio::spawn_blocking(move || {
-                        crate::registry_controller::connect_client_stdio(&client_id, None, false)
-                    })
-                    .await;
-                    match result {
-                        Ok(Ok(_)) => {
-                            show_success(
-                                &feedback,
-                                "Client connected. Restart it if it was already open.",
-                            );
-                            load_clients(&list, &feedback);
-                        }
-                        Ok(Err(error)) => {
-                            button.set_sensitive(true);
-                            show_error(&feedback, &error);
-                        }
-                        Err(_) => {
-                            button.set_sensitive(true);
-                            show_error(
-                                &feedback,
-                                "the client connection task stopped unexpectedly",
-                            );
-                        }
-                    }
+                super::setup::connect(&parent, client_id.clone(), None, false, move || {
+                    load_clients(&list, &feedback)
                 });
             });
             row.append(&connect);

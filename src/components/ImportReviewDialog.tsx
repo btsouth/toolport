@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, ShieldAlert } from "lucide-react";
+import { Check, Loader2, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -15,6 +15,11 @@ interface Props {
   items: ImportItem[];
   busy?: boolean;
   title?: string;
+  description?: string;
+  confirmLabel?: string;
+  allowEmpty?: boolean;
+  details?: string;
+  error?: string;
   onOpenChange: (open: boolean) => void;
   onConfirm: (keys: string[]) => void;
 }
@@ -25,6 +30,11 @@ export function ImportReviewDialog({
   items,
   busy = false,
   title = "Review servers to import",
+  description,
+  confirmLabel,
+  allowEmpty = false,
+  details,
+  error,
   onOpenChange,
   onConfirm,
 }: Props) {
@@ -36,6 +46,11 @@ export function ImportReviewDialog({
         items={items}
         busy={busy}
         title={title}
+        description={description}
+        confirmLabel={confirmLabel}
+        allowEmpty={allowEmpty}
+        details={details}
+        error={error}
         onOpenChange={onOpenChange}
         onConfirm={onConfirm}
       />
@@ -47,6 +62,11 @@ function ImportReviewContent({
   items,
   busy = false,
   title = "Review servers to import",
+  description,
+  confirmLabel,
+  allowEmpty = false,
+  details,
+  error,
   onOpenChange,
   onConfirm,
 }: Omit<Props, "open">) {
@@ -66,9 +86,22 @@ function ImportReviewContent({
       </DialogHeader>
       <div className="flex flex-col gap-4 py-1">
         <p className="text-xs text-muted-foreground">
-          Review the commands and URLs before adding them. You can leave any server
-          unchecked and import only the ones you want.
+          {description ??
+            "Review the commands and URLs before adding them. Leave any server unchecked to keep it as it is."}
         </p>
+        {details && (
+          <details>
+            <summary className="text-xs">Details</summary>
+            <p className="mt-2 whitespace-pre-wrap break-all text-xs text-muted-foreground">
+              {details}
+            </p>
+          </details>
+        )}
+        {error && (
+          <p role="alert" className="text-sm text-warning">
+            {error}
+          </p>
+        )}
         <div className="flex max-h-72 flex-col gap-2 overflow-y-auto">
           {keyedItems.map(({ item, key }) => {
             const isSelected = selected.has(key);
@@ -77,8 +110,14 @@ function ImportReviewContent({
                 key={key}
                 type="button"
                 aria-pressed={isSelected}
+                disabled={busy}
+                data-failed={!!error?.includes(item.name)}
                 className={`rounded-md text-left transition-colors ${
-                  isSelected ? "ring-1 ring-success/60" : "opacity-60"
+                  error?.includes(item.name)
+                    ? "ring-1 ring-warning"
+                    : isSelected
+                      ? "ring-1 ring-success/60"
+                      : "opacity-60"
                 }`}
                 onClick={() =>
                   setSelected((previous) => {
@@ -90,6 +129,12 @@ function ImportReviewContent({
                 }
               >
                 <ImportRow item={item} selected={isSelected} />
+                {busy && isSelected && (
+                  <p role="status" className="flex gap-2 px-3 pb-2 text-xs">
+                    <Loader2 className="size-3 animate-spin" />
+                    Checking {item.name}...
+                  </p>
+                )}
               </button>
             );
           })}
@@ -101,12 +146,13 @@ function ImportReviewContent({
         </Button>
         <Button
           onClick={() => onConfirm(Array.from(selected))}
-          disabled={busy || selectedCount === 0}
+          disabled={busy || (!allowEmpty && selectedCount === 0)}
         >
           <Check className="size-4" />
-          {selectedCount === 0
-            ? "Select a server"
-            : `Import ${selectedCount} server${selectedCount === 1 ? "" : "s"}`}
+          {confirmLabel ??
+            (selectedCount === 0
+              ? "Select a server"
+              : `Import ${selectedCount} server${selectedCount === 1 ? "" : "s"}`)}
         </Button>
       </DialogFooter>
     </DialogContent>
@@ -131,14 +177,32 @@ export function ImportRow({ item, selected }: { item: ImportItem; selected?: boo
           />
         )}
         <span className="truncate text-sm font-medium">{item.name}</span>
-        {!item.isNew && (
+        {
           <span className="ml-auto shrink-0 text-xs text-muted-foreground">
-            already added
+            {item.isNew ? "New" : "In Toolport"}
           </span>
-        )}
+        }
       </div>
       {runs && (
-        <p className="mt-1 font-mono text-xs break-all text-muted-foreground">{runs}</p>
+        <p
+          title={runs}
+          aria-label={runs}
+          className="mt-1 flex min-w-0 font-mono text-xs text-muted-foreground"
+        >
+          {runs.length > 72 ? (
+            <>
+              <span className="min-w-0 truncate">{runs.slice(0, -28)}</span>
+              <span className="shrink-0">{runs.slice(-28)}</span>
+            </>
+          ) : (
+            runs
+          )}
+        </p>
+      )}
+      {!!item.envKeys?.length && (
+        <p className="mt-1 text-xs text-warning">
+          Credentials: {item.envKeys.join(", ")}. Review their status before connecting.
+        </p>
       )}
       {shell && (
         <p className="mt-1.5 flex items-center gap-1.5 text-xs text-warning">

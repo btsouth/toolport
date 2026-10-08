@@ -146,6 +146,10 @@ impl Config {
                 .map(std::time::Duration::from_millis),
             start_delay: std::env::var("MOCK_MCP_START_DELAY_MS")
                 .ok()
+                .or_else(|| {
+                    std::env::args()
+                        .find_map(|arg| arg.strip_prefix("--start-delay-ms=").map(str::to_string))
+                })
                 .and_then(|raw| raw.trim().parse().ok())
                 .map(std::time::Duration::from_millis),
             garbage_stdout: std::env::var("MOCK_MCP_GARBAGE_STDOUT_MS")

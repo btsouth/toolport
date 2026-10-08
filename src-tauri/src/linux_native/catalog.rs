@@ -90,7 +90,7 @@ impl CatalogPage {
         );
         page.append(
             &gtk::Label::builder()
-                .label("Browse Toolport's curated picks or search the official MCP Registry. Added servers start disabled so you can review and authenticate them first.")
+                .label("Browse Toolport's curated picks or search the official MCP Registry. Valid servers turn on. Missing credentials and setup inputs stay off.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
@@ -795,11 +795,7 @@ fn stack_card(
             .css_classes(["caption", "toolport-muted"])
             .build(),
     );
-    let add = gtk::Button::with_label(if missing == 0 {
-        "Added"
-    } else {
-        "Add Collection"
-    });
+    let add = gtk::Button::with_label(if missing == 0 { "Added" } else { "Add Collection" });
     add.set_sensitive(missing > 0);
     add.add_css_class(if missing == 0 {
         "toolport-secondary-action"
@@ -816,30 +812,11 @@ fn stack_card(
         })
         .cloned()
         .collect();
-    add.connect_clicked(move |button| {
-        button.set_sensitive(false);
+    add.connect_clicked(move |_| {
+        let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else { return; };
         let entries = missing_entries.clone();
-        let name = name.clone();
-        let button = button.clone();
-        let page = page.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::registry_controller::add_catalog_stack(entries)
-            })
-            .await;
-            button.set_sensitive(true);
-            match result {
-                Ok(Ok((_, added))) => {
-                    page.pending_notice.replace(Some(format!(
-                        "Added {added} server{} from {name}. Review and enable them in Servers.",
-                        if added == 1 { "" } else { "s" }
-                    )));
-                    page.refresh();
-                }
-                Ok(Err(error)) => page.show_error(&error),
-                Err(_) => page.show_error("the collection setup stopped unexpectedly"),
-            }
-        });
+        let refreshed = page.clone();
+        super::setup::collection(&parent, &name, entries, move || refreshed.refresh());
     });
     footer.append(&add);
     card.append(&footer);

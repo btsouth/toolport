@@ -116,7 +116,16 @@ describe("Onboarding collection loading", () => {
       const label = screen.getByText("Memory").parentElement!;
       expect(label.querySelector("svg.text-success") !== null).toBe(match);
       await user.click(screen.getByRole("button", { name: "Add this Collection" }));
-      await waitFor(() => expect(props.onRegistryChange).toHaveBeenCalled());
+      const confirm = await screen.findByRole("button", { name: "Add selected servers" });
+      expect(addCatalogServer).not.toHaveBeenCalled();
+      if (match) {
+        expect(confirm).toBeDisabled();
+        expect(props.onRegistryChange).not.toHaveBeenCalled();
+      } else {
+        expect(confirm).toBeEnabled();
+        await user.click(confirm);
+        await waitFor(() => expect(props.onRegistryChange).toHaveBeenCalled());
+      }
       expect(addCatalogServer).toHaveBeenCalledTimes(match ? 0 : 1);
     },
   );

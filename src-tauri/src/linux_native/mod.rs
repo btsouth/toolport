@@ -13,6 +13,7 @@ mod package_updates;
 mod pairing;
 mod settings;
 mod single_instance;
+mod setup;
 mod state;
 mod teams;
 mod theme;
@@ -489,7 +490,7 @@ fn build_window(
     state.attach(&window);
     approval_page.attach(&window);
     teams_page.attach_background_sync(&window);
-    onboarding::install(app, &window, client_page);
+    onboarding::install(app, &window);
     if std::env::var_os("TOOLPORT_DEBUG_MEASURE").is_none() {
         start_startup_reap(app, bridge_for_reap, server_page_for_reap);
     }
@@ -1575,7 +1576,7 @@ impl ServerPage {
                 self.list.append(&state_card(
                     "network-server-symbolic",
                     "Toolport is ready for setup",
-                    "Use Add server for a custom endpoint or open Catalog for a curated starting point. New servers stay disabled until you review them.",
+                    "Use Add server for a custom endpoint or open Catalog for a curated starting point. Valid servers turn on. Missing setup inputs stay off.",
                     false,
                 ));
             }
@@ -2039,7 +2040,7 @@ impl ClientPage {
         body.add_css_class("toolport-editor-body");
         body.append(
             &gtk::Label::builder()
-                .label("Review the local servers Toolport found. Imported servers start disabled so you can inspect credentials and commands before enabling them.")
+                .label("Review the local servers Toolport found. Valid servers turn on. Servers needing credentials or launch values stay off until setup is complete.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
@@ -2491,33 +2492,6 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.set_halign(gtk::Align::End);
     actions.set_valign(gtk::Align::Center);
-    if !client.uses_connectors
-        && client.movable_server_count > 0
-        && !client.config_error
-        && client.gateway_state != state::ClientGatewayState::Connected
-    {
-        let migrate = gtk::Button::with_label(&format!("Move in {}", client.movable_server_count));
-        migrate.add_css_class("toolport-secondary-action");
-        migrate.set_tooltip_text(Some(&format!(
-            "Import the {} {} this client manages directly, then rewrite its config to use only the Toolport gateway",
-            client.movable_server_count,
-            if client.movable_server_count == 1 {
-                "server"
-            } else {
-                "servers"
-            }
-        )));
-        let client_for_migrate = client.clone();
-        let page_for_migrate = page.clone();
-        migrate.connect_clicked(move |button| {
-            confirm_client_migrate(
-                &client_for_migrate,
-                button.clone(),
-                page_for_migrate.clone(),
-            );
-        });
-        actions.append(&migrate);
-    }
     if client.legacy_bearer_argv {
         let warning = gtk::Label::new(Some("This older HTTP connection exposes a bearer credential in process arguments. Review migration to stdio; it stays unchanged until you confirm."));
         warning.set_wrap(true);
@@ -2537,13 +2511,9 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             connect.add_css_class("suggested-action");
             let client_for_connect = client.clone();
             let page_for_connect = page.clone();
-            connect.connect_clicked(move |button| {
-                run_client_mutation(
+            connect.connect_clicked(move |_| {
+                confirm_client_migrate(
                     &client_for_connect,
-                    true,
-                    false,
-                    None,
-                    button,
                     page_for_connect.clone(),
                 );
             });
@@ -2571,80 +2541,17 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
     card
 }
 
-/// The feedback line after a one-shot migration. States what moved, what was
-/// newly imported, and that a backup exists - the user is about to restart the
-/// client and needs to know the old config is recoverable.
-fn migrate_feedback(client_name: &str, imported: usize, moved: usize, backup: bool) -> String {
-    let mut message = format!(
-        "Moved {moved} {} into Toolport ({imported} newly imported). {client_name} now uses only the Toolport gateway.",
-        if moved == 1 { "server" } else { "servers" }
-    );
-    if backup {
-        message.push_str(" The previous config was backed up.");
-    }
-    message.push_str(" Restart the client to pick this up.");
-    message
-}
-
-fn confirm_client_migrate(client: &state::ClientView, button: gtk::Button, page: ClientPage) {
+fn confirm_client_migrate(client: &state::ClientView, page: ClientPage) {
     let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else {
         return;
     };
-    let count = client.movable_server_count;
-    let mut body = format!(
-        "Toolport imports the {count} {} this client manages directly, turns them on, backs the config up, and rewrites it to contain only the Toolport gateway. Plugin-managed servers are left untouched. Secret values are never read from the client; add them under Credentials after the move.",
-        if count == 1 { "server" } else { "servers" }
+    setup::connect(
+        &parent,
+        client.id.clone(),
+        client.scope_id.clone(),
+        client.gateway_state == state::ClientGatewayState::Customized,
+        move || page.refresh(),
     );
-    let force = client.gateway_state == state::ClientGatewayState::Customized;
-    if force {
-        body.push_str(
-            "\n\nThis client's Toolport entry has a custom configuration; migrating replaces it with the default gateway entry.",
-        );
-    }
-    #[allow(deprecated)]
-    let dialog = adw::MessageDialog::new(
-        Some(&parent),
-        Some(&format!("Move {}'s servers into Toolport?", client.name)),
-        Some(&body),
-    );
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("migrate", "Move into gateway");
-    dialog.set_close_response("cancel");
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_response_appearance("migrate", adw::ResponseAppearance::Suggested);
-    let client = client.clone();
-    dialog.connect_response(None, move |dialog, response| {
-        if response == "migrate" {
-            button.set_sensitive(false);
-            page.show_progress("Moving servers into Toolport…");
-            let client_id = client.id.clone();
-            let client_name = client.name.clone();
-            let scope = client.scope_id.clone();
-            let page = page.clone();
-            let button = button.clone();
-            gtk::glib::spawn_future_local(async move {
-                let result = gtk::gio::spawn_blocking(move || {
-                    crate::registry_controller::migrate_client(&client_id, scope.as_deref(), force)
-                })
-                .await;
-                button.set_sensitive(true);
-                match result {
-                    Ok(Ok(outcome)) => {
-                        page.refresh_with_confirmation(migrate_feedback(
-                            &client_name,
-                            outcome.imported,
-                            outcome.moved.len(),
-                            outcome.result.outcome.backup.is_some(),
-                        ));
-                    }
-                    Ok(Err(error)) => page.show_error(&format!("{client_name}: {error}")),
-                    Err(_) => page.show_error(&format!("{client_name}: the migration stopped")),
-                }
-            });
-        }
-        dialog.close();
-    });
-    dialog.present();
 }
 
 fn append_client_discovery_actions(
@@ -2742,11 +2649,10 @@ fn connected_client_actions_menu(client: state::ClientView, page: ClientPage) ->
         let client_for_migrate = client.clone();
         let page_for_migrate = page.clone();
         let menu_for_migrate = menu.clone();
-        migrate.connect_clicked(move |button| {
+        migrate.connect_clicked(move |_| {
             menu_for_migrate.popdown();
             confirm_client_migrate(
                 &client_for_migrate,
-                button.clone(),
                 page_for_migrate.clone(),
             );
         });
@@ -8683,7 +8589,8 @@ fn open_server_editor_prefilled(
         let url_for_fill = url.clone();
         let cwd_for_fill = cwd.clone();
         let env_for_fill = snippet_env.clone();
-        fill.connect_clicked(move |_| {
+        let page_for_fill = page.clone();
+        fill.connect_clicked(move |fill| {
             let buffer = snippet.buffer();
             let text = buffer
                 .text(&buffer.start_iter(), &buffer.end_iter(), false)
@@ -8701,6 +8608,16 @@ fn open_server_editor_prefilled(
             feedback_for_fill.set_visible(true);
             match parsed {
                 Ok(servers) => {
+                    if servers.len() > 1 {
+                        let Some(parent) = fill.root().and_downcast::<gtk::Window>() else { return; };
+                        let items = servers.iter().enumerate().map(|(i, s)| crate::registry_controller::SetupItem {key:i.to_string(),name:s.name.clone(),transport:s.transport.clone(),command:s.command.clone(),args:s.args.clone(),url:s.url.clone(),env_keys:s.env.iter().map(|e| e.key.clone()).collect(),is_new:true}).collect();
+                        setup::review(&parent, "Review pasted servers", items, "Review each command and URL. Credentials go to the keychain. Missing inputs stay off.", "Add selected servers", move |selected| {
+                            let outcome = crate::registry_controller::add_snippet_servers(&text, &selected)?;
+                            if !outcome.failed.is_empty() { return Err("Could not save credentials. Open Credentials and retry.".into()); }
+                            Ok("Added selected servers. Check their status under Servers.".into())
+                        }, { let page = page_for_fill.clone(); move || run_profile_mutation(page.clone(), "Added selected servers", crate::registry_controller::registry_for_disconnect) });
+                        return;
+                    }
                     let Some(first) = servers.first() else {
                         feedback_for_fill.set_label("No servers found in the pasted config.");
                         feedback_for_fill.remove_css_class("success");
@@ -10139,21 +10056,6 @@ mod tests {
         first.requires_review = !first.requires_review;
         assert_eq!(server_order_key(&first), before);
         assert!(server_order_key(&first) < server_order_key(&second));
-    }
-
-    #[test]
-    fn migrate_feedback_reports_moved_imported_and_the_backup() {
-        assert_eq!(
-            migrate_feedback("Claude Desktop", 2, 3, true),
-            "Moved 3 servers into Toolport (2 newly imported). Claude Desktop now uses only \
-             the Toolport gateway. The previous config was backed up. Restart the client to \
-             pick this up."
-        );
-        assert_eq!(
-            migrate_feedback("Zed", 0, 1, false),
-            "Moved 1 server into Toolport (0 newly imported). Zed now uses only the Toolport \
-             gateway. Restart the client to pick this up."
-        );
     }
 
     #[test]

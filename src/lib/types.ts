@@ -59,10 +59,20 @@ export interface WriteOutcome {
   restored?: string[];
 }
 
+export interface ClientSetupReview {
+  configPath: string;
+  backupDir: string;
+  revision: string;
+  items: ImportItem[];
+}
+
 export interface MigrateResult {
   registry: Registry;
   imported: number;
+  servers: { name: string; toolCount: number; credentialState: string }[];
   moved: string[];
+  tools: { name: string; description?: string }[];
+  outcome: WriteOutcome;
 }
 
 export interface AuditEntry {
@@ -326,6 +336,7 @@ export interface AuthInfo {
 
 /** One server a shared setup would add, shown for review before importing. */
 export interface ImportItem {
+  envKeys?: string[];
   /** Opaque key used to confirm a detected-client import. Absent for shared setups. */
   key?: string;
   name: string;

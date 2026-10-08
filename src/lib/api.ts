@@ -606,9 +606,13 @@ export function migrateClient(
   clientId: string,
   profile?: string,
   force?: boolean,
+  selected: string[] = [],
+  revision = "",
 ): Promise<MigrateResult> {
   return invoke<MigrateResult>("migrate_client", {
     clientId,
+    selected,
+    revision,
     profile: profile ?? null,
     force: force ?? false,
   });
@@ -954,4 +958,14 @@ export interface DisconnectResult {
 
 export function disconnectAllClients(): Promise<DisconnectResult[]> {
   return invoke("disconnect_all_clients");
+}
+
+export function previewClientSetup(
+  clientId: string,
+): Promise<import("@/lib/types").ClientSetupReview> {
+  return invoke("preview_client_setup", { clientId });
+}
+
+export function addSnippetServers(text: string, selected: string[]): Promise<Registry> {
+  return invoke("add_snippet_servers", { text, selected });
 }

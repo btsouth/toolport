@@ -797,7 +797,11 @@ fn protocol_meta_for_catalog(version: &str, server_capabilities: Option<&Value>)
 /// Max time to wait for a single stdio response before giving up. Without this a
 /// server that never replies would block its thread (and the batch health probe)
 /// forever.
-const STDIO_READ_TIMEOUT: Duration = Duration::from_secs(30);
+pub const STDIO_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Leave time for private setup discovery to return its verified-tool diagnostic
+/// before the caller's stdio read deadline expires.
+pub const SETUP_CATALOG_WAIT_BUDGET: Duration =
+    STDIO_READ_TIMEOUT.saturating_sub(Duration::from_secs(5));
 /// Tighter bound for the connect handshake (initialize + tools/list). The batch
 /// probe and every router rebuild connect to all servers and wait on the slowest,
 /// so one hung server should fail in seconds, not stall everything for the full

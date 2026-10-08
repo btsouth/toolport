@@ -82,6 +82,17 @@ fn container(format: Format) -> Container {
     }
 }
 
+pub(super) fn server_container(format: Format, root: &serde_json::Value) -> serde_json::Value {
+    match container(format) {
+        Container::Json { key, nested } => {
+            let value = &root[key];
+            nested.map_or_else(|| value.clone(), |key| value[key].clone())
+        }
+        Container::Toml => root["mcp_servers"].clone(),
+        Container::YamlMap(key) | Container::YamlList(key) => root[key].clone(),
+    }
+}
+
 fn record_path(client_id: &str) -> Result<PathBuf, String> {
     Ok(backup_dir(client_id)
         .ok_or("Could not resolve backup dir")?
@@ -140,7 +151,21 @@ pub(super) fn recorded_paths() -> Vec<(String, PathBuf, Result<Format, String>)>
 /// Copy every non-gateway entry in `path` into the client's move record before
 /// migration strips them. Entries already recorded by an earlier move are kept;
 /// a name moved again takes its newest definition.
+#[cfg(test)]
 pub(super) fn record(client_id: &str, format: Format, path: &Path) -> Result<(), String> {
+    let names = extract(container(format), &read_config_file(path)?)?
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    record_selected(client_id, format, path, &names)
+}
+
+pub(super) fn record_selected(
+    client_id: &str,
+    format: Format,
+    path: &Path,
+    names: &[String],
+) -> Result<(), String> {
     let record_file = record_path(client_id)?;
     let previous = match std::fs::read_to_string(&record_file) {
         Ok(bytes) => Some(bytes),
@@ -167,7 +192,10 @@ pub(super) fn record(client_id: &str, format: Format, path: &Path) -> Result<(),
     if entries.is_empty() && record.entries.is_empty() {
         return Ok(());
     }
-    for entry in entries {
+    for entry in entries
+        .into_iter()
+        .filter(|entry| names.contains(&entry.name))
+    {
         record
             .entries
             .retain(|kept| !kept.name.eq_ignore_ascii_case(&entry.name));
@@ -176,6 +204,61 @@ pub(super) fn record(client_id: &str, format: Format, path: &Path) -> Result<(),
     let text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
     atomic_write(&record_file, &text)?;
     Ok(())
+}
+
+/// Remove only the definitions reviewed for this transaction. Other entries,
+/// including unknown adapter fields and inline credentials, stay in their format.
+pub(super) fn remove_selected(format: Format, path: &Path, names: &[String]) -> Result<(), String> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    match container(format) {
+        Container::Json { key, nested } => {
+            let original = read_config_file(path)?;
+            let mut root = read_existing_json(&original, true)?;
+            let mut servers = root.get_mut(key);
+            if let Some(nested) = nested {
+                servers = servers.and_then(|v| v.get_mut(nested));
+            }
+            let servers = servers
+                .and_then(|v| v.as_object_mut())
+                .ok_or("Could not read the reviewed server list")?;
+            for name in names {
+                servers.remove(name);
+            }
+            atomic_write_json_config(path, Some(&original), &root, key)
+        }
+        Container::Toml => {
+            let mut doc = load_toml_document(path)?;
+            for name in names {
+                toml_mcp_servers_mut(&mut doc).remove(name);
+            }
+            atomic_write(path, &doc.to_string())
+        }
+        Container::YamlMap(key) | Container::YamlList(key) => {
+            let list = matches!(container(format), Container::YamlList(_));
+            let (original, mut root) = read_existing_yaml_with_source(path)?;
+            let servers = root
+                .get_mut(key)
+                .ok_or("Could not read the reviewed server list")?;
+            if list {
+                servers
+                    .as_sequence_mut()
+                    .ok_or("Expected a server list")?
+                    .retain(|v| {
+                        !v.get("name")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|n| names.iter().any(|name| name == n))
+                    });
+            } else {
+                let servers = servers.as_mapping_mut().ok_or("Expected a server map")?;
+                for name in names {
+                    servers.remove(serde_yaml::Value::String(name.clone()));
+                }
+            }
+            atomic_write_yaml_config(path, original.as_deref(), &root, key)
+        }
+    }
 }
 
 pub(super) fn toml_entry(

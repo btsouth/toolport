@@ -2309,6 +2309,11 @@ impl CatalogSearchIndex {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static CATALOG_SNAPSHOT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug)]
 struct CatalogSnapshot {
     tools: Vec<Value>,
@@ -2317,6 +2322,8 @@ struct CatalogSnapshot {
 
 impl CatalogSnapshot {
     fn new(mut tools: Vec<Value>) -> Self {
+        #[cfg(test)]
+        CATALOG_SNAPSHOT_BUILDS.with(|count| count.set(count.get() + 1));
         // Normalize both fresh and disk-cached catalogs. Without this, the first
         // tools/list after restart could replay pre-SOU-454 incidental ordering
         // until the background router build replaced it.
@@ -14647,6 +14654,23 @@ fn process_request(
     .map(GatewayResponse::into_value)
 }
 
+fn catalog_wait_budget(
+    discovery: DiscoveryMode,
+    scoped_search: bool,
+    client: Option<&str>,
+    setup: bool,
+) -> Duration {
+    if setup {
+        downstream::SETUP_CATALOG_WAIT_BUDGET
+    } else if discovery == DiscoveryMode::Full || scoped_search {
+        Duration::from_millis(
+            clients::discovery_capabilities(client.unwrap_or("")).cold_full_list_wait_ms,
+        )
+    } else {
+        FIRST_CATALOG_WAIT
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_request_wire(
     state: &GatewayState,
@@ -14671,13 +14695,16 @@ fn process_request_wire(
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     // One deadline includes startup and rooted composition, rather than granting
     // each phase another budget. Warm tools lists never enter the catalog wait.
-    let tools_list_budget = if discovery == DiscoveryMode::Full {
-        Duration::from_millis(
-            clients::discovery_capabilities(client.unwrap_or("")).cold_full_list_wait_ms,
-        )
-    } else {
-        FIRST_CATALOG_WAIT
-    };
+    let search_server = (method == "tools/call"
+        && req["params"]["name"] == "toolport_search_tools")
+        .then(|| req["params"]["arguments"]["server"].as_str())
+        .flatten();
+    let tools_list_budget = catalog_wait_budget(
+        discovery,
+        search_server.is_some(),
+        client,
+        std::env::args().any(|arg| arg == "--setup-review"),
+    );
     let tools_list_deadline = Instant::now() + tools_list_budget;
     if !state.http && upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
         state.stdio_upstream.mark_modern_upstream();
@@ -14782,7 +14809,7 @@ fn process_request_wire(
         _ => false,
     };
     if wait {
-        let deadline = if method == "tools/list" {
+        let deadline = if method == "tools/list" || search_server.is_some() {
             tools_list_deadline
         } else {
             Instant::now() + Duration::from_secs(30)
@@ -15013,11 +15040,22 @@ fn process_request_wire(
         (rooted, cached)
     };
     let (mut router, mut cache_snapshot) = catalog_for_view(rooted_router);
-    if method == "tools/list" {
-        let visible = |id: &str| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope));
+    if method == "tools/list" || search_server.is_some() {
+        let visible = |id: &str| {
+            search_server.is_none_or(|server| server == id)
+                && allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
+        };
+        if search_server.is_some() {
+            router.demand_servers(visible);
+            router.discover_uncached(visible);
+        }
         let cold = !has_scoped_tools(&cache_snapshot.tools, allowed, &router, &reg)
-            || discovery == DiscoveryMode::Full && router.any_missing_catalog(visible);
-        if cold {
+            || (discovery == DiscoveryMode::Full || search_server.is_some())
+                && router.any_missing_catalog(visible);
+        // Scoped search verifies the live published catalog even when another
+        // server makes the cache warm. Publication swaps the router before the
+        // cached search index is refreshed.
+        if cold || search_server.is_some() {
             #[cfg(test)]
             COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
                 if let Some(hook) = hook.take() {
@@ -15059,10 +15097,21 @@ fn process_request_wire(
             } else {
                 base
             };
-            router = catalog_for_view(rooted).0;
-            // Ready slots can precede disk-cache publication. Read the live view
-            // after a cold wait so another client's cache cannot hide new tools.
-            cache_snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+            (router, cache_snapshot) = catalog_for_view(rooted);
+            // Profile snapshots already reflect the live router. Cold lists need
+            // the shared cache's live fallback; warm scoped search only needs it
+            // when publication has not yet added this server's tools.
+            let search_cache_lag = search_server.is_some_and(|server| {
+                let prefix = format!("{}__", sanitize_segment(server));
+                !cache_snapshot.tools.iter().any(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.starts_with(&prefix))
+                })
+            });
+            if !daemon_adapter && (cold && method == "tools/list" || search_cache_lag) {
+                cache_snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+            }
             // Do not wait on rebuild_lock after the deadline: a slow publisher
             // must not turn a bounded cold list into a client startup timeout.
         }
@@ -19099,6 +19148,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "--daemon",
     conduit_lib::stdio_adapter::PRIVATE_GATEWAY_FLAG,
     "--selftest-secrets",
+    "--setup-review",
     conduit_lib::stdio_adapter::STDIO_ADAPTER_FLAG,
 ];
 
@@ -19241,6 +19291,7 @@ fn usage() -> String {
          \x20                        unresponsive (internal)\n\
          \x20   --installer-preflight <absolute-install-dir> Defer installation while client gateways are open\n\
          \x20   --disconnect-all [--dry-run] Restore all client configs and exit; JSON per-client results\n\
+         \x20   --setup-review       Private setup verification with a 30-second catalog wait\n\
          \x20   --selftest-secrets    Diagnostic: read every vaulted secret and report\n\
          \x20   --toolport-hook EVENT Deprecated no-op accepted so hook entries an\n\
          \x20                         earlier version installed do not error; exits 0\n\
@@ -22161,6 +22212,207 @@ mod tests {
             .unwrap()
             .iter()
             .any(|tool| tool["name"] == "other__cached"));
+    }
+
+    #[test]
+    fn reviewed_scoped_search_reads_published_catalog_before_cache_refresh() {
+        let _env = DataDirTestEnv::new("reviewed-search-cache-publication");
+        let state = http_state(false);
+        let mut live = Router::new();
+        live.add(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap());
+        *state.router.lock().unwrap() = Arc::new(live);
+        // Publication swaps the indexed router before persistence refreshes the
+        // cached catalog. A different server can already make that cache warm.
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
+        let reply = process_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"","server":"late"}}}),
+            &SearchGuard::default(), None, None, None, None, Some("claude-code"), None, DiscoveryMode::Lazy,
+        ).unwrap();
+        assert!(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("late__cached"),
+            "scoped search used the stale cache: {reply}"
+        );
+    }
+
+    #[test]
+    fn reviewed_warm_scoped_search_reuses_catalog_snapshot() {
+        let _env = DataDirTestEnv::new("reviewed-warm-scoped-search");
+        let state = http_state(false);
+        let (mut reg, router, catalog) = tool_surface_fixture();
+        reg.profiles.push(registry::Profile {
+            id: "adapter".into(),
+            name: "Adapter".into(),
+            enabled_server_ids: vec!["alpha".into()],
+            tool_scope: HashMap::from([("alpha".into(), vec!["read".into()])]),
+            instructions: None,
+            unknown_fields: serde_json::Map::new(),
+        });
+        *state.registry.lock().unwrap() = reg.clone();
+        *state.router.lock().unwrap() = Arc::clone(&router);
+        *state.cached_tools.lock().unwrap() = catalog;
+        let allowed = HashSet::from(["alpha".to_string()]);
+        for daemon in [false, true] {
+            state.daemon_mode.store(daemon, Ordering::SeqCst);
+            let profile = daemon.then_some("adapter");
+            if daemon {
+                state.router_for_adapter_profile(Arc::clone(&router), &reg, "adapter");
+            }
+            let builds = CATALOG_SNAPSHOT_BUILDS.with(|count| count.get());
+            for scope in [None, Some(&allowed)] {
+                let reply = process_request(
+                    &state,
+                    &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"read","server":"alpha"}}}),
+                    &SearchGuard::default(), scope, profile, None, None, Some("claude-code"), None, DiscoveryMode::Lazy,
+                ).unwrap();
+                assert!(reply["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("alpha__read"));
+                assert_eq!(
+                    CATALOG_SNAPSHOT_BUILDS.with(|count| count.get()),
+                    builds,
+                    "warm scoped search rebuilt its catalog (daemon={daemon})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reviewed_setup_budget_preserves_real_client_budget() {
+        assert_eq!(
+            catalog_wait_budget(DiscoveryMode::Full, false, Some("claude-code"), false),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            catalog_wait_budget(DiscoveryMode::Lazy, true, Some("claude-code"), true),
+            downstream::SETUP_CATALOG_WAIT_BUDGET
+        );
+        assert_eq!(downstream::SETUP_CATALOG_WAIT_BUDGET, Duration::from_secs(25));
+        assert!(downstream::SETUP_CATALOG_WAIT_BUDGET < downstream::STDIO_READ_TIMEOUT);
+    }
+
+    #[test]
+    fn reviewed_scoped_search_bounds_bootstrap_by_client_budget() {
+        let _env = DataDirTestEnv::new("reviewed-search-bootstrap-budget");
+        let state = http_state(false);
+        state.ready.store(false, Ordering::SeqCst);
+        let mut live = Router::new();
+        live.add(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap());
+        *state.router.lock().unwrap() = Arc::new(live);
+        let requester = state.clone();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let request = std::thread::spawn(move || {
+            let reply = process_request(
+                &requester,
+                &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"","server":"late"}}}),
+                &SearchGuard::default(), None, None, None, None, Some("claude-code"), None, DiscoveryMode::Lazy,
+            ).unwrap();
+            reply_tx.send(reply).unwrap();
+        });
+        let bound = Duration::from_millis(
+            clients::discovery_capabilities("claude-code").cold_full_list_wait_ms,
+        ) + Duration::from_secs(1);
+        let early = reply_rx.recv_timeout(bound);
+        // Release the bootstrap flag even on the negative control, then join.
+        // The fixture cannot leave a request running against a removed data dir.
+        state.ready.store(true, Ordering::SeqCst);
+        let reply = early
+            .clone()
+            .unwrap_or_else(|_| reply_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        request.join().unwrap();
+        assert!(
+            early.is_ok(),
+            "scoped search used the generic 30-second bootstrap wait"
+        );
+        assert!(reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("late__cached"));
+    }
+
+    #[test]
+    fn reviewed_scoped_search_waits_for_first_catalog() {
+        let _env = DataDirTestEnv::new("reviewed-scoped-search");
+        let state = http_state(false);
+        // Another client's warm catalog must not shorten this view's cold wait.
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let mut live = Router::new();
+        live.add_supervised(
+            "late".into(),
+            Vec::new(),
+            Arc::new(move || {
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        let live = Arc::new(live);
+        *state.router.lock().unwrap() = Arc::clone(&live);
+        let publisher = state.clone();
+        COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
+            hook.replace(Some(Box::new(move |snapshot| {
+                assert!(snapshot.aggregated_tools().is_empty());
+                assert!(snapshot.any_discovering(|id| id == "late"));
+                // Force the request to retain the old router across publication.
+                // Wait for the actual supervisor result, not a scheduler delay.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut seen = started_supervisors();
+                release_tx.send(()).unwrap();
+                while !live.has_ready_reconnects() && Instant::now() < deadline {
+                    seen = wait_for_started_supervisor(seen, deadline);
+                }
+                assert!(live.has_ready_reconnects(), "fixture did not connect");
+                adopt_reconnected_servers(
+                    &publisher.host,
+                    &publisher.stdio_upstream,
+                    &publisher.profile,
+                );
+                assert!(!snapshot.any_discovering(|_| true));
+                assert!(!snapshot.any_publishing_first_catalog(|_| true));
+                assert!(snapshot.aggregated_tools().is_empty());
+                assert!(publisher
+                    .router
+                    .lock()
+                    .unwrap()
+                    .aggregated_tools()
+                    .iter()
+                    .any(|tool| tool["name"] == "late__cached"));
+            })));
+        });
+        let allowed = HashSet::from(["late".to_string()]);
+        let started = Instant::now();
+        let reply = process_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"","server":"late"}}}),
+            &SearchGuard::default(), Some(&allowed), None, None, None, Some("cursor"), None, DiscoveryMode::Lazy,
+        ).unwrap();
+        assert!(
+            started.elapsed()
+                < Duration::from_millis(
+                    clients::discovery_capabilities("cursor").cold_full_list_wait_ms,
+                ),
+            "fixture exceeded the client's budget"
+        );
+        assert!(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("late__cached"),
+            "first search read an unpublished catalog: {reply}"
+        );
     }
 
     #[test]

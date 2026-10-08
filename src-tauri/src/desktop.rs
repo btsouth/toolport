@@ -200,6 +200,24 @@ async fn import_servers(
     Ok(reg)
 }
 
+#[tauri::command]
+async fn add_snippet_servers(
+    state: State<'_, RegistryState>,
+    text: String,
+    selected: Vec<String>,
+) -> Result<Registry, String> {
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        crate::registry_controller::add_snippet_servers(&text, &selected)
+    })
+    .await
+    .map_err(|_| "Paste import stopped".to_string())??;
+    let registry = reload_into_state(state.inner())?;
+    if !outcome.failed.is_empty() {
+        return Err("Servers added, but the keychain could not save credentials. Open Credentials and retry.".into());
+    }
+    Ok(registry)
+}
+
 /// Parse a pasted config snippet and return the detected server(s) with
 /// env-var values included. Used by the Add Server dialog's "paste config" feature.
 #[tauri::command]
@@ -605,6 +623,20 @@ struct MigrateResult {
     imported: usize,
     /// Names of the servers moved out of the client's config.
     moved: Vec<String>,
+    tools: Vec<serde_json::Value>,
+    outcome: clients::WriteOutcome,
+    servers: Vec<crate::registry_controller::SetupServerResult>,
+}
+
+#[tauri::command]
+async fn preview_client_setup(
+    client_id: String,
+) -> Result<crate::registry_controller::ClientSetupReview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::registry_controller::preview_client_setup(&client_id)
+    })
+    .await
+    .map_err(|_| "Client review stopped".to_string())?
 }
 
 /// Migrate a client to Toolport: import its directly-configured servers into the
@@ -619,12 +651,16 @@ async fn migrate_client(
     client_id: String,
     profile: Option<String>,
     force: Option<bool>,
+    selected: Vec<String>,
+    revision: String,
 ) -> Result<MigrateResult, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::migrate_client(
+        crate::registry_controller::migrate_client_reviewed(
             &client_id,
             profile.as_deref(),
             force.unwrap_or(false),
+            &selected,
+            &revision,
         )
     })
     .await
@@ -635,6 +671,9 @@ async fn migrate_client(
         registry,
         imported: outcome.imported,
         moved: outcome.moved,
+        tools: outcome.tools,
+        servers: outcome.servers,
+        outcome: outcome.result.outcome,
     })
 }
 
@@ -1865,15 +1904,24 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
             let connected = registry::load().map(|r| r.team.is_some());
             let delay = match connected {
-                Ok(false) => { failures = 0; 3 }
+                Ok(false) => {
+                    failures = 0;
+                    3
+                }
                 Ok(true) => match teams::sync_wait(25) {
                     Ok(result) => {
                         failures = 0;
-                        if stop.load(std::sync::atomic::Ordering::Acquire) { break; }
+                        if stop.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
                         let state = handle.state::<RegistryState>();
                         match finish_sync(&handle, state.inner(), result) {
-                            Ok(fresh) => { let _ = handle.emit("team-sync-registry", &fresh); }
-                            Err(error) => eprintln!("Toolport: Teams registry refresh failed: {error}"),
+                            Ok(fresh) => {
+                                let _ = handle.emit("team-sync-registry", &fresh);
+                            }
+                            Err(error) => {
+                                eprintln!("Toolport: Teams registry refresh failed: {error}")
+                            }
                         }
                         teams::retry_delay_seconds(0)
                     }
@@ -2018,8 +2066,10 @@ async fn team_push(
 ) -> Result<teams::PublishResult, String> {
     refresh_from_disk(state.inner())?;
     // push_current does a blocking GET + PUT to the team server; keep it off the main thread.
-    tauri::async_runtime::spawn_blocking(move || {
-        match selected_ids { Some(ids) => teams::push_selected(&ids, base_version, &local_fingerprint), None => teams::push_current(base_version, &local_fingerprint).map(teams::PublishResult::whole_set) }
+    tauri::async_runtime::spawn_blocking(move || match selected_ids {
+        Some(ids) => teams::push_selected(&ids, base_version, &local_fingerprint),
+        None => teams::push_current(base_version, &local_fingerprint)
+            .map(teams::PublishResult::whole_set),
     })
     .await
     .map_err(|e| format!("push task join failed: {e}"))?
@@ -3887,6 +3937,7 @@ pub fn run() {
             import_servers,
             preview_import_servers,
             parse_server_snippet,
+            add_snippet_servers,
             add_server,
             update_server,
             remove_server,
@@ -3902,6 +3953,7 @@ pub fn run() {
             uninstall_gateway,
             disconnect_all_clients,
             migrate_client,
+            preview_client_setup,
             set_secret,
             set_launch_secret,
             set_launch_input_value,

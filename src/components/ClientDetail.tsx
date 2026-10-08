@@ -9,7 +9,6 @@ import {
   PlugZap,
   Puzzle,
   RefreshCw,
-  Shuffle,
   TriangleAlert,
   X,
 } from "lucide-react";
@@ -18,7 +17,6 @@ import { toastError } from "@/lib/toast";
 import {
   addServer,
   installGateway,
-  migrateClient,
   setClientDiscovery,
   uninstallGateway,
 } from "@/lib/api";
@@ -36,13 +34,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+
 import {
   Select,
   SelectContent,
@@ -51,12 +43,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { ConnectReviewDialog } from "@/components/ConnectReviewDialog";
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
-import {
-  clientRestartHint,
-  clientRestartHintAfterRemoval,
-  connectSuccessDescription,
-} from "@/lib/clientConnect";
+import { clientRestartHint, clientRestartHintAfterRemoval } from "@/lib/clientConnect";
 
 interface Props {
   client: DetectedClient;
@@ -246,37 +235,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   }
   // Servers configured directly in the client (not the gateway) that migrate
   // would move into Toolport and strip from the client's config.
+
   const movable = client.servers.filter((s) => !isGatewayDetected(s));
-
-  async function migrate() {
-    setBusy(true);
-    try {
-      // Migrate rewrites the whole gateway slot; force only after the user confirmed
-      // the migrate dialog when the entry is customized (SOU-406).
-      const result = await migrateClient(
-        client.id,
-        profile || undefined,
-        customized || undefined,
-      );
-      onRegistryChange(result.registry);
-      toast.success(
-        `Moved ${result.moved.length} server${result.moved.length === 1 ? "" : "s"} into Toolport`,
-        {
-          // Migrate rewrites the whole gateway slot, so it needs the restart line for
-          // the same reason Connect does.
-          description: `${client.name} now uses only the Toolport gateway. Config backed up. ${clientRestartHint(client.name)}`,
-        },
-      );
-      noteRestartNeeded("applied");
-      setMigrateOpen(false);
-      onChanged();
-    } catch (e) {
-      toastError(`${e}`);
-    } finally {
-      setBusy(false);
-    }
-  }
-
   const importedNames = new Set(
     (registry?.servers ?? []).map((s) => s.name.toLowerCase()),
   );
@@ -375,18 +335,6 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           },
         );
         noteRestartNeeded("removed");
-      } else {
-        const outcome = await installGateway(client.id, profile || undefined, false);
-        // Restart is the load-bearing line (SOU-317): MCP clients typically do not
-        // pick up a new gateway entry until relaunch. Scope/backup are secondary.
-        toast.success(`Connected Toolport to ${client.name}`, {
-          description: connectSuccessDescription(client.name, [
-            profile ? `Access: ${accessLabel(profile)}.` : null,
-            !profile && outcome.backup ? "Previous config backed up." : null,
-            ...(outcome.warnings ?? []),
-          ]),
-        });
-        noteRestartNeeded("applied");
       }
       onChanged();
     } catch (e) {
@@ -532,7 +480,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             <Button
               size="sm"
               variant="default"
-              onClick={toggleInstall}
+              onClick={() => setMigrateOpen(true)}
               disabled={busy || !present}
             >
               <PlugZap className="size-4" />
@@ -700,18 +648,6 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                   Import all ({toImport.length})
                 </Button>
               )}
-              {movable.length > 0 && (
-                <Button
-                  size="sm"
-                  variant="default"
-                  className="h-7 px-2 text-xs"
-                  onClick={() => setMigrateOpen(true)}
-                  disabled={busy}
-                >
-                  <Shuffle className="size-3" />
-                  Move into gateway ({movable.length})
-                </Button>
-              )}
             </div>
           </div>
           <details className="mb-2">
@@ -725,7 +661,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               </li>
               {movable.length > 0 && (
                 <li>
-                  <span className="font-medium text-foreground">Move into gateway</span>{" "}
+                  <span className="font-medium text-foreground">Review and connect</span>{" "}
                   copies it, then removes it from {client.name}'s config so the gateway is
                   the only source (plugin servers stay). The cutover that actually saves
                   context.
@@ -739,8 +675,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               <span>
                 {client.name} is already connected to Toolport. Import on its own leaves a
                 copy here too, so these tools load twice, once directly and once through
-                the gateway. Use <span className="font-medium">Move into gateway</span> to
-                avoid that.
+                the gateway. Use <span className="font-medium">Review and connect</span>{" "}
+                to avoid that.
               </span>
             </p>
           )}
@@ -772,63 +708,20 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         </div>
       )}
 
-      <Dialog open={migrateOpen} onOpenChange={setMigrateOpen}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>Move {client.name} onto Toolport</DialogTitle>
-          </DialogHeader>
-          <div className="flex flex-col gap-3 py-1 text-sm">
-            <p className="text-muted-foreground">
-              This imports{" "}
-              <span className="font-medium text-foreground">
-                {movable.length} server{movable.length === 1 ? "" : "s"}
-              </span>{" "}
-              from {client.name} into Toolport and turns them on, then rewrites{" "}
-              {client.name}'s config so it uses{" "}
-              <span className="font-medium text-foreground">
-                only the Toolport gateway
-              </span>
-              . The original config is backed up first, and Disconnect puts these servers
-              back.
-            </p>
-            <p className="rounded-md bg-warning/10 p-2 text-xs text-warning">
-              Secret values (API keys, tokens) aren't carried over, they stay only in the
-              backed-up config. After migrating, re-enter them under each server's secrets
-              so the gateway can connect.
-            </p>
-            {customized && (
-              <p className="rounded-md bg-warning/10 p-2 text-xs text-warning">
-                This client has a custom Toolport entry. Migrating replaces it with the
-                default gateway command.
-              </p>
-            )}
-            <div className="rounded-md bg-muted/40 p-2 font-mono text-xs text-muted-foreground">
-              {movable.map((s) => s.name).join(", ")}
-            </div>
-            {client.pluginServers.length > 0 && (
-              <p className="text-xs text-muted-foreground">
-                Note: {client.pluginServers.length} server
-                {client.pluginServers.length === 1 ? "" : "s"} managed by {client.name}'s
-                plugins or extensions can't be moved, only {client.name} controls those.
-                They stay where they are (you can still import a copy above).
-              </p>
-            )}
-          </div>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setMigrateOpen(false)}
-              disabled={busy}
-            >
-              Cancel
-            </Button>
-            <Button onClick={migrate} disabled={busy}>
-              <Shuffle className="size-4" />
-              Move {movable.length} into Toolport
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {migrateOpen && (
+        <ConnectReviewDialog
+          clientId={client.id}
+          clientName={client.name}
+          profile={profile || undefined}
+          force={customized}
+          onClose={() => setMigrateOpen(false)}
+          onConnected={(next) => {
+            onRegistryChange(next);
+            noteRestartNeeded("applied");
+            onChanged();
+          }}
+        />
+      )}
       <ImportReviewDialog
         open={bulkImportPreview !== null}
         items={bulkImportPreview ?? []}
