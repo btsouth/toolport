@@ -146,11 +146,28 @@ describe("CatalogView collection loading", () => {
 describe("CatalogView search and installed identity", () => {
   it.each(identities)("$case", (fixture) => {
     const { catalog, server, equal } = fixture;
-    const a = catalogIdentity(catalog as CatalogEntry);
-    expect(a !== null && a === catalogIdentity(server as CatalogEntry)).toBe(equal);
+    const a = catalogIdentity({
+      ...entry,
+      ...catalog,
+      transport: catalog.transport as CatalogEntry["transport"],
+    });
+    expect(
+      a !== null &&
+        a ===
+          catalogIdentity({
+            ...entry,
+            ...server,
+            transport: server.transport as CatalogEntry["transport"],
+          }),
+    ).toBe(equal);
     expect(
       installed(
-        new Set(catalogInstalledIdentities(server as Registry["servers"][number])),
+        new Set(
+          catalogInstalledIdentities({
+            ...server,
+            transport: server.transport as CatalogEntry["transport"],
+          }),
+        ),
         { ...entry, source: "", ...catalog } as CatalogEntry,
       ),
     ).toBe("installedEqual" in fixture ? fixture.installedEqual : equal);

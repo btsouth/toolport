@@ -2,7 +2,7 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { addCatalogServer, listStacks } from "@/lib/api";
-import type { Registry, Stack } from "@/lib/types";
+import type { CatalogEntry, Registry, Stack } from "@/lib/types";
 import { Onboarding } from "./Onboarding";
 
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -76,7 +76,7 @@ describe("Onboarding collection loading", () => {
   it.each([true, false])(
     "matches Collection installs by launch identity: %s",
     async (match) => {
-      const entry = {
+      const entry: CatalogEntry = {
         name: "Memory",
         description: "Memory tools",
         transport: "stdio",
