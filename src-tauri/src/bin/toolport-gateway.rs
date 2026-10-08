@@ -20417,6 +20417,83 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_cold_full_no_refresh_honours_larger_client_budget() {
+        let _env = DataDirTestEnv::new("cold-full-larger-client-budget");
+        let state = http_state(false);
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let mut live = Router::new();
+        live.add_supervised(
+            "late".into(),
+            Vec::new(),
+            Arc::new(move || {
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        let live = Arc::new(live);
+        *state.router.lock().unwrap() = Arc::clone(&live);
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let requester = state.clone();
+        let request = std::thread::spawn(move || {
+            COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
+                hook.replace(Some(Box::new(move |snapshot| {
+                    assert!(snapshot.aggregated_tools().is_empty());
+                    assert!(snapshot.any_discovering(|id| id == "late"));
+                    waiting_tx.send(()).unwrap();
+                })));
+            });
+            let allowed = HashSet::from(["late".to_string()]);
+            reply_tx
+                .send(full_tools_list_for_client(
+                    &requester,
+                    "cursor",
+                    Some(&allowed),
+                ))
+                .unwrap();
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The only timed synchronization is proving the 2 s default did not win.
+        let early_reply = reply_rx.recv_timeout(FIRST_CATALOG_WAIT + Duration::from_millis(500));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut seen = started_supervisors();
+        release_tx.send(()).unwrap();
+        while !live.has_ready_reconnects() && Instant::now() < deadline {
+            seen = wait_for_started_supervisor(seen, deadline);
+        }
+        assert!(live.has_ready_reconnects(), "fixture did not connect");
+        adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
+        let reply = match &early_reply {
+            Ok(reply) => reply.clone(),
+            Err(_) => reply_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        };
+        request.join().unwrap();
+        assert!(
+            matches!(early_reply, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "cold list returned while its visible server was still discovering"
+        );
+        assert!(reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "late__cached"));
+        assert!(!reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "other__cached"));
+    }
+
+    #[test]
     fn supervisor_cold_full_no_refresh_hanging_start_stops_at_client_budget() {
         let _env = DataDirTestEnv::new("cold-full-client-budget");
         let state = http_state(false);
