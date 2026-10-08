@@ -26,12 +26,18 @@ pub struct CatalogSession {
 }
 
 impl CatalogSession {
-    fn first_exposure(&self, client: Option<&str>, full: &str, exposed: &str) -> bool {
+    fn first_exposure(
+        &self,
+        client: Option<&str>,
+        full: &SerializedSurface,
+        exposed: &SerializedSurface,
+    ) -> bool {
         let mut hash = Sha256::new();
-        for text in [client.unwrap_or(""), full, exposed] {
-            hash.update((text.len() as u64).to_le_bytes());
-            hash.update(text.as_bytes());
-        }
+        let client = client.unwrap_or("");
+        hash.update((client.len() as u64).to_le_bytes());
+        hash.update(client.as_bytes());
+        hash.update(full.hash);
+        hash.update(exposed.hash);
         self.seen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -156,11 +162,50 @@ pub fn estimate_tokens(tools: &[Value]) -> u64 {
     bytes.div_ceil(4) as u64
 }
 
-/// Record the exact surfaces returned by this gateway and by full mode for the
-/// same client. `by_server_bytes` is exact omitted downstream definition bytes;
-/// its sum need not equal the global difference, which includes meta tools and
-/// JSON array punctuation. Team attribution is apportioned from the positive
-/// tokenizer catalog delta, so it never credits extra exposure.
+/// Immutable, exact JSON bytes and their digest. Names and element sizes are
+/// retained for savings attribution without keeping another parsed catalog.
+#[derive(Debug)]
+pub struct SerializedSurface {
+    pub json: Box<serde_json::value::RawValue>,
+    pub hash: [u8; 32],
+    tools: BTreeMap<String, u64>,
+    count: usize,
+}
+
+impl SerializedSurface {
+    pub fn new(tools: &[Value]) -> Self {
+        let mut sizes = BTreeMap::new();
+        let text = serialize_surface_text(tools, |tool, bytes| {
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                *sizes.entry(name.to_string()).or_default() += bytes;
+            }
+        });
+        Self {
+            hash: Sha256::digest(text.as_bytes()).into(),
+            json: serde_json::value::RawValue::from_string(text)
+                .expect("serialized tools are valid JSON"),
+            tools: sizes,
+            count: tools.len(),
+        }
+    }
+
+    /// Includes a conservative allowance for B-tree nodes and owned names.
+    pub fn retained_bytes(&self) -> usize {
+        self.json.get().len()
+            + std::mem::size_of::<Self>()
+            + self
+                .tools
+                .keys()
+                .map(|name| name.capacity() + 128)
+                .sum::<usize>()
+    }
+
+    pub fn tool_count(&self) -> usize {
+        self.count
+    }
+}
+
+/// Compatibility entry point for callers without a cached surface.
 pub fn record_catalog(
     session: &CatalogSession,
     mode: &str,
@@ -169,40 +214,50 @@ pub fn record_catalog(
     exposed: &[Value],
     route: impl Fn(&str) -> Option<String>,
 ) {
-    let exposed_names: std::collections::HashSet<&str> = exposed
-        .iter()
-        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-        .collect();
-    let mut by_server_bytes = BTreeMap::<String, u64>::new();
-    let full_text = serialize_surface_text(full, |tool, bytes| {
-        let Some(name) = tool.get("name").and_then(Value::as_str) else {
-            return;
-        };
-        if exposed_names.contains(name) {
-            return;
-        }
-        let Some(server) = route(name) else {
-            return;
-        };
-        *by_server_bytes.entry(server).or_default() += bytes;
-    });
-    let exposed_text = serialize_surface_text(exposed, |_, _| {});
-    if !session.first_exposure(client, &full_text, &exposed_text) {
+    record_catalog_surfaces(
+        session,
+        mode,
+        client,
+        &SerializedSurface::new(full),
+        &SerializedSurface::new(exposed),
+        route,
+    );
+}
+
+/// Record cached surfaces once per client/session and pair of surface hashes.
+/// Dedupe precedes attribution, text copies and offline tokenization.
+pub fn record_catalog_surfaces(
+    session: &CatalogSession,
+    mode: &str,
+    client: Option<&str>,
+    full: &SerializedSurface,
+    exposed: &SerializedSurface,
+    route: impl Fn(&str) -> Option<String>,
+) {
+    if !session.first_exposure(client, full, exposed) {
         return;
     }
-    let full_bytes = full_text.len() as u64;
-    let exposed_bytes = exposed_text.len() as u64;
+    let mut by_server_bytes = BTreeMap::<String, u64>::new();
+    for (name, bytes) in &full.tools {
+        if !exposed.tools.contains_key(name) {
+            if let Some(server) = route(name) {
+                *by_server_bytes.entry(server).or_default() += bytes;
+            }
+        }
+    }
+    let full_bytes = full.json.get().len() as u64;
+    let exposed_bytes = exposed.json.get().len() as u64;
     let avoided = full_bytes.saturating_sub(exposed_bytes);
     let extra = exposed_bytes.saturating_sub(full_bytes);
     let mut row = json!({
         "v": 3, "kind": "catalog_exposure", "ts": epoch_millis() as u64,
-        "mode": mode, "fullToolCount": full.len(), "exposedToolCount": exposed.len(),
+        "mode": mode, "fullToolCount": full.count, "exposedToolCount": exposed.count,
         "fullSurfaceBytes": full_bytes, "exposedSurfaceBytes": exposed_bytes,
         "avoidedSurfaceBytes": avoided,
         "extraExposedSurfaceBytes": extra,
         "surfaceDeltaBytes": full_bytes as i64 - exposed_bytes as i64,
         "tokenizer": TOKENIZER,
-        "_fullText": full_text, "_exposedText": exposed_text,
+        "_fullText": full.json.get(), "_exposedText": exposed.json.get(),
         "byServerBytes": by_server_bytes,
     });
     if let Some(client) = client.filter(|client| !client.is_empty()) {

@@ -1360,7 +1360,7 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> std::io::R
 /// Serialize a complete JSON-RPC frame before touching stdout. Formatting a
 /// `serde_json::Value` directly into a pipe can issue many small writes; clients
 /// with fragile stdio decoders may mistake those chunks for complete frames.
-fn write_json_line<W: Write>(writer: &mut W, value: &Value) -> std::io::Result<()> {
+fn write_json_line<W: Write>(writer: &mut W, value: &impl serde::Serialize) -> std::io::Result<()> {
     let mut line = serde_json::to_vec(value).map_err(std::io::Error::other)?;
     line.push(b'\n');
     writer.write_all(&line)?;
@@ -4206,7 +4206,18 @@ fn execute_call(
                     conduit_lib::rate_limits::check_and_count(&team.rate_limits, server_id, tool)
                 {
                     // Count as a failed call with a clear reason so Activity / export show the block.
-                    audit::record_routed_call(reg, server_id, tool, false, None, Some("rate_limit"), client, client_name, None, None);
+                    audit::record_routed_call(
+                        reg,
+                        server_id,
+                        tool,
+                        false,
+                        None,
+                        Some("rate_limit"),
+                        client,
+                        client_name,
+                        None,
+                        None,
+                    );
                     return json!({
                         "content": [{ "type": "text", "text": msg }],
                         "isError": true
@@ -6115,6 +6126,238 @@ fn handle_request(
         None,
         None,
     )
+}
+
+/// A tools response serializes its immutable array directly into the envelope.
+/// IDs, protocol decoration and downstream TTL remain request-local.
+struct GatewayResponse {
+    envelope: Value,
+    surface: Option<Arc<savings::SerializedSurface>>,
+}
+
+impl From<Value> for GatewayResponse {
+    fn from(envelope: Value) -> Self {
+        Self {
+            envelope,
+            surface: None,
+        }
+    }
+}
+
+impl serde::Serialize for GatewayResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let Some(surface) = &self.surface else {
+            return self.envelope.serialize(serializer);
+        };
+        struct ResultSurface<'a>(&'a Value, &'a savings::SerializedSurface);
+        impl serde::Serialize for ResultSurface<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let fields = self.0.as_object().expect("tools result is an object");
+                let mut map = serializer.serialize_map(Some(fields.len()))?;
+                for (key, value) in fields {
+                    if key == "tools" {
+                        map.serialize_entry(key, &self.1.json)?;
+                    } else {
+                        map.serialize_entry(key, value)?;
+                    }
+                }
+                map.end()
+            }
+        }
+        let fields = self.envelope.as_object().expect("response is an object");
+        let mut map = serializer.serialize_map(Some(fields.len()))?;
+        for (key, value) in fields {
+            if key == "result" {
+                map.serialize_entry(key, &ResultSurface(value, surface))?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
+}
+
+impl GatewayResponse {
+    fn into_value(self) -> Value {
+        // Parsed callers (tests and OpenAPI calls) retain their existing API.
+        // MCP stdio and HTTP never take this compatibility path.
+        if self.surface.is_none() {
+            return self.envelope;
+        }
+        serde_json::from_slice(&serde_json::to_vec(&self).expect("response serializes"))
+            .expect("response is JSON")
+    }
+}
+
+const TOOL_SURFACE_CACHE_VIEWS: usize = 8;
+const TOOL_SURFACE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(PartialEq, Eq)]
+struct ToolSurfaceKey {
+    catalog: usize,
+    router: usize,
+    registry: [u8; 32],
+    profile: Option<String>,
+    connection_profile: Option<String>,
+    allowed: Option<Vec<String>>,
+    mode: u8,
+    code_mode: bool,
+    apps: bool,
+}
+
+struct ToolSurfaceEntry {
+    key: ToolSurfaceKey,
+    // Weak identities prevent allocation-address reuse and make Arc::make_mut
+    // fork mutable router publications. They do not retain parsed catalogs.
+    _catalog: Weak<CatalogSnapshot>,
+    _router: Weak<Router>,
+    full: Arc<savings::SerializedSurface>,
+    exposed: Arc<savings::SerializedSurface>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct ToolSurfaceCache {
+    entries: std::collections::VecDeque<ToolSurfaceEntry>,
+    bytes: usize,
+}
+
+impl ToolSurfaceCache {
+    fn get(
+        &mut self,
+        key: &ToolSurfaceKey,
+    ) -> Option<(
+        Arc<savings::SerializedSurface>,
+        Arc<savings::SerializedSurface>,
+    )> {
+        let index = self.entries.iter().position(|entry| &entry.key == key)?;
+        let entry = self.entries.remove(index).expect("cache entry exists");
+        let surfaces = (Arc::clone(&entry.full), Arc::clone(&entry.exposed));
+        self.entries.push_back(entry);
+        Some(surfaces)
+    }
+
+    fn insert(&mut self, entry: ToolSurfaceEntry) {
+        // A single oversized view is served without retaining it. No catalog
+        // size can force the resident cache beyond its byte budget.
+        if entry.bytes > TOOL_SURFACE_CACHE_BYTES {
+            return;
+        }
+        while self.entries.len() >= TOOL_SURFACE_CACHE_VIEWS
+            || self.bytes + entry.bytes > TOOL_SURFACE_CACHE_BYTES
+        {
+            if let Some(old) = self.entries.pop_front() {
+                self.bytes -= old.bytes;
+            }
+        }
+        self.bytes += entry.bytes;
+        self.entries.push_back(entry);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cached_tool_surfaces(
+    host: &HostState,
+    reg: &Registry,
+    router: &Arc<Router>,
+    snapshot: &Arc<CatalogSnapshot>,
+    allowed: Option<&HashSet<String>>,
+    profile: Option<&str>,
+    mode: DiscoveryMode,
+) -> (
+    Arc<savings::SerializedSurface>,
+    Arc<savings::SerializedSurface>,
+) {
+    use sha2::{Digest, Sha256};
+    let mut allowed_key = allowed.map(|set| set.iter().cloned().collect::<Vec<_>>());
+    if let Some(allowed) = &mut allowed_key {
+        allowed.sort();
+    }
+    let key = ToolSurfaceKey {
+        catalog: Arc::as_ptr(snapshot) as usize,
+        router: Arc::as_ptr(router) as usize,
+        registry: Sha256::digest(serde_json::to_vec(reg).expect("registry serializes")).into(),
+        profile: profile.map(str::to_string),
+        connection_profile: active_connection_profile(),
+        allowed: allowed_key,
+        mode: mode.as_u8(),
+        code_mode: host.code_mode_enabled(),
+        apps: active_client_supports_mcp_app_html(),
+    };
+    // Single flight over immutable snapshots. A rebuild publishes different
+    // identities; it cannot overwrite or combine this view's surfaces.
+    let mut cache = host
+        .tool_surfaces
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(surfaces) = cache.get(&key) {
+        return surfaces;
+    }
+    let catalog = if snapshot.tools.is_empty() {
+        router.aggregated_tools()
+    } else {
+        drop_blocked_from_cache(snapshot.tools.clone(), router, reg)
+    };
+    let full = Arc::new(savings::SerializedSurface::new(&tool_surface(
+        host,
+        reg,
+        router,
+        &catalog,
+        allowed,
+        DiscoveryMode::Full,
+    )));
+    let exposed = if mode == DiscoveryMode::Full {
+        Arc::clone(&full)
+    } else {
+        Arc::new(savings::SerializedSurface::new(&tool_surface(
+            host, reg, router, &catalog, allowed, mode,
+        )))
+    };
+    let key_bytes = key.profile.as_ref().map_or(0, String::capacity)
+        + key.connection_profile.as_ref().map_or(0, String::capacity)
+        + key.allowed.as_ref().map_or(0, |scope| {
+            scope.capacity() * std::mem::size_of::<String>()
+                + scope.iter().map(String::capacity).sum::<usize>()
+        });
+    let bytes = std::mem::size_of::<ToolSurfaceEntry>()
+        + key_bytes
+        + full.retained_bytes()
+        + if Arc::ptr_eq(&full, &exposed) {
+            0
+        } else {
+            exposed.retained_bytes()
+        };
+    cache.insert(ToolSurfaceEntry {
+        key,
+        _catalog: Arc::downgrade(snapshot),
+        _router: Arc::downgrade(router),
+        full: Arc::clone(&full),
+        exposed: Arc::clone(&exposed),
+        bytes,
+    });
+    (full, exposed)
+}
+
+/// Check coldness without cloning a potentially multi-megabyte tool catalog.
+fn has_scoped_tools(
+    tools: &[Value],
+    allowed: Option<&HashSet<String>>,
+    router: &Router,
+    reg: &Registry,
+) -> bool {
+    let owners = unique_prefix_owners(reg);
+    tools.iter().any(|tool| {
+        allowed.is_none_or(|scope| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| {
+                    tool_in_scope(name, scope, &|name| {
+                        owner_of_exposed_tool(Some(router), &owners, name)
+                    })
+                })
+        })
+    })
 }
 
 /// Construct the exact tool array for one discovery mode from a policy-filtered
@@ -9060,8 +9303,9 @@ type IntegrityCheckFailure = (String, BTreeSet<String>);
 /// prove the drifted definition is never published in the first place. Registered and
 /// consumed on one thread, so a parallel test's gate cannot trigger it.
 #[cfg(test)]
-static INTEGRITY_GATE_OBSERVER: Mutex<Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>> =
-    Mutex::new(None);
+static INTEGRITY_GATE_OBSERVER: Mutex<
+    Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>,
+> = Mutex::new(None);
 
 #[cfg(test)]
 fn observe_integrity_gate() {
@@ -10648,6 +10892,7 @@ struct HostState {
     /// adapter's original-tool allowlist. Invalidated when the live router or
     /// that profile's allowlist changes.
     tool_scope_views: Mutex<ToolScopeViews>,
+    tool_surfaces: Mutex<ToolSurfaceCache>,
     /// Root-dependent downstreams are keyed by their resolved launch parameters.
     /// Every view shares the host router's ordinary slots and any rooted slot
     /// whose LaunchKey is equal, even when another root view is composed later.
@@ -14030,6 +14275,35 @@ fn process_request(
     client_name: Option<&str>,
     discovery: DiscoveryMode,
 ) -> Option<Value> {
+    process_request_wire(
+        state,
+        req,
+        guard,
+        allowed,
+        adapter_profile,
+        connection_profile,
+        cancel,
+        client,
+        client_name,
+        discovery,
+    )
+    .map(GatewayResponse::into_value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_request_wire(
+    state: &GatewayState,
+    req: &Value,
+    guard: &SearchGuard,
+    allowed: Option<&std::collections::HashSet<String>>,
+    adapter_profile: Option<&str>,
+    // The profile an HTTP caller is scoped to (`HttpCaller::profile`); `None` on stdio.
+    connection_profile: Option<&str>,
+    cancel: Option<downstream::CancelContext>,
+    client: Option<&str>,
+    client_name: Option<&str>,
+    discovery: DiscoveryMode,
+) -> Option<GatewayResponse> {
     let _approval_cancel = ApprovalCancelGuard::enter(cancel.clone());
     let _transport = UpstreamTransportGuard::enter(if state.http {
         UpstreamTransport::Http
@@ -14104,11 +14378,7 @@ fn process_request(
                         .clone(),
                 )
             });
-            let owners = unique_prefix_owners(&reg);
-            scope_tools(&cached.tools, allowed, |name| {
-                owner_of_exposed_tool(Some(&view), &owners, name)
-            })
-            .is_empty()
+            !has_scoped_tools(&cached.tools, allowed, &view, &reg)
         }
         "tools/call"
         | "resources/list"
@@ -14354,12 +14624,8 @@ fn process_request(
     };
     let (mut router, mut cache_snapshot) = catalog_for_view(rooted_router);
     if method == "tools/list" {
-        let owners = unique_prefix_owners(&reg);
         let visible = |id: &str| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope));
-        let cold = scope_tools(&cache_snapshot.tools, allowed, |name| {
-            owner_of_exposed_tool(Some(&router), &owners, name)
-        })
-        .is_empty()
+        let cold = !has_scoped_tools(&cache_snapshot.tools, allowed, &router, &reg)
             || discovery == DiscoveryMode::Full && router.any_missing_catalog(visible);
         if cold {
             #[cfg(test)]
@@ -14425,7 +14691,7 @@ fn process_request(
             ModernSubscriptionTransport::Stdio,
         ) {
             Ok(_) => None,
-            Err(response) => Some(response),
+            Err(response) => Some(response.into()),
         };
     }
     // Resource subscriptions need the live GatewayState (session table + sink)
@@ -14441,21 +14707,22 @@ fn process_request(
         let declared = upstream_declared_version(req).map(str::to_string);
         if let (Some(id), Some(version)) = (id.as_ref(), declared.as_deref()) {
             if !MODERN_UPSTREAM_VERSIONS.contains(&version) {
-                return Some(unsupported_version_error(id.clone(), version));
+                return Some(unsupported_version_error(id.clone(), version).into());
             }
         }
         if declared.as_deref() == Some(MODERN_PROTOCOL_VERSION) {
             return id.map(|id| {
-                error(
+                GatewayResponse::from(error(
                     id,
                     -32601,
                     &format!("Method not found: {method}; use subscriptions/listen in 2026-07-28"),
-                )
+                ))
             });
         }
         let _era =
             UpstreamEraGuard::enter(declared.filter(|v| v.as_str() == MODERN_PROTOCOL_VERSION));
-        return handle_resource_subscription(state, &router, req, allowed, cancel.as_ref(), method);
+        return handle_resource_subscription(state, &router, req, allowed, cancel.as_ref(), method)
+            .map(Into::into);
     }
     let live_view: Option<LiveRouterResolver> = if state.daemon_mode.load(Ordering::SeqCst) {
         adapter_profile.map(|profile| {
@@ -14474,6 +14741,61 @@ fn process_request(
             .or(profile_snapshot.as_deref())
             .map(str::to_string),
     );
+    let declared = upstream_declared_version(req);
+    if method == "tools/list"
+        && req.get("id").is_some_and(|id| !id.is_null())
+        && declared.is_none_or(|version| MODERN_UPSTREAM_VERSIONS.contains(&version))
+    {
+        let _era = UpstreamEraGuard::enter(
+            declared
+                .filter(|v| *v == MODERN_PROTOCOL_VERSION)
+                .map(str::to_string),
+        );
+        let _capabilities = UpstreamCapabilitiesGuard::enter(req);
+        let (full, exposed) = cached_tool_surfaces(
+            state,
+            &reg,
+            &router,
+            &cache_snapshot,
+            allowed,
+            profile_snapshot.as_deref(),
+            discovery,
+        );
+        if discovery != DiscoveryMode::Full {
+            savings::record_catalog_surfaces(
+                &guard.catalog,
+                if discovery == DiscoveryMode::Lazy {
+                    "lazy"
+                } else {
+                    "grouped"
+                },
+                client,
+                &full,
+                &exposed,
+                |name| router.route_of(name).map(|(server, _)| server.to_string()),
+            );
+        }
+        let hint = if discovery == DiscoveryMode::Lazy {
+            CacheHint::local(LOCAL_CACHE_TTL_MS)
+        } else {
+            router
+                .tools_cache_hint()
+                .map(|hint| CacheHint::local(LOCAL_CACHE_TTL_MS).merge(hint))
+                .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS))
+        };
+        let envelope = success(
+            req["id"].clone(),
+            cacheable_for_upstream(
+                json!({"tools": []}),
+                hint,
+                profile_snapshot.is_some() || allowed.is_some(),
+            ),
+        );
+        return Some(GatewayResponse {
+            envelope,
+            surface: Some(exposed),
+        });
+    }
     handle_request_with_cancel(
         state,
         req,
@@ -14494,9 +14816,10 @@ fn process_request(
         // Swappable slot for post-HITL rebind (SOU-321); distinct from the snapshot above.
         Some(&state.router),
     )
+    .map(Into::into)
 }
 
-fn write_stdio_response(stdio: &SessionState, response: &Value) -> bool {
+fn write_stdio_response(stdio: &SessionState, response: &impl serde::Serialize) -> bool {
     let Some(stdout) = stdio.stdio_stdout() else {
         // No stdio face means there is nobody to answer. Treat it as a broken pipe
         // so the reader loop stops instead of grinding through requests it can
@@ -14531,7 +14854,7 @@ fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
     // return a JSON-RPC internal error for this request unless the client
     // cancelled it while it was in flight.
     let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        process_request(
+        process_request_wire(
             &state,
             &req,
             &guards.search,
@@ -14547,7 +14870,7 @@ fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
     .unwrap_or_else(|_| {
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         glog("panic while handling a request; returned an internal error, gateway still up");
-        Some(error(id, -32603, "internal error"))
+        Some(error(id, -32603, "internal error").into())
     });
 
     if cancel_registry.is_cancelled(&request_key) {
@@ -15624,7 +15947,7 @@ fn handle_mcp_http(
             }
 
             let _session = McpSessionGuard::enter(session_id.clone());
-            let resp = process_request(
+            let resp = process_request_wire(
                 state,
                 &req,
                 guard,
@@ -15639,7 +15962,7 @@ fn handle_mcp_http(
             match resp {
                 Some(resp) => {
                     let status = if is_modern {
-                        modern_http_status(&resp)
+                        modern_http_status(&resp.envelope)
                     } else {
                         200
                     };
@@ -17537,12 +17860,7 @@ fn proxy_public_http_connection(
     }
     // The daemon detects the public caller's full socket close. Keep the write
     // side open during the relay so waiting callers do not appear abandoned.
-    let _ = relay_http_response(
-        &mut client,
-        &mut upstream,
-        Arc::new(|| {}),
-        Arc::new(|| {}),
-    );
+    let _ = relay_http_response(&mut client, &mut upstream, Arc::new(|| {}), Arc::new(|| {}));
 }
 
 /// The desktop keeps this lightweight public listener as its child. The heavy
@@ -18336,7 +18654,10 @@ fn handle_connection(
         ),
         (b"Access-Control-Allow-Headers", allow_headers.as_bytes()),
         // Browser clients need session identity and untrusted-data provenance.
-        (b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()),
+        (
+            b"Access-Control-Expose-Headers",
+            EXPOSED_HTTP_HEADERS.as_bytes(),
+        ),
     ];
     for (name, value) in cors {
         // Skip a header that won't encode rather than panicking the thread.
@@ -18613,11 +18934,13 @@ fn main() {
                         "{}",
                         serde_json::to_string(&results).expect("serializable disconnect results")
                     );
-                    conduit_lib::telemetry::exit_with(if results.iter().any(|result| result.error.is_some()) {
-                        1
-                    } else {
-                        0
-                    });
+                    conduit_lib::telemetry::exit_with(
+                        if results.iter().any(|result| result.error.is_some()) {
+                            1
+                        } else {
+                            0
+                        },
+                    );
                 }
                 Err(error) => {
                     eprintln!("toolport-gateway --disconnect-all: {error}");
@@ -18938,6 +19261,7 @@ fn main() {
         registry_trusted: Arc::clone(&registry_trusted),
         router: Arc::clone(&router),
         tool_scope_views: Mutex::new(ToolScopeViews::default()),
+        tool_surfaces: Mutex::new(ToolSurfaceCache::default()),
         root_launch_pool: Mutex::new(RootLaunchPool::default()),
         cached_tools: Arc::clone(&cached_tools),
         ready: Arc::clone(&ready),
@@ -24790,6 +25114,7 @@ mod tests {
             registry_trusted,
             router,
             tool_scope_views: Mutex::new(ToolScopeViews::default()),
+            tool_surfaces: Mutex::new(ToolSurfaceCache::default()),
             root_launch_pool: Mutex::new(RootLaunchPool::default()),
             cached_tools,
             ready: Arc::new(AtomicBool::new(true)),
@@ -24840,6 +25165,7 @@ mod tests {
                 registry_trusted: Arc::new(AtomicBool::new(true)),
                 router: Arc::new(Mutex::new(Arc::new(Router::new()))),
                 tool_scope_views: Mutex::new(ToolScopeViews::default()),
+                tool_surfaces: Mutex::new(ToolSurfaceCache::default()),
                 root_launch_pool: Mutex::new(RootLaunchPool::default()),
                 cached_tools: Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -25374,14 +25700,7 @@ mod tests {
 
         let listener_inflight = Arc::clone(&inflight);
         std::thread::spawn(move || {
-            serve_http_loop_with_inflight(
-                server,
-                state,
-                None,
-                search,
-                true,
-                listener_inflight,
-            )
+            serve_http_loop_with_inflight(server, state, None, search, true, listener_inflight)
         });
         std::thread::sleep(Duration::from_millis(50));
 
@@ -34181,7 +34500,11 @@ mod tests {
             (**guard).clone()
         };
 
-        fail_closed_integrity_catalog(&mut live, Some("sbs714-gateway"), set_of(&["srv__new_drift"]));
+        fail_closed_integrity_catalog(
+            &mut live,
+            Some("sbs714-gateway"),
+            set_of(&["srv__new_drift"]),
+        );
 
         assert_eq!(
             live.quarantined(),
