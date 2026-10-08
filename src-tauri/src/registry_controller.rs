@@ -2594,13 +2594,13 @@ mod tests {
 
     #[test]
     fn reviewed_rollback_preserves_concurrent_environment_fields() {
-        let previous = json!({"enabled":false,"env":[{"key":"PAT","value":"old"}]});
-        let staged = json!({"enabled":true,"env":[{"key":"PAT","value":"staged"}]});
-        let mut latest = json!({"enabled":true,"env":[{"key":"PAT","value":"concurrent"},{"key":"PORT","value":"3000"}]});
+        let previous = serde_json::json!({"enabled":false,"env":[{"key":"PAT","value":"old"}]});
+        let staged = serde_json::json!({"enabled":true,"env":[{"key":"PAT","value":"staged"}]});
+        let mut latest = serde_json::json!({"enabled":true,"env":[{"key":"PAT","value":"concurrent"},{"key":"PORT","value":"3000"}]});
         assert!(!undo_staged_value(&mut latest, &previous, &staged));
         assert_eq!(
             latest,
-            json!({"enabled":false,"env":[{"key":"PAT","value":"concurrent"},{"key":"PORT","value":"3000"}]})
+            serde_json::json!({"enabled":false,"env":[{"key":"PAT","value":"concurrent"},{"key":"PORT","value":"3000"}]})
         );
     }
 
