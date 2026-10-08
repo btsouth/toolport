@@ -2,16 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Onboarding } from "./Onboarding";
-import { listStacks } from "@/lib/api";
 import type { DetectedClient, Registry } from "@/lib/types";
 
-vi.mock("@/lib/api", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/api")>();
-  return {
-    ...actual,
-    listStacks: vi.fn().mockResolvedValue([]),
-  };
-});
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("@/lib/toast", () => ({ toastError: vi.fn() }));
 // ClientLogo loads vendored SVGs via import.meta.glob; stub it so the test stays focused.
@@ -86,29 +78,17 @@ describe("Onboarding dialog accessibility", () => {
     expect(screen.getByRole("dialog")).toHaveAccessibleName("Join your team");
   });
 
-  it("exposes the selected state of the role/Collection choice buttons", async () => {
-    vi.mocked(listStacks).mockResolvedValue([
-      { id: "dev", name: "Developer", description: "A dev Collection", servers: [] },
-      { id: "ops", name: "Operations", description: "An ops Collection", servers: [] },
-    ]);
+  it("offers reviewed client import and the catalog from the add step", async () => {
     const user = userEvent.setup();
     render(
       <Onboarding {...props} initialStep={1} onProbe={vi.fn().mockResolvedValue([])} />,
     );
-
-    const dev = await screen.findByRole("button", { name: "Developer" });
-    const ops = screen.getByRole("button", { name: "Operations" });
-    // Neither is selected initially.
-    expect(dev).toHaveAttribute("aria-pressed", "false");
-    expect(ops).toHaveAttribute("aria-pressed", "false");
-
-    // Selecting a role presses only that button.
-    await user.click(dev);
-    expect(dev).toHaveAttribute("aria-pressed", "true");
-    expect(ops).toHaveAttribute("aria-pressed", "false");
-
-    // Clicking again toggles it back off (deselect).
-    await user.click(dev);
-    expect(dev).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByText(/import your existing servers/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Browse the full catalog" }));
+    expect(props.onBrowseCatalog).toHaveBeenCalledOnce();
+    await user.click(
+      screen.getByRole("button", { name: "Review and connect your clients" }),
+    );
+    expect(screen.getByRole("dialog")).toHaveAccessibleName("Connect a client");
   });
 });

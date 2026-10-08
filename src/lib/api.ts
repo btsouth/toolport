@@ -24,18 +24,12 @@ import type {
   ToolIdentity,
   ServerEntry,
   ToolCallResult,
-  Stack,
   WriteOutcome,
 } from "./types";
 
 /** The hand-verified popular catalog (offline, instant). */
 export function popularCatalog(): Promise<CatalogEntry[]> {
   return invoke<CatalogEntry[]>("popular_catalog");
-}
-
-/** Curated Collections: groups of catalog servers to add in one flow (offline). */
-export function listStacks(): Promise<Stack[]> {
-  return invoke<Stack[]>("list_stacks");
 }
 
 /** Search the catalog (your picks + curated, then the MCP Registry). */

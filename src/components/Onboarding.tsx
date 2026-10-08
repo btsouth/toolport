@@ -1,5 +1,4 @@
-import { catalogInstalledIdentities, installed } from "@/lib/catalogIdentity";
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ArrowLeft,
   ArrowRight,
@@ -9,7 +8,6 @@ import {
   KeyRound,
   Link2,
   Loader2,
-  Plus,
   ShieldCheck,
   Sparkles,
   Store,
@@ -19,26 +17,22 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
-import { getAuditLog, listStacks, teamConnect, teamJoinPoll } from "@/lib/api";
-import { CollectionReviewDialog } from "@/components/CollectionReviewDialog";
+import { getAuditLog, teamConnect, teamJoinPoll } from "@/lib/api";
 import { ClientLogo } from "@/components/ClientLogo";
 import { clientRestartHint } from "@/lib/clientConnect";
 import { HOSTED_TEAMS_URL, TEAMS_MARKETING_URL, teamUrlError } from "@/lib/teamUrl";
 import { Input } from "@/components/ui/input";
 import {
-  importableServers,
   isGatewayServer,
   type AuditEntry,
   type DetectedClient,
   type ProbeResult,
   type Registry,
-  type Stack,
 } from "@/lib/types";
 import { openExternal } from "@/lib/openUrl";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogTitle } from "@/components/ui/dialog";
 import { ConnectReviewDialog } from "@/components/ConnectReviewDialog";
-import { Skeleton } from "@/components/ui/skeleton";
 
 interface Props {
   /** Step to open at (0 = Welcome). Used to resume mid-flow. */
@@ -80,11 +74,6 @@ export function Onboarding({
   const [joining, setJoining] = useState(false);
 
   const present = clients.filter((c) => c.appPresent);
-  const importable = new Set(
-    clients.flatMap((c) =>
-      importableServers(c, registry).map((s) => s.name.toLowerCase()),
-    ),
-  ).size;
   // Live progress, so the final step reflects what the user actually did.
   const serverCount = registry.servers.filter((s) => !isGatewayServer(s)).length;
   const connectedCount = clients.filter((c) => c.gatewayInstalled).length;
@@ -120,14 +109,7 @@ export function Onboarding({
 
   const steps = [
     welcome,
-    <AddServers
-      key="add"
-      registry={registry}
-      importable={importable}
-      onImport={onRegistryChange}
-      onBrowseCatalog={onBrowseCatalog}
-      onNext={() => setStep(2)}
-    />,
+    <AddServers key="add" onBrowseCatalog={onBrowseCatalog} onNext={() => setStep(2)} />,
     connect,
     done,
   ];
@@ -501,172 +483,30 @@ function JoinTeam({
 }
 
 function AddServers({
-  registry,
-  importable,
-  onImport,
   onBrowseCatalog,
   onNext,
 }: {
-  registry: Registry;
-  importable: number;
-  onImport: (r: Registry) => void;
   onBrowseCatalog: () => void;
   onNext: () => void;
 }) {
-  const [collections, setCollections] = useState<Stack[]>([]);
-  const [collectionsLoading, setCollectionsLoading] = useState(true);
-  const [collectionsError, setCollectionsError] = useState(false);
-  const [selected, setSelected] = useState<string | null>(null);
-  const [reviewCollection, setReviewCollection] = useState<Stack | null>(null);
-  const applying = false;
-  // True once the user has added a Collection or imported, so "Next" replaces "later".
-  const [touched, setTouched] = useState(false);
-
-  const reloadCollections = useCallback(() => {
-    setCollectionsLoading(true);
-    setCollectionsError(false);
-    listStacks()
-      .then(setCollections)
-      .catch(() => setCollectionsError(true))
-      .finally(() => setCollectionsLoading(false));
-  }, []);
-
-  useEffect(() => {
-    reloadCollections();
-  }, [reloadCollections]);
-
-  const have = new Set(registry.servers.flatMap(catalogInstalledIdentities));
-  const collection = collections.find((s) => s.id === selected) ?? null;
-
-  /** Add every server in the chosen Collection that isn't already in Toolport. */
-  function applyCollection(s: Stack) {
-    setReviewCollection(s);
-  }
-
   return (
     <>
-      {reviewCollection && (
-        <CollectionReviewDialog
-          collection={reviewCollection}
-          registry={registry}
-          onAdded={(next) => {
-            onImport(next);
-            setTouched(true);
-          }}
-          onClose={() => setReviewCollection(null)}
-        />
-      )}
       <StepHeader icon={<Download className="size-5" />} title="Add your first servers">
-        Pick what you work on and Toolport sets up a matching Collection. You can also
-        review and connect a client, or browse the full catalog.
+        Review and connect a client to import your existing servers, or browse the full
+        catalog.
       </StepHeader>
-
       <div className="flex flex-col gap-3">
-        {/* Collection picker: each Collection is a use case / role. */}
-        {collectionsLoading ? (
-          <div
-            role="status"
-            aria-label="Loading collections"
-            className="flex flex-wrap gap-1.5"
-          >
-            {Array.from({ length: 3 }).map((_, i) => (
-              <Skeleton key={i} className="h-7 w-24 rounded-full" />
-            ))}
-          </div>
-        ) : collectionsError ? (
-          <div
-            role="status"
-            aria-live="polite"
-            className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5"
-          >
-            <div>
-              <p className="text-sm font-medium">Collections couldn't load</p>
-              <p className="text-xs text-muted-foreground">
-                Try again to see role-based recommendations.
-              </p>
-            </div>
-            <Button variant="outline" size="sm" onClick={reloadCollections}>
-              Try again
-            </Button>
-          </div>
-        ) : collections.length > 0 ? (
-          <div className="flex flex-col gap-1.5">
-            <span className="text-xs text-muted-foreground">What do you work on?</span>
-            <div className="flex flex-wrap gap-1.5">
-              {collections.map((s) => (
-                <button
-                  key={s.id}
-                  type="button"
-                  aria-pressed={s.id === selected}
-                  onClick={() => setSelected(s.id === selected ? null : s.id)}
-                  className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${
-                    s.id === selected
-                      ? "border-success/50 bg-success/10 text-success"
-                      : "hover:bg-accent"
-                  }`}
-                >
-                  {s.name}
-                </button>
-              ))}
-            </div>
-          </div>
-        ) : null}
-
-        {/* The recommended Collection for the chosen role. */}
-        {collection && (
-          <div className="flex flex-col gap-2 rounded-md border bg-muted/20 p-2.5">
-            <p className="text-xs text-muted-foreground">{collection.description}</p>
-            <div className="flex flex-col gap-1">
-              {collection.servers.map((e) => (
-                <div key={e.name} className="flex items-center gap-1.5 text-[11px]">
-                  {installed(have, e) ? (
-                    <Check className="size-3 shrink-0 text-success" />
-                  ) : (
-                    <span className="inline-block size-3 shrink-0" />
-                  )}
-                  <span className="font-medium text-foreground">{e.name}</span>
-                  {e.credentialsUrl && (
-                    <button
-                      onClick={() => openExternal(e.credentialsUrl)}
-                      className="text-info hover:underline"
-                    >
-                      get key
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
-            <Button
-              size="sm"
-              className="self-start"
-              disabled={applying}
-              onClick={() => applyCollection(collection)}
-            >
-              {applying ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
-                <Plus className="size-3.5" />
-              )}
-              Add this Collection
-            </Button>
-          </div>
-        )}
-
-        {importable > 0 && (
-          <Button variant="outline" onClick={onNext}>
-            <Download className="size-4" />
-            Review and connect your clients
-          </Button>
-        )}
-
+        <Button onClick={onNext}>
+          <Download className="size-4" />
+          Review and connect your clients
+        </Button>
         <Button variant="outline" onClick={onBrowseCatalog}>
           <Store className="size-4" />
           Browse the full catalog
         </Button>
       </div>
-
       <Button variant="ghost" onClick={onNext} className="self-start">
-        {touched ? "Next" : "I'll add servers later"}
+        I'll add servers later
         <ArrowRight className="size-4" />
       </Button>
     </>

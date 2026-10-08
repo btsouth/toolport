@@ -308,18 +308,6 @@ mockIPC(
       case "popular_catalog":
       case "search_catalog":
         return setupCatalog;
-      case "list_stacks":
-        return [
-          {
-            id: "local-notes",
-            name: "Local notes",
-            description: "Notes and Calendar",
-            servers: [
-              ...setupCatalog,
-              { ...setupCatalog[0], name: "Calendar", envKeys: ["PAT"] },
-            ],
-          },
-        ];
       case "add_server":
         return fixtureAdd(args.entry as ServerEntry);
       case "set_secret":

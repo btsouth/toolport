@@ -27,7 +27,6 @@ vi.mock("@/lib/api", () => ({
   teamSyncWait: vi.fn(),
   testServer: vi.fn(),
   updateServer: vi.fn(),
-  listStacks: vi.fn(() => Promise.resolve([])),
   popularCatalog: vi.fn(() => Promise.resolve([])),
   searchCatalog: vi.fn(() => Promise.resolve([])),
 }));

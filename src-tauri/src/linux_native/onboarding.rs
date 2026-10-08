@@ -174,54 +174,10 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow) {
 
     let add = wizard_page(
         "Add your first servers",
-        "Choose a Collection, review and connect a client, or continue to the full catalog.",
+        "Review and connect a client to import your existing servers, or continue to the full catalog.",
     );
-    let stack_feedback = feedback_label("Choose a Collection or continue when you are ready.");
-    add.append(&stack_feedback);
-    let stack_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    stack_list.add_css_class("toolport-settings-group");
-    for starter in crate::stacks::stacks() {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        row.add_css_class("toolport-setting-row");
-        let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        copy.set_hexpand(true);
-        copy.append(
-            &gtk::Label::builder()
-                .label(&starter.name)
-                .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build(),
-        );
-        copy.append(
-            &gtk::Label::builder()
-                .label(&starter.description)
-                .halign(gtk::Align::Fill)
-                .xalign(0.0)
-                .wrap(true)
-                .lines(2)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .css_classes(["toolport-muted"])
-                .build(),
-        );
-        row.append(&copy);
-        let add_stack = gtk::Button::with_label("Add Collection");
-        add_stack.add_css_class("toolport-secondary-action");
-        let entries = starter.servers;
-        let name = starter.name;
-        let feedback = stack_feedback.clone();
-        let parent = window.clone();
-        add_stack.connect_clicked(move |button| {
-            let button = button.clone();
-            let feedback = feedback.clone();
-            super::setup::collection(parent.upcast_ref(), &name, entries.clone(), move || {
-                button.set_label("Added");
-                show_success(&feedback, "Added selected servers. Check status and complete any missing setup inputs under Servers.");
-            });
-        });
-        row.append(&add_stack);
-        stack_list.append(&row);
-    }
-    add.append(&stack_list);
+    let add_feedback = feedback_label("Review a client or browse the catalog when you are ready.");
+    add.append(&add_feedback);
     let import = gtk::Button::with_label("Review and connect clients");
     import.add_css_class("toolport-secondary-action");
     add.append(&import);
@@ -321,7 +277,7 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow) {
     });
     let app_for_catalog = app.clone();
     let window_for_catalog = window.clone();
-    let feedback_for_catalog = stack_feedback.clone();
+    let feedback_for_catalog = add_feedback.clone();
     catalog.connect_clicked(move |_| {
         if complete_and_close(&window_for_catalog, &feedback_for_catalog) {
             activate_page(&app_for_catalog, "show-catalog");

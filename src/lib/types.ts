@@ -381,16 +381,6 @@ export interface CatalogEntry {
   urlHint?: string;
 }
 
-/** A curated Collection: a group of catalog servers the user adds together for
- * guided setup. The wire type keeps its legacy name (`list_stacks`). */
-export interface Stack {
-  id: string;
-  name: string;
-  description: string;
-  /** The Collection's servers, resolved to full catalog entries (with cred hints). */
-  servers: CatalogEntry[];
-}
-
 // --- Toolport registry (source of truth) ---
 
 export interface EnvVar {

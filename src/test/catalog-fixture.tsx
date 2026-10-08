@@ -87,8 +87,6 @@ mockIPC((command) => {
   switch (command) {
     case "popular_catalog":
       return entries;
-    case "list_stacks":
-      return [];
     case "search_catalog":
       return {
         entries: state === "empty-outage" ? [] : entries.slice(0, 1),

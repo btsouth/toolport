@@ -34,7 +34,6 @@ use crate::savings;
 use crate::searchtrace;
 use crate::secrets;
 use crate::server_runtime::{probe_one, probe_one_bounded, ProbeResult};
-use crate::stacks;
 use crate::teams;
 use crate::vendors;
 
@@ -2208,13 +2207,6 @@ fn popular_catalog() -> Vec<catalog::CatalogEntry> {
     catalog::popular()
 }
 
-/// Curated Collections: groups of catalog servers (each resolved to full entries
-/// with credential hints) for the guided one-flow setup.
-#[tauri::command]
-fn list_stacks() -> Vec<stacks::Stack> {
-    stacks::stacks()
-}
-
 /// Search the official MCP Registry for servers to add. Network call, so it runs
 /// on a blocking worker. Empty query returns popular/recent servers.
 #[tauri::command]
@@ -4029,7 +4021,6 @@ pub fn run() {
             cancel_oauth_attempt,
             probe_auth,
             popular_catalog,
-            list_stacks,
             search_catalog,
             open_data_dir,
             set_all_enabled,

@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { importServers, listStacks } from "@/lib/api";
+import { importServers } from "@/lib/api";
 import type { DetectedClient, ProbeResult, Registry } from "@/lib/types";
 import { Onboarding } from "./Onboarding";
 
@@ -9,7 +9,6 @@ vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
   return {
     ...actual,
-    listStacks: vi.fn(),
     previewImportServers: vi.fn(),
     importServers: vi.fn(),
   };
@@ -82,7 +81,6 @@ const props = {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  vi.mocked(listStacks).mockResolvedValue([]);
 });
 
 describe("Onboarding import copy", () => {

@@ -3,14 +3,13 @@ import { Check, ExternalLink, Loader2, Plus, Search, ShieldCheck } from "lucide-
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
 import { openExternal } from "@/lib/openUrl";
-import { addCatalogServer, listStacks, popularCatalog, searchCatalog } from "@/lib/api";
+import { addCatalogServer, popularCatalog, searchCatalog } from "@/lib/api";
 import {
   catalogIdentity,
   catalogInstalledIdentities,
   installed,
 } from "@/lib/catalogIdentity";
-import { CollectionReviewDialog } from "@/components/CollectionReviewDialog";
-import type { CatalogEntry, CatalogSearch, Registry, Stack } from "@/lib/types";
+import type { CatalogEntry, CatalogSearch, Registry } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -46,27 +45,9 @@ export function CatalogView({ registry, onAdded }: Props) {
   const [registryStatus, setRegistryStatus] =
     useState<CatalogSearch["registryStatus"]>("notQueried");
   const [searchNonce, setSearchNonce] = useState(0);
-  const [collections, setCollections] = useState<Stack[]>([]);
-  const [collectionsLoading, setCollectionsLoading] = useState(true);
-  const [collectionsError, setCollectionsError] = useState(false);
-  const collectionBusy = null;
-  const [reviewCollection, setReviewCollection] = useState<Stack | null>(null);
   const [configEntry, setConfigEntry] = useState<CatalogEntry | null>(null);
 
   const have = new Set((registry?.servers ?? []).flatMap(catalogInstalledIdentities));
-
-  const reloadCollections = useCallback(() => {
-    setCollectionsLoading(true);
-    setCollectionsError(false);
-    listStacks()
-      .then(setCollections)
-      .catch(() => setCollectionsError(true))
-      .finally(() => setCollectionsLoading(false));
-  }, []);
-
-  useEffect(() => {
-    reloadCollections();
-  }, [reloadCollections]);
 
   const reloadPopular = useCallback(() => {
     setPopularLoading(true);
@@ -155,12 +136,6 @@ export function CatalogView({ registry, onAdded }: Props) {
     }
   }
 
-  /** Add every server in a Collection that isn't already in Toolport, then point
-   * the user at the credential steps for the ones that need them. */
-  function setupCollection(collection: Stack) {
-    setReviewCollection(collection);
-  }
-
   const shown = results ?? popular;
   const browsing = !query.trim();
 
@@ -193,14 +168,6 @@ export function CatalogView({ registry, onAdded }: Props) {
 
   return (
     <div className="flex min-w-0 w-full flex-col gap-4">
-      {reviewCollection && (
-        <CollectionReviewDialog
-          collection={reviewCollection}
-          registry={registry}
-          onAdded={onAdded}
-          onClose={() => setReviewCollection(null)}
-        />
-      )}
       <div className="relative">
         <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
         {loading && (
@@ -254,42 +221,6 @@ export function CatalogView({ registry, onAdded }: Props) {
             </Button>
           </div>
         )}
-
-      {browsing &&
-        (collectionsLoading ? (
-          <div
-            role="status"
-            aria-label="Loading collections"
-            className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3"
-          >
-            {Array.from({ length: 3 }).map((_, i) => (
-              <Skeleton key={i} className="h-32 rounded-lg" />
-            ))}
-          </div>
-        ) : collectionsError ? (
-          <div
-            role="status"
-            aria-live="polite"
-            className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5"
-          >
-            <div>
-              <p className="text-sm font-medium">Collections couldn't load</p>
-              <p className="text-xs text-muted-foreground">
-                Toolport couldn't load the curated groups. Try again in a moment.
-              </p>
-            </div>
-            <Button variant="outline" size="sm" onClick={reloadCollections}>
-              Try again
-            </Button>
-          </div>
-        ) : collections.length > 0 ? (
-          <CollectionsSection
-            collections={collections}
-            haveNames={have}
-            busyId={collectionBusy}
-            onSetup={setupCollection}
-          />
-        ) : null)}
 
       {shown.length === 0 ? (
         browsing && popularLoading ? (
@@ -408,139 +339,6 @@ export function CatalogView({ registry, onAdded }: Props) {
           urlHint={configEntry.urlHint ?? undefined}
           trigger={<span className="hidden" />}
         />
-      )}
-    </div>
-  );
-}
-
-/** "Collections": curated groups of servers you can add in one click, with the
- * credential steps spelled out per server. */
-function CollectionsSection({
-  collections,
-  haveNames,
-  busyId,
-  onSetup,
-}: {
-  collections: Stack[];
-  haveNames: Set<string>;
-  busyId: string | null;
-  onSetup: (s: Stack) => void;
-}) {
-  return (
-    <section>
-      <h2 className="mb-2 flex items-center gap-2 text-xs font-medium tracking-wide text-muted-foreground uppercase">
-        Collections
-        <span className="font-normal text-muted-foreground/60 normal-case">
-          curated groups to add together
-        </span>
-      </h2>
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        {collections.map((s) => (
-          <CollectionCard
-            key={s.id}
-            collection={s}
-            haveNames={haveNames}
-            busy={busyId === s.id}
-            onSetup={() => onSetup(s)}
-          />
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function CollectionCard({
-  collection,
-  haveNames,
-  busy,
-  onSetup,
-}: {
-  collection: Stack;
-  haveNames: Set<string>;
-  busy: boolean;
-  onSetup: () => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const missing = collection.servers.filter((e) => !installed(haveNames, e));
-  const allAdded = missing.length === 0;
-  return (
-    <div className="flex flex-col gap-2 rounded-lg border border-ring/20 bg-muted/20 p-3">
-      <div className="flex items-start justify-between gap-2">
-        <span className="text-sm font-medium">{collection.name}</span>
-        <span className="shrink-0 text-[11px] text-muted-foreground">
-          {collection.servers.length} servers
-        </span>
-      </div>
-      <p className="min-h-8 text-xs text-muted-foreground">{collection.description}</p>
-      <div className="flex flex-wrap gap-1">
-        {collection.servers.map((e) => (
-          <span
-            key={e.name}
-            className={`rounded px-1.5 py-0.5 text-[11px] ${
-              installed(haveNames, e)
-                ? "bg-success/10 text-success"
-                : "bg-muted text-muted-foreground"
-            }`}
-          >
-            {e.name}
-          </span>
-        ))}
-      </div>
-      <div className="mt-auto flex items-center justify-between gap-2 pt-1">
-        <button
-          onClick={() => setOpen((o) => !o)}
-          className="text-[11px] text-muted-foreground hover:text-foreground"
-        >
-          {open ? "Hide setup steps" : "Setup steps"}
-        </button>
-        {allAdded ? (
-          <span className="inline-flex items-center gap-1 text-xs text-success">
-            <Check className="size-3" />
-            all added
-          </span>
-        ) : (
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 px-2 text-xs"
-            disabled={busy}
-            onClick={onSetup}
-          >
-            {busy ? (
-              <Loader2 className="size-3 animate-spin" />
-            ) : (
-              <Plus className="size-3" />
-            )}
-            Add {missing.length}
-          </Button>
-        )}
-      </div>
-      {open && (
-        <div className="mt-1 flex flex-col gap-1.5 border-t pt-2">
-          {collection.servers.map((e) => (
-            <div key={e.name} className="text-[11px] leading-snug">
-              <span className="font-medium text-foreground">{e.name}</span>
-              {e.setupHint && (
-                <span className="text-muted-foreground">: {e.setupHint}</span>
-              )}
-              {!!e.launch?.inputs.length && (
-                <span className="text-muted-foreground">
-                  {e.setupHint ? " · " : ": "}Launch setup:{" "}
-                  {e.launch.inputs.map((input) => input.label).join(", ")}
-                </span>
-              )}
-              {e.credentialsUrl && (
-                <button
-                  onClick={() => openExternal(e.credentialsUrl)}
-                  className="ml-1 inline-flex items-center gap-0.5 text-info hover:underline"
-                >
-                  get credential
-                  <ExternalLink className="size-2.5" />
-                </button>
-              )}
-            </div>
-          ))}
-        </div>
       )}
     </div>
   );
