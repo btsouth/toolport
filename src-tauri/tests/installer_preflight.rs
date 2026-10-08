@@ -40,7 +40,6 @@ fn command(binary: &Path, data: &Path) -> Command {
     let mut cmd = Command::new(binary);
     cmd.env("TOOLPORT_DATA_DIR", data)
         .env("TOOLPORT_NO_KEYRING", "1")
-        .env("TOOLPORT_NO_DAEMON", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -61,12 +60,20 @@ fn busy_client_defers_and_foreign_gateway_is_never_stopped() {
     let installed = copied_gateway(temp.path(), "install");
     let foreign = copied_gateway(temp.path(), "foreign");
     let data = temp.path().join("data");
-    let mut client = Gateway(command(&installed, &data).spawn().unwrap());
-    let mut other = Gateway(
-        command(&foreign, &temp.path().join("other-data"))
+    let mut client = Gateway(
+        command(&installed, &data)
+            .arg("fixture-direct-stdio")
             .spawn()
             .unwrap(),
     );
+    let mut other = Gateway(
+        command(&foreign, &temp.path().join("other-data"))
+            .arg("fixture-direct-stdio")
+            .spawn()
+            .unwrap(),
+    );
+    // A bare positional fixture argument selects direct stdio, avoiding the
+    // default shared-host adapter role without changing normal CLI behavior.
     // The OS process handle exists before preflight inventories it. There is no
     // need to wait for gateway startup: an open stdio process is already a veto.
     let output = command(Path::new(env!("CARGO_BIN_EXE_toolport-gateway")), &data)
@@ -88,9 +95,14 @@ fn busy_client_defers_and_foreign_gateway_is_never_stopped() {
             "--installer-preflight",
             installed.parent().unwrap().to_str().unwrap(),
         ])
-        .status()
+        .stdout(Stdio::piped())
+        .output()
         .unwrap();
-    assert!(status.success());
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
     assert!(other.0.try_wait().unwrap().is_none());
 }
 
