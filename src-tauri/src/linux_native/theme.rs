@@ -952,7 +952,10 @@ button.toolport-activity-filter {{
 }}
 image.approval-denied {{ color: @toolport_error; }}
 image.approval-warning {{ color: #d9a441; }}
-image.success {{ color: @toolport_success; }}
+image.success {{
+  color: @toolport_success;
+  -gtk-icon-palette: error @toolport_success, warning @toolport_success, success @toolport_success;
+}}
 image.disabled {{ color: @toolport_muted; }}
 
 .toolport-catalog-added {{

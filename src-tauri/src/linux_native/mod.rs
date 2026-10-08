@@ -4995,7 +4995,7 @@ fn approval_outcome(
         ),
         "no_response" => (
             "No answer",
-            "appointment-soon-symbolic",
+            "preferences-system-time-symbolic",
             "approval-warning",
             None,
         ),
