@@ -328,7 +328,8 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
         json!({"mcpServers":{"secured":{"command":secured_command,"env":{"PAT":"synthetic-setup-pat"}}}})
             .to_string();
     std::fs::write(fixture.config(), &credential_config).unwrap();
-    let result = controller::migrate_client("claude-code", None, false).unwrap();
+    let review = controller::preview_client_setup("claude-code").unwrap();
+    let result = migrate_fixture(&fixture, &["secured".into()], &review.revision);
     let saved = registry::load().unwrap();
     let entry = &saved.servers[0];
     assert_eq!(
@@ -348,7 +349,8 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
     let fixture = Fixture::new();
     let http = HttpFixture::new();
     std::fs::write(fixture.config(),json!({"mcpServers":{"remote":{"url":format!("{}?token=synthetic-url-key",http.url),"headers":{"Authorization":"Bearer synthetic-setup-pat"}}}}).to_string()).unwrap();
-    let result = controller::migrate_client("claude-code", None, false).unwrap();
+    let review = controller::preview_client_setup("claude-code").unwrap();
+    let result = migrate_fixture(&fixture, &["remote".into()], &review.revision);
     assert_eq!(result.moved, ["remote"]);
     let saved = registry::load().unwrap();
     let entry = &saved.servers[0];
