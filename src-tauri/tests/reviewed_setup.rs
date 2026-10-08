@@ -313,7 +313,7 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
         Some("synthetic-import-integration".into()),
     );
     let credential_config =
-        json!({"mcpServers":{"secured":{"command":mock,"env":{"PAT":"synthetic-setup-pat"}}}})
+        json!({"mcpServers":{"secured":{"command":secured_command,"env":{"PAT":"synthetic-setup-pat"}}}})
             .to_string();
     std::fs::write(fixture.config(), &credential_config).unwrap();
     let result = controller::migrate_client("claude-code", None, false).unwrap();
@@ -360,41 +360,82 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
 }
 
 struct HttpFixture {
-    child: std::process::Child,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
     url: String,
 }
 impl HttpFixture {
     fn new() -> Self {
-        use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mock-mcp-server"))
-            .env("MOCK_MCP_HTTP", "1")
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            let result = std::io::BufReader::new(stdout)
-                .read_line(&mut line)
-                .map(|_| line);
-            let _ = sender.send(result);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", server.server_addr().to_ip().unwrap());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        let worker = std::thread::spawn(move || {
+            while !stopping.load(std::sync::atomic::Ordering::Acquire) {
+                let Some(mut request) = server
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .unwrap()
+                else {
+                    continue;
+                };
+                let authenticated = request.url() == "/mcp?token=synthetic-url-key"
+                    && request.headers().iter().any(|h| {
+                        h.field.equiv("Authorization")
+                            && h.value.as_str() == "Bearer synthetic-setup-pat"
+                    });
+                if !authenticated {
+                    let _ = request.respond(
+                        tiny_http::Response::from_string("missing reviewed credentials")
+                            .with_status_code(401),
+                    );
+                    continue;
+                }
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                let call: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                let method = call["method"].as_str().unwrap_or("");
+                if call.get("id").is_none() {
+                    let _ = request.respond(tiny_http::Response::empty(204));
+                    continue;
+                }
+                let result = match method {
+                    "initialize" => Some(
+                        json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"Credential fixture","version":"1"}}),
+                    ),
+                    "tools/list" => Some(
+                        json!({"tools":[{"name":"echo","description":"Fixture","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}),
+                    ),
+                    "tools/call" => Some(
+                        json!({"content":[{"type":"text","text":call["params"]["arguments"]["text"].as_str().unwrap_or("")}]}),
+                    ),
+                    _ => None,
+                };
+                let response = match result {
+                    Some(result) => json!({"jsonrpc":"2.0","id":call["id"],"result":result}),
+                    None => {
+                        json!({"jsonrpc":"2.0","id":call["id"],"error":{"code":-32601,"message":"Method not found"}})
+                    }
+                };
+                let _ = request.respond(
+                    tiny_http::Response::from_string(response.to_string()).with_header(
+                        tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+                    ),
+                );
+            }
         });
-        let url = receiver
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .unwrap()
-            .unwrap()
-            .trim()
-            .strip_prefix("MOCK_MCP_URL=")
-            .unwrap()
-            .to_string();
-        Self { child, url }
+        Self {
+            stop,
+            worker: Some(worker),
+            url,
+        }
     }
 }
 impl Drop for HttpFixture {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
     }
 }
 
