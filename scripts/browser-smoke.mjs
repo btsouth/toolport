@@ -54,7 +54,9 @@ try {
     await page.goto(`${baseURL}/fixtures/catalog.html?state=${state}`);
     await expect(page.getByText("GitHub", { exact: true })).toBeVisible();
     if (state === "outage" || state === "timeout" || state === "empty-outage") {
-      await page.getByRole("textbox").fill("github");
+      await page
+        .getByRole("textbox")
+        .fill(state === "empty-outage" ? "unknown-fixture" : "github");
       await expect(page.getByText(/Showing curated matches only/)).toBeVisible();
       await expect(page.getByText(/No catalog results/)).toHaveCount(0);
       if (state === "empty-outage")
