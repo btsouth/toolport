@@ -94,60 +94,8 @@ fn migrate_fixture(
     names: &[String],
     revision: &str,
 ) -> controller::MigrateOutcome {
-    let original = std::fs::read_to_string(fixture.config()).unwrap();
-    let attempt = controller::migrate_client_reviewed("claude-code", None, false, names, revision);
-    if let Err(error) = &attempt {
-        assert!(error.contains("no verified gateway tools"), "{error}");
-        assert_eq!(std::fs::read_to_string(fixture.config()).unwrap(), original);
-        let keys = controller::preview_client_imports()
-            .unwrap()
-            .into_iter()
-            .filter(|candidate| names.contains(&candidate.name))
-            .map(|candidate| candidate.key)
-            .collect();
-        controller::import_client_servers(keys).unwrap();
-        // Synchronize with real lazy discovery through a harmless fixture tool.
-        // No timed sleeps or arbitrary retry loop is needed for the cold catalog.
-        registry::update(|reg| {
-            reg.safety_level = Some(registry::SafetyLevel::Off);
-            reg.human_approval = false;
-            Ok(())
-        })
-        .unwrap();
-        let mut env = vec![(
-            "TOOLPORT_DATA_DIR".into(),
-            fixture.dir.join("data").display().to_string(),
-        )];
-        if let Ok(key) = std::env::var("TOOLPORT_SECRET_KEY") {
-            env.push(("TOOLPORT_SECRET_KEY".into(), key));
-        }
-        let transport = conduit_lib::downstream::StdioTransport::spawn(
-            env!("CARGO_BIN_EXE_toolport-gateway"),
-            &[],
-            &env,
-            None,
-            false,
-        )
-        .unwrap();
-        let mut gateway = conduit_lib::downstream::DownstreamServer::connect(
-            "fixture-agent".into(),
-            Box::new(transport),
-        )
-        .unwrap();
-        for name in names {
-            let response = gateway
-                .call(
-                    "toolport_call_tool",
-                    json!({"name":format!("{name}__echo"),"arguments":{"text":"verified"}}),
-                )
-                .unwrap();
-            assert_ne!(response["isError"], true, "{response}");
-            assert!(response.to_string().contains("verified"), "{response}");
-        }
-        return controller::migrate_client_reviewed("claude-code", None, false, names, revision)
-            .unwrap();
-    }
-    attempt.unwrap()
+    controller::migrate_client_reviewed("claude-code", None, false, names, revision)
+        .expect("the cold first connect must succeed")
 }
 
 #[test]
@@ -165,6 +113,12 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
     registry::save(&registry::Registry::default()).unwrap();
     let mock = env!("CARGO_BIN_EXE_mock-mcp-server");
     std::fs::write(fixture.config(),json!({"mcpServers":{"alpha":{"command":mock},"beta":{"command":mock},"kept":{"command":"native-only","env":{"PAT":"synthetic-native-secret"},"custom":true}}}).to_string()).unwrap();
+    registry::update(|reg| {
+        let mut unrelated: registry::ServerEntry = serde_json::from_value(json!({"id":"unrelated","name":"Unrelated","enabled":true,"transport":"stdio","command":"/not-a-real-unrelated-command","args":[],"env":[]})).unwrap();
+        unrelated.enabled = true;
+        reg.add_server(unrelated);
+        Ok(())
+    }).unwrap();
     let review = controller::preview_client_setup("claude-code").unwrap();
     let result = migrate_fixture(&fixture, &["alpha".into(), "beta".into()], &review.revision);
     assert_eq!(result.moved, ["alpha", "beta"]);

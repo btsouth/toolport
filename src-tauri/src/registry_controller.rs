@@ -2430,6 +2430,25 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_setup_tolerates_unrelated_client_state_and_records_only_moved() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(fixture.claude(), r#"{"numStartups":1,"mcpServers":{"chosen":{"command":"chosen"},"kept":{"command":"kept"}}}"#).unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        std::fs::write(fixture.claude(), r#"{"numStartups":2,"mcpServers":{"chosen":{"command":"chosen"},"kept":{"command":"kept"}}}"#).unwrap();
+        migrate_client_reviewed_with("claude-code", None, false, &["chosen".into()], &review.revision, |_,_,_,_| Ok(Vec::new())).unwrap();
+        let record = json_file(&fixture.move_record("claude-code"));
+        assert_eq!(record["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(record["entries"][0]["name"], "chosen");
+        let mut config = json_file(&fixture.claude());
+        config["mcpServers"].as_object_mut().unwrap().remove("kept");
+        std::fs::write(fixture.claude(), config.to_string()).unwrap();
+        disconnect_client("claude-code").unwrap();
+        let restored = json_file(&fixture.claude());
+        assert!(restored["mcpServers"].get("kept").is_none());
+        assert_eq!(restored["numStartups"], 2);
+    }
+
+    #[test]
     fn reviewed_setup_failed_gateway_leaves_native_bytes_intact() {
         let fixture = MoveFixture::new(&Registry::default());
         let original = r#"{ "mcpServers": {"broken":{"command":"missing-command"}} }"#;
