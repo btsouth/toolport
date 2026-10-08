@@ -3050,7 +3050,7 @@ impl ActivityPage {
         page.set_margin_end(20);
         page.append(
             &gtk::Label::builder()
-                .label("Every routed tool call, visible locally")
+                .label("Calls and approvals, visible locally")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
@@ -3059,7 +3059,7 @@ impl ActivityPage {
         );
         page.append(
             &gtk::Label::builder()
-                .label("Toolport records outcomes and timing, never tool arguments or result data. The latest 10 calls are shown first; up to 100 remain available.")
+                .label("Toolport records outcomes and timing, never tool arguments or result data. The latest 10 events are shown first; up to 100 remain available.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
@@ -3072,7 +3072,7 @@ impl ActivityPage {
             .wrap(true)
             .css_classes(["toolport-feedback"])
             .build();
-        feedback.set_label("Open Activity to load retained calls.");
+        feedback.set_label("Open Activity to load retained events.");
         page.append(&feedback);
 
         let summary = gtk::FlowBox::new();
@@ -3179,7 +3179,7 @@ impl ActivityPage {
         performance.append(&stats_list);
         page.append(
             &gtk::Label::builder()
-                .label("Recent calls")
+                .label("Recent calls and approvals")
                 .halign(gtk::Align::Start)
                 .css_classes(["heading"])
                 .build(),
@@ -3189,7 +3189,7 @@ impl ActivityPage {
         filter_server.add_css_class("toolport-input");
         filter_server.add_css_class("toolport-activity-filter");
         filter_server.set_valign(gtk::Align::Center);
-        filter_server.set_tooltip_text(Some("Show calls from one server"));
+        filter_server.set_tooltip_text(Some("Show events from one server"));
         filter_row.append(&filter_server);
         let errors_only = gtk::ToggleButton::with_label("Errors only");
         errors_only.add_css_class("toolport-secondary-action");
@@ -3205,7 +3205,7 @@ impl ActivityPage {
         page.append(&filter_row);
         let list = gtk::Box::new(gtk::Orientation::Vertical, 10);
         page.append(&list);
-        let show_more_calls = gtk::Button::with_label("Show more calls");
+        let show_more_calls = gtk::Button::with_label("Show more events");
         show_more_calls.add_css_class("toolport-secondary-action");
         show_more_calls.set_halign(gtk::Align::Center);
         show_more_calls.set_visible(false);
@@ -3542,7 +3542,7 @@ impl ActivityPage {
         self.average_latency.set_label(
             &snapshot
                 .average_duration_ms
-                .map(|duration| format!("{duration} ms"))
+                .map(format_duration)
                 .unwrap_or_else(|| "–".to_string()),
         );
         self.tokens_saved
@@ -3950,7 +3950,7 @@ impl ActivityPage {
             self.list.append(&state_card(
                 "view-list-symbolic",
                 "No activity yet",
-                "Calls routed through Toolport will appear here with their outcome and timing.",
+                "Calls and approval outcomes will appear here with their timing.",
                 false,
             ));
             return;
@@ -3959,12 +3959,12 @@ impl ActivityPage {
         let errors_only = self.errors_only.is_active();
         let filtered = filter_calls(&snapshot.recent, server.as_deref(), errors_only);
         if filtered.is_empty() {
-            self.filter_count.set_label("0 matching calls");
+            self.filter_count.set_label("0 matching events");
             self.show_more_calls.set_visible(false);
             self.list.append(&state_card(
                 "edit-find-symbolic",
-                "No matching calls",
-                "No retained call matches the current filter.",
+                "No matching events",
+                "No retained event matches the current filter.",
                 false,
             ));
             return;
@@ -3977,18 +3977,18 @@ impl ActivityPage {
         };
         self.filter_count
             .set_label(&if visible_count < match_count {
-                format!("Showing {visible_count} of {match_count} calls")
+                format!("Showing {visible_count} of {match_count} events")
             } else if match_count == snapshot.recent.len() {
-                format!("{match_count} calls")
+                format!("{match_count} events")
             } else {
-                format!("{match_count} of {} calls", snapshot.recent.len())
+                format!("{match_count} of {} events", snapshot.recent.len())
             });
         self.show_more_calls
             .set_visible(match_count > RECENT_CALL_PREVIEW_LIMIT);
         let show_more_label = if self.show_all_recent.get() {
             "Show fewer".to_string()
         } else {
-            format!("Show all {match_count} calls")
+            format!("Show all {match_count} events")
         };
         self.show_more_calls.set_label(&show_more_label);
         for activity in filtered.into_iter().take(visible_count) {
@@ -4704,7 +4704,7 @@ fn inspect_card(capture: &serde_json::Value, expanded_rows: ActivityExpansionSta
     let duration = capture
         .get("durationMs")
         .and_then(serde_json::Value::as_u64)
-        .map(|duration| format!(" · {duration} ms"))
+        .map(|duration| format!(" · {}", format_duration(duration)))
         .unwrap_or_default();
     card.append(
         &gtk::Label::builder()
@@ -4873,14 +4873,33 @@ fn pii_badge(
 fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     card.add_css_class("toolport-card");
-    let icon = gtk::Image::from_icon_name(if activity.ok {
-        "emblem-ok-symbolic"
-    } else {
-        "dialog-error-symbolic"
-    });
+    let outcome = activity.approval_decision.as_deref().map(approval_outcome);
+    let icon = gtk::Image::from_icon_name(outcome.map(|(_, icon, _, _)| icon).unwrap_or(
+        if activity.ok {
+            "emblem-ok-symbolic"
+        } else {
+            "dialog-error-symbolic"
+        },
+    ));
+    if let Some((_, _, tone, _)) = outcome {
+        icon.add_css_class(tone);
+    }
     icon.add_css_class("toolport-card-icon");
     icon.set_valign(gtk::Align::Center);
-    card.append(&icon);
+    if let Some((_, _, tone, Some(emblem))) = outcome {
+        let overlay = gtk::Overlay::new();
+        overlay.set_valign(gtk::Align::Center);
+        overlay.set_child(Some(&icon));
+        let emblem = gtk::Image::from_icon_name(emblem);
+        emblem.set_pixel_size(10);
+        emblem.set_halign(gtk::Align::Center);
+        emblem.set_valign(gtk::Align::Center);
+        emblem.add_css_class(tone);
+        overlay.add_overlay(&emblem);
+        card.append(&overlay);
+    } else {
+        card.append(&icon);
+    }
 
     let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
     copy.set_hexpand(true);
@@ -4893,13 +4912,16 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
             .css_classes(["heading"])
             .build(),
     );
-    let mut detail = Vec::new();
-    if let Some(client) = activity.client.as_deref() {
-        detail.push(client.to_string());
-    }
-    detail.push(relative_activity_time(activity.timestamp_ms));
+    let mut detail = vec![
+        activity_client_name(activity),
+        relative_activity_time(activity.timestamp_ms),
+    ];
     if let Some(duration) = activity.duration_ms {
-        detail.push(format!("{duration} ms"));
+        detail.push(if outcome.is_some() {
+            format!("waited {}", format_duration(duration))
+        } else {
+            format_duration(duration)
+        });
     }
     copy.append(
         &gtk::Label::builder()
@@ -4907,21 +4929,11 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
             .tooltip_text(activity.client_id.as_deref().unwrap_or(""))
             .halign(gtk::Align::Fill)
             .xalign(0.0)
-            .wrap(true)
+            .single_line_mode(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["toolport-muted"])
             .build(),
     );
-    if let Some(label) = activity.client_label.as_deref() {
-        copy.append(
-            &gtk::Label::builder()
-                .label(label)
-                .xalign(0.0)
-                .wrap(true)
-                .wrap_mode(gtk::pango::WrapMode::WordChar)
-                .css_classes(["toolport-muted"])
-                .build(),
-        );
-    }
     if let Some(error) = activity.error.as_deref() {
         copy.append(
             &gtk::Label::builder()
@@ -4943,7 +4955,9 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
         badge.set_tooltip_text(Some(tooltip));
         card.append(&badge);
     }
-    let (status, class) = if activity.held {
+    let (status, class) = if let Some((label, _, tone, _)) = outcome {
+        (label, tone)
+    } else if activity.held {
         ("Held", "review")
     } else if activity.ok {
         ("Succeeded", "success")
@@ -4958,6 +4972,83 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     card
 }
 
+fn approval_outcome(
+    decision: &str,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+) {
+    // Adwaita symbolic icons, also available in Omarchy's inherited icon theme.
+    match decision {
+        "approved" => (
+            "Approved",
+            "security-medium-symbolic",
+            "success",
+            Some("object-select-symbolic"),
+        ),
+        "denied" => (
+            "Denied",
+            "security-medium-symbolic",
+            "approval-denied",
+            Some("window-close-symbolic"),
+        ),
+        "no_response" => (
+            "No answer",
+            "preferences-system-time-symbolic",
+            "approval-warning",
+            None,
+        ),
+        "withdrawn" => ("Withdrawn", "edit-undo-symbolic", "disabled", None),
+        "stale_state" => (
+            "Changed after approval",
+            "dialog-warning-symbolic",
+            "approval-warning",
+            None,
+        ),
+        "unreachable" => (
+            "No approver available",
+            "dialog-warning-symbolic",
+            "approval-warning",
+            None,
+        ),
+        _ => (
+            "Approval event",
+            "dialog-information-symbolic",
+            "disabled",
+            None,
+        ),
+    }
+}
+
+fn format_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else if ms < 60000 {
+        let tenths = (ms + 50) / 100;
+        format!("{}.{} s", tenths / 10, tenths % 10)
+    } else {
+        let seconds = ms.saturating_add(500) / 1000;
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    }
+}
+
+fn activity_client_name(activity: &state::ActivityView) -> String {
+    let name = activity.client.as_deref().unwrap_or("An AI client");
+    match activity
+        .client_label
+        .as_deref()
+        .filter(|label| *label != name)
+    {
+        Some(label) => match label.strip_prefix(name) {
+            Some(remainder) => format!("{name} {}", remainder.trim()),
+            None => format!("{name} (reports \"{label}\")"),
+        },
+        None => name.to_string(),
+    }
+}
+
 /// One aggregation row's metrics, shared by the server line and its tool lines:
 /// calls, errors, and latency where the log carried durations.
 fn stat_metrics_line(stat: &serde_json::Value) -> String {
@@ -4969,10 +5060,10 @@ fn stat_metrics_line(stat: &serde_json::Value) -> String {
         format!("{errors} {}", if errors == 1 { "error" } else { "errors" }),
     ];
     if let Some(avg) = number("avgMs") {
-        parts.push(format!("avg {avg} ms"));
+        parts.push(format!("avg {}", format_duration(avg)));
     }
     if let Some(p95) = number("p95Ms") {
-        parts.push(format!("p95 {p95} ms"));
+        parts.push(format!("p95 {}", format_duration(p95)));
     }
     parts.join(" · ")
 }
@@ -5121,7 +5212,7 @@ fn filter_calls<'a>(
     calls
         .iter()
         .filter(|call| server.is_none_or(|server| call.server == server))
-        .filter(|call| !errors_only || !call.ok)
+        .filter(|call| !errors_only || (call.approval_decision.is_none() && !call.ok))
         .collect()
 }
 
@@ -9477,6 +9568,7 @@ mod tests {
             client: None,
             client_label: None,
             client_id: None,
+            approval_decision: None,
             ok,
             held: false,
             duration_ms: None,
@@ -9512,6 +9604,27 @@ mod tests {
             activity_server_filter_options(&calls),
             vec!["All servers", "github", "jira"]
         );
+    }
+
+    #[test]
+    fn p10c_approval_badges_and_error_filter_keep_outcomes_separate() {
+        let mut events = Vec::new();
+        for (decision, label) in [
+            ("denied", "Denied"),
+            ("no_response", "No answer"),
+            ("withdrawn", "Withdrawn"),
+            ("stale_state", "Changed after approval"),
+            ("approved", "Approved"),
+            ("unreachable", "No approver available"),
+        ] {
+            assert_eq!(approval_outcome(decision).0, label);
+            let mut event = call("github", false);
+            event.approval_decision = Some(decision.into());
+            events.push(event);
+        }
+        events.push(call("github", false));
+        assert_eq!(filter_calls(&events, None, false).len(), 7);
+        assert_eq!(filter_calls(&events, None, true).len(), 1);
     }
 
     #[test]
@@ -10185,5 +10298,51 @@ mod tests {
         assert!(server_matches_query(&linear, " HTTP "));
         assert!(server_matches_query(&linear, ""));
         assert!(!server_matches_query(&linear, "local stdio"));
+    }
+}
+
+#[cfg(test)]
+mod p10c_r1_presentation_tests {
+    use super::*;
+
+    #[test]
+    fn p10c_r1_duration_and_identity_meta_match_react() {
+        for (ms, text) in [
+            (850, "850 ms"),
+            (1500, "1.5 s"),
+            (59999, "60.0 s"),
+            (60000, "1m 0s"),
+            (90000, "1m 30s"),
+            (119999, "2m 0s"),
+        ] {
+            assert_eq!(format_duration(ms), text);
+        }
+        let mut row = state::ActivityView {
+            timestamp_ms: 0,
+            server: "team_slack".into(),
+            tool: "delete".into(),
+            client: Some("Claude Code".into()),
+            client_id: Some("adapter:claude-code".into()),
+            client_label: Some("Claude Code 2.1".into()),
+            approval_decision: Some("denied".into()),
+            ok: true,
+            held: true,
+            duration_ms: Some(1500),
+            error: None,
+            pii_replaced: None,
+            pii_incomplete: false,
+        };
+        assert_eq!(activity_client_name(&row), "Claude Code 2.1");
+        row.client_label = Some("Someone else".into());
+        assert_eq!(
+            activity_client_name(&row),
+            "Claude Code (reports \"Someone else\")"
+        );
+        assert_eq!(
+            activity_server_filter_options(&[row.clone(), row]),
+            vec!["All servers", "team_slack"]
+        );
+        assert_eq!(approval_outcome("denied").2, "approval-denied");
+        assert_eq!(approval_outcome("withdrawn").2, "disabled");
     }
 }

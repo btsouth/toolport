@@ -1,4 +1,4 @@
-import { trustedClientName } from "@/lib/clientIdentity";
+import { activityClientName } from "@/lib/clientIdentity";
 import { useWindowVisible } from "@/lib/windowVisible";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -14,6 +14,9 @@ import {
   Share2,
   ShieldAlert,
   ShieldCheck,
+  ShieldX,
+  Clock,
+  Undo2,
   Sparkles,
   Trash2,
   X,
@@ -22,6 +25,7 @@ import {
 import type { LucideIcon } from "lucide-react";
 import { toast } from "sonner";
 import {
+  fmtAgo,
   fmtBytes,
   fmtMs,
   fmtPercent,
@@ -751,7 +755,21 @@ function PiiBadge({ entry }: { entry: AuditEntry }) {
 
 function CallRow({ e }: { e: AuditEntry }) {
   const [open, setOpen] = useState(false);
-  const hasDetail = !e.ok && !!e.error;
+  const approvalOutcome =
+    e.kind === "approval"
+      ? (APPROVAL_OUTCOME[e.decision ?? ""] ?? UNKNOWN_APPROVAL)
+      : null;
+  const RowIcon =
+    approvalOutcome?.Icon ?? (e.held ? ShieldAlert : e.ok ? CheckCircle2 : XCircle);
+  const duration = approvalOutcome ? e.heldMs : e.durationMs;
+  const meta = [
+    activityClientName(e),
+    fmtAgo(e.ts),
+    ...(duration == null
+      ? []
+      : [approvalOutcome ? `waited ${fmtMs(duration)}` : fmtMs(duration)]),
+  ].join(" · ");
+  const hasDetail = !approvalOutcome && !e.ok && !!e.error;
   return (
     <div className="rounded-md border border-border/50 text-sm">
       <div
@@ -783,35 +801,32 @@ function CallRow({ e }: { e: AuditEntry }) {
         ) : (
           <span className="inline-block size-3.5 shrink-0" />
         )}
-        {e.held ? (
-          <ShieldAlert className="size-4 shrink-0 text-warning" />
-        ) : e.ok ? (
-          <CheckCircle2 className="size-4 shrink-0 text-success" />
-        ) : (
-          <XCircle className="size-4 shrink-0 text-destructive" />
-        )}
-        <span className="min-w-0 truncate font-medium">{e.server}</span>
-        <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
-          {e.tool}
-        </span>
-        {(e.clientName || e.client) && (
-          <span
-            className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
-            title={e.client ? `Client: ${e.client}` : "Client that made this call"}
+        <RowIcon
+          className={`size-4 shrink-0 ${approvalOutcome?.iconClass ?? (e.held ? "text-warning" : e.ok ? "text-success" : "text-destructive")}`}
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="min-w-0 truncate font-medium">{e.server}</span>
+            <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
+              {e.tool}
+            </span>
+          </div>
+          <div
+            className="mt-1 truncate text-xs text-muted-foreground"
+            title={e.client ? `${meta} · Client: ${e.client}` : meta}
+            dir="auto"
           >
-            {trustedClientName(e)}
-          </span>
-        )}
-        {e.clientLabel && (
-          <span className="min-w-0 truncate text-xs text-muted-foreground" dir="auto">
-            {e.clientLabel}
+            {meta}
+          </div>
+        </div>
+        {approvalOutcome && (
+          <span
+            className={`shrink-0 rounded border px-2 py-0.5 text-xs ${approvalOutcome.className}`}
+          >
+            {approvalOutcome.label}
           </span>
         )}
         <PiiBadge entry={e} />
-        <span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">
-          {fmtMs(e.durationMs ?? e.heldMs ?? null)}
-        </span>
-        <span className="shrink-0 text-xs text-muted-foreground">{fmtTs(e.ts)}</span>
       </div>
       {open && e.error && (
         <div className="border-t border-border/50 bg-destructive/5 px-3 py-2 pl-9">
@@ -823,6 +838,54 @@ function CallRow({ e }: { e: AuditEntry }) {
     </div>
   );
 }
+
+const APPROVAL_OUTCOME: Record<
+  string,
+  { label: string; Icon: LucideIcon; iconClass: string; className: string }
+> = {
+  approved: {
+    label: "Approved",
+    Icon: ShieldCheck,
+    iconClass: "text-success",
+    className: "border-success/30 bg-success/10 text-success",
+  },
+  denied: {
+    label: "Denied",
+    Icon: ShieldX,
+    iconClass: "text-destructive",
+    className: "border-destructive/50 text-destructive",
+  },
+  no_response: {
+    label: "No answer",
+    Icon: Clock,
+    iconClass: "text-warning",
+    className: "border-warning/30 bg-warning/10 text-warning",
+  },
+  withdrawn: {
+    label: "Withdrawn",
+    Icon: Undo2,
+    iconClass: "text-muted-foreground",
+    className: "border-border text-muted-foreground",
+  },
+  stale_state: {
+    label: "Changed after approval",
+    Icon: AlertTriangle,
+    iconClass: "text-warning",
+    className: "border-warning/30 bg-warning/10 text-warning",
+  },
+  unreachable: {
+    label: "No approver available",
+    Icon: AlertTriangle,
+    iconClass: "text-warning",
+    className: "border-warning/30 bg-warning/10 text-warning",
+  },
+};
+const UNKNOWN_APPROVAL = {
+  label: "Approval event",
+  Icon: ShieldAlert,
+  iconClass: "text-muted-foreground",
+  className: "border-border text-muted-foreground",
+};
 
 export function TelemetryNotice({ stats }: { stats: AuditStats | null }) {
   const health = stats?.telemetry;
@@ -1861,7 +1924,9 @@ export function ActivityView({
   );
 
   const visible = (entries ?? []).filter(
-    (e) => (!serverFilter || e.server === serverFilter) && (!errorsOnly || !e.ok),
+    (e) =>
+      (!serverFilter || e.server === serverFilter) &&
+      (!errorsOnly || (e.kind !== "approval" && !e.ok)),
   );
 
   if (entries === null && auditLoadStatus === "loading") {
@@ -1940,10 +2005,10 @@ export function ActivityView({
         <div className="flex flex-col items-center justify-center gap-3 py-24 text-center">
           <ScrollText className="size-10 text-muted-foreground/50" />
           <div>
-            <p className="font-medium">No tool calls yet</p>
+            <p className="font-medium">No activity yet</p>
             <p className="max-w-md text-sm text-muted-foreground">
-              Once a client runs a tool through Toolport, every call is recorded here,
-              with per-server latency and error rates.
+              Calls and approval outcomes appear here. Call totals and error rates count
+              tools that ran.
             </p>
           </div>
         </div>
@@ -1966,9 +2031,9 @@ export function ActivityView({
           <ChevronRight
             className={`size-4 transition-transform ${logOpen ? "rotate-90" : ""}`}
           />
-          Recent calls
+          Recent calls and approvals
           <span className="text-xs font-normal text-muted-foreground/70">
-            last {entries.length} {entries.length === 1 ? "call" : "calls"}
+            last {entries.length} {entries.length === 1 ? "event" : "events"}
           </span>
         </button>
         <button

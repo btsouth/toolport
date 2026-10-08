@@ -57,7 +57,13 @@ export function stableListKeys<T>(items: T[], identity: (item: T) => string): st
 /** Compact latency string: "180 ms" or "1.2 s", or a dash when unmeasured. */
 export function fmtMs(ms: number | null): string {
   if (ms == null) return "-";
-  return ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`;
+  if (ms < 1000) return `${ms} ms`;
+  if (ms < 60000) {
+    const tenths = Math.round(ms / 100);
+    return `${Math.floor(tenths / 10)}.${tenths % 10} s`;
+  }
+  const seconds = Math.round(ms / 1000);
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
 /** Dollar value of saved input tokens, scaled to the number's size. */
@@ -106,4 +112,13 @@ export function fmtTs(timestamp: number, format?: "time" | "date" | "monthDay"):
       minute: "2-digit",
     });
   }
+}
+
+/** Relative time shared by Activity rows. */
+export function fmtAgo(ts: number, now = Date.now()): string {
+  const seconds = Math.max(0, Math.floor((now - ts) / 1000));
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
 }

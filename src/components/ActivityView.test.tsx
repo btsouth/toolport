@@ -76,6 +76,53 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+it("p10c shows approval outcomes without treating them as call errors", async () => {
+  const outcomes = [
+    ["denied", "Denied"],
+    ["no_response", "No answer"],
+    ["withdrawn", "Withdrawn"],
+    ["stale_state", "Changed after approval"],
+    ["approved", "Approved"],
+    ["unreachable", "No approver available"],
+  ];
+  getAuditLog.mockResolvedValue([
+    ...outcomes.map(([decision], index) => ({
+      ...entry({ ts: 1700000010000 + index, tool: `approval_${index}`, ok: false }),
+      kind: "approval",
+      decision,
+      heldMs: 90000,
+      durationMs: undefined,
+    })),
+    ...initialLog,
+  ]);
+  getAuditStats.mockResolvedValue({ total: 2, errors: 1, errorRate: 0.5, servers: [] });
+  render(<ActivityView refreshKey={0} registry={null} />);
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  expect(screen.getByText("calls logged").parentElement).toHaveTextContent(
+    /2\s*calls logged/,
+  );
+  expect(screen.getByText("errors (50%)").parentElement).toHaveTextContent(/1\s*errors/);
+  for (const [, label] of outcomes) expect(screen.getByText(label)).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /errors only/i }));
+  expect(screen.getByText("merge_pr")).toBeInTheDocument();
+  for (const [, label] of outcomes)
+    expect(screen.queryByText(label)).not.toBeInTheDocument();
+});
+
+it("p10c shows an approval-only history even when no tools ran", async () => {
+  getAuditLog.mockResolvedValue([
+    { ...entry(), kind: "approval", decision: "withdrawn" },
+  ]);
+  getAuditStats.mockResolvedValue({ total: 0, errors: 0, errorRate: 0, servers: [] });
+  render(<ActivityView refreshKey={0} registry={null} />);
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  expect(screen.getByText("Withdrawn")).toBeInTheDocument();
+  expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
+  expect(screen.queryByText("calls logged")).not.toBeInTheDocument();
+});
+
 it("pauses Activity polling while hidden and resumes when visible", async () => {
   const view = render(<ActivityView refreshKey={0} registry={null} />);
   await act(async () => {});
@@ -111,7 +158,7 @@ describe("ActivityView trust-state loading", () => {
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
 
-    expect(screen.getByText("No tool calls yet")).toBeInTheDocument();
+    expect(screen.getByText("No activity yet")).toBeInTheDocument();
     expect(screen.getByText("Protection active.")).toBeInTheDocument();
   });
 
@@ -232,7 +279,7 @@ describe("ActivityView trust-state loading", () => {
 
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    expect(screen.getByText("No tool calls yet")).toBeInTheDocument();
+    expect(screen.getByText("No activity yet")).toBeInTheDocument();
 
     await act(async () => {
       vi.advanceTimersByTime(3000);
@@ -240,7 +287,7 @@ describe("ActivityView trust-state loading", () => {
 
     expect(screen.getByText("Activity may be out of date.")).toBeInTheDocument();
     expect(screen.getByText("No current activity status")).toBeInTheDocument();
-    expect(screen.queryByText("No tool calls yet")).not.toBeInTheDocument();
+    expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Retry activity log" }),
     ).toBeInTheDocument();
@@ -280,11 +327,11 @@ describe("ActivityView trust-state loading", () => {
     await act(async () => {});
 
     expect(screen.getByText("Couldn't load activity")).toBeInTheDocument();
-    expect(screen.queryByText("No tool calls yet")).not.toBeInTheDocument();
+    expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Retry activity log" }));
     await act(async () => {});
-    expect(screen.getByText("No tool calls yet")).toBeInTheDocument();
+    expect(screen.getByText("No activity yet")).toBeInTheDocument();
   });
 });
 
@@ -689,6 +736,41 @@ describe("telemetry health", () => {
       await screen.findByText(/Gateway telemetry health is unavailable/),
     ).toBeInTheDocument();
   });
+});
+
+it("uses one server filter and one identity, time and wait meta line", async () => {
+  const ts = Date.now() - 120000;
+  getAuditLog.mockResolvedValue([
+    entry({
+      ts,
+      server: "team_slack",
+      serverId: "team-slack",
+      kind: "approval",
+      decision: "denied",
+      client: "adapter:claude-code",
+      clientName: "Claude Code",
+      clientLabel: "Claude Code 2.1",
+      heldMs: 1500,
+    }),
+    entry({
+      ts,
+      server: "team_slack",
+      serverId: "team-slack",
+      clientName: "Claude Code",
+      durationMs: 850,
+    }),
+  ]);
+  render(<ActivityView refreshKey={0} registry={null} />);
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  expect(screen.getByText("Claude Code 2.1 · 2m ago · waited 1.5 s")).toHaveAttribute(
+    "title",
+    expect.stringContaining("adapter:claude-code"),
+  );
+  expect(screen.queryByText("adapter:claude-code")).not.toBeInTheDocument();
+  await user.click(screen.getByRole("combobox"));
+  expect(screen.getAllByRole("option", { name: /^team_slack$/ })).toHaveLength(1);
+  expect(screen.queryByRole("option", { name: /^team-slack$/ })).not.toBeInTheDocument();
 });
 
 it("uses one server option for hyphenated call and approval identities", async () => {

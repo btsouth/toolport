@@ -698,7 +698,7 @@ impl CallVerifier {
                 let Some(client) = connected else {
                     return Ok::<_, String>(None);
                 };
-                let recent = crate::audit::read_recent(1)
+                let recent = crate::audit::read_activity(1)
                     .map_err(|error| format!("could not read the activity log: {error}"))?;
                 let since = recent
                     .first()
@@ -753,7 +753,7 @@ impl CallVerifier {
             let in_flight_for_read = in_flight.clone();
             gtk::glib::spawn_future_local(async move {
                 let result = gtk::gio::spawn_blocking(move || {
-                    crate::audit::read_recent(25)
+                    crate::audit::read_activity(25)
                         .map(|entries| audit_proof_after(&entries, since))
                         .map_err(|error| format!("could not read the activity log: {error}"))
                 })

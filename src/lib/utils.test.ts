@@ -192,3 +192,11 @@ describe("fmtTs", () => {
     );
   });
 });
+
+it("formats minute durations with the same rollover as GTK", () => {
+  expect(fmtMs(850)).toBe("850 ms");
+  expect(fmtMs(1500)).toBe("1.5 s");
+  expect(fmtMs(60000)).toBe("1m 0s");
+  expect(fmtMs(90000)).toBe("1m 30s");
+  expect(fmtMs(119999)).toBe("2m 0s");
+});

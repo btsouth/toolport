@@ -243,6 +243,8 @@ pub enum ApprovalDecision {
     /// the seam a decoupled approval (session re-use, or a code-mode script that approves
     /// then replays) must clear before its effect runs.
     StaleState,
+    /// The caller withdrew before a human decision was received. Gateway-only.
+    Withdrawn,
 }
 
 impl ApprovalDecision {
@@ -586,7 +588,7 @@ pub fn try_decide_once_with_cancel(
     cancel: Option<&crate::downstream::CancelContext>,
 ) -> BrokerAttempt {
     if cancel.is_some_and(crate::downstream::CancelContext::is_cancelled) {
-        return BrokerAttempt::Decided(ApprovalDecision::Denied);
+        return BrokerAttempt::Decided(ApprovalDecision::Withdrawn);
     }
     let Some(desc) = desc else {
         return BrokerAttempt::Unreachable;
@@ -613,21 +615,53 @@ pub fn try_decide_once_with_cancel(
         }))
     });
     if cancel.is_some_and(crate::downstream::CancelContext::is_cancelled) {
-        return BrokerAttempt::Decided(ApprovalDecision::Denied);
+        return BrokerAttempt::Decided(ApprovalDecision::Withdrawn);
     }
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)));
-    let decision = exchange_approval_request(req, stream);
-    if cancel.is_some_and(crate::downstream::CancelContext::is_cancelled) {
-        BrokerAttempt::Decided(ApprovalDecision::Denied)
+    // Windows shutdown can expose EOF to the broker without waking our blocked
+    // reader. Poll cancellation within the unchanged overall approval deadline.
+    let read_timeout = if cancel.is_some() {
+        Duration::from_millis(50)
     } else {
+        Duration::from_secs(DEFAULT_TIMEOUT_SECS)
+    };
+    let _ = stream.set_read_timeout(Some(read_timeout));
+    let decision = if cancel.is_some() {
+        exchange_approval_request_with_cancel(req, stream, cancel)
+    } else {
+        exchange_approval_request(req, stream)
+    };
+    broker_attempt_after_cancel(
+        decision,
+        cancel.is_some_and(crate::downstream::CancelContext::is_cancelled),
+    )
+}
+
+fn broker_attempt_after_cancel(decision: BrokerAttempt, cancelled: bool) -> BrokerAttempt {
+    // A parsed human answer wins even if the client disconnected immediately
+    // after it arrived. Only a transport failure without an answer is withdrawal.
+    if matches!(
+        decision,
+        BrokerAttempt::Decided(ApprovalDecision::Approved | ApprovalDecision::Denied)
+    ) || !cancelled
+    {
         decision
+    } else {
+        BrokerAttempt::Decided(ApprovalDecision::Withdrawn)
     }
 }
 
 fn exchange_approval_request(
     req: &ApprovalRequest,
+    stream: impl io::Read + io::Write,
+) -> BrokerAttempt {
+    exchange_approval_request_with_cancel(req, stream, None)
+}
+
+fn exchange_approval_request_with_cancel(
+    req: &ApprovalRequest,
     mut stream: impl io::Read + io::Write,
+    cancel: Option<&crate::downstream::CancelContext>,
 ) -> BrokerAttempt {
     use std::io::{BufRead, BufReader, Read};
     let Ok(line) = serde_json::to_string(req) else {
@@ -641,27 +675,43 @@ fn exchange_approval_request(
     }
     let _ = stream.flush();
     let mut resp = String::new();
-    match BufReader::new(stream).take(4096).read_line(&mut resp) {
-        // Connected and the peer closed with no answer: not a healthy broker. No human was
-        // shown a prompt (the broker's pre-prompt reject paths close silently), so re-dial.
-        Ok(0) => BrokerAttempt::Unreachable,
-        Ok(_) => {
-            let t = resp.trim();
-            if t.is_empty() {
-                BrokerAttempt::Unreachable
-            } else {
-                // A parseable decision is authoritative; an unparseable line is fail-closed
-                // as a Timeout (a real broker answered, so this is not a retry case).
-                BrokerAttempt::Decided(
-                    serde_json::from_str::<ApprovalDecision>(t)
-                        .unwrap_or(ApprovalDecision::Timeout),
-                )
-            }
+    let mut reader = BufReader::new(stream).take(4096);
+    let deadline = std::time::Instant::now() + Duration::from_secs(DEFAULT_TIMEOUT_SECS);
+    loop {
+        if cancel.is_some_and(crate::downstream::CancelContext::is_cancelled) {
+            return BrokerAttempt::Decided(ApprovalDecision::Withdrawn);
         }
-        // A read error AFTER we sent the request is the "human didn't answer in time" path
-        // (read timeout) or a mid-wait drop. Either way the broker had our request, so this
-        // is a genuine no-decision Timeout - never retry (that would re-prompt).
-        Err(_) => BrokerAttempt::Decided(ApprovalDecision::Timeout),
+        if std::time::Instant::now() >= deadline {
+            return BrokerAttempt::Decided(ApprovalDecision::Timeout);
+        }
+        match reader.read_line(&mut resp) {
+            // Connected and the peer closed with no answer: not a healthy broker. No human was
+            // shown a prompt (the broker's pre-prompt reject paths close silently), so re-dial.
+            Ok(0) => return BrokerAttempt::Unreachable,
+            Ok(_) => {
+                let t = resp.trim();
+                if t.is_empty() {
+                    return BrokerAttempt::Unreachable;
+                } else {
+                    // A parseable decision is authoritative; an unparseable line is fail-closed
+                    // as a Timeout (a real broker answered, so this is not a retry case).
+                    return BrokerAttempt::Decided(
+                        serde_json::from_str::<ApprovalDecision>(t)
+                            .unwrap_or(ApprovalDecision::Timeout),
+                    );
+                }
+            }
+            // A read error AFTER we sent the request is the "human didn't answer in time" path
+            // (read timeout) or a mid-wait drop. Either way the broker had our request, so this
+            // is a genuine no-decision Timeout - never retry (that would re-prompt).
+            Err(error)
+                if cancel.is_some()
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) => {}
+            Err(_) => return BrokerAttempt::Decided(ApprovalDecision::Timeout),
+        }
     }
 }
 
@@ -1215,5 +1265,97 @@ mod p08b_revision_tests {
             crate::clients::trusted_client_name(Some("adapter:claude-code"), Some("Recorded name")),
             "Recorded name"
         );
+    }
+}
+
+#[cfg(test)]
+mod p10c_decision_tests {
+    use super::*;
+
+    #[test]
+    fn p10c_r1_cancelled_read_poll_retires_without_a_reply_and_keeps_received_answers() {
+        struct PollStream {
+            registry: crate::downstream::CancelRegistry,
+            reply: Option<ApprovalDecision>,
+            reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl io::Write for PollStream {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl io::Read for PollStream {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if read == 0 {
+                    if self.reply.is_none() {
+                        self.registry.cancel("poll", None);
+                    }
+                    // Model a blocked Windows read waking on its short timeout,
+                    // with no reply from the broker to unblock cancellation.
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                let reply = self.reply.expect("a cancelled poll must not read again");
+                let line = format!("{}\n", serde_json::to_string(&reply).unwrap());
+                bytes[..line.len()].copy_from_slice(line.as_bytes());
+                // The received answer must survive an immediate disconnect.
+                self.registry.cancel("poll", None);
+                Ok(line.len())
+            }
+        }
+        let req = ApprovalRequest {
+            token: "tok".into(),
+            id: "poll".into(),
+            client: None,
+            client_label: None,
+            server: "s".into(),
+            tool: "t".into(),
+            reason: ApprovalReason::Destructive,
+            arguments: serde_json::json!({}),
+            tool_fingerprint: None,
+            url_elicitation: None,
+            pii_release: None,
+        };
+        for reply in [
+            None,
+            Some(ApprovalDecision::Approved),
+            Some(ApprovalDecision::Denied),
+        ] {
+            let registry = crate::downstream::CancelRegistry::new();
+            assert!(registry.begin_client_request("poll".into()));
+            let cancel = registry.context("poll".into());
+            let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let result = exchange_approval_request_with_cancel(
+                &req,
+                PollStream {
+                    registry,
+                    reply,
+                    reads: reads.clone(),
+                },
+                Some(&cancel),
+            );
+            let expected = reply.unwrap_or(ApprovalDecision::Withdrawn);
+            assert!(matches!(result, BrokerAttempt::Decided(actual) if actual == expected));
+            assert_eq!(
+                reads.load(std::sync::atomic::Ordering::SeqCst),
+                if reply.is_some() { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn p10c_r1_human_answer_wins_over_immediate_disconnect() {
+        for decision in [ApprovalDecision::Approved, ApprovalDecision::Denied] {
+            assert!(
+                matches!(broker_attempt_after_cancel(BrokerAttempt::Decided(decision), true), BrokerAttempt::Decided(actual) if actual == decision)
+            );
+        }
+        assert!(matches!(
+            broker_attempt_after_cancel(BrokerAttempt::Unreachable, true),
+            BrokerAttempt::Decided(ApprovalDecision::Withdrawn)
+        ));
     }
 }

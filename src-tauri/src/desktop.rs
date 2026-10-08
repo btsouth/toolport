@@ -920,7 +920,7 @@ async fn get_audit_log(limit: usize) -> Result<Vec<serde_json::Value>, String> {
     // (SBS-813). An unreadable log or a join failure must reject so Activity
     // can show error/retry instead of "No tool calls yet" (SBS-873).
     tauri::async_runtime::spawn_blocking(move || {
-        audit::read_recent(limit).map_err(|e| format!("Couldn't read the activity log: {e}"))
+        audit::read_activity(limit).map_err(|e| format!("Couldn't read the activity log: {e}"))
     })
     .await
     .map_err(|e| format!("activity log task join failed: {e}"))?

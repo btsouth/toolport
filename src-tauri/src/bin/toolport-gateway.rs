@@ -92,7 +92,7 @@ fn request_human_decision_with_cancel(
         return approval::request_human_decision(req);
     };
     if cancel.is_cancelled() {
-        return approval::ApprovalDecision::Denied;
+        return approval::ApprovalDecision::Withdrawn;
     }
     for _ in 0..2 {
         let decision = approval::try_decide_once_with_cancel(
@@ -100,11 +100,11 @@ fn request_human_decision_with_cancel(
             &mut req,
             Some(cancel),
         );
-        if cancel.is_cancelled() {
-            return approval::ApprovalDecision::Denied;
-        }
         if let approval::BrokerAttempt::Decided(decision) = decision {
             return decision;
+        }
+        if cancel.is_cancelled() {
+            return approval::ApprovalDecision::Withdrawn;
         }
     }
     approval::ApprovalDecision::Unreachable
@@ -3842,10 +3842,20 @@ fn decision_token(decision: approval::ApprovalDecision) -> &'static str {
     match decision {
         approval::ApprovalDecision::Approved => "approved",
         approval::ApprovalDecision::Denied => "denied",
+        approval::ApprovalDecision::Withdrawn => "withdrawn",
         approval::ApprovalDecision::Unreachable => "unreachable",
         approval::ApprovalDecision::StaleState => "stale_state",
         // A human was asked but didn't answer in the fail-closed window.
         approval::ApprovalDecision::Timeout => "no_response",
+    }
+}
+
+fn approval_reason_token(reason: approval::ApprovalReason) -> &'static str {
+    match reason {
+        approval::ApprovalReason::Destructive => "destructive",
+        approval::ApprovalReason::UntrustedSource => "untrusted_source",
+        approval::ApprovalReason::DestructiveAndUntrusted => "destructive_and_untrusted",
+        approval::ApprovalReason::PiiCrossServer => "pii_cross_server",
     }
 }
 
@@ -4014,6 +4024,10 @@ fn refused_call_result(
 ) -> Value {
     let token = decision_token(decision);
     let (retriable, why) = match decision {
+        approval::ApprovalDecision::Withdrawn => (
+            false,
+            format!("the call to {name} was withdrawn before a human answered"),
+        ),
         approval::ApprovalDecision::Denied => (
             false,
             format!("the call to {name} was denied by a human reviewer"),
@@ -4390,15 +4404,18 @@ fn execute_call(
                     Some((token, ModernHitlPoll::Pending)) => {
                         return modern_hitl_input_required(token)
                     }
-                    Some((_, ModernHitlPoll::Stale)) => (
-                        approval::ApprovalDecision::StaleState,
-                        0,
-                        current_fp.clone(),
-                        false,
-                    ),
+                    Some((_, ModernHitlPoll::Stale(held_ms, stored_reason))) => {
+                        approval_reason = stored_reason;
+                        (
+                            approval::ApprovalDecision::StaleState,
+                            held_ms,
+                            current_fp.clone(),
+                            true,
+                        )
+                    }
                     Some((_, ModernHitlPoll::Decided(decision, held_ms, stored_reason))) => {
                         approval_reason = stored_reason;
-                        (decision, held_ms, current_fp.clone(), false)
+                        (decision, held_ms, current_fp.clone(), true)
                     }
                     Some((
                         token,
@@ -4427,7 +4444,7 @@ fn execute_call(
                             approval::ApprovalDecision::StaleState,
                             0,
                             current_fp.clone(),
-                            false,
+                            !modern_hitl_is_terminal(token),
                         )
                     }
                     Some((_, ModernHitlPoll::Missing)) | None => {
@@ -4446,13 +4463,13 @@ fn execute_call(
                             current_fp.clone(),
                             reason,
                             client,
-                            srv,
+                            server_id,
                             tool,
                             &arguments,
                             incoming,
                         ) {
                             Ok(token) => return modern_hitl_input_required(&token),
-                            Err(decision) => (decision, 0, current_fp.clone(), false),
+                            Err(decision) => (decision, 0, current_fp.clone(), true),
                         }
                     }
                 }
@@ -4469,30 +4486,24 @@ fn execute_call(
             };
             // The gate reason names WHY a human was asked; shared by the audit record
             // and the agent-facing envelope on every outcome (approved included).
-            let reason_str = match approval_reason {
-                approval::ApprovalReason::Destructive => "destructive",
-                approval::ApprovalReason::UntrustedSource => "untrusted_source",
-                approval::ApprovalReason::DestructiveAndUntrusted => "destructive_and_untrusted",
-                // Unreachable here: this gate comes from `gate_reason`, which never returns
-                // it. The PII release gate runs later, at the dispatch boundary, and audits
-                // itself in `approve_pii_release`.
-                approval::ApprovalReason::PiiCrossServer => "pii_cross_server",
-            };
+            let reason_str = approval_reason_token(approval_reason);
             if !decision.is_approved() {
                 // Governance audit: the gate reason and which non-approval outcome
                 // (denied / no-response / unreachable), plus a content hash of the
                 // exact call - never the raw args. Replaces the flat record_held so
                 // the failure modes are no longer indistinguishable in the log.
-                audit::record_decision(
-                    server_id,
-                    tool,
-                    client,
-                    active_client_label().as_deref(),
-                    reason_str,
-                    decision_token(decision),
-                    &arguments,
-                    Some(held_ms),
-                );
+                if audit_approval {
+                    audit::record_decision(
+                        server_id,
+                        tool,
+                        client,
+                        active_client_label().as_deref(),
+                        reason_str,
+                        decision_token(decision),
+                        &arguments,
+                        Some(held_ms),
+                    );
+                }
                 return refused_call_result(name, decision, reason_str);
             }
             // A human approved. Enforce content-binding before running: if the call
@@ -4545,12 +4556,31 @@ fn execute_call(
             let token = mrtr
                 .and_then(|retry| retry.request_state.as_ref())
                 .and_then(Value::as_str);
+            let reason = token
+                .and_then(modern_hitl_reason)
+                .map(approval_reason_token)
+                .unwrap_or("unknown");
+            let held_ms = token.and_then(|token| {
+                session_tables().hitl().with(token, |pending| {
+                    pending.abandoned_audit = None;
+                    pending.started.elapsed().as_millis() as u64
+                })
+            });
+            let already_recorded = token.is_some_and(modern_hitl_is_terminal);
             finish_modern_hitl(token);
-            return refused_call_result(
-                name,
-                approval::ApprovalDecision::StaleState,
-                "stale_state",
-            );
+            if !already_recorded {
+                audit::record_decision(
+                    server_id,
+                    tool,
+                    client,
+                    active_client_label().as_deref(),
+                    reason,
+                    "stale_state",
+                    &arguments,
+                    held_ms,
+                );
+            }
+            return refused_call_result(name, approval::ApprovalDecision::StaleState, reason);
         }
     }
 
@@ -13539,7 +13569,7 @@ fn broker_url_elicitation(
         approval::ApprovalDecision::Denied => ServerRequestAction::Respond(
             upstream_json_rpc_response(id, Ok(json!({ "action": "decline" }))),
         ),
-        approval::ApprovalDecision::Timeout => ServerRequestAction::Respond(
+        approval::ApprovalDecision::Timeout | approval::ApprovalDecision::Withdrawn => ServerRequestAction::Respond(
             upstream_json_rpc_response(id, Ok(json!({ "action": "cancel" }))),
         ),
         approval::ApprovalDecision::Unreachable | approval::ApprovalDecision::StaleState => {
@@ -13585,7 +13615,10 @@ enum ModernHitlStatus {
     Approved,
 }
 
+// Pending prompts live only in memory. A daemon restart loses them without an
+// Activity row; there is deliberately no shutdown drain or persisted arguments.
 struct ModernHitlApproval {
+    token: String,
     name: String,
     args_hash: String,
     scope: String,
@@ -13595,13 +13628,29 @@ struct ModernHitlApproval {
     downstream: MrtrRequest,
     input_request: Value,
     status: ModernHitlStatus,
+    abandoned_audit: Option<audit::PendingApprovalAudit>,
     _cancel_guard: Option<downstream::CancelGuard>,
+}
+
+impl Drop for ModernHitlApproval {
+    fn drop(&mut self) {
+        remember_terminal_modern_hitl(&self.token);
+        if let Some(audit) = self.abandoned_audit.take() {
+            let elapsed = self.started.elapsed();
+            let decision = if elapsed >= Duration::from_secs(approval::DEFAULT_TIMEOUT_SECS) {
+                "no_response"
+            } else {
+                "withdrawn"
+            };
+            audit.finish(decision, elapsed.as_millis() as u64);
+        }
+    }
 }
 
 enum ModernHitlPoll {
     Missing,
     Pending,
-    Stale,
+    Stale(u64, approval::ApprovalReason),
     Decided(approval::ApprovalDecision, u64, approval::ApprovalReason),
     Approved {
         approved_fingerprint: Option<String>,
@@ -13614,6 +13663,31 @@ enum ModernHitlPoll {
 
 const MODERN_HITL_MAX_PENDING: usize = 64;
 const MODERN_HITL_RETENTION: Duration = Duration::from_secs(approval::DEFAULT_TIMEOUT_SECS + 30);
+
+fn terminal_modern_hitl_tokens() -> &'static Mutex<std::collections::VecDeque<String>> {
+    static TOKENS: OnceLock<Mutex<std::collections::VecDeque<String>>> = OnceLock::new();
+    TOKENS.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn remember_terminal_modern_hitl(token: &str) {
+    let mut tokens = terminal_modern_hitl_tokens()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !tokens.iter().any(|seen| seen == token) {
+        tokens.push_back(token.to_string());
+        if tokens.len() > MODERN_HITL_MAX_PENDING * 2 {
+            tokens.pop_front();
+        }
+    }
+}
+
+fn modern_hitl_is_terminal(token: &str) -> bool {
+    terminal_modern_hitl_tokens()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|seen| seen == token)
+}
 
 fn modern_hitl_input_required(token: &str) -> Value {
     let input_request = session_tables()
@@ -13670,7 +13744,7 @@ fn start_modern_hitl(
             .as_ref()
             .is_some_and(downstream::CancelContext::is_cancelled)
         {
-            return Err(approval::ApprovalDecision::Denied);
+            return Err(approval::ApprovalDecision::Withdrawn);
         }
         if approvals.len() >= MODERN_HITL_MAX_PENDING {
             return Err(approval::ApprovalDecision::Unreachable);
@@ -13678,7 +13752,10 @@ fn start_modern_hitl(
         approvals.insert(
             &token,
             ModernHitlApproval {
+                token: token.clone(),
                 name: name.to_string(),
+                abandoned_audit: Some(audit::PendingApprovalAudit::new(server, tool, client,
+                    active_client_label().as_deref(), approval_reason_token(reason), &args_hash)),
                 args_hash,
                 scope: conversation_scope(client),
                 approved_fingerprint,
@@ -13720,17 +13797,37 @@ fn poll_modern_hitl(
     client: Option<&str>,
     input_responses: Option<Value>,
 ) -> ModernHitlPoll {
-    let (poll, remove) = session_tables()
-        .hitl()
+    let mut approvals = session_tables().hitl();
+    let (poll, remove) = approvals
         .with(token, |pending| {
             if pending.name != name
                 || pending.args_hash != args_hash
                 || pending.scope != conversation_scope(client)
             {
-                return (ModernHitlPoll::Stale, false);
+                pending.abandoned_audit = None;
+                return (
+                    ModernHitlPoll::Stale(
+                        pending.started.elapsed().as_millis() as u64,
+                        pending.reason,
+                    ),
+                    true,
+                );
             }
             let decision = match &pending.status {
                 ModernHitlStatus::AwaitingClient => {
+                    if pending.started.elapsed()
+                        >= Duration::from_secs(approval::DEFAULT_TIMEOUT_SECS)
+                    {
+                        pending.abandoned_audit = None;
+                        return (
+                            ModernHitlPoll::Decided(
+                                approval::ApprovalDecision::Timeout,
+                                pending.started.elapsed().as_millis() as u64,
+                                pending.reason,
+                            ),
+                            true,
+                        );
+                    }
                     let response = input_responses
                         .as_ref()
                         .and_then(|responses| responses.get("toolport_approval"));
@@ -13753,6 +13850,9 @@ fn poll_modern_hitl(
             };
             let newly_approved = decision.is_some();
             if let Some(decision) = decision {
+                // The resumed tools/call records the terminal outcome. Drop only
+                // records prompts that disappear without that continuation.
+                pending.abandoned_audit = None;
                 if !decision.is_approved() {
                     let held_ms = pending.started.elapsed().as_millis() as u64;
                     let reason = pending.reason;
@@ -13774,7 +13874,7 @@ fn poll_modern_hitl(
         })
         .unwrap_or((ModernHitlPoll::Missing, false));
     if remove {
-        session_tables().hitl().remove(token);
+        approvals.remove(token);
     }
     poll
 }
@@ -23067,6 +23167,7 @@ mod tests {
 
     #[test]
     fn initial_modern_hitl_call_starts_mrtr_without_retry_fields() {
+        let _env = DataDirTestEnv::new("p10c-initial_modern_hitl_call_starts_mrtr_without_retry_fields");
         session_tables().hitl().clear();
         let request = json!({
             "params": {
@@ -23118,6 +23219,7 @@ mod tests {
 
     #[test]
     fn modern_hitl_state_polls_then_carries_downstream_mrtr() {
+        let _env = DataDirTestEnv::new("p10c-modern_hitl_state_polls_then_carries_downstream_mrtr");
         let arguments = json!({ "target": "x" });
         let hash = audit::args_hash(&arguments);
         let token = start_modern_hitl(
@@ -23206,6 +23308,7 @@ mod tests {
         session_tables().hitl().insert(
             &token,
             ModernHitlApproval {
+                token: token.clone(),
                 name: "s__wipe".into(),
                 args_hash: audit::args_hash(&json!({ "target": "x" })),
                 scope: conversation_scope(Some("cursor")),
@@ -23215,6 +23318,7 @@ mod tests {
                 downstream: MrtrRequest::default(),
                 input_request: json!({ "method": "elicitation/create" }),
                 status: ModernHitlStatus::AwaitingClient,
+                abandoned_audit: None,
                 _cancel_guard: None,
             },
         );
@@ -23226,7 +23330,7 @@ mod tests {
                 Some("cursor"),
                 None,
             ),
-            ModernHitlPoll::Stale
+            ModernHitlPoll::Stale(_, _)
         ));
         finish_modern_hitl(Some(&token));
     }
@@ -23253,6 +23357,7 @@ mod tests {
                 hitl.insert(
                     &format!("token-{i}"),
                     ModernHitlApproval {
+                        token: format!("token-{i}"),
                         name: "s__wipe".into(),
                         args_hash: audit::args_hash(&json!({ "target": i })),
                         scope: conversation_scope(Some("cursor")),
@@ -23262,6 +23367,7 @@ mod tests {
                         downstream: MrtrRequest::default(),
                         input_request: json!({ "method": "elicitation/create" }),
                         status: ModernHitlStatus::AwaitingClient,
+                        abandoned_audit: None,
                         _cancel_guard: None,
                     },
                 );
@@ -23277,6 +23383,9 @@ mod tests {
 
     #[test]
     fn two_daemon_sessions_with_one_client_identity_keep_pii_and_approvals_separate() {
+        let _env = DataDirTestEnv::new(
+            "p10c-two_daemon_sessions_with_one_client_identity_keep_pii_and_approvals_separate",
+        );
         let client = Some("shared-adapter-client");
         let first = format!("first-{}", new_correlation_id());
         let second = format!("second-{}", new_correlation_id());
@@ -23308,7 +23417,7 @@ mod tests {
             });
             assert!(matches!(
                 poll_modern_hitl(&token, "s__wipe", &hash, client, None),
-                ModernHitlPoll::Stale
+                ModernHitlPoll::Stale(_, _)
             ));
         }
         clear_mcp_session_tables(&first);
@@ -23325,6 +23434,7 @@ mod tests {
 
     #[test]
     fn modern_hitl_decline_fails_closed_and_consumes_state() {
+        let _env = DataDirTestEnv::new("p10c-modern_hitl_decline_fails_closed_and_consumes_state");
         let arguments = json!({ "target": "x" });
         let hash = audit::args_hash(&arguments);
         let token = start_modern_hitl(
@@ -34335,7 +34445,7 @@ mod tests {
     }
 
     #[test]
-    fn p08_http_session_delete_withdraws_approval_and_late_allow_cannot_dispatch() {
+    fn p10c_http_session_delete_records_withdrawal_and_late_allow_cannot_dispatch() {
         let env = DataDirTestEnv::new("p08-delete-approval");
         let state = http_state(false);
         state.registry.lock().unwrap().confirm_destructive = true;
@@ -34357,6 +34467,7 @@ mod tests {
         .unwrap();
         let (parked_tx, parked_rx) = std::sync::mpsc::channel();
         let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let (late_allow_tx, late_allow_rx) = std::sync::mpsc::channel();
         let broker = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
@@ -34372,6 +34483,10 @@ mod tests {
                 "withdrawal must close the broker socket"
             );
             closed_tx.send(()).unwrap();
+            // EOF confirms socket shutdown, but Windows can still deliver a reply
+            // to its concurrent reader. Wait for the cancelled call to finish so
+            // this answer is unambiguously late, not a received human decision.
+            late_allow_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             let _ = stream.write_all(b"\"approved\"\n");
         });
         let serving = state.clone();
@@ -34401,6 +34516,7 @@ mod tests {
         let out = call.join().unwrap();
         assert!(out.body.contains("isError"), "{}", out.body);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        late_allow_tx.send(()).unwrap();
         let other = handle_http(
             &state,
             &SearchGuard::default(),
@@ -34418,6 +34534,10 @@ mod tests {
             .get("result")
             .is_some());
         broker.join().unwrap();
+        let entries = audit::read_all().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["decision"], "withdrawn");
+        assert_eq!(audit::stats().unwrap()["total"], 0);
     }
 
     #[test]
@@ -34486,8 +34606,103 @@ mod tests {
         worker.join().unwrap();
     }
 
+    fn p10c_r1_resume(
+        reg: &Registry,
+        router: &Router,
+        args: Value,
+        retry: Option<&MrtrRequest>,
+    ) -> Value {
+        execute_call(
+            reg,
+            router,
+            &router.aggregated_tools(),
+            Some("adapter:claude-code"),
+            None,
+            None,
+            None,
+            "team_slack__delete",
+            args,
+            None,
+            retry,
+            CallOpts {
+                direct: true,
+                shape: true,
+                allow_app_only: false,
+            },
+            None,
+        )
+    }
+
     #[test]
-    fn p08_modern_approval_cannot_be_allowed_after_owner_close() {
+    fn p10c_r1_reaped_prompt_late_resume_has_one_outcome() {
+        let _env = DataDirTestEnv::new("p10c-r1-reaped-resume");
+        let _era = UpstreamEraGuard::enter(Some(MODERN_PROTOCOL_VERSION.to_string()));
+        let _caps = UpstreamCapabilitiesGuard::enter(
+            &json!({"params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{"elicitation":{}}}}}),
+        );
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Ask);
+        let router = routed_router("team-slack", "delete");
+        let args = json!({"id":7});
+        let initial = p10c_r1_resume(&reg, &router, args.clone(), None);
+        let token = initial["requestState"].as_str().unwrap();
+        let mut pending = session_tables().hitl().remove(token).unwrap();
+        pending.started = Instant::now() - MODERN_HITL_RETENTION;
+        let mut expired = SessionStore::new(Duration::ZERO, 1);
+        expired.insert(token, pending);
+        assert_eq!(expired.reap_expired(), 1);
+        let retry = MrtrRequest {
+            request_state: Some(json!(token)),
+            input_responses: Some(
+                json!({"toolport_approval":{"action":"accept","content":{"approved":true}}}),
+            ),
+        };
+        let result = p10c_r1_resume(&reg, &router, args, Some(&retry));
+        assert!(result["isError"].as_bool().unwrap());
+        let rows = audit::read_all().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["decision"], "no_response");
+        assert_eq!(rows[0]["server"], "team_slack");
+        assert_eq!(rows[0]["serverId"], "team-slack");
+    }
+
+    #[test]
+    fn p10c_r1_stale_poll_then_reaper_has_one_outcome_with_gate_and_wait() {
+        let _env = DataDirTestEnv::new("p10c-r1-stale-reaper");
+        let _era = UpstreamEraGuard::enter(Some(MODERN_PROTOCOL_VERSION.to_string()));
+        let _caps = UpstreamCapabilitiesGuard::enter(
+            &json!({"params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{"elicitation":{}}}}}),
+        );
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Ask);
+        let router = routed_router("team-slack", "delete");
+        let initial = p10c_r1_resume(&reg, &router, json!({"id":7}), None);
+        let token = initial["requestState"].as_str().unwrap();
+        session_tables().hitl().with(token, |pending| {
+            pending.started = Instant::now() - Duration::from_millis(1500)
+        });
+        let retry = MrtrRequest {
+            request_state: Some(json!(token)),
+            input_responses: None,
+        };
+        let result = p10c_r1_resume(&reg, &router, json!({"id":8}), Some(&retry));
+        assert!(result["isError"].as_bool().unwrap());
+        if let Some(mut pending) = session_tables().hitl().remove(token) {
+            pending.started = Instant::now() - MODERN_HITL_RETENTION;
+            let mut expired = SessionStore::new(Duration::ZERO, 1);
+            expired.insert(token, pending);
+            expired.reap_expired();
+        }
+        let rows = audit::read_all().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["decision"], "stale_state");
+        assert_eq!(rows[0]["reason"], "destructive");
+        assert!(rows[0]["heldMs"].as_u64().unwrap() >= 1500);
+    }
+
+    #[test]
+    fn p10c_modern_approval_records_owner_close_once() {
+        let _env = DataDirTestEnv::new("p10c-modern-withdrawal");
         let registry = downstream::CancelRegistry::new();
         assert!(registry.begin_client_request("modern-approval".into()));
         let _cancel = ApprovalCancelGuard::enter(Some(registry.context("modern-approval".into())));
@@ -34516,6 +34731,81 @@ mod tests {
             ),
             ModernHitlPoll::Missing
         ));
+        let entries = audit::read_all().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["decision"], "withdrawn");
+        assert_eq!(entries[0]["client"], "p08-client");
+        assert_eq!(audit::stats().unwrap()["total"], 0);
+    }
+
+    #[test]
+    fn p10c_expired_suspended_approval_records_timeout_once() {
+        let _env = DataDirTestEnv::new("p10c-modern-timeout");
+        let hash = audit::args_hash(&json!({"secret":"never logged"}));
+        let token = start_modern_hitl(
+            "s__work",
+            hash,
+            None,
+            approval::ApprovalReason::Destructive,
+            Some("client:real"),
+            "s",
+            "work",
+            &json!({"secret":"never logged"}),
+            MrtrRequest::default(),
+        )
+        .unwrap();
+        let mut pending = session_tables().hitl().remove(&token).unwrap();
+        pending.started = Instant::now() - Duration::from_secs(approval::DEFAULT_TIMEOUT_SECS + 1);
+        let mut expired = SessionStore::new(Duration::ZERO, 1);
+        expired.insert(&token, pending);
+        assert_eq!(expired.reap_expired(), 1);
+        assert_eq!(expired.reap_expired(), 0);
+        let entries = audit::read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["decision"], "no_response");
+        assert!(entries[0]["heldMs"].as_u64().unwrap() >= 120000);
+        assert!(!entries[0].to_string().contains("never logged"));
+        assert_eq!(audit::stats().unwrap()["total"], 0);
+    }
+
+    #[test]
+    fn p10c_late_modern_approval_cannot_extend_the_deadline() {
+        let _env = DataDirTestEnv::new("p10c-late-modern");
+        let hash = audit::args_hash(&json!({}));
+        let token = start_modern_hitl(
+            "s__work",
+            hash.clone(),
+            None,
+            approval::ApprovalReason::Destructive,
+            Some("client:real"),
+            "s",
+            "work",
+            &json!({}),
+            MrtrRequest::default(),
+        )
+        .unwrap();
+        session_tables().hitl().with(&token, |pending| {
+            pending.started =
+                Instant::now() - Duration::from_secs(approval::DEFAULT_TIMEOUT_SECS + 1);
+        });
+        assert!(matches!(
+            poll_modern_hitl(
+                &token,
+                "s__work",
+                &hash,
+                Some("client:real"),
+                Some(json!({"toolport_approval":{"action":"accept","content":{"approved":true}}}))
+            ),
+            ModernHitlPoll::Decided(approval::ApprovalDecision::Timeout, _, _)
+        ));
+        assert!(matches!(
+            poll_modern_hitl(&token, "s__work", &hash, Some("client:real"), None),
+            ModernHitlPoll::Missing
+        ));
+        assert!(
+            audit::read_all().unwrap().is_empty(),
+            "the resumed call records the decision"
+        );
     }
 
     #[test]
