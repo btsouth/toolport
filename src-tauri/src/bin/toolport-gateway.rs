@@ -9738,6 +9738,8 @@ fn router_relevant(reg: &Registry) -> Value {
     if let Some(obj) = v.as_object_mut() {
         obj.remove("team");
         obj.remove("gatewayInstructions");
+        // Discovery is resolved per request or refreshed before the rebuild check.
+        obj.remove("clientDiscovery");
         // From v2 on the 1.x safety toggles only mirror `safetyLevel` for 1.x readers.
         if reg.version >= 2 {
             for key in [
@@ -10064,6 +10066,7 @@ fn watch_tick(
         };
     }
 
+    let mut registry_rebuild = None;
     if file_changed {
         // Reload the registry, then compose a new catalog from unchanged
         // supervisors and lazy slots for changed or newly enabled servers.
@@ -10153,16 +10156,16 @@ fn watch_tick(
             eprintln!("toolport: registry policy changed; enforcing it on live connections");
         }
         let new_relevant = router_relevant(&new_reg);
-        if downstream_changed == 0 && new_relevant == state.last_relevant {
+        if new_relevant == state.last_relevant {
             eprintln!(
-                "toolport: registry changed (team metadata or instructions only); skipped rebuild"
+                "toolport: registry changed (metadata, instructions or client discovery only); skipped rebuild"
             );
-            return TickOutcome {
-                quarantine_changed,
-                idle_after_quarantine: false,
-            };
+        } else {
+            state.last_relevant = new_relevant;
+            registry_rebuild = Some((new_reg, resolved, root));
         }
-        state.last_relevant = new_relevant;
+    }
+    if let Some((new_reg, resolved, root)) = registry_rebuild {
         // Capture the profile we were serving before this reload so the log can
         // show the transition - the single most useful line when diagnosing
         // "why can't this client see server X": it pins down which profile is
@@ -10236,7 +10239,9 @@ fn watch_tick(
             server_count,
             tools.len(),
         );
-    } else {
+    }
+    // A registry reload must not consume a simultaneous downstream notification.
+    if downstream_changed != 0 {
         host.refresh_rooted_catalogs(downstream_changed);
         let resolved = profile
             .lock()
@@ -33208,6 +33213,129 @@ mod tests {
             "an instructions-only edit must not rebuild the router"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn watch_tick_publishes_client_discovery_without_catalog_fanout() {
+        let _env = DataDirTestEnv::new("client-discovery-tick");
+        let mut live = Registry::default();
+        live.servers = vec![stub_server("one", "One"), stub_server("two", "Two")];
+        for server in &mut live.servers {
+            server.enabled = true;
+        }
+        let mut router = router_with_registry_policy(&live);
+        let mut growing = DownstreamServer::connect(
+            "one".into(),
+            Box::new(MockRoute {
+                tools: vec![json!({"name": "echo"}), json!({"name": "greet"})],
+            }),
+        )
+        .unwrap();
+        // The next real tools/list publishes greet; the current catalog has echo.
+        growing.tools.retain(|tool| tool["name"] == "echo");
+        router.add(growing);
+        router.add(
+            DownstreamServer::connect(
+                "two".into(),
+                Box::new(MockRoute {
+                    tools: vec![json!({"name": "echo"})],
+                }),
+            )
+            .unwrap(),
+        );
+        let cached = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        let reg_path = registry::resolved_path().unwrap();
+        let mut on_disk = live.clone();
+        on_disk.set_client_discovery("cursor", Some("lazy"));
+        on_disk.set_client_discovery("new-client", Some("full"));
+        registry::save_to(&reg_path, &on_disk).unwrap();
+        let mut watcher = WatchLoopState {
+            last_mtime: None,
+            last_relevant: router_relevant(&live),
+        };
+        let host = host_from_parts(
+            Arc::new(Mutex::new(live.clone())),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(Mutex::new(Arc::new(router))),
+            Arc::new(Mutex::new(cached)),
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(|_| None),
+            Arc::new(Mutex::new(())),
+            None,
+            None,
+        );
+        host.set_discovery_mode(DiscoveryMode::Full);
+        let session = |server: &str| {
+            Arc::new(SessionState::new_http(Some(McpSessionOwner {
+                identity: server.into(),
+                profile: None,
+                tool_scope: None,
+                scope: Some(vec![server.into()]),
+            })))
+        };
+        let authorized = session("one");
+        let unrelated = session("two");
+        host.mcp_sessions.lock().unwrap().extend([
+            ("authorized".into(), Arc::clone(&authorized)),
+            ("unrelated".into(), Arc::clone(&unrelated)),
+        ]);
+        let before = Arc::clone(&host.router.lock().unwrap());
+        watch_tick(
+            &reg_path,
+            &test_stdio_session(),
+            &Arc::new(Mutex::new(None)),
+            Some("cursor"),
+            None,
+            false,
+            &Arc::new(Mutex::new(None)),
+            None,
+            &mut watcher,
+            &host,
+        );
+        assert_eq!(host.discovery_mode(), DiscoveryMode::Lazy);
+        let published = host.registry.lock().unwrap();
+        assert_eq!(published.client_discovery_mode("new-client"), Some("full"));
+        drop(published);
+        assert!(
+            unrelated.outbound.lock().unwrap().is_empty(),
+            "one client's discovery choice must not notify unrelated sessions"
+        );
+        assert!(
+            Arc::ptr_eq(&before, &host.router.lock().unwrap()),
+            "discovery choices must not rebuild downstream catalogs"
+        );
+
+        // A discovery edit can land in the same tick as a downstream change.
+        // It must not consume that change via an unscoped registry rebuild.
+        on_disk.set_client_discovery("new-client", Some("lazy"));
+        registry::save_to(&reg_path, &on_disk).unwrap();
+        watcher.last_mtime = None;
+        host.downstream_dirty
+            .store(downstream::change::TOOLS, Ordering::SeqCst);
+        watch_tick(
+            &reg_path,
+            &test_stdio_session(),
+            &Arc::new(Mutex::new(None)),
+            Some("cursor"),
+            None,
+            false,
+            &Arc::new(Mutex::new(None)),
+            None,
+            &mut watcher,
+            &host,
+        );
+        assert!(unrelated.outbound.lock().unwrap().is_empty());
+        let queue = authorized.outbound.lock().unwrap();
+        assert_eq!(queue.len(), 1, "the authorized session must be notified");
+        let notification: Value = serde_json::from_str(&queue[0].json).unwrap();
+        assert_eq!(notification["method"], "notifications/tools/list_changed");
+        assert!(host
+            .router
+            .lock()
+            .unwrap()
+            .aggregated_tools()
+            .iter()
+            .any(|tool| tool["name"] == "one__greet"));
     }
 
     /// P1.3: the discovery mode belongs to the host, so one host's switch cannot decide what
