@@ -209,8 +209,11 @@ fn run_private_fixture(test: &str) -> bool {
         dir.join(format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX)),
     )
     .unwrap();
+    let mock = std::env::var_os("TOOLPORT_REVIEWED_TEST_MOCK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mock-mcp-server")));
     std::fs::copy(
-        env!("CARGO_BIN_EXE_mock-mcp-server"),
+        mock,
         dir.join(format!("mock-mcp-server{}", std::env::consts::EXE_SUFFIX)),
     )
     .unwrap();
