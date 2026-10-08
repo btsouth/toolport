@@ -28,6 +28,7 @@ InstallDir "\$LOCALAPPDATA\\ToolportHookTest"
 RequestExecutionLevel user
 Var PassiveMode
 Var UpdateMode
+Var DeleteAppDataCheckboxState
 Section
   !insertmacro NSIS_HOOK_PREINSTALL
   !insertmacro NSIS_HOOK_POSTINSTALL

@@ -173,12 +173,19 @@ exit 1''',
         self.assertIn("/TIMEOUT=60000", preinstall)
         self.assertIn('StrCpy $1 "Toolport could not finish', preinstall)
         recovery = preinstall.split("${If} $UpdateMode = 1", 1)[1].split("${EndIf}", 1)[0]
-        self.assertIn("${OrIf} $PassiveMode = 1", recovery)
+        self.assertNotIn("${OrIf} $PassiveMode = 1", recovery)
+        self.assertIn('${AndIf} ${FileExists} "$INSTDIR\\${MAINBINARYNAME}.exe"', recovery)
         self.assertLess(recovery.index("Exec '"), recovery.index("IfSilent"))
         self.assertIn("MessageBox MB_OK", recovery)
+        self.assertLess(preinstall.index("!insertmacro CheckIfAppIsRunning"), preinstall.index("--installer-preflight"))
         uninstall = hooks.split("!macro NSIS_HOOK_PREUNINSTALL", 1)[1].split("!macroend", 1)[0]
         self.assertIn('!insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"', uninstall)
         self.assertLess(uninstall.index("!insertmacro CheckIfAppIsRunning"), uninstall.index("--disconnect-all"))
+        failure = uninstall.split("${If} $0 != 0", 1)[1]
+        self.assertLess(failure.index("StrCpy $DeleteAppDataCheckboxState 0"), failure.index("IfSilent"))
+        self.assertIn("MessageBox MB_OKCANCEL", failure)
+        self.assertIn("IDCANCEL toolport_cleanup_cancel", failure)
+        self.assertIn("SetErrorLevel 1\n    Abort", failure)
 
 
 if __name__ == "__main__":
