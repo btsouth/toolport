@@ -14252,10 +14252,7 @@ fn process_request(
             owner_of_exposed_tool(Some(&router), &owners, name)
         })
         .is_empty()
-            || discovery == DiscoveryMode::Full
-                && (router.any_missing_catalog(visible)
-                    || router.any_discovering(visible)
-                    || router.any_publishing_first_catalog(visible));
+            || discovery == DiscoveryMode::Full && router.any_missing_catalog(visible);
         if cold {
             #[cfg(test)]
             COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
@@ -20454,6 +20451,24 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "warm cache waited"
         );
+        // A cached launch's first use may be starting or publishing. Its valid
+        // catalog already covers this view, so a Full list must still be instant.
+        let live = state.router.lock().unwrap().clone();
+        live.prepare_lazy_use("cache");
+        wait_for_supervisor_result(&live);
+        assert!(live.any_publishing_first_catalog(|_| true));
+        let started = Instant::now();
+        let reply = full_tools_list_for_client(&state, "claude-code", None);
+        assert!(reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "cache__cached"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "covered cache waited for publication"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
     }
 
     #[test]
