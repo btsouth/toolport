@@ -299,7 +299,7 @@ try {
   await page.getByRole("button", { name: "Add selected servers" }).click();
   await expect(page.getByText("Alpha", { exact: true })).toBeVisible();
   await expect(page.getByText("Beta", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Catalog", exact: true }).click();
+  await page.getByRole("button", { name: "Browse catalog", exact: true }).click();
   await expect(page.getByText("NoteKit", { exact: true }).last()).toBeVisible();
   await page.getByRole("button", { name: "Add 2", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Review Local notes" })).toBeVisible();
