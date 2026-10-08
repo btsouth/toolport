@@ -281,6 +281,7 @@ mockIPC(
           args: [],
           env: [{ key: "PAT", value: null, secret: true }],
           url: null,
+          source: "imported:codex",
         });
         return {
           registry: structuredClone(registry),
