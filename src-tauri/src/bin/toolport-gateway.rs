@@ -9769,6 +9769,20 @@ struct WatchLoopState {
     last_relevant: Value,
 }
 
+impl WatchLoopState {
+    fn new(path: &Path, host: &HostState) -> Self {
+        Self {
+            last_mtime: mtime(path),
+            last_relevant: router_relevant(
+                &host
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+        }
+    }
+}
+
 /// What one watcher iteration did. Extracted so tests can drive a tick without the
 /// infinite sleep loop (SOU-304).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9803,17 +9817,7 @@ fn watch_registry(
 ) {
     eprintln!("toolport: watching registry at {}", path.display());
     // routines.json is no longer read; the v2 migration exports it to <data dir>/exports/.
-    let mut state = WatchLoopState {
-        last_mtime: mtime(&path),
-        // Router-relevant slice (everything except the `team` block) as of the initial build,
-        // so a team-metadata-only rewrite from the desktop sync loop doesn't force a rebuild.
-        last_relevant: router_relevant(
-            &host
-                .registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        ),
-    };
+    let mut state = WatchLoopState::new(&path, &host);
     let mut seen = started_supervisors();
     loop {
         // A started server is published as soon as it connects, through the
@@ -28511,6 +28515,131 @@ mod tests {
             "reaping must preserve the initialized child"
         );
         assert_eq!(state.root_launch_pool.lock().unwrap().launches.len(), 1);
+    }
+
+    #[test]
+    fn watcher_start_after_spec_edit_replaces_rooted_launch_and_restores_subscription() {
+        let env = DataDirTestEnv::new("watcher-start-spec-edit");
+        let state = http_state(false);
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        let mut reg = Registry::default();
+        let mut server = stub_server("rooted", "Rooted");
+        server.cwd = Some("${ROOT}".into());
+        reg.servers.push(server);
+        reg.set_server_enabled("default", "rooted", true).unwrap();
+        *state.registry.lock().unwrap() = reg.clone();
+        let path = registry::resolved_path().unwrap();
+        registry::save_to(&path, &reg).unwrap();
+        let root = env.dir.to_str().unwrap();
+        let subscriptions = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
+        subscriptions
+            .lock()
+            .unwrap()
+            .add("subscriber", "fixture://cached", "rooted")
+            .unwrap();
+        state
+            .root_launch_pool
+            .lock()
+            .unwrap()
+            .subscriptions
+            .insert(("rooted".into(), root.into()), Arc::clone(&subscriptions));
+        struct SubscriptionRoute(Arc<AtomicUsize>);
+        impl downstream::Transport for SubscriptionRoute {
+            fn request(
+                &mut self,
+                method: &str,
+                params: Value,
+            ) -> Result<Value, downstream::TransportError> {
+                if method == "resources/subscribe" {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+                downstream::Transport::request(&mut CacheRoute, method, params)
+            }
+            fn notify(
+                &mut self,
+                method: &str,
+                params: Value,
+            ) -> Result<(), downstream::TransportError> {
+                downstream::Transport::notify(&mut CacheRoute, method, params)
+            }
+        }
+        let connects = Arc::new(AtomicUsize::new(0));
+        let subscribes = Arc::new(AtomicUsize::new(0));
+        let observer = {
+            let connects = Arc::clone(&connects);
+            let subscribes = Arc::clone(&subscribes);
+            Arc::new(move |event: &str| {
+                (event == "connecting").then(|| {
+                    connects.fetch_add(1, Ordering::SeqCst);
+                    DownstreamServer::connect(
+                        "rooted".into(),
+                        Box::new(SubscriptionRoute(Arc::clone(&subscribes))),
+                    )
+                    .unwrap()
+                })
+            }) as RootPlacementTestHook
+        };
+        state.root_launch_pool.lock().unwrap().placement_test_hook = Some(observer);
+        let base = state.router.lock().unwrap().clone();
+        state.router_for_root(base, &reg, Some(root), None);
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        assert_eq!(subscribes.load(Ordering::SeqCst), 1);
+        let old_active = state
+            .root_launch_pool
+            .lock()
+            .unwrap()
+            .launches
+            .values()
+            .next()
+            .unwrap()
+            .active
+            .clone();
+
+        // Hold watcher startup until after the client has used the old spec and
+        // the new spec is on disk. No scheduler timing or polling is involved.
+        reg.secrets_generation += 1;
+        reg.servers[0].env.push(registry::EnvVar {
+            key: "ROOT_LAUNCH_REVISION".into(),
+            value: Some("2".into()),
+            secret: false,
+            unknown_fields: Default::default(),
+        });
+        registry::save_to(&path, &reg).unwrap();
+        let mut watcher = WatchLoopState::new(&path, &state.host);
+        watch_tick(
+            &path,
+            &state.stdio_upstream,
+            &state.profile,
+            None,
+            None,
+            true,
+            &Arc::new(Mutex::new(None)),
+            None,
+            &mut watcher,
+            &state.host,
+        );
+        let current = state.registry.lock().unwrap().clone();
+        assert_eq!(
+            current.servers[0].env, reg.servers[0].env,
+            "watcher missed the spec edit before startup"
+        );
+        let base = state.router.lock().unwrap().clone();
+        state.router_for_root(base, &current, Some(root), None);
+        assert!(
+            !old_active.load(Ordering::SeqCst),
+            "the old rooted launch survived the edit"
+        );
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            2,
+            "replacement rooted child was not launched"
+        );
+        assert_eq!(
+            subscribes.load(Ordering::SeqCst),
+            2,
+            "replacement did not restore the subscription"
+        );
+        assert_eq!(subscriptions.lock().unwrap().total_count(), 1);
     }
 
     #[test]
