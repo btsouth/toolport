@@ -87,6 +87,7 @@ const SettingsView = lazy(() =>
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/Callout";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { GitHubStarPrompt, type StarSurface } from "@/components/GitHubStarPrompt";
 import { serverNameOrder } from "@/lib/serverOrder";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Input } from "@/components/ui/input";
@@ -152,6 +153,8 @@ function App() {
   // Toolport into their tools.
   const [onboardingStep, setOnboardingStep] = useState(0);
   const [resumeAtConnect, setResumeAtConnect] = useState(false);
+  const [justOnboarded, setJustOnboarded] = useState(false);
+  const [starSurface, setStarSurface] = useState<StarSurface>(null);
   const lastProbeRef = useRef(0);
   const probeFlightRef = useRef(createSingleFlight<ProbeResult[]>());
   const loadedOnce = useRef(false);
@@ -591,6 +594,7 @@ function App() {
     // Drop the pre-rename key so brand remnants do not linger in DevTools.
     localStorage.removeItem("conduit.onboarded");
     setOnboarded(true);
+    setJustOnboarded(true);
     setShowOnboarding(false);
     setResumeAtConnect(false);
     setOnboardingStep(0);
@@ -1055,6 +1059,13 @@ function App() {
           />
         </Suspense>
       )}
+      <GitHubStarPrompt
+        justOnboarded={justOnboarded}
+        onboardingOpen={showOnboarding}
+        enabledCount={enabledCount}
+        refreshKey={activityKey}
+        onVisibleChange={setStarSurface}
+      />
       <PendingApprovals />
       <TeamPairingDialog onConnected={openTeams} />
       {/* Quarantine has no global signal otherwise: the first sign used to be an agent
@@ -1141,7 +1152,17 @@ function App() {
           </dl>
         </DialogContent>
       </Dialog>
-      <Toaster theme={resolvedTheme} position="bottom-right" offset={16} />
+      <Toaster
+        theme={resolvedTheme}
+        position="bottom-right"
+        offset={
+          starSurface === "chip"
+            ? { bottom: "3.5rem" }
+            : starSurface
+              ? { bottom: "10rem" }
+              : 16
+        }
+      />
     </TooltipProvider>
   );
 }

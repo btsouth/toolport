@@ -912,12 +912,137 @@ fn build_sidebar(
         .child(&nav)
         .build();
     root.append(&nav_scroll);
+    install_star_prompt(&root);
 
     (
         root,
         quarantine_badge,
         team_button.expect("the Team row is always in NAV_SECTIONS"),
     )
+}
+
+/// The one-off "star the repo" ask, shown once ever, only to someone actually
+/// using Toolport (three servers and calls on two UTC dates), and only after the window has been on
+/// screen a while. Showing it retires it permanently.
+fn install_star_prompt(container: &gtk::Box) {
+    fn marker() -> Option<std::path::PathBuf> {
+        Some(crate::registry::conduit_dir()?.join(".gtk-star-prompt-done"))
+    }
+    if marker().is_none_or(|marker| marker.exists()) {
+        return;
+    }
+    // Vertical, with copy short enough to sit on one line: the sidebar is ~220px
+    // wide, so a horizontal row of label plus two buttons squeezes the label into
+    // a five-line column.
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    card.add_css_class("toolport-card");
+    card.set_margin_start(12);
+    card.set_margin_end(12);
+    card.set_margin_bottom(6);
+    card.set_visible(false);
+    card.append(
+        &gtk::Label::builder()
+            .label("Enjoying Toolport?")
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["caption", "toolport-muted"])
+            .build(),
+    );
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let retire = |card: &gtk::Box| {
+        if let Some(marker) = marker() {
+            let _ = std::fs::write(marker, b"1");
+        }
+        card.set_visible(false);
+    };
+    let star = gtk::Button::with_label("Star on GitHub");
+    star.add_css_class("toolport-secondary-action");
+    star.set_hexpand(true);
+    {
+        let card = card.clone();
+        star.connect_clicked(move |_| {
+            let _ = crate::oauth::open_web_url("https://github.com/btsouth/toolport");
+            retire(&card);
+        });
+    }
+    actions.append(&star);
+    let dismiss = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text("Dismiss forever")
+        .css_classes(["flat"])
+        .build();
+    {
+        let card = card.clone();
+        dismiss.connect_clicked(move |_| retire(&card));
+    }
+    actions.append(&dismiss);
+    card.append(&actions);
+    container.append(&card);
+    let card_for_timer = card.clone();
+    gtk::glib::timeout_add_seconds_local_once(8, move || {
+        gtk::glib::spawn_future_local(async move {
+            let eligible = gtk::gio::spawn_blocking(|| {
+                crate::registry::load()
+                    .map(|registry| {
+                        let profile = registry.active_profile_id();
+                        registry
+                            .servers
+                            .iter()
+                            .filter(|server| registry.is_enabled(&profile, &server.id))
+                            .count()
+                    })
+                    .map(|enabled| {
+                        star_value_reached(enabled, &crate::audit::read_all().unwrap_or_default())
+                    })
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+            // The card itself is hidden (thus unmapped); "on screen" means its
+            // sidebar parent is mapped, i.e. the window is actually shown.
+            let sidebar_on_screen = card_for_timer
+                .parent()
+                .is_some_and(|parent| parent.is_mapped());
+            let window = card_for_timer.root().and_downcast::<gtk::Window>();
+            let unobstructed = window.as_ref().is_some_and(|window| window.is_active())
+                && !gtk::Window::list_toplevels().iter().any(|widget| {
+                    widget
+                        .downcast_ref::<gtk::Window>()
+                        .is_some_and(|window| window.is_modal() && window.is_visible())
+                });
+            if star_should_show(eligible, sidebar_on_screen, unobstructed) {
+                if marker().is_some_and(|marker| spend_star_prompt(&marker)) {
+                    card_for_timer.set_visible(true);
+                }
+            }
+        });
+    });
+}
+
+fn spend_star_prompt(marker: &std::path::Path) -> bool {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+        .is_ok()
+}
+
+fn star_value_reached(enabled: usize, entries: &[serde_json::Value]) -> bool {
+    let days: std::collections::HashSet<_> = entries
+        .iter()
+        .filter(|entry| {
+            crate::audit::tool_call_ok(entry) == Some(true)
+                && entry.get("held").and_then(serde_json::Value::as_bool) != Some(true)
+        })
+        .filter_map(|entry| entry.get("ts").and_then(serde_json::Value::as_u64))
+        .filter(|ts| *ts > 0)
+        .map(|ts| ts / 86_400_000)
+        .collect();
+    enabled >= 3 && days.len() >= 2
+}
+fn star_should_show(eligible: bool, mapped: bool, unobstructed: bool) -> bool {
+    eligible && mapped && unobstructed
 }
 
 #[derive(Clone)]
@@ -9025,6 +9150,37 @@ mod tests {
         let access = registry.resolve_profile_id(registry.client_scopes.get(&client.id).unwrap());
         assert_eq!(access, registry.default_access_id());
         assert_ne!(access, registry.all_access_id());
+    }
+
+    #[test]
+    fn star_prompt_is_spent_once_even_without_a_click() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".gtk-star-prompt-done");
+        assert!(spend_star_prompt(&marker));
+        assert!(!spend_star_prompt(&marker));
+        assert!(!spend_star_prompt(&dir.path().join("missing/marker")));
+    }
+
+    #[test]
+    fn star_prompt_waits_for_value_and_an_unobstructed_window() {
+        let entries = vec![
+            serde_json::json!({"ts":86400000,"ok":true}),
+            serde_json::json!({"ts":172800000,"ok":true}),
+        ];
+        assert!(!star_value_reached(2, &entries));
+        assert!(!star_value_reached(3, &entries[..1]));
+        assert!(star_value_reached(3, &entries));
+        assert!(!star_value_reached(
+            3,
+            &[
+                entries[0].clone(),
+                serde_json::json!({"ts":172800000,"ok":true,"kind":"approval"})
+            ]
+        ));
+        assert!(!star_should_show(true, true, false));
+        assert!(!star_should_show(true, false, true));
+        assert!(!star_should_show(false, true, true));
+        assert!(star_should_show(true, true, true));
     }
 
     /// The 2.0 sidebar is the four fixed views in order, with Team appended only
