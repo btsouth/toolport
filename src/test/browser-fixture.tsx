@@ -271,7 +271,7 @@ mockIPC(
         };
       case "migrate_client":
         if (setupVerifying) return new Promise(() => {});
-        if (setupFailure)
+        if (setupFailure && setupFailure !== "optional")
           throw new Error(
             setupFailure === "vault"
               ? "Keychain unavailable. Unlock it and retry importing. Client config unchanged."
