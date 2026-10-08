@@ -9738,6 +9738,8 @@ fn router_relevant(reg: &Registry) -> Value {
     if let Some(obj) = v.as_object_mut() {
         obj.remove("team");
         obj.remove("gatewayInstructions");
+        // Discovery is resolved per request or refreshed before the rebuild check.
+        obj.remove("clientDiscovery");
         // From v2 on the 1.x safety toggles only mirror `safetyLevel` for 1.x readers.
         if reg.version >= 2 {
             for key in [
@@ -10064,6 +10066,7 @@ fn watch_tick(
         };
     }
 
+    let mut registry_rebuild = None;
     if file_changed {
         // Reload the registry, then compose a new catalog from unchanged
         // supervisors and lazy slots for changed or newly enabled servers.
@@ -10153,16 +10156,16 @@ fn watch_tick(
             eprintln!("toolport: registry policy changed; enforcing it on live connections");
         }
         let new_relevant = router_relevant(&new_reg);
-        if downstream_changed == 0 && new_relevant == state.last_relevant {
+        if new_relevant == state.last_relevant {
             eprintln!(
-                "toolport: registry changed (team metadata or instructions only); skipped rebuild"
+                "toolport: registry changed (metadata, instructions or client discovery only); skipped rebuild"
             );
-            return TickOutcome {
-                quarantine_changed,
-                idle_after_quarantine: false,
-            };
+        } else {
+            state.last_relevant = new_relevant;
+            registry_rebuild = Some((new_reg, resolved, root));
         }
-        state.last_relevant = new_relevant;
+    }
+    if let Some((new_reg, resolved, root)) = registry_rebuild {
         // Capture the profile we were serving before this reload so the log can
         // show the transition - the single most useful line when diagnosing
         // "why can't this client see server X": it pins down which profile is
@@ -10236,7 +10239,9 @@ fn watch_tick(
             server_count,
             tools.len(),
         );
-    } else {
+    }
+    // A registry reload must not consume a simultaneous downstream notification.
+    if downstream_changed != 0 {
         host.refresh_rooted_catalogs(downstream_changed);
         let resolved = profile
             .lock()
