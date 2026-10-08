@@ -23131,6 +23131,7 @@ mod tests {
 
     #[test]
     fn initial_modern_hitl_call_starts_mrtr_without_retry_fields() {
+        let _env = DataDirTestEnv::new("p10c-initial_modern_hitl_call_starts_mrtr_without_retry_fields");
         session_tables().hitl().clear();
         let request = json!({
             "params": {
@@ -23182,6 +23183,7 @@ mod tests {
 
     #[test]
     fn modern_hitl_state_polls_then_carries_downstream_mrtr() {
+        let _env = DataDirTestEnv::new("p10c-modern_hitl_state_polls_then_carries_downstream_mrtr");
         let arguments = json!({ "target": "x" });
         let hash = audit::args_hash(&arguments);
         let token = start_modern_hitl(
@@ -23343,6 +23345,7 @@ mod tests {
 
     #[test]
     fn two_daemon_sessions_with_one_client_identity_keep_pii_and_approvals_separate() {
+        let _env = DataDirTestEnv::new("p10c-two_daemon_sessions_with_one_client_identity_keep_pii_and_approvals_separate");
         let client = Some("shared-adapter-client");
         let first = format!("first-{}", new_correlation_id());
         let second = format!("second-{}", new_correlation_id());
@@ -23391,6 +23394,7 @@ mod tests {
 
     #[test]
     fn modern_hitl_decline_fails_closed_and_consumes_state() {
+        let _env = DataDirTestEnv::new("p10c-modern_hitl_decline_fails_closed_and_consumes_state");
         let arguments = json!({ "target": "x" });
         let hash = audit::args_hash(&arguments);
         let token = start_modern_hitl(
