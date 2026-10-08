@@ -2551,7 +2551,7 @@ fn confirm_client_migrate(client: &state::ClientView, _button: gtk::Button, page
         client.id.clone(),
         client.scope_id.clone(),
         client.gateway_state == state::ClientGatewayState::Customized,
-        move || page.refresh(),
+        move || run_profile_mutation(page.clone(), "Added selected servers", crate::registry_controller::registry_for_disconnect),
     );
 }
 
@@ -8617,7 +8617,7 @@ fn open_server_editor_prefilled(
                             let outcome = crate::registry_controller::add_snippet_servers(&text, &selected)?;
                             if !outcome.failed.is_empty() { return Err("Could not save credentials. Open Credentials and retry.".into()); }
                             Ok("Added selected servers. Check their status under Servers.".into())
-                        }, { let page = page_for_fill.clone(); move || page.refresh() });
+                        }, { let page = page_for_fill.clone(); move || run_profile_mutation(page.clone(), "Added selected servers", crate::registry_controller::registry_for_disconnect) });
                         return;
                     }
                     let Some(first) = servers.first() else {
