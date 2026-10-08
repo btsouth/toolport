@@ -270,6 +270,27 @@ fn normalize_node(schema: &mut Value, aliases: &BTreeMap<String, String>) -> Arg
             normalize_number(object, exclusive);
         }
     }
+    if let Some(reference) = object.get_mut("$ref") {
+        if let Some(pointer) = reference.as_str().and_then(|s| s.strip_prefix("#/")) {
+            let mut segments: Vec<String> = pointer.split('/').map(str::to_string).collect();
+            let mut changed = false;
+            for index in 1..segments.len() {
+                if matches!(
+                    segments[index - 1].as_str(),
+                    "properties" | "dependentSchemas" | "dependencies"
+                ) {
+                    let key = segments[index].replace("~1", "/").replace("~0", "~");
+                    if let Some(alias) = aliases.get(&key) {
+                        segments[index] = alias.clone();
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                *reference = Value::String(format!("#/{}", segments.join("/")));
+            }
+        }
+    }
     let mut plan = ArgumentMap::default();
     if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
         let old = std::mem::take(properties);
@@ -498,6 +519,13 @@ mod tests {
         let bytes = serde_json::to_vec(&schema).unwrap();
         normalize(&mut schema);
         assert_eq!(serde_json::to_vec(&schema).unwrap(), bytes);
+    }
+
+    #[test]
+    fn local_property_references_follow_renamed_keys() {
+        let mut schema = json!({"properties": {"a/b": {"type": "string"}, "copy": {"$ref": "#/properties/a~1b"}}});
+        normalize(&mut schema);
+        assert_eq!(schema["properties"]["copy"]["$ref"], "#/properties/a_b");
     }
 
     #[test]
