@@ -9763,16 +9763,18 @@ fn router_relevant(reg: &Registry) -> Value {
 
 /// Mutable loop state for [`watch_registry`] / [`watch_tick`].
 struct WatchLoopState {
-    /// Last observed registry-file mtime (None if missing).
+    /// Last successfully loaded registry-file mtime (None before the first tick).
     last_mtime: Option<SystemTime>,
     /// Router-relevant slice of the last applied registry (excludes team metadata).
     last_relevant: Value,
 }
 
 impl WatchLoopState {
-    fn new(path: &Path, host: &HostState) -> Self {
+    fn new(host: &HostState) -> Self {
         Self {
-            last_mtime: mtime(path),
+            // Disk may have changed after the host's boot load but before this
+            // thread starts. Only a successful tick can mark that edit as seen.
+            last_mtime: None,
             last_relevant: router_relevant(
                 &host
                     .registry
@@ -9817,7 +9819,7 @@ fn watch_registry(
 ) {
     eprintln!("toolport: watching registry at {}", path.display());
     // routines.json is no longer read; the v2 migration exports it to <data dir>/exports/.
-    let mut state = WatchLoopState::new(&path, &host);
+    let mut state = WatchLoopState::new(&host);
     let mut seen = started_supervisors();
     loop {
         // A started server is published as soon as it connects, through the
@@ -28605,7 +28607,7 @@ mod tests {
             unknown_fields: Default::default(),
         });
         registry::save_to(&path, &reg).unwrap();
-        let mut watcher = WatchLoopState::new(&path, &state.host);
+        let mut watcher = WatchLoopState::new(&state.host);
         watch_tick(
             &path,
             &state.stdio_upstream,

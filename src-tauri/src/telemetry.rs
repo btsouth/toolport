@@ -832,11 +832,15 @@ mod tests {
     fn slow_writer_and_full_queue_never_block_admission_or_flush() {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (delivered_tx, delivered_rx) = mpsc::sync_channel(1);
         let mut gate = Some(release_rx);
-        let writer = Arc::new(Writer::spawn(2, move |_, _, _| {
+        let writer = Arc::new(Writer::spawn(2, move |_, lines, _| {
             if let Some(gate) = gate.take() {
                 started_tx.send(()).unwrap();
                 gate.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            if lines.iter().any(|line| line == "2") {
+                delivered_tx.send(()).unwrap();
             }
             Ok(())
         }));
@@ -873,6 +877,10 @@ mod tests {
         let status = serde_json::to_value(&health).unwrap();
         assert_eq!(status["queueDropped"], 1);
         assert!(health.notice().unwrap().contains("1 records dropped"));
+        // The first barrier acknowledges only record 0. Its acknowledgement
+        // can arrive while records 1 and 2 still fill the queue, where flush
+        // deliberately fails admission immediately even with a nonzero budget.
+        delivered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(writer.flush(Duration::from_secs(5)));
     }
 
