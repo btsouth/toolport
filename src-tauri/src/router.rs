@@ -1508,6 +1508,8 @@ impl PendingHandle {
 pub struct Router {
     servers: Vec<Arc<ServerSlot>>,
     launch_specs: HashMap<String, Value>,
+    /// Catalog coverage belongs to this indexed view, not the shared mutable slots.
+    catalog_servers: HashSet<String>,
     /// Server id -> index into `servers`, so a call resolves its server without a
     /// linear scan and without locking any server to read its id.
     by_id: HashMap<String, usize>,
@@ -1793,6 +1795,9 @@ impl Router {
         // Allocate the exposed name regardless of policy so toggling one tool
         // never renames its siblings (their `_2` suffixes stay put), and in an
         // order that doesn't depend on how the server happened to list them.
+        if !tools.is_empty() {
+            self.catalog_servers.insert(server_id.to_string());
+        }
         let tool_names = self.allocate_exposed_names(server_id, tools);
         for (idx, tool) in tools.iter().enumerate() {
             let Some(orig) = tool.get("name").and_then(|n| n.as_str()) else {
@@ -1954,6 +1959,7 @@ impl Router {
             &server.prompts,
             route_mcp_apps,
         );
+        self.catalog_servers.insert(id.clone());
         let idx = self.servers.len();
         if !self.server_order.contains(&id) {
             self.server_order.push(id.clone());
@@ -2085,6 +2091,13 @@ impl Router {
                 slot.start(true);
             }
         }
+    }
+
+    /// A visible launch has no valid catalog in this indexed view.
+    pub fn any_missing_catalog(&self, visible: impl Fn(&str) -> bool) -> bool {
+        self.servers
+            .iter()
+            .any(|slot| visible(&slot.id) && !self.catalog_servers.contains(&slot.id))
     }
 
     /// Whether a visible server is starting to load its first full catalog.
@@ -3034,6 +3047,7 @@ impl Router {
     fn rebuild_aggregation_with_reserved(&mut self, restored: &[RestoredTool]) {
         self.restored_candidates.clear();
         self.tools.clear();
+        self.catalog_servers.clear();
         self.routes.clear();
         self.seen.clear();
         // A restored route keeps its exposed name until a fresh tool catalog
@@ -3081,6 +3095,9 @@ impl Router {
                     supports_mcp_app_html(s.extensions()),
                 )
             };
+            if slot.catalog_complete() {
+                self.catalog_servers.insert(slot.id.clone());
+            }
             self.index_server(
                 &slot.id,
                 &tools,

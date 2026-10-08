@@ -202,19 +202,19 @@ fn a_cached_server_stays_lazy_then_stops_when_idle_and_restarts_on_use() {
         &[mock_entry("lazy", &[("MOCK_MCP_PID_FILE", &pid_path)])],
         &["lazy"],
     );
-    let raw = json!({"name":"echo", "description":"Echo", "inputSchema":{"type":"object"}});
-    let mut exposed = raw.clone();
-    exposed["name"] = json!("lazy__echo");
-    std::fs::write(
-        scratch.join("tool-cache.json"),
-        json!({"version":1,"tools":[exposed]}).to_string(),
-    )
-    .unwrap();
-    std::fs::write(
-        scratch.join("tool-cache.servers.json"),
-        json!({"version":1,"servers":{"lazy":[raw]}}).to_string(),
-    )
-    .unwrap();
+    // Seed a current, spec-bound cache through the real publication path.
+    {
+        let _warm_daemon = start_daemon(scratch.path());
+        let mut warm_client = Client::start(scratch.path(), "cache-writer");
+        assert!(warm_client.wait_for_tool("lazy__echo", CATALOG));
+        wait_for("the catalog cache to be persisted", CATALOG, || {
+            std::fs::read_to_string(scratch.join("tool-cache.servers.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .is_some_and(|cache| cache["servers"]["lazy"]["spec"].is_string())
+        });
+    }
+    std::fs::remove_file(&pids).unwrap();
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "lazy-client");
     assert!(client.wait_for_tool("lazy__echo", CATALOG));

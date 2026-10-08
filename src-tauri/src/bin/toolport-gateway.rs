@@ -7592,7 +7592,7 @@ fn build_router_incremental(
             continue;
         }
         let id = server.id.clone();
-        let tools = raw_catalogs.get(&id).cloned().unwrap_or_default();
+        let tools = cached_server_tools(&raw_catalogs, &id, &spec);
         let dirty = Arc::clone(dirty);
         let handler = Arc::clone(&server_handler);
         let root = root.map(str::to_string);
@@ -9630,7 +9630,8 @@ fn tool_cache_path(profile: Option<&str>) -> Option<PathBuf> {
 /// Bump when the shape/derivation of cached tools changes (new sanitizing, projection,
 /// schema handling), so a stale on-disk cache from an older build is discarded and
 /// rebuilt rather than served verbatim until the next server toggle.
-const TOOL_CACHE_VERSION: u64 = 1;
+// Version 1 (including 1.24) has no per-server launch identity and cannot prove coverage.
+const TOOL_CACHE_VERSION: u64 = 2;
 
 fn load_tool_cache(profile: Option<&str>) -> Vec<Value> {
     tool_cache_path(profile)
@@ -9647,18 +9648,49 @@ fn server_catalog_path(profile: Option<&str>) -> Option<PathBuf> {
     tool_cache_path(profile).map(|path| path.with_extension("servers.json"))
 }
 
-fn load_server_catalogs(profile: Option<&str>) -> HashMap<String, Vec<Value>> {
+fn load_server_catalogs(profile: Option<&str>) -> HashMap<String, Value> {
     server_catalog_path(profile)
         .and_then(|path| std::fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .filter(|value| value["version"] == 1)
+        .filter(|value| value["version"] == TOOL_CACHE_VERSION)
         .and_then(|value| serde_json::from_value(value["servers"].clone()).ok())
         .unwrap_or_default()
 }
 
+fn cached_server_tools(catalogs: &HashMap<String, Value>, id: &str, spec: &Value) -> Vec<Value> {
+    catalogs
+        .get(id)
+        .filter(|entry| entry["spec"] == registry::sha256_hex(&spec.to_string()))
+        .and_then(|entry| entry["tools"].as_array().cloned())
+        .unwrap_or_default()
+}
+
 fn save_server_catalogs(router: &Router, profile: Option<&str>) {
+    save_server_catalogs_for_launches(router, profile, &[]);
+}
+
+fn save_server_catalogs_for_launches(router: &Router, profile: Option<&str>, keys: &[LaunchKey]) {
     if let (Some(path), Some(catalogs)) = (server_catalog_path(profile), router.raw_catalogs()) {
-        if let Ok(raw) = serde_json::to_string(&json!({"version": 1, "servers": catalogs})) {
+        let catalogs: HashMap<_, _> = catalogs
+            .into_iter()
+            .map(|(id, tools)| {
+                // Persist only the digest: launch specs can contain literal env values.
+                let spec = keys
+                    .iter()
+                    .find(|key| key.server == id)
+                    .map(|key| key.digest.clone())
+                    .unwrap_or_else(|| {
+                        registry::sha256_hex(
+                            &router.launch_spec(&id).unwrap_or(&Value::Null).to_string(),
+                        )
+                    });
+                let entry = json!({"spec": spec, "tools": tools});
+                (id, entry)
+            })
+            .collect();
+        if let Ok(raw) =
+            serde_json::to_string(&json!({"version": TOOL_CACHE_VERSION, "servers": catalogs}))
+        {
             let _ = registry::atomic_write(&path, &raw);
         }
     }
@@ -11153,7 +11185,7 @@ impl HostState {
             }
             None => view.fail_closed_catalog(),
         }
-        save_server_catalogs(view, Some(scope));
+        save_server_catalogs_for_launches(view, Some(scope), keys);
     }
 
     fn reconcile_rooted_view(&self, keys: &[LaunchKey], cached: Arc<Router>) -> Arc<Router> {
@@ -11402,9 +11434,12 @@ impl HostState {
                 server
             });
             let root_scope = format!("root:{}", registry::sha256_hex(root));
-            let cached = load_server_catalogs(Some(&root_scope))
-                .remove(&server.id)
-                .unwrap_or_default();
+            let launch_spec = effective_server_spec(&server, Some(root), reg.secrets_generation);
+            let cached = cached_server_tools(
+                &load_server_catalogs(Some(&root_scope)),
+                &server.id,
+                &launch_spec,
+            );
             let spec = server.clone();
             let root = root.to_string();
             let subs = Arc::clone(&subscriptions);
@@ -13933,6 +13968,7 @@ fn process_request(
     }
 
     let wait = match method {
+        "tools/list" if discovery == DiscoveryMode::Full => true,
         "tools/list" => {
             let reg = state
                 .registry
@@ -14009,13 +14045,14 @@ fn process_request(
         }
         live.discover_uncached(|id| {
             allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
-                && !cached.tools.iter().any(|tool| {
-                    tool.get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| {
-                            name.starts_with(&format!("{}__", sanitize_segment(id)))
-                        })
-                })
+                && (discovery == DiscoveryMode::Full
+                    || !cached.tools.iter().any(|tool| {
+                        tool.get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| {
+                                name.starts_with(&format!("{}__", sanitize_segment(id)))
+                            })
+                    }))
         });
     }
 
@@ -14214,7 +14251,8 @@ fn process_request(
         let cold = scope_tools(&cache_snapshot.tools, allowed, |name| {
             owner_of_exposed_tool(Some(&router), &owners, name)
         })
-        .is_empty();
+        .is_empty()
+            || discovery == DiscoveryMode::Full && router.any_missing_catalog(visible);
         if cold {
             #[cfg(test)]
             COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
@@ -20344,6 +20382,249 @@ mod tests {
     }
 
     #[test]
+    fn inherited_catalog_cache_requires_current_version_and_launch_spec() {
+        let _env = DataDirTestEnv::new("inherited-catalog-version-spec");
+        let tools = vec![json!({"name":"cache__cached"})];
+        std::fs::write(
+            tool_cache_path(None).unwrap(),
+            json!({"version":1,"tools":tools}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            server_catalog_path(None).unwrap(),
+            json!({"version":1,"servers":{"cache":[{"name":"cached"}]}}).to_string(),
+        )
+        .unwrap();
+        assert!(
+            load_tool_cache(None).is_empty(),
+            "1.24 cache must be discarded"
+        );
+        assert!(
+            load_server_catalogs(None).is_empty(),
+            "unidentified server specs must be discarded"
+        );
+        let router = cached_supervisor();
+        save_server_catalogs(&router, None);
+        let catalogs = load_server_catalogs(None);
+        let spec = router.launch_spec("cache").unwrap();
+        assert_eq!(cached_server_tools(&catalogs, "cache", spec).len(), 1);
+        assert!(cached_server_tools(&catalogs, "cache", &json!({"revision":2})).is_empty());
+        let key = LaunchKey {
+            server: "cache".into(),
+            kind: "stdio",
+            digest: registry::sha256_hex(&spec.to_string()),
+        };
+        // Rooted compositions share slots without inheriting their launch_specs map.
+        let rooted = Router::new().with_shared_server_slot(&router.server_slot("cache").unwrap());
+        save_server_catalogs_for_launches(&rooted, Some("root:test"), &[key]);
+        assert_eq!(
+            cached_server_tools(&load_server_catalogs(Some("root:test")), "cache", spec).len(),
+            1
+        );
+        save_tool_cache(&tools, None);
+        assert_eq!(load_tool_cache(None), tools);
+    }
+
+    #[test]
+    fn supervisor_complete_cache_full_first_list_keeps_fast_path() {
+        let _env = DataDirTestEnv::new("complete-cache-first-list");
+        let state = http_state(false);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let router = counting_cache_supervisor("cache", vec![json!({"name":"cached"})], &starts);
+        save_server_catalogs(&router, None);
+        save_tool_cache(&router.aggregated_tools(), None);
+        *state.cached_tools.lock().unwrap() = Arc::new(CatalogSnapshot::new(load_tool_cache(None)));
+        *state.router.lock().unwrap() = Arc::new(router);
+        let started = Instant::now();
+        let reply = full_tools_list_for_client(&state, "claude-code", None);
+        assert!(reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "cache__cached"));
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            0,
+            "cached server was restarted"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "warm cache waited"
+        );
+        // A cached launch's first use may be starting or publishing. Its valid
+        // catalog already covers this view, so a Full list must still be instant.
+        let live = state.router.lock().unwrap().clone();
+        live.prepare_lazy_use("cache");
+        wait_for_supervisor_result(&live);
+        assert!(live.any_publishing_first_catalog(|_| true));
+        let started = Instant::now();
+        let reply = full_tools_list_for_client(&state, "claude-code", None);
+        assert!(reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "cache__cached"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "covered cache waited for publication"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn supervisor_partial_cache_lazy_first_list_keeps_fast_path() {
+        let _env = DataDirTestEnv::new("partial-cache-lazy-first-list");
+        let state = http_state(false);
+        let mut router = cache_router();
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        let release = hanging_supervisor(&mut router, "hang");
+        *state.router.lock().unwrap() = Arc::new(router);
+        let started = Instant::now();
+        let reply = process_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            &SearchGuard::default(),
+            None,
+            None,
+            None,
+            None,
+            Some("claude-code"),
+            None,
+            DiscoveryMode::Lazy,
+        )
+        .unwrap();
+        assert!(reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "toolport_search_tools"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "lazy list waited for missing catalogs"
+        );
+        drop(release);
+    }
+
+    #[test]
+    fn supervisor_failed_uncached_full_first_list_discards_stale_flat_cache() {
+        let _env = DataDirTestEnv::new("failed-uncached-first-list");
+        let state = http_state(false);
+        let mut live = cache_router();
+        live.add_supervised(
+            "stale".into(),
+            Vec::new(),
+            Arc::new(|| {
+                Err(ConnectFailure {
+                    message: "needs authentication".into(),
+                    needs_auth: true,
+                })
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":2}),
+        );
+        live.prepare_lazy_use("stale");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = started_supervisors();
+        while live.any_starting(|_| true) && Instant::now() < deadline {
+            seen = wait_for_started_supervisor(seen, deadline);
+        }
+        assert!(!live.any_starting(|_| true));
+        *state.cached_tools.lock().unwrap() = Arc::new(CatalogSnapshot::new(vec![
+            json!({"name":"cache__cached"}),
+            json!({"name":"stale__old"}),
+        ]));
+        *state.router.lock().unwrap() = Arc::new(live);
+        let started = Instant::now();
+        let reply = full_tools_list_for_client(&state, "claude-code", None);
+        let names: Vec<_> = reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(names.contains(&"cache__cached"), "{names:?}");
+        assert!(
+            !names.contains(&"stale__old"),
+            "invalid launch cache survived: {names:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "failed server was awaited"
+        );
+    }
+
+    #[test]
+    fn supervisor_partial_cache_full_first_list_waits_for_each_client() {
+        let _env = DataDirTestEnv::new("partial-cache-full-first-list");
+        for client in ["claude-code", "codex", "cursor", "unknown"] {
+            let state = http_state(false);
+            let mut live = cache_router();
+            // Seed the actual disk format with only one of two visible servers.
+            save_tool_cache(&live.aggregated_tools(), None);
+            *state.cached_tools.lock().unwrap() =
+                Arc::new(CatalogSnapshot::new(load_tool_cache(None)));
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = Arc::new(Mutex::new(release_rx));
+            live.add_supervised(
+                "late".into(),
+                Vec::new(),
+                Arc::new(move || {
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                    Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
+                }),
+                ReconnectBackoff::default(),
+                json!({"revision":1}),
+            );
+            let live = Arc::new(live);
+            *state.router.lock().unwrap() = Arc::clone(&live);
+            let publisher = state.clone();
+            COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
+                hook.replace(Some(Box::new(move |snapshot| {
+                    assert!(snapshot.any_discovering(|id| id == "late"));
+                    release_tx.send(()).unwrap();
+                    wait_for_supervisor_result(&live);
+                    // Publish in memory: this unit fixture must not depend on
+                    // unrelated disk or keyring latency to meet the client budget.
+                    let mut published = (*live).clone();
+                    assert_eq!(published.adopt_ready_reconnects(), vec!["late"]);
+                    let published = Arc::new(published);
+                    *publisher.router.lock().unwrap() = Arc::clone(&published);
+                    published.activate_supervisors();
+                })));
+            });
+            let started = Instant::now();
+            let reply = full_tools_list_for_client(&state, client, None);
+            let elapsed = started.elapsed();
+            COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
+                hook.take();
+            });
+            let names: Vec<_> = reply["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(names.contains(&"cache__cached"), "{client}: {names:?}");
+            assert!(
+                names.contains(&"late__cached"),
+                "{client}: partial first list {names:?}"
+            );
+            assert!(
+                elapsed
+                    < Duration::from_millis(
+                        clients::discovery_capabilities(client).cold_full_list_wait_ms
+                    ),
+                "{client}: exceeded first-list budget"
+            );
+        }
+    }
+
+    #[test]
     fn supervisor_cold_full_no_refresh_waits_for_visible_first_catalog() {
         let _env = DataDirTestEnv::new("cold-full-no-refresh");
         let state = http_state(false);
@@ -20526,7 +20807,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_warm_full_no_refresh_does_not_wait_for_hanging_start() {
+    fn supervisor_warm_full_no_refresh_does_not_wait_for_hidden_hanging_start() {
         let _env = DataDirTestEnv::new("warm-full-no-refresh");
         let state = http_state(false);
         let mut live = cache_router();
@@ -20535,9 +20816,9 @@ mod tests {
         *state.cached_tools.lock().unwrap() =
             Arc::new(CatalogSnapshot::new(live.aggregated_tools()));
         *state.router.lock().unwrap() = Arc::new(live);
-        state.ready.store(false, Ordering::SeqCst);
         let started = Instant::now();
-        let reply = full_tools_list_for_client(&state, "codex", None);
+        let allowed = HashSet::from(["cache".to_string()]);
+        let reply = full_tools_list_for_client(&state, "codex", Some(&allowed));
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "warm list waited for startup"
