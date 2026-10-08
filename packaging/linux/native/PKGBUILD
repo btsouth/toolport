@@ -38,7 +38,7 @@ build() {
 
 check() {
   cd "toolport-$pkgver/src-tauri"
-  cargo test --locked --no-default-features --features gtk-desktop \
+  cargo test --locked --no-default-features --features gtk-desktop,test-support \
     --lib linux_native::
 }
 
