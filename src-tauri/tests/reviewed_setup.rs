@@ -312,6 +312,20 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
         "TOOLPORT_SECRET_KEY",
         Some("synthetic-import-integration".into()),
     );
+    #[cfg(unix)]
+    let secured_command = {
+        use std::os::unix::fs::PermissionsExt;
+        let path = fixture.dir.join("credential-server");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n[ \"$PAT\" = synthetic-setup-pat ] || exit 42\nexec \"{mock}\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    #[cfg(not(unix))]
+    let secured_command = mock.clone();
     let credential_config =
         json!({"mcpServers":{"secured":{"command":secured_command,"env":{"PAT":"synthetic-setup-pat"}}}})
             .to_string();
