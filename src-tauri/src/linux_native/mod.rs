@@ -12,6 +12,7 @@ mod onboarding;
 mod package_updates;
 mod pairing;
 mod settings;
+mod single_instance;
 mod state;
 mod teams;
 mod theme;
@@ -38,16 +39,15 @@ pub fn run() {
     let args = std::env::args()
         .filter(|arg| arg != "--hidden")
         .collect::<Vec<_>>();
-    let app = adw::Application::builder()
-        .application_id(APP_ID)
-        .flags(gtk::gio::ApplicationFlags::HANDLES_OPEN)
-        .build();
     // Register before starting the tray, broker, bridge or startup maintenance.
-    // Secondary launches only forward activation/URLs to the primary process.
-    if let Err(error) = app.register(gtk::gio::Cancellable::NONE) {
-        eprintln!("toolport: could not register the desktop application: {error}");
-        return;
-    }
+    // An upgraded launch retires the old build before taking over its identity.
+    let app = match single_instance::register(APP_ID) {
+        Ok(app) => app,
+        Err(error) => {
+            single_instance::show_failure(&error);
+            return;
+        }
+    };
     if app.is_remote() {
         app.run_with_args(&args);
         return;
