@@ -313,6 +313,8 @@ describe("CatalogView search and installed identity", () => {
       />,
     );
     await user.click(await screen.findByRole("button", { name: "Add 1" }));
+    expect(addCatalogServer).not.toHaveBeenCalled();
+    await user.click(await screen.findByRole("button", { name: "Add selected servers" }));
     await waitFor(() => expect(addCatalogServer).toHaveBeenCalledTimes(1));
     expect(vi.mocked(addCatalogServer).mock.calls[0][0].name).toBe("Other");
   });
