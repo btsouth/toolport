@@ -3215,7 +3215,7 @@ fn epoch_millis() -> u128 {
 /// bound is 64 MB: generous enough for real whole-app-state files while still capping
 /// memory. The device/FIFO/directory case is handled separately by the `is_file`
 /// check, so this only guards against an abnormally huge regular file.
-const MAX_CONFIG_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_CONFIG_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Read a client config to a string, refusing anything that isn't a regular file
 /// (after following symlinks, so a benign symlinked dotfile still works but a

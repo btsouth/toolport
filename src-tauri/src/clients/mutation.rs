@@ -76,18 +76,11 @@ pub(super) fn write(path: &Path, contents: &str) -> Result<(), String> {
     if staged {
         Ok(())
     } else {
-        crate::registry::atomic_write(path, contents)
-    }
-}
-
-fn disk(path: &Path) -> Result<Option<String>, String> {
-    match std::fs::metadata(path) {
-        Ok(_) => super::read_config_file_disk(path).map(Some),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!(
-            "could not stat {} before editing: {e}",
-            path.display()
-        )),
+        crate::registry::client_file::commit(
+            path,
+            &crate::registry::client_file::read(path)?,
+            Some(contents),
+        )
     }
 }
 
@@ -241,7 +234,8 @@ fn run_inner<T>(
         };
         #[cfg(test)]
         before_commit(path);
-        let current = disk(path)?;
+        let current_revision = crate::registry::client_file::read(path)?;
+        let current = current_revision.text.clone();
         if current != original {
             if !unrelated(
                 format,
@@ -251,7 +245,7 @@ fn run_inner<T>(
             )? {
                 return Err(format!("Client config conflict at {}: native edits overlap this operation. Config unchanged.", path.display()));
             }
-            revision = crate::registry::client_file::read(path)?;
+            revision = current_revision;
             original = revision.text.clone();
             continue;
         }
@@ -273,7 +267,8 @@ fn run_inner<T>(
         match commit {
             Ok(()) => return Ok(result),
             Err(e) if e == "Client config revision changed before rename" => {
-                let current = disk(path)?;
+                let current_revision = crate::registry::client_file::read(path)?;
+                let current = current_revision.text.clone();
                 if !unrelated(
                     format,
                     original.as_deref(),
@@ -285,7 +280,7 @@ fn run_inner<T>(
                         path.display()
                     ));
                 }
-                revision = crate::registry::client_file::read(path)?;
+                revision = current_revision;
                 original = revision.text.clone();
             }
             Err(e) => return Err(e),
