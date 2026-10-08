@@ -329,6 +329,11 @@ export interface ImportItem {
   isNew: boolean;
 }
 
+export interface CatalogSearch {
+  entries: CatalogEntry[];
+  registryStatus: "notQueried" | "available" | "unavailable" | "timedOut";
+}
+
 /** An addable server from the catalog (curated seed or the live MCP Registry). */
 export interface CatalogEntry {
   name: string;

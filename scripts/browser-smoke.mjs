@@ -50,6 +50,23 @@ try {
     errors.push(`Unexpected external request: ${route.request().url()}`);
     return route.abort();
   });
+  for (const state of ["normal", "outage", "timeout", "empty-outage", "installed"]) {
+    await page.goto(`${baseURL}/fixtures/catalog.html?state=${state}`);
+    await expect(page.getByText("GitHub", { exact: true })).toBeVisible();
+    if (state === "outage" || state === "timeout" || state === "empty-outage") {
+      await page.getByRole("textbox").fill("github");
+      await expect(page.getByText(/Showing curated matches only/)).toBeVisible();
+      await expect(page.getByText(/No catalog results/)).toHaveCount(0);
+      if (state === "empty-outage")
+        await expect(page.getByText(/No curated matches/)).toBeVisible();
+      else await expect(page.getByText("GitHub", { exact: true })).toBeVisible();
+    }
+    if (state === "installed") {
+      await expect(page.getByText("in Toolport", { exact: true })).toHaveCount(1);
+      await expect(page.getByRole("button", { name: "Add", exact: true })).toHaveCount(2);
+    }
+    await page.screenshot({ path: path.join(output, `catalog-react-${state}.png`) });
+  }
   await page.goto(`${baseURL}/fixtures/`);
   await expect(page.getByText("GitHub", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "35.0k tokens saved" })).toBeVisible();

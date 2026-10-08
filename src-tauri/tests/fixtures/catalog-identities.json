@@ -1,0 +1,218 @@
+[
+  {
+    "case": "renamed npm and runner path",
+    "catalog": {
+      "name": "GitHub",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github@1.2.3"],
+      "url": null
+    },
+    "server": {
+      "name": "My repositories",
+      "transport": "stdio",
+      "command": "/usr/bin/npx",
+      "args": ["--yes", "@modelcontextprotocol/server-github@2.0.0"],
+      "url": null
+    },
+    "equal": true
+  },
+  {
+    "case": "same name different package",
+    "catalog": {
+      "name": "GitHub",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github@1.2.3"],
+      "url": null
+    },
+    "server": {
+      "name": "GitHub",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "unrelated-mcp@1.2.3"],
+      "url": null
+    },
+    "equal": false
+  },
+  {
+    "case": "different launch args",
+    "catalog": {
+      "name": "GitHub",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github@1.2.3", "/a"],
+      "url": null
+    },
+    "server": {
+      "name": "GitHub",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github@1.2.3", "/b"],
+      "url": null
+    },
+    "equal": false
+  },
+  {
+    "case": "uvx package normalization",
+    "catalog": {
+      "name": "GitHub",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["Example_Package==1.0"],
+      "url": null
+    },
+    "server": {
+      "name": "Renamed",
+      "transport": "stdio",
+      "command": "/usr/bin/uvx",
+      "args": ["example-package==2.0"],
+      "url": null
+    },
+    "equal": true
+  },
+  {
+    "case": "URL scheme host slash default port secrets",
+    "catalog": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://Example.COM:443/mcp/?api_key=first#ignored"
+    },
+    "server": {
+      "name": "Renamed",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "HTTPS://example.com/mcp?api_key=second"
+    },
+    "equal": true
+  },
+  {
+    "case": "HTTP default port",
+    "catalog": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "http://EXAMPLE.com:80/mcp/"
+    },
+    "server": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "http://example.com/mcp"
+    },
+    "equal": true
+  },
+  {
+    "case": "same name different endpoint",
+    "catalog": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://Example.COM:443/mcp/?api_key=first#ignored"
+    },
+    "server": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://other.example/mcp"
+    },
+    "equal": false
+  },
+  {
+    "case": "non-default port",
+    "catalog": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://Example.COM:443/mcp/?api_key=first#ignored"
+    },
+    "server": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://example.com:8443/mcp"
+    },
+    "equal": false
+  },
+  {
+    "case": "scheme matters",
+    "catalog": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "http://example.com/mcp"
+    },
+    "server": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://example.com/mcp"
+    },
+    "equal": false
+  },
+  {
+    "case": "non-secret query selects instance",
+    "catalog": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://example.com/mcp?project=a&token=first"
+    },
+    "server": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://example.com/mcp?project=b&token=second"
+    },
+    "equal": false
+  },
+  {
+    "case": "path case matters",
+    "catalog": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://example.com/MCP"
+    },
+    "server": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": "https://example.com/mcp"
+    },
+    "equal": false
+  },
+  {
+    "case": "self-hosted has no identity",
+    "catalog": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": null
+    },
+    "server": {
+      "name": "GitHub",
+      "transport": "http",
+      "command": null,
+      "args": [],
+      "url": null
+    },
+    "equal": false
+  }
+]

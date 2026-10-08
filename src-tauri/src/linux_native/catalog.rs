@@ -17,6 +17,7 @@ struct CatalogSnapshot {
 struct SuggestionState {
     entries: Vec<crate::catalog::CatalogEntry>,
     existing: HashSet<String>,
+    registry_status: Option<crate::catalog::RegistryStatus>,
 }
 
 #[derive(Clone)]
@@ -261,6 +262,7 @@ impl CatalogPage {
         self.suggestion_state.replace(SuggestionState {
             entries: entries.clone(),
             existing,
+            registry_status: None,
         });
         self.suggestion_limit.set(SUGGESTION_BATCH);
         if entries.is_empty() {
@@ -275,14 +277,25 @@ impl CatalogPage {
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || {
-                let entries = crate::catalog::search(&query)?;
+                let result = crate::catalog::search(&query);
                 let registry = crate::registry::load()?;
                 let existing = registry
                     .servers
                     .into_iter()
-                    .map(|server| server.name.to_lowercase())
+                    .filter_map(|server| {
+                        crate::catalog::server_identity(
+                            &server.transport,
+                            server.command.as_deref(),
+                            &server.args,
+                            server.url.as_deref(),
+                        )
+                    })
                     .collect::<HashSet<_>>();
-                Ok::<_, String>(SuggestionState { entries, existing })
+                Ok::<_, String>(SuggestionState {
+                    entries: result.entries,
+                    existing,
+                    registry_status: Some(result.registry_status),
+                })
             })
             .await;
             if generation != page.suggestion_generation.get() {
@@ -336,7 +349,28 @@ impl CatalogPage {
             self.suggestion_list.remove(&child);
         }
         let state = self.suggestion_state.borrow().clone();
+        if let Some(notice) = state
+            .registry_status
+            .and_then(crate::catalog::RegistryStatus::notice)
+        {
+            self.suggestion_list.append(
+                &gtk::Label::builder()
+                    .label(notice)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .css_classes(["toolport-suggestion-message", "error"])
+                    .build(),
+            );
+        }
         if state.entries.is_empty() {
+            if state
+                .registry_status
+                .and_then(crate::catalog::RegistryStatus::notice)
+                .is_some()
+            {
+                self.open_suggestions();
+                return;
+            }
             self.show_suggestion_message(
                 "No trusted matches. Try a vendor, capability, or category.",
                 false,
@@ -394,30 +428,60 @@ impl CatalogPage {
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || {
-                let entries = if query.trim().is_empty() {
-                    crate::catalog::popular()
-                } else {
-                    crate::catalog::search(&query)?
-                };
+                let result = crate::catalog::search(&query);
+                let entries = result.entries;
                 let registry = crate::registry::load()?;
                 let existing = registry
                     .servers
                     .into_iter()
-                    .map(|server| server.name.to_lowercase())
+                    .filter_map(|server| {
+                        crate::catalog::server_identity(
+                            &server.transport,
+                            server.command.as_deref(),
+                            &server.args,
+                            server.url.as_deref(),
+                        )
+                    })
                     .collect::<HashSet<_>>();
                 let stacks = query.trim().is_empty().then(crate::stacks::stacks);
-                Ok::<_, String>((entries, existing, stacks))
+                Ok::<_, String>((entries, existing, stacks, result.registry_status))
             })
             .await;
             if generation != page.request_generation.get() {
                 return;
             }
             match result {
-                Ok(Ok((entries, existing, stacks))) => page.render(entries, existing, stacks),
+                Ok(Ok((entries, existing, stacks, status))) => {
+                    page.render_search(
+                        crate::catalog::CatalogSearch {
+                            entries,
+                            registry_status: status,
+                        },
+                        existing,
+                        stacks,
+                    );
+                }
                 Ok(Err(error)) => page.show_error(&error),
                 Err(_) => page.show_error("the catalog search stopped unexpectedly"),
             }
         });
+    }
+
+    fn render_search(
+        &self,
+        result: crate::catalog::CatalogSearch,
+        existing: HashSet<String>,
+        stacks: Option<Vec<crate::stacks::Stack>>,
+    ) {
+        self.render(result.entries, existing, stacks);
+        if let Some(notice) = result.registry_status.notice() {
+            if let Some(timer) = self.feedback_timer.borrow_mut().take() {
+                timer.remove();
+            }
+            self.feedback.set_label(notice);
+            self.feedback.add_css_class("error");
+            self.feedback.set_visible(true);
+        }
     }
 
     fn render(
@@ -545,7 +609,7 @@ fn suggestion_row(
     );
     row.append(&copy);
 
-    if existing.contains(&entry.name.to_lowercase()) {
+    if crate::catalog::entry_identity(&entry).is_some_and(|identity| existing.contains(&identity)) {
         let added = gtk::Label::new(Some("Added"));
         added.set_size_request(72, -1);
         added.set_valign(gtk::Align::Center);
@@ -653,7 +717,10 @@ fn stack_card(
     let missing = stack
         .servers
         .iter()
-        .filter(|entry| !existing.contains(&entry.name.to_lowercase()))
+        .filter(|entry| {
+            !crate::catalog::entry_identity(&entry)
+                .is_some_and(|identity| existing.contains(&identity))
+        })
         .count();
     // Setup steps up front: which credential each server needs and where to
     // create it, so "Add Collection" is not a leap of faith.
@@ -732,7 +799,11 @@ fn stack_card(
             .css_classes(["caption", "toolport-muted"])
             .build(),
     );
-    let add = gtk::Button::with_label(if missing == 0 { "Added" } else { "Add Collection" });
+    let add = gtk::Button::with_label(if missing == 0 {
+        "Added"
+    } else {
+        "Add Collection"
+    });
     add.set_sensitive(missing > 0);
     add.add_css_class(if missing == 0 {
         "toolport-secondary-action"
@@ -740,9 +811,18 @@ fn stack_card(
         "suggested-action"
     });
     let name = stack.name.clone();
+    let missing_entries: Vec<_> = stack
+        .servers
+        .iter()
+        .filter(|entry| {
+            !crate::catalog::entry_identity(entry)
+                .is_some_and(|identity| existing.contains(&identity))
+        })
+        .cloned()
+        .collect();
     add.connect_clicked(move |button| {
         button.set_sensitive(false);
-        let entries = stack.servers.clone();
+        let entries = missing_entries.clone();
         let name = name.clone();
         let button = button.clone();
         let page = page.clone();
@@ -855,7 +935,7 @@ fn catalog_card(
 
     let action_slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     action_slot.set_size_request(72, -1);
-    if existing.contains(&entry.name.to_lowercase()) {
+    if crate::catalog::entry_identity(&entry).is_some_and(|identity| existing.contains(&identity)) {
         let added = gtk::Label::new(Some("Added"));
         added.set_valign(gtk::Align::Center);
         added.set_size_request(72, -1);
@@ -932,5 +1012,183 @@ fn open_added_setup(registry: &crate::registry::Registry, page: &CatalogPage) {
             page.server_page.clone(),
             None,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn labels(widget: &impl IsA<gtk::Widget>) -> Vec<String> {
+        let widget = widget.as_ref();
+        let mut result = Vec::new();
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            result.push(label.text().to_string());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            result.extend(labels(&current));
+            child = current.next_sibling();
+        }
+        result
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn catalog_outage_and_installed_states() {
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.CatalogFixture")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        // Only the catalog is mounted. No broker, registry load or probes run.
+        let server_page = super::super::ServerPage {
+            app: app.clone(),
+            server_count: gtk::Label::new(None),
+            enabled_count: gtk::Label::new(None),
+            profile_count: gtk::Label::new(None),
+            section_title: gtk::Label::new(None),
+            posture: gtk::Label::new(None),
+            search: gtk::SearchEntry::new(),
+            feedback: gtk::Label::new(None),
+            list: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            last_snapshot: Default::default(),
+            feedback_timer: Default::default(),
+            health_rows: Default::default(),
+            rows: Default::default(),
+            no_matches: Default::default(),
+            off_heading: Default::default(),
+            health: Default::default(),
+        };
+        let page = CatalogPage::new(server_page);
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .title("Toolport catalog fixture")
+            .default_width(1000)
+            .default_height(720)
+            .content(&page.root)
+            .build();
+        window.add_css_class("toolport-native");
+        let theme = super::super::theme::ThemeController::new();
+        theme.attach(&window);
+        let entries: Vec<_> = crate::catalog::popular()
+            .into_iter()
+            .filter(|entry| matches!(entry.name.as_str(), "GitHub" | "Memory" | "Redis"))
+            .collect();
+        let installed = entries.iter().find(|entry| entry.name == "GitHub").unwrap();
+        let identity = crate::catalog::server_identity(
+            "http",
+            None,
+            &[],
+            Some("HTTPS://API.GITHUBCOPILOT.COM:443/mcp/?token=fixture-only"),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::catalog::entry_identity(installed).as_deref(),
+            Some(identity.as_str())
+        );
+        for (state, status, existing) in [
+            (
+                "normal",
+                crate::catalog::RegistryStatus::NotQueried,
+                HashSet::new(),
+            ),
+            (
+                "outage",
+                crate::catalog::RegistryStatus::Unavailable,
+                HashSet::new(),
+            ),
+            (
+                "installed",
+                crate::catalog::RegistryStatus::NotQueried,
+                HashSet::from([identity]),
+            ),
+        ] {
+            page.render_search(
+                crate::catalog::CatalogSearch {
+                    entries: entries.clone(),
+                    registry_status: status,
+                },
+                existing,
+                None,
+            );
+            assert_eq!(
+                labels(&page.list)
+                    .iter()
+                    .filter(|label| *label == "Added")
+                    .count(),
+                usize::from(state == "installed")
+            );
+            assert_eq!(page.feedback.is_visible(), state == "outage");
+            if state == "outage" {
+                assert!(page.feedback.text().contains("curated matches only"));
+            }
+            window.present();
+            let main_loop = gtk::glib::MainLoop::new(None, false);
+            let frames = Rc::new(Cell::new(0));
+            let finished = main_loop.clone();
+            window.add_tick_callback(move |_, _| {
+                frames.set(frames.get() + 1);
+                if frames.get() >= 2 {
+                    finished.quit();
+                    gtk::glib::ControlFlow::Break
+                } else {
+                    gtk::glib::ControlFlow::Continue
+                }
+            });
+            let deadline = main_loop.clone();
+            let timer =
+                gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || {
+                    deadline.quit()
+                });
+            main_loop.run();
+            timer.remove();
+            assert!(page.root.width() > 0);
+            if let Ok(output) = std::env::var("P22_SCREENSHOT_DIR") {
+                std::fs::create_dir_all(&output).unwrap();
+                let snapshot = gtk::Snapshot::new();
+                gtk::WidgetPaintable::new(Some(&page.root)).snapshot(
+                    &snapshot,
+                    page.root.width() as f64,
+                    page.root.height() as f64,
+                );
+                let node = snapshot.to_node().unwrap();
+                window
+                    .renderer()
+                    .unwrap()
+                    .render_texture(&node, None)
+                    .save_to_png(
+                        std::path::Path::new(&output).join(format!("catalog-gtk-{state}.png")),
+                    )
+                    .unwrap();
+            }
+        }
+        for status in [
+            crate::catalog::RegistryStatus::Unavailable,
+            crate::catalog::RegistryStatus::TimedOut,
+        ] {
+            page.suggestion_state.replace(SuggestionState {
+                entries: entries.clone(),
+                existing: HashSet::new(),
+                registry_status: Some(status),
+            });
+            page.render_suggestions();
+            assert!(labels(&page.suggestion_list)
+                .iter()
+                .any(|label| label.contains("curated matches only")));
+            assert!(labels(&page.suggestion_list)
+                .iter()
+                .any(|label| label == "GitHub"));
+            page.suggestion_state.borrow_mut().entries.clear();
+            page.render_suggestions();
+            assert!(labels(&page.suggestion_list)
+                .iter()
+                .any(|label| label.contains("curated matches only")));
+            assert!(!labels(&page.suggestion_list)
+                .iter()
+                .any(|label| label.contains("No trusted matches")));
+        }
+        page.close_suggestions();
+        window.close();
     }
 }

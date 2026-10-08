@@ -3,7 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { addServer, listStacks, popularCatalog, searchCatalog } from "@/lib/api";
 import type { CatalogEntry, Registry, Stack } from "@/lib/types";
-import { CatalogView } from "./CatalogView";
+import identities from "../../src-tauri/tests/fixtures/catalog-identities.json";
+import { catalogIdentity, CatalogView } from "./CatalogView";
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
@@ -56,7 +57,10 @@ function deferred<T>() {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(popularCatalog).mockResolvedValue([entry]);
-  vi.mocked(searchCatalog).mockResolvedValue([]);
+  vi.mocked(searchCatalog).mockResolvedValue({
+    entries: [],
+    registryStatus: "available",
+  });
   vi.mocked(addServer).mockResolvedValue(registry);
 });
 
@@ -132,4 +136,85 @@ describe("CatalogView collection loading", () => {
     ).not.toBeInTheDocument();
     expect(screen.getByText("GitHub")).toBeInTheDocument();
   });
+});
+
+describe("CatalogView search and installed identity", () => {
+  it.each(identities)("$case", ({ catalog, server, equal }) => {
+    const a = catalogIdentity(catalog as CatalogEntry);
+    expect(a !== null && a === catalogIdentity(server as CatalogEntry)).toBe(equal);
+  });
+
+  it.each(["unavailable", "timedOut"] as const)(
+    "keeps curated cards during %s and retries",
+    async (registryStatus) => {
+      vi.mocked(listStacks).mockResolvedValue([]);
+      vi.mocked(searchCatalog)
+        .mockResolvedValueOnce({ entries: [entry], registryStatus })
+        .mockResolvedValueOnce({ entries: [entry], registryStatus: "available" });
+      const user = userEvent.setup();
+      render(<CatalogView registry={registry} onAdded={vi.fn()} />);
+      await user.type(screen.getByRole("textbox"), "github");
+      expect(await screen.findByText(/Showing curated matches only/)).toBeInTheDocument();
+      expect(screen.getByText("GitHub")).toBeInTheDocument();
+      expect(screen.queryByText(/No catalog results/)).not.toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Try again" }));
+      await waitFor(() => expect(searchCatalog).toHaveBeenCalledTimes(2));
+      await waitFor(() =>
+        expect(
+          screen.queryByText(/Showing curated matches only/),
+        ).not.toBeInTheDocument(),
+      );
+    },
+  );
+
+  it("does not call an outage with no curated matches no results", async () => {
+    vi.mocked(listStacks).mockResolvedValue([]);
+    vi.mocked(searchCatalog).mockResolvedValue({
+      entries: [],
+      registryStatus: "unavailable",
+    });
+    const user = userEvent.setup();
+    render(<CatalogView registry={registry} onAdded={vi.fn()} />);
+    await user.type(screen.getByRole("textbox"), "unknown");
+    expect(await screen.findByText(/No curated matches/)).toBeInTheDocument();
+    expect(screen.getByText(/Showing curated matches only/)).toBeInTheDocument();
+    expect(screen.queryByText(/No catalog results/)).not.toBeInTheDocument();
+  });
+
+  it.each([true, false])(
+    "uses identity for installed cards and Collections: match=%s",
+    async (match) => {
+      vi.mocked(listStacks).mockResolvedValue([collection]);
+      render(
+        <CatalogView
+          registry={{
+            ...registry,
+            servers: [
+              {
+                id: "installed",
+                enabled: false,
+                name: match ? "Renamed" : entry.name,
+                transport: "stdio",
+                command: "npx",
+                args: match ? entry.args : ["other-package"],
+                env: [],
+                url: null,
+                source: "manual",
+              },
+            ],
+          }}
+          onAdded={vi.fn()}
+        />,
+      );
+      await screen.findByText("Developer");
+      if (match) {
+        expect(screen.getByText("in Toolport")).toBeInTheDocument();
+        expect(screen.getByText("all added")).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: "Add 1" })).not.toBeInTheDocument();
+      } else {
+        expect(screen.queryByText("in Toolport")).not.toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "Add 1" })).toBeEnabled();
+      }
+    },
+  );
 });

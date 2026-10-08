@@ -4,6 +4,7 @@ import type {
   AuditStats,
   AuthInfo,
   CatalogEntry,
+  CatalogSearch,
   DetectedClient,
   FolderProfile,
   ImportItem,
@@ -38,8 +39,8 @@ export function listStacks(): Promise<Stack[]> {
 }
 
 /** Search the catalog (your picks + curated, then the MCP Registry). */
-export function searchCatalog(query: string): Promise<CatalogEntry[]> {
-  return invoke<CatalogEntry[]>("search_catalog", { query });
+export function searchCatalog(query: string): Promise<CatalogSearch> {
+  return invoke<CatalogSearch>("search_catalog", { query });
 }
 
 /** Recent tool-call audit entries (newest first). */

@@ -503,26 +503,171 @@ pub fn search_curated(query: &str) -> Vec<CatalogEntry> {
     filter_catalog(popular(), query)
 }
 
-/// Search the catalog: the user's picks + curated matches first (highest
-/// quality), then live MCP Registry results for the long tail, de-duplicated by
-/// name. This is why popular picks like Vercel always surface even when the
-/// registry's own search doesn't return them.
-pub fn search(query: &str) -> Result<Vec<CatalogEntry>, String> {
-    let mut out = search_curated(query);
-    let mut seen: std::collections::HashSet<String> =
-        out.iter().map(|e| e.name.to_lowercase()).collect();
-    if !query.trim().is_empty() {
-        // Propagate a registry/network failure instead of swallowing it: otherwise an
-        // outage renders as an innocent "no results" in the UI with no retry. An empty
-        // registry response is `Ok(empty)`, so only a real failure surfaces as an error.
-        for e in search_registry(query)? {
-            if seen.insert(e.name.to_lowercase()) {
-                out.push(e);
-            }
+/// Live search is optional; its failure never discards bundled matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RegistryStatus {
+    NotQueried,
+    Available,
+    Unavailable,
+    TimedOut,
+}
+
+impl RegistryStatus {
+    pub fn notice(self) -> Option<&'static str> {
+        match self {
+            Self::Unavailable => Some("The live MCP Registry is unavailable. Showing curated matches only. Try again."),
+            Self::TimedOut => Some("The live MCP Registry took too long to respond. Showing curated matches only. Try again."),
+            _ => None,
         }
     }
-    rank_search_results(&mut out, query);
-    Ok(out)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSearch {
+    pub entries: Vec<CatalogEntry>,
+    pub registry_status: RegistryStatus,
+}
+
+pub fn search(query: &str) -> CatalogSearch {
+    search_with_registry(query, |query| {
+        search_registry(query).map_err(|error| {
+            let error = error.to_ascii_lowercase();
+            if error.contains("timed out") || error.contains("timeout") {
+                RegistryStatus::TimedOut
+            } else {
+                RegistryStatus::Unavailable
+            }
+        })
+    })
+}
+
+fn search_with_registry(
+    query: &str,
+    live: impl FnOnce(&str) -> Result<Vec<CatalogEntry>, RegistryStatus>,
+) -> CatalogSearch {
+    let mut entries = search_curated(query);
+    let mut seen: std::collections::HashSet<String> =
+        entries.iter().filter_map(entry_identity).collect();
+    let registry_status = if query.trim().is_empty() {
+        RegistryStatus::NotQueried
+    } else {
+        match live(query) {
+            Ok(live_entries) => {
+                for entry in live_entries {
+                    // Labels are not identities: keep same-name different servers.
+                    if entry_identity(&entry).is_none_or(|identity| seen.insert(identity)) {
+                        entries.push(entry);
+                    }
+                }
+                RegistryStatus::Available
+            }
+            Err(status) => status,
+        }
+    };
+    rank_search_results(&mut entries, query);
+    CatalogSearch {
+        entries,
+        registry_status,
+    }
+}
+
+pub fn entry_identity(entry: &CatalogEntry) -> Option<String> {
+    server_identity(
+        &entry.transport,
+        entry.command.as_deref(),
+        &entry.args,
+        entry.url.as_deref(),
+    )
+}
+
+/// Ignore labels, credentials and package versions, retaining launch arguments
+/// and endpoint selectors so different packages/instances do not collapse.
+pub fn server_identity(
+    transport: &str,
+    command: Option<&str>,
+    args: &[String],
+    endpoint: Option<&str>,
+) -> Option<String> {
+    if transport != "stdio" {
+        let mut url = url::Url::parse(endpoint?.trim()).ok()?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return None;
+        }
+        url.set_username("").ok()?;
+        url.set_password(None).ok()?;
+        url.set_fragment(None);
+        let query: Vec<_> = url
+            .query_pairs()
+            .filter(|(key, _)| !secret_query_key(key))
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        url.set_query(None);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        let path = url.path().trim_end_matches('/').to_string();
+        url.set_path(if path.is_empty() { "/" } else { &path });
+        return Some(format!("remote:{}", url));
+    }
+    let command = command?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let runner = command
+        .rsplit(['/', '\\'])
+        .next()?
+        .trim_end_matches(".cmd")
+        .trim_end_matches(".exe");
+    let mut args = args.to_vec();
+    let command = if matches!(runner, "npx" | "uvx") {
+        if runner == "npx"
+            && args
+                .first()
+                .is_some_and(|arg| matches!(arg.as_str(), "-y" | "--yes"))
+        {
+            args.remove(0);
+        }
+        let index = usize::from(runner == "uvx" && args.first().is_some_and(|arg| arg == "--from"));
+        if let Some(spec) = args.get_mut(index) {
+            if runner == "npx" {
+                if let Some((name, _)) = spec.rsplit_once('@').filter(|(name, _)| !name.is_empty())
+                {
+                    *spec = name.to_string();
+                }
+            } else {
+                *spec = spec
+                    .split("==")
+                    .next()
+                    .unwrap_or(spec)
+                    .replace('_', "-")
+                    .to_ascii_lowercase();
+            }
+        }
+        runner
+    } else {
+        command
+    };
+    Some(serde_json::to_string(&(command, args)).expect("launch identity"))
+}
+
+fn secret_query_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "key"
+        || key == "sig"
+        || [
+            "token",
+            "secret",
+            "password",
+            "credential",
+            "api_key",
+            "apikey",
+            "authorization",
+            "signature",
+        ]
+        .iter()
+        .any(|part| key.contains(part))
 }
 
 fn rank_search_results(entries: &mut [CatalogEntry], query: &str) {
@@ -829,7 +974,7 @@ pub fn search_registry(query: &str) -> Result<Vec<CatalogEntry>, String> {
     let url = registry_search_url(query);
     use std::io::Read;
     let resp = ureq::get(&url)
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(5))
         .call()
         .map_err(|e| e.to_string())?;
     // Cap the registry response (defense in depth against a huge or MITM'd body).
@@ -859,6 +1004,69 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn launch_and_endpoint_identity_fixtures() {
+        let fixtures: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/catalog-identities.json"))
+                .unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            let identity = |value: &Value| {
+                server_identity(
+                    value["transport"].as_str().unwrap(),
+                    value["command"].as_str(),
+                    &serde_json::from_value::<Vec<String>>(value["args"].clone()).unwrap(),
+                    value["url"].as_str(),
+                )
+            };
+            let a = identity(&fixture["catalog"]);
+            assert_eq!(
+                a.is_some() && a == identity(&fixture["server"]),
+                fixture["equal"].as_bool().unwrap(),
+                "{}",
+                fixture["case"]
+            );
+        }
+    }
+
+    #[test]
+    fn live_failure_and_timeout_keep_curated_matches_and_status() {
+        for status in [RegistryStatus::Unavailable, RegistryStatus::TimedOut] {
+            let result = search_with_registry("github", |_| Err(status));
+            assert!(result.entries.iter().any(|entry| entry.name == "GitHub"));
+            assert!(result.entries.iter().all(|entry| entry.source == "curated"));
+            assert_eq!(result.registry_status, status);
+            assert!(status.notice().unwrap().contains("curated matches only"));
+            let empty = search_with_registry("no-fixture-match-xyz", |_| Err(status));
+            assert!(empty.entries.is_empty());
+            assert_eq!(empty.registry_status, status);
+        }
+        assert_eq!(
+            search_with_registry("", |_| panic!("browse must stay offline")).registry_status,
+            RegistryStatus::NotQueried
+        );
+    }
+
+    #[test]
+    fn search_deduplicates_identity_not_labels() {
+        let github = search_curated("github")
+            .into_iter()
+            .find(|entry| entry.name == "GitHub")
+            .unwrap();
+        let mut renamed = github.clone();
+        renamed.name = "My repositories".into();
+        let mut other = github.clone();
+        other.url = Some("https://different.example/mcp".into());
+        other.source = "registry".into();
+        let result = search_with_registry("github", |_| Ok(vec![renamed, other.clone()]));
+        assert_eq!(result.registry_status, RegistryStatus::Available);
+        assert!(result.entries.contains(&github));
+        assert!(result.entries.contains(&other));
+        assert!(!result
+            .entries
+            .iter()
+            .any(|entry| entry.name == "My repositories"));
+    }
+
+    #[test]
     fn curated_packages_have_reviewed_exact_pins() {
         let pins: Value = serde_json::from_str(include_str!("../catalog-pins.json")).unwrap();
         for entry in curated().into_iter().filter(|e| e.transport == "stdio") {
@@ -878,7 +1086,10 @@ mod tests {
             } else {
                 r"^[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc|\.post|\.dev)[0-9]+)?$"
             };
-            assert!(regex::Regex::new(exact).unwrap().is_match(version), "floating pin: {spec}");
+            assert!(
+                regex::Regex::new(exact).unwrap().is_match(version),
+                "floating pin: {spec}"
+            );
             let pin = &pins[format!("{runner}:{name}")];
             assert_eq!(pin["version"], version);
             assert!(pin["integrity"]
