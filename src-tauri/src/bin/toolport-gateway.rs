@@ -23279,6 +23279,7 @@ mod tests {
                 downstream: MrtrRequest::default(),
                 input_request: json!({ "method": "elicitation/create" }),
                 status: ModernHitlStatus::AwaitingClient,
+                abandoned_audit: None,
                 _cancel_guard: None,
             },
         );
@@ -23326,6 +23327,7 @@ mod tests {
                         downstream: MrtrRequest::default(),
                         input_request: json!({ "method": "elicitation/create" }),
                         status: ModernHitlStatus::AwaitingClient,
+                        abandoned_audit: None,
                         _cancel_guard: None,
                     },
                 );
