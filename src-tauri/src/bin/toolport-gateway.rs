@@ -63,6 +63,8 @@ use conduit_lib::topology::LaunchKey;
 #[global_allocator]
 static CODE_MODE_ALLOCATOR: worker::WorkerAllocator = worker::WorkerAllocator;
 
+mod gateway_memory;
+
 thread_local! {
     static APPROVAL_CANCEL: std::cell::RefCell<Option<downstream::CancelContext>> = const { std::cell::RefCell::new(None) };
 }
@@ -6517,6 +6519,7 @@ fn build_tool_surfaces(
     } else {
         &snapshot.tools
     };
+    let _reclaim = gateway_memory::AfterBuild(catalog.len());
     let owners = unique_prefix_owners(reg);
     let deny_destructive = reg.deny_destructive_effective();
     // Filtering keeps references, not a second parsed copy of every schema.
@@ -10154,6 +10157,7 @@ impl HostState {
         } else {
             notify_tools_changed(stdio, mcp_sessions);
         }
+        gateway_memory::request(tools.len());
     }
 }
 
@@ -14239,6 +14243,13 @@ fn finish_startup_build(
         "background build: initial catalog announced; servers={}",
         serde_json::to_string(&announced_servers).unwrap()
     ));
+    gateway_memory::request(
+        host.cached_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tools
+            .len(),
+    );
 }
 
 /// Fetch the upstream client's roots over stdio, update the shared `${ROOT}` path,
