@@ -33280,20 +33280,8 @@ mod tests {
             );
             // On the old denial path the second connection never happens.
             if decision == approval::ApprovalDecision::Denied && reply.is_empty() {
-                let mut unblock =
-                    TcpStream::connect(approval::read_endpoint_descriptor().unwrap().endpoint)
-                        .unwrap();
-                let mut reader = BufReader::new(unblock.try_clone().unwrap());
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                unblock
-                    .write_all(
-                        approval::answer_challenge(line.as_bytes(), "p08-token")
-                            .unwrap()
-                            .as_bytes(),
-                    )
-                    .unwrap();
-                unblock.write_all(b"\n{}\n").unwrap();
+                let mut unblock = approval::dial_broker(&approval::read_endpoint_descriptor().unwrap()).unwrap();
+                unblock.write_all(b"{}\n").unwrap();
             }
             worker.join().unwrap();
             assert_eq!(
