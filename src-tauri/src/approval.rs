@@ -1069,12 +1069,26 @@ mod client_label_tests {
 
     #[test]
     fn p08b_labels_are_bounded_and_strip_controls_and_bidi() {
-        assert_eq!(client_info_label(Some(&json!({"clientInfo":{"name":"  Claude\n\r\t\u{202e} Code\u{2066}","version":"1\0"}}))), Some("Claude Code 1".into()));
+        assert_eq!(
+            client_info_label(Some(
+                &json!({"clientInfo":{"name":"  Claude\n\r\t\u{202e} Code\u{2066}","version":"1\0"}})
+            )),
+            Some("Claude Code 1".into())
+        );
         let long = "界".repeat(1000);
-        let label = client_info_label(Some(&json!({"clientInfo":{"name":long,"version":"evil"}}))).unwrap();
+        let label =
+            client_info_label(Some(&json!({"clientInfo":{"name":long,"version":"evil"}}))).unwrap();
         assert_eq!(label.chars().count(), 120);
-        assert_eq!(client_info_label(Some(&json!({"clientInfo":{"name":"\u{202e}\0","version":"1"}}))), None);
-        assert_eq!(client_info_label(Some(&json!({"clientInfo":{"name":false}}))), None);
+        assert_eq!(
+            client_info_label(Some(
+                &json!({"clientInfo":{"name":"\u{202e}\0","version":"1"}})
+            )),
+            None
+        );
+        assert_eq!(
+            client_info_label(Some(&json!({"clientInfo":{"name":false}}))),
+            None
+        );
     }
 
     #[test]

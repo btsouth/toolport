@@ -9926,7 +9926,6 @@ mod tests {
     fn restart_advice_names_each_app_once() {
         let client = |name: &str, pid: u32| crate::gateway_publish::ClientNeedingRestart {
             client: name.to_string(),
-            client_label: None,
             client_pid: pid,
             gateway: "toolport-gateway-1.16.0".to_string(),
         };

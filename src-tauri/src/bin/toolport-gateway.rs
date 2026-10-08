@@ -26242,18 +26242,34 @@ mod tests {
     fn p08b_spoofed_initialize_label_cannot_select_identity_or_permissions() {
         let env = DataDirTestEnv::new("p08b-spoof");
         let state = http_state(true);
-        state.registry.lock().unwrap().human_approval = Some(true);
+        state.registry.lock().unwrap().human_approval = true;
         let (router, calls, _) = counting_router(true);
         swap_router(&state, router);
         let mut reg = Registry::default();
-        reg.http_clients.push(registry::HttpClient { id: "real".into(), label: "Real".into(), token_sha256: registry::sha256_hex("token"), profile: String::new(), unknown_fields: Default::default() });
+        reg.http_clients.push(registry::HttpClient {
+            id: "real".into(),
+            label: "Real".into(),
+            token_sha256: registry::sha256_hex("token"),
+            profile: String::new(),
+            unknown_fields: Default::default(),
+        });
         let (_, caller) = resolve_http_caller(&reg, None, Some("token"), false, true).unwrap();
         let guard = SearchGuard::default();
         let init = handle_http(&state, &guard, "POST", "/mcp", &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"client:admin","version":"99"}}}).to_string(), None, None, None, Some(&caller));
         let sid = mcp_session_of(&init);
         let observed = stub_broker(&env.dir, approval::ApprovalDecision::Denied);
         let request = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"s__work","arguments":{}}}).to_string();
-        let reply = handle_http(&state, &guard, "POST", "/mcp", &request, Some(&sid), None, None, Some(&caller));
+        let reply = handle_http(
+            &state,
+            &guard,
+            "POST",
+            "/mcp",
+            &request,
+            Some(&sid),
+            None,
+            None,
+            Some(&caller),
+        );
         assert_eq!(reply.status, 200);
         assert!(reply.body.contains("denied"), "{}", reply.body);
         let approval = observed.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -26262,7 +26278,17 @@ mod tests {
         assert_eq!(approval.server, "s");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let denied_scope = std::collections::HashSet::new();
-        let reply = handle_http(&state, &guard, "POST", "/mcp", &request, Some(&sid), None, Some(&denied_scope), Some(&caller));
+        let reply = handle_http(
+            &state,
+            &guard,
+            "POST",
+            "/mcp",
+            &request,
+            Some(&sid),
+            None,
+            Some(&denied_scope),
+            Some(&caller),
+        );
         assert!(reply.body.contains("not available"), "{}", reply.body);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
@@ -31783,6 +31809,7 @@ mod tests {
         // Two sessionless modern requests on the daemon that agree on everything
         // the server-request handler reads: era, capabilities, root and profile.
         let modern = |identity: &str, nonce: u64| ActiveRequestContext {
+            client_label: None,
             upstream_version: Some(MODERN_PROTOCOL_VERSION.to_string()),
             upstream_capabilities: Some(Arc::new(json!({ "elicitation": {}, "roots": {} }))),
             mcp_session: None,
