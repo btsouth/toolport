@@ -675,15 +675,29 @@ mod tests {
             ("ENDPOINT", "https://host/mcp?v=1"),
             ("VALUE", "0123456789abcdef0123456789abcdef"),
             ("API_KEY", "small"),
+            ("APIKEY", "x"), ("apiKey", "x"), ("accessToken", "x"),
+            ("GPG_PASSPHRASE", "x"), ("DB_PASSWD", "x"), ("API_KEYS", "x"), ("CLIENTSECRET", "x"),
             ("PAT", "small"),
         ] {
             assert!(secret_env(key, Some(value)), "{key} was left plain");
         }
-        for key in ["PATH", "MONKEY", "KEYBOARD", "COMPASS"] {
+        for key in ["PATH", "MONKEY", "KEYBOARD", "COMPASS", "COMPATIBILITY", "PATTERN", "PORT"] {
             assert!(
                 !secret_env(key, Some("/usr/bin")),
                 "{key} was falsely vaulted"
             );
+        }
+    }
+
+    #[test]
+    fn reviewed_bearer_env_names_always_remain_secret() {
+        for key in ["LINEAR_APIKEY", "MCP_CRED"] {
+            let mut raw = entry(true);
+            raw.env.clear();
+            raw.url = Some("https://example.invalid/mcp".into());
+            let import = Import::prepare_with_choices(raw, Some(&json!({"bearerTokenEnvVar":key})), Some(&std::collections::BTreeMap::from([(key.into(), false)]))).unwrap();
+            assert!(import.entry.env.iter().find(|env| env.key == key).unwrap().secret);
+            assert!(import.review_credentials().iter().any(|env| env.0 == key && env.1));
         }
     }
 

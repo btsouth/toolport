@@ -3110,6 +3110,39 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_conflict_restores_other_existing_server_secret() {
+        let mut previous = Registry::default();
+        let mut a = server("a");
+        a.command = Some("a".into());
+        a.env.push(crate::registry::EnvVar { key:"PAT".into(), value:None, secret:true, unknown_fields:Default::default() });
+        previous.add_server(a);
+        let fixture = MoveFixture::new(&previous);
+        crate::secrets::set_secret("a", "PAT", "old").unwrap();
+        std::fs::write(fixture.claude(), r#"{"mcpServers":{"a":{"command":"a","env":{"PAT":"new"}},"b":{"command":"b","env":{"PAT":"new-b"}}}}"#).unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        let error = migrate_client_reviewed_with("claude-code", None, false, &["a".into(), "b".into()], &review.revision, |_,_,_,_| {
+            registry::update(|r| { r.servers.iter_mut().find(|s| s.id == "b").unwrap().name = "Concurrent B".into(); Ok(()) }).unwrap();
+            Err("Launch failed".into())
+        }).unwrap_err();
+        assert!(error.contains("Concurrent edits"));
+        assert_eq!(read_registry_exact().unwrap().servers.iter().find(|s| s.id == "a").unwrap(), &previous.servers[0]);
+        assert_eq!(crate::secrets::get_vault_secret_result("a", "PAT").unwrap().as_deref(), Some("old"));
+        assert_eq!(crate::secrets::get_vault_secret_result("b", "PAT").unwrap().as_deref(), Some("new-b"));
+    }
+
+    #[test]
+    fn reviewed_existing_vault_value_is_present_and_required() {
+        let mut previous = Registry::default();
+        previous.add_server(server("one"));
+        let fixture = MoveFixture::new(&previous);
+        crate::secrets::set_secret("one", "PAT", "old").unwrap();
+        std::fs::write(fixture.claude(), r#"{"mcpServers":{"one":{"command":"one","env":{"PAT":"${PAT}"}}}}"#).unwrap();
+        let review = serde_json::to_value(preview_client_setup("claude-code").unwrap()).unwrap();
+        assert_eq!(review["items"][0]["credentials"][0]["present"], true);
+        assert_eq!(review["items"][0]["credentials"][0]["required"], true);
+    }
+
+    #[test]
     fn reviewed_conflicting_registry_edit_keeps_staged_vault_values() {
         let fixture = MoveFixture::new(&Registry::default());
         std::fs::write(
