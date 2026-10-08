@@ -339,6 +339,44 @@ pub fn record_decision(
     write_line(&entry);
 }
 
+/// An unanswered suspended approval can disappear without another tools/call.
+/// Capture its destination and metadata now, without retaining raw arguments.
+pub struct PendingApprovalAudit {
+    path: Option<PathBuf>,
+    entry: Value,
+}
+
+impl PendingApprovalAudit {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        server: &str,
+        tool: &str,
+        client: Option<&str>,
+        client_label: Option<&str>,
+        reason: &str,
+        args_hash: &str,
+    ) -> Self {
+        let mut entry = decision_entry(server, tool, client, reason, "withdrawn", args_hash, None);
+        entry["serverId"] = json!(server);
+        if let Some(label) = client_label.and_then(crate::approval::sanitize_client_label) {
+            entry["clientLabel"] = json!(label);
+        }
+        Self {
+            path: audit_path(),
+            entry,
+        }
+    }
+
+    pub fn finish(mut self, decision: &str, held_ms: u64) {
+        self.entry["ts"] = json!(epoch_millis() as u64);
+        self.entry["decision"] = json!(decision);
+        self.entry["heldMs"] = json!(held_ms);
+        if let Some(path) = self.path {
+            write_line_at(&path, &self.entry);
+        }
+    }
+}
+
 /// A stable SHA-256 (hex) of a call's arguments over a canonical JSON serialization
 /// (object keys sorted recursively), so the same logical call always hashes the same
 /// regardless of key order. This is the content-binding foundation: it proves "the exact
@@ -479,6 +517,21 @@ fn write_line_at_with_rotation_hook(
 /// "no tool calls" / Protection active (SBS-873). Unparseable lines are skipped
 /// — a mid-write or corrupt line is not an IO failure.
 pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
+    read_recent_matching(limit, |row| row["kind"] != "telemetry_gap")
+}
+
+/// Visible Activity rows, filtering before the limit so other governance logs
+/// cannot hide an older call or approval outcome.
+pub fn read_activity(limit: usize) -> std::io::Result<Vec<Value>> {
+    read_recent_matching(limit, |row| {
+        tool_call_ok(row).is_some() || row["kind"] == "approval"
+    })
+}
+
+fn read_recent_matching(
+    limit: usize,
+    visible: impl Fn(&Value) -> bool,
+) -> std::io::Result<Vec<Value>> {
     // This process may have accepted audit lines that are still queued for the
     // background writer; land them before reading so a caller never misses its own
     // writes.
@@ -499,7 +552,7 @@ pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
         .lines()
         .rev()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|row| row["kind"] != "telemetry_gap")
+        .filter(visible)
         .take(limit)
         .map(activity_client_name)
         .collect())
@@ -1114,6 +1167,50 @@ mod tests {
             .unwrap()
             .iter()
             .all(|row| row["server"] != "toolport"));
+    }
+
+    #[test]
+    fn p10c_all_approval_outcomes_leave_call_stats_unchanged() {
+        let calls = vec![
+            json!({"server":"s","tool":"work","ok":true,"durationMs":10}),
+            json!({"server":"s","tool":"work","ok":false,"durationMs":30}),
+        ];
+        let expected = aggregate(&calls);
+        let mut entries = calls;
+        for decision in [
+            "approved",
+            "denied",
+            "no_response",
+            "withdrawn",
+            "stale_state",
+            "unreachable",
+        ] {
+            entries.push(decision_entry(
+                "s",
+                "work",
+                Some("client:real"),
+                "destructive",
+                decision,
+                "hash",
+                Some(90000),
+            ));
+        }
+        assert_eq!(aggregate(&entries), expected);
+        assert_eq!(expected["total"], 2);
+        assert_eq!(expected["errors"], 1);
+        assert_eq!(expected["servers"][0]["avgMs"], 20);
+    }
+
+    #[test]
+    fn p10c_activity_filters_other_governance_before_the_window_limit() {
+        let _env = crate::registry::DataDirTestEnv::new("p10c-activity-window");
+        write_line(&json!({"kind":"approval", "decision":"denied", "ok":true}));
+        write_line(&json!({"ok":false, "tool":"work"}));
+        write_line(&json!({"kind":"advisor", "ok":true}));
+        let entries = read_activity(2).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["tool"], "work");
+        assert_eq!(entries[1]["decision"], "denied");
     }
 
     #[test]

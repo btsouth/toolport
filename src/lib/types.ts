@@ -66,6 +66,10 @@ export interface MigrateResult {
 }
 
 export interface AuditEntry {
+  /** Approval outcomes are Activity events, never dispatched calls. */
+  kind?: string;
+  decision?: string;
+  reason?: string;
   ts: number;
   server: string;
   /** Canonical routed ID, separate from the Activity display prefix. */

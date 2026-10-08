@@ -101,7 +101,8 @@ it("p10c shows approval outcomes without treating them as call errors", async ()
   for (const [, label] of outcomes) expect(screen.getByText(label)).toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: /errors only/i }));
   expect(screen.getByText("merge_pr")).toBeInTheDocument();
-  for (const [, label] of outcomes) expect(screen.queryByText(label)).not.toBeInTheDocument();
+  for (const [, label] of outcomes)
+    expect(screen.queryByText(label)).not.toBeInTheDocument();
 });
 
 it("pauses Activity polling while hidden and resumes when visible", async () => {

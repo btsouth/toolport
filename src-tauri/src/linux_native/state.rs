@@ -15,6 +15,7 @@ pub(super) struct ActivityView {
     pub(super) client: Option<String>,
     pub(super) client_id: Option<String>,
     pub(super) client_label: Option<String>,
+    pub(super) approval_decision: Option<String>,
     pub(super) ok: bool,
     pub(super) held: bool,
     pub(super) duration_ms: Option<u64>,
@@ -75,17 +76,23 @@ impl ActivitySnapshot {
         let mut calls = Vec::new();
 
         for entry in entries {
-            let Some(ok) = crate::audit::tool_call_ok(&entry) else {
+            let call_ok = crate::audit::tool_call_ok(&entry);
+            let is_approval = entry["kind"] == "approval";
+            if call_ok.is_none() && !is_approval {
                 continue;
-            };
-            call_count += 1;
-            if !ok {
-                error_count += 1;
             }
-            let duration_ms = entry.get("durationMs").and_then(serde_json::Value::as_u64);
-            if let Some(duration) = duration_ms {
-                duration_total = duration_total.saturating_add(duration);
-                duration_count += 1;
+            let duration_ms = entry
+                .get(if is_approval { "heldMs" } else { "durationMs" })
+                .and_then(serde_json::Value::as_u64);
+            if let Some(ok) = call_ok {
+                call_count += 1;
+                if !ok {
+                    error_count += 1;
+                }
+                if let Some(duration) = duration_ms {
+                    duration_total = duration_total.saturating_add(duration);
+                    duration_count += 1;
+                }
             }
             if calls.len() < recent_limit {
                 calls.push(ActivityView {
@@ -111,7 +118,9 @@ impl ActivitySnapshot {
                         .get("clientLabel")
                         .and_then(serde_json::Value::as_str)
                         .and_then(crate::approval::sanitize_client_label),
-                    ok,
+                    approval_decision: is_approval
+                        .then(|| entry["decision"].as_str().unwrap_or("unknown").to_string()),
+                    ok: call_ok.unwrap_or(true),
                     held: entry
                         .get("held")
                         .and_then(serde_json::Value::as_bool)
@@ -1008,16 +1017,28 @@ mod tests {
 
     #[test]
     fn p10c_approval_events_are_visible_without_inflating_calls_or_savings() {
-        let mut entries = ["denied", "no_response", "withdrawn", "stale_state", "approved"]
-            .into_iter()
-            .map(|decision| serde_json::json!({
+        let mut entries = [
+            "denied",
+            "no_response",
+            "withdrawn",
+            "stale_state",
+            "approved",
+        ]
+        .into_iter()
+        .map(|decision| {
+            serde_json::json!({
                 "kind":"approval", "decision":decision, "server":"github",
                 "tool":"delete_issue", "ok":false, "heldMs":90000,
                 "client":"client:real", "clientLabel":"Claude Code 2.1"
-            }))
-            .collect::<Vec<_>>();
-        entries.push(serde_json::json!({"server":"github", "tool":"list", "ok":true, "durationMs":10}));
-        entries.push(serde_json::json!({"server":"github", "tool":"list", "ok":false, "durationMs":30}));
+            })
+        })
+        .collect::<Vec<_>>();
+        entries.push(
+            serde_json::json!({"server":"github", "tool":"list", "ok":true, "durationMs":10}),
+        );
+        entries.push(
+            serde_json::json!({"server":"github", "tool":"list", "ok":false, "durationMs":30}),
+        );
         let snapshot = ActivitySnapshot::from_entries(entries, 100);
         assert_eq!(snapshot.recent.len(), 7);
         assert_eq!(snapshot.call_count, 2);

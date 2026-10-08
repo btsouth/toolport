@@ -751,7 +751,8 @@ function PiiBadge({ entry }: { entry: AuditEntry }) {
 
 function CallRow({ e }: { e: AuditEntry }) {
   const [open, setOpen] = useState(false);
-  const hasDetail = !e.ok && !!e.error;
+  const approvalOutcome = e.kind === "approval" ? approvalStatus(e.decision) : null;
+  const hasDetail = !approvalOutcome && !e.ok && !!e.error;
   return (
     <div className="rounded-md border border-border/50 text-sm">
       <div
@@ -783,7 +784,7 @@ function CallRow({ e }: { e: AuditEntry }) {
         ) : (
           <span className="inline-block size-3.5 shrink-0" />
         )}
-        {e.held ? (
+        {approvalOutcome || e.held ? (
           <ShieldAlert className="size-4 shrink-0 text-warning" />
         ) : e.ok ? (
           <CheckCircle2 className="size-4 shrink-0 text-success" />
@@ -807,9 +808,14 @@ function CallRow({ e }: { e: AuditEntry }) {
             {e.clientLabel}
           </span>
         )}
+        {approvalOutcome && (
+          <span className="shrink-0 rounded bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+            {approvalOutcome}
+          </span>
+        )}
         <PiiBadge entry={e} />
         <span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">
-          {fmtMs(e.durationMs ?? e.heldMs ?? null)}
+          {fmtMs(approvalOutcome ? (e.heldMs ?? null) : (e.durationMs ?? null))}
         </span>
         <span className="shrink-0 text-xs text-muted-foreground">{fmtTs(e.ts)}</span>
       </div>
@@ -822,6 +828,25 @@ function CallRow({ e }: { e: AuditEntry }) {
       )}
     </div>
   );
+}
+
+function approvalStatus(decision?: string): string {
+  switch (decision) {
+    case "approved":
+      return "Approved";
+    case "denied":
+      return "Denied";
+    case "no_response":
+      return "Timed out";
+    case "withdrawn":
+      return "Withdrawn";
+    case "stale_state":
+      return "Stale approval";
+    case "unreachable":
+      return "Approval unavailable";
+    default:
+      return "Approval event";
+  }
 }
 
 export function TelemetryNotice({ stats }: { stats: AuditStats | null }) {
@@ -1861,7 +1886,9 @@ export function ActivityView({
   );
 
   const visible = (entries ?? []).filter(
-    (e) => (!serverFilter || e.server === serverFilter) && (!errorsOnly || !e.ok),
+    (e) =>
+      (!serverFilter || e.server === serverFilter) &&
+      (!errorsOnly || (e.kind !== "approval" && !e.ok)),
   );
 
   if (entries === null && auditLoadStatus === "loading") {
@@ -1966,9 +1993,9 @@ export function ActivityView({
           <ChevronRight
             className={`size-4 transition-transform ${logOpen ? "rotate-90" : ""}`}
           />
-          Recent calls
+          Recent calls and approvals
           <span className="text-xs font-normal text-muted-foreground/70">
-            last {entries.length} {entries.length === 1 ? "call" : "calls"}
+            last {entries.length} {entries.length === 1 ? "event" : "events"}
           </span>
         </button>
         <button
