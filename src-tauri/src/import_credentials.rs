@@ -38,7 +38,7 @@ const SECRET_NAMES: &[&str] = &[
     "PAT",
 ];
 
-pub(crate) fn secret_path_name(value: &str) -> bool {
+pub(crate) fn secret_url_name(value: &str) -> bool {
     value
         .to_ascii_uppercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -161,7 +161,7 @@ pub(crate) fn secret_url_path(url: &url::Url) -> bool {
         let secret = after_secret_name
             || registry::arg_looks_secret(&decoded)
             || secret_env("", Some(&decoded));
-        after_secret_name = secret_path_name(&decoded);
+        after_secret_name = secret_url_name(&decoded);
         secret
     })
 }

@@ -1392,7 +1392,7 @@ impl Redaction {
                 }
                 for pair in parsed.query().unwrap_or("").split('&') {
                     if let Some((key, value)) = pair.split_once('=') {
-                        if crate::import_credentials::secret_env(key, None)
+                        if crate::import_credentials::secret_url_name(key)
                             || decoded(value).len() >= 4
                         {
                             add(value);
@@ -1408,7 +1408,7 @@ impl Redaction {
                     {
                         add(segment);
                     }
-                    after_secret_name = crate::import_credentials::secret_path_name(&value);
+                    after_secret_name = crate::import_credentials::secret_url_name(&value);
                 }
             }
         }
