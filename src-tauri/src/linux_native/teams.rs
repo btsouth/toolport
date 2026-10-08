@@ -1628,21 +1628,51 @@ mod tests {
     #[test]
     fn member_review_native_keeps_remaining_decisions_open() {
         adw::init().unwrap();
+        let _lock = crate::registry::data_dir_test_lock();
+        let scratch = std::env::temp_dir().join(format!("toolport-native-queue-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&scratch);
         let mut reg = crate::registry::Registry::default();
         reg.team = Some(serde_json::from_value(serde_json::json!({"teamId":"native-review", "serverUrl":"https://teams.toolport.app", "role":"member"})).unwrap());
         crate::teams::stage_team_config(&mut reg, "native-review", &serde_json::json!({"servers":[], "instructions":{"content":"Pending text"}, "callAuditExport":true}), 1, &[]).unwrap();
-        let mut review = crate::teams::member_review(&reg).unwrap();
+        crate::registry::save(&reg).unwrap();
+        let review = crate::teams::member_review(&reg).unwrap();
         let parent = adw::ApplicationWindow::builder().build();
+        let app = adw::Application::builder().application_id("app.toolport.ReviewFixture").build();
+        let page = super::TeamsPage::new(&app);
         let dialog = super::member_review_dialog(&parent, &review);
-        review.pending.remove("instructions");
-        assert!(super::refresh_member_review_dialog(&dialog, &review));
+        let content = dialog.extra_child().unwrap();
+        super::connect_member_decisions(&content, &review, &page, &dialog);
+        parent.present();
+        dialog.present();
+        let mut widgets = vec![content];
+        let button = loop {
+            let widget = widgets.pop().expect("reject instructions button");
+            if widget.widget_name() == "reject:instructions" {
+                break widget.downcast::<gtk::Button>().unwrap();
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                child = current.next_sibling();
+                widgets.push(current);
+            }
+        };
+        button.emit_clicked();
+        let timed_out = Rc::new(Cell::new(false));
+        let timeout_state = timed_out.clone();
+        let timeout = gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || timeout_state.set(true));
+        let context = gtk::glib::MainContext::default();
+        while page.busy.get() && !timed_out.get() { context.iteration(true); }
+        if !timed_out.get() { timeout.remove(); }
+        assert!(!timed_out.get(), "native member decision did not finish");
+        assert!(dialog.is_visible(), "remaining decisions must stay open");
         let mut text = String::new();
         collect(&dialog.clone().upcast(), &mut text);
         assert!(text.contains("Call-log export"));
         assert!(!text.contains("Pending text"));
-        review.pending.clear();
-        assert!(!super::refresh_member_review_dialog(&dialog, &review));
+        dialog.close();
         parent.close();
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     fn selection(
