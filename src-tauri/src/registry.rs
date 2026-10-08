@@ -2265,6 +2265,17 @@ impl Registry {
     /// as they were so Enable all cannot bypass the Teams confirm, and so a
     /// server the member already consented to is not wiped.
     pub fn set_all_enabled(&mut self, profile_id: &str, enabled: bool) -> Result<(), String> {
+        if !enabled {
+            let held: Vec<_> = self
+                .servers
+                .iter()
+                .filter(|s| crate::teams::server_change_held(self, &s.id))
+                .map(|s| s.id.clone())
+                .collect();
+            for id in held {
+                crate::teams::remember_held_disable(self, profile_id, &id)?;
+            }
+        }
         let ids: Vec<String> = if enabled {
             self.servers
                 .iter()

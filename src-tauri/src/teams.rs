@@ -3691,6 +3691,34 @@ pub fn review_team_change(key: &str, hash: &str, accept: bool) -> Result<Registr
     crate::registry::load()
 }
 
+/// Keep a member's explicit off decision while a replacement is awaiting review.
+pub(crate) fn remember_held_disable(
+    reg: &mut Registry,
+    profile_id: &str,
+    server_id: &str,
+) -> Result<(), String> {
+    if !server_change_held(reg, server_id) {
+        return Ok(());
+    }
+    let original = reg
+        .servers
+        .iter()
+        .find(|s| s.id == server_id)
+        .and_then(saved_team_original_id)
+        .map(str::to_string);
+    let mut review = member_review(reg)?;
+    if let Some(access) = original.and_then(|id| review.held_access.get_mut(&id)) {
+        if reg.version >= 3 {
+            access.enabled = false;
+        } else {
+            access.profiles.retain(|id| id != profile_id);
+            access.enabled = !access.profiles.is_empty();
+        }
+    }
+    save_member_review(reg, &review);
+    Ok(())
+}
+
 /// Member access before a held change, used to restore a personal route on leave.
 pub(crate) fn held_server_access(reg: &Registry, server_id: &str) -> Option<(bool, Vec<String>)> {
     let original = saved_team_original_id(reg.servers.iter().find(|s| s.id == server_id)?)?;
@@ -8401,6 +8429,30 @@ mod member_review_tests {
                     enabled || version < 3 && !profiles.is_empty()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn member_review_accept_keeps_an_explicit_off_during_the_hold() {
+        for bulk in [false, true] {
+            let mut reg = registry();
+            reg.version = 3;
+            let mut cfg = config("first");
+            stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+            decide(&mut reg, "server:remote", true);
+            let id = remote_id(&reg);
+            cfg["servers"][1]["url"] = json!("https://1.2.3.5/mcp");
+            stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+            if bulk {
+                reg.set_all_enabled("default", false).unwrap();
+            } else {
+                crate::registry_controller::apply_server_enabled(
+                    &mut reg, "default", &id, false, false,
+                )
+                .unwrap();
+            }
+            decide(&mut reg, "server:remote", true);
+            assert!(!reg.server_enabled(&id));
         }
     }
 

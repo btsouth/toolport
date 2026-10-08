@@ -1697,23 +1697,10 @@ mod tests {
 
     #[test]
     fn the_confirm_action_matches_what_the_share_will_do() {
-        let switch = selection(
-            "Linear",
-            "Already shared",
-            HandoffOutcome::Switched,
-            "switches",
-        );
+        let switch = selection("Linear", "Already shared", HandoffOutcome::Switched, "switches");
         let kept = selection("Linear", "Already shared", HandoffOutcome::Kept, "keeps");
-        let blocked = selection(
-            "Vercel",
-            "Already shared",
-            HandoffOutcome::Attention,
-            "needs setup",
-        );
-        assert_eq!(
-            share_action(&selection_preview(vec![switch.clone(), blocked.clone()])),
-            Some("Use Team copies")
-        );
+        let blocked = selection("Vercel", "Already shared", HandoffOutcome::Attention, "needs setup");
+        assert_eq!(share_action(&selection_preview(vec![switch.clone(), blocked.clone()])), Some("Use Team copies"));
         assert_eq!(share_action(&selection_preview(vec![kept, blocked])), None);
         let mut update = selection_preview(vec![switch]);
         update.changed = vec!["Linear".into()];
@@ -1763,11 +1750,7 @@ mod tests {
         }
         dialog.close();
 
-        let picker = share_choice_label(
-            "Linear",
-            None,
-            Some("Shared. The Team copy is in use in this profile."),
-        );
+        let picker = share_choice_label("Linear", None, Some("Shared. The Team copy is in use in this profile."));
         let mut text = String::new();
         collect(picker.upcast_ref(), &mut text);
         assert_eq!(text, "Linear\nShared. The Team copy is in use in this profile.\n");
