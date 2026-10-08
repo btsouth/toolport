@@ -589,7 +589,7 @@ pub fn apply_remove_server(registry: &mut Registry, server_id: &str) -> Result<(
     registry.remove_server(server_id)
 }
 
-pub fn add_reviewed_entry(entry: ServerEntry) -> Result<Registry, String> {
+pub fn add_reviewed_entry(entry: ServerEntry) -> Result<(Registry, String), String> {
     let env = entry
         .env
         .iter()
@@ -605,7 +605,7 @@ pub fn add_reviewed_entry(entry: ServerEntry) -> Result<Registry, String> {
         .collect::<serde_json::Map<_, _>>();
     let definition = serde_json::json!({"env":env});
     let import = crate::import_credentials::Import::prepare(entry, Some(&definition))?;
-    let (registry, ()) = registry::update(|registry| {
+    let (registry, id) = registry::update(|registry| {
         let mut entry = import.entry.clone();
         entry.enabled = false;
         let id = registry.add_server(entry);
@@ -617,9 +617,9 @@ pub fn add_reviewed_entry(entry: ServerEntry) -> Result<Registry, String> {
             }
         }
         registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
-        Ok(())
+        Ok(id)
     })?;
-    Ok(registry)
+    Ok((registry, id))
 }
 
 pub fn add_server(fields: ServerFields) -> Result<Registry, String> {

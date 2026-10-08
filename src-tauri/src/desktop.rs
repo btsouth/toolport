@@ -237,9 +237,9 @@ fn parse_server_snippet(text: String) -> Result<Vec<clients::ParsedSnippetServer
 #[tauri::command]
 fn add_server(state: State<RegistryState>, mut entry: ServerEntry) -> Result<Registry, String> {
     entry.enabled = false;
-    crate::registry_controller::add_reviewed_entry(entry)?;
+    let (_, id) = crate::registry_controller::add_reviewed_entry(entry)?;
     let reg = reload_into_state(state.inner())?;
-    if let Some(saved) = reg.servers.last() {
+    if let Some(saved) = reg.servers.iter().find(|s| s.id == id) {
         prewarm_launcher(saved);
     }
     Ok(reg)

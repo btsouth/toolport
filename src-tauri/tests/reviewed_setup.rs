@@ -372,7 +372,8 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
         .contains("verified"));
     let error = connection
         .call("echo", json!({"text":"reject"}))
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
     assert!(!error.contains("synthetic-url-key"));
     assert!(!error.contains("synthetic-setup-pat"));
 }
