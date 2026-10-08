@@ -279,16 +279,14 @@ try {
   await page.screenshot({ path: path.join(output, "setup-manual-add.png") });
   await page.getByRole("button", { name: "Add server", exact: true }).click();
   await page.getByRole("button", { name: "Paste from client config" }).click();
-  await page
-    .locator("textarea")
-    .fill(
-      JSON.stringify({
-        mcpServers: {
-          Alpha: { command: "fixture-alpha" },
-          Beta: { command: "fixture-beta", env: { PAT: "synthetic-secret" } },
-        },
-      }),
-    );
+  await page.locator("textarea").fill(
+    JSON.stringify({
+      mcpServers: {
+        Alpha: { command: "fixture-alpha" },
+        Beta: { command: "fixture-beta", env: { PAT: "synthetic-secret" } },
+      },
+    }),
+  );
   await page.getByRole("button", { name: "Parse & fill" }).click();
   await expect(
     page.getByRole("heading", { name: "Review pasted servers" }),

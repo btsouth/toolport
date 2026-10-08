@@ -14,24 +14,22 @@ vi.mock("@/lib/api", () => ({
   installGateway: (...a: unknown[]) => installGateway(...a),
   uninstallGateway: (...a: unknown[]) => uninstallGateway(...a),
   migrateClient: (...a: unknown[]) => migrateClient(...a),
-  previewClientSetup: vi
-    .fn()
-    .mockResolvedValue({
-      configPath: "/fixture/client.json",
-      backupDir: "/fixture/backups",
-      revision: "fixture-revision",
-      items: [
-        {
-          key: "calendar",
-          name: "calendar",
-          transport: "stdio",
-          command: "calendar-mcp",
-          args: [],
-          url: null,
-          isNew: true,
-        },
-      ],
-    }),
+  previewClientSetup: vi.fn().mockResolvedValue({
+    configPath: "/fixture/client.json",
+    backupDir: "/fixture/backups",
+    revision: "fixture-revision",
+    items: [
+      {
+        key: "calendar",
+        name: "calendar",
+        transport: "stdio",
+        command: "calendar-mcp",
+        args: [],
+        url: null,
+        isNew: true,
+      },
+    ],
+  }),
   setClientDiscovery: vi.fn(),
   addServer: vi.fn(),
 }));
