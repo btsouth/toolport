@@ -210,8 +210,14 @@ pub(super) fn review(
         row.add_suffix(&spinner);
         let state = if !item.credentials.is_empty() {
             let found = item.credentials.iter().all(|env| env.present);
+            let required_found = item
+                .credentials
+                .iter()
+                .all(|env| !env.required || env.present);
             let secret = item.credentials.iter().any(|env| env.secret);
-            let state = gtk::Label::new(Some(if !found {
+            let state = gtk::Label::new(Some(if !found && required_found {
+                "Optional"
+            } else if !found {
                 "Missing"
             } else if secret {
                 "Found, goes to keychain"
@@ -247,7 +253,17 @@ pub(super) fn review(
                                 .and_then(|values| values.get(&env.key))
                                 .is_some_and(|value| !value.is_empty())
                     });
-                    state.set_label(if !found {
+                    let required_found = fields.iter().all(|env| {
+                        !env.required
+                            || env.present
+                            || inputs
+                                .get(&name)
+                                .and_then(|values| values.get(&env.key))
+                                .is_some_and(|value| !value.is_empty())
+                    });
+                    state.set_label(if !found && required_found {
+                        "Optional"
+                    } else if !found {
                         "Missing"
                     } else if choices
                         .borrow()

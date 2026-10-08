@@ -171,14 +171,23 @@ function ImportReviewContent({
                   {!!item.credentials?.length && (
                     <p className="px-3 pb-2 text-xs text-muted-foreground">
                       {item.credentials.some(
-                        (env) => !env.present && !credentialInputs[item.name]?.[env.key],
+                        (env) =>
+                          env.required &&
+                          !env.present &&
+                          !credentialInputs[item.name]?.[env.key],
                       )
                         ? "Needs input"
                         : item.credentials.some(
-                              (env) => secretChoices[item.name]?.[env.key] ?? env.secret,
+                              (env) =>
+                                !env.present && !credentialInputs[item.name]?.[env.key],
                             )
-                          ? "Found, goes to keychain"
-                          : "Found"}
+                          ? "Optional"
+                          : item.credentials.some(
+                                (env) =>
+                                  secretChoices[item.name]?.[env.key] ?? env.secret,
+                              )
+                            ? "Found, goes to keychain"
+                            : "Found"}
                     </p>
                   )}
                   {busy && isSelected && (

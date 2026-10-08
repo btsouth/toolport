@@ -269,7 +269,7 @@ try {
         await expect(
           page.getByRole("button", { name: "Connect to Toolport", exact: true }),
         ).toBeEnabled();
-        await expect(page.getByText("Optional", { exact: true })).toBeVisible();
+        await expect(page.getByText("Optional", { exact: true }).first()).toBeVisible();
       }
       await page.screenshot({
         animations: "disabled",
