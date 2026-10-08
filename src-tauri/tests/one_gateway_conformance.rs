@@ -1115,6 +1115,21 @@ fn transcript_initialize_count(path: &Path) -> usize {
     transcript_method_count(path, "initialize")
 }
 
+fn demand_root_replacement(
+    client: &mut AdapterClient,
+    transcript: &Path,
+    tool: &str,
+    failure: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while transcript_initialize_count(transcript) < 2 {
+        assert!(Instant::now() < deadline, "{failure}");
+        // A demand may complete the replacement after this scheduling deadline.
+        // Observe that completion before deciding whether to start another RPC.
+        client.call_tool(tool, json!({}));
+    }
+}
+
 fn wait_until(mut predicate: impl FnMut() -> bool, label: &str, within: Duration) {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
@@ -2643,15 +2658,12 @@ fn matrix_pooling_root_restarts_only_when_its_effective_spec_changes() {
         unknown_fields: Default::default(),
     });
     registry::save_to(&path, &reg).expect("change root launch spec");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while transcript_initialize_count(&transcript) < 2 {
-        client.call_tool(&pwd, json!({}));
-        assert!(
-            Instant::now() < deadline,
-            "the old rooted launch survived an effective spec change"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    demand_root_replacement(
+        &mut client,
+        &transcript,
+        &pwd,
+        "the old rooted launch survived an effective spec change",
+    );
     assert!(
         client.call_tool(&pwd, json!({}))["isError"] != true,
         "replacement child must remain callable"
@@ -2735,16 +2747,12 @@ fn rooted_subscription_rollover(slow_call: bool) {
         });
     }
     registry::save_to(&path, &reg).expect("rotate secret generation");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while transcript_initialize_count(&transcript) < 2 {
-        assert!(
-            Instant::now() < deadline,
-            "replacement rooted child was not launched"
-        );
-        // A synchronous demand may itself finish the replacement after this
-        // scheduling deadline. Check its result before judging the next wait.
-        client.call_tool(&pwd, json!({}));
-    }
+    demand_root_replacement(
+        &mut client,
+        &transcript,
+        &pwd,
+        "replacement rooted child was not launched",
+    );
     assert_eq!(
         transcript_method_count(&transcript, "resources/subscribe"),
         2,
