@@ -1119,14 +1119,20 @@ fn demand_root_replacement(
     client: &mut AdapterClient,
     transcript: &Path,
     tool: &str,
+    completed_method: &str,
     failure: &str,
 ) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while transcript_initialize_count(transcript) < 2 {
+    loop {
         assert!(Instant::now() < deadline, "{failure}");
-        // A demand may complete the replacement after this scheduling deadline.
-        // Observe that completion before deciding whether to start another RPC.
+        // Demand once even if the watcher has already started the replacement.
+        // Its initialize frame precedes catalog and subscription restoration.
         client.call_tool(tool, json!({}));
+        // A successful demand can outlive this scheduling deadline. Observe its
+        // completion before deciding whether to start another RPC.
+        if transcript_method_count(transcript, completed_method) >= 2 {
+            break;
+        }
     }
 }
 
@@ -2662,6 +2668,7 @@ fn matrix_pooling_root_restarts_only_when_its_effective_spec_changes() {
         &mut client,
         &transcript,
         &pwd,
+        "initialize",
         "the old rooted launch survived an effective spec change",
     );
     assert!(
@@ -2751,7 +2758,8 @@ fn rooted_subscription_rollover(slow_call: bool) {
         &mut client,
         &transcript,
         &pwd,
-        "replacement rooted child was not launched",
+        "resources/subscribe",
+        "replacement rooted child did not resume the subscription",
     );
     assert_eq!(
         transcript_method_count(&transcript, "resources/subscribe"),
