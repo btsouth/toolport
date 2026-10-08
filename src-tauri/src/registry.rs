@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 pub(crate) static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+pub(crate) mod client_file;
 mod v2_migration;
 mod v3_migration;
 

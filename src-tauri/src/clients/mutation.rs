@@ -51,18 +51,28 @@ pub(super) fn strict_json(path: &Path) -> bool {
 }
 
 pub(super) fn write(path: &Path, contents: &str) -> Result<(), String> {
-    let staged = PENDING.with(|slot| {
+    let staged = PENDING.with(|slot| -> Result<bool, String> {
         let mut slot = slot.borrow_mut();
         let Some(pending) = slot.as_mut() else {
-            return false;
+            return Ok(false);
         };
         if path == pending.path {
             pending.output = Some(contents.into());
         } else {
+            let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
+            let parent = path.parent().ok_or("Auxiliary path has no parent")?;
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let dir = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
+            let parent = std::fs::canonicalize(parent).map_err(|e| e.to_string())?;
+            if !parent.starts_with(dir) || path.is_symlink() {
+                return Err(
+                    "Auxiliary config writes must stay inside the Toolport data dir".into(),
+                );
+            }
             pending.auxiliary.insert(path.into(), contents.into());
         }
-        true
-    });
+        Ok(true)
+    })?;
     if staged {
         Ok(())
     } else {
@@ -194,7 +204,8 @@ fn run_inner<T>(
     }
     let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
     let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
-    let mut original = disk(path)?;
+    let mut revision = crate::registry::client_file::read(path)?;
+    let mut original = revision.text.clone();
     let strict_json = !jsonc_settings
         && !matches!(
             format,
@@ -210,7 +221,7 @@ fn run_inner<T>(
         }
         if strict_json {
             if let Some(text) = original.as_deref().filter(|text| !text.trim().is_empty()) {
-                serde_json::from_str::<Value>(text).map_err(|_| format!("{} requires strict JSON; remove comments or trailing commas before connecting. Config unchanged.", path.display()))?;
+                serde_json::from_str::<Value>(text.strip_prefix('\u{feff}').unwrap_or(text)).map_err(|_| format!("{} requires strict JSON; remove comments or trailing commas before connecting. Config unchanged.", path.display()))?;
             }
         }
         PENDING.with(|slot| {
@@ -240,7 +251,8 @@ fn run_inner<T>(
             )? {
                 return Err(format!("Client config conflict at {}: native edits overlap this operation. Config unchanged.", path.display()));
             }
-            original = current;
+            revision = crate::registry::client_file::read(path)?;
+            original = revision.text.clone();
             continue;
         }
         // Recovery records must land before the config they protect. Roll them
@@ -251,14 +263,7 @@ fn run_inner<T>(
                 auxiliary_recovery.push(checkpoint(&auxiliary)?);
                 crate::registry::atomic_write(&auxiliary, &text)?;
             }
-            let check = || {
-                if disk(path)? == original {
-                    Ok(())
-                } else {
-                    Err("Client config revision changed before rename".into())
-                }
-            };
-            crate::registry::atomic_write_checked(path, &output, check)
+            crate::registry::client_file::commit(path, &revision, Some(&output))
         })();
         if commit.is_err() {
             for receipt in auxiliary_recovery.into_iter().rev() {
@@ -280,7 +285,8 @@ fn run_inner<T>(
                         path.display()
                     ));
                 }
-                original = current;
+                revision = crate::registry::client_file::read(path)?;
+                original = revision.text.clone();
             }
             Err(e) => return Err(e),
         }
@@ -350,6 +356,57 @@ mod tests {
         });
         assert!(connect(&path).unwrap_err().contains("conflict"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), native);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn strict_json_bom_is_accepted_and_preserved() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (dir, _data) = fixture();
+        let path = dir.join(".claude.json");
+        std::fs::write(&path, "\u{feff}{\"mcpServers\":{}}").unwrap();
+        connect(&path).unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .starts_with('\u{feff}'));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn exchange_conflict_replays_unrelated_native_save() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (dir, _data) = fixture();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"session":1,"mcpServers":{}}"#).unwrap();
+        crate::registry::client_file::HOOK.with(|slot| {
+            *slot.borrow_mut() = Some((
+                "commit",
+                Box::new(|path| {
+                    let tmp = path.with_extension("native");
+                    std::fs::write(&tmp, r#"{"session":2,"mcpServers":{}}"#).unwrap();
+                    #[cfg(windows)]
+                    std::fs::remove_file(path).unwrap();
+                    std::fs::rename(tmp, path).unwrap();
+                }),
+            ))
+        });
+        connect(&path).unwrap();
+        let root = parse_json_value(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["session"], 2);
+        assert!(root["mcpServers"]["toolport"].is_object());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn auxiliary_write_outside_data_dir_is_refused() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (dir, _data) = fixture();
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let outside = dir.join("outside.json");
+        let error = run("cursor", &path, Format::JsonMcpServers, || {
+            write(&outside, "secret")
+        })
+        .unwrap_err();
+        assert!(error.contains("inside the Toolport data dir"));
+        assert!(!outside.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
