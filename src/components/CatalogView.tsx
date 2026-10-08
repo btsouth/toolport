@@ -62,7 +62,7 @@ export function catalogIdentity(
     const index = runner === "uvx" && args[0] === "--from" ? 1 : 0;
     if (args[index]) {
       if (runner === "npx") args[index] = args[index].replace(/(.+)@[^@]+$/, "$1");
-      else args[index] = args[index].split("==")[0].replaceAll("_", "-").toLowerCase();
+      else args[index] = args[index].split("==")[0].replace(/_/g, "-").toLowerCase();
     }
     return JSON.stringify([runner, args]);
   }
