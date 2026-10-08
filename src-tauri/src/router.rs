@@ -290,6 +290,11 @@ fn match_simple_pattern(mut pattern: &str, mut text: &str) -> bool {
     }
 }
 
+/// Normalize client input schemas when reading a legacy catalog snapshot.
+pub fn normalize_tool_schema(schema: &mut Value) {
+    crate::schema_compat::normalize(schema);
+}
+
 /// Inline local `$ref` pointers into a self-contained JSON Schema, so a downstream
 /// consumer that can't resolve refs gets a complete schema. Handles `#/$defs/X`,
 /// `#/definitions/X`, AND any in-document JSON Pointer (`#/properties/a/b`, which
@@ -1517,6 +1522,8 @@ pub struct Router {
     tools: Vec<Value>,
     /// Exposed tool name -> (server id, original downstream tool name).
     routes: HashMap<String, (String, String)>,
+    /// Argument aliases compiled alongside the published tool definitions.
+    schema_arguments: HashMap<String, Arc<crate::schema_compat::ArgumentMap>>,
     /// Routes kept across a guarded catalog collapse. Profile views recheck
     /// these under their own allowlist after indexing the shared live slots.
     restored_candidates: Vec<RestoredTool>,
@@ -1566,6 +1573,7 @@ struct RestoredTool {
     server: String,
     original: String,
     source_revision: u64,
+    schema_arguments: Option<Arc<crate::schema_compat::ArgumentMap>>,
 }
 
 impl Router {
@@ -1844,6 +1852,11 @@ impl Router {
             t["name"] = json!(exposed);
             if let Some(schema) = t.get_mut("inputSchema") {
                 inline_refs(schema);
+                let arguments = crate::schema_compat::normalize(schema);
+                if !arguments.is_empty() {
+                    self.schema_arguments
+                        .insert(exposed.clone(), Arc::new(arguments));
+                }
             }
             self.tools.push(t);
             self.routes
@@ -2937,6 +2950,7 @@ impl Router {
                     server: server_id.to_string(),
                     original: original.to_string(),
                     source_revision: self.tool_revision(server_id).unwrap_or(0),
+                    schema_arguments: previous.schema_arguments.get(exposed).cloned(),
                 });
             }
         }
@@ -2984,6 +2998,7 @@ impl Router {
                         server: server_id.to_string(),
                         original: original.to_string(),
                         source_revision: self.tool_revision(server_id).unwrap_or(0),
+                        schema_arguments: unrestricted.schema_arguments.get(exposed).cloned(),
                     });
                 }
             }
@@ -3017,6 +3032,10 @@ impl Router {
                 candidate.exposed.clone(),
                 (candidate.server.clone(), candidate.original.clone()),
             );
+            if let Some(arguments) = &candidate.schema_arguments {
+                self.schema_arguments
+                    .insert(candidate.exposed.clone(), Arc::clone(arguments));
+            }
             self.tools.push(candidate.definition.clone());
             self.seen.insert(candidate.exposed.clone());
         }
@@ -3049,6 +3068,7 @@ impl Router {
         self.tools.clear();
         self.catalog_servers.clear();
         self.routes.clear();
+        self.schema_arguments.clear();
         self.seen.clear();
         // A restored route keeps its exposed name until a fresh tool catalog
         // confirms its removal. Reserve that name before indexing new slots,
@@ -3525,6 +3545,10 @@ impl Router {
             .routes
             .get(exposed_name)
             .ok_or_else(|| self.no_route_message(exposed_name))?;
+        let mut arguments = arguments;
+        if let Some(plan) = self.schema_arguments.get(exposed_name) {
+            plan.restore(&mut arguments)?;
+        }
         let slot = self.authorized_slot(server_id)?;
         let (result, downstream_supports_tasks) = self.call_with_retry(
             &slot,
