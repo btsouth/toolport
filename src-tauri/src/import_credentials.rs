@@ -24,6 +24,27 @@ pub(crate) fn provided(value: &str) -> bool {
         )
 }
 
+const SECRET_NAMES: &[&str] = &[
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASS",
+    "AUTH",
+    "CREDENTIAL",
+    "BEARER",
+    "COOKIE",
+    "PRIVATE",
+    "PAT",
+];
+
+pub(crate) fn secret_path_name(value: &str) -> bool {
+    value
+        .to_ascii_uppercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| SECRET_NAMES.contains(&word))
+}
+
 pub(crate) fn secret_env(key: &str, value: Option<&str>) -> bool {
     let key = key.to_ascii_uppercase();
     if key == "PATH" {
@@ -34,20 +55,10 @@ pub(crate) fn secret_env(key: &str, value: Option<&str>) -> bool {
         || words
             .filter(|word| !matches!(*word, "KEYBOARD" | "MONKEY" | "COMPASS"))
             .any(|word| {
-                [
-                    "KEY",
-                    "TOKEN",
-                    "SECRET",
-                    "PASSWORD",
-                    "PASS",
-                    "AUTH",
-                    "CREDENTIAL",
-                    "BEARER",
-                    "COOKIE",
-                    "PRIVATE",
-                ]
-                .iter()
-                .any(|needle| word.contains(needle))
+                SECRET_NAMES
+                    .iter()
+                    .filter(|needle| **needle != "PAT")
+                    .any(|needle| word.contains(needle))
             })
     {
         return true;
@@ -150,7 +161,7 @@ pub(crate) fn secret_url_path(url: &url::Url) -> bool {
         let secret = after_secret_name
             || registry::arg_looks_secret(&decoded)
             || secret_env("", Some(&decoded));
-        after_secret_name = secret_env(&decoded, None);
+        after_secret_name = secret_path_name(&decoded);
         secret
     })
 }
@@ -792,10 +803,20 @@ mod tests {
     #[test]
     fn reviewed_environment_matching_does_not_widen_endpoint_paths() {
         for path in ["/author/mcp", "/tokenizer/mcp", "/monkey/mcp"] {
-            assert!(!secret_url_path(&url::Url::parse(&format!("https://example.invalid{path}")).unwrap()), "harmless path widened: {path}");
+            assert!(
+                !secret_url_path(
+                    &url::Url::parse(&format!("https://example.invalid{path}")).unwrap()
+                ),
+                "harmless path widened: {path}"
+            );
         }
         for path in ["/oauth/token/mcp", "/auth/mcp", "/sk-private-path"] {
-            assert!(secret_url_path(&url::Url::parse(&format!("https://example.invalid{path}")).unwrap()), "existing path protection lost: {path}");
+            assert!(
+                secret_url_path(
+                    &url::Url::parse(&format!("https://example.invalid{path}")).unwrap()
+                ),
+                "existing path protection lost: {path}"
+            );
         }
     }
 

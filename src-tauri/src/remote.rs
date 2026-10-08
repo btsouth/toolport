@@ -1408,7 +1408,7 @@ impl Redaction {
                     {
                         add(segment);
                     }
-                    after_secret_name = crate::import_credentials::secret_env(&value, None);
+                    after_secret_name = crate::import_credentials::secret_path_name(&value);
                 }
             }
         }
