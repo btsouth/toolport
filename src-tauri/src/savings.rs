@@ -174,18 +174,35 @@ pub struct SerializedSurface {
 
 impl SerializedSurface {
     pub fn new(tools: &[Value]) -> Self {
+        Self::from_tools(tools)
+    }
+
+    /// Serialize borrowed or individually-owned definitions without collecting
+    /// another parsed catalog. Only one temporary tool need exist at a time.
+    pub fn from_tools<T: std::borrow::Borrow<Value>>(tools: impl IntoIterator<Item = T>) -> Self {
         let mut sizes = BTreeMap::new();
-        let text = serialize_surface_text(tools, |tool, bytes| {
-            if let Some(name) = tool.get("name").and_then(Value::as_str) {
-                *sizes.entry(name.to_string()).or_default() += bytes;
+        let mut bytes = vec![b'['];
+        let mut count = 0;
+        for tool in tools {
+            let tool = tool.borrow();
+            if count > 0 {
+                bytes.push(b',');
             }
-        });
+            let start = bytes.len();
+            serde_json::to_writer(&mut bytes, tool).expect("serde_json::Value serializes");
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                *sizes.entry(name.to_string()).or_default() += (bytes.len() - start) as u64;
+            }
+            count += 1;
+        }
+        bytes.push(b']');
+        let text = String::from_utf8(bytes).expect("JSON is UTF-8");
         Self {
             hash: Sha256::digest(text.as_bytes()).into(),
             json: serde_json::value::RawValue::from_string(text)
                 .expect("serialized tools are valid JSON"),
             tools: sizes,
-            count: tools.len(),
+            count,
         }
     }
 

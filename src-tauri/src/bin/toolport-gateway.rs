@@ -6293,26 +6293,89 @@ fn cached_tool_surfaces(
     if let Some(surfaces) = cache.get(&key) {
         return surfaces;
     }
+    let live;
     let catalog = if snapshot.tools.is_empty() {
-        router.aggregated_tools()
+        live = router.aggregated_tools();
+        live.as_slice()
     } else {
-        drop_blocked_from_cache(snapshot.tools.clone(), router, reg)
+        &snapshot.tools
     };
-    let full = Arc::new(savings::SerializedSurface::new(
-        &tool_surface_with_code_mode(
-            key.code_mode,
-            reg,
-            router,
-            &catalog,
-            allowed,
-            DiscoveryMode::Full,
+    let owners = unique_prefix_owners(reg);
+    let deny_destructive = reg.deny_destructive_effective();
+    // Filtering keeps references, not a second parsed copy of every schema.
+    let scoped: Vec<&Value> = catalog
+        .iter()
+        .filter(|tool| {
+            let name = tool.get("name").and_then(Value::as_str);
+            (snapshot.tools.is_empty() || name.is_none_or(|name| {
+                !router.is_blocked(name)
+                    && !(deny_destructive && cached_tool_is_destructive(tool, name))
+            })) && allowed.is_none_or(|scope| {
+                name.is_some_and(|name| {
+                    tool_in_scope(name, scope, &|name| {
+                        owner_of_exposed_tool(Some(router), &owners, name)
+                    })
+                })
+            })
+        })
+        .collect();
+    let relays_apps = relays_mcp_app_html_to_active_client(router, allowed);
+    let neutralized = |tool: &Value| {
+        let mut tool = tool.clone();
+        neutralize_listed_tool(&mut tool);
+        tool
+    };
+    let floor = tool_surface_with_code_mode(
+        key.code_mode,
+        reg,
+        router,
+        &[],
+        allowed,
+        DiscoveryMode::Full,
+    );
+    let full = Arc::new(savings::SerializedSurface::from_tools(
+        floor.into_iter().chain(
+            scoped
+                .iter()
+                .copied()
+                .filter(|tool| relays_apps || mcp_app_tool_is_model_visible(tool))
+                .map(neutralized),
         ),
     ));
     let exposed = if mode == DiscoveryMode::Full {
         Arc::clone(&full)
     } else {
-        Arc::new(savings::SerializedSurface::new(
-            &tool_surface_with_code_mode(key.code_mode, reg, router, &catalog, allowed, mode),
+        let mut floor = floor_tool_defs_with_code_mode(key.code_mode);
+        if mode == DiscoveryMode::Grouped {
+            let mut counts = HashMap::<String, usize>::new();
+            let mut prefixes = Vec::new();
+            for tool in &scoped {
+                if let Some(prefix) = namespaced_prefix(tool) {
+                    if !counts.contains_key(&prefix) {
+                        prefixes.push(prefix.clone());
+                    }
+                    *counts.entry(prefix).or_default() += 1;
+                }
+            }
+            for prefix in prefixes {
+                floor.push(help_tool_def(&prefix, counts[&prefix]));
+            }
+        }
+        let apps = scoped
+            .iter()
+            .copied()
+            .filter(|tool| {
+                relays_apps
+                    && is_mcp_app_tool(tool)
+                    && tool
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .and_then(|name| router.route_of(name))
+                        .is_some_and(|(server, _)| server_supports_mcp_app_html(router, server))
+            })
+            .map(neutralized);
+        Arc::new(savings::SerializedSurface::from_tools(
+            floor.into_iter().chain(apps),
         ))
     };
     let key_bytes = key.profile.as_ref().map_or(0, String::capacity)
