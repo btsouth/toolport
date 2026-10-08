@@ -428,7 +428,14 @@ impl CatalogPage {
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || {
-                let result = crate::catalog::search(&query);
+                let result = if query.trim().is_empty() {
+                    crate::catalog::CatalogSearch {
+                        entries: crate::catalog::popular(),
+                        registry_status: crate::catalog::RegistryStatus::NotQueried,
+                    }
+                } else {
+                    crate::catalog::search(&query)
+                };
                 let entries = result.entries;
                 let registry = crate::registry::load()?;
                 let existing = registry
