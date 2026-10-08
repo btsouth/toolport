@@ -231,7 +231,9 @@ function ImportReviewContent({
                                 ? "Found"
                                 : credentialInputs[item.name]?.[env.key]
                                   ? "Ready for connection"
-                                  : "Missing"}
+                                  : env.required
+                                    ? "Missing"
+                                    : ""}
                             </span>
                           </label>
                           {!env.present && (

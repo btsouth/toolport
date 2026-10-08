@@ -104,6 +104,7 @@ describe("ImportReviewDialog", () => {
     expect(screen.getByRole("button", { name: "Connect" })).toBeEnabled();
     await userEvent.click(screen.getByText("stripe credentials and settings"));
     expect(screen.getAllByText("Optional")).toHaveLength(2);
+    expect(screen.queryByText("Missing")).not.toBeInTheDocument();
   });
 
   it("allows deselection of a missing required server", async () => {
