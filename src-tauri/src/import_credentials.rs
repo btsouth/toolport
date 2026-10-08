@@ -192,9 +192,10 @@ impl Import {
             }
         }
         let mask = registry::secret_arg_mask(&entry.args);
+        let had_launch = entry.launch.is_some();
         let mut launch = entry.launch.take().unwrap_or_default();
         for (index, secret) in mask.into_iter().enumerate() {
-            if !secret {
+            if !secret || launch.bindings.iter().any(|binding| binding.index == index) {
                 continue;
             }
             let key = format!("IMPORTED_ARG_{index}");
@@ -232,8 +233,10 @@ impl Import {
                 unknown_fields: Default::default(),
             })
             .collect();
-        launch.required_env = entry.env.iter().map(|e| e.key.clone()).collect();
-        if !launch.inputs.is_empty() || !launch.required_env.is_empty() {
+        if !had_launch {
+            launch.required_env = entry.env.iter().map(|e| e.key.clone()).collect();
+        }
+        if had_launch || !launch.inputs.is_empty() || !launch.required_env.is_empty() {
             entry.launch = Some(launch);
         }
         Ok(Self { entry, values })
@@ -253,7 +256,15 @@ impl Import {
         for (key, imported) in &self.values {
             let current = read(id, key).map_err(|_| VAULT_FAILURE.to_string())?;
             let Some(value) = imported.as_deref().filter(|v| provided(v)) else {
-                if current.is_none_or(|v| !provided(&v)) {
+                let required = self.entry.launch.as_ref().is_none_or(|launch| {
+                    launch
+                        .inputs
+                        .iter()
+                        .find(|input| &input.key == key)
+                        .map(|input| input.required)
+                        .unwrap_or_else(|| launch.required_env.contains(key))
+                });
+                if required && current.is_none_or(|v| !provided(&v)) {
                     missing.push(key.clone());
                 }
                 continue;
@@ -279,7 +290,13 @@ impl Import {
 
 pub(crate) fn ready(server: &ServerEntry) -> Result<bool, String> {
     for env in &server.env {
-        if env.secret && env.value.is_none() {
+        if env.secret
+            && env.value.is_none()
+            && server
+                .launch
+                .as_ref()
+                .is_none_or(|launch| launch.required_env.contains(&env.key))
+        {
             let value = secrets::get_vault_secret_result(&server.id, &env.key)
                 .map_err(|_| VAULT_FAILURE.to_string())?;
             if value.is_none_or(|value| !provided(&value)) {
@@ -339,6 +356,41 @@ mod tests {
                 .is_empty());
         }
         assert_eq!(writes.get(), 2);
+    }
+
+    #[test]
+    fn existing_launch_bindings_and_optional_env_remain_usable() {
+        let mut server = entry(false);
+        server.args = vec!["--token".into(), "<launch-input>".into()];
+        server.env[0].key = "OPTIONAL".into();
+        server.launch = Some(serde_json::from_value(json!({
+            "inputs":[{"key":"TOKEN","label":"Token","secret":true,"required":true,"value":"synthetic-launch-secret"}],
+            "bindings":[{"index":1,"parts":[{"kind":"input","key":"TOKEN"}]}],"requiredEnv":[]
+        })).unwrap());
+        let import = Import::prepare(server, None).unwrap();
+        let vault = std::cell::RefCell::new(std::collections::HashMap::new());
+        assert!(import
+            .transfer_with(
+                "imported",
+                |_, key| Ok(vault.borrow().get(key).cloned()),
+                |_, key, value| {
+                    vault
+                        .borrow_mut()
+                        .insert(key.to_string(), value.to_string());
+                    Ok(())
+                }
+            )
+            .unwrap()
+            .is_empty());
+        let resolved = crate::launch_inputs::resolve_args_with(&import.entry, |_, key| {
+            Ok(vault.borrow().get(key).cloned())
+        })
+        .unwrap();
+        assert_eq!(resolved.args, ["--token", "synthetic-launch-secret"]);
+        assert_eq!(import.entry.launch.as_ref().unwrap().bindings.len(), 1);
+        assert!(!serde_json::to_string(&import.entry)
+            .unwrap()
+            .contains("synthetic-launch-secret"));
     }
 
     #[test]
