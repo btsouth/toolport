@@ -37872,6 +37872,7 @@ mod tests {
             DiscoveryMode::Lazy,
             DiscoveryMode::Grouped,
         ] {
+            state.set_discovery_mode(mode);
             let guard = SearchGuard::default();
             let ordinary = modern_req(1, "tools/list", json!({}));
             let apps = modern_apps_req(1, "tools/list", json!({}));
@@ -38138,6 +38139,7 @@ mod tests {
         .1;
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (hit_tx, hit_rx) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             let cold = scope.spawn(|| {
                 TOOL_SURFACE_BUILD_HOOK.with(|hook| {
@@ -38157,7 +38159,6 @@ mod tests {
                 )
             });
             started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            let (hit_tx, hit_rx) = std::sync::mpsc::channel();
             let warm = scope.spawn(|| {
                 let next = cached_tool_surfaces(
                     &host,
@@ -38191,6 +38192,7 @@ mod tests {
         *host.cached_tools.lock().unwrap() = Arc::clone(&snapshot);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (retry_tx, retry_rx) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             let failed = scope.spawn(|| {
                 TOOL_SURFACE_BUILD_HOOK.with(|hook| {
@@ -38211,7 +38213,6 @@ mod tests {
                 )
             });
             started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            let (retry_tx, retry_rx) = std::sync::mpsc::channel();
             let retry = scope.spawn(|| {
                 let value = cached_tool_surfaces(
                     &host,
