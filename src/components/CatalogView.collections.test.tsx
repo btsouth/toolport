@@ -165,6 +165,7 @@ describe("CatalogView search and installed identity", () => {
         new Set(
           catalogInstalledIdentities({
             ...server,
+            source: server.source ?? null,
             transport: server.transport as CatalogEntry["transport"],
           }),
         ),
