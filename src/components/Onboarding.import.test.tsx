@@ -100,7 +100,9 @@ describe("Onboarding import copy", () => {
     await user.click(
       await screen.findByRole("button", { name: "Review and connect your clients" }),
     );
-    expect(await screen.findByText("Connect your tools")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Connect a client" }),
+    ).toBeInTheDocument();
     expect(importServers).not.toHaveBeenCalled();
   });
 

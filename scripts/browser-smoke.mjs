@@ -315,6 +315,15 @@ try {
   ).not.toBeChecked();
   await page.screenshot({ path: path.join(output, "setup-collection-added.png") });
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
+  await page.goto(`${baseURL}/fixtures/?setup=1`);
+  await page.getByRole("button", { name: "Browse catalog", exact: true }).click();
+  await page.getByRole("button", { name: "Add", exact: true }).first().click();
+  await page.getByRole("button", { name: "Servers", exact: true }).click();
+  await expect(
+    page.getByRole("switch", { name: "Toggle NoteKit", exact: true }),
+  ).toBeChecked();
+  await page.screenshot({ path: path.join(output, "setup-catalog-add.png") });
+  expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   await page.goto(`${baseURL}/fixtures/?logos`);
   await expect(page.getByText("Dark logo fixture")).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
