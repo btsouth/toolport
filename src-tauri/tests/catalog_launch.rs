@@ -458,21 +458,26 @@ fn changed_team_remote_url_cannot_send_a_stored_token_without_new_consent() {
 }
 
 fn gateway_lists_fixture_tools(fixture: &Fixture, ids: &[String]) {
-    let gate = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let mut reg = registry::load().unwrap();
     let gated = &ids[0];
-    reg.servers
+    let server = reg
+        .servers
         .iter_mut()
         .find(|server| &server.id == gated)
-        .unwrap()
-        .env
-        .push(registry::EnvVar {
+        .unwrap();
+    let gate = if server.transport == "stdio" {
+        let gate = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        server.env.push(registry::EnvVar {
             key: "TOOLPORT_FIXTURE_CATALOG_GATE".into(),
             value: Some(format!("http://{}/", gate.server_addr())),
             secret: false,
             unknown_fields: Default::default(),
         });
-    registry::save_to(&fixture.dir.join("registry.json"), &reg).unwrap();
+        registry::save_to(&fixture.dir.join("registry.json"), &reg).unwrap();
+        Some(gate)
+    } else {
+        None
+    };
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -535,52 +540,56 @@ fn gateway_lists_fixture_tools(fixture: &Fixture, ids: &[String]) {
             .filter_map(|t| t["name"].as_str().map(str::to_string))
             .collect()
     };
-    assert!(
-        !tool_names(&listed).contains(&format!("{}__ready", gated.replace('-', "_"))),
-        "the gated fixture must still be absent from the first list"
-    );
-    // Initialization and the first list can finish before downstream discovery.
-    // Force that interleaving above, then use completed catalog notifications to
-    // discover the rest. Each list is successful; only a list_changed triggers
-    // another query, with the original startup deadline still in force.
-    gate.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .unwrap()
-        .expect("the gated fixture must reach its initialize handshake")
-        .respond(tiny_http::Response::from_string("continue"))
-        .unwrap();
-    let listen = ureq::get(&endpoint)
-        .set("Authorization", "Bearer fixture-gateway-token")
-        .set("Accept", "text/event-stream")
-        .set("Mcp-Session-Id", session.as_deref().unwrap())
-        .timeout(deadline.saturating_duration_since(Instant::now()))
-        .call()
-        .unwrap();
-    let mut notifications = BufReader::new(listen.into_reader());
-    while ids
-        .iter()
-        .any(|id| !tool_names(&listed).contains(&format!("{}__ready", id.replace('-', "_"))))
-    {
+    if let Some(gate) = gate {
         assert!(
-            Instant::now() < deadline,
-            "gateway catalog deadline: {listed}"
+            !tool_names(&listed).contains(&format!("{}__ready", gated.replace('-', "_"))),
+            "the gated fixture must still be absent from the first list"
         );
-        let mut line = String::new();
-        assert!(
-            notifications.read_line(&mut line).unwrap() > 0,
-            "catalog notification stream ended: {listed}"
-        );
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        let note: Value = serde_json::from_str(data).unwrap();
-        if note["method"] == "notifications/tools/list_changed" {
-            listed = post(
-                json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
-                session.as_deref(),
-            )
+        gate.recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .unwrap()
-            .into_json()
+            .expect("the gated fixture must reach its initialize handshake")
+            .respond(tiny_http::Response::from_string("continue"))
             .unwrap();
+    }
+    // Initialization and the first list can finish before downstream discovery.
+    // Follow completed catalog notifications, keeping the original startup
+    // deadline. Only a list_changed triggers another successful list query.
+    let complete = |listed: &Value| {
+        ids.iter()
+            .all(|id| tool_names(listed).contains(&format!("{}__ready", id.replace('-', "_"))))
+    };
+    if !complete(&listed) {
+        let listen = ureq::get(&endpoint)
+            .set("Authorization", "Bearer fixture-gateway-token")
+            .set("Accept", "text/event-stream")
+            .set("Mcp-Session-Id", session.as_deref().unwrap())
+            .timeout(deadline.saturating_duration_since(Instant::now()))
+            .call()
+            .unwrap();
+        let mut notifications = BufReader::new(listen.into_reader());
+        while !complete(&listed) {
+            assert!(
+                Instant::now() < deadline,
+                "gateway catalog deadline: {listed}"
+            );
+            let mut line = String::new();
+            assert!(
+                notifications.read_line(&mut line).unwrap() > 0,
+                "catalog notification stream ended: {listed}"
+            );
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let note: Value = serde_json::from_str(data).unwrap();
+            if note["method"] == "notifications/tools/list_changed" {
+                listed = post(
+                    json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+                    session.as_deref(),
+                )
+                .unwrap()
+                .into_json()
+                .unwrap();
+            }
         }
     }
     let names = tool_names(&listed);

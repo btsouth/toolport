@@ -5254,11 +5254,17 @@ pub(crate) mod tests {
 
         const THREADS: u64 = 4;
         const PER: u64 = 30;
+        // flock is not fair: a fast winner can reacquire for all 30 fsync-backed
+        // writes while a peer exhausts its contention budget. Contend once per
+        // round so no writer can start another increment before its peers finish.
+        let round = std::sync::Arc::new(std::sync::Barrier::new(THREADS as usize));
         let handles: Vec<_> = (0..THREADS)
             .map(|_| {
                 let p = path.clone();
+                let round = std::sync::Arc::clone(&round);
                 std::thread::spawn(move || {
                     for _ in 0..PER {
+                        round.wait();
                         increment_with_retry(&p);
                     }
                 })
