@@ -2551,7 +2551,7 @@ fn confirm_client_migrate(client: &state::ClientView, _button: gtk::Button, page
         client.id.clone(),
         client.scope_id.clone(),
         client.gateway_state == state::ClientGatewayState::Customized,
-        move || run_profile_mutation(page.clone(), "Added selected servers", crate::registry_controller::registry_for_disconnect),
+        move || page.refresh(),
     );
 }
 
