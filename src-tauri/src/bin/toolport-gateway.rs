@@ -37637,6 +37637,52 @@ mod tests {
     }
 
     #[test]
+    fn tool_surface_apps_capability_change_does_not_replay_hidden_tools() {
+        let _env = DataDirTestEnv::new("tool-surface-apps");
+        let state = http_state(false);
+        let mut router = Router::new();
+        router.add(
+            DownstreamServer::connect("apps".into(), Box::new(McpAppsServer::default())).unwrap(),
+        );
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        *state.router.lock().unwrap() = Arc::new(router);
+        for mode in [
+            DiscoveryMode::Full,
+            DiscoveryMode::Lazy,
+            DiscoveryMode::Grouped,
+        ] {
+            let guard = SearchGuard::default();
+            let ordinary = modern_req(1, "tools/list", json!({}));
+            let apps = modern_apps_req(1, "tools/list", json!({}));
+            let run = |req| {
+                process_request_wire(
+                    &state, req, &guard, None, None, None, None, None, None, mode,
+                )
+                .unwrap()
+            };
+            let hidden = run(&ordinary);
+            assert!(!serde_json::to_string(&hidden)
+                .unwrap()
+                .contains("apps__app_only"));
+            let visible = run(&apps);
+            assert!(serde_json::to_string(&visible)
+                .unwrap()
+                .contains("apps__app_only"));
+            assert!(!Arc::ptr_eq(
+                hidden.surface.as_ref().unwrap(),
+                visible.surface.as_ref().unwrap()
+            ));
+            assert!(Arc::ptr_eq(
+                visible.surface.as_ref().unwrap(),
+                run(&apps).surface.as_ref().unwrap()
+            ));
+            assert!(!serde_json::to_string(&run(&ordinary))
+                .unwrap()
+                .contains("apps__app_only"));
+        }
+    }
+    #[test]
     fn tool_surface_cache_invalidates_every_effective_input() {
         let _env = DataDirTestEnv::new("tool-surface-invalidation");
         let host = dispatch_host(false);
@@ -37903,6 +37949,8 @@ mod tests {
             "name": "new__schedule_meeting", "description": "Schedule a meeting", "inputSchema": {}
         })]);
 
+        assert_eq!(old.search.surface_bytes, savings::surface_bytes(&old.tools));
+        assert_eq!(next.search.surface_bytes, savings::surface_bytes(&next.tools));
         assert!(old.search.matches_catalog(&old.tools));
         assert!(next.search.matches_catalog(&next.tools));
         assert!(
