@@ -273,7 +273,10 @@ pub(super) fn review(
             cancel.set_sensitive(true);
             button.set_sensitive(true);
             for (check, _, spinner, _, _) in selected.iter() {
-                check.set_sensitive(true);
+                check.set_sensitive(
+                    row.subtitle()
+                        .is_none_or(|s| !s.starts_with("Unsupported:")),
+                );
                 spinner.set_spinning(false);
                 spinner.set_visible(false);
             }
@@ -343,8 +346,18 @@ pub(super) fn review(
                     }
                     if let Some(backup) = outcome.backup {
                         let (detail, content) = details_expander("Details");
+                        let date = std::fs::metadata(&backup)
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .and_then(|t| {
+                                gtk::glib::DateTime::from_unix_local(t.as_secs() as i64).ok()
+                            })
+                            .and_then(|t| t.format("%e %B %Y, %H:%M").ok())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "saved".into());
                         let label = gtk::Label::builder()
-                            .label(format!("Backup: {backup}"))
+                            .label(format!("Backup {date}\n{backup}"))
                             .wrap(true)
                             .selectable(true)
                             .build();

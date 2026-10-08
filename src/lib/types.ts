@@ -67,6 +67,7 @@ export interface ClientSetupReview {
 }
 
 export interface MigrateResult {
+  backupDate?: number | null;
   registry: Registry;
   imported: number;
   servers: { name: string; toolCount: number; credentialState: string }[];

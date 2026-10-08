@@ -500,8 +500,12 @@ pub fn preview_client_imports() -> Result<Vec<ClientImportCandidate>, String> {
 }
 
 fn registry_matches(left: &Registry, right: &Registry) -> Result<bool, String> {
-    Ok(serde_json::to_value(left).map_err(|e| e.to_string())?
-        == serde_json::to_value(right).map_err(|e| e.to_string())?)
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.normalize_profile_references();
+    right.normalize_profile_references();
+    Ok(serde_json::to_value(&left).map_err(|e| e.to_string())?
+        == serde_json::to_value(&right).map_err(|e| e.to_string())?)
 }
 fn commit_imports(previous: &Registry, prepared: Registry) -> Result<Registry, String> {
     registry::update(|latest| {
@@ -1627,7 +1631,22 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
                                 .and_then(|d| {
                                     ["env", "environment", "envs", "headers", "http_headers"]
                                         .into_iter()
-                                        .find_map(|field| d.get(field)?.get(&env.key))
+                                        .find_map(|field| {
+                                            d.get(field)?.get(
+                                                if env.key == crate::secrets::HTTP_AUTH_KEY {
+                                                    "Authorization"
+                                                } else {
+                                                    &env.key
+                                                },
+                                            )
+                                        })
+                                        .or_else(|| {
+                                            if env.key == crate::secrets::IMPORTED_URL_KEY {
+                                                d.get("url")
+                                            } else {
+                                                None
+                                            }
+                                        })
                                 })
                                 .is_some_and(|v| {
                                     v.as_str()
@@ -2824,6 +2843,168 @@ mod tests {
             &review.revision,
             |_, _, _, _| Ok(Vec::new().into()),
         )
+    }
+
+    #[test]
+    fn reviewed_vault_rolls_back_prior_values_and_late_batch_failure() {
+        let _fixture = MoveFixture::new(&Registry::default());
+        crate::secrets::set_secret("one", "PAT", "synthetic-prior").unwrap();
+        let first = crate::import_credentials::Import::prepare(
+            server("one"),
+            Some(&serde_json::json!({"env":{"PAT":"synthetic-new"}})),
+        )
+        .unwrap();
+        let second = crate::import_credentials::Import::prepare(
+            server("two"),
+            Some(&serde_json::json!({"env":{"TOKEN":"synthetic-second"}})),
+        )
+        .unwrap();
+        let result = crate::secrets::tests::with_failed_write("TOKEN", || {
+            crate::import_credentials::transaction(|writes| {
+                first.transfer_into("one", writes)?;
+                second.transfer_into("two", writes)?;
+                Ok(())
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            crate::secrets::get_vault_secret_result("one", "PAT")
+                .unwrap()
+                .as_deref(),
+            Some("synthetic-prior")
+        );
+        assert!(crate::secrets::get_vault_secret_result("two", "TOKEN")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn reviewed_verification_releases_both_mutation_locks() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"command":"one"}}}"#,
+        )
+        .unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
+            |_, _, _, _| {
+                use fs2::FileExt;
+                for path in [
+                    fixture.root.join("data/client-config-mutation.lock"),
+                    fixture.root.join("data/registry.json.lock"),
+                ] {
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(path)
+                        .unwrap();
+                    file.try_lock_exclusive()
+                        .expect("vault/transport work must run outside mutation locks");
+                }
+                Ok(Vec::new().into())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reviewed_legacy_secret_definitions_match_without_masked_comparison() {
+        let mut reg = Registry::default();
+        let mut raw = server("one");
+        raw.transport = "http".into();
+        raw.command = None;
+        raw.url = Some("https://example.invalid/mcp?token=synthetic-value".into());
+        reg.add_server(raw);
+        let fixture = MoveFixture::new(&reg);
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"url":"https://example.invalid/mcp?token=synthetic-value"}}}"#,
+        )
+        .unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
+            |_, _, _, _| Ok(Vec::new().into()),
+        )
+        .unwrap();
+        assert_eq!(read_registry_exact().unwrap().servers.len(), 1);
+    }
+
+    #[test]
+    fn reviewed_unsupported_server_stays_native_while_supported_selection_connects() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(fixture.claude(),r#"{"mcpServers":{"one":{"command":"one"},"unsupported":{"url":"https://example.invalid/mcp","headers":{"X-API-Key":"synthetic-private"}}}}"#).unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        assert!(review
+            .items
+            .iter()
+            .find(|s| s.name == "unsupported")
+            .unwrap()
+            .unsupported
+            .is_some());
+        let result = migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into(), "unsupported".into()],
+            &review.revision,
+            |_, moved, _, _| {
+                assert_eq!(moved, ["one"]);
+                Ok(Vec::new().into())
+            },
+        )
+        .unwrap();
+        assert_eq!(result.moved, ["one"]);
+        assert!(json_file(&fixture.claude())["mcpServers"]
+            .get("unsupported")
+            .is_some());
+        assert!(!serde_json::to_string(&review)
+            .unwrap()
+            .contains("synthetic-private"));
+    }
+
+    #[test]
+    fn reviewed_plain_env_can_be_explicitly_vaulted() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"command":"one","env":{"PORT":"3000"}}}}"#,
+        )
+        .unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        let choices = std::collections::BTreeMap::from([(
+            "one".into(),
+            std::collections::BTreeMap::from([("PORT".into(), true)]),
+        )]);
+        migrate_client_reviewed_choices_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
+            &choices,
+            |_, _, _, _| Ok(Vec::new().into()),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::secrets::get_vault_secret_result("one", "PORT")
+                .unwrap()
+                .as_deref(),
+            Some("3000")
+        );
+        assert!(read_registry_exact().unwrap().servers[0].env[0].secret);
     }
 
     #[test]

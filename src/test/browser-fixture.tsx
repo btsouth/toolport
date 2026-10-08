@@ -346,7 +346,14 @@ mockIPC(
             source: "manual",
           });
         });
-        return structuredClone(registry);
+        return {
+          registry: structuredClone(registry),
+          servers: (args.selected as string[]).map((i) => ({
+            name: Object.keys(parsed.mcpServers)[Number(i)],
+            status: "added",
+            missing: [],
+          })),
+        };
       }
       case "team_instructions_status":
         return null;

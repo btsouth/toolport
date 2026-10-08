@@ -343,3 +343,20 @@ describe("sameReviewedDefinition", () => {
     expect(sameReviewedDefinition(reviewed, live)).toBe(false);
   });
 });
+
+it("leaves unsupported servers unchecked and sends per-row keychain choices", async () => {
+  const onConfirm = vi.fn();
+  renderDialog({
+    onConfirm,
+    items: [
+      { ...items()[0], credentials: [{ key: "PORT", secret: false, present: true }] },
+      { ...items()[1], unsupported: "Custom headers stay native" },
+    ],
+  });
+  expect(screen.getByRole("button", { name: /linear/ })).toBeDisabled();
+  expect(screen.getByLabelText(/Keep PORT in keychain/)).not.toBeChecked();
+  expect(screen.getByText("Found")).toBeVisible();
+  await userEvent.click(screen.getByLabelText(/Keep PORT in keychain/));
+  await userEvent.click(screen.getByRole("button", { name: /Import 1 server/ }));
+  expect(onConfirm).toHaveBeenCalledWith(["a"], { stripe: { PORT: true }, linear: {} });
+});

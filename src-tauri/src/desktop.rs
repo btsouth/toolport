@@ -622,6 +622,7 @@ struct MigrateResult {
     tools: Vec<serde_json::Value>,
     outcome: clients::WriteOutcome,
     servers: Vec<crate::registry_controller::SetupServerResult>,
+    backup_date: Option<u64>,
 }
 
 #[tauri::command]
@@ -665,12 +666,14 @@ async fn migrate_client(
     .map_err(|e| e.to_string())??;
 
     let registry = reload_into_state(state.inner())?;
+    let backup_date = outcome.result.outcome.backup.as_ref().and_then(|path|std::fs::metadata(path).ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()).map(|duration|duration.as_secs());
     Ok(MigrateResult {
         registry,
         imported: outcome.imported,
         moved: outcome.moved,
         tools: outcome.tools,
         servers: outcome.servers,
+        backup_date,
         outcome: outcome.result.outcome,
     })
 }

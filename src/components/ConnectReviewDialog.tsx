@@ -54,7 +54,7 @@ export function ConnectReviewDialog({
         force,
         selected,
         review.revision,
-        ...(secretChoices ? [secretChoices] : []),
+        ...(secretChoices ? ([secretChoices] as const) : ([] as const)),
       );
       setResult(next);
       onConnected(next.registry);
@@ -129,7 +129,14 @@ export function ConnectReviewDialog({
                 <summary>Details</summary>
                 <p className="mt-2 break-all">Config: {result.outcome.path}</p>
                 {result.outcome.backup && (
-                  <p className="break-all">Backup: {result.outcome.backup}</p>
+                  <>
+                    <p>
+                      {result.backupDate
+                        ? `Backup saved ${new Date(result.backupDate * 1000).toLocaleString()}`
+                        : "Backup saved"}
+                    </p>
+                    <p className="break-all">Backup: {result.outcome.backup}</p>
+                  </>
                 )}
               </details>
               <Button onClick={onClose}>Done</Button>
