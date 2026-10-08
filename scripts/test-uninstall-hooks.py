@@ -84,6 +84,18 @@ class RemovalHooks(unittest.TestCase):
         (self.bin / "getent").write_text("#!/bin/sh\nexit 2\n")
         self.assertIn("could not enumerate", self.run_script(self.helper).stderr)
 
+    def test_timeouts_cover_account_lookup_and_user_switching(self):
+        self.accounts(["alice"])
+        (self.root / "alice/.config/Toolport").mkdir(parents=True)
+        marker = self.root / "timeout-calls"
+        timeout = self.bin / "timeout"
+        timeout.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{marker}"\ntest "$1" = -k && test "$2" = 2 || exit 99\nshift 3\nexec "$@"\n')
+        timeout.chmod(0o755)
+        self.run_script(self.helper)
+        calls = marker.read_text().splitlines()
+        self.assertEqual(calls[0], "-k 2 5 getent passwd")
+        self.assertTrue(calls[1].startswith("-k 2 30 runuser -u alice -- env -i "))
+
     def test_missing_binary_prints_recovery_and_succeeds(self):
         self.accounts(["empty"])
         self.gateway.unlink()

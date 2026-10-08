@@ -9,7 +9,7 @@ if [ ! -x /usr/bin/toolport-gateway ]; then
   manual "gateway binary is missing; client configs were not restored"
   exit 0
 fi
-accounts=$(getent passwd) || {
+accounts=$(timeout -k 2 5 getent passwd) || {
   manual "could not enumerate user accounts; client configs were not restored"
   exit 0
 }
@@ -23,12 +23,12 @@ printf '%s\n' "$accounts" | while IFS=: read -r user _password uid _gid _gecos h
   fi
   echo "Toolport: restoring client configs for $user"
   if command -v runuser >/dev/null 2>&1; then
-    runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" \
+    timeout -k 2 30 runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" \
       PATH=/usr/bin:/bin XDG_CONFIG_HOME="$home/.config" \
-      timeout 30 /usr/bin/toolport-gateway --disconnect-all || manual "cleanup failed for $user"
+      /usr/bin/toolport-gateway --disconnect-all || manual "cleanup failed for $user"
   elif command -v su >/dev/null 2>&1; then
     # shellcheck disable=SC2016 # Positional args expand in the user shell.
-    su -s /bin/sh -c 'exec env -i HOME="$1" USER="$2" LOGNAME="$2" PATH=/usr/bin:/bin XDG_CONFIG_HOME="$1/.config" timeout 30 /usr/bin/toolport-gateway --disconnect-all' \
+    timeout -k 2 30 su -s /bin/sh -c 'exec env -i HOME="$1" USER="$2" LOGNAME="$2" PATH=/usr/bin:/bin XDG_CONFIG_HOME="$1/.config" /usr/bin/toolport-gateway --disconnect-all' \
       -- "$user" sh "$home" "$user" || manual "cleanup failed for $user"
   else
     manual "runuser and su are unavailable; cleanup skipped for $user"
