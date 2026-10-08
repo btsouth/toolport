@@ -249,7 +249,9 @@ try {
     await expect(
       page.getByRole("heading", { name: "Review and connect Codex" }),
     ).toBeVisible();
-    await expect(page.getByText(/Backup saved to/)).toBeVisible();
+    await page.getByText("Details", { exact: true }).click();
+    await expect(page.getByText(/Backups will be saved/)).toBeVisible();
+    await page.getByText("Details", { exact: true }).click();
     await page.screenshot({
       animations: "disabled",
       path: path.join(output, "setup-client-review.png"),
@@ -259,12 +261,11 @@ try {
       await expect(
         page.getByRole("alert").filter({ hasText: "Client config unchanged" }),
       ).toBeVisible();
-      await expect(page.getByRole("heading", { name: "Connected to Codex" })).toHaveCount(
-        0,
-      );
+      await expect(page.getByRole("heading", { name: "Codex connected" })).toHaveCount(0);
     } else {
-      await expect(page.getByText("notes__read", { exact: true })).toHaveCount(1);
-      await expect(page.getByText("Gateway tools your agent will see:")).toBeVisible();
+      await expect(page.getByText(/3 tools/)).toHaveCount(2);
+      await page.getByText("What your agent sees", { exact: true }).click();
+      await expect(page.getByText("notes__read", { exact: true })).toBeVisible();
     }
     await page.screenshot({
       animations: "disabled",
