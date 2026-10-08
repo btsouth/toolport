@@ -13569,7 +13569,7 @@ fn broker_url_elicitation(
         approval::ApprovalDecision::Denied => ServerRequestAction::Respond(
             upstream_json_rpc_response(id, Ok(json!({ "action": "decline" }))),
         ),
-        approval::ApprovalDecision::Timeout => ServerRequestAction::Respond(
+        approval::ApprovalDecision::Timeout | approval::ApprovalDecision::Withdrawn => ServerRequestAction::Respond(
             upstream_json_rpc_response(id, Ok(json!({ "action": "cancel" }))),
         ),
         approval::ApprovalDecision::Unreachable | approval::ApprovalDecision::StaleState => {

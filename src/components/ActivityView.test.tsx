@@ -769,12 +769,8 @@ it("uses one server filter and one identity, time and wait meta line", async () 
   );
   expect(screen.queryByText("adapter:claude-code")).not.toBeInTheDocument();
   await user.click(screen.getByRole("combobox"));
-  expect(screen.getAllByRole("option", { name: "team_slack", exact: true })).toHaveLength(
-    1,
-  );
-  expect(
-    screen.queryByRole("option", { name: "team-slack", exact: true }),
-  ).not.toBeInTheDocument();
+  expect(screen.getAllByRole("option", { name: /^team_slack$/ })).toHaveLength(1);
+  expect(screen.queryByRole("option", { name: /^team-slack$/ })).not.toBeInTheDocument();
 });
 
 it("uses one server option for hyphenated call and approval identities", async () => {
