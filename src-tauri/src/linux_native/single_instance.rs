@@ -67,21 +67,19 @@ fn bus_call(
 pub(super) fn register(app_id: &str) -> Result<adw::Application, String> {
     let deadline = Instant::now() + HANDOVER_LIMIT;
     let current = Executable::read("/proc/self/exe")?;
+    let connection = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
+        .map_err(|error| error.to_string())?;
     loop {
         remaining(deadline)?;
-        let app = adw::Application::builder()
-            .application_id(app_id)
-            .flags(gio::ApplicationFlags::HANDLES_OPEN)
-            .build();
-        app.register(gio::Cancellable::NONE)
-            .map_err(|error| error.to_string())?;
-        if !app.is_remote() {
-            return Ok(app);
-        }
-        let connection = app.dbus_connection().ok_or("No session bus connection.")?;
-        // The old primary may have exited between registration and inspection.
+        // Inspect before GApplication registration: registration synchronizes
+        // remote actions, which can block on an unresponsive old executable.
         let reply = bus_call(&connection, "NameHasOwner", app_id, deadline)?;
         if reply.get::<(bool,)>() == Some((false,)) {
+            let app = register_application(app_id)?;
+            if !app.is_remote() {
+                return Ok(app);
+            }
+            // A concurrent launcher won the name. Inspect that primary next.
             continue;
         }
         let owner = bus_call(&connection, "GetNameOwner", app_id, deadline)?
@@ -108,7 +106,14 @@ pub(super) fn register(app_id: &str) -> Result<adw::Application, String> {
         let process = unsafe { OwnedFd::from_raw_fd(fd as i32) };
         let running = Executable::read(format!("/proc/{pid}/exe"))?;
         if !needs_handover(&current, &running, uid)? {
-            return Ok(app);
+            let app = register_application(app_id)?;
+            if !app.is_remote()
+                || bus_call(&connection, "GetNameOwner", app_id, deadline)?.get::<(String,)>()
+                    == Some((owner,))
+            {
+                return Ok(app);
+            }
+            continue;
         }
         eprintln!("toolport: asking replaced shell {pid} to quit before upgrade startup");
         // Preview.1 already exports this action. Address its unique bus name,
@@ -156,9 +161,19 @@ pub(super) fn register(app_id: &str) -> Result<adw::Application, String> {
         if owner_alive.get::<(bool,)>() != Some((false,)) {
             return Err("The old Toolport still owns its session bus connection.".into());
         }
-        // Drop the registered remote application and let GApplication arbitrate
-        // again. A concurrent launch of this same build will simply activate it.
+        // Let GApplication arbitrate again. A concurrent launch of this same
+        // build will simply activate it.
     }
+}
+
+fn register_application(app_id: &str) -> Result<adw::Application, String> {
+    let app = adw::Application::builder()
+        .application_id(app_id)
+        .flags(gio::ApplicationFlags::HANDLES_OPEN)
+        .build();
+    app.register(gio::Cancellable::NONE)
+        .map_err(|error| error.to_string())?;
+    Ok(app)
 }
 
 pub(super) fn show_failure(error: &str) {
