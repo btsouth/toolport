@@ -262,9 +262,11 @@ mockIPC(
         if (setupVerifying) return new Promise(() => {});
         if (setupFailure)
           throw new Error(
-            setupFailure === "credential"
-              ? "Calendar needs credentials. Open Credentials and retry. Client config unchanged."
-              : "Notes could not start. Check its command and retry. Client config unchanged.",
+            setupFailure === "vault"
+              ? "Keychain unavailable. Unlock it and retry importing. Client config unchanged."
+              : setupFailure === "credential"
+                ? "Calendar needs credentials. Open Credentials and retry. Client config unchanged."
+                : "Notes could not start. Check its command and retry. Client config unchanged.",
           );
         setupConnected = true;
         return {

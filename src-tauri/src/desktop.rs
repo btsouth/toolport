@@ -231,7 +231,7 @@ fn parse_server_snippet(text: String) -> Result<Vec<clients::ParsedSnippetServer
             MAX_SNIPPET_BYTES / 1024,
         ));
     }
-    clients::parse_snippet(&text)
+    clients::parse_snippet(&text).map_err(|_| "Could not read the pasted config. Check its syntax and retry.".into())
 }
 
 #[tauri::command]

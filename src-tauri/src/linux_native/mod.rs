@@ -8603,7 +8603,7 @@ fn open_server_editor_prefilled(
                     MAX_SNIPPET_BYTES / 1024,
                 ))
             } else {
-                crate::clients::parse_snippet(&text)
+                crate::clients::parse_snippet(&text).map_err(|_| "Could not read the pasted config. Check its syntax and retry.".to_string())
             };
             feedback_for_fill.set_visible(true);
             match parsed {

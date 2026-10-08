@@ -239,7 +239,7 @@ try {
   await expect(page.getByText("Claude Code 2.1 · 2m ago · waited 1m 30s")).toBeVisible();
   await page.screenshot({ path: path.join(output, "approval-activity.png") });
   await page.setViewportSize({ width: 1240, height: 900 });
-  for (const failure of ["", "launch", "credential", "verifying"]) {
+  for (const failure of ["", "launch", "credential", "vault", "verifying"]) {
     await page.goto(
       `${baseURL}/fixtures/?setup=1${failure === "verifying" ? "&setup-verifying=1" : failure ? `&setup-failure=${failure}` : ""}`,
     );
