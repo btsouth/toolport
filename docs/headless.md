@@ -418,3 +418,12 @@ Toolport installation you are removing. Running as root reads root's data dir
 and can return `[]`. The command prints a hint to stderr when no data dir exists.
 Per-client `warnings` report keychain cleanup failures or edited Toolport entries
 kept for manual removal. Warnings do not make successfully restored configs fail.
+
+Client-config publication uses Linux `renameat2(RENAME_EXCHANGE)`, macOS
+`renamex_np(RENAME_SWAP)`, and Windows `ReplaceFileW` with a backup pathname.
+Toolport verifies the displaced bytes and reverses conflicting swaps before
+retrying its merge. Unsupported kernels or filesystems fall back to an immediate
+file-identity check (device, inode/file ID, modification time and size) before
+rename; an external writer can still race in the interval after that check.
+Removal verifies a same-directory tombstone before deleting it. If another save
+prevents safe recovery, Toolport retains the displaced file and reports its path.

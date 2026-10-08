@@ -263,7 +263,7 @@ struct ClientConfigReceipt {
 }
 
 impl ClientConfigReceipt {
-    fn capture(outcome: &WriteOutcome) -> Result<Self, String> {
+fn capture(outcome: &WriteOutcome) -> Result<Self, String> {
         let target = PathBuf::from(&outcome.path);
         let written = match std::fs::read(&target) {
             Ok(bytes) => Some(bytes),
@@ -271,7 +271,10 @@ impl ClientConfigReceipt {
             Err(e) => return Err(format!("could not verify the updated client config: {e}")),
         };
         let exact_rollback = outcome.recovery_path.is_none()
-            || written.as_deref().map(|bytes| registry::sha256_hex(std::str::from_utf8(bytes).unwrap_or(""))) == outcome.revision;
+            || written
+                .as_deref()
+                .map(|bytes| registry::sha256_hex(std::str::from_utf8(bytes).unwrap_or("")))
+                == outcome.revision;
         Ok(Self {
             target,
             backup: outcome.backup.as_deref().map(PathBuf::from),
@@ -281,7 +284,7 @@ impl ClientConfigReceipt {
         })
     }
 
-    fn rollback(&self) -> Result<(), String> {
+fn rollback(&self) -> Result<(), String> {
         if !self.exact_rollback {
             return Err("exact rollback is unavailable because the client saved after this operation; newer edits were left untouched".into());
         }
@@ -289,11 +292,20 @@ impl ClientConfigReceipt {
         let _lock = registry::lock_at(&dir.join("client-config-mutation"))?;
         let revision = registry::client_file::read(&self.target)?;
         if revision.text.as_deref().map(str::as_bytes) != self.written.as_deref() {
-            return Err("the client config changed again, so Toolport left the newer file untouched".into());
+            return Err(
+                "the client config changed again, so Toolport left the newer file untouched".into(),
+            );
         }
-        let original = self.backup.as_ref().map(std::fs::read_to_string).transpose().map_err(|e| e.to_string())?;
+        let original = self
+            .backup
+            .as_ref()
+            .map(std::fs::read_to_string)
+            .transpose()
+            .map_err(|e| e.to_string())?;
         registry::client_file::commit(&self.target, &revision, original.as_deref())?;
-        if let Some(file) = &self.recovery_path { clients::record_config_rollback(file, &self.target, original.as_deref())?; }
+        if let Some(file) = &self.recovery_path {
+            clients::record_config_rollback(file, &self.target, original.as_deref())?;
+        }
         Ok(())
     }
 }
@@ -813,7 +825,10 @@ fn finish_client_config_mutation(
 ) -> Result<ClientMutationResult, String> {
     let receipt = ClientConfigReceipt::capture(&outcome)?;
     if !receipt.exact_rollback {
-        outcome.warnings.push("the client saved after this operation; exact rollback is unavailable for this write".into());
+        outcome.warnings.push(
+            "the client saved after this operation; exact rollback is unavailable for this write"
+                .into(),
+        );
     }
     match write_registry(outcome.managed.clone()) {
         Ok(registry) => Ok(ClientMutationResult { registry, outcome }),
@@ -1388,7 +1403,9 @@ fn finish_http_disconnect(
 ) -> Result<(), String> {
     clients::finish_uninstall(client_id, &result.outcome)?;
     if let Err(error) = revoke() {
-        result.outcome.warnings.push(format!("config restored; could not remove the revoked keychain token: {error}"));
+        result.outcome.warnings.push(format!(
+            "config restored; could not remove the revoked keychain token: {error}"
+        ));
     }
     Ok(())
 }
@@ -1398,10 +1415,15 @@ pub(crate) fn registry_for_disconnect() -> Result<Registry, String> {
 }
 
 pub fn disconnect_client(client_id: &str) -> Result<ClientMutationResult, String> {
-    disconnect_client_with_revocation(client_id, || crate::secrets::delete_secret(CLIENT_HTTP_VAULT_SERVER, client_id))
+    disconnect_client_with_revocation(client_id, || {
+        crate::secrets::delete_secret(CLIENT_HTTP_VAULT_SERVER, client_id)
+    })
 }
 
-fn disconnect_client_with_revocation(client_id: &str, revoke: impl FnOnce() -> Result<(), String>) -> Result<ClientMutationResult, String> {
+fn disconnect_client_with_revocation(
+    client_id: &str,
+    revoke: impl FnOnce() -> Result<(), String>,
+) -> Result<ClientMutationResult, String> {
     let current = read_registry_exact_or_default()?;
     let http_id = format!("client:{client_id}");
     let has_shared_http_token = current
@@ -3084,7 +3106,7 @@ mod tests {
     }
 
     #[test]
-    fn client_save_before_receipt_capture_updates_registry_with_warning() {
+fn client_save_before_receipt_capture_updates_registry_with_warning() {
         let fixture = MoveFixture::new(&Registry::default());
         std::fs::write(fixture.claude(), "{\"mcpServers\":{}}").unwrap();
         let outcome = clients::install_gateway("claude-code", None).unwrap();
@@ -3098,43 +3120,65 @@ mod tests {
                 Ok(())
             })?;
             Ok(registry)
-        }).unwrap();
-        assert!(result.registry.client_managed_entries.contains_key("claude-code"));
+        })
+        .unwrap();
+        assert!(result
+            .registry
+            .client_managed_entries
+            .contains_key("claude-code"));
         assert!(result.outcome.warnings[0].contains("exact rollback is unavailable"));
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), native);
-        assert!(!ClientConfigReceipt::capture(&result.outcome).unwrap().exact_rollback);
+        assert!(
+            !ClientConfigReceipt::capture(&result.outcome)
+                .unwrap()
+                .exact_rollback
+        );
         disconnect_client("claude-code").unwrap();
         assert_eq!(json_file(&fixture.claude())["session"], 2);
     }
 
     #[test]
-    fn http_disconnect_finishes_before_failed_keychain_revocation() {
+fn http_disconnect_finishes_before_failed_keychain_revocation() {
         let fixture = MoveFixture::new(&Registry::default());
         let original = "{ \"mcpServers\": {} }";
         std::fs::write(fixture.claude(), original).unwrap();
         clients::install_gateway("claude-code", None).unwrap();
         registry::update(|registry| {
             registry.http_clients.push(registry::HttpClient {
-                id: "client:claude-code".into(), label: "Claude Code".into(), token_sha256: registry::sha256_hex("fixture"),
-                profile: String::new(), unknown_fields: Default::default()
+                id: "client:claude-code".into(),
+                label: "Claude Code".into(),
+                token_sha256: registry::sha256_hex("fixture"),
+                profile: String::new(),
+                unknown_fields: Default::default(),
             });
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         let result = disconnect_client_with_revocation("claude-code", || {
             let record = fixture.root.join("data/backups/claude-code");
-            let snapshot = std::fs::read_dir(record).unwrap().filter_map(Result::ok).find(|entry| entry.file_name().to_string_lossy().starts_with("original-")).unwrap();
-            let record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(snapshot.path()).unwrap()).unwrap();
+            let snapshot = std::fs::read_dir(record)
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| entry.file_name().to_string_lossy().starts_with("original-"))
+                .unwrap();
+            let record: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(snapshot.path()).unwrap()).unwrap();
             assert_eq!(record["disconnected"], true);
             assert!(record["disconnectBefore"].is_null());
             assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
             Err("keychain unreachable".into())
-        }).unwrap();
+        })
+        .unwrap();
         assert!(result.registry.http_clients.is_empty());
-        assert!(result.outcome.warnings.iter().any(|warning| warning.contains("keychain unreachable")));
+        assert!(result
+            .outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("keychain unreachable")));
     }
 
     #[test]
-    fn edited_toolport_entry_is_reported_after_disconnect() {
+fn edited_toolport_entry_is_reported_after_disconnect() {
         let fixture = MoveFixture::new(&Registry::default());
         std::fs::write(fixture.claude(), "{}").unwrap();
         clients::install_gateway("claude-code", None).unwrap();
@@ -3142,7 +3186,11 @@ mod tests {
         native["mcpServers"][clients::GATEWAY_ENTRY_NAME]["args"] = serde_json::json!(["--custom"]);
         std::fs::write(fixture.claude(), native.to_string()).unwrap();
         let result = disconnect_client("claude-code").unwrap();
-        assert!(result.outcome.warnings.iter().any(|warning| warning.contains("kept your edited toolport entry")));
+        assert!(result
+            .outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("kept your edited toolport entry")));
         assert_eq!(json_file(&fixture.claude()), native);
     }
 
