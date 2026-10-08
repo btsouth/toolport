@@ -197,7 +197,9 @@ try {
   expect(errors).toEqual([]);
   await page.goto(`${baseURL}/fixtures/?approvals`);
   const approval = page.getByRole("alertdialog");
-  await expect(approval.getByText("Claude Code wants to run this · destructive tool")).toBeVisible();
+  await expect(
+    approval.getByText("Claude Code wants to run this · destructive tool"),
+  ).toBeVisible();
   await expect(approval.getByText("Reports itself as: Claude Code 2.1.0")).toBeVisible();
   await page.screenshot({ path: path.join(output, "approval-card.png") });
   await approval.getByRole("button", { name: "Deny", exact: true }).click();

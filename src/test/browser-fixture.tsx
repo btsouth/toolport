@@ -5,7 +5,13 @@ import { TeamsView } from "@/components/TeamsView";
 import { createRoot } from "react-dom/client";
 import { ClientLogo } from "@/components/ClientLogo";
 import { ServerLogo } from "@/components/ServerLogo";
-import type { AuditEntry, PendingApproval, Registry, SavingsSummary, ServerEntry } from "@/lib/types";
+import type {
+  AuditEntry,
+  PendingApproval,
+  Registry,
+  SavingsSummary,
+  ServerEntry,
+} from "@/lib/types";
 import "../index.css";
 
 if (!import.meta.env.DEV) throw new Error("Fixtures require the development server");
@@ -107,7 +113,21 @@ if (memberReviewFixture) {
 }
 
 const approvalFixture = new URLSearchParams(location.search).has("approvals");
-let pendingApproval: PendingApproval[] = approvalFixture ? [{ id: "fixture-approval", client: "adapter:claude-code", clientName: "Claude Code", clientLabel: "Claude Code 2.1.0", server: "team-slack", tool: "delete_issue", reason: "destructive", arguments: { issue: 42 }, deadlineMs: Date.now() + 120000 }] : [];
+let pendingApproval: PendingApproval[] = approvalFixture
+  ? [
+      {
+        id: "fixture-approval",
+        client: "adapter:claude-code",
+        clientName: "Claude Code",
+        clientLabel: "Claude Code 2.1.0",
+        server: "team-slack",
+        tool: "delete_issue",
+        reason: "destructive",
+        arguments: { issue: 42 },
+        deadlineMs: Date.now() + 120000,
+      },
+    ]
+  : [];
 
 const auditRows: AuditEntry[] = Array.from({ length: 200 }, (_, i) => ({
   ts: 1_700_000_000_000 - i * 1000,
@@ -117,9 +137,40 @@ const auditRows: AuditEntry[] = Array.from({ length: 200 }, (_, i) => ({
   durationMs: 12,
 }));
 if (approvalFixture) {
-  auditRows.splice(0, auditRows.length,
-    { ts: Date.now() - 120000, server: "team_slack", serverId: "team-slack", tool: "read_issue", ok: true, durationMs: 850, client: "adapter:claude-code", clientName: "Claude Code", clientLabel: "Claude Code 2.1" },
-    ...["approved", "denied", "no_response", "withdrawn", "stale_state", "unreachable"].map((decision, index) => ({ ts: Date.now() - 120000, server: "team_slack", serverId: "team-slack", tool: `delete_issue_${index}`, kind: "approval", decision, ok: true, heldMs: index === 0 ? 90000 : 1500, client: "adapter:claude-code", clientName: "Claude Code", clientLabel: index === 5 ? "<b>Other client</b> 2.1" : "Claude Code 2.1" })),
+  auditRows.splice(
+    0,
+    auditRows.length,
+    {
+      ts: Date.now() - 120000,
+      server: "team_slack",
+      serverId: "team-slack",
+      tool: "read_issue",
+      ok: true,
+      durationMs: 850,
+      client: "adapter:claude-code",
+      clientName: "Claude Code",
+      clientLabel: "Claude Code 2.1",
+    },
+    ...[
+      "approved",
+      "denied",
+      "no_response",
+      "withdrawn",
+      "stale_state",
+      "unreachable",
+    ].map((decision, index) => ({
+      ts: Date.now() - 120000,
+      server: "team_slack",
+      serverId: "team-slack",
+      tool: `delete_issue_${index}`,
+      kind: "approval",
+      decision,
+      ok: true,
+      heldMs: index === 0 ? 90000 : 1500,
+      client: "adapter:claude-code",
+      clientName: "Claude Code",
+      clientLabel: index === 5 ? "<b>Other client</b> 2.1" : "Claude Code 2.1",
+    })),
   );
 }
 const savingsSummary: SavingsSummary = {

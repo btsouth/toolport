@@ -506,6 +506,9 @@ pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
 }
 
 pub fn activity_client_name(mut entry: Value) -> Value {
+    if !entry.is_object() {
+        return entry;
+    }
     entry["clientName"] = json!(crate::clients::trusted_client_name(
         entry.get("client").and_then(Value::as_str),
         entry.get("clientName").and_then(Value::as_str),
