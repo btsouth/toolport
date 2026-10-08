@@ -1071,6 +1071,21 @@ mod tests {
         window.add_css_class("toolport-native");
         let theme = super::super::theme::ThemeController::new();
         theme.attach(&window);
+        // Cancel the production debounce in this fixture before it can start
+        // network work, then render the same suggestion state as a failed search.
+        page.search.set_search_delay(0);
+        let offline_page = page.clone();
+        page.search.connect_search_changed(move |search| {
+            offline_page.cancel_suggestion_timer();
+            if !search.text().is_empty() {
+                offline_page.suggestion_state.replace(SuggestionState {
+                    entries: crate::catalog::search_curated(search.text().as_str()),
+                    existing: HashSet::new(),
+                    registry_status: Some(crate::catalog::RegistryStatus::Unavailable),
+                });
+                offline_page.render_suggestions();
+            }
+        });
         let entries: Vec<_> = crate::catalog::popular()
             .into_iter()
             .filter(|entry| matches!(entry.name.as_str(), "GitHub" | "Memory" | "Redis"))
@@ -1087,7 +1102,7 @@ mod tests {
             crate::catalog::entry_identity(installed).as_deref(),
             Some(identity.as_str())
         );
-        for (state, status, existing) in [
+        for (state, _status, existing) in [
             (
                 "normal",
                 crate::catalog::RegistryStatus::NotQueried,
@@ -1107,7 +1122,7 @@ mod tests {
             page.render_search(
                 crate::catalog::CatalogSearch {
                     entries: entries.clone(),
-                    registry_status: status,
+                    registry_status: crate::catalog::RegistryStatus::NotQueried,
                 },
                 existing,
                 None,
@@ -1119,10 +1134,7 @@ mod tests {
                     .count(),
                 usize::from(state == "installed")
             );
-            assert_eq!(page.feedback.is_visible(), state == "outage");
-            if state == "outage" {
-                assert!(page.feedback.text().contains("curated matches only"));
-            }
+            assert!(!page.feedback.is_visible());
             window.present();
             let main_loop = gtk::glib::MainLoop::new(None, false);
             let frames = Rc::new(Cell::new(0));
@@ -1149,23 +1161,27 @@ mod tests {
             );
             timer.remove();
             assert!(page.root.width() > 0);
+            if state == "outage" {
+                assert!(page.suggestion_popover.is_visible());
+                assert!(labels(&page.suggestion_list)
+                    .iter()
+                    .any(|label| label.contains("curated matches only")));
+                assert!(labels(&page.suggestion_list)
+                    .iter()
+                    .any(|label| label == "GitHub"));
+            }
             if let Ok(output) = std::env::var("P22_SCREENSHOT_DIR") {
                 std::fs::create_dir_all(&output).unwrap();
-                let snapshot = gtk::Snapshot::new();
-                gtk::WidgetPaintable::new(Some(&page.root)).snapshot(
-                    &snapshot,
-                    page.root.width() as f64,
-                    page.root.height() as f64,
-                );
-                let node = snapshot.to_node().unwrap();
-                window
-                    .renderer()
+                // Include GTK's separate popover surface in the isolated desktop
+                // capture. Widget snapshots omit that surface.
+                let output = std::path::Path::new(&output).join(format!("catalog-gtk-{state}.png"));
+                assert!(std::process::Command::new("timeout")
+                    .arg("10")
+                    .arg("grim")
+                    .arg(output)
+                    .status()
                     .unwrap()
-                    .render_texture(&node, None)
-                    .save_to_png(
-                        std::path::Path::new(&output).join(format!("catalog-gtk-{state}.png")),
-                    )
-                    .unwrap();
+                    .success());
             }
         }
         for status in [
