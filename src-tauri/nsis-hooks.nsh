@@ -42,11 +42,12 @@
 
 ; Tauri invokes the uninstaller during /UPDATE too. Only real removal disconnects.
 !macro NSIS_HOOK_PREUNINSTALL
-  ; Setup's remove-and-reinstall path passes _?= even without /UPDATE.
-  ; Skip cleanup in that path too, preserving connections on manual upgrades.
-  ClearErrors
-  ${GetOptions} $CMDLINE "_?=" $0
-  ${IfNot} ${Errors}
+  ; Setup passes _?= to run directly in the install directory. NSIS consumes
+  ; that flag before $CMDLINE, so compare the executable and install directories.
+  ; A normal removal runs NSIS's temporary uninstaller copy instead.
+  GetFullPathName $0 "$EXEDIR"
+  GetFullPathName $1 "$INSTDIR"
+  ${If} $0 == $1
     Goto toolport_cleanup_done
   ${EndIf}
   ${If} $UpdateMode != 1
