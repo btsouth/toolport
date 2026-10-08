@@ -1642,6 +1642,27 @@ fn http_client_discovery_override(reg: &Registry, client_id: &str) -> Option<Dis
     parse_mode(conduit_lib::clients::client_discovery_mode(reg, client_id))
 }
 
+/// The adapter's generated PID identity attributes anonymous sessions; it is not
+/// a known client definition. Preserve their global default unless overridden.
+fn adapter_client_discovery_override(reg: &Registry, client_id: &str) -> Option<DiscoveryMode> {
+    let anonymous = client_id
+        .strip_prefix("adapter-pid-")
+        .is_some_and(|pid| pid.parse::<u32>().is_ok());
+    if anonymous && reg.client_discovery_mode(client_id).is_none() {
+        // Resolve from the live registry, independently of the named client
+        // that bootstrapped the shared host.
+        let (mode, _) = resolve_mode_from(
+            None,
+            None,
+            reg.discovery_mode.as_deref(),
+            reg.lazy_discovery,
+        );
+        Some(mode)
+    } else {
+        http_client_discovery_override(reg, client_id)
+    }
+}
+
 /// Resolve this client's discovery mode from a loaded registry + env. See
 /// [`resolve_mode_from`] for the precedence.
 fn discovery_mode_for(reg: &Registry, client_id: Option<&str>) -> DiscoveryMode {
@@ -3561,7 +3582,7 @@ fn resolve_adapter_caller(
                 tool_scope: Some(tool_scope),
                 scope: Some(scope),
             },
-            discovery: http_client_discovery_override(reg, client_id),
+            discovery: adapter_client_discovery_override(reg, client_id),
             profile: Some(profile),
         },
     )
@@ -26678,6 +26699,29 @@ mod tests {
         assert_eq!(resolve(&reg), Some(DiscoveryMode::Grouped));
         reg.set_client_discovery("c-claude-code", None);
         assert_eq!(resolve(&reg), Some(DiscoveryMode::Lazy));
+    }
+
+    #[test]
+    fn adapter_discovery_defaults_preserve_anonymous_and_explicit_choices() {
+        let mut reg = Registry::default();
+        reg.discovery_mode = Some("full".into());
+        let resolve = |reg: &Registry, id| resolve_adapter_caller(reg, id, None, None).1.discovery;
+        assert_eq!(resolve(&reg, "adapter-pid-123"), Some(DiscoveryMode::Full));
+        reg.discovery_mode = Some("lazy".into());
+        assert_eq!(resolve(&reg, "adapter-pid-123"), Some(DiscoveryMode::Lazy));
+        assert_eq!(
+            resolve(&reg, "adapter-pid-not-a-number"),
+            Some(DiscoveryMode::Lazy)
+        );
+        assert_eq!(resolve(&reg, "unknown-client"), Some(DiscoveryMode::Lazy));
+        assert_eq!(resolve(&reg, "claude-code"), Some(DiscoveryMode::Full));
+        reg.set_client_discovery("adapter-pid-123", Some("grouped"));
+        assert_eq!(
+            resolve(&reg, "adapter-pid-123"),
+            Some(DiscoveryMode::Grouped)
+        );
+        reg.set_client_discovery("unknown-client", Some("full"));
+        assert_eq!(resolve(&reg, "unknown-client"), Some(DiscoveryMode::Full));
     }
 
     /// SBS-866: route_of is authoritative; an override-renamed team tool must not

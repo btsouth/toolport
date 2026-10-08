@@ -62,7 +62,8 @@ entry restores Auto; this needs no schema migration (registry v3 stays v3).
 unless an override exists for the bearer ID itself. Arbitrary bearer IDs
 stay conservative; Toolport does not guess capabilities from a display label.
 Identified connections use Auto instead of the global discovery default; the
-global mode and legacy boolean still apply to anonymous connections. An explicit
+global mode and legacy boolean still apply to anonymous connections, including
+stdio adapters with generated PID identities and no stable client ID. An explicit
 `TOOLPORT_DISCOVERY` on a standalone stdio gateway still wins; shared daemon
 sessions resolve their per-client choice or Auto.
 
