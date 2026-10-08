@@ -389,6 +389,20 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: powershell -ExecutionPolicy Bypass -File scripts/smoke-headless.ps1
 
+      # Approval OS toasts use desktop-only APIs. Headless checks cannot compile
+      # the Windows/macOS notification branches.
+      - name: Install frontend dependencies for desktop approval checks
+        if: matrix.os != 'ubuntu-22.04'
+        run: npm ci
+
+      - name: Build frontend assets for desktop approval checks
+        if: matrix.os != 'ubuntu-22.04'
+        run: npm run build
+
+      - name: Compile desktop approval notifications (Windows and macOS)
+        if: matrix.os != 'ubuntu-22.04'
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --lib
+
       # scripts/install.ps1 is piped into `iex` from a pinned commit, so a
       # regression in asset selection, checksum enforcement, or the silent-install
       # flag reaches users with no build step in between. Nothing else in CI runs

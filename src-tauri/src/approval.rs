@@ -498,7 +498,18 @@ pub fn try_decide_once(
     desc: Option<EndpointDescriptor>,
     req: &mut ApprovalRequest,
 ) -> BrokerAttempt {
-    use std::io::{BufRead, BufReader, Write};
+    try_decide_once_with_cancel(desc, req, None)
+}
+
+/// Preserve broker outcome and retry semantics while withdrawing a cancelled call.
+pub fn try_decide_once_with_cancel(
+    desc: Option<EndpointDescriptor>,
+    req: &mut ApprovalRequest,
+    cancel: Option<&crate::downstream::CancelContext>,
+) -> BrokerAttempt {
+    if cancel.is_some_and(crate::downstream::CancelContext::is_cancelled) {
+        return BrokerAttempt::Decided(ApprovalDecision::Denied);
+    }
     let Some(desc) = desc else {
         return BrokerAttempt::Unreachable;
     };
@@ -508,8 +519,39 @@ pub fn try_decide_once(
     let Ok(mut stream) = dial_broker(&desc) else {
         return BrokerAttempt::Unreachable;
     };
+    let withdrawal = match stream.try_clone() {
+        Ok(stream) => stream,
+        Err(_) => return BrokerAttempt::Unreachable,
+    };
+    let _withdraw = cancel.map(|cancel| {
+        cancel.on_cancel(std::sync::Arc::new(move |_| match &withdrawal {
+            BrokerStream::Tcp(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            #[cfg(unix)]
+            BrokerStream::Unix(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }))
+    });
+    if cancel.is_some_and(crate::downstream::CancelContext::is_cancelled) {
+        return BrokerAttempt::Decided(ApprovalDecision::Denied);
+    }
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_read_timeout(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)));
+    let decision = exchange_approval_request(req, stream);
+    if cancel.is_some_and(crate::downstream::CancelContext::is_cancelled) {
+        BrokerAttempt::Decided(ApprovalDecision::Denied)
+    } else {
+        decision
+    }
+}
+
+fn exchange_approval_request(
+    req: &ApprovalRequest,
+    mut stream: impl io::Read + io::Write,
+) -> BrokerAttempt {
+    use std::io::{BufRead, BufReader, Read};
     let Ok(line) = serde_json::to_string(req) else {
         // We connected but can't serialize our own request: not a reachability problem, so
         // don't spin on retry. Fail closed.
@@ -521,7 +563,7 @@ pub fn try_decide_once(
     }
     let _ = stream.flush();
     let mut resp = String::new();
-    match BufReader::new(stream).read_line(&mut resp) {
+    match BufReader::new(stream).take(4096).read_line(&mut resp) {
         // Connected and the peer closed with no answer: not a healthy broker. No human was
         // shown a prompt (the broker's pre-prompt reject paths close silently), so re-dial.
         Ok(0) => BrokerAttempt::Unreachable,
@@ -583,6 +625,50 @@ pub fn request_human_decision(mut req: ApprovalRequest) -> ApprovalDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p08_cancel_aware_broker_keeps_write_failure_unreachable_and_read_timeout_no_response() {
+        struct FailingStream {
+            write_fails: bool,
+        }
+        impl io::Write for FailingStream {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.write_fails {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl io::Read for FailingStream {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::TimedOut.into())
+            }
+        }
+        let req = ApprovalRequest {
+            token: "tok".into(),
+            id: "p08-outcomes".into(),
+            client: None,
+            server: "s".into(),
+            tool: "t".into(),
+            reason: ApprovalReason::Destructive,
+            arguments: serde_json::json!({}),
+            tool_fingerprint: None,
+            url_elicitation: None,
+            pii_release: None,
+        };
+        assert!(matches!(
+            exchange_approval_request(&req, FailingStream { write_fails: true }),
+            BrokerAttempt::Unreachable
+        ));
+        assert!(matches!(
+            exchange_approval_request(&req, FailingStream { write_fails: false }),
+            BrokerAttempt::Decided(ApprovalDecision::Timeout)
+        ));
+    }
 
     #[test]
     fn gate_is_off_when_disabled() {
