@@ -177,7 +177,9 @@ fn corrupt_and_future_registries_refuse_startup_without_losing_bytes() {
 
 #[test]
 fn unreadable_bytes_never_default_or_overwrite_from_last_good() {
+    let _data_dir_lock = registry::data_dir_test_lock();
     let scratch = Scratch::new("unreadable-bytes");
+    let _data_dir = registry::DataDirOverride::set(&scratch.0);
     let path = scratch.0.join("registry.json");
     let original = [0xff, 0xfe, 0x80];
     std::fs::write(&path, original).unwrap();
