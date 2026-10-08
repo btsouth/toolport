@@ -1102,22 +1102,10 @@ mod tests {
             crate::catalog::entry_identity(installed).as_deref(),
             Some(identity.as_str())
         );
-        for (state, _status, existing) in [
-            (
-                "normal",
-                crate::catalog::RegistryStatus::NotQueried,
-                HashSet::new(),
-            ),
-            (
-                "outage",
-                crate::catalog::RegistryStatus::Unavailable,
-                HashSet::new(),
-            ),
-            (
-                "installed",
-                crate::catalog::RegistryStatus::NotQueried,
-                HashSet::from([identity]),
-            ),
+        for (state, existing) in [
+            ("normal", HashSet::new()),
+            ("outage", HashSet::new()),
+            ("installed", HashSet::from([identity])),
         ] {
             page.render_search(
                 crate::catalog::CatalogSearch {
@@ -1127,6 +1115,8 @@ mod tests {
                 existing,
                 None,
             );
+            page.search
+                .set_text(if state == "outage" { "github" } else { "" });
             assert_eq!(
                 labels(&page.list)
                     .iter()
