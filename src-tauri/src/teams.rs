@@ -3418,7 +3418,16 @@ pub fn stage_team_config(
     if review.accepted.is_empty() {
         seed_member_review(reg, team_id, config, &mut review);
     }
-    let latest = review_items(config);
+    let mut latest = review_items(config);
+    // The merge drops unusable, blocked and duplicate definitions. They revoke
+    // prior consent just like removal, rather than offering to keep an old copy.
+    latest.retain(|key, value| {
+        !key.starts_with("server:")
+            || matches!(
+                classify_team_server(value, &tag_for(team_id)),
+                TeamClass::Ready(_) | TeamClass::Review(_)
+            )
+    });
     if latest.get("instructions") != review.latest.get("instructions") {
         review.instructions_version = version;
     }
@@ -3740,7 +3749,8 @@ fn decide_member_change(
 fn apply_accepted_instructions(team_id: &str) -> Result<(), String> {
     let path = crate::registry::resolved_path().ok_or("Could not resolve registry path")?;
     // Serialize desktop and daemon writers before reading the accepted content.
-    let _instructions = crate::registry::lock_at(&path.with_file_name("team-instructions"))?;
+    let _instructions = crate::registry::lock_at(&path.with_file_name("team-instructions"))
+        .map_err(|e| e.replace("registry", "team instructions file"))?;
     let reg = crate::registry::load()?;
     let Some(team) = reg.team.as_ref().filter(|team| team.team_id == team_id) else {
         return Ok(());
@@ -8465,7 +8475,7 @@ mod member_review_tests {
     }
 
     #[test]
-    fn member_review_round2_removal_is_immediate_and_readd_needs_consent() {
+    fn member_review_removal_or_invalid_definition_revokes_consent() {
         let mut reg = registry();
         reg.version = 3;
         let cfg = config("first");
@@ -8484,8 +8494,14 @@ mod member_review_tests {
         personal.enabled = false;
         reg.servers.push(personal.clone());
         crate::local_auth::bind(&mut reg, &managed, &personal).unwrap();
-        let removed = json!({"servers":[]});
-        for version in [2, 5] {
+        let duplicate = json!({"servers":[cfg["servers"][1].clone(), cfg["servers"][1].clone()]});
+        let invalid = json!({"servers":[{"id":"remote", "transport":"http", "url":"invalid"}]});
+        let unusable = json!({"servers":[{"id":"remote", "transport":"stdio"}]});
+        for (index, removed) in [json!({"servers":[]}), duplicate, invalid, unusable]
+            .into_iter()
+            .enumerate()
+        {
+            let version = 2 + index as i64 * 3;
             stage_team_config(&mut reg, "review-team", &removed, version, &[]).unwrap();
             let review = member_review(&reg).unwrap();
             assert!(!review.pending.contains_key("server:remote"));
@@ -8894,22 +8910,24 @@ mod member_review_tests {
         let hash = member_review(&reg).unwrap().pending["server:remote"]
             .hash
             .clone();
-        let sync = SYNC_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            tx.send(review_team_change("server:remote", &hash, true))
-                .unwrap();
+        std::thread::scope(|scope| {
+            let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+            let owner = scope.spawn(move || {
+                let _sync = SYNC_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                locked_tx.send(()).unwrap();
+                // Release only when the real decision path has completed. The test
+                // runner's process watchdog bounds a regression that deadlocks here.
+                done_rx.recv().unwrap();
+            });
+            locked_rx.recv().unwrap();
+            let result = review_team_change("server:remote", &hash, true);
+            done_tx.send(()).unwrap();
+            owner.join().unwrap();
+            result.unwrap();
         });
-        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
-        drop(sync);
-        worker.join().unwrap();
-        assert!(
-            result.is_ok(),
-            "member decision waited for the network sync lock"
-        );
-        result.unwrap().unwrap();
     }
 
     #[test]
