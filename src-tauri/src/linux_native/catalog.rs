@@ -1122,8 +1122,12 @@ mod tests {
                 existing,
                 None,
             );
+            window.present();
             page.search
                 .set_text(if state == "outage" { "github" } else { "" });
+            // Programmatic text changes do not always emit SearchEntry's user
+            // search signal. Exercise its connected handlers explicitly.
+            page.search.emit_by_name::<()>("search-changed", &[]);
             assert_eq!(
                 labels(&page.list)
                     .iter()
@@ -1132,7 +1136,6 @@ mod tests {
                 usize::from(state == "installed")
             );
             assert!(!page.feedback.is_visible());
-            window.present();
             let main_loop = gtk::glib::MainLoop::new(None, false);
             let frames = Rc::new(Cell::new(0));
             let observed_frames = frames.clone();
