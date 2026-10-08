@@ -4,8 +4,13 @@ import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
 import { openExternal } from "@/lib/openUrl";
 import { addCatalogServer, listStacks, popularCatalog, searchCatalog } from "@/lib/api";
+import {
+  catalogIdentity,
+  catalogInstalledIdentities,
+  installed,
+} from "@/lib/catalogIdentity";
 import { addCollection } from "@/lib/collections";
-import type { CatalogEntry, Registry, Stack } from "@/lib/types";
+import type { CatalogEntry, CatalogSearch, Registry, Stack } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -38,6 +43,8 @@ export function CatalogView({ registry, onAdded }: Props) {
   // A failed live search is distinct from a genuinely empty result: without this a
   // network/registry failure would render as an innocent "no results for …".
   const [searchError, setSearchError] = useState(false);
+  const [registryStatus, setRegistryStatus] =
+    useState<CatalogSearch["registryStatus"]>("notQueried");
   const [searchNonce, setSearchNonce] = useState(0);
   const [collections, setCollections] = useState<Stack[]>([]);
   const [collectionsLoading, setCollectionsLoading] = useState(true);
@@ -45,7 +52,7 @@ export function CatalogView({ registry, onAdded }: Props) {
   const [collectionBusy, setCollectionBusy] = useState<string | null>(null);
   const [configEntry, setConfigEntry] = useState<CatalogEntry | null>(null);
 
-  const have = new Set((registry?.servers ?? []).map((s) => s.name.toLowerCase()));
+  const have = new Set((registry?.servers ?? []).flatMap(catalogInstalledIdentities));
 
   const reloadCollections = useCallback(() => {
     setCollectionsLoading(true);
@@ -80,16 +87,21 @@ export function CatalogView({ registry, onAdded }: Props) {
     if (!q) {
       setResults(null);
       setSearchError(false);
+      setRegistryStatus("notQueried");
       setLoading(false);
       return;
     }
     setLoading(true);
     setSearchError(false);
+    setRegistryStatus("notQueried");
     let cancelled = false;
     const t = setTimeout(() => {
       searchCatalog(q)
         .then((r) => {
-          if (!cancelled) setResults(r);
+          if (!cancelled) {
+            setResults(r.entries);
+            setRegistryStatus(r.registryStatus);
+          }
         })
         .catch(() => {
           // Distinguish a failed search from an empty one so we can offer a retry
@@ -146,7 +158,11 @@ export function CatalogView({ registry, onAdded }: Props) {
    * the user at the credential steps for the ones that need them. */
   async function setupCollection(collection: Stack) {
     setCollectionBusy(collection.id);
-    const existing = new Set((registry?.servers ?? []).map((s) => s.name.toLowerCase()));
+    const existing = new Set(
+      collection.servers
+        .filter((entry) => installed(have, entry))
+        .map((entry) => entry.name.toLowerCase()),
+    );
     try {
       const { added, needSetup } = await addCollection(
         collection.servers,
@@ -174,7 +190,7 @@ export function CatalogView({ registry, onAdded }: Props) {
   }
 
   const shown = results ?? popular;
-  const browsing = results === null;
+  const browsing = !query.trim();
 
   // Browse view: group the popular picks into category sections. Search results
   // stay flat (they're query-driven, including the long-tail registry).
@@ -195,9 +211,9 @@ export function CatalogView({ registry, onAdded }: Props) {
 
   const card = (entry: CatalogEntry) => (
     <CatalogCard
-      key={`${entry.source}:${entry.name}`}
+      key={`${entry.source}:${entry.name}:${catalogIdentity(entry)}`}
       entry={entry}
-      added={have.has(entry.name.toLowerCase())}
+      added={installed(have, entry)}
       busy={busy === entry.name}
       onAdd={() => add(entry)}
     />
@@ -221,8 +237,12 @@ export function CatalogView({ registry, onAdded }: Props) {
 
       <div className="flex items-center justify-between text-xs text-muted-foreground">
         <span>
-          {results !== null
-            ? `${shown.length} result${shown.length === 1 ? "" : "s"} (popular picks first, then the MCP Registry)`
+          {!browsing
+            ? loading
+              ? "Searching the MCP Registry…"
+              : registryStatus === "unavailable" || registryStatus === "timedOut"
+                ? `${shown.length} curated match${shown.length === 1 ? "" : "es"}`
+                : `${shown.length} result${shown.length === 1 ? "" : "s"} (popular picks first, then the MCP Registry)`
             : "Popular servers"}
         </span>
         {results !== null && shown.length > 0 && (
@@ -231,6 +251,29 @@ export function CatalogView({ registry, onAdded }: Props) {
           </button>
         )}
       </div>
+
+      {!loading &&
+        (registryStatus === "unavailable" || registryStatus === "timedOut") && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5"
+          >
+            <p className="text-sm">
+              {registryStatus === "timedOut"
+                ? "The live MCP Registry took too long to respond."
+                : "The live MCP Registry is unavailable."}{" "}
+              Showing curated matches only.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setSearchNonce((n) => n + 1)}
+            >
+              Try again
+            </Button>
+          </div>
+        )}
 
       {browsing &&
         (collectionsLoading ? (
@@ -321,7 +364,9 @@ export function CatalogView({ registry, onAdded }: Props) {
             >
               <p className="font-medium">
                 {results !== null
-                  ? `No catalog results for "${query}"`
+                  ? registryStatus === "unavailable" || registryStatus === "timedOut"
+                    ? `No curated matches for "${query}"`
+                    : `No catalog results for "${query}"`
                   : "No popular servers available"}
               </p>
               <p className="max-w-md text-sm text-muted-foreground">
@@ -436,7 +481,7 @@ function CollectionCard({
   onSetup: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const missing = collection.servers.filter((e) => !haveNames.has(e.name.toLowerCase()));
+  const missing = collection.servers.filter((e) => !installed(haveNames, e));
   const allAdded = missing.length === 0;
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-ring/20 bg-muted/20 p-3">
@@ -452,7 +497,7 @@ function CollectionCard({
           <span
             key={e.name}
             className={`rounded px-1.5 py-0.5 text-[11px] ${
-              haveNames.has(e.name.toLowerCase())
+              installed(haveNames, e)
                 ? "bg-success/10 text-success"
                 : "bg-muted text-muted-foreground"
             }`}

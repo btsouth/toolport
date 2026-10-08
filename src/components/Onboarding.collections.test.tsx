@@ -1,8 +1,8 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { listStacks } from "@/lib/api";
-import type { Registry, Stack } from "@/lib/types";
+import { addCatalogServer, listStacks } from "@/lib/api";
+import type { CatalogEntry, Registry, Stack } from "@/lib/types";
 import { Onboarding } from "./Onboarding";
 
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -10,6 +10,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return {
     ...actual,
     listStacks: vi.fn(),
+    addCatalogServer: vi.fn(),
   };
 });
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -71,6 +72,54 @@ describe("Onboarding collection loading", () => {
     expect(screen.queryByText("Collections couldn't load")).not.toBeInTheDocument();
     expect(listStacks).toHaveBeenCalledTimes(2);
   });
+
+  it.each([true, false])(
+    "matches Collection installs by launch identity: %s",
+    async (match) => {
+      const entry: CatalogEntry = {
+        name: "Memory",
+        description: "Memory tools",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "memory-mcp"],
+        url: null,
+        envKeys: [],
+        source: "curated",
+        homepage: null,
+        category: "Local tools",
+      };
+      vi.mocked(listStacks).mockResolvedValue([{ ...collection, servers: [entry] }]);
+      vi.mocked(addCatalogServer).mockResolvedValue(registry);
+      const user = userEvent.setup();
+      render(
+        <Onboarding
+          {...props}
+          registry={{
+            ...registry,
+            servers: [
+              {
+                id: "installed",
+                name: match ? "My memory" : "Memory",
+                enabled: false,
+                transport: "stdio",
+                command: "npx",
+                args: [match ? "memory-mcp@2" : "other-mcp"],
+                env: [],
+                url: null,
+                source: "manual",
+              },
+            ],
+          }}
+        />,
+      );
+      await user.click(await screen.findByRole("button", { name: "Developer" }));
+      const label = screen.getByText("Memory").parentElement!;
+      expect(label.querySelector("svg.text-success") !== null).toBe(match);
+      await user.click(screen.getByRole("button", { name: "Add this Collection" }));
+      await waitFor(() => expect(props.onRegistryChange).toHaveBeenCalled());
+      expect(addCatalogServer).toHaveBeenCalledTimes(match ? 0 : 1);
+    },
+  );
 
   it("shows a skeleton while loading and stays quiet for an empty collection catalog", async () => {
     const pending = deferred<Stack[]>();

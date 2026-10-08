@@ -2162,10 +2162,10 @@ fn list_stacks() -> Vec<stacks::Stack> {
 /// Search the official MCP Registry for servers to add. Network call, so it runs
 /// on a blocking worker. Empty query returns popular/recent servers.
 #[tauri::command]
-async fn search_catalog(query: String) -> Result<Vec<catalog::CatalogEntry>, String> {
+async fn search_catalog(query: String) -> Result<catalog::CatalogSearch, String> {
     tauri::async_runtime::spawn_blocking(move || catalog::search(&query))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 /// Which of a server's env keys currently have a value stored in the keychain.
