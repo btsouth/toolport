@@ -13817,7 +13817,10 @@ mod tests {
         let _holder = callback.lock().unwrap();
         // Waiting for this guard would deadlock: a listener may hold it across I/O.
         transport.refresh_before_send().unwrap();
-        assert_eq!(transport.auth.lock().unwrap().as_deref(), Some("pending-token"));
+        assert_eq!(
+            transport.auth.lock().unwrap().as_deref(),
+            Some("pending-token")
+        );
     }
 
     #[test]
