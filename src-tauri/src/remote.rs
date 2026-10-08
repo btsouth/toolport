@@ -2425,6 +2425,10 @@ mod tests {
                     )
                     .unwrap();
                     secrets::set_secret("rotation", secrets::HTTP_AUTH_KEY, "token-0").unwrap();
+                    assert_eq!(
+                        current_credential("rotation").unwrap().as_deref(),
+                        Some("token-0")
+                    );
                     transport = authed_transport(
                         &format!("http://{}/", server.server_addr()),
                         Some("token-0".into()),
