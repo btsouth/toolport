@@ -3004,6 +3004,7 @@ mod tests {
     fn reviewed_legacy_secret_arguments_match_without_masked_comparison() {
         let mut registry = Registry::default();
         let mut raw = server("one");
+        raw.command = Some("one".into());
         raw.args = vec!["--api-key".into(), "synthetic-private-argument".into()];
         registry.add_server(raw);
         let fixture = MoveFixture::new(&registry);
