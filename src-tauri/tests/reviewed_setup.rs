@@ -10,11 +10,11 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        // Pin a private image so another worktree cannot replace the gateway mid-test.
-        // The override is for the old-image negative control in the review harness.
-        let gateway = std::env::var_os("TOOLPORT_REVIEWED_TEST_GATEWAY")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_toolport-gateway")));
+        let gateway = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX));
         let dir = std::env::temp_dir().join(format!(
             "toolport-reviewed-setup-{}-{}",
             std::process::id(),
@@ -41,7 +41,7 @@ impl Fixture {
             "CLAUDE_CONFIG_DIR",
             Some(fixture.dir.join("client").into_os_string()),
         );
-        fixture.set("APPIMAGE", Some("synthetic-reviewed-fixture".into()));
+        fixture.set("APPIMAGE", None);
         fixture.set(
             "TOOLPORT_DATA_DIR",
             Some(fixture.dir.join("data").into_os_string()),
@@ -101,8 +101,56 @@ fn migrate_fixture(
         .expect("the cold first connect must succeed")
 }
 
+// Run the acceptance test beside private gateway and mock images. Both read-only
+// lookup and config publication then exercise the normal packaged resolver.
+fn run_private_fixture() -> bool {
+    if std::env::var_os("TOOLPORT_REVIEWED_CHILD").is_some() {
+        return false;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "toolport-reviewed-runtime-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let child = dir.join(format!("reviewed-setup{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(std::env::current_exe().unwrap(), &child).unwrap();
+    let gateway = std::env::var_os("TOOLPORT_REVIEWED_TEST_GATEWAY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_toolport-gateway")));
+    std::fs::copy(
+        gateway,
+        dir.join(format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
+    std::fs::copy(
+        env!("CARGO_BIN_EXE_mock-mcp-server"),
+        dir.join(format!("mock-mcp-server{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
+    let status = std::process::Command::new(&child)
+        .env("TOOLPORT_REVIEWED_CHILD", "1")
+        .args([
+            "--exact",
+            "reviewed_setup_real_gateway_and_failed_launch",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .status()
+        .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(status.success(), "private cold-connect fixture failed");
+    true
+}
+
 #[test]
 fn reviewed_setup_real_gateway_and_failed_launch() {
+    if run_private_fixture() {
+        return;
+    }
     let _lock = registry::data_dir_test_lock();
     let fixture = Fixture::new();
     let original =
@@ -122,7 +170,12 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
 
     // Start again with an empty registry so the failed import cannot affect this cutover.
     registry::save(&registry::Registry::default()).unwrap();
-    let mock = env!("CARGO_BIN_EXE_mock-mcp-server");
+    let mock_path = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("mock-mcp-server{}", std::env::consts::EXE_SUFFIX));
+    let mock = mock_path.to_str().unwrap();
     std::fs::write(fixture.config(),json!({"mcpServers":{"alpha":{"command":mock},"beta":{"command":mock},"kept":{"command":"native-only","env":{"PAT":"synthetic-native-secret"},"custom":true}}}).to_string()).unwrap();
     registry::update(|reg| {
         let mut unrelated: registry::ServerEntry = serde_json::from_value(json!({"id":"unrelated","name":"Unrelated","enabled":true,"transport":"stdio","command":"/not-a-real-unrelated-command","args":[],"env":[]})).unwrap();
