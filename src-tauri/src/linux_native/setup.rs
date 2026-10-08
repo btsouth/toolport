@@ -629,6 +629,61 @@ mod tests {
 
     #[test]
     #[ignore = "requires isolated GTK display"]
+    fn credential_state_tracks_keychain_choice() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        review(
+            &parent,
+            "Credential choice fixture",
+            vec![SetupItem {
+                key: "one".into(),
+                name: "One".into(),
+                transport: "stdio".into(),
+                command: Some("one".into()),
+                args: vec![],
+                url: None,
+                env_keys: vec!["PORT".into()],
+                is_new: true,
+                credentials: vec![crate::registry_controller::CredentialReview {
+                    key: "PORT".into(),
+                    secret: false,
+                    present: true,
+                }],
+                unsupported: None,
+            }],
+            "Fixture",
+            "Connect",
+            |_, _, _| Err("fixture".into()),
+            || {},
+            None,
+        );
+        let window = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Credential choice fixture"))
+            .unwrap();
+        let widgets = descendants(window.upcast_ref());
+        let choice = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::CheckButton>())
+            .find(|c| c.label().as_deref() == Some("Keep PORT in keychain"))
+            .unwrap();
+        assert!(!choice.is_active());
+        choice.set_active(true);
+        assert!(widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .any(|label| label.text() == "Found, goes to keychain"));
+        choice.set_active(false);
+        assert!(!widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .any(|label| label.text() == "Found, goes to keychain"));
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
     fn successful_review_shows_restart_and_only_done() {
         adw::init().unwrap();
         let parent = gtk::Window::new();
