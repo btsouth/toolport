@@ -12,7 +12,7 @@ license=('MIT')
 # to the Secret Service over D-Bus rather than linking libsecret, and namcap
 # confirms neither binary links it. A provider is a runtime choice, and without
 # one Toolport falls back to its own encrypted file backend.
-depends=('gtk4' 'libadwaita' 'glib2' 'dbus' 'hicolor-icon-theme')
+depends=('coreutils' 'util-linux' 'gtk4' 'libadwaita' 'glib2' 'dbus' 'hicolor-icon-theme')
 optdepends=('gnome-keyring: store credentials in the system keyring instead of the encrypted file backend'
             'kwallet: same, on KDE')
 makedepends=('cargo' 'desktop-file-utils' 'appstream' 'zip')

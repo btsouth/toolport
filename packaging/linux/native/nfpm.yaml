@@ -81,6 +81,8 @@ overrides:
       preremove: packaging/linux/native/preremove-deb.sh
     # Ubuntu 24.04 ABI floor; GTK/adwaita pull the rendering dependencies.
     depends:
+      - coreutils
+      - util-linux
       - libgtk-4-1 (>= 4.14)
       - libadwaita-1-0 (>= 1.5)
       - libglib2.0-0t64 (>= 2.80)
@@ -94,6 +96,8 @@ overrides:
     scripts:
       preremove: packaging/linux/native/preremove-rpm.sh
     depends:
+      - coreutils
+      - util-linux
       - gtk4 >= 4.14
       - libadwaita >= 1.5
       - glib2 >= 2.80
