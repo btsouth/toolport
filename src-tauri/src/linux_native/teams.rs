@@ -1565,6 +1565,7 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn member_review_native_shows_diff_labels_and_both_decisions() {
         adw::init().unwrap();
         let mut registry = crate::registry::Registry::default();

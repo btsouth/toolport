@@ -162,7 +162,7 @@ jobs:
       # The native shell deliberately skips WebKit/Tauri. Ubuntu 24.04 provides
       # GTK >= 4.10 and libadwaita >= 1.4, the floor for adaptive navigation.
       - name: Install GTK build dependencies
-        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev libgtk-4-dev libadwaita-1-dev
+        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev libgtk-4-dev libadwaita-1-dev xvfb xauth dbus-daemon
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -178,6 +178,23 @@ jobs:
         run: >-
           cargo test --manifest-path src-tauri/Cargo.toml --no-default-features
           --features gtk-desktop --lib linux_native::
+
+      - name: Test Teams dialogs in isolated processes
+        env:
+          GSK_RENDERER: cairo
+          GTK_A11Y: none
+        run: |
+          for case in \
+            member_review_native_shows_diff_labels_and_both_decisions \
+            member_review_native_keeps_remaining_decisions_open \
+            share_preview_explains_each_selection_and_its_route \
+            share_preview_widgets_show_allowlisted_definitions
+          do
+            xvfb-run -a dbus-run-session -- cargo test \
+              --manifest-path src-tauri/Cargo.toml --no-default-features \
+              --features gtk-desktop --lib "linux_native::teams::tests::$case" \
+              -- --exact --ignored
+          done
 
   clippy:
     needs: changes
