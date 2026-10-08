@@ -34335,7 +34335,7 @@ mod tests {
     }
 
     #[test]
-    fn p08_http_session_delete_withdraws_approval_and_late_allow_cannot_dispatch() {
+    fn p10c_http_session_delete_records_withdrawal_and_late_allow_cannot_dispatch() {
         let env = DataDirTestEnv::new("p08-delete-approval");
         let state = http_state(false);
         state.registry.lock().unwrap().confirm_destructive = true;
@@ -34418,6 +34418,10 @@ mod tests {
             .get("result")
             .is_some());
         broker.join().unwrap();
+        let entries = audit::read_all().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["decision"], "withdrawn");
+        assert_eq!(audit::stats().unwrap()["total"], 0);
     }
 
     #[test]
@@ -34487,7 +34491,8 @@ mod tests {
     }
 
     #[test]
-    fn p08_modern_approval_cannot_be_allowed_after_owner_close() {
+    fn p10c_modern_approval_records_owner_close_once() {
+        let _env = DataDirTestEnv::new("p10c-modern-withdrawal");
         let registry = downstream::CancelRegistry::new();
         assert!(registry.begin_client_request("modern-approval".into()));
         let _cancel = ApprovalCancelGuard::enter(Some(registry.context("modern-approval".into())));
@@ -34516,6 +34521,11 @@ mod tests {
             ),
             ModernHitlPoll::Missing
         ));
+        let entries = audit::read_all().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["decision"], "withdrawn");
+        assert_eq!(entries[0]["client"], "p08-client");
+        assert_eq!(audit::stats().unwrap()["total"], 0);
     }
 
     #[test]

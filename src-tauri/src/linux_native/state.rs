@@ -1007,6 +1007,26 @@ mod tests {
     }
 
     #[test]
+    fn p10c_approval_events_are_visible_without_inflating_calls_or_savings() {
+        let mut entries = ["denied", "no_response", "withdrawn", "stale_state", "approved"]
+            .into_iter()
+            .map(|decision| serde_json::json!({
+                "kind":"approval", "decision":decision, "server":"github",
+                "tool":"delete_issue", "ok":false, "heldMs":90000,
+                "client":"client:real", "clientLabel":"Claude Code 2.1"
+            }))
+            .collect::<Vec<_>>();
+        entries.push(serde_json::json!({"server":"github", "tool":"list", "ok":true, "durationMs":10}));
+        entries.push(serde_json::json!({"server":"github", "tool":"list", "ok":false, "durationMs":30}));
+        let snapshot = ActivitySnapshot::from_entries(entries, 100);
+        assert_eq!(snapshot.recent.len(), 7);
+        assert_eq!(snapshot.call_count, 2);
+        assert_eq!(snapshot.error_count, 1);
+        assert_eq!(snapshot.average_duration_ms, Some(20));
+        assert_eq!(snapshot.tokens_saved, 0);
+    }
+
+    #[test]
     fn blank_activity_servers_use_the_qualified_tool_prefix() {
         let snapshot = ActivitySnapshot::from_entries(
             vec![serde_json::json!({

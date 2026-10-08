@@ -76,6 +76,34 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+it("p10c shows approval outcomes without treating them as call errors", async () => {
+  const outcomes = [
+    ["denied", "Denied"],
+    ["no_response", "Timed out"],
+    ["withdrawn", "Withdrawn"],
+    ["stale_state", "Stale approval"],
+    ["approved", "Approved"],
+  ];
+  getAuditLog.mockResolvedValue([
+    ...outcomes.map(([decision], index) => ({
+      ...entry({ ts: 1700000010000 + index, tool: `approval_${index}`, ok: false }),
+      kind: "approval",
+      decision,
+      heldMs: 90000,
+      durationMs: undefined,
+    })),
+    ...initialLog,
+  ]);
+  getAuditStats.mockResolvedValue({ total: 2, errors: 1, errorRate: 0.5, servers: [] });
+  render(<ActivityView refreshKey={0} registry={null} />);
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  for (const [, label] of outcomes) expect(screen.getByText(label)).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /errors only/i }));
+  expect(screen.getByText("merge_pr")).toBeInTheDocument();
+  for (const [, label] of outcomes) expect(screen.queryByText(label)).not.toBeInTheDocument();
+});
+
 it("pauses Activity polling while hidden and resumes when visible", async () => {
   const view = render(<ActivityView refreshKey={0} registry={null} />);
   await act(async () => {});
