@@ -61,6 +61,17 @@ class RemovalHooks(unittest.TestCase):
         self.assertIn("cleanup failed for bob", result.stderr)
         self.assertIn("Removal will continue", result.stderr)
 
+    def test_su_fallback_has_no_login_shell_and_handles_spaces(self):
+        self.accounts(["alice"])
+        (self.root / "alice/.config/Toolport").mkdir(parents=True)
+        # Model su's shell argument forwarding, without switching a real account.
+        su = self.bin / "su"
+        su.write_text('#!/bin/sh\ntest "$1" = -s && test "$2" = /bin/sh && test "$3" = -c && test "$5" = -- || exit 99\ncmd=$4\nshift 6\nexec /bin/sh -c "$cmd" "$@"\n')
+        su.chmod(0o755)
+        self.helper.write_text(self.helper.read_text().replace("command -v runuser >/dev/null 2>&1", "false"))
+        self.run_script(self.helper)
+        self.assertIn("alice|unset|--disconnect-all", self.calls.read_text())
+
     def test_no_data_directory_does_nothing(self):
         self.accounts(["empty"])
         self.run_script(self.helper)
