@@ -34609,8 +34609,8 @@ mod tests {
             None,
             "team_slack__delete",
             args,
-            retry,
             None,
+            retry,
             CallOpts {
                 direct: true,
                 shape: true,
