@@ -14497,11 +14497,13 @@ mod tests {
         let mut transport = HttpTransport::with_auth_refresh(
             "http://127.0.0.1:1/mcp",
             Some("pending-token".into()),
-            Some(Box::new(|_| panic!("a held callback must not be invoked"))),
+            Some(Box::new(|_, _| {
+                panic!("a held auth gate must skip the callback")
+            })),
         );
-        let callback = transport.refresh.as_ref().unwrap().clone();
-        let _holder = callback.lock().unwrap();
-        // Waiting for this guard would deadlock: a listener may hold it across I/O.
+        let gate = Arc::clone(&transport.auth_gate);
+        let _holder = gate.busy.lock().unwrap();
+        // Waiting for this guard would deadlock; pre-send refresh must skip it.
         transport.refresh_before_send().unwrap();
         assert_eq!(
             transport.auth.lock().unwrap().as_deref(),
