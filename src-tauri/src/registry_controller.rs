@@ -830,14 +830,8 @@ fn finish_client_config_mutation(
                 .into(),
         );
         if let Some(file) = &outcome.recovery_path {
-            if let Err(error) = clients::record_config_capture_conflict(
-                file,
-                &receipt.target,
-                outcome.revision.as_deref(),
-            ) {
-                outcome.warnings.push(format!(
-                    "could not record unavailable exact rollback: {error}"
-                ));
+            if let Err(error) = clients::record_config_capture_conflict(file, &receipt.target, outcome.revision.as_deref()) {
+                outcome.warnings.push(format!("could not record unavailable exact rollback: {error}"));
             }
         }
     }
@@ -3145,10 +3139,7 @@ mod tests {
                 .unwrap()
                 .exact_rollback
         );
-        let snapshot: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(result.outcome.recovery_path.as_ref().unwrap()).unwrap(),
-        )
-        .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(result.outcome.recovery_path.as_ref().unwrap()).unwrap()).unwrap();
         assert_eq!(snapshot["exactEligible"], false);
         disconnect_client("claude-code").unwrap();
         assert_eq!(json_file(&fixture.claude())["session"], 2);

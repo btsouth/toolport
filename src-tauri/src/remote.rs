@@ -2432,9 +2432,6 @@ mod tests {
 
     #[test]
     fn current_credential_retains_last_token_after_failed_access_save() {
-        let _data = crate::registry::DataDirTestEnv::new(
-            "current_credential_retains_last_token_after_failed_access_save",
-        );
         secrets::tests::with_isolated_vault(|| {
             let endpoint = RotatingEndpoint::new();
             endpoint.seed();
@@ -2461,8 +2458,8 @@ mod tests {
                 current_credential("rotation").unwrap().as_deref(),
                 Some("peer-token")
             );
+            assert!(current_credential(RESERVED_VAULT_NS).is_err());
         });
-        assert!(current_credential(RESERVED_VAULT_NS).is_err());
     }
 
     #[test]
