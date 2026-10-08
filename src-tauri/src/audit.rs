@@ -152,6 +152,7 @@ pub fn record_routed_call(
     error: Option<&str>,
     client: Option<&str>,
     client_name: Option<&str>,
+    client_label: Option<&str>,
     args_hash: Option<&str>,
     pii: Option<PiiPass>,
 ) {
@@ -166,6 +167,9 @@ pub fn record_routed_call(
         args_hash,
         pii,
     );
+    if let Some(label) = client_label.and_then(crate::approval::sanitize_client_label) {
+        entry["clientLabel"] = json!(label);
+    }
     if let Err(error) = crate::team_activity::record(reg, server_id, ok) {
         eprintln!("Toolport: Teams activity could not be persisted: {error}");
     }
@@ -307,16 +311,18 @@ fn decision_entry(
 /// Record a gated HITL decision (the human approved/denied it, it timed out, or the
 /// broker was unreachable). Replaces the flat `record_held` on the approval path so the
 /// audit can distinguish the outcomes. Hashes the arguments; never stores them raw.
+#[allow(clippy::too_many_arguments)]
 pub fn record_decision(
     server: &str,
     tool: &str,
     client: Option<&str>,
+    client_label: Option<&str>,
     reason: &str,
     decision: &str,
     args: &Value,
     held_ms: Option<u64>,
 ) {
-    write_line(&decision_entry(
+    let mut entry = decision_entry(
         server,
         tool,
         client,
@@ -324,7 +330,12 @@ pub fn record_decision(
         decision,
         &args_hash(args),
         held_ms,
-    ));
+    );
+    if let Some(label) = client_label.and_then(crate::approval::sanitize_client_label) {
+        entry["clientLabel"] = json!(label);
+    }
+    entry["serverId"] = json!(server);
+    write_line(&entry);
 }
 
 /// A stable SHA-256 (hex) of a call's arguments over a canonical JSON serialization
@@ -767,6 +778,7 @@ const CSV_COLUMNS: &[&str] = &[
     "piiReplaced",
     "piiIncomplete",
     "clientName",
+    "clientLabel",
 ];
 
 /// Render audit `entries` as CSV (RFC-4180-ish: CRLF rows, quoted cells, doubled
@@ -928,7 +940,7 @@ mod tests {
         })];
         let csv = to_csv(&entries);
         assert!(csv.starts_with(
-            "ts,server,tool,client,ok,held,kind,reason,decision,argsHash,durationMs,heldMs,action,error,piiReplaced,piiIncomplete,clientName\r\n"
+            "ts,server,tool,client,ok,held,kind,reason,decision,argsHash,durationMs,heldMs,action,error,piiReplaced,piiIncomplete,clientName,clientLabel\r\n"
         ));
         assert!(csv.contains("\"gh\""));
         assert!(csv.contains("\"search\""));
@@ -1117,7 +1129,9 @@ mod tests {
         );
         // This storage-content test must confirm its FIFO barrier before claiming
         // completion. It does not exercise the interactive reader's 500ms budget.
-        assert!(crate::telemetry::flush_for_test(std::time::Duration::from_secs(5)));
+        assert!(crate::telemetry::flush_for_test(
+            std::time::Duration::from_secs(5)
+        ));
         std::fs::write(done, "done").expect("signal sentinel append complete");
     }
 
@@ -1218,7 +1232,9 @@ mod tests {
             }
             // The parent reads only after this process exits, so land every queued
             // line here instead of relying on the writer's next interval.
-            assert!(crate::telemetry::flush_for_test(std::time::Duration::from_secs(5)));
+            assert!(crate::telemetry::flush_for_test(
+                std::time::Duration::from_secs(5)
+            ));
             return;
         }
 

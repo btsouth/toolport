@@ -215,12 +215,22 @@ export function PendingApprovals() {
                         </>
                       )}
                     </div>
-                    {a.client && (
-                      <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
-                        <Monitor className="size-3" />
-                        Requested by {a.client}
-                      </div>
-                    )}
+                    <div className="mt-1 min-w-0 text-xs text-muted-foreground">
+                      {a.client && (
+                        <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+                          <Monitor className="size-3" />
+                          Requested by {a.client}
+                        </div>
+                      )}
+                      {a.clientLabel && (
+                        <div
+                          className="mt-1 break-words [overflow-wrap:anywhere]"
+                          dir="auto"
+                        >
+                          {a.clientLabel}
+                        </div>
+                      )}
+                    </div>
                   </div>
                   {urlElicitation ? (
                     <Badge className="bg-warning/15 text-warning">

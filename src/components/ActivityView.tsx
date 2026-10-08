@@ -798,7 +798,12 @@ function CallRow({ e }: { e: AuditEntry }) {
             className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
             title={e.client ? `Client: ${e.client}` : "Client that made this call"}
           >
-            {e.clientName ?? e.client}
+            {e.client ?? e.clientName}
+          </span>
+        )}
+        {e.clientLabel && (
+          <span className="min-w-0 truncate text-xs text-muted-foreground" dir="auto">
+            {e.clientLabel}
           </span>
         )}
         <PiiBadge entry={e} />
@@ -987,7 +992,7 @@ function InspectRow({ e }: { e: InspectEntry }) {
             className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground"
             title={e.client ? `Client: ${e.client}` : "Client that made this call"}
           >
-            {e.clientName ?? e.client}
+            {e.client ?? e.clientName}
           </span>
         )}
         <span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">

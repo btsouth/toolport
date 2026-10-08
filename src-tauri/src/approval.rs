@@ -95,6 +95,36 @@ pub struct PiiReleaseValue {
     pub origins: Vec<String>,
 }
 
+/// Client-reported text is display-only. Strip controls and direction changes and
+/// bound Unicode characters before it reaches a prompt, notification, or audit row.
+pub fn sanitize_client_label(text: &str) -> Option<String> {
+    let label: String = text.chars().filter(|c| {
+        !c.is_control() && !matches!(*c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
+    }).take(120).collect();
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_string())
+}
+
+pub fn client_info_label(params: Option<&serde_json::Value>) -> Option<String> {
+    let info = params?.get("clientInfo")?;
+    let name = sanitize_client_label(info.get("name")?.as_str()?)?;
+    let version = info
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .and_then(sanitize_client_label);
+    sanitize_client_label(&match version {
+        Some(version) => format!("{name} {version}"),
+        None => name,
+    })
+}
+
+fn deserialize_client_label<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let label = Option::<String>::deserialize(deserializer)?;
+    Ok(label.as_deref().and_then(sanitize_client_label))
+}
+
 /// A request from a gateway to the broker: "a human should approve this call." The arguments
 /// are included so the person can review them; they stay in memory on both ends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +137,13 @@ pub struct ApprovalRequest {
     /// Which client/agent triggered it (for display + attribution), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
+    /// Untrusted initialize clientInfo label. Never an access principal.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_client_label"
+    )]
+    pub client_label: Option<String>,
     /// The downstream server the tool belongs to.
     pub server: String,
     /// The tool name.
@@ -652,6 +689,7 @@ mod tests {
             token: "tok".into(),
             id: "p08-outcomes".into(),
             client: None,
+            client_label: None,
             server: "s".into(),
             tool: "t".into(),
             reason: ApprovalReason::Destructive,
@@ -734,6 +772,7 @@ mod tests {
             token: "tok".into(),
             id: "abc".into(),
             client: Some("cursor".into()),
+            client_label: None,
             server: "db".into(),
             tool: "drop_table".into(),
             reason: ApprovalReason::Destructive,
@@ -843,6 +882,7 @@ mod tests {
             token: "tok".into(),
             id: "abc".into(),
             client: None,
+            client_label: None,
             server: "db".into(),
             tool: "drop_table".into(),
             reason: ApprovalReason::Destructive,
@@ -1019,5 +1059,31 @@ mod tests {
         ));
         let stream = dial_broker(&d).expect("falls back to the loopback listener");
         assert!(matches!(stream, BrokerStream::Tcp(_)));
+    }
+}
+
+#[cfg(test)]
+mod client_label_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn p08b_labels_are_bounded_and_strip_controls_and_bidi() {
+        assert_eq!(client_info_label(Some(&json!({"clientInfo":{"name":"  Claude\n\r\t\u{202e} Code\u{2066}","version":"1\0"}}))), Some("Claude Code 1".into()));
+        let long = "界".repeat(1000);
+        let label = client_info_label(Some(&json!({"clientInfo":{"name":long,"version":"evil"}}))).unwrap();
+        assert_eq!(label.chars().count(), 120);
+        assert_eq!(client_info_label(Some(&json!({"clientInfo":{"name":"\u{202e}\0","version":"1"}}))), None);
+        assert_eq!(client_info_label(Some(&json!({"clientInfo":{"name":false}}))), None);
+    }
+
+    #[test]
+    fn p08b_request_label_is_sanitized_and_json_escaped() {
+        let req: ApprovalRequest = serde_json::from_value(json!({"token":"t","id":"1","client":"client:real","clientLabel":"<b>Fake</b>\n\u{202e} \"1\"","server":"s","tool":"t","reason":"destructive","arguments":{}})).unwrap();
+        assert_eq!(req.client.as_deref(), Some("client:real"));
+        assert_eq!(req.client_label.as_deref(), Some("<b>Fake</b> \"1\""));
+        let wire = serde_json::to_string(&req).unwrap();
+        assert!(wire.contains("\\\"1\\\""));
+        assert!(!wire.contains('\u{202e}'));
     }
 }

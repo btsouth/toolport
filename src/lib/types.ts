@@ -84,6 +84,8 @@ export interface AuditEntry {
   client?: string;
   /** Human-readable name of the registered HTTP client, when known. */
   clientName?: string;
+  /** Untrusted client-reported name/version, for display only. */
+  clientLabel?: string;
   /** How many values this call's result had pseudonymized. Absent when PII redaction was
    * off for the call — which is deliberately distinct from `0` ("it ran, found nothing").
    * A count only; the values themselves never enter the audit log. */
@@ -457,6 +459,8 @@ export interface FolderProfile {
 export interface PendingApproval {
   id: string;
   client: string | null;
+  /** Untrusted initialize clientInfo label. */
+  clientLabel?: string | null;
   server: string;
   tool: string;
   toolFingerprint?: string | null;

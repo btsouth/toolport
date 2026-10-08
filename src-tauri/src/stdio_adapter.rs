@@ -438,7 +438,8 @@ struct Session {
     /// closes its stdin, which is what ends it.
     private_gateway: Mutex<Option<std::process::Child>>,
     session_id: Mutex<Option<String>>,
-    /// The client's `initialize` and its `notifications/initialized`, kept so a
+    /// The client's `initialize` (including untrusted clientInfo) and its
+    /// `notifications/initialized`, kept so a
     /// replacement daemon can be given an equivalent session.
     handshake_initialize: Mutex<Option<String>>,
     handshake_initialized: Mutex<Option<String>>,

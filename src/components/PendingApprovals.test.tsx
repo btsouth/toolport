@@ -127,15 +127,18 @@ describe("PendingApprovals refresh ordering", () => {
   });
 });
 
-
 describe("PendingApprovals client identity", () => {
   it("shows the authenticated client before an escaped secondary label", async () => {
-    listPendingApprovals.mockResolvedValue([{ ...approval({ client: "client:c1" }), clientLabel: '<b>Claude Code</b> 1' }]);
+    listPendingApprovals.mockResolvedValue([
+      { ...approval({ client: "client:c1" }), clientLabel: "<b>Claude Code</b> 1" },
+    ]);
     const { container } = render(<PendingApprovals />);
     await act(async () => {});
     expect(screen.getByText("Requested by client:c1")).toBeInTheDocument();
-    expect(screen.getByText('<b>Claude Code</b> 1')).toBeInTheDocument();
+    expect(screen.getByText("<b>Claude Code</b> 1")).toBeInTheDocument();
     expect(container.querySelector("b")).toBeNull();
-    expect(container.textContent!.indexOf("client:c1")).toBeLessThan(container.textContent!.indexOf("<b>Claude Code"));
+    expect(container.textContent!.indexOf("client:c1")).toBeLessThan(
+      container.textContent!.indexOf("<b>Claude Code"),
+    );
   });
 });

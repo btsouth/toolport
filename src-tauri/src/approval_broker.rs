@@ -42,6 +42,8 @@ use crate::approval::{
 pub struct PendingView {
     pub id: String,
     pub client: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_label: Option<String>,
     pub server: String,
     pub tool: String,
     pub tool_fingerprint: Option<String>,
@@ -744,6 +746,7 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, host: BrokerHost) {
     let view = PendingView {
         id: req.id.clone(),
         client: req.client.clone(),
+        client_label: req.client_label.clone(),
         server: req.server.clone(),
         tool: req.tool.clone(),
         tool_fingerprint: req.tool_fingerprint.clone(),
@@ -884,22 +887,26 @@ fn notification_host(host: BrokerHost, show: ShowPendingNotification) -> BrokerH
     }
 }
 
+pub fn approval_requester(view: &PendingView) -> String {
+    let client = view.client.as_deref().unwrap_or("An AI client");
+    match view.client_label.as_deref() {
+        Some(label) => format!("{client} · {label}"),
+        None => client.to_string(),
+    }
+}
+
 /// Notify the human that a call is held: an OS notification plus
 /// taskbar attention on the main window. Best-effort and non-blocking - if either fails (permission
 /// off, no window) the in-app overlay is still the source of truth. We flash rather than
 /// force-focus so we don't yank the user out of what they're doing.
 #[cfg(feature = "desktop")]
 fn notify_pending(app: &AppHandle, view: &PendingView, resolved: std::sync::mpsc::Receiver<()>) {
-    let who = view
-        .client
-        .as_deref()
-        .map(|c| format!("{c} wants to run "))
-        .unwrap_or_default();
+    let who = approval_requester(view);
     let (title, body) = if let Some(elicitation) = &view.url_elicitation {
         (
             "Toolport: browser action required",
             format!(
-                "{} requested an external browser interaction. Review it in Toolport.",
+                "{who} requested a browser action for {}. Review it in Toolport.",
                 elicitation.origin
             ),
         )
@@ -907,7 +914,7 @@ fn notify_pending(app: &AppHandle, view: &PendingView, resolved: std::sync::mpsc
         (
             "Toolport: approval required",
             format!(
-                "{who}{}/{} - approve or deny it in Toolport.",
+                "{who} wants to run {} / {} - approve or deny it in Toolport.",
                 view.server, view.tool
             ),
         )
@@ -995,7 +1002,7 @@ fn notify_until_resolved_at_destination(
                         id,
                         "toolport",
                         title,
-                        body,
+                        gio::glib::markup_escape_text(body).as_str(),
                         Vec::<String>::new(),
                         hints,
                         expiry,
@@ -1103,6 +1110,7 @@ mod tests {
         let view = |req: ApprovalRequest| PendingView {
             id: req.id,
             client: req.client,
+            client_label: req.client_label,
             server: req.server,
             tool: req.tool,
             reason: req.reason,
@@ -1196,6 +1204,7 @@ mod tests {
         let view = PendingView {
             id: id.into(),
             client: None,
+            client_label: None,
             server: "s".into(),
             tool: "drop".into(),
             tool_fingerprint: Some("v2:abc".into()),
@@ -1431,6 +1440,7 @@ mod tests {
             token: token.into(),
             id: "req-1".into(),
             client: None,
+            client_label: None,
             server: "db".into(),
             tool: "drop_table".into(),
             reason: ApprovalReason::Destructive,

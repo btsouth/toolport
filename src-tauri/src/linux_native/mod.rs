@@ -4910,6 +4910,17 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
             .css_classes(["toolport-muted"])
             .build(),
     );
+    if let Some(label) = activity.client_label.as_deref() {
+        copy.append(
+            &gtk::Label::builder()
+                .label(label)
+                .xalign(0.0)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .css_classes(["toolport-muted"])
+                .build(),
+        );
+    }
     if let Some(error) = activity.error.as_deref() {
         copy.append(
             &gtk::Label::builder()
@@ -5508,6 +5519,17 @@ fn approval_card(
             .build(),
     );
 
+    if let Some(label) = view.client_label.as_deref() {
+        card.append(
+            &gtk::Label::builder()
+                .label(label)
+                .xalign(0.0)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .css_classes(["toolport-muted"])
+                .build(),
+        );
+    }
     if let Some(url) = &view.url_elicitation {
         card.append(
             &gtk::Label::builder()
@@ -6744,16 +6766,16 @@ fn maybe_show_tray_hint(app: &adw::Application) {
 /// wording: a URL-elicitation request must say a browser interaction was asked
 /// for, not disguise itself as an ordinary tool call.
 fn approval_notification(view: &crate::approval_broker::PendingView) -> (String, String) {
+    let requester = crate::approval_broker::approval_requester(view);
     if let Some(elicitation) = &view.url_elicitation {
         return (
             "Toolport: browser action required".to_string(),
             format!(
-                "{} requested an external browser interaction. Review it in Toolport.",
+                "{requester} requested a browser action for {}. Review it in Toolport.",
                 elicitation.origin
             ),
         );
     }
-    let requester = view.client.as_deref().unwrap_or("An AI client");
     (
         "Toolport: approval required".to_string(),
         format!(
@@ -9460,6 +9482,7 @@ mod tests {
             server: server.to_string(),
             tool: "tool".to_string(),
             client: None,
+            client_label: None,
             ok,
             held: false,
             duration_ms: None,
@@ -9660,6 +9683,7 @@ mod tests {
         let mut view = crate::approval_broker::PendingView {
             id: "1".into(),
             client: Some("claude".into()),
+            client_label: None,
             server: "github".into(),
             tool: "create_issue".into(),
             tool_fingerprint: None,
@@ -9686,8 +9710,7 @@ mod tests {
             approval_notification(&view),
             (
                 "Toolport: browser action required".to_string(),
-                "github requested an external browser interaction. Review it in Toolport."
-                    .to_string()
+                "claude requested a browser action for github. Review it in Toolport.".to_string()
             )
         );
 
@@ -9704,7 +9727,7 @@ mod tests {
             approval_queue_notification(&queue),
             Some((
                 "Toolport: 2 approvals required".to_string(),
-                "github requested an external browser interaction. Review it in Toolport. 1 more is waiting."
+                "claude requested a browser action for github. Review it in Toolport. 1 more is waiting."
                     .to_string()
             ))
         );
@@ -9903,6 +9926,7 @@ mod tests {
     fn restart_advice_names_each_app_once() {
         let client = |name: &str, pid: u32| crate::gateway_publish::ClientNeedingRestart {
             client: name.to_string(),
+            client_label: None,
             client_pid: pid,
             gateway: "toolport-gateway-1.16.0".to_string(),
         };

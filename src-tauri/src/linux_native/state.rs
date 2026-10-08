@@ -13,6 +13,7 @@ pub(super) struct ActivityView {
     pub(super) server: String,
     pub(super) tool: String,
     pub(super) client: Option<String>,
+    pub(super) client_label: Option<String>,
     pub(super) ok: bool,
     pub(super) held: bool,
     pub(super) duration_ms: Option<u64>,
@@ -98,11 +99,15 @@ impl ActivitySnapshot {
                         .unwrap_or("Unknown tool")
                         .to_string(),
                     client: entry
-                        .get("clientName")
-                        .or_else(|| entry.get("client"))
+                        .get("client")
+                        .or_else(|| entry.get("clientName"))
                         .and_then(serde_json::Value::as_str)
                         .filter(|value| !value.is_empty())
                         .map(str::to_string),
+                    client_label: entry
+                        .get("clientLabel")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(crate::approval::sanitize_client_label),
                     ok,
                     held: entry
                         .get("held")
