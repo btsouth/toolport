@@ -272,7 +272,7 @@ pub(super) fn review(
             }
             cancel.set_sensitive(true);
             button.set_sensitive(true);
-            for (check, _, spinner, _, _) in selected.iter() {
+            for (check, row, spinner, _, _) in selected.iter() {
                 check.set_sensitive(
                     row.subtitle()
                         .is_none_or(|s| !s.starts_with("Unsupported:")),

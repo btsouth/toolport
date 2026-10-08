@@ -1492,6 +1492,9 @@ fn prepare_client_servers_for_migration(
             }
             let id = existing.id.clone();
             let entry = registry.servers.iter_mut().find(|e| e.id == id).unwrap();
+            entry.command = import.entry.command.clone();
+            entry.args = import.entry.args.clone();
+            entry.url = import.entry.url.clone();
             entry.env = import.entry.env.clone();
             entry.launch = import.entry.launch.clone();
             id
@@ -2950,7 +2953,11 @@ mod tests {
             |_, _, _, _| Ok(Vec::new().into()),
         )
         .unwrap();
-        assert_eq!(read_registry_exact().unwrap().servers.len(), 1);
+        let saved = read_registry_exact().unwrap();
+        assert_eq!(saved.servers.len(), 1);
+        assert!(!serde_json::to_string(&saved)
+            .unwrap()
+            .contains("synthetic-value"));
     }
 
     #[test]
