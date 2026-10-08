@@ -1977,6 +1977,27 @@ async fn team_use_managed(app: tauri::AppHandle, state: State<'_, RegistryState>
     Ok(fresh)
 }
 
+#[tauri::command]
+async fn team_review(
+    app: tauri::AppHandle,
+    state: State<'_, RegistryState>,
+    key: String,
+    hash: String,
+    accept: bool,
+) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || teams::review_team_change(&key, &hash, accept))
+        .await
+        .map_err(|e| e.to_string())??;
+    let fresh = reload_into_state(state.inner())?;
+    let _ = app.emit("team-sync-registry", &fresh);
+    Ok(fresh)
+}
+
+#[tauri::command]
+fn team_open_confirmation(url: String) -> Result<(), String> {
+    teams::open_confirmation(&url)
+}
+
 /// Admin: replace only the team's shared server list with the current local set (own servers
 /// only, secret values never sent). Remote instructions and policy fields are preserved, and
 /// an optimistic-concurrency conflict is returned rather than overwriting another admin.
@@ -3940,6 +3961,8 @@ pub fn run() {
             team_use_managed,
             team_account_link,
             team_push,
+            team_review,
+            team_open_confirmation,
             set_auth_token,
             clear_auth_token,
             has_auth_token,

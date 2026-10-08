@@ -411,7 +411,10 @@ fn push_body(config: &Value, base_version: i64) -> Value {
 }
 
 fn push_status_message(status: u16) -> Option<&'static str> {
-    (status == 409).then_some(STALE_PUSH_MESSAGE)
+    match status {
+        409 => Some(STALE_PUSH_MESSAGE),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -695,14 +698,71 @@ pub(crate) fn build_push_preview(
     })
 }
 
-/// Admin push of a servers-only config update. Returns the new version.
+/// A desktop push either publishes directly or waits for dashboard confirmation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigProposal {
+    pub id: String,
+    pub base_version: i64,
+    pub confirm_url: String,
+}
+
+#[derive(Debug)]
+pub enum PushOutcome {
+    Published(i64),
+    Confirmation(ConfigProposal),
+}
+
+impl From<i64> for PushOutcome {
+    fn from(version: i64) -> Self {
+        Self::Published(version)
+    }
+}
+
+pub fn validate_confirmation_url(server_url: &str, confirm_url: &str) -> Result<(), String> {
+    let server = url::Url::parse(server_url).map_err(|_| "Invalid Teams service URL")?;
+    let confirm = url::Url::parse(confirm_url).map_err(|_| "Invalid confirmation URL")?;
+    if confirm.scheme() != "https"
+        || confirm.host_str() != server.host_str()
+        || confirm.port_or_known_default() != server.port_or_known_default()
+        || !confirm.username().is_empty()
+        || confirm.password().is_some()
+    {
+        return Err("Confirmation must open on the HTTPS Teams service host.".into());
+    }
+    Ok(())
+}
+
+pub fn open_confirmation(confirm_url: &str) -> Result<(), String> {
+    let reg = crate::registry::load()?;
+    let team = reg.team.as_ref().ok_or("not connected to a team")?;
+    validate_confirmation_url(&team.server_url, confirm_url)?;
+    crate::oauth::open_web_url(confirm_url)
+}
+
+fn parse_push_response(server_url: &str, status: u16, value: Value) -> Result<PushOutcome, String> {
+    if status == 202 {
+        let proposal: ConfigProposal = serde_json::from_value(value["proposal"].clone())
+            .map_err(|_| "Team server returned an invalid confirmation proposal")?;
+        if proposal.id.is_empty() || proposal.id.len() > 128 || proposal.base_version < 0 {
+            return Err("Team server returned an invalid confirmation proposal".into());
+        }
+        validate_confirmation_url(server_url, &proposal.confirm_url)?;
+        return Ok(PushOutcome::Confirmation(proposal));
+    }
+    value["version"]
+        .as_i64()
+        .map(PushOutcome::Published)
+        .ok_or_else(|| "team server did not return a version after push".to_string())
+}
+
 pub fn push_config(
     server_url: &str,
     team_id: &str,
     token: &str,
     config: &Value,
     base_version: i64,
-) -> Result<i64, String> {
+) -> Result<PushOutcome, String> {
     require_secure_team_url(server_url)?;
     let url = format!("{}/teams/{}/config", base(server_url), team_id);
     let body = push_body(config, base_version);
@@ -712,18 +772,25 @@ pub fn push_config(
         .send_json(body)
     {
         Ok(resp) => require_no_redirect(resp)?,
-        Err(e @ ureq::Error::Status(status, _)) => {
+        Err(ureq::Error::Status(status, resp)) => {
             if let Some(message) = push_status_message(status) {
                 return Err(message.into());
             }
-            return Err(stringify(e));
+            let body = resp.into_string().unwrap_or_default();
+            let not_admin_session = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|value| value["error"].as_str().map(str::to_owned))
+                .is_some_and(|message| message.contains("not an admin session"));
+            if status == 403 && not_admin_session {
+                return Err("Finish this in the Teams dashboard".into());
+            }
+            return Err(format!("server returned {status}: {}", body.trim()));
         }
         Err(e) => return Err(stringify(e)),
     };
+    let status = resp.status();
     let v: Value = resp.into_json().map_err(|e| e.to_string())?;
-    v["version"]
-        .as_i64()
-        .ok_or_else(|| "team server did not return a version after push".to_string())
+    parse_push_response(server_url, status, v)
 }
 
 /// Report one UTC day's usage rollup (counts + estimates only, see `usage_report`).
@@ -780,8 +847,10 @@ fn stringify(e: ureq::Error) -> String {
 /// A portal link for this installation's existing Team opens it without replacing
 /// the connection or resetting local review/authentication. This is not a health check.
 pub fn pair_target_is_current(reg: &Registry, origin: &str, team: &str) -> bool {
-    reg.team.as_ref().is_some_and(|current| current.team_id == team
-        && current.server_url.trim_end_matches('/') == origin.trim_end_matches('/'))
+    reg.team.as_ref().is_some_and(|current| {
+        current.team_id == team
+            && current.server_url.trim_end_matches('/') == origin.trim_end_matches('/')
+    })
 }
 
 pub fn parse_pair_link(raw: &str) -> Option<(String, String)> {
@@ -816,6 +885,32 @@ pub fn parse_pair_link(raw: &str) -> Option<(String, String)> {
     }
     Some((u.origin().ascii_serialization(), team))
 }
+fn device_name() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+}
+
+fn pairing_body(
+    team: &str,
+    challenge: &str,
+    device_name: Option<&str>,
+    os: &str,
+    app_version: &str,
+) -> Value {
+    let truncate = |value: &str| value.chars().take(128).collect::<String>();
+    let mut body = json!({"teamId":team, "challenge":challenge, "os":truncate(os), "appVersion":truncate(app_version)});
+    if let Some(name) = device_name.filter(|name| !name.trim().is_empty()) {
+        body["deviceName"] = json!(truncate(name));
+    }
+    body
+}
+
 static PAIRING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Returned by [`pair_device`] when the person cancelled the request in the app.
 pub const PAIRING_CANCELLED: &str = "Connection request cancelled.";
@@ -840,7 +935,13 @@ pub fn pair_device(
     let challenge = crate::registry::sha256_hex(&verifier);
     let response = agent(origin)
         .post(&format!("{}/pairing/start", base(origin)))
-        .send_json(json!({"teamId":team,"challenge":challenge}))
+        .send_json(pairing_body(
+            team,
+            &challenge,
+            device_name().as_deref(),
+            std::env::consts::OS,
+            env!("CARGO_PKG_VERSION"),
+        ))
         .map_err(stringify)?;
     let data: Value = require_no_redirect(response)?
         .into_json()
@@ -977,11 +1078,12 @@ fn finish_connect(
         conn.team_name = team_name;
         conn.account_linked = account_linked;
     }
-    // Capture the org instructions before the closure consumes `pulled`; applied to disk after
-    // the save (outside the lock).
-    let desired_instr = pulled
-        .as_ref()
-        .map(|(version, cfg, _)| (*version, desired_instructions(cfg)));
+    let labels = match pulled.as_ref() {
+        Some((version, _, _)) => {
+            fetch_change_labels(&conn, &joined.member_token, 0, *version).unwrap_or_default()
+        }
+        None => vec![],
+    };
     // Load-modify-save the fresh registry under the cross-process lock, so a concurrent write
     // during the join window's pull isn't reverted (SOU-23).
     let (reg, outcome) = crate::registry::update(|reg| {
@@ -989,7 +1091,7 @@ fn finish_connect(
         reg.team = Some(conn);
         let mut outcome = MergeOutcome::default();
         if let Some((version, cfg, etag)) = pulled {
-            outcome = apply_team_config(reg, &joined.team_id, &cfg);
+            outcome = stage_team_config(reg, &joined.team_id, &cfg, version, &labels)?;
             if let Some(t) = reg.team.as_mut() {
                 t.last_version = version;
                 t.last_etag = etag;
@@ -997,11 +1099,6 @@ fn finish_connect(
         }
         Ok(outcome)
     })?;
-    if let Some((version, desired)) = desired_instr {
-        apply_instructions(&joined.team_id, version, desired.as_deref()).map_err(|error| {
-            format!("Team joined, but instructions state was not saved: {error}")
-        })?;
-    }
     let conn = reg
         .team
         .clone()
@@ -1105,11 +1202,13 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         wait_secs,
     )?;
 
-    // Capture the org instructions before the closure consumes `pulled`; applied to disk after
-    // the save (outside the lock). `None` on a 304 (config unchanged) — nothing to reconcile.
-    let desired_instr = pulled
-        .as_ref()
-        .map(|(version, cfg, _)| (*version, desired_instructions(cfg)));
+    let since = member_review(&crate::registry::load()?)?.accepted_version;
+    let labels = match pulled.as_ref() {
+        Some((version, _, _)) => {
+            fetch_change_labels(&conn, &token, since, *version).unwrap_or_default()
+        }
+        None => vec![],
+    };
     // Re-load a FRESH registry now, AFTER the (possibly multi-second) network round
     // trips, and apply the deltas to it. Loading at the top and saving here would clobber
     // any change another command made to the registry while we were on the network.
@@ -1131,7 +1230,7 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         let applied = match pulled {
             None => None,
             Some((version, cfg, etag)) => {
-                let outcome = apply_team_config(reg, &conn.team_id, &cfg);
+                let outcome = stage_team_config(reg, &conn.team_id, &cfg, version, &labels)?;
                 if let Some(t) = reg.team.as_mut() {
                     t.last_version = version;
                     t.last_etag = etag;
@@ -1168,14 +1267,8 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
             state_errors.push(error);
         }
     };
-    check_state(match desired_instr {
-        Some((version, desired)) => apply_instructions(&conn.team_id, version, desired.as_deref()),
-        // A 304 means the org text is unchanged, but a release can still move where a client
-        // reads its rules from (Goose/Zed under XDG, SBS-899). Re-run against the content we
-        // already applied so the block relocates on the next quiet cycle rather than waiting for
-        // an admin edit; `apply_instructions` returns immediately unless a target really moved.
-        None => relocate_stored_instructions(&conn.team_id),
-    });
+    // Only accepted instructions can be written or relocated after a sync.
+    check_state(apply_accepted_instructions(&conn.team_id));
     // Best-effort showback after the config work: report today's/yesterday's per-server
     // usage rollup to the team server. Network failures retry next cycle;
     // local state-save failures must be visible after the config was applied.
@@ -2233,6 +2326,9 @@ pub fn use_managed_server(managed_id: &str) -> Result<Registry, String> {
 }
 
 fn apply_use_managed(reg: &mut Registry, managed_id: &str, profile: &str) -> Result<(), String> {
+    if server_change_held(reg, managed_id) {
+        return Err("Review this change in Teams before using it.".into());
+    }
     let team = reg.team.as_ref().ok_or("not connected to a team")?;
     let personal_id = team
         .managed_server_ids
@@ -2325,17 +2421,33 @@ pub struct PublishResult {
     pub handoffs: Vec<LocalHandoff>,
     /// The notice both desktop shells show after sharing.
     pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<ConfigProposal>,
 }
 
 impl PublishResult {
     /// A whole-set push has no selections and no local handoff.
-    pub fn whole_set(version: i64) -> Self {
+    pub fn whole_set(outcome: impl Into<PushOutcome>) -> Self {
+        let version = match outcome.into() {
+            PushOutcome::Published(version) => version,
+            PushOutcome::Confirmation(proposal) => {
+                return Self {
+                    version: proposal.base_version,
+                    published: false,
+                    local_setup_error: None,
+                    handoffs: vec![],
+                    summary: "Sent for confirmation".into(),
+                    proposal: Some(proposal),
+                }
+            }
+        };
         Self {
             version,
             published: true,
             local_setup_error: None,
             handoffs: Vec::new(),
             summary: publish_summary(version, true, None, &[]),
+            proposal: None,
         }
     }
 
@@ -2544,7 +2656,9 @@ pub fn personal_share_hint(reg: &Registry, personal: &ServerEntry) -> Option<&'s
     reg.servers
         .iter()
         .any(|s| is_team_server(s, &tag) && same_display_name(&s.name, &personal.name))
-        .then_some("The team has a different server with this name. Sharing adds a separate definition.")
+        .then_some(
+            "The team has a different server with this name. Sharing adds a separate definition.",
+        )
 }
 
 /// The preview's explanation for each selection, including a dry run of the local
@@ -2659,12 +2773,17 @@ pub fn push_selected(
     let servers = additive_server_set(remote, &selected)?;
     // Re-sharing definitions the Team already has unchanged only runs the local step.
     let before = server_index(remote)?;
-    let published = server_index(&servers)?
-        .iter()
-        .any(|(id, server)| before.get(id).is_none_or(|current| !same_definition(current, server)));
+    let published = server_index(&servers)?.iter().any(|(id, server)| {
+        before
+            .get(id)
+            .is_none_or(|current| !same_definition(current, server))
+    });
     let version = if published {
         let config = replace_server_set(config, servers)?;
-        push_config(&conn.server_url, &conn.team_id, &token, &config, version)?
+        match push_config(&conn.server_url, &conn.team_id, &token, &config, version)? {
+            PushOutcome::Published(version) => version,
+            outcome @ PushOutcome::Confirmation(_) => return Ok(PublishResult::whole_set(outcome)),
+        }
     } else {
         version
     };
@@ -2689,6 +2808,7 @@ pub fn push_selected(
         local_setup_error,
         handoffs,
         summary,
+        proposal: None,
     })
 }
 
@@ -2719,7 +2839,7 @@ pub fn preview_push_current() -> Result<PushPreview, String> {
 pub fn push_current(
     expected_base_version: i64,
     expected_local_fingerprint: &str,
-) -> Result<i64, String> {
+) -> Result<PushOutcome, String> {
     let reg = crate::registry::load()?;
     let conn = reg.team.clone().ok_or("not connected to a team")?;
     if conn.role != "admin" {
@@ -2801,6 +2921,896 @@ fn team_server_export(reg: &Registry) -> Value {
         })
         .collect();
     Value::Array(servers)
+}
+
+// Stored in TeamConnection's forward-compatible fields. Older registry readers preserve
+// this state and the existing server review flag, so no schema migration is needed.
+const MEMBER_REVIEW_FIELD: &str = "memberReview";
+const HELD_CHANGE_FIELD: &str = "teamHeldChange";
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MemberReview {
+    accepted: BTreeMap<String, Value>,
+    latest: BTreeMap<String, Value>,
+    pub pending: BTreeMap<String, MemberChange>,
+    rejected: BTreeMap<String, Vec<String>>,
+    pub accepted_version: i64,
+    version: i64,
+    instructions_version: i64,
+    accepted_instructions_version: i64,
+    held_access: BTreeMap<String, HeldAccess>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct HeldAccess {
+    existed: bool,
+    enabled: bool,
+    profiles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MemberChange {
+    pub key: String,
+    pub title: String,
+    pub hash: String,
+    pub fields: Vec<MemberChangeField>,
+    pub labels: Vec<Value>,
+    before: Value,
+    after: Value,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MemberChangeField {
+    pub field: String,
+    pub before: String,
+    pub after: String,
+}
+
+pub fn member_review(reg: &Registry) -> Result<MemberReview, String> {
+    match reg
+        .team
+        .as_ref()
+        .and_then(|t| t.unknown_fields.get(MEMBER_REVIEW_FIELD))
+    {
+        Some(value) => serde_json::from_value(value.clone()).map_err(|_| {
+            "Team review state could not be read. Reconnect before accepting changes.".into()
+        }),
+        None => Ok(MemberReview::default()),
+    }
+}
+
+fn save_member_review(reg: &mut Registry, review: &MemberReview) {
+    if let Some(team) = &mut reg.team {
+        team.unknown_fields
+            .insert(MEMBER_REVIEW_FIELD.into(), json!(review));
+    }
+}
+
+fn review_items(config: &Value) -> BTreeMap<String, Value> {
+    let mut items = BTreeMap::new();
+    for server in config["servers"].as_array().into_iter().flatten() {
+        if let Some(id) = team_entry_original_id(server) {
+            let key = format!("server:{id}");
+            // Duplicate identities are blocked by the existing merge. Never approve one
+            // ambiguous definition while displaying another.
+            if items.insert(key.clone(), server.clone()).is_some() {
+                items.insert(key, Value::Null);
+            }
+        }
+    }
+    items.insert(
+        "instructions".into(),
+        desired_instructions(config).map_or(Value::Null, |s| json!(s)),
+    );
+    let screening = config.get("screeningPolicy").cloned().unwrap_or(json!({}));
+    let screening = if screening.is_object() {
+        screening
+    } else {
+        json!({"minSafetyLevel":"strict"})
+    };
+    items.insert(
+        "policy".into(),
+        json!({
+            "denyDestructive": config["denyDestructive"].as_bool().unwrap_or(false),
+            "screeningPolicy": screening,
+            "rateLimits": config.get("rateLimits").cloned().unwrap_or(json!([])),
+        }),
+    );
+    items.insert(
+        "callAuditExport".into(),
+        json!(config["callAuditExport"].as_bool().unwrap_or(false)),
+    );
+    items
+}
+
+fn normalized_server(value: &Value) -> Value {
+    match classify_team_server(value, "team:member-review") {
+        TeamClass::Ready(entry) | TeamClass::Review(entry) => {
+            let mut imported = json!(entry);
+            // Tool scopes are applied separately from the imported server entry.
+            imported["allowedTools"] = json!(parse_allowed_tools(value));
+            imported
+        }
+        // Invalid definitions remain distinct and cannot gain consent by normalization.
+        _ => value.clone(),
+    }
+}
+
+fn comparable_item(key: &str, value: &Value) -> Value {
+    if key.starts_with("server:") {
+        normalized_server(value)
+    } else {
+        value.clone()
+    }
+}
+
+fn raw_item_hash(key: &str, value: &Value) -> String {
+    crate::registry::sha256_hex(&json!(["team-member-review-v1", key, value]).to_string())
+}
+
+fn item_hash(key: &str, value: &Value) -> String {
+    // Compare what is actually imported, including secret flags and launch literals.
+    raw_item_hash(key, &comparable_item(key, value))
+}
+
+fn floor(policy: &Value) -> crate::registry::SafetyLevel {
+    use crate::registry::SafetyLevel::{Ask, Off, Strict};
+    match policy["screeningPolicy"]["minSafetyLevel"].as_str() {
+        Some("strict") => Strict,
+        Some("ask") => Ask,
+        Some("off") => Off,
+        // Invalid floors fail closed; missing floors keep legacy semantics.
+        Some(_) => Strict,
+        None if policy["denyDestructive"] == true => Strict,
+        None if policy["screeningPolicy"]["forceHumanApproval"] == true => Ask,
+        None => Off,
+    }
+}
+
+fn current_policy(reg: &Registry) -> Value {
+    json!({"denyDestructive": reg.team_forced_deny_destructive,
+        "screeningPolicy": {
+            "minSafetyLevel": reg.team_min_safety_level,
+            "forceHumanApproval": reg.team_forced_human_approval,
+            "forceContentDefense": reg.team_forced_content_defense,
+            "forceQuarantineOnDrift": reg.team_forced_quarantine_on_drift,
+            "forceBlockOnInjection": reg.team_forced_block_on_injection,
+            "forcePiiRedaction": reg.team_forced_pii_redaction,
+        },
+        "rateLimits": reg.team.as_ref().map(|t| &t.rate_limits),
+    })
+}
+
+fn immediate_floors(policy: &mut Value, incoming: &Value, accepted: &Value) {
+    policy["screeningPolicy"]["minSafetyLevel"] = json!(floor(incoming).max(floor(accepted)));
+    for key in [
+        "forceHumanApproval",
+        "forceContentDefense",
+        "forceQuarantineOnDrift",
+        "forceBlockOnInjection",
+        "forcePiiRedaction",
+    ] {
+        policy["screeningPolicy"][key] = json!(
+            incoming["screeningPolicy"][key] == true || accepted["screeningPolicy"][key] == true
+        );
+    }
+    policy["denyDestructive"] =
+        json!(incoming["denyDestructive"] == true || accepted["denyDestructive"] == true);
+}
+
+fn immediate_rate_limits(policy: &mut Value, incoming: &Value) {
+    let mut caps = crate::rate_limits::parse_caps(policy);
+    for cap in crate::rate_limits::parse_caps(incoming) {
+        // Counters use window and tool scope, not the cap's display id. Keep both
+        // scopes when one changes so tightening cannot release an accepted limit.
+        if let Some(accepted) = caps
+            .iter_mut()
+            .find(|old| old.window == cap.window && old.tool == cap.tool)
+        {
+            accepted.max_calls = accepted.max_calls.min(cap.max_calls);
+        } else {
+            caps.push(cap);
+        }
+    }
+    policy["rateLimits"] = json!(caps);
+}
+
+fn diff_fields(before: &Value, after: &Value, prefix: &str, fields: &mut Vec<MemberChangeField>) {
+    if before == after {
+        return;
+    }
+    if before.is_object() || after.is_object() {
+        let keys: std::collections::BTreeSet<_> = before
+            .as_object()
+            .into_iter()
+            .flat_map(|o| o.keys())
+            .chain(after.as_object().into_iter().flat_map(|o| o.keys()))
+            .collect();
+        for key in keys {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            diff_fields(&before[key], &after[key], &path, fields);
+        }
+    } else {
+        let text = |value: &Value| match value {
+            Value::Null => "None".into(),
+            Value::String(s) => s.clone(),
+            _ => serde_json::to_string_pretty(value).unwrap_or_default(),
+        };
+        fields.push(MemberChangeField {
+            field: if prefix.is_empty() {
+                "Content".into()
+            } else {
+                prefix.into()
+            },
+            before: text(before),
+            after: text(after),
+        });
+    }
+}
+
+fn display_server(value: &Value) -> Value {
+    if value.is_null() {
+        return Value::Null;
+    }
+    let mut display = serde_json::Map::new();
+    for key in [
+        "id",
+        "name",
+        "transport",
+        "command",
+        "args",
+        "cwd",
+        "launch",
+        "url",
+        "env",
+        "headerKeys",
+        "allowedTools",
+        "disabledTools",
+        "clientCredentials",
+        "requestTimeoutMs",
+        "initializeTimeoutMs",
+    ] {
+        if let Some(field) = value.get(key) {
+            display.insert(key.into(), field.clone());
+        }
+    }
+    if let Some(env) = display.get_mut("env").and_then(Value::as_array_mut) {
+        for entry in env.iter_mut().filter_map(Value::as_object_mut) {
+            entry.remove("value");
+        }
+    }
+    if let Some(inputs) = display
+        .get_mut("launch")
+        .and_then(|launch| launch.get_mut("inputs"))
+        .and_then(Value::as_array_mut)
+    {
+        for input in inputs.iter_mut().filter_map(Value::as_object_mut) {
+            input.remove("value");
+        }
+    }
+    if let Some(args) = value["args"].as_array() {
+        let args: Vec<String> = args
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        display.insert(
+            "args".into(),
+            json!(args
+                .iter()
+                .zip(crate::registry::secret_arg_mask(&args))
+                .map(|(arg, secret)| if secret { "<redacted>" } else { arg.as_str() })
+                .collect::<Vec<_>>()),
+        );
+    }
+    if let Some(endpoint) = value["url"].as_str() {
+        display.insert("url".into(), json!(preview_endpoint(endpoint)));
+    }
+    if let Some(credentials) = value.get("clientCredentials").filter(|v| !v.is_null()) {
+        if let Ok(mut credentials) =
+            serde_json::from_value::<crate::registry::ClientCredentials>(credentials.clone())
+        {
+            credentials.strip_secret_fields();
+            display.insert("clientCredentials".into(), json!(credentials));
+        } else {
+            display.insert(
+                "clientCredentials".into(),
+                json!("Invalid authentication definition"),
+            );
+        }
+    }
+    Value::Object(display)
+}
+
+fn change_labels(key: &str, changes: &[Value]) -> Vec<Value> {
+    let text = |value: &Value, fallback: &str| {
+        value
+            .as_str()
+            .unwrap_or(fallback)
+            .chars()
+            .take(128)
+            .collect::<String>()
+    };
+    changes.iter().filter(|change| {
+        if let Some(id) = key.strip_prefix("server:") {
+            ["serversAdded", "serversChanged", "serversRemoved"].iter().any(|field| change["summary"][field].as_array().is_some_and(|ids| ids.iter().any(|v| v == id)))
+        } else { change["summary"][key] == true }
+    }).map(|change| json!({
+        "author": {"name": text(&change["author"]["name"], "Unknown author")},
+        "at": change["at"].as_i64(),
+        "via": text(&change["via"], "unknown"),
+        "approvedBy": change.get("approvedBy").filter(|v| !v.is_null()).map(|value| json!({"name":text(&value["name"], "Unknown approver")})),
+    })).collect()
+}
+
+/// Metadata is useful only when it covers the entire interval since member consent.
+/// Missing version/baseVersion or a capped history yields an unlabelled full diff.
+fn covered_changes(data: Value, since: i64, version: i64) -> Vec<Value> {
+    let Some(changes) = data["changes"].as_array() else {
+        return vec![];
+    };
+    let mut expected = version;
+    for change in changes {
+        if change["version"].as_i64() != Some(expected) {
+            return vec![];
+        }
+        let Some(base) = change["baseVersion"].as_i64() else {
+            return vec![];
+        };
+        if base >= expected {
+            return vec![];
+        }
+        expected = base;
+        if expected <= since {
+            return changes
+                .iter()
+                .take_while(|c| c["version"].as_i64().unwrap_or(0) > since)
+                .cloned()
+                .collect();
+        }
+    }
+    vec![]
+}
+
+fn fetch_change_labels(
+    conn: &TeamConnection,
+    token: &str,
+    since: i64,
+    version: i64,
+) -> Result<Vec<Value>, String> {
+    let response = match agent(&conn.server_url)
+        .get(&format!(
+            "{}/teams/{}/config/changes?since={since}",
+            base(&conn.server_url),
+            conn.team_id
+        ))
+        .set("authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Ok(response) => require_no_redirect(response)?,
+        Err(ureq::Error::Status(404, _)) => return Ok(vec![]),
+        Err(error) => return Err(stringify(error)),
+    };
+    let data = response.into_json().map_err(|e| e.to_string())?;
+    Ok(covered_changes(data, since, version))
+}
+
+fn seed_member_review(reg: &Registry, team_id: &str, config: &Value, review: &mut MemberReview) {
+    review.accepted = review_items(&json!({"servers":[]}));
+    review.accepted.insert("policy".into(), current_policy(reg));
+    if let Some(team) = &reg.team {
+        review.accepted_version = team.last_version;
+        review.accepted_instructions_version = team.team_instructions_version;
+        if let Some(content) = &team.team_instructions_content {
+            review
+                .accepted
+                .insert("instructions".into(), json!(content));
+        }
+        review
+            .accepted
+            .insert("callAuditExport".into(), json!(team.call_audit_export));
+    }
+    for server in reg
+        .servers
+        .iter()
+        .filter(|s| s.source.as_deref() == Some(&tag_for(team_id)))
+    {
+        let original = saved_team_original_id(server).or_else(|| {
+            reg.team
+                .as_ref()?
+                .managed_server_ids
+                .get(&server.id)
+                .map(String::as_str)
+        });
+        let incoming = config["servers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|item| {
+                team_entry_original_id(item) == original
+                    || original.is_none()
+                        && format!(
+                            "team_{}",
+                            slugify_id(team_entry_original_id(item).unwrap_or(""))
+                        ) == server.id
+            });
+        let Some(original) = original.or_else(|| incoming.and_then(team_entry_original_id)) else {
+            continue;
+        };
+        let mut saved = json!(server);
+        // Compare the imported definition, excluding member-local setup and switches.
+        saved["id"] = json!(format!("team_{}", slugify_id(original)));
+        saved["enabled"] = json!(false);
+        saved.as_object_mut().unwrap().remove("inheritEnv");
+        if let Some(launch) = &server.launch {
+            saved["launch"] = json!(launch.without_values());
+        }
+        for env in saved["env"].as_array_mut().into_iter().flatten() {
+            if let Some(object) = env.as_object_mut() { object.remove("value"); }
+        }
+        if let Some(object) = saved.as_object_mut() {
+            object.remove(HELD_CHANGE_FIELD);
+            object.remove("teamEnableReview");
+        }
+        let matches = incoming.is_some_and(|item| {
+            let entry = match classify_team_server(item, &tag_for(team_id)) {
+                TeamClass::Ready(entry) | TeamClass::Review(entry) => entry,
+                _ => return false,
+            };
+            let mut imported = json!(entry);
+            // Old rows may have no original-id marker.
+            imported
+                .as_object_mut()
+                .unwrap()
+                .remove(TEAM_ORIGINAL_ID_FIELD);
+            let mut saved = saved.clone();
+            saved
+                .as_object_mut()
+                .unwrap()
+                .remove(TEAM_ORIGINAL_ID_FIELD);
+            imported == saved
+        });
+        let mut definition = incoming.filter(|_| matches).cloned().unwrap_or_else(|| {
+            let mut definition = saved.clone();
+            definition["id"] = json!(original);
+            definition
+        });
+        // The profile overlays own the already-applied team allow-list.
+        if let Some(scope) = reg
+            .profiles
+            .iter()
+            .find_map(|profile| profile.tool_scope.get(&server.id))
+        {
+            definition["allowedTools"] = json!(scope);
+        }
+        review
+            .accepted
+            .insert(format!("server:{original}"), definition);
+    }
+    // Equivalent policy representations should not invent a migration review.
+    let incoming = review_items(config)["policy"].clone();
+    let mut comparable = incoming.clone();
+    immediate_floors(&mut comparable, &incoming, &json!({}));
+    let mut current = current_policy(reg);
+    immediate_floors(&mut current, &current_policy(reg), &json!({}));
+    if comparable == current {
+        review.accepted.insert("policy".into(), incoming);
+    }
+}
+
+/// Stage every changed control-plane item. Definitions use the existing review gate;
+/// instructions, policy and export use the same queue and member decision.
+pub fn stage_team_config(
+    reg: &mut Registry,
+    team_id: &str,
+    config: &Value,
+    version: i64,
+    labels: &[Value],
+) -> Result<MergeOutcome, String> {
+    let mut review = member_review(reg)?;
+    if review.accepted.is_empty() {
+        seed_member_review(reg, team_id, config, &mut review);
+    }
+    let mut latest = review_items(config);
+    // The merge drops unusable, blocked and duplicate definitions. They revoke
+    // prior consent just like removal, rather than offering to keep an old copy.
+    latest.retain(|key, value| {
+        !key.starts_with("server:")
+            || matches!(
+                classify_team_server(value, &tag_for(team_id)),
+                TeamClass::Ready(_) | TeamClass::Review(_)
+            )
+    });
+    if latest.get("instructions") != review.latest.get("instructions") {
+        review.instructions_version = version;
+    }
+    let previous_keys: Vec<_> = review.latest.keys().cloned().collect();
+    review.latest = latest;
+    // Stopping export revokes prior acceptance. Rejected enablement hashes stay rejected.
+    if review.latest.get("callAuditExport") == Some(&json!(false)) {
+        review
+            .accepted
+            .insert("callAuditExport".into(), json!(false));
+    }
+    review.version = version;
+    review.pending.clear();
+    let keys: std::collections::BTreeSet<String> = review
+        .latest
+        .keys()
+        .chain(review.accepted.keys())
+        .chain(review.rejected.keys())
+        .chain(previous_keys.iter())
+        .cloned()
+        .collect();
+    for key in keys {
+        let before = review.accepted.get(&key).cloned().unwrap_or(Value::Null);
+        let after = review.latest.get(&key).cloned().unwrap_or(Value::Null);
+        // Removal is a tightening. Forget consent and rejection history so the
+        // same identity returning later always starts a fresh new-server review.
+        if key.starts_with("server:") && !review.latest.contains_key(&key) {
+            if let Some(managed) = reg
+                .servers
+                .iter()
+                .find(|server| {
+                    server.source.as_deref() == Some(&tag_for(team_id))
+                        && saved_team_original_id(server) == Some(&key[7..])
+                })
+                .map(|server| server.id.clone())
+            {
+                crate::local_auth::restore_personal_route(reg, team_id, &managed);
+            }
+            review.accepted.remove(&key);
+            review.rejected.remove(&key);
+            review.held_access.remove(&key[7..]);
+            continue;
+        }
+        if comparable_item(&key, &before) == comparable_item(&key, &after)
+            || (before.is_null()
+                && (after == false
+                    || (key == "policy"
+                        && after
+                            == json!({"denyDestructive":false,"screeningPolicy":{},"rateLimits":[]}))))
+        {
+            continue;
+        }
+        let hash = item_hash(&key, &after);
+        if review.rejected.get(&key).is_some_and(|hashes| {
+            hashes.contains(&hash) || hashes.contains(&raw_item_hash(&key, &after))
+        }) {
+            continue;
+        }
+        let title = if key.starts_with("server:") {
+            format!(
+                "Server: {}",
+                after["name"]
+                    .as_str()
+                    .or(before["name"].as_str())
+                    .unwrap_or(&key[7..])
+            )
+        } else {
+            match key.as_str() {
+                "instructions" => "Team instructions",
+                "policy" => "Team policy",
+                _ => "Call-log export",
+            }
+            .into()
+        };
+        let (a, b) = if key.starts_with("server:") {
+            (display_server(&before), display_server(&after))
+        } else {
+            (before.clone(), after.clone())
+        };
+        let mut fields = Vec::new();
+        diff_fields(&a, &b, "", &mut fields);
+        if fields.is_empty() {
+            fields.push(MemberChangeField {
+                field: "Hidden or secret fields changed".into(),
+                before: "Previously accepted hidden fields".into(),
+                after: "Changed hidden fields (values redacted)".into(),
+            });
+        }
+        review.pending.insert(
+            key.clone(),
+            MemberChange {
+                key: key.clone(),
+                title,
+                hash,
+                fields,
+                labels: change_labels(&key, labels),
+                before,
+                after,
+            },
+        );
+    }
+    for key in review
+        .pending
+        .keys()
+        .filter(|key| key.starts_with("server:"))
+    {
+        let original = &key[7..];
+        review
+            .held_access
+            .entry(original.into())
+            .or_insert_with(|| {
+                let server = reg.servers.iter().find(|s| {
+                    s.source.as_deref() == Some(&tag_for(team_id))
+                        && saved_team_original_id(s) == Some(original)
+                });
+                HeldAccess {
+                    existed: server.is_some(),
+                    enabled: server.is_some_and(|s| reg.server_enabled(&s.id)),
+                    profiles: server
+                        .map(|s| {
+                            reg.profiles
+                                .iter()
+                                .filter(|p| p.enabled_server_ids.contains(&s.id))
+                                .map(|p| p.id.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                }
+            });
+    }
+    let outcome = apply_review_state(reg, team_id, &review, true)?;
+    if review.latest.len() == review.accepted.len()
+        && review.latest.iter().all(|(key, value)| {
+            comparable_item(key, value)
+                == comparable_item(key, review.accepted.get(key).unwrap_or(&Value::Null))
+        })
+    {
+        review.accepted_version = version;
+    }
+    review.held_access.retain(|id, _| {
+        review.pending.contains_key(&format!("server:{id}"))
+            || !review.accepted.contains_key(&format!("server:{id}"))
+    });
+    save_member_review(reg, &review);
+    Ok(outcome)
+}
+
+fn apply_review_state(
+    reg: &mut Registry,
+    team_id: &str,
+    review: &MemberReview,
+    tighten: bool,
+) -> Result<MergeOutcome, String> {
+    let mut policy = review
+        .accepted
+        .get("policy")
+        .cloned()
+        .unwrap_or(json!({"denyDestructive":false,"screeningPolicy":{},"rateLimits":[]}));
+    if tighten {
+        let accepted = policy.clone();
+        let latest = review.latest.get("policy").unwrap_or(&Value::Null);
+        immediate_floors(&mut policy, latest, &accepted);
+        immediate_rate_limits(&mut policy, latest);
+    }
+    policy["screeningPolicy"]["minSafetyLevel"] = json!(floor(&policy));
+    let mut effective = policy;
+    effective["callAuditExport"] = review
+        .accepted
+        .get("callAuditExport")
+        .cloned()
+        .unwrap_or(json!(false));
+    // Export can stop immediately; re-enabling always requires a new decision.
+    if review.latest.get("callAuditExport") == Some(&json!(false)) {
+        effective["callAuditExport"] = json!(false);
+    }
+    let keys: std::collections::BTreeSet<_> = review
+        .latest
+        .keys()
+        .chain(review.accepted.keys())
+        .filter(|k| k.starts_with("server:"))
+        .collect();
+    let mut held = HashSet::new();
+    let servers: Vec<Value> = keys
+        .into_iter()
+        .filter_map(|key| {
+            let accepted = review.accepted.get(key).cloned().unwrap_or(Value::Null);
+            let latest = review.latest.get(key).cloned().unwrap_or(Value::Null);
+            if review.pending.contains_key(key) || accepted.is_null() && !latest.is_null() {
+                held.insert(key[7..].to_string());
+            }
+            // Keep the accepted definition and local authentication until consent.
+            // New, rejected definitions stay visible but cannot run.
+            let definition = if accepted.is_null() { latest } else { accepted };
+            (!definition.is_null()).then_some(definition)
+        })
+        .collect();
+    effective["servers"] = json!(servers);
+    let mut outcome = apply_team_config(reg, team_id, &effective);
+    for server in reg
+        .servers
+        .iter_mut()
+        .filter(|s| s.source.as_deref() == Some(&tag_for(team_id)))
+    {
+        if saved_team_original_id(server).is_some_and(|id| held.contains(id)) {
+            server.require_team_enable_review();
+            server
+                .unknown_fields
+                .insert(HELD_CHANGE_FIELD.into(), json!(true));
+            server.enabled = false;
+            for profile in &mut reg.profiles {
+                profile.enabled_server_ids.retain(|id| id != &server.id);
+            }
+        } else {
+            server.unknown_fields.remove(HELD_CHANGE_FIELD);
+            if let Some(access) =
+                saved_team_original_id(server).and_then(|id| review.held_access.get(id))
+            {
+                if access.existed {
+                    server.enabled = access.enabled;
+                    // Content review is complete even when the member's switch stays off.
+                    server.unknown_fields.remove("teamEnableReview");
+                    for profile in &mut reg.profiles {
+                        profile.enabled_server_ids.retain(|id| id != &server.id);
+                        if access.profiles.contains(&profile.id) {
+                            profile.enabled_server_ids.push(server.id.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    outcome.review = review.pending.len();
+    Ok(outcome)
+}
+
+pub fn server_change_held(reg: &Registry, server_id: &str) -> bool {
+    reg.servers
+        .iter()
+        .any(|s| s.id == server_id && s.unknown_fields.get(HELD_CHANGE_FIELD) == Some(&json!(true)))
+}
+
+fn decide_member_change(
+    reg: &mut Registry,
+    key: &str,
+    hash: &str,
+    accept: bool,
+) -> Result<(), String> {
+    let team_id = reg
+        .team
+        .as_ref()
+        .ok_or("not connected to a team")?
+        .team_id
+        .clone();
+    let mut review = member_review(reg)?;
+    let change = review
+        .pending
+        .get(key)
+        .ok_or("This change is no longer pending. Review the current queue.")?
+        .clone();
+    if change.hash != hash || item_hash(key, review.latest.get(key).unwrap_or(&Value::Null)) != hash
+    {
+        return Err("The team change was updated. Review its new content before accepting.".into());
+    }
+    if accept {
+        if change.after.is_null() && key.starts_with("server:") {
+            review.accepted.remove(key);
+        } else {
+            review.accepted.insert(key.into(), change.after);
+            if key == "instructions" {
+                review.accepted_instructions_version = review.instructions_version;
+            }
+        }
+    } else {
+        review
+            .rejected
+            .entry(key.into())
+            .or_default()
+            .push(hash.into());
+    }
+    review.pending.remove(key);
+    // Accepting another item must never release a safety floor still awaiting review.
+    apply_review_state(reg, &team_id, &review, !(accept && key == "policy"))?;
+    if accept {
+        if let Some(original) = key.strip_prefix("server:").filter(|id| {
+            review
+                .held_access
+                .get(*id)
+                .is_none_or(|access| !access.existed)
+        }) {
+            if let Some(id) = reg
+                .servers
+                .iter()
+                .find(|s| {
+                    saved_team_original_id(s) == Some(original)
+                        && s.source.as_deref() == Some(&tag_for(&team_id))
+                })
+                .map(|s| s.id.clone())
+            {
+                let profile = reg.active_profile_id();
+                crate::registry_controller::apply_server_enabled(reg, &profile, &id, true, true)?;
+            }
+        }
+    }
+    if let Some(original) = key.strip_prefix("server:") {
+        review.held_access.remove(original);
+    }
+    if review.latest.len() == review.accepted.len()
+        && review.latest.iter().all(|(key, value)| {
+            comparable_item(key, value)
+                == comparable_item(key, review.accepted.get(key).unwrap_or(&Value::Null))
+        })
+    {
+        review.accepted_version = review.version;
+    }
+    save_member_review(reg, &review);
+    Ok(())
+}
+
+fn apply_accepted_instructions(team_id: &str) -> Result<(), String> {
+    let path = crate::registry::resolved_path().ok_or("Could not resolve registry path")?;
+    // Serialize desktop and daemon writers before reading the accepted content.
+    let _instructions = crate::registry::lock_at(&path.with_file_name("team-instructions"))
+        .map_err(|e| e.replace("registry", "team instructions file"))?;
+    let reg = crate::registry::load()?;
+    let Some(team) = reg.team.as_ref().filter(|team| team.team_id == team_id) else {
+        return Ok(());
+    };
+    let review = member_review(&reg)?;
+    if let Some(content) = review.accepted.get("instructions") {
+        apply_instructions(
+            team_id,
+            review.accepted_instructions_version,
+            content.as_str(),
+        )
+    } else {
+        relocate_stored_instructions(&team.team_id)
+    }
+}
+
+pub fn review_team_change(key: &str, hash: &str, accept: bool) -> Result<Registry, String> {
+    let (reg, ()) = crate::registry::update(|reg| decide_member_change(reg, key, hash, accept))?;
+    if accept && key == "instructions" {
+        let team = reg.team.as_ref().ok_or("not connected to a team")?;
+        apply_accepted_instructions(&team.team_id)
+            .map_err(|e| format!("Instructions accepted, but local setup needs attention: {e}"))?;
+    }
+    crate::registry::load()
+}
+
+/// Keep a member's explicit off decision while a replacement is awaiting review.
+pub(crate) fn remember_held_disable(
+    reg: &mut Registry,
+    profile_id: &str,
+    server_id: &str,
+) -> Result<(), String> {
+    if !server_change_held(reg, server_id) {
+        return Ok(());
+    }
+    let original = reg
+        .servers
+        .iter()
+        .find(|s| s.id == server_id)
+        .and_then(saved_team_original_id)
+        .map(str::to_string);
+    let mut review = member_review(reg)?;
+    if let Some(access) = original.and_then(|id| review.held_access.get_mut(&id)) {
+        if reg.version >= 3 {
+            access.enabled = false;
+        } else {
+            access.profiles.retain(|id| id != profile_id);
+            access.enabled = !access.profiles.is_empty();
+        }
+    }
+    save_member_review(reg, &review);
+    Ok(())
+}
+
+/// Member access before a held change, used to restore a personal route on leave.
+pub(crate) fn held_server_access(reg: &Registry, server_id: &str) -> Option<(bool, Vec<String>)> {
+    let original = saved_team_original_id(reg.servers.iter().find(|s| s.id == server_id)?)?;
+    let review = member_review(reg).ok()?;
+    let access = review.held_access.get(original)?;
+    Some((access.enabled, access.profiles.clone()))
 }
 
 // --- merge (pure, testable) ---
@@ -3104,7 +4114,10 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
                         review_ids.push(entry.id.clone());
                         review_fingerprints.insert(entry.id.clone(), fingerprint);
                     } else {
-                        if !reg.servers.iter().any(|s| s.id == shared_id && !s.source.as_deref().unwrap_or("").starts_with("team:")) {
+                        if !reg.servers.iter().any(|s| {
+                            s.id == shared_id
+                                && !s.source.as_deref().unwrap_or("").starts_with("team:")
+                        }) {
                             auto_enable.push(entry.id.clone());
                         }
                     }
@@ -3135,7 +4148,11 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     // Only rows that exist keep a mapping. A definition deleted from the Team and
     // shared again later can get a new local id; its old mapping must not linger
     // beside the new one for the same original.
-    managed_server_ids.retain(|id, _| reg.servers.iter().any(|s| &s.id == id && is_team_server(s, &tag)));
+    managed_server_ids.retain(|id, _| {
+        reg.servers
+            .iter()
+            .any(|s| &s.id == id && is_team_server(s, &tag))
+    });
     if let Some(conn) = reg.team.as_mut().filter(|c| c.team_id == team_id) {
         conn.managed_server_ids = managed_server_ids;
     }
@@ -3421,6 +4438,37 @@ fn team_launch_value(value: &Value) -> Value {
     value
 }
 
+#[cfg(feature = "test-support")]
+thread_local! {
+    static PUBLIC_TEST_HOST: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Thread-local host classification fixture. Never built into shipping binaries.
+#[cfg(feature = "test-support")]
+pub struct PublicTeamHostOverride(Option<String>);
+
+#[cfg(feature = "test-support")]
+impl PublicTeamHostOverride {
+    pub fn set(host: &str) -> Self {
+        Self(PUBLIC_TEST_HOST.with(|value| value.replace(Some(host.into()))))
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for PublicTeamHostOverride {
+    fn drop(&mut self) {
+        PUBLIC_TEST_HOST.with(|value| value.replace(self.0.take()));
+    }
+}
+
+fn team_host_is_private(host: &str) -> bool {
+    #[cfg(feature = "test-support")]
+    if PUBLIC_TEST_HOST.with(|value| value.borrow().as_deref() == Some(host)) {
+        return false;
+    }
+    crate::oauth::host_is_private(host)
+}
+
 fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
     let str_field = |k: &str| s.get(k).and_then(Value::as_str).filter(|x| !x.is_empty());
     let orig_id = str_field("id");
@@ -3511,12 +4559,13 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
     let transport = str_field("transport").unwrap_or("stdio").to_string();
     let command = str_field("command").map(String::from);
     let launch = match s.get("launch").filter(|value| !value.is_null()) {
-        Some(value) => match serde_json::from_value::<crate::registry::LaunchConfig>(
-            team_launch_value(value),
-        ) {
-            Ok(launch) => Some(launch.without_values()),
-            Err(_) => return TeamClass::Blocked,
-        },
+        Some(value) => {
+            match serde_json::from_value::<crate::registry::LaunchConfig>(team_launch_value(value))
+            {
+                Ok(launch) => Some(launch.without_values()),
+                Err(_) => return TeamClass::Blocked,
+            }
+        }
         None => None,
     };
     let mut entry = ServerEntry {
@@ -3618,7 +4667,7 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         None => None,
     };
     // Loopback / LAN (RFC1918) is a legit internal server, but require opt-in like stdio.
-    if crate::oauth::host_is_private(&host) {
+    if team_host_is_private(&host) {
         return TeamClass::Review(entry);
     }
     TeamClass::Ready(entry)
@@ -4549,15 +5598,24 @@ mod tests {
     fn publisher_changed_scope_or_target_fails_without_partial_handoff() {
         crate::secrets::tests::with_isolated_vault(|| {
             let before = publisher_registry();
-            for field in ["team", "origin", "device", "role", "profile", "target", "version"] {
+            for field in [
+                "team", "origin", "device", "role", "profile", "target", "version",
+            ] {
                 let mut r = sync_publisher(&before);
                 let id = member_id(&r, "mine");
                 match field {
                     "team" => r.team.as_mut().unwrap().team_id = "other".into(),
-                    "origin" => r.team.as_mut().unwrap().server_url = "https://other.example.test".into(),
+                    "origin" => {
+                        r.team.as_mut().unwrap().server_url = "https://other.example.test".into()
+                    }
                     "device" => r.team.as_mut().unwrap().reporting_device_id = "other".into(),
                     "role" => r.team.as_mut().unwrap().role = "member".into(),
-                    "profile" => { let mut other = r.profiles[0].clone(); other.id = "other".into(); r.profiles.push(other); r.active_profile_id = Some("other".into()); },
+                    "profile" => {
+                        let mut other = r.profiles[0].clone();
+                        other.id = "other".into();
+                        r.profiles.push(other);
+                        r.active_profile_id = Some("other".into());
+                    }
                     "version" => r.team.as_mut().unwrap().last_version = 3,
                     _ => {
                         r.servers.iter_mut().find(|s| s.id == id).unwrap().command =
@@ -6946,7 +8004,11 @@ mod tests {
         }
 
         /// Publish, sync and hand off. Returns the registry and the published set.
-        fn share(before: &Registry, remote: &Value, ids: &[&str]) -> (Registry, Value, Vec<LocalHandoff>) {
+        fn share(
+            before: &Registry,
+            remote: &Value,
+            ids: &[&str],
+        ) -> (Registry, Value, Vec<LocalHandoff>) {
             let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
             let merged = additive_server_set(remote, &selected_export(before, &ids).unwrap()).unwrap();
             let mut r = synced(before, &merged, 2);
@@ -7105,7 +8167,12 @@ mod tests {
                 let before = synced(&personal, &remote, 1);
                 let managed = team_copy(&before, "mine");
                 crate::registry::save(&before).unwrap();
-                crate::secrets::set_secret(&managed, crate::secrets::HTTP_AUTH_KEY, "independent-synthetic").unwrap();
+                crate::secrets::set_secret(
+                    &managed,
+                    crate::secrets::HTTP_AUTH_KEY,
+                    "independent-synthetic",
+                )
+                .unwrap();
 
                 let predicted = preview(&before, &remote, &["mine"]);
                 assert_eq!(predicted[0].local.outcome, HandoffOutcome::Attention);
@@ -7135,7 +8202,12 @@ mod tests {
                 let before = synced(&two, &remote, 1);
                 let other = team_copy(&before, "other");
                 crate::registry::save(&before).unwrap();
-                crate::secrets::set_secret(&other, crate::secrets::HTTP_AUTH_KEY, "independent-synthetic").unwrap();
+                crate::secrets::set_secret(
+                    &other,
+                    crate::secrets::HTTP_AUTH_KEY,
+                    "independent-synthetic",
+                )
+                .unwrap();
 
                 let (r, _, handoffs) = share(&before, &remote, &["mine", "other"]);
 
@@ -7204,7 +8276,11 @@ mod tests {
 
                 // The next sync keeps the owner's local value and binding.
                 let mut again = r.clone();
-                apply_team_config(&mut again, "publisher-test", &stored_definition(&json!({"servers": published})));
+                apply_team_config(
+                    &mut again,
+                    "publisher-test",
+                    &stored_definition(&json!({"servers": published})),
+                );
                 let owner_copy = again.servers.iter().find(|s| s.id == copy).unwrap();
                 assert_eq!(local_value(owner_copy).as_deref(), Some("/work"));
                 assert!(again.is_enabled(&profile, &copy));
@@ -7213,7 +8289,11 @@ mod tests {
                 // A member receives a Team copy to set up, with the input vaulted.
                 let mut member = base_registry();
                 member.servers.clear();
-                let outcome = apply_team_config(&mut member, "publisher-test", &stored_definition(&json!({"servers": published})));
+                let outcome = apply_team_config(
+                    &mut member,
+                    "publisher-test",
+                    &stored_definition(&json!({"servers": published})),
+                );
                 assert_eq!((outcome.blocked, outcome.review), (0, 1));
                 let input = &member.servers[0].launch.as_ref().unwrap().inputs[0];
                 assert!(input.secret && input.value.is_none());
@@ -7286,10 +8366,8 @@ mod tests {
         fn definitions_compare_in_the_form_the_service_stores() {
             crate::secrets::tests::with_isolated_vault(|| {
                 let mut personal = publisher_registry();
-                personal.servers[0].env = vec![serde_json::from_value(
-                    json!({"key":"API_TOKEN","secret":true}),
-                )
-                .unwrap()];
+                personal.servers[0].env =
+                    vec![serde_json::from_value(json!({"key":"API_TOKEN","secret":true})).unwrap()];
                 // The service drops every `secret` flag and `value` before saving.
                 let stored = stored_definition(&team_server_export(&personal));
                 assert!(!stored.to_string().contains("\"secret\""));
@@ -7346,15 +8424,1014 @@ mod tests {
                 "Already shared with your team (version 4). Nothing new was uploaded.\nLinear: Now uses the Team copy in this profile."
             );
             let result = PublishResult {
+                proposal: None,
                 version: 5,
                 published: true,
                 local_setup_error: None,
-                handoffs: vec![handoff("Vercel", HandoffOutcome::Attention, "Needs setup. Your personal server stays on in this profile.")],
+                handoffs: vec![handoff(
+                    "Vercel",
+                    HandoffOutcome::Attention,
+                    "Needs setup. Your personal server stays on in this profile.",
+                )],
                 summary: String::new(),
             };
             assert!(result.needs_attention());
             assert!(!PublishResult::whole_set(5).needs_attention());
             assert_eq!(PublishResult::whole_set(5).summary, "Shared with your team (version 5).");
         }
+    }
+}
+
+#[cfg(test)]
+mod member_review_tests {
+    use super::*;
+
+    fn registry() -> Registry {
+        let mut reg = Registry::default();
+        reg.team = Some(serde_json::from_value(json!({"teamId":"review-team", "serverUrl":"https://teams.toolport.app", "role":"member"})).unwrap());
+        reg
+    }
+
+    fn config(command: &str) -> Value {
+        json!({"servers":[
+            {"id":"stdio", "name":"Local tool", "transport":"stdio", "command":command, "args":[], "env":[]},
+            {"id":"remote", "name":"Public tool", "transport":"http", "url":"https://1.2.3.4/mcp", "env":[]}
+        ], "instructions":{"content":"Reviewed instructions"}, "screeningPolicy":{"minSafetyLevel":"ask"},
+            "rateLimits":[{"id":"daily-calls", "window":"day", "maxCalls":5, "tool":"stdio/echo"}], "callAuditExport":true})
+    }
+
+    fn decide(reg: &mut Registry, key: &str, accept: bool) {
+        let hash = member_review(reg).unwrap().pending[key].hash.clone();
+        decide_member_change(reg, key, &hash, accept).unwrap();
+    }
+
+    fn remote_id(reg: &Registry) -> String {
+        reg.servers
+            .iter()
+            .find(|s| saved_team_original_id(s) == Some("remote"))
+            .unwrap()
+            .id
+            .clone()
+    }
+
+    #[test]
+    fn member_review_removal_or_invalid_definition_revokes_consent() {
+        let mut reg = registry();
+        reg.version = 3;
+        let cfg = config("first");
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "server:remote", true);
+        let managed = reg
+            .servers
+            .iter()
+            .find(|s| s.id == remote_id(&reg))
+            .unwrap()
+            .clone();
+        let mut personal = managed.clone();
+        personal.id = "remote".into();
+        personal.source = None;
+        personal.unknown_fields.remove(TEAM_ORIGINAL_ID_FIELD);
+        personal.enabled = false;
+        reg.servers.push(personal.clone());
+        crate::local_auth::bind(&mut reg, &managed, &personal).unwrap();
+        let duplicate = json!({"servers":[cfg["servers"][1].clone(), cfg["servers"][1].clone()]});
+        let invalid = json!({"servers":[{"id":"remote", "transport":"http", "url":"invalid"}]});
+        let unusable = json!({"servers":[{"id":"remote", "transport":"stdio"}]});
+        for (index, removed) in [json!({"servers":[]}), duplicate, invalid, unusable]
+            .into_iter()
+            .enumerate()
+        {
+            let version = 2 + index as i64 * 3;
+            stage_team_config(&mut reg, "review-team", &removed, version, &[]).unwrap();
+            let review = member_review(&reg).unwrap();
+            assert!(!review.pending.contains_key("server:remote"));
+            assert!(!review.accepted.contains_key("server:remote"));
+            assert!(!review.held_access.contains_key("remote"));
+            assert!(reg
+                .servers
+                .iter()
+                .all(|s| s.source.as_deref() != Some("team:review-team")));
+            assert!(reg.server_enabled("remote") && reg.is_enabled("default", "remote"));
+            assert_eq!(
+                reg.servers.iter().find(|s| s.id == "remote").unwrap().url,
+                personal.url
+            );
+            stage_team_config(&mut reg, "review-team", &removed, version + 1, &[]).unwrap();
+            assert_eq!(reg.servers.len(), 1);
+            stage_team_config(&mut reg, "review-team", &cfg, version + 2, &[]).unwrap();
+            assert!(member_review(&reg)
+                .unwrap()
+                .pending
+                .contains_key("server:remote"));
+            let id = remote_id(&reg);
+            assert!(server_change_held(&reg, &id));
+            assert!(!reg.server_enabled(&id));
+            decide(&mut reg, "server:remote", true);
+        }
+    }
+
+    #[test]
+    fn member_review_round2_reverted_floors_return_to_accepted_policy() {
+        use crate::registry::SafetyLevel::{Off, Strict};
+        let mut reg = registry();
+        let accepted = json!({"servers":[], "denyDestructive":false, "screeningPolicy":{"minSafetyLevel":"off"}});
+        stage_team_config(&mut reg, "review-team", &accepted, 1, &[]).unwrap();
+        // Off already matches the member's accepted policy when review is seeded.
+        let strict = json!({"servers":[], "denyDestructive":true, "screeningPolicy":{
+            "minSafetyLevel":"strict", "forceHumanApproval":true, "forceContentDefense":true,
+            "forceQuarantineOnDrift":true, "forceBlockOnInjection":true, "forcePiiRedaction":true}});
+        stage_team_config(&mut reg, "review-team", &strict, 2, &[]).unwrap();
+        assert_eq!(reg.team_min_safety_level, Strict);
+        assert!(reg.team_forced_deny_destructive);
+        stage_team_config(&mut reg, "review-team", &accepted, 3, &[]).unwrap();
+        assert!(member_review(&reg).unwrap().pending.is_empty());
+        assert_eq!(reg.team_min_safety_level, Off);
+        assert!(
+            !reg.team_forced_deny_destructive
+                && !reg.team_forced_human_approval
+                && !reg.team_forced_content_defense
+                && !reg.team_forced_quarantine_on_drift
+                && !reg.team_forced_block_on_injection
+                && !reg.team_forced_pii_redaction
+        );
+    }
+
+    #[test]
+    fn member_review_round2_description_does_not_hold_working_server() {
+        ignored_field_does_not_hold("description");
+    }
+
+    #[test]
+    fn member_review_round2_env_value_does_not_hold_working_server() {
+        ignored_field_does_not_hold("env-value");
+    }
+
+    fn ignored_field_does_not_hold(field: &str) {
+        let mut reg = registry();
+        let mut cfg = config("first");
+        cfg["servers"][1]["env"] = json!([{"key":"TOKEN", "secret":true}]);
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "server:remote", true);
+        let id = remote_id(&reg);
+        if field == "description" {
+            cfg["servers"][1]["description"] = json!("Documentation only");
+        } else {
+            cfg["servers"][1]["env"][0]["value"] = json!("ignored-value");
+        }
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert!(!member_review(&reg)
+            .unwrap()
+            .pending
+            .contains_key("server:remote"));
+        assert!(!server_change_held(&reg, &id));
+        assert!(reg.server_enabled(&id));
+        cfg["servers"][1]["env"][0]["secret"] = json!(false);
+        stage_team_config(&mut reg, "review-team", &cfg, 4, &[]).unwrap();
+        assert!(server_change_held(&reg, &id));
+        assert!(!reg.server_enabled(&id));
+    }
+
+    #[test]
+    fn member_review_round2_launch_literal_changes_still_require_review() {
+        let mut reg = registry();
+        let mut cfg = config("first");
+        cfg["servers"][0]["args"] = json!(["<launch-input>"]);
+        cfg["servers"][0]["launch"] =
+            json!({"bindings":[{"index":0,"parts":[{"kind":"literal","value":"/"}]}],"inputs":[]});
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "server:stdio", true);
+        cfg["servers"][0]["launch"]["bindings"][0]["parts"][0]["value"] = json!(":");
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert!(
+            member_review(&reg).unwrap().pending["server:stdio"]
+                .fields
+                .iter()
+                .any(|f| f.before.contains("\"value\": \"/\"")
+                    && f.after.contains("\"value\": \":\""))
+        );
+    }
+
+    #[test]
+    fn member_review_round2_push_403_preserves_authorization_errors() {
+        for body in [
+            json!({"error":"forbidden"}),
+            json!({"error":"admin role was revoked"}),
+            json!({"error":"Confirm two-factor authentication to continue", "code":"step_up_required"}),
+        ] {
+            let (url, server) = serve(403, body.clone());
+            let error = push_config(
+                &url,
+                "review-team",
+                "fixture-token",
+                &json!({"servers":[]}),
+                4,
+            )
+            .unwrap_err();
+            server.join().unwrap();
+            assert_eq!(error, format!("server returned 403: {body}"));
+        }
+    }
+
+    #[test]
+    fn member_review_round2_new_and_stricter_rate_caps_apply_immediately() {
+        let mut reg = registry();
+        let mut cfg =
+            json!({"servers":[], "rateLimits":[{"id":"calls", "window":"day", "maxCalls":10}]});
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 10);
+        decide(&mut reg, "policy", true);
+        cfg["rateLimits"][0]["maxCalls"] = json!(5);
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 5);
+        cfg["rateLimits"][0]["maxCalls"] = json!(10);
+        stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 10);
+        assert!(member_review(&reg).unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn member_review_round2_stricter_rate_cap_applies_before_review() {
+        let mut reg = registry();
+        let mut cfg =
+            json!({"servers":[], "rateLimits":[{"id":"calls", "window":"day", "maxCalls":10}]});
+        apply_team_config(&mut reg, "review-team", &cfg);
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        cfg["rateLimits"][0]["maxCalls"] = json!(5);
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 5);
+        assert!(member_review(&reg).unwrap().pending.contains_key("policy"));
+    }
+
+    #[test]
+    fn member_review_round2_removed_rejected_new_server_returns_as_fresh_review() {
+        let mut reg = registry();
+        let cfg = config("first");
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "server:remote", false);
+        stage_team_config(&mut reg, "review-team", &json!({"servers":[]}), 2, &[]).unwrap();
+        assert!(reg.servers.is_empty());
+        stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
+        assert!(member_review(&reg)
+            .unwrap()
+            .pending
+            .contains_key("server:remote"));
+        assert!(server_change_held(&reg, &remote_id(&reg)));
+    }
+
+    #[test]
+    fn member_review_round2_rate_cap_loosening_and_removal_wait_for_consent() {
+        let mut reg = registry();
+        let mut cfg =
+            json!({"servers":[], "rateLimits":[{"id":"calls", "window":"day", "maxCalls":5}]});
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "policy", true);
+        cfg["rateLimits"][0]["maxCalls"] = json!(10);
+        // A simultaneous new cap applies, but cannot release the accepted cap.
+        cfg["rateLimits"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"monthly", "window":"month", "maxCalls":100}));
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 5);
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits.len(), 2);
+        decide(&mut reg, "policy", false);
+        stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 5);
+        cfg["rateLimits"] = json!([]);
+        stage_team_config(&mut reg, "review-team", &cfg, 4, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 5);
+        assert!(member_review(&reg).unwrap().pending.contains_key("policy"));
+        decide(&mut reg, "policy", true);
+        assert!(reg.team.as_ref().unwrap().rate_limits.is_empty());
+    }
+
+    #[test]
+    fn member_review_preserves_every_access_set_and_disabled_switch() {
+        for version in [2, 3] {
+            for enabled in [false, true] {
+                let mut reg = registry();
+                reg.version = version;
+                let mut cfg = config("first");
+                stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+                decide(&mut reg, "server:remote", true);
+                let id = remote_id(&reg);
+                let second = reg.add_profile("Second");
+                reg.profiles
+                    .iter_mut()
+                    .find(|p| p.id == second)
+                    .unwrap()
+                    .enabled_server_ids
+                    .push(id.clone());
+                reg.set_server_enabled("default", &id, enabled).unwrap();
+                let profiles: Vec<_> = reg
+                    .profiles
+                    .iter()
+                    .filter(|p| p.enabled_server_ids.contains(&id))
+                    .map(|p| p.id.clone())
+                    .collect();
+                cfg["servers"][1]["url"] = json!("https://1.2.3.5/mcp");
+                stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+                assert!(!reg.is_enabled("default", &id));
+                stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
+                decide(&mut reg, "server:remote", true);
+                let restored: Vec<_> = reg
+                    .profiles
+                    .iter()
+                    .filter(|p| p.enabled_server_ids.contains(&id))
+                    .map(|p| p.id.clone())
+                    .collect();
+                assert_eq!(restored, profiles, "version={version}, enabled={enabled}");
+                assert_eq!(
+                    reg.server_enabled(&id),
+                    enabled || version < 3 && !profiles.is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn member_review_accept_keeps_an_explicit_off_during_the_hold() {
+        for bulk in [false, true] {
+            let mut reg = registry();
+            reg.version = 3;
+            let mut cfg = config("first");
+            stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+            decide(&mut reg, "server:remote", true);
+            let id = remote_id(&reg);
+            cfg["servers"][1]["url"] = json!("https://1.2.3.5/mcp");
+            stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+            if bulk {
+                reg.set_all_enabled("default", false).unwrap();
+            } else {
+                crate::registry_controller::apply_server_enabled(
+                    &mut reg, "default", &id, false, false,
+                )
+                .unwrap();
+            }
+            decide(&mut reg, "server:remote", true);
+            assert!(!reg.server_enabled(&id));
+        }
+    }
+
+    #[test]
+    fn member_review_upgrade_keeps_applied_servers_and_caps() {
+        let mut reg = registry();
+        let cfg = config("first");
+        apply_team_config(&mut reg, "review-team", &cfg);
+        let id = remote_id(&reg);
+        let second = reg.add_profile("Second");
+        reg.profiles
+            .iter_mut()
+            .find(|p| p.id == second)
+            .unwrap()
+            .enabled_server_ids
+            .push(id.clone());
+        let before = reg.team.as_ref().unwrap().rate_limits.clone();
+        assert_eq!(before.len(), 1);
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits, before);
+        assert!(!server_change_held(&reg, &id));
+        assert!(reg.is_enabled("default", &id) && reg.is_enabled(&second, &id));
+        assert!(!member_review(&reg)
+            .unwrap()
+            .pending
+            .contains_key("server:remote"));
+    }
+
+    #[test]
+    fn member_review_upgrade_keeps_saved_secret_arguments_while_held() {
+        let mut reg = registry();
+        let mut cfg = config("first");
+        cfg["servers"][0]["args"] = json!(["--token", "saved-secret"]);
+        apply_team_config(&mut reg, "review-team", &cfg);
+        cfg["servers"][0]["args"] = json!(["--token", "changed-secret"]);
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        let server = reg.servers.iter().find(|s| saved_team_original_id(s) == Some("stdio")).unwrap();
+        assert_eq!(server.args, ["--token", "saved-secret"]);
+        assert!(server_change_held(&reg, &server.id));
+        let review = member_review(&reg).unwrap();
+        assert!(!json!(review.pending["server:stdio"].fields).to_string().contains("saved-secret"));
+    }
+
+    #[test]
+    fn member_review_rejected_replacement_runs_accepted_definition() {
+        let mut reg = registry();
+        let mut cfg = config("first");
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "server:remote", true);
+        let id = remote_id(&reg);
+        cfg["servers"][1]["url"] = json!("https://1.2.3.5/mcp");
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        decide(&mut reg, "server:remote", false);
+        stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
+        assert_eq!(
+            reg.servers
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .url
+                .as_deref(),
+            Some("https://1.2.3.4/mcp")
+        );
+        assert!(!server_change_held(&reg, &id));
+        assert!(reg.is_enabled("default", &id));
+    }
+
+    #[test]
+    fn member_review_hidden_changes_always_have_a_visible_diff() {
+        let mut reg = registry();
+        let mut cfg = config("first");
+        cfg["servers"][0]["args"] = json!(["--token", "old-secret"]);
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "server:stdio", true);
+        cfg["servers"][0]["args"] = json!(["--token", "new-secret"]);
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        let review = member_review(&reg).unwrap();
+        let fields = &review.pending["server:stdio"].fields;
+        assert!(!fields.is_empty());
+        assert!(!json!(fields).to_string().contains("new-secret"));
+        assert_eq!(
+            display_server(&json!({"launch":{"args":[{"type":"literal","value":"visible"}]}}))
+                ["launch"]["args"][0]["value"],
+            "visible"
+        );
+        assert_ne!(
+            display_server(&json!({"env":[{"key":"X","secret":true}]})),
+            display_server(&json!({"env":[{"key":"X","secret":false}]}))
+        );
+    }
+
+    #[test]
+    fn member_review_labels_are_bounded_strings() {
+        let labels = change_labels(
+            "instructions",
+            &[
+                json!({"summary":{"instructions":true},"author":{"name":{"bad":"object"}},"via":"界".repeat(150),"approvedBy":{"name":"a".repeat(150)},"at":{"bad":1}}),
+            ],
+        );
+        assert!(labels[0]["author"]["name"].is_string());
+        assert_eq!(labels[0]["via"].as_str().unwrap().chars().count(), 128);
+        assert_eq!(labels[0]["approvedBy"]["name"].as_str().unwrap().len(), 128);
+        assert!(labels[0]["at"].is_null());
+    }
+
+    #[test]
+    fn member_review_pull_403_retains_the_service_error() {
+        let (url, server) = serve(403, json!({"error":"member access revoked"}));
+        let mut conn = registry().team.unwrap();
+        conn.server_url = url;
+        let error = fetch_change_labels(&conn, "fixture-token", 4, 5).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            error.contains("403") && error.contains("member access revoked"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn member_review_pairing_omits_empty_device_name() {
+        for name in ["", "  "] {
+            assert!(pairing_body("t", "c", Some(name), "linux", "2.0")
+                .get("deviceName")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn member_review_decisions_do_not_wait_for_network_sync() {
+        let _data_lock = crate::registry::data_dir_test_lock();
+        let temp =
+            std::env::temp_dir().join(format!("toolport-review-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&temp);
+        let mut reg = registry();
+        stage_team_config(&mut reg, "review-team", &config("first"), 1, &[]).unwrap();
+        crate::registry::save(&reg).unwrap();
+        let hash = member_review(&reg).unwrap().pending["server:remote"]
+            .hash
+            .clone();
+        std::thread::scope(|scope| {
+            let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+            let owner = scope.spawn(move || {
+                let _sync = SYNC_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                locked_tx.send(()).unwrap();
+                // Release only when the real decision path has completed. The test
+                // runner's process watchdog bounds a regression that deadlocks here.
+                done_rx.recv().unwrap();
+            });
+            locked_rx.recv().unwrap();
+            let result = review_team_change("server:remote", &hash, true);
+            done_tx.send(()).unwrap();
+            owner.join().unwrap();
+            result.unwrap();
+        });
+    }
+
+    #[test]
+    fn member_review_instructions_keep_their_content_version() {
+        let mut reg = registry();
+        let mut cfg = config("first");
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        cfg["servers"][0]["command"] = json!("later");
+        stage_team_config(&mut reg, "review-team", &cfg, 9, &[]).unwrap();
+        decide(&mut reg, "instructions", true);
+        assert_eq!(
+            json!(member_review(&reg).unwrap())["acceptedInstructionsVersion"],
+            1
+        );
+        stage_team_config(&mut reg, "review-team", &cfg, 10, &[]).unwrap();
+        assert_eq!(
+            json!(member_review(&reg).unwrap())["acceptedInstructionsVersion"],
+            1
+        );
+    }
+
+    #[test]
+    fn member_review_leaving_restores_personal_route_while_held() {
+        let mut reg = registry();
+        reg.version = 3;
+        let mut cfg = config("first");
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "server:remote", true);
+        let id = remote_id(&reg);
+        let managed = reg.servers.iter().find(|s| s.id == id).unwrap().clone();
+        let mut personal = managed.clone();
+        personal.id = "remote".into();
+        personal.source = None;
+        personal.enabled = false;
+        reg.servers.push(personal.clone());
+        crate::local_auth::bind(&mut reg, &managed, &personal).unwrap();
+        cfg["servers"][1]["url"] = json!("https://1.2.3.5/mcp");
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert!(!reg.server_enabled(&id) && !reg.server_enabled("remote"));
+        remove_team(&mut reg, "review-team");
+        assert!(reg.server_enabled("remote"));
+        assert!(reg.is_enabled("default", "remote"));
+    }
+
+    #[test]
+    fn member_review_sync_holds_all_control_plane_changes() {
+        let mut reg = registry();
+        stage_team_config(&mut reg, "review-team", &config("fixture-only"), 1, &[]).unwrap();
+        assert_eq!(member_review(&reg).unwrap().pending.len(), 5);
+        assert_eq!(reg.servers.len(), 2);
+        for server in &reg.servers {
+            assert!(!server.enabled);
+            assert!(!reg.is_enabled(&reg.active_profile_id(), &server.id));
+            assert!(server.needs_team_enable_review());
+            assert!(server.check_enable_allowed(false).is_err());
+        }
+        assert!(reg
+            .team
+            .as_ref()
+            .unwrap()
+            .team_instructions_content
+            .is_none());
+        assert!(!reg.team.as_ref().unwrap().call_audit_export);
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 5);
+        // The required safety floor still takes effect before consent.
+        assert_eq!(reg.team_min_safety_level, crate::registry::SafetyLevel::Ask);
+        let id = reg.servers[0].id.clone();
+        let profile = reg.active_profile_id();
+        assert!(crate::registry_controller::apply_server_enabled(
+            &mut reg, &profile, &id, true, true
+        )
+        .is_err());
+        reg.set_all_enabled(&profile, true).unwrap();
+        assert!(reg.servers.iter().all(|s| !reg.is_enabled(&profile, &s.id)));
+    }
+
+    #[test]
+    fn member_review_rejection_survives_save_sync_and_content_return() {
+        let mut reg = registry();
+        let first = config("first");
+        stage_team_config(&mut reg, "review-team", &first, 1, &[]).unwrap();
+        decide(&mut reg, "server:stdio", false);
+        decide(&mut reg, "instructions", false);
+        decide(&mut reg, "policy", false);
+        decide(&mut reg, "callAuditExport", false);
+        reg = serde_json::from_value(serde_json::to_value(&reg).unwrap()).unwrap();
+        stage_team_config(&mut reg, "review-team", &first, 2, &[]).unwrap();
+        assert_eq!(member_review(&reg).unwrap().pending.len(), 1);
+        let mut next = config("next");
+        next["instructions"]["content"] = json!("Different instructions");
+        next["screeningPolicy"]["forceBlockOnInjection"] = json!(true);
+        stage_team_config(&mut reg, "review-team", &next, 3, &[]).unwrap();
+        let pending = member_review(&reg).unwrap().pending;
+        assert!(pending.contains_key("server:stdio"));
+        assert!(pending.contains_key("instructions"));
+        assert!(pending.contains_key("policy"));
+        assert!(!pending.contains_key("callAuditExport"));
+        stage_team_config(&mut reg, "review-team", &first, 4, &[]).unwrap();
+        assert!(!member_review(&reg)
+            .unwrap()
+            .pending
+            .contains_key("server:stdio"));
+        assert!(reg.servers.iter().all(|s| !s.enabled));
+        assert!(!reg.team.as_ref().unwrap().call_audit_export);
+    }
+
+    #[test]
+    fn member_review_stale_accept_cannot_accept_a_later_definition() {
+        let mut reg = registry();
+        stage_team_config(&mut reg, "review-team", &config("first"), 1, &[]).unwrap();
+        let hash = member_review(&reg).unwrap().pending["server:stdio"]
+            .hash
+            .clone();
+        stage_team_config(&mut reg, "review-team", &config("changed"), 2, &[]).unwrap();
+        let before = serde_json::to_value(&reg).unwrap();
+        assert!(decide_member_change(&mut reg, "server:stdio", &hash, true)
+            .unwrap_err()
+            .contains("updated"));
+        assert_eq!(serde_json::to_value(&reg).unwrap(), before);
+        decide(&mut reg, "server:stdio", true);
+        let server = reg
+            .servers
+            .iter()
+            .find(|s| saved_team_original_id(s) == Some("stdio"))
+            .unwrap();
+        assert_eq!(server.command.as_deref(), Some("changed"));
+        assert!(server.enabled);
+        assert!(reg.is_enabled(&reg.active_profile_id(), &server.id));
+        assert!(!server_change_held(&reg, &server.id));
+        stage_team_config(&mut reg, "review-team", &config("changed"), 3, &[]).unwrap();
+        assert!(!member_review(&reg)
+            .unwrap()
+            .pending
+            .contains_key("server:stdio"));
+    }
+
+    #[test]
+    fn member_review_changed_remote_is_held_and_removal_is_immediate() {
+        let mut reg = registry();
+        let mut cfg = config("first");
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "server:remote", true);
+        cfg["servers"][1]["url"] = json!("https://1.2.3.5/mcp");
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert!(member_review(&reg).unwrap().pending["server:remote"]
+            .fields
+            .iter()
+            .any(|f| f.before.contains("1.2.3.4") && f.after.contains("1.2.3.5")));
+        assert!(reg.servers.iter().all(|s| !s.enabled));
+        cfg["servers"] = json!([]);
+        stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
+        assert!(!member_review(&reg)
+            .unwrap()
+            .pending
+            .contains_key("server:remote"));
+        assert!(!reg
+            .servers
+            .iter()
+            .any(|s| saved_team_original_id(s) == Some("remote")));
+    }
+
+    #[test]
+    fn member_review_floor_tightens_immediately_and_loosening_waits() {
+        use crate::registry::SafetyLevel::{Off, Strict};
+        let mut reg = registry();
+        let strict = json!({"servers":[], "screeningPolicy":{"minSafetyLevel":"strict", "forceQuarantineOnDrift":true,"forceBlockOnInjection":true}});
+        stage_team_config(&mut reg, "review-team", &strict, 1, &[]).unwrap();
+        assert_eq!(reg.team_min_safety_level, Strict);
+        assert!(reg.team_forced_quarantine_on_drift && reg.team_forced_block_on_injection);
+        decide(&mut reg, "policy", true);
+        let loose = json!({"servers":[], "screeningPolicy":{"minSafetyLevel":"off", "forceQuarantineOnDrift":false,"forceBlockOnInjection":false}});
+        stage_team_config(&mut reg, "review-team", &loose, 2, &[]).unwrap();
+        assert_eq!(reg.team_min_safety_level, Strict);
+        assert!(reg.team_forced_quarantine_on_drift && reg.team_forced_block_on_injection);
+        decide(&mut reg, "policy", false);
+        stage_team_config(&mut reg, "review-team", &loose, 3, &[]).unwrap();
+        assert_eq!(reg.team_min_safety_level, Strict);
+        assert!(member_review(&reg).unwrap().pending.is_empty());
+        let mut different = loose.clone();
+        different["screeningPolicy"]["forcePiiRedaction"] = json!(true);
+        stage_team_config(&mut reg, "review-team", &different, 4, &[]).unwrap();
+        decide(&mut reg, "policy", true);
+        assert_eq!(reg.team_min_safety_level, Off);
+        assert!(!reg.team_forced_quarantine_on_drift && !reg.team_forced_block_on_injection);
+    }
+
+    #[test]
+    fn member_review_export_turn_off_revokes_prior_consent() {
+        let mut reg = registry();
+        let mut cfg = config("first");
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "callAuditExport", true);
+        assert!(reg.team.as_ref().unwrap().call_audit_export);
+        cfg["callAuditExport"] = json!(false);
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert!(!reg.team.as_ref().unwrap().call_audit_export);
+        cfg["callAuditExport"] = json!(true);
+        stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
+        assert!(!reg.team.as_ref().unwrap().call_audit_export);
+        assert!(member_review(&reg)
+            .unwrap()
+            .pending
+            .contains_key("callAuditExport"));
+    }
+
+    #[test]
+    fn member_review_malformed_floor_fails_closed() {
+        let mut reg = registry();
+        for screening in [json!("invalid"), json!({"minSafetyLevel":"invalid"})] {
+            stage_team_config(
+                &mut reg,
+                "review-team",
+                &json!({"servers":[], "screeningPolicy":screening}),
+                1,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                reg.team_min_safety_level,
+                crate::registry::SafetyLevel::Strict
+            );
+            decide(&mut reg, "policy", true);
+            assert_eq!(
+                reg.team_min_safety_level,
+                crate::registry::SafetyLevel::Strict
+            );
+        }
+    }
+
+    #[test]
+    fn member_review_hash_is_full_content_and_stable_for_object_key_order() {
+        assert_eq!(
+            item_hash("server:s", &json!({"a":1,"b":2})),
+            item_hash("server:s", &json!({"b":2,"a":1}))
+        );
+        assert_ne!(
+            item_hash("server:s", &json!({"a":1})),
+            item_hash("server:s", &json!({"a":2}))
+        );
+        assert_ne!(
+            item_hash("server:s", &json!({"args":["a","b"]})),
+            item_hash("server:s", &json!({"args":["b","a"]}))
+        );
+        assert_ne!(
+            item_hash("server:s", &json!({})),
+            item_hash("server:t", &json!({}))
+        );
+    }
+
+    #[test]
+    fn member_review_labels_require_a_complete_version_chain() {
+        let changes = json!({"changes":[
+            {"version":12,"baseVersion":11,"author":{"name":"Alice"},"at":1,"via":"dashboard","approvedBy":{"name":"Bob"},"summary":{"serversChanged":["stdio"]}},
+            {"version":11,"baseVersion":9,"summary":{"instructions":true}}
+        ]});
+        assert_eq!(covered_changes(changes.clone(), 9, 12).len(), 2);
+        assert!(covered_changes(changes.clone(), 8, 12).is_empty());
+        let mut missing = changes.clone();
+        missing["changes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("baseVersion");
+        assert!(covered_changes(missing, 9, 12).is_empty());
+        let labels = change_labels("server:stdio", &covered_changes(changes, 9, 12));
+        assert_eq!(labels[0]["author"]["name"], "Alice");
+        assert_eq!(labels[0]["approvedBy"]["name"], "Bob");
+        assert_eq!(labels[0]["via"], "dashboard");
+    }
+
+    fn serve(status: u16, mut body: Value) -> (String, std::thread::JoinHandle<(String, Value)>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", server.server_addr());
+        if body["proposal"]["confirmUrl"] == "<service>" {
+            body["proposal"]["confirmUrl"] = json!(format!(
+                "{}/#changes=team/p1",
+                address.replacen("http://", "https://", 1)
+            ));
+        }
+        let handle = std::thread::spawn(move || {
+            let mut request = server
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .expect("Teams request");
+            let path = request.url().to_string();
+            let mut payload = String::new();
+            request.as_reader().read_to_string(&mut payload).unwrap();
+            request
+                .respond(
+                    tiny_http::Response::from_string(body.to_string()).with_status_code(status),
+                )
+                .unwrap();
+            (path, serde_json::from_str(&payload).unwrap_or(Value::Null))
+        });
+        (address, handle)
+    }
+
+    #[test]
+    fn member_review_http_404_is_unlabelled_and_403_explains_dashboard() {
+        let (url, server) = serve(404, json!({}));
+        let mut conn = registry().team.unwrap();
+        conn.server_url = url;
+        assert!(fetch_change_labels(&conn, "fixture-token", 4, 5)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            server.join().unwrap().0,
+            "/teams/review-team/config/changes?since=4"
+        );
+        let (url, server) = serve(403, json!({"error":"device token is not an admin session"}));
+        assert_eq!(
+            push_config(
+                &url,
+                "review-team",
+                "fixture-token",
+                &json!({"servers":[]}),
+                4
+            )
+            .unwrap_err(),
+            "Finish this in the Teams dashboard"
+        );
+        server.join().unwrap();
+        assert_eq!(push_status_message(403), None);
+    }
+
+    #[test]
+    fn member_review_202_and_safe_confirmation_url() {
+        let proposal = json!({"proposal":{"id":"p1","baseVersion":7,"confirmUrl":"https://teams.toolport.app/#changes=team/p1"}});
+        let outcome = parse_push_response(HOSTED_TEAMS_URL, 202, proposal).unwrap();
+        let result = PublishResult::whole_set(outcome);
+        assert_eq!(result.summary, "Sent for confirmation");
+        assert!(!result.published);
+        assert!(result.handoffs.is_empty());
+        assert_eq!(result.proposal.unwrap().base_version, 7);
+        for url in [
+            "http://teams.toolport.app/#changes=p1",
+            "https://evil.example/",
+            "https://teams.toolport.app.evil.example/",
+            "https://user@teams.toolport.app/",
+            "file:///tmp/config",
+            "https://teams.toolport.app:444/",
+        ] {
+            assert!(
+                validate_confirmation_url(HOSTED_TEAMS_URL, url).is_err(),
+                "{url}"
+            );
+        }
+        assert!(matches!(
+            parse_push_response(HOSTED_TEAMS_URL, 200, json!({"version":8})).unwrap(),
+            PushOutcome::Published(8)
+        ));
+    }
+
+    #[test]
+    fn member_review_pairing_start_sends_device_fields_and_push_202_is_not_an_error() {
+        let (origin, server) = serve(200, json!({"transaction":"a".repeat(64)}));
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            pair_device(&origin, "review-team", &cancel, |_, _| cancel
+                .store(true, std::sync::atomic::Ordering::SeqCst))
+            .unwrap_err(),
+            PAIRING_CANCELLED
+        );
+        let (path, body) = server.join().unwrap();
+        assert_eq!(path, "/pairing/start");
+        assert_eq!(body["os"], std::env::consts::OS);
+        assert_eq!(body["appVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["teamId"], "review-team");
+        assert_eq!(body["challenge"].as_str().unwrap().len(), 64);
+        let (origin, server) = serve(
+            202,
+            json!({"proposal":{"id":"p1", "baseVersion":3,"confirmUrl":"<service>"}}),
+        );
+        let outcome = push_config(
+            &origin,
+            "review-team",
+            "fixture-token",
+            &json!({"servers":[]}),
+            3,
+        )
+        .unwrap();
+        assert!(matches!(outcome, PushOutcome::Confirmation(_)));
+        assert_eq!(server.join().unwrap().1["base_version"], 3);
+    }
+
+    #[test]
+    fn member_review_pairing_device_fields_are_optional_and_bounded() {
+        let body = pairing_body(
+            "t",
+            "challenge",
+            Some(&"界".repeat(150)),
+            &"o".repeat(140),
+            &"v".repeat(140),
+        );
+        assert_eq!(body["teamId"], "t");
+        assert_eq!(body["challenge"], "challenge");
+        for key in ["deviceName", "os", "appVersion"] {
+            assert_eq!(body[key].as_str().unwrap().chars().count(), 128);
+        }
+        assert!(pairing_body("t", "c", None, "linux", "2.0")
+            .get("deviceName")
+            .is_none());
+    }
+
+    #[test]
+    fn member_review_survives_v1_v2_v3_round_trip() {
+        let mut reg = registry();
+        stage_team_config(&mut reg, "review-team", &config("fixture-only"), 1, &[]).unwrap();
+        decide(&mut reg, "instructions", false);
+        let expected = reg.team.as_ref().unwrap().unknown_fields[MEMBER_REVIEW_FIELD].clone();
+        for version in [1, 2, 3] {
+            let mut value = serde_json::to_value(&reg).unwrap();
+            value["version"] = json!(version);
+            let reloaded: Registry = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                reloaded.team.unwrap().unknown_fields[MEMBER_REVIEW_FIELD],
+                expected
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod member_pairing_regression {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires private omabox HOME for before-change instructions writes"]
+    fn pairing_holds_servers_instructions_policy_and_export() {
+        assert_eq!(std::env::var("HOME").unwrap(), "/home/sbx");
+        let _lock = crate::registry::data_dir_test_lock();
+        let root =
+            std::env::temp_dir().join(format!("toolport-member-pairing-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&root);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", server.server_addr());
+        let config = json!({"servers":[
+            {"id":"remote", "name":"Public tool", "transport":"http", "url":"https://1.2.3.4/mcp", "env":[]},
+            {"id":"stdio", "name":"Local tool", "transport":"stdio", "command":"fixture-only", "args":[], "env":[]}
+        ], "instructions":{"content":"Do not apply before member acceptance."}, "callAuditExport":true,
+            "screeningPolicy":{"minSafetyLevel":"ask"}, "rateLimits":[{"id":"daily-calls","window":"day","maxCalls":5,"tool":"stdio/echo"}]});
+        let service = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+            while std::time::Instant::now() < deadline {
+                let Some(request) = server
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap()
+                else {
+                    break;
+                };
+                let (status, body) = if request.url().contains("/config/changes") {
+                    (404, json!({}))
+                } else if request.url().ends_with("/config") {
+                    (200, json!({"version":1,"config":config}))
+                } else if request.url().ends_with("/me") {
+                    (200, json!({"role":"member"}))
+                } else {
+                    (404, json!({}))
+                };
+                request
+                    .respond(
+                        tiny_http::Response::from_string(body.to_string()).with_status_code(status),
+                    )
+                    .unwrap();
+            }
+        });
+        let result = finish_connect(
+            &origin,
+            None,
+            Joined {
+                team_id: "review-team".into(),
+                member_token: "fixture-token".into(),
+                role: "member".into(),
+            },
+        );
+        service.join().unwrap();
+        result.unwrap();
+        let registry = crate::registry::load().unwrap();
+        assert_eq!(registry.servers.len(), 2);
+        assert!(
+            registry.servers.iter().all(|server| !server.enabled),
+            "pairing enabled an unreviewed server"
+        );
+        assert!(
+            registry
+                .team
+                .as_ref()
+                .unwrap()
+                .team_instructions_content
+                .is_none(),
+            "pairing applied unreviewed instructions"
+        );
+        assert!(
+            !registry.team.as_ref().unwrap().call_audit_export,
+            "pairing enabled unreviewed call-log export"
+        );
+        assert!(
+            registry.team.as_ref().unwrap().rate_limits[0].max_calls == 5,
+            "pairing did not apply the tightening rate cap"
+        );
+        assert_eq!(
+            registry.team_min_safety_level,
+            crate::registry::SafetyLevel::Ask
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

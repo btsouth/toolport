@@ -552,6 +552,28 @@ impl TeamsPage {
         self.content.append(&summary);
         self.content.append(&gtk::Label::builder().label("Open Clients to use your enabled team servers from an AI client. Review any remaining servers below before enabling them. Successful managed calls are reported automatically.").wrap(true).xalign(0.0).build());
 
+        match crate::teams::member_review(&registry) {
+            Ok(review) if !review.pending.is_empty() => {
+                let button = gtk::Button::with_label(&format!(
+                    "Review {} team changes",
+                    review.pending.len()
+                ));
+                let page = self.clone();
+                button.connect_clicked(move |_| {
+                    if let Some(parent) = page.app.active_window() {
+                        let dialog = member_review_dialog(&parent, &review);
+                        let extra = dialog.extra_child().unwrap();
+                        connect_member_decisions(&extra, &review, &page, &dialog);
+                        dialog.present();
+                    }
+                });
+                self.content.append(&gtk::Label::builder().label("Held servers stay off and instructions stay unchanged. Safety floors can tighten immediately.").wrap(true).xalign(0.0).build());
+                self.content.append(&button);
+            }
+            Err(error) => self.feedback.set_text(&error),
+            _ => {}
+        }
+
         let review = registry
             .servers
             .iter()
@@ -854,6 +876,32 @@ impl TeamsPage {
                     .await;
                     match result {
                         Ok(Ok(result)) => {
+                            if let Some(proposal) = &result.proposal {
+                                if let Some(parent) = page.app.active_window() {
+                                    let confirmation = adw::MessageDialog::new(
+                                        Some(&parent),
+                                        Some("Sent for confirmation"),
+                                        Some(
+                                            "Finish publishing this update in the Teams dashboard.",
+                                        ),
+                                    );
+                                    confirmation.add_response("close", "Close");
+                                    confirmation.add_response("open", "Open");
+                                    let url = proposal.confirm_url.clone();
+                                    let page = page.clone();
+                                    confirmation.connect_response(None, move |dialog, response| {
+                                        if response == "open" {
+                                            if let Err(error) =
+                                                crate::teams::open_confirmation(&url)
+                                            {
+                                                page.show_error(&error);
+                                            }
+                                        }
+                                        dialog.close();
+                                    });
+                                    confirmation.present();
+                                }
+                            }
                             *page.sync_notice.borrow_mut() =
                                 Some((result.summary.clone(), result.needs_attention()));
                             page.refresh();
@@ -1010,9 +1058,8 @@ fn team_review_line(review: usize, blocked: usize) -> Option<String> {
     let mut parts = Vec::new();
     if review > 0 {
         parts.push(format!(
-            "{review} team {} off until you review and enable {} below. Check the command, address and authentication before enabling.",
-            if review == 1 { "server is" } else { "servers are" },
-            if review == 1 { "it" } else { "them" },
+            "{review} team {} waiting for your review. Held servers stay off; review queued changes above.",
+            if review == 1 { "change is" } else { "changes are" },
         ));
     }
     if blocked > 0 {
@@ -1132,7 +1179,11 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
         "Review and enable"
     });
     enable.set_valign(gtk::Align::Center);
-    enable.set_sensitive(!already_enabled);
+    let held = server.unknown_fields.get("teamHeldChange") == Some(&serde_json::json!(true));
+    if held {
+        enable.set_label("Held for team change review");
+    }
+    enable.set_sensitive(!already_enabled && !held);
     enable.add_css_class("toolport-secondary-action");
     let server_name = server.name.clone();
     let server_id = server.id.clone();
@@ -1334,6 +1385,176 @@ fn share_preview_content(preview: &crate::teams::PushPreview) -> gtk::ScrolledWi
         .build()
 }
 
+fn member_label(label: &serde_json::Value) -> String {
+    let author = label["author"]["name"].as_str().unwrap_or("Unknown author");
+    let time = label["at"]
+        .as_i64()
+        .and_then(|ms| gtk::glib::DateTime::from_unix_utc(ms / 1000).ok())
+        .and_then(|date| date.format("%Y-%m-%d %H:%M UTC").ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "Unknown time".into());
+    let via = label["via"].as_str().unwrap_or("unknown");
+    let approval = label["approvedBy"]["name"]
+        .as_str()
+        .map(|name| format!(" · approved by {name}"))
+        .unwrap_or_default();
+    format!("{author} · {time} · via {via}{approval}")
+}
+
+fn member_review_dialog(
+    parent: &impl IsA<gtk::Window>,
+    review: &crate::teams::MemberReview,
+) -> adw::MessageDialog {
+    let dialog = adw::MessageDialog::new(Some(parent), Some("Review team changes"), Some("Each decision applies to this member and the exact content shown. Held servers stay off. Safety floors can tighten immediately."));
+    dialog.add_response("close", "Close");
+    dialog.set_extra_child(Some(&member_review_content(review)));
+    dialog
+}
+
+fn member_review_content(review: &crate::teams::MemberReview) -> gtk::ScrolledWindow {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    for change in review.pending.values() {
+        let section = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        section.add_css_class("toolport-card");
+        section.append(
+            &gtk::Label::builder()
+                .label(&change.title)
+                .xalign(0.0)
+                .css_classes(["heading"])
+                .build(),
+        );
+        if change.labels.is_empty() {
+            section.append(&gtk::Label::builder().label("Full diff from your accepted configuration. Change history labels unavailable.").wrap(true).xalign(0.0).build());
+        } else {
+            for label in &change.labels {
+                section.append(
+                    &gtk::Label::builder()
+                        .label(member_label(label))
+                        .wrap(true)
+                        .xalign(0.0)
+                        .build(),
+                );
+            }
+        }
+        for field in &change.fields {
+            section.append(
+                &gtk::Label::builder()
+                    .label(format!(
+                        "{}\nBefore: {}\nAfter: {}",
+                        field.field, field.before, field.after
+                    ))
+                    .wrap(true)
+                    .selectable(true)
+                    .xalign(0.0)
+                    .build(),
+            );
+        }
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        for (name, accept) in [("Accept", true), ("Reject", false)] {
+            let button = gtk::Button::with_label(name);
+            button.set_widget_name(&format!(
+                "{}:{}",
+                if accept { "accept" } else { "reject" },
+                change.key
+            ));
+            if accept {
+                button.add_css_class("suggested-action");
+            }
+            buttons.append(&button);
+        }
+        section.append(&buttons);
+        content.append(&section);
+    }
+    gtk::ScrolledWindow::builder()
+        .min_content_width(480)
+        .max_content_height(520)
+        .propagate_natural_height(true)
+        .child(&content)
+        .build()
+}
+
+fn refresh_member_review_dialog(
+    dialog: &adw::MessageDialog,
+    review: &crate::teams::MemberReview,
+) -> bool {
+    if review.pending.is_empty() {
+        dialog.close();
+        return false;
+    }
+    dialog.set_extra_child(Some(&member_review_content(review)));
+    true
+}
+
+fn connect_member_decisions(
+    widget: &gtk::Widget,
+    review: &crate::teams::MemberReview,
+    page: &TeamsPage,
+    dialog: &adw::MessageDialog,
+) {
+    if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+        let name = button.widget_name();
+        if let Some((action, key)) = name.split_once(':') {
+            if let Some(change) = review.pending.get(key) {
+                let key = change.key.clone();
+                let hash = change.hash.clone();
+                let accept = action == "accept";
+                let page = page.clone();
+                let dialog = dialog.clone();
+                button.connect_clicked(move |button| {
+                    if page.busy.replace(true) {
+                        return;
+                    }
+                    button.set_sensitive(false);
+                    let (key, hash, page, dialog) =
+                        (key.clone(), hash.clone(), page.clone(), dialog.clone());
+                    gtk::glib::spawn_future_local(async move {
+                        let result = gtk::gio::spawn_blocking(move || {
+                            crate::teams::review_team_change(&key, &hash, accept)
+                        })
+                        .await;
+                        page.busy.set(false);
+                        match result {
+                            Ok(Ok(reg)) => {
+                                match crate::teams::member_review(&reg) {
+                                    Ok(review) => {
+                                        if refresh_member_review_dialog(&dialog, &review) {
+                                            if let Some(content) = dialog.extra_child() {
+                                                connect_member_decisions(
+                                                    &content, &review, &page, &dialog,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        dialog.close();
+                                        page.show_error(&error);
+                                    }
+                                }
+                                page.refresh();
+                            }
+                            Ok(Err(error)) => {
+                                dialog.close();
+                                page.show_error(&error);
+                            }
+                            Err(_) => {
+                                dialog.close();
+                                page.show_error(
+                                    "Team review stopped unexpectedly. Review the current queue.",
+                                );
+                            }
+                        }
+                    });
+                });
+            }
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        connect_member_decisions(&current, review, page, dialog);
+        child = current.next_sibling();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::share_preview_dialog;
@@ -1341,8 +1562,127 @@ mod tests {
     use super::{share_action, share_choice_label};
     use crate::teams::{HandoffOutcome, LocalHandoff, PushPreview, ShareSelectionPreview};
     use adw::prelude::*;
+    use std::{cell::Cell, rc::Rc};
 
-    fn selection(name: &str, change: &str, outcome: HandoffOutcome, message: &str) -> ShareSelectionPreview {
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn member_review_native_shows_diff_labels_and_both_decisions() {
+        adw::init().unwrap();
+        let mut registry = crate::registry::Registry::default();
+        registry.team = Some(serde_json::from_value(serde_json::json!({"teamId":"native-review", "serverUrl":"https://teams.toolport.app", "role":"member"})).unwrap());
+        crate::teams::stage_team_config(&mut registry, "native-review", &serde_json::json!({"servers":[], "instructions":{"content":"Recognized team instructions"}}), 12, &[serde_json::json!({"author":{"name":"Alice"},"at":1791417600000_i64,"via":"dashboard","approvedBy":{"name":"Bob"},"summary":{"instructions":true}})]).unwrap();
+        let review = crate::teams::member_review(&registry).unwrap();
+        let parent = adw::ApplicationWindow::builder()
+            .title("P14 member review")
+            .default_width(700)
+            .default_height(800)
+            .build();
+        let dialog = super::member_review_dialog(&parent, &review);
+        let mut text = String::new();
+        collect(&dialog.clone().upcast(), &mut text);
+        assert!(text.contains("Team instructions"));
+        assert!(text.contains("Before: None"));
+        assert!(text.contains("After: Recognized team instructions"));
+        assert!(
+            text.contains("Alice")
+                && text.contains("via dashboard")
+                && text.contains("approved by Bob")
+        );
+        assert!(text.contains("Accept") && text.contains("Reject"));
+        // Hold this fixture only for an external omabox capture. Frame callbacks
+        // observe the completion marker; the timeout bounds the optional capture.
+        if let Ok(path) = std::env::var("TOOLPORT_MEMBER_REVIEW_SCREENSHOT") {
+            let done = std::path::PathBuf::from(format!("{path}.done"));
+            let finished = Rc::new(Cell::new(false));
+            let main_loop = gtk::glib::MainLoop::new(None, false);
+            let frame_loop = main_loop.clone();
+            let captured = finished.clone();
+            dialog.add_tick_callback(move |_, _| {
+                if done.exists() {
+                    captured.set(true);
+                    frame_loop.quit();
+                    gtk::glib::ControlFlow::Break
+                } else {
+                    gtk::glib::ControlFlow::Continue
+                }
+            });
+            let timeout_loop = main_loop.clone();
+            let timeout =
+                gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(30), move || {
+                    timeout_loop.quit()
+                });
+            parent.present();
+            dialog.present();
+            main_loop.run();
+            if finished.get() {
+                timeout.remove();
+            }
+            assert!(
+                finished.get(),
+                "omabox capture did not finish within 30 seconds"
+            );
+        }
+        dialog.close();
+        parent.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn member_review_native_keeps_remaining_decisions_open() {
+        adw::init().unwrap();
+        let _lock = crate::registry::data_dir_test_lock();
+        let scratch = std::env::temp_dir().join(format!("toolport-native-queue-{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&scratch);
+        let mut reg = crate::registry::Registry::default();
+        reg.team = Some(serde_json::from_value(serde_json::json!({"teamId":"native-review", "serverUrl":"https://teams.toolport.app", "role":"member"})).unwrap());
+        crate::teams::stage_team_config(&mut reg, "native-review", &serde_json::json!({"servers":[], "instructions":{"content":"Pending text"}, "callAuditExport":true}), 1, &[]).unwrap();
+        crate::registry::save(&reg).unwrap();
+        let review = crate::teams::member_review(&reg).unwrap();
+        let parent = adw::ApplicationWindow::builder().build();
+        let app = adw::Application::builder().application_id("app.toolport.ReviewFixture").build();
+        let page = super::TeamsPage::new(&app);
+        let dialog = super::member_review_dialog(&parent, &review);
+        let content = dialog.extra_child().unwrap();
+        super::connect_member_decisions(&content, &review, &page, &dialog);
+        parent.present();
+        dialog.present();
+        let mut widgets = vec![content];
+        let button = loop {
+            let widget = widgets.pop().expect("reject instructions button");
+            if widget.widget_name() == "reject:instructions" {
+                break widget.downcast::<gtk::Button>().unwrap();
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                child = current.next_sibling();
+                widgets.push(current);
+            }
+        };
+        button.emit_clicked();
+        let timed_out = Rc::new(Cell::new(false));
+        let timeout_state = timed_out.clone();
+        let timeout = gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || timeout_state.set(true));
+        let context = gtk::glib::MainContext::default();
+        while page.busy.get() && !timed_out.get() { context.iteration(true); }
+        if !timed_out.get() { timeout.remove(); }
+        assert!(!timed_out.get(), "native member decision did not finish");
+        assert!(dialog.is_visible(), "remaining decisions must stay open");
+        let mut text = String::new();
+        collect(&dialog.clone().upcast(), &mut text);
+        assert!(text.contains("Call-log export"));
+        assert!(!text.contains("Pending text"));
+        dialog.close();
+        parent.close();
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    fn selection(
+        name: &str,
+        change: &str,
+        outcome: HandoffOutcome,
+        message: &str,
+    ) -> ShareSelectionPreview {
         ShareSelectionPreview {
             id: name.to_lowercase(),
             name: name.into(),
@@ -1505,13 +1845,11 @@ mod tests {
         assert_eq!(team_review_line(0, 0), None);
         assert_eq!(
             team_review_line(1, 0).unwrap(),
-            "1 team server is off until you review and enable it below. \
-             Check the command, address and authentication before enabling."
+            "1 team change is waiting for your review. Held servers stay off; review queued changes above."
         );
         assert_eq!(
             team_review_line(2, 1).unwrap(),
-            "2 team servers are off until you review and enable them below. \
-             Check the command, address and authentication before enabling. \
+            "2 team changes are waiting for your review. Held servers stay off; review queued changes above. \
              1 was blocked as unsafe (link-local or cloud-metadata URLs)."
         );
     }

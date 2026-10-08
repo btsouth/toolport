@@ -3,6 +3,9 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { InstructionsStatusView, Registry } from "@/lib/types";
 
+const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+
 const api = vi.hoisted(() => ({
   teamConnect: vi.fn(),
   teamUseManaged: vi.fn(),
@@ -735,5 +738,147 @@ describe("Teams plan copy", () => {
     for (const line of [TEAMS_FREE_LINE, TEAMS_PAID_LINE]) {
       expect(line).not.toMatch(/[—–]/);
     }
+  });
+});
+
+describe("Teams member review", () => {
+  const change = {
+    key: "server:remote",
+    title: "Server: Public tool",
+    hash: "reviewed-content-hash",
+    fields: [
+      {
+        field: "URL",
+        before: "https://old.example/mcp",
+        after: "https://new.example/mcp",
+      },
+    ],
+    labels: [
+      {
+        author: { name: "Alice" },
+        at: 1791417600000,
+        via: "dashboard",
+        approvedBy: { name: "Bob" },
+      },
+    ],
+  };
+  const reviewedRegistry = (labels = change.labels): Registry => ({
+    ...registry,
+    team: {
+      ...registry.team!,
+      memberReview: { pending: { [change.key]: { ...change, labels } } },
+    } as NonNullable<Registry["team"]>,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    invoke.mockResolvedValue(registry);
+  });
+
+  it.each([true, false])(
+    "shows the full diff and submits the displayed hash, accept=%s",
+    async (accept) => {
+      const onRegistryChange = vi.fn();
+      render(
+        <TeamsView registry={reviewedRegistry()} onRegistryChange={onRegistryChange} />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Review team changes" }));
+      const dialog = screen.getByRole("dialog");
+      expect(
+        within(dialog)
+          .getByText(/Before:/)
+          .closest("dd"),
+      ).toHaveTextContent("https://old.example/mcp");
+      expect(
+        within(dialog)
+          .getByText(/After:/)
+          .closest("dd"),
+      ).toHaveTextContent("https://new.example/mcp");
+      expect(within(dialog).getByText(/Alice/)).toHaveTextContent(
+        "via dashboard · approved by Bob",
+      );
+      await userEvent.click(
+        within(dialog).getByRole("button", {
+          name: `${accept ? "Accept" : "Reject"} ${change.title}`,
+        }),
+      );
+      expect(invoke).toHaveBeenCalledWith("team_review", {
+        key: change.key,
+        hash: change.hash,
+        accept,
+      });
+      await waitFor(() => expect(onRegistryChange).toHaveBeenCalledWith(registry));
+    },
+  );
+
+  it("shows an unlabelled full diff for unavailable history", async () => {
+    render(<TeamsView registry={reviewedRegistry([])} onRegistryChange={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Review team changes" }));
+    expect(screen.getByText(/Full diff from your accepted configuration/)).toBeVisible();
+    expect(screen.queryByText(/Alice/)).toBeNull();
+  });
+
+  it("leaves the review open with an explicit stale-content error", async () => {
+    invoke.mockRejectedValueOnce(
+      "The team change was updated. Review its new content before accepting.",
+    );
+    const onRegistryChange = vi.fn();
+    render(
+      <TeamsView registry={reviewedRegistry()} onRegistryChange={onRegistryChange} />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Review team changes" }));
+    await userEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: `Accept ${change.title}`,
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        within(screen.getByRole("dialog")).getByText(/The team change was updated/),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByRole("dialog")).toBeVisible();
+    expect(onRegistryChange).not.toHaveBeenCalled();
+  });
+});
+
+it("shows a 202 proposal with an Open action instead of a webview link", async () => {
+  vi.clearAllMocks();
+  const preview = {
+    baseVersion: 7,
+    localFingerprint: "hash",
+    added: ["Personal GitHub"],
+    changed: [],
+    removed: [],
+    definitions: [],
+    selections: [],
+  };
+  api.teamPushPreview.mockResolvedValue(preview);
+  api.teamPush.mockResolvedValue({
+    version: 7,
+    published: false,
+    localSetupError: null,
+    handoffs: [],
+    summary: "Sent for confirmation",
+    proposal: {
+      id: "p",
+      baseVersion: 7,
+      confirmUrl: "https://teams.toolport.app/#changes=t/p",
+    },
+  });
+  api.getRegistry.mockResolvedValue(registry);
+  invoke.mockResolvedValue(undefined);
+  render(<TeamsView registry={registry} onRegistryChange={vi.fn()} />);
+  if (!(screen.getByRole("checkbox") as HTMLInputElement).checked)
+    await userEvent.click(screen.getByRole("checkbox"));
+  await userEvent.click(screen.getByRole("button", { name: "Share selected servers" }));
+  await screen.findByRole("dialog");
+  await userEvent.click(screen.getByRole("button", { name: "Share selected" }));
+  expect(await screen.findByText("Sent for confirmation")).toBeVisible();
+  const open = screen.getByRole("button", { name: "Open confirmation" });
+  expect(screen.queryByRole("link", { name: "Open confirmation" })).toBeNull();
+  await userEvent.click(open);
+  expect(invoke).toHaveBeenCalledWith("team_open_confirmation", {
+    url: "https://teams.toolport.app/#changes=t/p",
   });
 });
