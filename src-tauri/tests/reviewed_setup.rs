@@ -42,7 +42,10 @@ impl Fixture {
             Some(fixture.dir.join("client").into_os_string()),
         );
         fixture.set("APPIMAGE", None);
-        fixture.set("TOOLPORT_SECRET_KEY", Some("synthetic-import-integration".into()));
+        fixture.set(
+            "TOOLPORT_SECRET_KEY",
+            Some("synthetic-import-integration".into()),
+        );
         fixture.set(
             "TOOLPORT_DATA_DIR",
             Some(fixture.dir.join("data").into_os_string()),
