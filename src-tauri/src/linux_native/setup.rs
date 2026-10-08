@@ -39,6 +39,14 @@ fn middle_ellipsize(widget: &gtk::Widget, text: &str) {
     }
 }
 
+fn boxed_expander(row: &adw::ExpanderRow) -> gtk::ListBox {
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.add_css_class("boxed-list");
+    list.append(row);
+    list
+}
+
 pub(super) fn review(
     parent: &gtk::Window,
     title: &str,
@@ -127,6 +135,7 @@ pub(super) fn review(
         .margin_end(12)
         .build();
     details.add_row(&path);
+    let details = boxed_expander(&details);
     body.append(&details);
     let feedback = gtk::Label::builder()
         .xalign(0.0)
@@ -260,7 +269,7 @@ pub(super) fn review(
                                 .build();
                             agent.add_row(&row);
                         }
-                        body.append(&agent);
+                        body.append(&boxed_expander(&agent));
                     }
                     if let Some(backup) = outcome.backup {
                         let detail = adw::ExpanderRow::builder().title("Details").build();
@@ -270,7 +279,7 @@ pub(super) fn review(
                             .selectable(true)
                             .build();
                         detail.add_row(&label);
-                        body.append(&detail);
+                        body.append(&boxed_expander(&detail));
                     }
                     finished();
                 }
@@ -433,6 +442,10 @@ mod tests {
             || {},
         );
         let window = review_window();
+        assert!(descendants(window.upcast_ref())
+            .iter()
+            .filter(|w| w.is::<adw::ExpanderRow>())
+            .all(|w| w.parent().is_some_and(|parent| parent.is::<gtk::ListBox>())));
         let button = descendants(window.upcast_ref())
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::Button>().ok())

@@ -5,12 +5,16 @@ use std::path::PathBuf;
 
 struct Fixture {
     dir: PathBuf,
-    sidecar: Option<PathBuf>,
     env: Vec<(String, Option<std::ffi::OsString>)>,
     _data: registry::DataDirOverride,
 }
 impl Fixture {
     fn new() -> Self {
+        // Pin a private image so another worktree cannot replace the gateway mid-test.
+        // The override is for the old-image negative control in the review harness.
+        let gateway = std::env::var_os("TOOLPORT_REVIEWED_TEST_GATEWAY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_toolport-gateway")));
         let dir = std::env::temp_dir().join(format!(
             "toolport-reviewed-setup-{}-{}",
             std::process::id(),
@@ -25,7 +29,6 @@ impl Fixture {
             _data: registry::DataDirOverride::set(dir.join("data")),
             dir,
             env: vec![],
-            sidecar: None,
         };
         let overrides = std::env::vars_os()
             .filter_map(|(key, _)| key.into_string().ok())
@@ -38,26 +41,17 @@ impl Fixture {
             "CLAUDE_CONFIG_DIR",
             Some(fixture.dir.join("client").into_os_string()),
         );
-        fixture.set("APPIMAGE", None);
-        let sidecar = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("toolport-gateway");
-        if !sidecar.exists() {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_toolport-gateway"), &sidecar).unwrap();
-            #[cfg(not(unix))]
-            std::fs::copy(env!("CARGO_BIN_EXE_toolport-gateway"), &sidecar).unwrap();
-            fixture.sidecar = Some(sidecar);
-        }
+        fixture.set("APPIMAGE", Some("synthetic-reviewed-fixture".into()));
         fixture.set(
             "TOOLPORT_DATA_DIR",
             Some(fixture.dir.join("data").into_os_string()),
         );
         std::fs::copy(
-            env!("CARGO_BIN_EXE_toolport-gateway"),
-            fixture.dir.join("data/bin/toolport-gateway"),
+            &gateway,
+            fixture.dir.join(format!(
+                "data/bin/toolport-gateway{}",
+                std::env::consts::EXE_SUFFIX
+            )),
         )
         .unwrap();
         registry::save(&registry::Registry::default()).unwrap();
@@ -76,14 +70,23 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if let Ok(files) = std::fs::read_dir(self.dir.join("data")) {
+            for file in files.flatten() {
+                let name = file.file_name();
+                if name.to_string_lossy().starts_with("daemon-")
+                    && file.path().extension().is_some_and(|e| e == "json")
+                {
+                    if let Some(descriptor) = conduit_lib::daemon::read_descriptor(&file.path()) {
+                        let _ = conduit_lib::daemon::request_shutdown_if_idle(&descriptor);
+                    }
+                }
+            }
+        }
         for (key, value) in self.env.iter().rev() {
             match value {
                 Some(value) => std::env::set_var(key, value),
                 None => std::env::remove_var(key),
             }
-        }
-        if let Some(sidecar) = &self.sidecar {
-            let _ = std::fs::remove_file(sidecar);
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
