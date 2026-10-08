@@ -6972,6 +6972,11 @@ mod tests {
         assert!(std::fs::read_to_string(dir.join("gateway.log"))
             .unwrap()
             .contains("publication failed"));
+        drop(_data);
+        assert!(crate::telemetry::retire_dir_for_test(
+            &dir,
+            std::time::Duration::from_secs(5)
+        ));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

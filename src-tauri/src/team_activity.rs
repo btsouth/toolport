@@ -188,6 +188,11 @@ mod tests {
             assert!(with_atomic_failure(step, || acknowledge(&device, 2)).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), saved);
         }
+        drop(_data);
+        assert!(crate::telemetry::retire_dir_for_test(
+            &dir,
+            Duration::from_secs(5)
+        ));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
