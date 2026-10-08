@@ -528,8 +528,9 @@ mod tests {
             Vec::new(),
             "Invalid fixture config",
             "Close",
-            |_| Err("not an import".into()),
+            |_, _| Err("not an import".into()),
             || {},
+            None,
         );
         let window = review_window();
         assert!(descendants(window.upcast_ref())
@@ -566,6 +567,16 @@ mod tests {
                     Vec::new()
                 },
                 is_new: true,
+                credentials: if name == "Calendar" {
+                    vec![crate::registry_controller::CredentialReview {
+                        key: "PAT".into(),
+                        secret: true,
+                        present: state != "missing",
+                    }]
+                } else {
+                    Vec::new()
+                },
+                unsupported: None,
             })
             .collect();
         review(
@@ -574,7 +585,7 @@ mod tests {
             items,
             "Config: /home/sbx/.claude.json\nBackups will be saved in Toolport/backups/claude-code",
             "Connect",
-            move |_| {
+            move |_, _| {
                 if state == "verifying" {
                     use std::io::Read;
                     let mut file = std::fs::File::open("/home/sbx/setup-release")
@@ -610,6 +621,7 @@ mod tests {
                 })
             },
             || {},
+            None,
         );
         gtk::glib::MainLoop::new(None, false).run();
     }
