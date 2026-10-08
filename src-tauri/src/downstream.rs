@@ -14917,6 +14917,12 @@ mod tests {
             fn notify(&mut self, _: &str, _: Value) -> Result<(), TransportError> {
                 unreachable!()
             }
+            fn connection_closed(&self) -> Option<bool> {
+                None
+            }
+            fn suspended_calls(&self) -> usize {
+                0
+            }
             fn concurrent(&self) -> Option<Arc<dyn super::ConcurrentTransport>> {
                 panic!("watcher cloned the transport")
             }
