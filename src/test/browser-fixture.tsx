@@ -224,6 +224,17 @@ const setupItems = ["Notes", "Calendar"].map((name) => ({
   url: null,
   envKeys: name === "Calendar" ? ["PAT"] : [],
   isNew: true,
+  credentials:
+    name === "Calendar"
+      ? [
+          {
+            key: "PAT",
+            secret: true,
+            present: setupFailure !== "credential" && setupFailure !== "optional",
+            required: setupFailure !== "optional",
+          },
+        ]
+      : [],
 }));
 function fixtureAdd(entry: ServerEntry) {
   const saved = {
@@ -260,23 +271,35 @@ mockIPC(
         };
       case "migrate_client":
         if (setupVerifying) return new Promise(() => {});
-        if (setupFailure)
+        if (setupFailure && setupFailure !== "optional")
           throw new Error(
-            setupFailure === "credential"
-              ? "Calendar needs credentials. Open Credentials and retry. Client config unchanged."
-              : "Notes could not start. Check its command and retry. Client config unchanged.",
+            setupFailure === "vault"
+              ? "Keychain unavailable. Unlock it and retry importing. Client config unchanged."
+              : setupFailure === "credential"
+                ? "Calendar needs credentials. Open Credentials and retry. Client config unchanged."
+                : "Notes could not start. Check its command and retry. Client config unchanged.",
           );
         setupConnected = true;
+        fixtureAdd({
+          id: "calendar",
+          name: "Calendar",
+          transport: "stdio",
+          command: "fixture-calendar",
+          args: [],
+          env: [{ key: "PAT", value: null, secret: true }],
+          url: null,
+          source: "imported:codex",
+        });
         return {
           registry: structuredClone(registry),
           imported: 1,
           servers: (args.selected as string[]).map((name) => ({
             name,
             toolCount: 3,
-            credentialState: "none",
+            credentialState: name === "Calendar" ? "stored" : "none",
           })),
           moved: args.selected,
-          tools: [{ name: "notes__read" }],
+          tools: [{ name: "toolport_search_tools" }, { name: "toolport_call_tool" }],
           outcome: {
             path: "/fixture/codex.toml",
             backup: "/fixture/Toolport/backups/codex/previous.toml",
@@ -344,7 +367,14 @@ mockIPC(
             source: "manual",
           });
         });
-        return structuredClone(registry);
+        return {
+          registry: structuredClone(registry),
+          servers: (args.selected as string[]).map((i) => ({
+            name: Object.keys(parsed.mcpServers)[Number(i)],
+            status: "added",
+            missing: [],
+          })),
+        };
       }
       case "team_instructions_status":
         return null;

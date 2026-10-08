@@ -497,7 +497,7 @@ fn render_clients(list: &gtk::Box, feedback: &gtk::Label, snapshot: ClientSnapsh
                 let feedback = feedback.clone();
                 super::setup::connect(&parent, client_id.clone(), None, false, move || {
                     load_clients(&list, &feedback)
-                });
+                }, None);
             });
             row.append(&connect);
         }

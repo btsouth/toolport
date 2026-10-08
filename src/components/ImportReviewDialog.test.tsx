@@ -59,12 +59,98 @@ function renderDialog(overrides: Partial<Parameters<typeof ImportReviewDialog>[0
 }
 
 describe("ImportReviewDialog", () => {
+  it("discloses changed settings on existing servers", () => {
+    renderDialog({
+      items: [
+        { ...items()[0], isNew: false, updates: ["Environment", "Launch settings"] },
+      ],
+    });
+    expect(screen.getByText("Updates existing server")).toBeVisible();
+    expect(screen.getByText("Changes: Environment, Launch settings")).toBeVisible();
+  });
+
+  it("blocks migration only for selected missing required values", async () => {
+    renderDialog({
+      items: [
+        {
+          ...items()[0],
+          name: "Calendar",
+          credentials: [{ key: "PAT", secret: true, present: false, required: true }],
+        },
+      ],
+      requireCredentials: true,
+      confirmLabel: "Connect",
+    });
+    expect(screen.getByRole("button", { name: "Connect" })).toBeDisabled();
+    expect(screen.getByText("Enter PAT or deselect Calendar")).toBeVisible();
+    await userEvent.click(screen.getByText("Calendar credentials and settings"));
+    await userEvent.click(screen.getByRole("button", { name: "Enter value" }));
+    await userEvent.type(screen.getByLabelText("PAT"), "synthetic");
+    await userEvent.click(screen.getByRole("button", { name: "Use for connection" }));
+    expect(screen.getByRole("button", { name: "Connect" })).toBeEnabled();
+  });
+
+  it("permits optional missing values and add flows", async () => {
+    renderDialog({
+      items: [
+        {
+          ...items()[0],
+          credentials: [{ key: "PAT", secret: true, present: false, required: false }],
+        },
+      ],
+      requireCredentials: true,
+      confirmLabel: "Connect",
+    });
+    expect(screen.getByRole("button", { name: "Connect" })).toBeEnabled();
+    await userEvent.click(screen.getByText("stripe credentials and settings"));
+    expect(screen.getAllByText("Optional")).toHaveLength(2);
+    expect(screen.queryByText("Missing")).not.toBeInTheDocument();
+  });
+
+  it("allows deselection of a missing required server", async () => {
+    renderDialog({
+      items: [
+        {
+          ...items()[0],
+          credentials: [{ key: "PAT", secret: true, present: false, required: true }],
+        },
+      ],
+      requireCredentials: true,
+      allowEmpty: true,
+      confirmLabel: "Connect",
+    });
+    await userEvent.click(screen.getByRole("button", { name: /stripe/ }));
+    expect(screen.getByRole("button", { name: "Connect" })).toBeEnabled();
+  });
+
   it("starts with every server selected and confirms them all", async () => {
     const { onConfirm } = renderDialog();
     // Button label reflects the full selection.
     await userEvent.click(screen.getByRole("button", { name: /import 3 servers/i }));
     expect(onConfirm).toHaveBeenCalledTimes(1);
     expect(new Set(onConfirm.mock.calls[0][0])).toEqual(new Set(["a", "b", "c"]));
+  });
+
+  it("keeps missing credentials in memory for the reviewed connection", async () => {
+    const { onConfirm } = renderDialog({
+      items: [
+        {
+          ...items()[0],
+          credentials: [{ key: "TOKEN", secret: true, present: false, required: true }],
+        },
+      ],
+    });
+    expect(screen.getAllByText("Missing")).toHaveLength(1);
+    await userEvent.click(screen.getByText("stripe credentials and settings"));
+    await userEvent.click(screen.getByRole("button", { name: "Enter value" }));
+    await userEvent.type(screen.getByLabelText("TOKEN"), "synthetic-secret");
+    await userEvent.click(screen.getByRole("button", { name: "Use for connection" }));
+    await userEvent.click(screen.getByRole("button", { name: /import 1 server/i }));
+    expect(onConfirm).toHaveBeenCalledWith(
+      ["a"],
+      { stripe: { TOKEN: true } },
+      { stripe: { TOKEN: "synthetic-secret" } },
+    );
   });
 
   it("exposes each server row as a pressed toggle", async () => {
@@ -342,4 +428,24 @@ describe("sameReviewedDefinition", () => {
   it.each(swaps)("rejects a swap of %s", (_label, live) => {
     expect(sameReviewedDefinition(reviewed, live)).toBe(false);
   });
+});
+
+it("leaves unsupported servers unchecked and sends per-row keychain choices", async () => {
+  const onConfirm = vi.fn();
+  renderDialog({
+    onConfirm,
+    items: [
+      {
+        ...items()[0],
+        credentials: [{ key: "PORT", secret: false, present: true, required: true }],
+      },
+      { ...items()[1], unsupported: "Custom headers stay native" },
+    ],
+  });
+  expect(screen.getByRole("button", { name: /linear/ })).toBeDisabled();
+  expect(screen.getByLabelText(/Keep PORT in keychain/)).not.toBeChecked();
+  expect(screen.getAllByText("Found")[0]).toBeVisible();
+  await userEvent.click(screen.getByLabelText(/Keep PORT in keychain/));
+  await userEvent.click(screen.getByRole("button", { name: /Import 1 server/ }));
+  expect(onConfirm).toHaveBeenCalledWith(["a"], { stripe: { PORT: true }, linear: {} });
 });

@@ -1,7 +1,78 @@
 //! Real gateway results and failure guarantees using disposable client configs.
 use conduit_lib::{registry, registry_controller as controller};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn private_fixture_dir(label: &str) -> PathBuf {
+    reserve_private_fixture_dir(
+        label,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    )
+}
+
+fn reserve_private_fixture_dir(label: &str, tick: u128) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "toolport-reviewed-{label}-{}-{tick}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ));
+    // Wall-clock ticks can coincide across threads. Reserve a unique directory,
+    // never accepting another fixture's existing executable or data directory.
+    std::fs::create_dir(&dir)
+        .unwrap_or_else(|error| panic!("could not reserve fixture {}: {error}", dir.display()));
+    dir
+}
+
+fn copy_fixture_image(source: &Path, destination: &Path) {
+    std::fs::copy(source, destination).unwrap_or_else(|error| {
+        panic!(
+            "could not copy fixture image {} to {}: {error}",
+            source.display(),
+            destination.display(),
+        )
+    });
+}
+
+#[test]
+fn reviewed_fixture_parallel_directories_are_private() {
+    let barrier = std::sync::Barrier::new(8);
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dirs = std::thread::scope(|scope| {
+        let threads = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    reserve_private_fixture_dir("parallel", tick)
+                })
+            })
+            .collect::<Vec<_>>();
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        dirs.iter().collect::<std::collections::HashSet<_>>().len(),
+        8
+    );
+    for (index, dir) in dirs.iter().enumerate() {
+        std::fs::write(dir.join("owner"), index.to_string()).unwrap();
+    }
+    for (index, dir) in dirs.iter().enumerate() {
+        assert_eq!(
+            std::fs::read_to_string(dir.join("owner")).unwrap(),
+            index.to_string()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
 
 struct Fixture {
     dir: PathBuf,
@@ -15,14 +86,7 @@ impl Fixture {
             .parent()
             .unwrap()
             .join(format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX));
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-reviewed-setup-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = private_fixture_dir("setup");
         std::fs::create_dir_all(dir.join("client")).unwrap();
         std::fs::create_dir_all(dir.join("data/bin")).unwrap();
         let mut fixture = Self {
@@ -43,17 +107,20 @@ impl Fixture {
         );
         fixture.set("APPIMAGE", None);
         fixture.set(
+            "TOOLPORT_SECRET_KEY",
+            Some("synthetic-import-integration".into()),
+        );
+        fixture.set(
             "TOOLPORT_DATA_DIR",
             Some(fixture.dir.join("data").into_os_string()),
         );
-        std::fs::copy(
+        copy_fixture_image(
             &gateway,
-            fixture.dir.join(format!(
+            &fixture.dir.join(format!(
                 "data/bin/toolport-gateway{}",
                 std::env::consts::EXE_SUFFIX
             )),
-        )
-        .unwrap();
+        );
         let mut registry = registry::Registry::default();
         registry.set_client_discovery("claude-code", Some("lazy"));
         registry::save(&registry).unwrap();
@@ -182,7 +249,7 @@ impl Drop for Fixture {
 }
 
 fn migrate_fixture(
-    fixture: &Fixture,
+    _fixture: &Fixture,
     names: &[String],
     revision: &str,
 ) -> controller::MigrateOutcome {
@@ -196,40 +263,37 @@ fn run_private_fixture(test: &str) -> bool {
     if std::env::var_os("TOOLPORT_REVIEWED_CHILD").is_some() {
         return false;
     }
-    let dir = std::env::temp_dir().join(format!(
-        "toolport-reviewed-runtime-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let _lock = registry::data_dir_test_lock();
+    let dir = private_fixture_dir("runtime");
     let child = dir.join(format!("reviewed-setup{}", std::env::consts::EXE_SUFFIX));
-    std::fs::copy(std::env::current_exe().unwrap(), &child).unwrap();
+    copy_fixture_image(&std::env::current_exe().unwrap(), &child);
     let gateway = std::env::var_os("TOOLPORT_REVIEWED_TEST_GATEWAY")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_toolport-gateway")));
-    std::fs::copy(
-        gateway,
-        dir.join(format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX)),
-    )
-    .unwrap();
+    copy_fixture_image(
+        &gateway,
+        &dir.join(format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX)),
+    );
     let mock = std::env::var_os("TOOLPORT_REVIEWED_TEST_MOCK")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mock-mcp-server")));
-    std::fs::copy(
-        mock,
-        dir.join(format!("mock-mcp-server{}", std::env::consts::EXE_SUFFIX)),
-    )
-    .unwrap();
+    copy_fixture_image(
+        &mock,
+        &dir.join(format!("mock-mcp-server{}", std::env::consts::EXE_SUFFIX)),
+    );
     let status = std::process::Command::new(&child)
         .env("TOOLPORT_REVIEWED_CHILD", "1")
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .status()
-        .unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
-    assert!(status.success(), "private cold-connect fixture failed");
+        .unwrap_or_else(|error| panic!("could not run {test} at {}: {error}", child.display()));
+    // status() waits for the child to exit before its private images are removed.
+    std::fs::remove_dir_all(&dir)
+        .unwrap_or_else(|error| panic!("could not remove fixture {}: {error}", dir.display()));
+    assert!(
+        status.success(),
+        "private cold-connect fixture {test} at {} failed: {status}",
+        child.display(),
+    );
     true
 }
 
@@ -306,6 +370,183 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
     let restored: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(fixture.config()).unwrap()).unwrap();
     assert_eq!(restored["mcpServers"]["alpha"]["command"], mock);
+    assert!(result.servers.iter().all(|s| s.credential_state == "none"));
+    // Imported subprocess values are available to both the app probe and gateway.
+    drop(fixture);
+    let fixture = Fixture::new();
+    #[cfg(unix)]
+    let secured_command = {
+        use std::os::unix::fs::PermissionsExt;
+        let path = fixture.dir.join("credential-server");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n[ \"$PAT\" = synthetic-setup-pat ] || exit 42\nexec \"{mock}\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    #[cfg(not(unix))]
+    let secured_command = mock;
+    let credential_config =
+        json!({"mcpServers":{"secured":{"command":secured_command,"env":{"PAT":"synthetic-setup-pat"}},"argument":{"command":mock,"args":["--token","synthetic-argument-only"]}}})
+            .to_string();
+    std::fs::write(fixture.config(), &credential_config).unwrap();
+    let review = controller::preview_client_setup("claude-code").unwrap();
+    let result = migrate_fixture(
+        &fixture,
+        &["secured".into(), "argument".into()],
+        &review.revision,
+    );
+    let saved = registry::load().unwrap();
+    let entry = saved.servers.iter().find(|s| s.name == "secured").unwrap();
+    assert_eq!(
+        conduit_lib::secrets::get_vault_secret_result(&entry.id, "PAT")
+            .unwrap()
+            .as_deref(),
+        Some("synthetic-setup-pat")
+    );
+    assert!(!serde_json::to_string(&saved)
+        .unwrap()
+        .contains("synthetic-setup-pat"));
+    assert_eq!(result.moved, ["argument", "secured"]);
+    assert!(result
+        .servers
+        .iter()
+        .all(|s| s.credential_state == "stored"));
+    controller::disconnect_client("claude-code").unwrap();
+
+    // A credential-bearing URL is resolved only for the real HTTP transport.
+    drop(fixture);
+    let fixture = Fixture::new();
+    let http = HttpFixture::new();
+    std::fs::write(fixture.config(),json!({"mcpServers":{"remote":{"url":format!("{}?token=synthetic-url-key",http.url),"headers":{"Authorization":"Bearer synthetic-setup-pat"}}}}).to_string()).unwrap();
+    let review = controller::preview_client_setup("claude-code").unwrap();
+    let result = migrate_fixture(&fixture, &["remote".into()], &review.revision);
+    assert_eq!(result.moved, ["remote"]);
+    let saved = registry::load().unwrap();
+    let entry = &saved.servers[0];
+    assert_eq!(
+        conduit_lib::secrets::get_vault_secret_result(
+            &entry.id,
+            conduit_lib::secrets::HTTP_AUTH_KEY
+        )
+        .unwrap()
+        .as_deref(),
+        Some("synthetic-setup-pat")
+    );
+    assert!(!serde_json::to_string(&saved)
+        .unwrap()
+        .contains("synthetic-url-key"));
+    let mut connection = conduit_lib::remote::connect_remote(entry).unwrap();
+    assert!(connection
+        .call("echo", json!({"text":"verified"}))
+        .unwrap()
+        .to_string()
+        .contains("verified"));
+    let error = connection
+        .call("echo", json!({"text":"reject"}))
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("synthetic-url-key"));
+    assert!(!error.contains("synthetic-setup-pat"));
+}
+
+struct HttpFixture {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    url: String,
+}
+impl HttpFixture {
+    fn new() -> Self {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", server.server_addr().to_ip().unwrap());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        let worker = std::thread::spawn(move || {
+            while !stopping.load(std::sync::atomic::Ordering::Acquire) {
+                let Some(mut request) = server
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .unwrap()
+                else {
+                    continue;
+                };
+                let authenticated = request.url() == "/mcp?token=synthetic-url-key"
+                    && request.headers().iter().any(|h| {
+                        h.field.equiv("Authorization")
+                            && h.value.as_str() == "Bearer synthetic-setup-pat"
+                    });
+                if !authenticated {
+                    eprintln!(
+                        "credential fixture rejected {}: URL matched={}, Authorization matched={}",
+                        request.method(),
+                        request.url() == "/mcp?token=synthetic-url-key",
+                        request
+                            .headers()
+                            .iter()
+                            .any(|h| h.field.equiv("Authorization")
+                                && h.value.as_str() == "Bearer synthetic-setup-pat")
+                    );
+                    let _ = request.respond(
+                        tiny_http::Response::from_string("missing reviewed credentials")
+                            .with_status_code(401),
+                    );
+                    continue;
+                }
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                let call: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                let method = call["method"].as_str().unwrap_or("");
+                if call.get("id").is_none() {
+                    let _ = request.respond(tiny_http::Response::empty(204));
+                    continue;
+                }
+                let result = match method {
+                    "initialize" => Some(
+                        json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"Credential fixture","version":"1"}}),
+                    ),
+                    "tools/list" => Some(
+                        json!({"tools":[{"name":"echo","description":"Fixture","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}),
+                    ),
+                    "tools/call" => Some(
+                        json!({"content":[{"type":"text","text":call["params"]["arguments"]["text"].as_str().unwrap_or("")}]}),
+                    ),
+                    _ => None,
+                };
+                let response = match result {
+                    Some(result) => json!({"jsonrpc":"2.0","id":call["id"],"result":result}),
+                    None => {
+                        json!({"jsonrpc":"2.0","id":call["id"],"error":{"code":-32601,"message":"Method not found"}})
+                    }
+                };
+                let response = if method == "tools/call"
+                    && call["params"]["arguments"]["text"] == "reject"
+                {
+                    json!({"jsonrpc":"2.0","id":call["id"],"error":{"code":-32001,"message":"synthetic-url-key synthetic-setup-pat","data":"synthetic-setup-pat"}})
+                } else {
+                    response
+                };
+                let _ = request.respond(
+                    tiny_http::Response::from_string(response.to_string()).with_header(
+                        tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+                    ),
+                );
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+            url,
+        }
+    }
+}
+impl Drop for HttpFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
 }
 
 #[test]

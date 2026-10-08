@@ -148,6 +148,33 @@ pub(super) fn recorded_paths() -> Vec<(String, PathBuf, Result<Format, String>)>
     paths
 }
 
+/// Raw values stay inside the backend and the owner-only config transaction.
+pub(super) fn definition(
+    format: Format,
+    path: &Path,
+    name: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let entries = extract(container(format), &read_config_file(path)?)?;
+    let Some(entry) = entries.into_iter().find(|entry| entry.name == name) else {
+        return Ok(None);
+    };
+    let value = match entry.raw {
+        Raw::Json { value } => value,
+        Raw::Toml { text } => {
+            let doc: toml::Value =
+                toml::from_str(&text).map_err(|_| "Could not read imported settings")?;
+            serde_json::to_value(&doc["mcp_servers"][name])
+                .map_err(|_| "Could not read imported settings")?
+        }
+        Raw::Yaml { text } => {
+            let doc: serde_yaml::Value =
+                serde_yaml::from_str(&text).map_err(|_| "Could not read imported settings")?;
+            serde_json::to_value(doc).map_err(|_| "Could not read imported settings")?
+        }
+    };
+    Ok(Some(value))
+}
+
 /// Copy every non-gateway entry in `path` into the client's move record before
 /// migration strips them. Entries already recorded by an earlier move are kept;
 /// a name moved again takes its newest definition.

@@ -15,7 +15,8 @@ import {
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
 import {
-  addServer,
+  importServers,
+  previewImportServers,
   installGateway,
   setClientDiscovery,
   uninstallGateway,
@@ -29,7 +30,6 @@ import {
   type ImportItem,
   type McpServer,
   type Registry,
-  type ServerEntry,
 } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -66,7 +66,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   const [busy, setBusy] = useState(false);
   // Snapshotted at dialog-open time so a registry-changed event mid-review can't
   // reshuffle `toImport` out from under the indices the user already confirmed.
-  const [bulkImportServers, setBulkImportServers] = useState<McpServer[] | null>(null);
+  const [bulkImportServers, setBulkImportServers] = useState<ImportItem[] | null>(null);
   // Empty uses the default access; named access sets narrow enabled servers.
   const [profile, setProfile] = useState("");
   const [migrateOpen, setMigrateOpen] = useState(false);
@@ -251,69 +251,51 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   }
   const allServers = [...byName.values()];
   const toImport = importableServers(client, registry);
-  const bulkImportPreview: ImportItem[] | null =
-    bulkImportServers?.map((server, index) => ({
-      key: String(index),
-      name: server.name,
-      transport: server.transport,
-      command: server.command,
-      args: server.args,
-      url: server.url,
-      isNew: true,
-    })) ?? null;
+  const bulkImportPreview = bulkImportServers;
 
-  async function importOne(server: McpServer) {
-    const isPlugin = pluginNames.has(server.name.toLowerCase());
-    const entry: ServerEntry = {
-      id: "",
-      name: server.name,
-      transport: server.transport,
-      command: server.command,
-      args: server.args,
-      env: server.envKeys.map((key) => ({ key, value: null, secret: true })),
-      url: server.url,
-      source: `imported:${client.id}${isPlugin ? "-plugin" : ""}`,
-    };
-    const next = await addServer(entry);
-    onRegistryChange(next);
-    return next;
+  async function reviewServers(servers: McpServer[]) {
+    try {
+      const preview = await previewImportServers();
+      const items = servers.map((server) =>
+        preview.find(
+          (item) =>
+            item.name === server.name &&
+            item.command === server.command &&
+            item.url === server.url &&
+            JSON.stringify(item.args) === JSON.stringify(server.args),
+        ),
+      );
+      if (items.some((item) => !item?.key))
+        throw new Error("Server changed. Refresh the client and review again.");
+      setBulkImportServers(items as ImportItem[]);
+    } catch (error) {
+      toastError(String(error));
+    }
   }
 
   async function handleImportAll() {
-    setBulkImportServers(toImport);
+    await reviewServers(toImport);
   }
 
-  async function confirmImportAll(selected: string[]) {
-    const servers = bulkImportServers ?? [];
+  async function confirmImportAll(
+    selected: string[],
+    choices?: Record<string, Record<string, boolean>>,
+    inputs?: Record<string, Record<string, string>>,
+  ) {
     setBusy(true);
-    let ok = 0;
-    const failed: string[] = [];
-    const succeeded = new Set<string>();
-    for (const key of selected) {
-      const s = servers[Number(key)];
-      if (!s) continue;
-      try {
-        await importOne(s);
-        ok += 1;
-        succeeded.add(key);
-      } catch {
-        failed.push(s.name);
-      }
-    }
-    setBusy(false);
-    if (failed.length === 0) {
-      toast.success(`Imported ${ok} server${ok === 1 ? "" : "s"} into Toolport`);
+    try {
+      const next = inputs
+        ? await importServers(selected, choices, inputs)
+        : choices
+          ? await importServers(selected, choices)
+          : await importServers(selected);
+      onRegistryChange(next);
+      toast.success("Imported selected servers. Check their status under Servers.");
       setBulkImportServers(null);
-    } else {
-      // Some imports failed. Drop ONLY the rows that succeeded so a re-confirm can't
-      // re-import them; the failures (and any rows the user didn't select this time)
-      // stay in the dialog to retry or import next.
-      if (ok > 0) {
-        toast.warning(`Imported ${ok}, couldn't import ${failed.join(", ")}`);
-      } else {
-        toastError(`Couldn't import ${failed.join(", ")}`);
-      }
-      setBulkImportServers(servers.filter((_, i) => !succeeded.has(String(i))));
+    } catch (error) {
+      toastError(String(error));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -691,7 +673,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                 busy={busy}
                 // Same review dialog as "Import all": a per-row import must show the
                 // same shell/private-host warnings before anything is added.
-                onImport={() => setBulkImportServers([server])}
+                onImport={() => void reviewServers([server])}
               />
             ))}
           </div>

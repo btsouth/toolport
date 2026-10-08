@@ -608,11 +608,15 @@ export function migrateClient(
   force?: boolean,
   selected: string[] = [],
   revision = "",
+  secretChoices?: Record<string, Record<string, boolean>>,
+  credentialInputs?: Record<string, Record<string, string>>,
 ): Promise<MigrateResult> {
   return invoke<MigrateResult>("migrate_client", {
     clientId,
     selected,
     revision,
+    secretChoices,
+    credentialInputs,
     profile: profile ?? null,
     force: force ?? false,
   });
@@ -824,8 +828,16 @@ export function takeRegistryRecoveryNotice(): Promise<RegistryRecoveryNotice | n
 }
 
 /** Pull reviewed servers from every detected client into the registry. */
-export function importServers(selected?: string[]): Promise<Registry> {
-  return invoke<Registry>("import_servers", { selected });
+export function importServers(
+  selected?: string[],
+  secretChoices?: Record<string, Record<string, boolean>>,
+  credentialInputs?: Record<string, Record<string, string>>,
+): Promise<Registry> {
+  return invoke<Registry>("import_servers", {
+    selected,
+    secretChoices,
+    credentialInputs,
+  });
 }
 
 /** Preview every detected-client server the bulk import would add. */
@@ -966,6 +978,19 @@ export function previewClientSetup(
   return invoke("preview_client_setup", { clientId });
 }
 
-export function addSnippetServers(text: string, selected: string[]): Promise<Registry> {
-  return invoke("add_snippet_servers", { text, selected });
+export function addSnippetServers(
+  text: string,
+  selected: string[],
+  secretChoices?: Record<string, Record<string, boolean>>,
+  credentialInputs?: Record<string, Record<string, string>>,
+): Promise<{
+  registry: Registry;
+  servers: { name: string; status: string; missing: string[] }[];
+}> {
+  return invoke("add_snippet_servers", {
+    text,
+    selected,
+    secretChoices,
+    credentialInputs,
+  });
 }

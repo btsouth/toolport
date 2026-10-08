@@ -81,10 +81,12 @@ it("keeps the failed selection for retry and collapses raw paths", async () => {
 });
 it("shows downstream tool counts and only Done on success", async () => {
   api.migrateClient.mockResolvedValue({
-    registry: { servers: [] },
+    registry: {
+      servers: [{ id: "one", name: "one", env: [{ key: "PAT", secret: true }] }],
+    },
     outcome: { path: "/fixture/config", backup: null },
     tools: [{ name: "toolport_search_tools" }],
-    servers: [{ name: "one", toolCount: 7, credentialState: "none" }],
+    servers: [{ name: "one", toolCount: 7, credentialState: "stored" }],
   });
   render(
     <ConnectReviewDialog
@@ -99,6 +101,9 @@ it("shows downstream tool counts and only Done on success", async () => {
   expect(await screen.findByText(/7 tools/)).toBeVisible();
   expect(
     screen.queryByRole("button", { name: "Connect to Toolport" }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Open Credentials" }),
   ).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Done" })).toBeVisible();
 });

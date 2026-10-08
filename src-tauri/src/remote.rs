@@ -1282,7 +1282,7 @@ fn guard_connect_target(server: &ServerEntry) -> Result<(), String> {
 /// anonymous exactly like the `HTTP_AUTH_KEY` path used to.
 fn first_vaulted_secret(server: &ServerEntry) -> Result<Option<String>, String> {
     for e in &server.env {
-        if e.secret && e.value.is_none() {
+        if e.secret && e.value.is_none() && e.key != secrets::IMPORTED_URL_KEY {
             if let Some(v) = secrets::get_secret_result(&server.id, &e.key)? {
                 return Ok(Some(v));
             }
@@ -1330,6 +1330,304 @@ pub fn connect_remote(server: &ServerEntry) -> Result<DownstreamServer, String> 
 /// routes `notifications/progress` back to the client that minted the token
 /// (SOU-444).
 pub fn connect_remote_with_handler(
+    server: &ServerEntry,
+    server_handler: Option<ServerRequestHandler>,
+    resource_updated: Option<ResourceUpdatedSink>,
+    progress: Option<ProgressSink>,
+    change_dirty: Option<Arc<AtomicU8>>,
+) -> Result<DownstreamServer, String> {
+    let imported = crate::import_credentials::has_imported_url(server);
+    if !imported {
+        return connect_remote_inner(
+            server,
+            server_handler,
+            resource_updated,
+            progress,
+            change_dirty,
+        )
+        .map_err(|error| safe_imported_error(server, error));
+    }
+    let url = secrets::get_vault_secret_result(&server.id, secrets::IMPORTED_URL_KEY)
+        .map_err(|_| "Keychain unavailable. Unlock it and retry.")?
+        .ok_or("Missing imported endpoint. Import its native definition again.")?;
+    if server.url.as_deref() != Some(&crate::import_credentials::shown_url(&url)) {
+        return Err("The endpoint changed. Review and import its credentials again.".into());
+    }
+    let mut resolved = server.clone();
+    resolved.url = Some(url);
+    connect_remote_inner(
+        &resolved,
+        server_handler,
+        resource_updated,
+        progress,
+        change_dirty,
+    )
+    .map_err(|error| safe_imported_error(&resolved, error))
+}
+
+/// Keep provider errors from echoing a credential-bearing endpoint after connect.
+struct ImportedTransport(Box<dyn Transport>, Redaction);
+struct ImportedConcurrent(Arc<dyn crate::downstream::ConcurrentTransport>, Redaction);
+#[derive(Clone)]
+struct Redaction(Vec<String>);
+impl Redaction {
+    fn for_server(server: &ServerEntry) -> Self {
+        let mut values = Vec::new();
+        if let Some(url) = &server.url {
+            values.push(url.clone());
+            if let Ok(parsed) = url::Url::parse(url) {
+                let decoded = |value: &str| {
+                    url::form_urlencoded::parse(format!("v={value}").as_bytes())
+                        .next()
+                        .map(|(_, v)| v.into_owned())
+                        .unwrap_or_default()
+                };
+                let mut add = |value: &str| {
+                    values.push(value.into());
+                    values.push(decoded(value));
+                };
+                add(parsed.username());
+                if let Some(password) = parsed.password() {
+                    add(password);
+                }
+                for pair in parsed.query().unwrap_or("").split('&') {
+                    if let Some((key, value)) = pair.split_once('=') {
+                        if crate::import_credentials::secret_url_name(key)
+                            || decoded(value).len() >= 4
+                        {
+                            add(value);
+                        }
+                    }
+                }
+                let mut after_secret_name = false;
+                for segment in parsed.path_segments().into_iter().flatten() {
+                    let value = decoded(segment);
+                    if after_secret_name
+                        || crate::registry::arg_looks_secret(&value)
+                        || crate::import_credentials::secret_env("", Some(&value))
+                    {
+                        add(segment);
+                    }
+                    after_secret_name = crate::import_credentials::secret_url_name(&value);
+                }
+            }
+        }
+        for env in server.env.iter().filter(|e| e.secret) {
+            if let Some(value) = env.value.clone().or_else(|| {
+                secrets::get_secret_result(&server.id, &env.key)
+                    .ok()
+                    .flatten()
+            }) {
+                values.push(value);
+            }
+        }
+        for input in server
+            .launch
+            .iter()
+            .flat_map(|launch| &launch.inputs)
+            .filter(|input| input.secret)
+        {
+            if let Some(value) = input.value.clone().or_else(|| {
+                secrets::get_vault_secret_result(&server.id, &input.key)
+                    .ok()
+                    .flatten()
+            }) {
+                values.push(value);
+            }
+        }
+        if crate::import_credentials::has_imported_url(server) {
+            if let Ok(Some(value)) =
+                secrets::get_vault_secret_result(&server.id, secrets::IMPORTED_URL_KEY)
+            {
+                values.push(value);
+            }
+        }
+        values.retain(|value| !value.is_empty());
+        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        values.dedup();
+        Self(values)
+    }
+    fn text(&self, mut message: String) -> String {
+        for value in &self.0 {
+            if value.len() < 4 {
+                let token = regex::Regex::new(&format!(r"\b{}\b", regex::escape(value))).unwrap();
+                message = token.replace_all(&message, "<redacted>").into_owned();
+            } else {
+                message = message.replace(value, "<redacted>");
+            }
+        }
+        message
+    }
+    fn value(&self, value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::String(value) => serde_json::Value::String(self.text(value)),
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.into_iter().map(|v| self.value(v)).collect())
+            }
+            serde_json::Value::Object(values) => serde_json::Value::Object(
+                values
+                    .into_iter()
+                    .map(|(k, v)| (self.text(k), self.value(v)))
+                    .collect(),
+            ),
+            value => value,
+        }
+    }
+    fn error(&self, error: crate::downstream::TransportError) -> crate::downstream::TransportError {
+        use crate::downstream::TransportError as E;
+        match error {
+            E::Fatal(message) => E::Fatal(self.text(message)),
+            E::FrameRejected(message) => E::FrameRejected(self.text(message)),
+            E::Unavailable(message) => E::Unavailable(self.text(message)),
+            E::Retry {
+                retry_after,
+                message,
+            } => E::Retry {
+                retry_after,
+                message: self.text(message),
+            },
+            E::Cancelled(message) => E::Cancelled(self.text(message)),
+            E::Busy(message) => E::Busy(self.text(message)),
+            E::Rpc(value) => E::Rpc(self.value(value)),
+        }
+    }
+}
+impl crate::downstream::ConcurrentTransport for ImportedConcurrent {
+    fn request_with_cancel_and_headers(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        cancel: Option<crate::downstream::CancelContext>,
+        headers: &[(String, String)],
+    ) -> Result<serde_json::Value, crate::downstream::TransportError> {
+        self.0
+            .request_with_cancel_and_headers(method, params, cancel, headers)
+            .map_err(|error| self.1.error(error))
+    }
+    fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+    fn suspended_calls(&self) -> usize {
+        self.0.suspended_calls()
+    }
+}
+impl Transport for ImportedTransport {
+    fn request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, crate::downstream::TransportError> {
+        self.0
+            .request(method, params)
+            .map_err(|error| self.1.error(error))
+    }
+    fn notify(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<(), crate::downstream::TransportError> {
+        self.0
+            .notify(method, params)
+            .map_err(|error| self.1.error(error))
+    }
+    fn request_with_cancel(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        cancel: Option<crate::downstream::CancelContext>,
+    ) -> Result<serde_json::Value, crate::downstream::TransportError> {
+        self.0
+            .request_with_cancel(method, params, cancel)
+            .map_err(|error| self.1.error(error))
+    }
+    fn request_with_cancel_and_headers(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        cancel: Option<crate::downstream::CancelContext>,
+        headers: &[(String, String)],
+    ) -> Result<serde_json::Value, crate::downstream::TransportError> {
+        self.0
+            .request_with_cancel_and_headers(method, params, cancel, headers)
+            .map_err(|error| self.1.error(error))
+    }
+    fn cancel_matching_pending_request(
+        &mut self,
+        method: &str,
+        params: &serde_json::Value,
+        cancel: &crate::downstream::CancelContext,
+    ) -> bool {
+        self.0
+            .cancel_matching_pending_request(method, params, cancel)
+    }
+    fn set_protocol_meta(&mut self, meta: Option<serde_json::Value>) {
+        self.0.set_protocol_meta(meta)
+    }
+    fn set_subscription_listener(
+        &mut self,
+        filter: crate::downstream::SubscriptionFilter,
+    ) -> Result<(), crate::downstream::TransportError> {
+        self.0
+            .set_subscription_listener(filter)
+            .map_err(|error| self.1.error(error))
+    }
+    fn supports_request_headers(&self) -> bool {
+        self.0.supports_request_headers()
+    }
+    fn set_read_timeout(&mut self, timeout: Duration) {
+        self.0.set_read_timeout(timeout)
+    }
+    fn connect_timeout(&self) -> Duration {
+        self.0.connect_timeout()
+    }
+    fn initialize_complete(&mut self) {
+        self.0.initialize_complete()
+    }
+    fn arm_tools_watch(&mut self) {
+        self.0.arm_tools_watch()
+    }
+    fn set_server_request_handler(&mut self, handler: ServerRequestHandler) {
+        self.0.set_server_request_handler(handler)
+    }
+    fn set_server_id(&mut self, id: &str) {
+        self.0.set_server_id(id)
+    }
+    fn concurrent(&self) -> Option<Arc<dyn crate::downstream::ConcurrentTransport>> {
+        self.0.concurrent().map(|transport| {
+            Arc::new(ImportedConcurrent(transport, self.1.clone()))
+                as Arc<dyn crate::downstream::ConcurrentTransport>
+        })
+    }
+    fn connection_closed(&self) -> Option<bool> {
+        self.0.connection_closed()
+    }
+    fn suspended_calls(&self) -> usize {
+        self.0.suspended_calls()
+    }
+}
+fn reviewed_transport(server: &ServerEntry, transport: HttpTransport) -> Box<dyn Transport> {
+    if has_imported_credentials(server) {
+        Box::new(ImportedTransport(
+            Box::new(transport),
+            Redaction::for_server(server),
+        ))
+    } else {
+        Box::new(transport)
+    }
+}
+
+fn safe_imported_error(server: &ServerEntry, error: String) -> String {
+    if !has_imported_credentials(server) {
+        return error;
+    }
+    Redaction::for_server(server).text(error)
+}
+
+fn has_imported_credentials(server: &ServerEntry) -> bool {
+    crate::import_credentials::has_secrets(server)
+}
+
+fn connect_remote_inner(
     server: &ServerEntry,
     server_handler: Option<ServerRequestHandler>,
     resource_updated: Option<ResourceUpdatedSink>,
@@ -1410,7 +1708,9 @@ pub fn connect_remote_with_handler(
     transport.set_resource_updated_sink(resource_updated.clone());
     transport.set_progress_sink(progress.clone());
     transport.set_change_sink(change_dirty.clone());
-    match DownstreamServer::connect(server_id.to_string(), Box::new(transport)) {
+    match DownstreamServer::connect(server_id.to_string(), reviewed_transport(server, transport))
+        .map_err(|e| safe_imported_error(server, e))
+    {
         Ok(mut ds) => {
             ds.set_call_timeout(request_timeout);
             Ok(ds)
@@ -1471,12 +1771,14 @@ pub fn connect_remote_with_handler(
                     transport.set_resource_updated_sink(resource_updated);
                     transport.set_progress_sink(progress);
                     transport.set_change_sink(change_dirty);
-                    DownstreamServer::connect(server_id.to_string(), Box::new(transport)).map(
-                        |mut ds| {
-                            ds.set_call_timeout(request_timeout);
-                            ds
-                        },
+                    DownstreamServer::connect(
+                        server_id.to_string(),
+                        reviewed_transport(server, transport),
                     )
+                    .map(|mut ds| {
+                        ds.set_call_timeout(request_timeout);
+                        ds
+                    })
                 }
                 Err(refresh_error) if is_refresh_storage_or_lock_error(&refresh_error) => {
                     Err(refresh_error)
@@ -1491,6 +1793,113 @@ pub fn connect_remote_with_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewed_url_only_vault_is_recognized_as_owned_credentials() {
+        secrets::tests::with_isolated_vault(|| {
+            let mut server = remote_server("https://example.invalid/mcp", None);
+            server.unknown_fields.insert(
+                "importedUrlKey".into(),
+                serde_json::json!(secrets::IMPORTED_URL_KEY),
+            );
+            secrets::set_secret(
+                &server.id,
+                secrets::IMPORTED_URL_KEY,
+                "https://example.invalid/mcp?token=private",
+            )
+            .unwrap();
+            assert!(secrets::has_own_credentials(&server).unwrap());
+            assert_eq!(first_vaulted_secret(&server).unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn reviewed_bearer_env_errors_are_redacted() {
+        secrets::tests::with_isolated_vault(|| {
+            let mut server = remote_server("https://example.invalid/mcp", None);
+            server.env.push(crate::registry::EnvVar {
+                key: "PAT".into(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            });
+            secrets::set_secret(&server.id, "PAT", "synthetic-codex-token").unwrap();
+            assert_eq!(
+                safe_imported_error(&server, "HTTP 500: synthetic-codex-token rejected".into()),
+                "HTTP 500: <redacted> rejected"
+            );
+        });
+    }
+
+    #[test]
+    fn reviewed_url_redaction_preserves_status_numbers() {
+        let server = remote_server("https://private-user:private-password@example.invalid/sk-private-path?token=private%2Fquery&v=1", None);
+        let redaction = Redaction::for_server(&server);
+        let result = redaction.text("HTTP 401: private-user private-password sk-private-path private%2Fquery private/query; attempt 1".into());
+        assert_eq!(
+            result,
+            "HTTP 401: <redacted> <redacted> <redacted> <redacted> <redacted>; attempt 1"
+        );
+    }
+
+    #[test]
+    fn imported_bearer_connect_error_does_not_echo_provider_credentials() {
+        secrets::tests::with_isolated_vault(|| {
+            let listener = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let mut server = remote_server(&format!("http://{}/mcp", listener.server_addr()), None);
+            server.env.push(crate::registry::EnvVar {
+                key: secrets::HTTP_AUTH_KEY.into(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            });
+            secrets::set_secret(&server.id, secrets::HTTP_AUTH_KEY, "synthetic-imported-pat")
+                .unwrap();
+            let worker = std::thread::spawn(move || {
+                listener
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .respond(
+                        tiny_http::Response::from_string("synthetic-imported-pat")
+                            .with_status_code(500),
+                    )
+                    .unwrap();
+            });
+            let error = connect_remote(&server).err().unwrap();
+            worker.join().unwrap();
+            assert!(!error.contains("synthetic-imported-pat"));
+            assert!(error.contains("500"));
+        });
+    }
+
+    #[test]
+    fn reviewed_transport_preserves_rpc_errors_and_redacts_only_private_values() {
+        let redact = Redaction(vec![
+            "synthetic-pat".into(),
+            "https://example.invalid/mcp?token=secret".into(),
+        ]);
+        let frame = redact.error(crate::downstream::TransportError::FrameRejected(
+            "oversized frame near synthetic-pat".into(),
+        ));
+        assert!(
+            matches!(frame, crate::downstream::TransportError::FrameRejected(ref message)
+            if message == "oversized frame near <redacted>")
+        );
+        let error = redact.error(crate::downstream::TransportError::Rpc(serde_json::json!({"code":-32602,"message":"Invalid argument near synthetic-pat","data":{"endpoint":"https://example.invalid/mcp?token=secret","field":"limit"}})));
+        if let crate::downstream::TransportError::Rpc(value) = error {
+            assert_eq!(value["code"], -32602);
+            assert_eq!(value["message"], "Invalid argument near <redacted>");
+            assert_eq!(value["data"]["field"], "limit");
+            assert_eq!(value["data"]["endpoint"], "<redacted>");
+        } else {
+            panic!("RPC error category must survive");
+        }
+        assert_eq!(
+            redact.text("HTTP 429: rate limit exceeded".into()),
+            "HTTP 429: rate limit exceeded"
+        );
+    }
 
     #[test]
     fn classifies_auth_errors() {

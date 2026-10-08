@@ -20,7 +20,7 @@ export interface ParsedSnippetServer {
   command: string | null;
   args: string[];
   url: string | null;
-  env: { key: string; value: string | null }[];
+  env: { key: string; value: string | null; secret?: boolean }[];
 }
 
 /** Ownership of the gateway entry under our name in a client config (SOU-406). */
@@ -67,6 +67,7 @@ export interface ClientSetupReview {
 }
 
 export interface MigrateResult {
+  backupDate?: number | null;
   registry: Registry;
   imported: number;
   servers: { name: string; toolCount: number; credentialState: string }[];
@@ -336,6 +337,8 @@ export interface AuthInfo {
 
 /** One server a shared setup would add, shown for review before importing. */
 export interface ImportItem {
+  credentials?: { key: string; secret: boolean; present: boolean; required: boolean }[];
+  unsupported?: string | null;
   envKeys?: string[];
   /** Opaque key used to confirm a detected-client import. Absent for shared setups. */
   key?: string;
@@ -346,6 +349,7 @@ export interface ImportItem {
   url: string | null;
   /** False if a server with this name is already present (import skips it). */
   isNew: boolean;
+  updates?: string[];
 }
 
 export interface CatalogSearch {

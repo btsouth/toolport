@@ -1960,7 +1960,7 @@ impl Registry {
     /// Rewrite every persisted profile reference to the stable profile id when
     /// it resolves unambiguously. Unknown or ambiguous legacy references remain
     /// dangling and therefore fail closed.
-    fn normalize_profile_references(&mut self) {
+    pub(crate) fn normalize_profile_references(&mut self) {
         let profiles = self.profiles.clone();
         let resolve = |profile_ref: &str| {
             let profile_ref = profile_ref.trim();

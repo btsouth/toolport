@@ -35,10 +35,13 @@ pub struct McpServer {
     pub name: String,
     /// "stdio" | "http" | "sse" | "unknown"
     pub transport: String,
+    #[serde(serialize_with = "crate::import_credentials::serialize_command")]
     pub command: Option<String>,
+    #[serde(serialize_with = "crate::import_credentials::serialize_args")]
     pub args: Vec<String>,
     /// Names of env vars only. Values are deliberately omitted (secrets).
     pub env_keys: Vec<String>,
+    #[serde(serialize_with = "crate::import_credentials::serialize_url")]
     pub url: Option<String>,
 }
 
@@ -85,7 +88,18 @@ pub struct DetectedClient {
     /// absent (SOU-406). Computed with the registry ownership record when present.
     pub entry_state: GatewayEntryState,
     /// Set when the config exists but could not be read or parsed.
+    #[serde(serialize_with = "serialize_config_error")]
     pub error: Option<String>,
+}
+
+fn serialize_config_error<S: serde::Serializer>(
+    error: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    error
+        .as_ref()
+        .map(|_| "Could not read this client config. Check its syntax and file permissions.")
+        .serialize(serializer)
 }
 
 /// How a given client stores its server list.
@@ -1897,11 +1911,16 @@ pub struct ParsedSnippetServer {
     pub env: Vec<SnippetEnvVar>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct SnippetEnvVar {
     pub key: String,
     pub value: Option<String>,
+}
+
+impl Serialize for SnippetEnvVar {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok,S::Error> {
+        serde_json::json!({"key":self.key,"value":self.value,"secret":crate::import_credentials::secret_env(&self.key,self.value.as_deref())}).serialize(serializer)
+    }
 }
 
 /// Like `json_server`, but also captures env-var values from the JSON def.
@@ -3095,6 +3114,15 @@ pub fn detect_clients() -> Vec<DetectedClient> {
 
 /// Validate behavior the redacted inventory cannot carry before a ZCode import.
 /// Other adapters retain their existing import policy and public inventory ABI.
+pub(crate) fn import_definition(
+    client: &DetectedClient,
+    name: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let def = find_def(&client.id).ok_or("Unknown client")?;
+    moved::definition(def.format, Path::new(&client.config_path), name)
+        .map_err(|_| "Could not read imported credentials. Client config unchanged.".into())
+}
+
 pub(crate) fn validate_client_import(
     client: &DetectedClient,
     names: &[String],
@@ -6359,6 +6387,15 @@ pub fn setup_revision(client_id: &str) -> Result<String, String> {
         path.display(),
         mutation::exists(&path)
     )))
+}
+
+/// Stage registry changes against the reviewed server container, then release
+/// the config lock before any vault read, unlock prompt or transport verification.
+pub(crate) fn stage_reviewed<T>(client_id: &str, revision: &str, stage: impl FnOnce() -> Result<T,String>) -> Result<T,String> {
+    let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
+    let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
+    if setup_revision(client_id)? != revision { return Err("Client config changed. Review it again before connecting. Config unchanged.".into()); }
+    stage()
 }
 
 /// Hold the existing config transaction while the reviewed servers are imported

@@ -185,19 +185,22 @@ fn selected_servers_to_import(
 async fn import_servers(
     state: State<'_, RegistryState>,
     selected: Option<Vec<String>>,
+    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
+    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
 ) -> Result<Registry, String> {
-    let detected = tauri::async_runtime::spawn_blocking(clients::detect_clients)
-        .await
-        .map_err(|e| e.to_string())?;
-    let selected: Option<std::collections::HashSet<String>> =
-        selected.map(|keys| keys.into_iter().collect());
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        for server in selected_servers_to_import(&detected, reg, selected.as_ref())? {
-            crate::registry_controller::apply_import_entry(reg, server);
-        }
-        Ok(())
-    })?;
-    Ok(reg)
+    let selected = match selected {
+        Some(selected) => selected,
+        None => crate::registry_controller::preview_client_imports()?
+            .into_iter()
+            .map(|item| item.key)
+            .collect(),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::registry_controller::import_client_servers_inputs(selected, &secret_choices.unwrap_or_default(), &credential_inputs.unwrap_or_default())
+    })
+    .await
+    .map_err(|_| "Import stopped".to_string())??;
+    reload_into_state(state.inner())
 }
 
 #[tauri::command]
@@ -205,17 +208,16 @@ async fn add_snippet_servers(
     state: State<'_, RegistryState>,
     text: String,
     selected: Vec<String>,
-) -> Result<Registry, String> {
+    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
+    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
+) -> Result<serde_json::Value, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::add_snippet_servers(&text, &selected)
+        crate::registry_controller::add_snippet_servers_inputs(&text,&selected,&secret_choices.unwrap_or_default(),&credential_inputs.unwrap_or_default())
     })
     .await
     .map_err(|_| "Paste import stopped".to_string())??;
     let registry = reload_into_state(state.inner())?;
-    if !outcome.failed.is_empty() {
-        return Err("Servers added, but the keychain could not save credentials. Open Credentials and retry.".into());
-    }
-    Ok(registry)
+    Ok(serde_json::json!({"registry":registry,"servers":outcome.servers}))
 }
 
 /// Parse a pasted config snippet and return the detected server(s) with
@@ -230,17 +232,14 @@ fn parse_server_snippet(text: String) -> Result<Vec<clients::ParsedSnippetServer
             MAX_SNIPPET_BYTES / 1024,
         ));
     }
-    clients::parse_snippet(&text)
+    clients::parse_snippet(&text).map_err(|_| "Could not read the pasted config. Check its syntax and retry.".into())
 }
 
 #[tauri::command]
 fn add_server(state: State<RegistryState>, mut entry: ServerEntry) -> Result<Registry, String> {
     entry.enabled = false;
-    let (reg, id) = write_registry(state.inner(), |reg| {
-        Ok(crate::registry_controller::apply_add_entry(reg, entry))
-    })?;
-    // Warm the launcher for the entry we just added, found by its assigned id (a concurrent
-    // add under the lock could otherwise make `last` a different server).
+    let (_, id) = crate::registry_controller::add_reviewed_entry(entry)?;
+    let reg = reload_into_state(state.inner())?;
     if let Some(saved) = reg.servers.iter().find(|s| s.id == id) {
         prewarm_launcher(saved);
     }
@@ -626,6 +625,7 @@ struct MigrateResult {
     tools: Vec<serde_json::Value>,
     outcome: clients::WriteOutcome,
     servers: Vec<crate::registry_controller::SetupServerResult>,
+    backup_date: Option<u64>,
 }
 
 #[tauri::command]
@@ -653,26 +653,32 @@ async fn migrate_client(
     force: Option<bool>,
     selected: Vec<String>,
     revision: String,
+    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
+    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
 ) -> Result<MigrateResult, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::migrate_client_reviewed(
+        crate::registry_controller::migrate_client_reviewed_inputs(
             &client_id,
             profile.as_deref(),
             force.unwrap_or(false),
             &selected,
             &revision,
+            &secret_choices.unwrap_or_default(),
+            &credential_inputs.unwrap_or_default(),
         )
     })
     .await
     .map_err(|e| e.to_string())??;
 
     let registry = reload_into_state(state.inner())?;
+    let backup_date = outcome.result.outcome.backup.as_ref().and_then(|path|std::fs::metadata(path).ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()).map(|duration|duration.as_secs());
     Ok(MigrateResult {
         registry,
         imported: outcome.imported,
         moved: outcome.moved,
         tools: outcome.tools,
         servers: outcome.servers,
+        backup_date,
         outcome: outcome.result.outcome,
     })
 }
@@ -2457,34 +2463,32 @@ struct ImportItem {
     url: Option<String>,
     /// False if a server with this name already exists (the import would skip it).
     is_new: bool,
+    credentials: Vec<crate::registry_controller::CredentialReview>,
+    unsupported: Option<String>,
 }
 
 /// Show exactly what the bulk client import would add without changing the
 /// registry. The same import key is accepted by `import_servers` after review.
 #[tauri::command]
 async fn preview_import_servers(
-    state: State<'_, RegistryState>,
+    _state: State<'_, RegistryState>,
 ) -> Result<Vec<ImportItem>, String> {
-    let detected = tauri::async_runtime::spawn_blocking(clients::detect_clients)
-        .await
-        .map_err(|e| e.to_string())?;
-    let reg = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok(servers_to_import(&detected, &reg)
+    let candidates =
+        tauri::async_runtime::spawn_blocking(crate::registry_controller::preview_client_imports)
+            .await
+            .map_err(|_| "Import preview stopped".to_string())??;
+    Ok(candidates
         .into_iter()
         .map(|server| ImportItem {
-            key: Some(clients::import_dedupe_key(
-                &server.name,
-                server.command.as_deref(),
-                &server.args,
-            )),
+            key: Some(server.key),
             name: server.name,
             transport: server.transport,
             command: server.command,
             args: server.args,
             url: server.url,
             is_new: true,
+            credentials: server.credentials,
+            unsupported: server.unsupported,
         })
         .collect())
 }
@@ -2517,6 +2521,8 @@ fn preview_import(state: State<RegistryState>, json: String) -> Result<Vec<Impor
                 args: s.args,
                 url: s.url,
                 is_new,
+                credentials: Vec::new(),
+                unsupported: None,
             }
         })
         .collect())

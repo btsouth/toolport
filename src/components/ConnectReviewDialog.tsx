@@ -3,7 +3,6 @@ import { Check, Loader2 } from "lucide-react";
 import { migrateClient, previewClientSetup } from "@/lib/api";
 import type { ClientSetupReview, MigrateResult, Registry } from "@/lib/types";
 import { ImportReviewDialog } from "./ImportReviewDialog";
-import { SecretsDialog } from "./SecretsDialog";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "./ui/dialog";
 import { Button } from "./ui/button";
 
@@ -40,18 +39,21 @@ export function ConnectReviewDialog({
       active = false;
     };
   }, [clientId, attempt]);
-  async function connect(selected: string[]) {
+  async function connect(
+    selected: string[],
+    secretChoices?: Record<string, Record<string, boolean>>,
+    credentialInputs?: Record<string, Record<string, string>>,
+  ) {
     if (!review) return;
     setBusy(true);
     setError("");
     try {
-      const next = await migrateClient(
-        clientId,
-        profile,
-        force,
-        selected,
-        review.revision,
-      );
+      const args = [clientId, profile, force, selected, review.revision] as const;
+      const next = credentialInputs
+        ? await migrateClient(...args, secretChoices, credentialInputs)
+        : secretChoices
+          ? await migrateClient(...args, secretChoices)
+          : await migrateClient(...args);
       setResult(next);
       onConnected(next.registry);
     } catch (e) {
@@ -80,7 +82,6 @@ export function ConnectReviewDialog({
               <p>Restart {clientName} to load Toolport.</p>
               <ul className="divide-y rounded-lg border">
                 {result.servers.map((row) => {
-                  const server = result.registry.servers.find((s) => s.name === row.name);
                   return (
                     <li
                       key={row.name}
@@ -97,13 +98,6 @@ export function ConnectReviewDialog({
                               : "No credentials needed"}
                         </p>
                       </div>
-                      {server && row.credentialState !== "none" && (
-                        <SecretsDialog
-                          server={server}
-                          onSaved={onConnected}
-                          trigger={<Button variant="outline">Open Credentials</Button>}
-                        />
-                      )}
                     </li>
                   );
                 })}
@@ -125,7 +119,14 @@ export function ConnectReviewDialog({
                 <summary>Details</summary>
                 <p className="mt-2 break-all">Config: {result.outcome.path}</p>
                 {result.outcome.backup && (
-                  <p className="break-all">Backup: {result.outcome.backup}</p>
+                  <>
+                    <p>
+                      {result.backupDate
+                        ? `Backup saved ${new Date(result.backupDate * 1000).toLocaleString()}`
+                        : "Backup saved"}
+                    </p>
+                    <p className="break-all">Backup: {result.outcome.backup}</p>
+                  </>
                 )}
               </details>
               <Button onClick={onClose}>Done</Button>
@@ -158,6 +159,7 @@ export function ConnectReviewDialog({
       items={review.items}
       busy={busy}
       allowEmpty
+      requireCredentials
       error={error}
       details={`Config: ${review.configPath}\nBackups will be saved in ${review.backupDir}`}
       title={`Review and connect ${clientName}`}

@@ -239,7 +239,7 @@ try {
   await expect(page.getByText("Claude Code 2.1 · 2m ago · waited 1m 30s")).toBeVisible();
   await page.screenshot({ path: path.join(output, "approval-activity.png") });
   await page.setViewportSize({ width: 1240, height: 900 });
-  for (const failure of ["", "launch", "credential", "verifying"]) {
+  for (const failure of ["", "launch", "credential", "optional", "vault", "verifying"]) {
     await page.goto(
       `${baseURL}/fixtures/?setup=1${failure === "verifying" ? "&setup-verifying=1" : failure ? `&setup-failure=${failure}` : ""}`,
     );
@@ -256,6 +256,36 @@ try {
       animations: "disabled",
       path: path.join(output, "setup-client-review.png"),
     });
+    if (failure === "credential" || failure === "optional") {
+      await page.getByText("Calendar credentials and settings", { exact: true }).click();
+      if (failure === "credential") {
+        await expect(
+          page.getByRole("button", { name: "Connect to Toolport", exact: true }),
+        ).toBeDisabled();
+        await expect(
+          page.getByText("Enter PAT or deselect Calendar", { exact: true }),
+        ).toBeVisible();
+      } else {
+        await expect(
+          page.getByRole("button", { name: "Connect to Toolport", exact: true }),
+        ).toBeEnabled();
+        await expect(page.getByText("Optional", { exact: true }).first()).toBeVisible();
+      }
+      await page.screenshot({
+        animations: "disabled",
+        path: path.join(output, `setup-${failure}-review.png`),
+      });
+      if (failure === "credential") {
+        await page.getByRole("button", { name: "Enter value", exact: true }).click();
+        await page.getByLabel("PAT", { exact: true }).fill("synthetic-review-value");
+        await page
+          .getByRole("button", { name: "Use for connection", exact: true })
+          .click();
+        await expect(
+          page.getByRole("button", { name: "Connect to Toolport", exact: true }),
+        ).toBeEnabled();
+      }
+    }
     await page.getByRole("button", { name: "Connect to Toolport", exact: true }).click();
     if (failure === "verifying") {
       await expect(
@@ -264,7 +294,7 @@ try {
       await expect(
         page.getByRole("status").filter({ hasText: "Checking Notes" }),
       ).toBeVisible();
-    } else if (failure) {
+    } else if (failure && failure !== "optional") {
       await expect(
         page.getByRole("alert").filter({ hasText: "Client config unchanged" }),
       ).toBeVisible();
@@ -272,7 +302,10 @@ try {
     } else {
       await expect(page.getByText(/3 tools/)).toHaveCount(2);
       await page.getByText("What your agent sees", { exact: true }).click();
-      await expect(page.getByText("notes__read", { exact: true })).toBeVisible();
+      await expect(
+        page.getByText("toolport_search_tools", { exact: true }),
+      ).toBeVisible();
+      await page.getByText("What your agent sees", { exact: true }).click();
     }
     await page.screenshot({
       animations: "disabled",
