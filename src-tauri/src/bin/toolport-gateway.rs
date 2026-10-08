@@ -13855,6 +13855,16 @@ fn adapter_live_view(
 /// awaited while the gateway publishes it.
 const FIRST_CATALOG_WAIT: Duration = Duration::from_secs(2);
 
+// Pause only this test request after it captured a cold router. Publication on
+// another thread can then change the shared supervisor without changing its tools.
+#[cfg(test)]
+type ColdToolsSnapshotHook = Box<dyn FnOnce(&Router)>;
+#[cfg(test)]
+thread_local! {
+    static COLD_TOOLS_SNAPSHOT_HOOK: std::cell::RefCell<Option<ColdToolsSnapshotHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// One request in, one response out: wait for a cold cache / live router when
 /// the method needs it, self-heal an empty router on a call, then dispatch.
 /// Shared by the stdio loop and the HTTP server so they can't diverge.
@@ -14200,6 +14210,12 @@ fn process_request(
         })
         .is_empty();
         if cold {
+            #[cfg(test)]
+            COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
+                if let Some(hook) = hook.take() {
+                    hook(&router);
+                }
+            });
             while Instant::now() < tools_list_deadline
                 && (router.any_discovering(visible) || router.any_publishing_first_catalog(visible))
             {
@@ -14222,6 +14238,20 @@ fn process_request(
                 };
                 router = catalog_for_view(rooted).0;
             }
+            // A snapshot shares supervisor state, but not the indexed catalog.
+            // Publication can mark its slots Ready after the last clone, making
+            // the wait stop on an empty old router. Re-read the published view.
+            let base = state
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let rooted = if daemon_adapter {
+                state.router_for_root(base, &reg, adapter_root.as_deref(), allowed)
+            } else {
+                base
+            };
+            router = catalog_for_view(rooted).0;
             // Ready slots can precede disk-cache publication. Read the live view
             // after a cold wait so another client's cache cannot hide new tools.
             cache_snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
@@ -20314,7 +20344,6 @@ mod tests {
         // Another client's warm catalog must not shorten this view's cold wait.
         *state.cached_tools.lock().unwrap() =
             Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Arc::new(Mutex::new(release_rx));
         let mut live = Router::new();
@@ -20322,7 +20351,6 @@ mod tests {
             "late".into(),
             Vec::new(),
             Arc::new(move || {
-                started_tx.send(()).unwrap();
                 release_rx
                     .lock()
                     .unwrap()
@@ -20335,39 +20363,134 @@ mod tests {
         );
         let live = Arc::new(live);
         *state.router.lock().unwrap() = Arc::clone(&live);
-        let allowed = HashSet::from(["late".to_string()]);
-        std::thread::scope(|scope| {
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            let state = &state;
-            let allowed = &allowed;
-            scope.spawn(move || {
-                reply_tx
-                    .send(full_tools_list_for_client(state, "cursor", Some(allowed)))
-                    .unwrap();
-            });
-            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            assert!(
-                matches!(
-                    reply_rx.recv_timeout(FIRST_CATALOG_WAIT + Duration::from_millis(100)),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                ),
-                "no-refresh client returned before its larger budget"
-            );
-            release_tx.send(()).unwrap();
-            wait_for_supervisor_result(&live);
-            adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
-            let reply = reply_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            assert!(reply["result"]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|tool| tool["name"] == "late__cached"));
-            assert!(!reply["result"]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|tool| tool["name"] == "other__cached"));
+        let publisher = state.clone();
+        COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
+            hook.replace(Some(Box::new(move |snapshot| {
+                assert!(snapshot.aggregated_tools().is_empty());
+                assert!(snapshot.any_discovering(|id| id == "late"));
+                // Force the request to retain the old router across publication.
+                // Wait for the actual supervisor result, not a scheduler delay.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut seen = started_supervisors();
+                release_tx.send(()).unwrap();
+                while !live.has_ready_reconnects() && Instant::now() < deadline {
+                    seen = wait_for_started_supervisor(seen, deadline);
+                }
+                assert!(live.has_ready_reconnects(), "fixture did not connect");
+                adopt_reconnected_servers(
+                    &publisher.host,
+                    &publisher.stdio_upstream,
+                    &publisher.profile,
+                );
+                assert!(!snapshot.any_discovering(|_| true));
+                assert!(!snapshot.any_publishing_first_catalog(|_| true));
+                assert!(snapshot.aggregated_tools().is_empty());
+                assert!(publisher
+                    .router
+                    .lock()
+                    .unwrap()
+                    .aggregated_tools()
+                    .iter()
+                    .any(|tool| tool["name"] == "late__cached"));
+            })));
         });
+        let allowed = HashSet::from(["late".to_string()]);
+        let started = Instant::now();
+        let reply = full_tools_list_for_client(&state, "cursor", Some(&allowed));
+        assert!(
+            started.elapsed()
+                < Duration::from_millis(
+                    clients::discovery_capabilities("cursor").cold_full_list_wait_ms,
+                ),
+            "fixture exceeded the client's budget"
+        );
+        assert!(reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "late__cached"));
+        assert!(!reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "other__cached"));
+    }
+
+    #[test]
+    fn supervisor_cold_full_no_refresh_honours_larger_client_budget() {
+        let _env = DataDirTestEnv::new("cold-full-larger-client-budget");
+        let state = http_state(false);
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let mut live = Router::new();
+        live.add_supervised(
+            "late".into(),
+            Vec::new(),
+            Arc::new(move || {
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        let live = Arc::new(live);
+        *state.router.lock().unwrap() = Arc::clone(&live);
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let requester = state.clone();
+        let request = std::thread::spawn(move || {
+            COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
+                hook.replace(Some(Box::new(move |snapshot| {
+                    assert!(snapshot.aggregated_tools().is_empty());
+                    assert!(snapshot.any_discovering(|id| id == "late"));
+                    waiting_tx.send(()).unwrap();
+                })));
+            });
+            let allowed = HashSet::from(["late".to_string()]);
+            reply_tx
+                .send(full_tools_list_for_client(
+                    &requester,
+                    "cursor",
+                    Some(&allowed),
+                ))
+                .unwrap();
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The only timed synchronization is proving the 2 s default did not win.
+        let early_reply = reply_rx.recv_timeout(FIRST_CATALOG_WAIT + Duration::from_millis(500));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut seen = started_supervisors();
+        release_tx.send(()).unwrap();
+        while !live.has_ready_reconnects() && Instant::now() < deadline {
+            seen = wait_for_started_supervisor(seen, deadline);
+        }
+        assert!(live.has_ready_reconnects(), "fixture did not connect");
+        adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
+        let reply = match &early_reply {
+            Ok(reply) => reply.clone(),
+            Err(_) => reply_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        };
+        request.join().unwrap();
+        assert!(
+            matches!(early_reply, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "cold list returned while its visible server was still discovering"
+        );
+        assert!(reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "late__cached"));
+        assert!(!reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "other__cached"));
     }
 
     #[test]
