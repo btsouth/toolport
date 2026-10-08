@@ -349,7 +349,7 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
     assert!(!serde_json::to_string(&saved)
         .unwrap()
         .contains("synthetic-setup-pat"));
-    assert_eq!(result.moved, ["secured", "argument"]);
+    assert_eq!(result.moved, ["argument", "secured"]);
     assert!(result
         .servers
         .iter()
