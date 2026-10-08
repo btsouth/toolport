@@ -175,19 +175,21 @@ try {
     memberReview.getByText(/Alice.*via dashboard.*approved by Bob/),
   ).toBeVisible();
   await expect(memberReview.getByText("Call-log export", { exact: true })).toBeVisible();
-  await expect(
-    memberReview.getByRole("button", { name: "Accept", exact: true }),
-  ).toHaveCount(4);
-  await expect(
-    memberReview.getByRole("button", { name: "Reject", exact: true }),
-  ).toHaveCount(4);
+  await expect(memberReview.getByRole("button", { name: /^Accept / })).toHaveCount(4);
+  await expect(memberReview.getByRole("button", { name: /^Reject / })).toHaveCount(4);
   await page.evaluate(() => document.fonts.ready);
   await page.screenshot({ path: path.join(output, "teams-member-review.png") });
-  await memberReview.getByRole("button", { name: "Reject", exact: true }).first().click();
+  await memberReview
+    .getByRole("button", { name: /^Reject / })
+    .first()
+    .click();
   await expect(
     memberReview.getByText("Server: Project tools", { exact: true }),
   ).toHaveCount(0);
-  await memberReview.getByRole("button", { name: "Accept", exact: true }).first().click();
+  await memberReview
+    .getByRole("button", { name: /^Accept / })
+    .first()
+    .click();
   await expect(memberReview.getByText("Team instructions", { exact: true })).toHaveCount(
     0,
   );
