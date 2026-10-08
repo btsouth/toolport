@@ -219,9 +219,7 @@ impl TeamsPage {
         }
         if let Some((notice, is_error)) = notice {
             self.set_status(&notice, is_error);
-            if !is_error {
-                self.feedback.add_css_class("success");
-            }
+            if !is_error { self.feedback.add_css_class("success"); }
             if let Some(team) = registry.team.clone() {
                 self.render_connected(registry, team);
             } else {
@@ -769,8 +767,7 @@ impl TeamsPage {
             }
             crate::teams::SyncResult::Ok { applied, .. } => {
                 let outcome = applied.map(|(_, outcome)| outcome).unwrap_or_default();
-                *self.sync_notice.borrow_mut() = team_review_line(outcome.review, outcome.blocked)
-                    .map(|message| (message, true));
+                *self.sync_notice.borrow_mut() = team_review_line(outcome.review, outcome.blocked).map(|message| (message, true));
             }
         }
         self.refresh();
@@ -1243,11 +1240,7 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
 /// how it relates to the team.
 fn share_choice_label(name: &str, keys: Option<String>, hint: Option<&str>) -> gtk::Box {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    let title = gtk::Label::builder()
-        .label(name)
-        .xalign(0.0)
-        .wrap(true)
-        .build();
+    let title = gtk::Label::builder().label(name).xalign(0.0).wrap(true).build();
     column.append(&title);
     for detail in keys.as_deref().into_iter().chain(hint) {
         let line = gtk::Label::builder()
@@ -1744,10 +1737,7 @@ mod tests {
             same_name,
             selection("Vercel (Full API)", "Already shared", HandoffOutcome::Attention, "This team copy already has its own local credentials. Keep its existing setup and enable it separately. Your personal server stays on in this profile."),
         ]);
-        let parent = gtk::Window::builder()
-            .default_width(1000)
-            .default_height(760)
-            .build();
+        let parent = gtk::Window::builder().default_width(1000).default_height(760).build();
         parent.present();
         let dialog = share_preview_dialog(&parent, &preview);
         let mut text = String::new();
@@ -1780,10 +1770,7 @@ mod tests {
         );
         let mut text = String::new();
         collect(picker.upcast_ref(), &mut text);
-        assert_eq!(
-            text,
-            "Linear\nShared. The Team copy is in use in this profile.\n"
-        );
+        assert_eq!(text, "Linear\nShared. The Team copy is in use in this profile.\n");
         parent.close();
     }
 
