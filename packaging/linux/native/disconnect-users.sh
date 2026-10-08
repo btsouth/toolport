@@ -1,5 +1,7 @@
 #!/bin/sh
 # Package-owned helper. Never inherit root's config, data override or shell.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 manual() {
   echo "Toolport: $*. Removal will continue. Before deleting Toolport data, reinstall Toolport and run toolport-gateway --disconnect-all as the affected user, or use Settings > Remove Toolport from all clients." >&2
 }
@@ -7,7 +9,11 @@ if [ ! -x /usr/bin/toolport-gateway ]; then
   manual "gateway binary is missing; client configs were not restored"
   exit 0
 fi
-getent passwd | while IFS=: read -r user password uid gid gecos home shell; do
+accounts=$(getent passwd) || {
+  manual "could not enumerate user accounts; client configs were not restored"
+  exit 0
+}
+printf '%s\n' "$accounts" | while IFS=: read -r user password uid gid gecos home shell; do
   case "$uid" in ''|*[!0-9]*|0) continue ;; esac
   case "$home" in /*) ;; *) continue ;; esac
   # Standard current and pre-rename data locations only. No uid floor: system

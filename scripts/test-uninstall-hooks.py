@@ -30,7 +30,7 @@ class RemovalHooks(unittest.TestCase):
             path.write_text("#!/bin/sh\n" + body + "\n")
             path.chmod(0o755)
         self.helper = self.root / "helper"
-        self.helper.write_text((NATIVE / "disconnect-users.sh").read_text().replace("/usr/bin/toolport-gateway", str(self.gateway)))
+        self.helper.write_text((NATIVE / "disconnect-users.sh").read_text().replace("/usr/bin/toolport-gateway", str(self.gateway)).replace("PATH=/usr/sbin:/usr/bin:/sbin:/bin", f"PATH={self.bin}:/usr/bin:/bin"))
         self.helper.chmod(0o755)
         self.env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TOOLPORT_DATA_DIR="/root/never-use-this")
 
