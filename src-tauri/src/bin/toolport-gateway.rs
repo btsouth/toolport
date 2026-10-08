@@ -2309,6 +2309,11 @@ impl CatalogSearchIndex {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static CATALOG_SNAPSHOT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug)]
 struct CatalogSnapshot {
     tools: Vec<Value>,
@@ -2317,6 +2322,8 @@ struct CatalogSnapshot {
 
 impl CatalogSnapshot {
     fn new(mut tools: Vec<Value>) -> Self {
+        #[cfg(test)]
+        CATALOG_SNAPSHOT_BUILDS.with(|count| count.set(count.get() + 1));
         // Normalize both fresh and disk-cached catalogs. Without this, the first
         // tools/list after restart could replay pre-SOU-454 incidental ordering
         // until the background router build replaced it.
@@ -14654,7 +14661,7 @@ fn catalog_wait_budget(
     setup: bool,
 ) -> Duration {
     if setup {
-        Duration::from_secs(30)
+        downstream::SETUP_CATALOG_WAIT_BUDGET
     } else if discovery == DiscoveryMode::Full || scoped_search {
         Duration::from_millis(
             clients::discovery_capabilities(client.unwrap_or("")).cold_full_list_wait_ms,
@@ -15090,10 +15097,21 @@ fn process_request_wire(
             } else {
                 base
             };
-            router = catalog_for_view(rooted).0;
-            // Ready slots can precede disk-cache publication. Read the live view
-            // after a cold wait so another client's cache cannot hide new tools.
-            cache_snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+            (router, cache_snapshot) = catalog_for_view(rooted);
+            // Profile snapshots already reflect the live router. Only repair the
+            // shared cache when publication has not yet added this server's tools.
+            if !daemon_adapter
+                && search_server.is_some_and(|server| {
+                    let prefix = format!("{}__", sanitize_segment(server));
+                    !cache_snapshot.tools.iter().any(|tool| {
+                        tool.get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| name.starts_with(&prefix))
+                    })
+                })
+            {
+                cache_snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+            }
             // Do not wait on rebuild_lock after the deadline: a slow publisher
             // must not turn a bounded cold list into a client startup timeout.
         }
@@ -18247,7 +18265,12 @@ fn proxy_public_http_connection(
     };
     drop(pending_read);
     let Some(_active) = try_acquire_inflight(active, http_max_connections()) else {
-        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway busy; retry later");
+        write_ingress_response(
+            &mut client,
+            503,
+            "Service Unavailable",
+            "gateway busy; retry later",
+        );
         return;
     };
     // Authenticate the cached daemon before every new public request. A failed
@@ -18257,23 +18280,43 @@ fn proxy_public_http_connection(
         Ok(descriptor) => descriptor,
         Err(error) => {
             glog(&format!("HTTP proxy: {error}"));
-            write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+            write_ingress_response(
+                &mut client,
+                503,
+                "Service Unavailable",
+                "gateway unavailable",
+            );
             return;
         }
     };
     let Ok(endpoint) = descriptor.endpoint.parse::<SocketAddr>() else {
-        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+        write_ingress_response(
+            &mut client,
+            503,
+            "Service Unavailable",
+            "gateway unavailable",
+        );
         return;
     };
     let mut upstream = match TcpStream::connect_timeout(&endpoint, Duration::from_secs(2)) {
         Ok(stream) => stream,
         Err(_) => {
-            write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+            write_ingress_response(
+                &mut client,
+                503,
+                "Service Unavailable",
+                "gateway unavailable",
+            );
             return;
         }
     };
     if upstream.write_all(&request).is_err() {
-        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+        write_ingress_response(
+            &mut client,
+            503,
+            "Service Unavailable",
+            "gateway unavailable",
+        );
         return;
     }
     // The daemon detects the public caller's full socket close. Keep the write
@@ -18352,13 +18395,23 @@ fn serve_http_proxy(port: u16) -> Result<(), String> {
             match listener.accept() {
                 Ok((mut client, _)) => {
                     if client.set_nonblocking(false).is_err() {
-                        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+                        write_ingress_response(
+                            &mut client,
+                            503,
+                            "Service Unavailable",
+                            "gateway unavailable",
+                        );
                         continue;
                     }
                     let Some(pending) =
                         try_acquire_inflight(&pending_reads, http_max_connections())
                     else {
-                        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway busy; retry later");
+                        write_ingress_response(
+                            &mut client,
+                            503,
+                            "Service Unavailable",
+                            "gateway busy; retry later",
+                        );
                         continue;
                     };
                     let state = Arc::clone(&state);
@@ -18470,7 +18523,11 @@ fn respond_mcp_sse_listen(request: tiny_http::Request, mut out: HttpOut, allow_h
         .unwrap(),
         tiny_http::Header::from_bytes(b"Access-Control-Allow-Headers", allow_headers.as_bytes())
             .unwrap(),
-        tiny_http::Header::from_bytes(b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()).unwrap(),
+        tiny_http::Header::from_bytes(
+            b"Access-Control-Expose-Headers",
+            EXPOSED_HTTP_HEADERS.as_bytes(),
+        )
+        .unwrap(),
     ];
     for (name, value) in out.extra {
         let safe = sanitize_header_value(&value);
@@ -22183,6 +22240,49 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_warm_scoped_search_reuses_catalog_snapshot() {
+        let _env = DataDirTestEnv::new("reviewed-warm-scoped-search");
+        let state = http_state(false);
+        let (mut reg, router, catalog) = tool_surface_fixture();
+        reg.profiles.push(registry::Profile {
+            id: "adapter".into(),
+            name: "Adapter".into(),
+            enabled_server_ids: vec!["alpha".into()],
+            tool_scope: HashMap::from([("alpha".into(), vec!["read".into()])]),
+            instructions: None,
+            unknown_fields: serde_json::Map::new(),
+        });
+        *state.registry.lock().unwrap() = reg.clone();
+        *state.router.lock().unwrap() = Arc::clone(&router);
+        *state.cached_tools.lock().unwrap() = catalog;
+        let allowed = HashSet::from(["alpha".to_string()]);
+        for daemon in [false, true] {
+            state.daemon_mode.store(daemon, Ordering::SeqCst);
+            let profile = daemon.then_some("adapter");
+            if daemon {
+                state.router_for_adapter_profile(Arc::clone(&router), &reg, "adapter");
+            }
+            let builds = CATALOG_SNAPSHOT_BUILDS.with(|count| count.get());
+            for scope in [None, Some(&allowed)] {
+                let reply = process_request(
+                    &state,
+                    &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"read","server":"alpha"}}}),
+                    &SearchGuard::default(), scope, profile, None, None, Some("claude-code"), None, DiscoveryMode::Lazy,
+                ).unwrap();
+                assert!(reply["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("alpha__read"));
+                assert_eq!(
+                    CATALOG_SNAPSHOT_BUILDS.with(|count| count.get()),
+                    builds,
+                    "warm scoped search rebuilt its catalog (daemon={daemon})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn reviewed_setup_budget_preserves_real_client_budget() {
         assert_eq!(
             catalog_wait_budget(DiscoveryMode::Full, false, Some("claude-code"), false),
@@ -22190,8 +22290,10 @@ mod tests {
         );
         assert_eq!(
             catalog_wait_budget(DiscoveryMode::Lazy, true, Some("claude-code"), true),
-            Duration::from_secs(30)
+            downstream::SETUP_CATALOG_WAIT_BUDGET
         );
+        assert_eq!(downstream::SETUP_CATALOG_WAIT_BUDGET, Duration::from_secs(25));
+        assert!(downstream::SETUP_CATALOG_WAIT_BUDGET < downstream::STDIO_READ_TIMEOUT);
     }
 
     #[test]
@@ -27619,11 +27721,8 @@ mod tests {
         let state = http_state(true);
         swap_router(&state, router);
         let search = SearchGuard::default();
-        let post = |path: &str| {
-            handle_http(
-                &state, &search, "POST", path, "{}", None, None, None, None,
-            )
-        };
+        let post =
+            |path: &str| handle_http(&state, &search, "POST", path, "{}", None, None, None, None);
 
         let ok = post("/s__work");
         assert_eq!(ok.status, 200, "body={}", ok.body);
