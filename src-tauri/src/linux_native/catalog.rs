@@ -1081,9 +1081,7 @@ mod tests {
         window.add_css_class("toolport-native");
         let theme = super::super::theme::ThemeController::new();
         theme.attach(&window);
-        let _lock = crate::registry::data_dir_test_lock();
-        let scratch = tempfile::tempdir().unwrap();
-        let _data = crate::registry::DataDirOverride::set(scratch.path());
+        let _data = crate::registry::DataDirTestEnv::new("catalog-desktop");
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();
         page.registry_fetch
