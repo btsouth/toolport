@@ -1522,6 +1522,12 @@ fn undo_staged_value(
     staged: &serde_json::Value,
 ) -> bool {
     use serde_json::Value;
+    let same_row = |left: &Value, right: &Value| {
+        ["id", "key"]
+            .iter()
+            .any(|field| left.get(field).is_some() && left.get(field) == right.get(field))
+            || left == right
+    };
     if previous == staged {
         return true;
     }
@@ -1553,12 +1559,8 @@ fn undo_staged_value(
         (Value::Array(latest), Value::Array(previous), Value::Array(staged)) => {
             let mut complete = true;
             for written in staged {
-                let old = previous.iter().find(|v| {
-                    v.get("id").is_some() && v.get("id") == written.get("id") || *v == written
-                });
-                let current = latest.iter().position(|v| {
-                    v.get("id").is_some() && v.get("id") == written.get("id") || v == written
-                });
+                let old = previous.iter().find(|v| same_row(v, written));
+                let current = latest.iter().position(|v| same_row(v, written));
                 match (old, current) {
                     (Some(old), Some(index)) => {
                         complete &= undo_staged_value(&mut latest[index], old, written)
@@ -1571,12 +1573,13 @@ fn undo_staged_value(
                     _ => {}
                 }
             }
-            for old in previous.iter().filter(|old| {
-                !staged
-                    .iter()
-                    .any(|v| v.get("id").is_some() && v.get("id") == old.get("id") || v == *old)
-            }) {
-                if !latest.contains(old) {
+            for old in previous
+                .iter()
+                .filter(|old| !staged.iter().any(|v| same_row(v, old)))
+            {
+                if let Some(current) = latest.iter().find(|v| same_row(v, old)) {
+                    complete &= current == old;
+                } else {
                     latest.push(old.clone());
                 }
             }
@@ -2587,6 +2590,18 @@ mod tests {
         assert!(read_registry_exact().unwrap().servers.is_empty());
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
         assert!(!fixture.move_record("claude-code").exists());
+    }
+
+    #[test]
+    fn reviewed_rollback_preserves_concurrent_environment_fields() {
+        let previous = json!({"enabled":false,"env":[{"key":"PAT","value":"old"}]});
+        let staged = json!({"enabled":true,"env":[{"key":"PAT","value":"staged"}]});
+        let mut latest = json!({"enabled":true,"env":[{"key":"PAT","value":"concurrent"},{"key":"PORT","value":"3000"}]});
+        assert!(!undo_staged_value(&mut latest, &previous, &staged));
+        assert_eq!(
+            latest,
+            json!({"enabled":false,"env":[{"key":"PAT","value":"concurrent"},{"key":"PORT","value":"3000"}]})
+        );
     }
 
     #[test]
