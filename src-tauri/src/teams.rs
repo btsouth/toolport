@@ -8048,7 +8048,7 @@ mod member_review_tests {
             {"id":"stdio", "name":"Local tool", "transport":"stdio", "command":command, "args":[], "env":[]},
             {"id":"remote", "name":"Public tool", "transport":"http", "url":"https://1.2.3.4/mcp", "env":[]}
         ], "instructions":{"content":"Reviewed instructions"}, "screeningPolicy":{"minSafetyLevel":"ask"},
-            "rateLimits":[{"serverId":"stdio", "callsPerMinute":10}], "callAuditExport":true})
+            "rateLimits":[{"id":"daily-calls", "window":"day", "maxCalls":5, "tool":"stdio/echo"}], "callAuditExport":true})
     }
 
     fn decide(reg: &mut Registry, key: &str, accept: bool) {
@@ -8438,5 +8438,92 @@ mod member_review_tests {
                 expected
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod member_pairing_regression {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires private omabox HOME for before-change instructions writes"]
+    fn pairing_holds_servers_instructions_policy_and_export() {
+        assert_eq!(std::env::var("HOME").unwrap(), "/home/sbx");
+        let _lock = crate::registry::data_dir_test_lock();
+        let root =
+            std::env::temp_dir().join(format!("toolport-member-pairing-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&root);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", server.server_addr());
+        let config = json!({"servers":[
+            {"id":"remote", "name":"Public tool", "transport":"http", "url":"https://1.2.3.4/mcp", "env":[]},
+            {"id":"stdio", "name":"Local tool", "transport":"stdio", "command":"fixture-only", "args":[], "env":[]}
+        ], "instructions":{"content":"Do not apply before member acceptance."}, "callAuditExport":true,
+            "screeningPolicy":{"minSafetyLevel":"ask"}, "rateLimits":[{"id":"daily-calls","window":"day","maxCalls":5,"tool":"stdio/echo"}]});
+        let service = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+            while std::time::Instant::now() < deadline {
+                let Some(request) = server
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap()
+                else {
+                    break;
+                };
+                let (status, body) = if request.url().contains("/config/changes") {
+                    (404, json!({}))
+                } else if request.url().ends_with("/config") {
+                    (200, json!({"version":1,"config":config}))
+                } else if request.url().ends_with("/me") {
+                    (200, json!({"role":"member"}))
+                } else {
+                    (404, json!({}))
+                };
+                request
+                    .respond(
+                        tiny_http::Response::from_string(body.to_string()).with_status_code(status),
+                    )
+                    .unwrap();
+            }
+        });
+        let result = finish_connect(
+            &origin,
+            Joined {
+                team_id: "review-team".into(),
+                member_token: "fixture-token".into(),
+                role: "member".into(),
+            },
+            None,
+        );
+        service.join().unwrap();
+        result.unwrap();
+        let registry = crate::registry::load().unwrap();
+        assert_eq!(registry.servers.len(), 2);
+        assert!(
+            registry.servers.iter().all(|server| !server.enabled),
+            "pairing enabled an unreviewed server"
+        );
+        assert!(
+            registry
+                .team
+                .as_ref()
+                .unwrap()
+                .team_instructions_content
+                .is_none(),
+            "pairing applied unreviewed instructions"
+        );
+        assert!(
+            !registry.team.as_ref().unwrap().call_audit_export,
+            "pairing enabled unreviewed call-log export"
+        );
+        assert!(
+            registry.team.as_ref().unwrap().rate_limits.is_empty(),
+            "pairing applied unreviewed policy caps"
+        );
+        assert_eq!(
+            registry.team_min_safety_level,
+            crate::registry::SafetyLevel::Ask
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

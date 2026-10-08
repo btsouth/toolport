@@ -1534,6 +1534,7 @@ mod tests {
     use super::{share_action, share_choice_label};
     use crate::teams::{HandoffOutcome, LocalHandoff, PushPreview, ShareSelectionPreview};
     use adw::prelude::*;
+    use std::{cell::Cell, rc::Rc};
 
     #[test]
     fn member_review_native_shows_diff_labels_and_both_decisions() {
@@ -1559,22 +1560,38 @@ mod tests {
                 && text.contains("approved by Bob")
         );
         assert!(text.contains("Accept") && text.contains("Reject"));
-        // Optional visual evidence from this exact widget, always in an isolated desktop.
+        // Hold this fixture only for an external omabox capture. Frame callbacks
+        // observe the completion marker; the timeout bounds the optional capture.
         if let Ok(path) = std::env::var("TOOLPORT_MEMBER_REVIEW_SCREENSHOT") {
+            let done = std::path::PathBuf::from(format!("{path}.done"));
+            let finished = Rc::new(Cell::new(false));
+            let main_loop = gtk::glib::MainLoop::new(None, false);
+            let frame_loop = main_loop.clone();
+            let captured = finished.clone();
+            dialog.add_tick_callback(move |_, _| {
+                if done.exists() {
+                    captured.set(true);
+                    frame_loop.quit();
+                    gtk::glib::ControlFlow::Break
+                } else {
+                    gtk::glib::ControlFlow::Continue
+                }
+            });
+            let timeout_loop = main_loop.clone();
+            let timeout =
+                gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(30), move || {
+                    timeout_loop.quit()
+                });
             parent.present();
             dialog.present();
-            let context = gtk::glib::MainContext::default();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while std::time::Instant::now() < deadline && !dialog.is_mapped() {
-                context.iteration(true);
+            main_loop.run();
+            if finished.get() {
+                timeout.remove();
             }
-            while context.pending() {
-                context.iteration(false);
-            }
-            std::process::Command::new("grim")
-                .arg(path)
-                .status()
-                .unwrap();
+            assert!(
+                finished.get(),
+                "omabox capture did not finish within 30 seconds"
+            );
         }
         dialog.close();
         parent.close();
