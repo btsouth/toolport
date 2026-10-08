@@ -138,7 +138,7 @@ pub(super) fn review(
             } else {
                 "Found"
             }));
-            state.add_css_class("warning");
+            state.add_css_class(if found { "dim-label" } else { "warning" });
             row.add_suffix(&state);
         }
         if let Some(reason) = &item.unsupported {
@@ -165,7 +165,7 @@ pub(super) fn review(
                 let key = env.key.clone();
                 let value_row_for_input = value_row.clone();
                 open.connect_clicked(move |_| {
-                    let prompt = adw::MessageDialog::new(Some(&owner), Some("Missing credential"), Some("This value is used only for the selected server. It goes to the keychain if connection succeeds."));
+                    let prompt = adw::MessageDialog::new(Some(&owner), Some(&format!("{name} credentials")), Some(&format!("Enter {key}. This value is used only for the selected server. It goes to the keychain if connection succeeds.")));
                     let entry = gtk::PasswordEntry::builder().show_peek_icon(true).build();
                     prompt.set_extra_child(Some(&entry));
                     prompt.add_responses(&[("cancel", "Cancel"), ("save", "Use for connection")]);
@@ -321,7 +321,18 @@ pub(super) fn review(
                     feedback.set_visible(false);
                     let status = adw::StatusPage::builder()
                         .icon_name("emblem-ok-symbolic")
-                        .title(&outcome.message)
+                        .title(
+                            outcome
+                                .message
+                                .split_once(". ")
+                                .map_or(outcome.message.as_str(), |(title, _)| title),
+                        )
+                        .description(
+                            outcome
+                                .message
+                                .split_once(". ")
+                                .map_or("", |(_, description)| description),
+                        )
                         .build();
                     status.add_css_class("compact");
                     status.set_vexpand(false);
@@ -595,6 +606,9 @@ mod tests {
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
         let broker = crate::approval_broker::start_native();
         let (_, credential_page, _) = super::super::build_content(&app, broker);
+        parent.set_title(Some("Toolport fixture"));
+        parent.set_default_size(1000, 740);
+        parent.present();
         let items = ["Notes", "Calendar"]
             .into_iter()
             .map(|name| SetupItem {

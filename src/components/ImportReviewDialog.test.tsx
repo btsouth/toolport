@@ -372,7 +372,7 @@ it("leaves unsupported servers unchecked and sends per-row keychain choices", as
   });
   expect(screen.getByRole("button", { name: /linear/ })).toBeDisabled();
   expect(screen.getByLabelText(/Keep PORT in keychain/)).not.toBeChecked();
-  expect(screen.getByText("Found")).toBeVisible();
+  expect(screen.getAllByText("Found")[0]).toBeVisible();
   await userEvent.click(screen.getByLabelText(/Keep PORT in keychain/));
   await userEvent.click(screen.getByRole("button", { name: /Import 1 server/ }));
   expect(onConfirm).toHaveBeenCalledWith(["a"], { stripe: { PORT: true }, linear: {} });

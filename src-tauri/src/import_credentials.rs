@@ -10,12 +10,14 @@ const VAULT_FAILURE: &str =
 
 pub(crate) fn provided(value: &str) -> bool {
     let value = value.trim();
-    let placeholder = regex::Regex::new(
-        r"^(\$\{[A-Za-z_][A-Za-z0-9_]*\}|<(?i:your[-_ ]|replace[-_ ])[A-Za-z0-9_ -]+>)$",
-    )
-    .unwrap();
+    static PLACEHOLDER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"^(\$\{[A-Za-z_][A-Za-z0-9_]*\}|<(?i:your[-_ ]|replace[-_ ])[A-Za-z0-9_ -]+>)$",
+        )
+        .unwrap()
+    });
     !value.is_empty()
-        && !placeholder.is_match(value)
+        && !PLACEHOLDER.is_match(value)
         && !matches!(
             value.to_ascii_uppercase().as_str(),
             "YOUR_API_KEY" | "YOUR_TOKEN" | "REPLACE_ME"
@@ -490,12 +492,32 @@ impl Import {
                 return Err(VAULT_FAILURE.into());
             }
         }
+        for env in self.entry.env.iter().filter(|env| !env.secret) {
+            if env.value.as_deref().is_none_or(|value| !provided(value))
+                && self
+                    .entry
+                    .launch
+                    .as_ref()
+                    .is_some_and(|launch| launch.required_env.contains(&env.key))
+            {
+                missing.push(env.key.clone());
+            }
+        }
         Ok(missing)
     }
 }
 
 pub(crate) fn ready(server: &ServerEntry) -> Result<bool, String> {
     for env in &server.env {
+        if !env.secret
+            && env.value.as_deref().is_none_or(|value| !provided(value))
+            && server
+                .launch
+                .as_ref()
+                .is_some_and(|launch| launch.required_env.contains(&env.key))
+        {
+            return Ok(false);
+        }
         if env.secret
             && env.value.is_none()
             && server
@@ -557,6 +579,47 @@ mod tests {
             .unwrap();
         assert!(!port.secret);
         assert_eq!(port.value.as_deref(), Some("3000"));
+    }
+
+    #[test]
+    fn ordinary_missing_environment_values_stay_off_until_supplied() {
+        let mut import = Import::prepare(
+            entry(false),
+            Some(&json!({"env":{"PAT":"synthetic-pat","PORT":"${PORT}"}})),
+        )
+        .unwrap();
+        let vault = std::cell::RefCell::new(std::collections::HashMap::new());
+        let missing = import
+            .transfer_with(
+                "imported",
+                |_, key| Ok(vault.borrow().get(key).cloned()),
+                |_, key, value| {
+                    vault
+                        .borrow_mut()
+                        .insert(key.to_string(), value.to_string());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(missing, ["PORT"]);
+        import
+            .supply(&std::collections::BTreeMap::from([(
+                "PORT".into(),
+                "3000".into(),
+            )]))
+            .unwrap();
+        assert_eq!(
+            import
+                .entry
+                .env
+                .iter()
+                .find(|env| env.key == "PORT")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("3000")
+        );
+        assert!(!vault.borrow().contains_key("PORT"));
     }
 
     #[test]
