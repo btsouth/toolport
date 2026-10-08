@@ -239,7 +239,7 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
         return;
     }
     let _lock = registry::data_dir_test_lock();
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
     let original =
         json!({"mcpServers":{"broken":{"command":"/not-a-real-toolport-setup-command"}}})
             .to_string();
@@ -306,6 +306,96 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
     let restored: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(fixture.config()).unwrap()).unwrap();
     assert_eq!(restored["mcpServers"]["alpha"]["command"], mock);
+    // Imported subprocess values are available to both the app probe and gateway.
+    registry::save(&registry::Registry::default()).unwrap();
+    fixture.set(
+        "TOOLPORT_SECRET_KEY",
+        Some("synthetic-import-integration".into()),
+    );
+    let credential_config =
+        json!({"mcpServers":{"secured":{"command":mock,"env":{"PAT":"synthetic-setup-pat"}}}})
+            .to_string();
+    std::fs::write(fixture.config(), &credential_config).unwrap();
+    let result = controller::migrate_client("claude-code", None, false).unwrap();
+    let saved = registry::load().unwrap();
+    let entry = &saved.servers[0];
+    assert_eq!(
+        conduit_lib::secrets::get_vault_secret_result(&entry.id, "PAT")
+            .unwrap()
+            .as_deref(),
+        Some("synthetic-setup-pat")
+    );
+    assert!(!serde_json::to_string(&saved)
+        .unwrap()
+        .contains("synthetic-setup-pat"));
+    assert_eq!(result.moved, ["secured"]);
+    controller::disconnect_client("claude-code").unwrap();
+
+    // A credential-bearing URL is resolved only for the real HTTP transport.
+    let http = HttpFixture::new();
+    registry::save(&registry::Registry::default()).unwrap();
+    std::fs::write(fixture.config(),json!({"mcpServers":{"remote":{"url":format!("{}?token=synthetic-url-key",http.url),"headers":{"Authorization":"Bearer synthetic-setup-pat"}}}}).to_string()).unwrap();
+    let result = controller::migrate_client("claude-code", None, false).unwrap();
+    assert_eq!(result.moved, ["remote"]);
+    let saved = registry::load().unwrap();
+    let entry = &saved.servers[0];
+    assert_eq!(
+        conduit_lib::secrets::get_vault_secret_result(
+            &entry.id,
+            conduit_lib::secrets::HTTP_AUTH_KEY
+        )
+        .unwrap()
+        .as_deref(),
+        Some("synthetic-setup-pat")
+    );
+    assert!(!serde_json::to_string(&saved)
+        .unwrap()
+        .contains("synthetic-url-key"));
+    let mut connection = conduit_lib::remote::connect_remote(entry).unwrap();
+    assert!(connection
+        .call("echo", json!({"text":"verified"}))
+        .unwrap()
+        .to_string()
+        .contains("verified"));
+}
+
+struct HttpFixture {
+    child: std::process::Child,
+    url: String,
+}
+impl HttpFixture {
+    fn new() -> Self {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mock-mcp-server"))
+            .env("MOCK_MCP_HTTP", "1")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .map(|_| line);
+            let _ = sender.send(result);
+        });
+        let url = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap()
+            .trim()
+            .strip_prefix("MOCK_MCP_URL=")
+            .unwrap()
+            .to_string();
+        Self { child, url }
+    }
+}
+impl Drop for HttpFixture {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[test]
