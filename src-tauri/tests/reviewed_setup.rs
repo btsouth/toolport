@@ -240,7 +240,7 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
         return;
     }
     let _lock = registry::data_dir_test_lock();
-    let mut fixture = Fixture::new();
+    let fixture = Fixture::new();
     let original =
         json!({"mcpServers":{"broken":{"command":"/not-a-real-toolport-setup-command"}}})
             .to_string();
@@ -370,6 +370,11 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
         .unwrap()
         .to_string()
         .contains("verified"));
+    let error = connection
+        .call("echo", json!({"text":"reject"}))
+        .unwrap_err();
+    assert!(!error.contains("synthetic-url-key"));
+    assert!(!error.contains("synthetic-setup-pat"));
 }
 
 struct HttpFixture {
@@ -428,6 +433,13 @@ impl HttpFixture {
                     None => {
                         json!({"jsonrpc":"2.0","id":call["id"],"error":{"code":-32601,"message":"Method not found"}})
                     }
+                };
+                let response = if method == "tools/call"
+                    && call["params"]["arguments"]["text"] == "reject"
+                {
+                    json!({"jsonrpc":"2.0","id":call["id"],"error":{"code":-32001,"message":"synthetic-url-key synthetic-setup-pat","data":"synthetic-setup-pat"}})
+                } else {
+                    response
                 };
                 let _ = request.respond(
                     tiny_http::Response::from_string(response.to_string()).with_header(

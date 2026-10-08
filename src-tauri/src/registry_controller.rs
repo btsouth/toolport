@@ -540,6 +540,9 @@ pub fn import_client_servers(selected: Vec<String>) -> Result<(Registry, usize),
             }
             added += 1;
         }
+        if added > 0 {
+            registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
+        }
         Ok(added)
     })?;
     Ok((registry, added))
@@ -1439,6 +1442,9 @@ pub(crate) fn import_client_servers_for_migration(
         if !missing.is_empty() {
             return Err(format!("{} needs credentials. Add the missing values in its native config or Credentials, then review again. Client config unchanged.", server.name));
         }
+    }
+    if !moved.is_empty() {
+        registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
     }
     Ok((imported, moved))
 }

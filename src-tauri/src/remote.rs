@@ -1347,7 +1347,8 @@ pub fn connect_remote_with_handler(
             resource_updated,
             progress,
             change_dirty,
-        );
+        )
+        .map_err(|error| safe_imported_error(server, error));
     }
     let url = secrets::get_vault_secret_result(&server.id, secrets::IMPORTED_URL_KEY)
         .map_err(|_| "Keychain unavailable. Unlock it and retry.")?
@@ -1506,11 +1507,7 @@ impl Transport for ImportedTransport {
     }
 }
 fn reviewed_transport(server: &ServerEntry, transport: HttpTransport) -> Box<dyn Transport> {
-    if server
-        .env
-        .iter()
-        .any(|e| e.key == secrets::IMPORTED_URL_KEY)
-    {
+    if has_imported_credentials(server) {
         Box::new(ImportedTransport(Box::new(transport)))
     } else {
         Box::new(transport)
@@ -1518,11 +1515,7 @@ fn reviewed_transport(server: &ServerEntry, transport: HttpTransport) -> Box<dyn
 }
 
 fn safe_imported_error(server: &ServerEntry, error: String) -> String {
-    if !server
-        .env
-        .iter()
-        .any(|e| e.key == secrets::IMPORTED_URL_KEY)
-    {
+    if !has_imported_credentials(server) {
         return error;
     }
     if is_auth_error(&error) {
@@ -1530,6 +1523,13 @@ fn safe_imported_error(server: &ServerEntry, error: String) -> String {
     } else {
         "Could not connect using imported credentials. Check the endpoint and unlock the keychain, then retry.".into()
     }
+}
+
+fn has_imported_credentials(server: &ServerEntry) -> bool {
+    server
+        .env
+        .iter()
+        .any(|e| matches!(e.key.as_str(), secrets::IMPORTED_URL_KEY | secrets::HTTP_AUTH_KEY))
 }
 
 fn connect_remote_inner(
@@ -1698,6 +1698,29 @@ fn connect_remote_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_bearer_connect_error_does_not_echo_provider_credentials() {
+        secrets::tests::with_isolated_vault(|| {
+            let listener = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let mut server = remote_server(&format!("http://{}/mcp", listener.server_addr()), None);
+            server.env.push(crate::registry::EnvVar {
+                key: secrets::HTTP_AUTH_KEY.into(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            });
+            secrets::set_secret(&server.id, secrets::HTTP_AUTH_KEY, "synthetic-imported-pat").unwrap();
+            let worker = std::thread::spawn(move || {
+                listener.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()
+                    .respond(tiny_http::Response::from_string("synthetic-imported-pat").with_status_code(500)).unwrap();
+            });
+            let error = connect_remote(&server).err().unwrap();
+            worker.join().unwrap();
+            assert!(!error.contains("synthetic-imported-pat"));
+            assert!(error.contains("imported credentials"));
+        });
+    }
 
     #[test]
     fn classifies_auth_errors() {
