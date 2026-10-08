@@ -814,7 +814,10 @@ function CallRow({ e }: { e: AuditEntry }) {
           </span>
         )}
         <PiiBadge entry={e} />
-        <span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">
+        <span
+          className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground"
+          title={approvalOutcome ? "Time waiting for approval" : "Call duration"}
+        >
           {fmtMs(approvalOutcome ? (e.heldMs ?? null) : (e.durationMs ?? null))}
         </span>
         <span className="shrink-0 text-xs text-muted-foreground">{fmtTs(e.ts)}</span>
@@ -1967,10 +1970,10 @@ export function ActivityView({
         <div className="flex flex-col items-center justify-center gap-3 py-24 text-center">
           <ScrollText className="size-10 text-muted-foreground/50" />
           <div>
-            <p className="font-medium">No tool calls yet</p>
+            <p className="font-medium">No activity yet</p>
             <p className="max-w-md text-sm text-muted-foreground">
-              Once a client runs a tool through Toolport, every call is recorded here,
-              with per-server latency and error rates.
+              Calls and approval outcomes appear here. Call totals and error rates count
+              tools that ran.
             </p>
           </div>
         </div>

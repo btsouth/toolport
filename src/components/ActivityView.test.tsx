@@ -98,11 +98,28 @@ it("p10c shows approval outcomes without treating them as call errors", async ()
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  expect(screen.getByText("calls logged").parentElement).toHaveTextContent(
+    /2\s*calls logged/,
+  );
+  expect(screen.getByText("errors (50%)").parentElement).toHaveTextContent(/1\s*errors/);
   for (const [, label] of outcomes) expect(screen.getByText(label)).toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: /errors only/i }));
   expect(screen.getByText("merge_pr")).toBeInTheDocument();
   for (const [, label] of outcomes)
     expect(screen.queryByText(label)).not.toBeInTheDocument();
+});
+
+it("p10c shows an approval-only history even when no tools ran", async () => {
+  getAuditLog.mockResolvedValue([
+    { ...entry(), kind: "approval", decision: "withdrawn" },
+  ]);
+  getAuditStats.mockResolvedValue({ total: 0, errors: 0, errorRate: 0, servers: [] });
+  render(<ActivityView refreshKey={0} registry={null} />);
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  expect(screen.getByText("Withdrawn")).toBeInTheDocument();
+  expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
+  expect(screen.queryByText("calls logged")).not.toBeInTheDocument();
 });
 
 it("pauses Activity polling while hidden and resumes when visible", async () => {
@@ -140,7 +157,7 @@ describe("ActivityView trust-state loading", () => {
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
 
-    expect(screen.getByText("No tool calls yet")).toBeInTheDocument();
+    expect(screen.getByText("No activity yet")).toBeInTheDocument();
     expect(screen.getByText("Protection active.")).toBeInTheDocument();
   });
 
@@ -261,7 +278,7 @@ describe("ActivityView trust-state loading", () => {
 
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    expect(screen.getByText("No tool calls yet")).toBeInTheDocument();
+    expect(screen.getByText("No activity yet")).toBeInTheDocument();
 
     await act(async () => {
       vi.advanceTimersByTime(3000);
@@ -269,7 +286,7 @@ describe("ActivityView trust-state loading", () => {
 
     expect(screen.getByText("Activity may be out of date.")).toBeInTheDocument();
     expect(screen.getByText("No current activity status")).toBeInTheDocument();
-    expect(screen.queryByText("No tool calls yet")).not.toBeInTheDocument();
+    expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Retry activity log" }),
     ).toBeInTheDocument();
@@ -309,11 +326,11 @@ describe("ActivityView trust-state loading", () => {
     await act(async () => {});
 
     expect(screen.getByText("Couldn't load activity")).toBeInTheDocument();
-    expect(screen.queryByText("No tool calls yet")).not.toBeInTheDocument();
+    expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Retry activity log" }));
     await act(async () => {});
-    expect(screen.getByText("No tool calls yet")).toBeInTheDocument();
+    expect(screen.getByText("No activity yet")).toBeInTheDocument();
   });
 });
 

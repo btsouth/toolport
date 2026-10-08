@@ -270,7 +270,7 @@ fn timed_entry(
 /// way it resolved (approved vs denied vs no-response vs unreachable vs stale-state) apart -
 /// which the old flat `record_held` collapsed into one indistinguishable record. `reason`
 /// is the snake_case [`crate::approval::ApprovalReason`]; `decision` is `approved` |
-/// `denied` | `no_response` | `unreachable` | `stale_state` (the last: a human approved but
+/// `denied` | `no_response` | `withdrawn` | `unreachable` | `stale_state` (the last: a human approved but
 /// the arguments were mutated before execute, so the stale approval was rejected). The RAW
 /// arguments are never stored - only `argsHash` - so the log proves which exact call was
 /// decided without persisting secrets/PII from arguments.
@@ -347,7 +347,6 @@ pub struct PendingApprovalAudit {
 }
 
 impl PendingApprovalAudit {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         server: &str,
         tool: &str,
