@@ -305,8 +305,8 @@ fn live_host_daemons_in(data_dir: &Path) -> Vec<crate::daemon::DaemonDescriptor>
 //
 // Two modes:
 //   * stop_stale_gateways — every launch; keep current/resolved paths, kill obsolete
-//   * stop_spawned_gateways — in-app updater; kill every Toolport gateway image so
-//     the installer can replace locked files
+//   * stop_spawned_gateways — in-app updater; defer open sessions and request
+//     authenticated idle shutdown before the installer replaces files
 //
 // Parent agent apps (Cursor, Claude, …) are never touched. Clients that auto-respawn
 // MCP on a dead stdio pipe pick up the repointed binary on the next tool call.

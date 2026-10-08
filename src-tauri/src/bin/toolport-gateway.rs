@@ -18476,10 +18476,6 @@ mod tests {
 
     use conduit_lib::approval::decide_via_broker;
 
-    /// A server whose NAME contains a write verb must not drag its read-only
-    /// tools out of the catalog. The destructive fallback scans the tool name for
-    /// verbs, and a cached entry carries the namespaced `server__tool` form, so
-    /// judging it whole lets the prefix decide for every tool on that server.
     #[test]
     fn installer_preflight_requires_exact_standalone_arguments() {
         let absolute = std::env::temp_dir().to_string_lossy().into_owned();
@@ -18504,6 +18500,10 @@ mod tests {
         assert!(matches!(parse_args(&["--disconnect-all".into(), "--daemon".into()]), ArgAction::Unknown(_)));
     }
 
+    /// A server whose NAME contains a write verb must not drag its read-only
+    /// tools out of the catalog. The destructive fallback scans the tool name for
+    /// verbs, and a cached entry carries the namespaced `server__tool` form, so
+    /// judging it whole lets the prefix decide for every tool on that server.
     #[test]
     fn a_server_named_after_a_write_verb_keeps_its_read_only_tools() {
         let cached = vec![
