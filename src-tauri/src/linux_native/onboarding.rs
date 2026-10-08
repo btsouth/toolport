@@ -6,27 +6,15 @@ use std::time::{Duration, Instant};
 use adw::prelude::*;
 
 use super::state::{self, ClientGatewayState, ClientSnapshot};
-use super::ClientPage;
 
 const MARKER: &str = "gtk-onboarding-complete";
 
-pub(super) fn install(
-    app: &adw::Application,
-    parent: &adw::ApplicationWindow,
-    client_page: ClientPage,
-) {
+pub(super) fn install(app: &adw::Application, parent: &adw::ApplicationWindow) {
     if app.lookup_action("show-onboarding").is_none() {
         let action = gtk::gio::SimpleAction::new("show-onboarding", None);
         let app_for_action = app.clone();
         let parent_for_action = parent.clone();
-        let clients_for_action = client_page.clone();
-        action.connect_activate(move |_, _| {
-            present(
-                &app_for_action,
-                &parent_for_action,
-                clients_for_action.clone(),
-            )
-        });
+        action.connect_activate(move |_, _| present(&app_for_action, &parent_for_action));
         app.add_action(&action);
     }
 
@@ -35,7 +23,7 @@ pub(super) fn install(
     gtk::glib::spawn_future_local(async move {
         let needed = gtk::gio::spawn_blocking(first_run_needed).await;
         if matches!(needed, Ok(Ok(true))) {
-            present(&app, &parent, client_page);
+            present(&app, &parent);
         } else if let Ok(Err(error)) = needed {
             eprintln!("toolport: could not check native onboarding state: {error}");
         }
@@ -95,7 +83,7 @@ pub(super) fn mark_complete() -> Result<(), String> {
         .map_err(|error| format!("could not save setup completion: {error}"))
 }
 
-fn present(app: &adw::Application, parent: &adw::ApplicationWindow, _client_page: ClientPage) {
+fn present(app: &adw::Application, parent: &adw::ApplicationWindow) {
     if let Some(window) = app
         .windows()
         .into_iter()

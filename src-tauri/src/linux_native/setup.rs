@@ -369,3 +369,116 @@ pub(super) fn collection(
         Ok(format!("Added {added} servers. Check status and complete any missing setup inputs under Servers.").into())
     },finished);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+        let mut out = vec![widget.clone()];
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            out.extend(descendants(&widget));
+        }
+        out
+    }
+    fn review_window() -> gtk::Window {
+        gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Could not review setup"))
+            .unwrap()
+    }
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn close_action_closes_review_error() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        review(
+            &parent,
+            "Could not review setup",
+            Vec::new(),
+            "Invalid fixture config",
+            "Close",
+            |_| Err("not an import".into()),
+            || {},
+        );
+        let window = review_window();
+        let button = descendants(window.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| b.label().as_deref() == Some("Close"))
+            .unwrap();
+        button.emit_clicked();
+        assert!(!window.is_visible(), "Close must close the error dialog");
+    }
+
+    #[test]
+    #[ignore = "manual isolated setup screenshot fixture"]
+    fn setup_screenshot_fixture() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        let state = std::env::var("TOOLPORT_SETUP_FIXTURE_STATE").unwrap_or_default();
+        let items = ["Notes", "Calendar"]
+            .into_iter()
+            .map(|name| SetupItem {
+                key: name.into(),
+                name: name.into(),
+                transport: "stdio".into(),
+                command: Some(format!("/usr/bin/fixture-{}", name.to_lowercase())),
+                args: Vec::new(),
+                url: None,
+                env_keys: if name == "Calendar" {
+                    vec!["PAT".into()]
+                } else {
+                    Vec::new()
+                },
+                is_new: true,
+            })
+            .collect();
+        review(
+            &parent,
+            "Review and connect Claude Code",
+            items,
+            "Config: /home/sbx/.claude.json\nBackups will be saved in Toolport/backups/claude-code",
+            "Connect",
+            move |_| {
+                if state == "verifying" {
+                    use std::io::Read;
+                    let mut file = std::fs::File::open("/home/sbx/setup-release")
+                        .map_err(|e| e.to_string())?;
+                    let mut bytes = [0u8; 1];
+                    let _ = file.read(&mut bytes).map_err(|e| e.to_string())?;
+                }
+                if state == "failure" {
+                    return Err("Calendar could not start. Check its command and retry. Client config unchanged.".into());
+                }
+                if state == "missing" {
+                    return Err("Calendar needs credentials. Open Credentials and retry. Client config unchanged.".into());
+                }
+                Ok(Completion {
+                    message: "Claude Code connected. Restart it to load Toolport.".into(),
+                    servers: vec![
+                        crate::registry_controller::SetupServerResult {
+                            name: "Notes".into(),
+                            tool_count: 3,
+                            credential_state: "none".into(),
+                        },
+                        crate::registry_controller::SetupServerResult {
+                            name: "Calendar".into(),
+                            tool_count: 5,
+                            credential_state: "stored".into(),
+                        },
+                    ],
+                    tools: vec![
+                        serde_json::json!({"name":"toolport_search_tools"}),
+                        serde_json::json!({"name":"toolport_call_tool"}),
+                    ],
+                    backup: None,
+                })
+            },
+            || {},
+        );
+        gtk::glib::MainLoop::new(None, false).run();
+    }
+}
