@@ -2645,7 +2645,7 @@ fn append_client_discovery_actions(
         (
             "Auto",
             None,
-            "Choose from this client's search and tool-list refresh capabilities",
+            "Choose from this client's native search or deferred loading capabilities",
         ),
         (
             "Full catalog",

@@ -13906,12 +13906,39 @@ fn process_request(
     }
 
     let wait = match method {
-        "tools/list" => state
-            .cached_tools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .tools
-            .is_empty(),
+        "tools/list" => {
+            let reg = state
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let base = state
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let (view, cached) = if state.daemon_mode.load(Ordering::SeqCst) {
+                adapter_profile
+                    .map(|profile| state.router_for_adapter_profile(base.clone(), &reg, profile))
+            } else {
+                None
+            }
+            .unwrap_or_else(|| {
+                (
+                    base,
+                    state
+                        .cached_tools
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
+                )
+            });
+            let owners = unique_prefix_owners(&reg);
+            scope_tools(&cached.tools, allowed, |name| {
+                owner_of_exposed_tool(Some(&view), &owners, name)
+            })
+            .is_empty()
+        }
         "tools/call"
         | "resources/list"
         | "resources/templates/list"
@@ -14184,6 +14211,9 @@ fn process_request(
                 };
                 (router, cache_snapshot) = catalog_for_view(rooted);
             }
+            // Ready slots can precede disk-cache publication. Read the live view
+            // after a cold wait so another client's cache cannot hide new tools.
+            cache_snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
             // Do not wait on rebuild_lock after the deadline: a slow publisher
             // must not turn a bounded cold list into a client startup timeout.
         }
