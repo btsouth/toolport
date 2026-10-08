@@ -828,8 +828,16 @@ export function takeRegistryRecoveryNotice(): Promise<RegistryRecoveryNotice | n
 }
 
 /** Pull reviewed servers from every detected client into the registry. */
-export function importServers(selected?: string[]): Promise<Registry> {
-  return invoke<Registry>("import_servers", { selected });
+export function importServers(
+  selected?: string[],
+  secretChoices?: Record<string, Record<string, boolean>>,
+  credentialInputs?: Record<string, Record<string, string>>,
+): Promise<Registry> {
+  return invoke<Registry>("import_servers", {
+    selected,
+    secretChoices,
+    credentialInputs,
+  });
 }
 
 /** Preview every detected-client server the bulk import would add. */

@@ -2009,162 +2009,23 @@ impl ClientPage {
         });
     }
 
-    fn show_import_review(
-        &self,
-        candidates: Vec<crate::registry_controller::ClientImportCandidate>,
-    ) {
-        let Some(parent) = self.root.root().and_downcast::<gtk::Window>() else {
-            return;
-        };
-        let dialog = adw::Window::builder()
-            .application(&self.app)
-            .transient_for(&parent)
-            .modal(true)
-            .title("Import servers from clients")
-            .default_width(680)
-            .default_height(600)
-            .build();
-        dialog.add_css_class("toolport-editor");
-
-        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let header = adw::HeaderBar::new();
-        header.set_show_start_title_buttons(false);
-        header.set_show_end_title_buttons(false);
-        let cancel = gtk::Button::with_label("Cancel");
-        cancel.add_css_class("toolport-secondary-action");
-        header.pack_start(&cancel);
-        let import = gtk::Button::with_label("Import selected");
-        import.add_css_class("suggested-action");
-        header.pack_end(&import);
-        root.append(&header);
-
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        body.add_css_class("toolport-editor-body");
-        body.append(
-            &gtk::Label::builder()
-                .label("Review the local servers Toolport found. Valid servers turn on. Servers needing credentials or launch values stay off until setup is complete.")
-                .halign(gtk::Align::Fill)
-                .xalign(0.0)
-                .wrap(true)
-                .css_classes(["toolport-editor-lede"])
-                .build(),
-        );
-        let candidate_count = candidates.len();
-        let count = gtk::Label::builder()
-            .label(format!("{candidate_count} selected"))
-            .halign(gtk::Align::Start)
-            .css_classes(["toolport-badge", "success"])
-            .build();
-        body.append(&count);
-
-        let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        rows.add_css_class("toolport-import-list");
-        let mut selections = Vec::new();
-        for candidate in candidates {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-            row.add_css_class("toolport-import-row");
-            let selected = gtk::CheckButton::builder().active(true).build();
-            row.append(&selected);
-            let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            copy.set_hexpand(true);
-            copy.append(
-                &gtk::Label::builder()
-                    .label(&candidate.name)
-                    .halign(gtk::Align::Fill)
-                    .xalign(0.0)
-                    .wrap(true)
-                    .css_classes(["heading"])
-                    .build(),
-            );
-            let origin = candidate
-                .command
-                .clone()
-                .or_else(|| {
-                    candidate
-                        .url
-                        .as_deref()
-                        .map(crate::registry::redact_url_userinfo)
-                })
-                .unwrap_or_else(|| "Client-managed connection".to_string());
-            copy.append(
-                &gtk::Label::builder()
-                    .label(format!("{} · {origin}", candidate.transport))
-                    .halign(gtk::Align::Start)
-                    .xalign(0.0)
-                    .ellipsize(gtk::pango::EllipsizeMode::Middle)
-                    .tooltip_text(&origin)
-                    .css_classes(["toolport-muted"])
-                    .build(),
-            );
-            row.append(&copy);
-            rows.append(&row);
-            selections.push((selected, candidate.key));
-        }
-        let scroller = gtk::ScrolledWindow::builder()
-            .child(&rows)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vexpand(true)
-            .css_classes(["toolport-import-scroller"])
-            .build();
-        body.append(&scroller);
-        root.append(&body);
-        dialog.set_content(Some(&root));
-
-        let selections = std::rc::Rc::new(selections);
-        let selected_count = std::rc::Rc::new(std::cell::Cell::new(candidate_count));
-        for (check, _) in selections.iter() {
-            let selected_count = selected_count.clone();
-            let count = count.clone();
-            let import = import.clone();
-            check.connect_toggled(move |check| {
-                let next = if check.is_active() {
-                    selected_count.get() + 1
-                } else {
-                    selected_count.get().saturating_sub(1)
-                };
-                selected_count.set(next);
-                count.set_label(&format!("{next} selected"));
-                import.set_sensitive(next > 0);
-            });
-        }
-
-        let dialog_for_cancel = dialog.clone();
-        cancel.connect_clicked(move |_| dialog_for_cancel.close());
+    fn show_import_review(&self, candidates: Vec<crate::registry_controller::ClientImportCandidate>) {
+        let Some(parent) = self.root.root().and_downcast::<gtk::Window>() else { return; };
+        let items = candidates.into_iter().map(|candidate| crate::registry_controller::SetupItem {
+            key: candidate.key, name: candidate.name, transport: candidate.transport,
+            command: candidate.command, args: candidate.args, url: candidate.url,
+            env_keys: candidate.credentials.iter().map(|env| env.key.clone()).collect(),
+            credentials: candidate.credentials, unsupported: candidate.unsupported, is_new: true,
+        }).collect();
         let page = self.clone();
-        let dialog_for_import = dialog.clone();
-        import.connect_clicked(move |_| {
-            let selected = selections
-                .iter()
-                .filter(|(check, _)| check.is_active())
-                .map(|(_, key)| key.clone())
-                .collect::<Vec<_>>();
-            dialog_for_import.close();
-            page.run_import(selected);
-        });
-        dialog.present();
-    }
-
-    fn run_import(&self, selected: Vec<String>) {
-        self.import_button.set_sensitive(false);
-        self.show_progress("Importing selected servers…");
-        let page = self.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::registry_controller::import_client_servers(selected)
-            })
-            .await;
-            page.import_button.set_sensitive(true);
-            match result {
-                Ok(Ok((_, added))) => {
-                    page.refresh_with_confirmation(format!(
-                        "Imported {added} server{} and turned them on.",
-                        if added == 1 { "" } else { "s" }
-                    ));
-                }
-                Ok(Err(error)) => page.show_error(&format!("Could not import servers: {error}")),
-                Err(_) => page.show_error("The import stopped unexpectedly."),
-            }
-        });
+        setup::review(&parent, "Review servers to import", items,
+            "Review each command and URL. Values are saved using your keychain choices. Missing inputs stay off.",
+            "Import selected servers", move |selected, choices, inputs| {
+                let (registry, added) = crate::registry_controller::import_client_servers_inputs(selected, &choices, &inputs)?;
+                let missing = registry.servers.iter().filter(|server| !server.enabled && server.source.as_deref().is_some_and(|source| source.starts_with("imported:"))).map(|server| server.name.clone()).collect::<Vec<_>>();
+                let message = if missing.is_empty() { format!("Imported {added} servers. Check their status under Servers.") } else { format!("Imported {added} servers. Needs input: {}", missing.join(", ")) };
+                Ok(message.into())
+            }, move || page.refresh(), Some(self.credential_page.clone()));
     }
 
     fn refresh(&self) {

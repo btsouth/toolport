@@ -17,6 +17,8 @@ pub struct ClientImportCandidate {
     pub command: Option<String>,
     pub args: Vec<String>,
     pub url: Option<String>,
+    pub credentials: Vec<CredentialReview>,
+    pub unsupported: Option<String>,
 }
 
 const AUTH_LOCK_LEASE_SECS: u64 = 180;
@@ -479,24 +481,57 @@ pub fn preview_client_imports() -> Result<Vec<ClientImportCandidate>, String> {
     let detected = clients::detect_clients();
     Ok(servers_to_import(&detected, &registry)
         .into_iter()
-        .map(|server| ClientImportCandidate {
-            key: clients::import_dedupe_key(&server.name, server.command.as_deref(), &server.args),
-            name: server.name,
-            transport: server.transport,
-            command: server.command.map(|c| {
-                if registry::arg_looks_secret(&c) {
-                    "<command>".into()
-                } else {
-                    c
-                }
-            }),
-            args: crate::import_credentials::shown_args(&server.args),
-            url: server
-                .url
-                .as_deref()
-                .map(crate::import_credentials::shown_url),
+        .map(|server| {
+            let client = detected
+                .iter()
+                .find(|client| {
+                    server.source.as_deref() == Some(format!("imported:{}", client.id).as_str())
+                })
+                .ok_or("Missing import client")?;
+            let definition = clients::import_definition(client, &server.name)?;
+            let (credentials, unsupported) = match crate::import_credentials::Import::prepare(
+                server.clone(),
+                definition.as_ref(),
+            ) {
+                Ok(import) => (
+                    import
+                        .review_credentials()
+                        .into_iter()
+                        .map(|(key, secret, present)| CredentialReview {
+                            key,
+                            secret,
+                            present,
+                        })
+                        .collect(),
+                    None,
+                ),
+                Err(error) => (Vec::new(), Some(error)),
+            };
+            Ok(ClientImportCandidate {
+                credentials,
+                unsupported,
+                key: clients::import_dedupe_key(
+                    &server.name,
+                    server.command.as_deref(),
+                    &server.args,
+                ),
+                name: server.name,
+                transport: server.transport,
+                command: server.command.map(|c| {
+                    if registry::arg_looks_secret(&c) {
+                        "<command>".into()
+                    } else {
+                        c
+                    }
+                }),
+                args: crate::import_credentials::shown_args(&server.args),
+                url: server
+                    .url
+                    .as_deref()
+                    .map(crate::import_credentials::shown_url),
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>, String>>()?)
 }
 
 fn registry_matches(left: &Registry, right: &Registry) -> Result<bool, String> {
@@ -521,6 +556,14 @@ fn commit_imports(previous: &Registry, prepared: Registry) -> Result<Registry, S
 }
 
 pub fn import_client_servers(selected: Vec<String>) -> Result<(Registry, usize), String> {
+    import_client_servers_inputs(selected, &Default::default(), &Default::default())
+}
+
+pub fn import_client_servers_inputs(
+    selected: Vec<String>,
+    choices: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    inputs: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+) -> Result<(Registry, usize), String> {
     let detected = clients::detect_clients();
     let selected = selected
         .into_iter()
@@ -539,10 +582,24 @@ pub fn import_client_servers(selected: Vec<String>) -> Result<(Registry, usize),
             .find(|c| c.id == client_id)
             .ok_or("Missing import client")?;
         let definition = clients::import_definition(client, &entry.name)?;
-        prepared.push(crate::import_credentials::Import::prepare(
+        let name = entry.name.clone();
+        match crate::import_credentials::Import::prepare_with_choices(
             entry,
             definition.as_ref(),
-        )?);
+            choices.get(&name),
+        ) {
+            Ok(mut import) => {
+                if let Some(values) = inputs.get(&name) {
+                    import.supply(values)?;
+                }
+                prepared.push(import);
+            }
+            Err(error)
+                if error.contains("custom HTTP headers")
+                    || error.contains("unsupported HTTP")
+                    || error.contains("HTTP headers from environment") => {}
+            Err(error) => return Err(error),
+        }
     }
     crate::import_credentials::transaction(|writes| {
         let mut registry = current.clone();
@@ -1598,7 +1655,7 @@ pub(crate) fn apply_import_entry(registry: &mut Registry, entry: ServerEntry) ->
     id
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialReview {
     pub key: String,
@@ -2897,6 +2954,63 @@ mod tests {
             &review.revision,
             |_, _, _, _| Ok(Vec::new().into()),
         )
+    }
+
+    #[test]
+    fn reviewed_bulk_import_shows_unsupported_and_uses_storage_choices() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let original = r#"{"mcpServers":{"one":{"command":"one","env":{"PORT":"3000","VALUE":"synthetic-custom-secret"}},"unsupported":{"url":"https://example.invalid/mcp","headers":{"X-Custom":"synthetic-header"}}}}"#;
+        std::fs::write(fixture.claude(), original).unwrap();
+        let review = preview_client_imports().unwrap();
+        let one = review.iter().find(|item| item.name == "one").unwrap();
+        assert!(one
+            .credentials
+            .iter()
+            .any(|env| env.key == "PORT" && env.present && !env.secret));
+        let unsupported = review
+            .iter()
+            .find(|item| item.name == "unsupported")
+            .unwrap();
+        assert!(unsupported
+            .unsupported
+            .as_ref()
+            .unwrap()
+            .contains("custom HTTP headers"));
+        let choices = std::collections::BTreeMap::from([(
+            "one".into(),
+            std::collections::BTreeMap::from([("VALUE".into(), true)]),
+        )]);
+        let (registry, added) = import_client_servers_inputs(
+            review.into_iter().map(|item| item.key).collect(),
+            &choices,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(added, 1);
+        let one = registry
+            .servers
+            .iter()
+            .find(|server| server.name == "one")
+            .unwrap();
+        assert!(one
+            .env
+            .iter()
+            .any(|env| env.key == "PORT" && !env.secret && env.value.as_deref() == Some("3000")));
+        assert!(one
+            .env
+            .iter()
+            .any(|env| env.key == "VALUE" && env.secret && env.value.is_none()));
+        assert_eq!(
+            crate::secrets::get_vault_secret_result(&one.id, "VALUE")
+                .unwrap()
+                .as_deref(),
+            Some("synthetic-custom-secret")
+        );
+        assert!(!registry
+            .servers
+            .iter()
+            .any(|server| server.name == "unsupported"));
+        assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
     }
 
     #[test]

@@ -112,6 +112,52 @@ it("imports the reviewed definition when another client has the same server name
   await waitFor(() => expect(importServers).toHaveBeenCalledWith(["reviewed-client"]));
 });
 
+it("uses bulk review storage choices and leaves unsupported servers unchecked", async () => {
+  const server = {
+    name: "calendar",
+    transport: "stdio" as const,
+    command: "calendar-mcp",
+    args: [],
+    envKeys: ["PORT"],
+    url: null,
+  };
+  const unsupported = { ...server, name: "unsupported", command: "custom-mcp" };
+  vi.mocked(previewImportServers).mockResolvedValue([
+    {
+      ...server,
+      key: "reviewed-safe",
+      isNew: true,
+      credentials: [{ key: "PORT", secret: false, present: true }],
+    },
+    {
+      ...unsupported,
+      key: "reviewed-unsupported",
+      isNew: true,
+      unsupported: "Custom HTTP headers",
+    },
+  ]);
+  vi.mocked(importServers).mockResolvedValue(emptyRegistry());
+  render(
+    <ClientDetail
+      client={client({ servers: [server, unsupported] })}
+      registry={emptyRegistry()}
+      onChanged={vi.fn()}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Import all (2)" }));
+  const choice = await screen.findByRole("checkbox", { name: /Keep PORT in keychain/ });
+  expect(choice).not.toBeChecked();
+  await userEvent.click(choice);
+  await userEvent.click(screen.getByRole("button", { name: "Import 1 server" }));
+  await waitFor(() =>
+    expect(importServers).toHaveBeenCalledWith(["reviewed-safe"], {
+      calendar: { PORT: true },
+      unsupported: {},
+    }),
+  );
+});
+
 describe("ClientDetail detection errors", () => {
   it("shows the client error in the main panel", () => {
     render(

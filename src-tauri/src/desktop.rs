@@ -185,6 +185,8 @@ fn selected_servers_to_import(
 async fn import_servers(
     state: State<'_, RegistryState>,
     selected: Option<Vec<String>>,
+    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
+    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
 ) -> Result<Registry, String> {
     let selected = match selected {
         Some(selected) => selected,
@@ -194,7 +196,7 @@ async fn import_servers(
             .collect(),
     };
     tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::import_client_servers(selected)
+        crate::registry_controller::import_client_servers_inputs(selected, &secret_choices.unwrap_or_default(), &credential_inputs.unwrap_or_default())
     })
     .await
     .map_err(|_| "Import stopped".to_string())??;
@@ -2461,6 +2463,8 @@ struct ImportItem {
     url: Option<String>,
     /// False if a server with this name already exists (the import would skip it).
     is_new: bool,
+    credentials: Vec<crate::registry_controller::CredentialReview>,
+    unsupported: Option<String>,
 }
 
 /// Show exactly what the bulk client import would add without changing the
@@ -2483,6 +2487,8 @@ async fn preview_import_servers(
             args: server.args,
             url: server.url,
             is_new: true,
+            credentials: server.credentials,
+            unsupported: server.unsupported,
         })
         .collect())
 }
@@ -2515,6 +2521,8 @@ fn preview_import(state: State<RegistryState>, json: String) -> Result<Vec<Impor
                 args: s.args,
                 url: s.url,
                 is_new,
+                credentials: Vec::new(),
+                unsupported: None,
             }
         })
         .collect())
