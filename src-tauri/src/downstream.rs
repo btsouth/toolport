@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -2161,11 +2161,23 @@ pub trait Transport: Send {
     /// Handle server→client JSON-RPC (roots/list, sampling, …) by forwarding to the
     /// upstream MCP client. Default no-op: unsupported server requests are ignored.
     fn set_server_request_handler(&mut self, _handler: ServerRequestHandler) {}
+    /// Credential owner for transports that recover from a shared vault.
+    fn set_server_id(&mut self, _id: &str) {}
     /// A request path that can run alongside other requests on this connection,
     /// carrying the current protocol metadata and read timeout. `None` (the
     /// default) keeps every request on the serialized `&mut self` path.
     fn concurrent(&self) -> Option<Arc<dyn ConcurrentTransport>> {
         None
+    }
+    /// Transports with direct shared-state getters avoid constructing a snapshot.
+    /// Keep the concurrent-handle fallback for other multiplexed transports.
+    fn connection_closed(&self) -> Option<bool> {
+        self.concurrent().map(|transport| transport.is_closed())
+    }
+    fn suspended_calls(&self) -> usize {
+        self.concurrent()
+            .map(|transport| transport.suspended_calls())
+            .unwrap_or(0)
     }
 }
 
@@ -5045,6 +5057,14 @@ impl Transport for StdioTransport {
         Ok(())
     }
 
+    fn connection_closed(&self) -> Option<bool> {
+        Some(self.core.is_closed())
+    }
+
+    fn suspended_calls(&self) -> usize {
+        self.core.lock_state().suspended.len()
+    }
+
     fn concurrent(&self) -> Option<Arc<dyn ConcurrentTransport>> {
         Some(Arc::new(StdioCall {
             core: Arc::clone(&self.core),
@@ -5218,8 +5238,10 @@ fn ids_match(got: Option<&Value>, wanted: Option<&Value>) -> bool {
 /// A callback that can proactively mint a fresh token before expiry or force a
 /// refresh after a 401/403. `force = false` returns `Ok(None)` when the current
 /// token is still fresh. A proactive error may fall back to the current token;
-/// a forced error is surfaced as a per-server authentication failure.
-pub type RefreshFn = Box<dyn Fn(bool) -> Result<Option<String>, String> + Send + Sync>;
+/// a forced error is surfaced as a per-server authentication failure. Forced calls
+/// pass the rejected bearer so the callback can adopt or exchange atomically.
+pub type RefreshFn =
+    Box<dyn Fn(bool, Option<&str>) -> Result<Option<String>, String> + Send + Sync>;
 
 /// Interactive OAuth step-up callback. Unlike a refresh-token exchange, this
 /// obtains user consent for the challenged scope and returns a new access token.
@@ -5331,18 +5353,20 @@ pub struct HttpTransport {
     connect_timeout: Duration,
     /// Ordinary HTTP request deadline restored immediately after `initialize`.
     request_timeout: Duration,
-    session_id: Option<String>,
-    next_id: i64,
+    session_id: Arc<Mutex<Option<String>>>,
+    next_id: Arc<AtomicI64>,
     /// Raw bearer token (without the "Bearer " prefix), if the server needs auth.
     auth: Arc<Mutex<Option<String>>>,
     /// Called before each POST to refresh a token nearing expiry, and forced once
     /// after a 401/403 to recover from an already-expired token. A proactive
     /// `None` or error keeps the current token; a forced refresh must return a new
     /// raw token or the authentication failure is surfaced.
-    refresh: Option<Arc<Mutex<RefreshFn>>>,
+    refresh: Option<Arc<RefreshFn>>,
+    /// Read only after a bearer rejection, to adopt another process's credential.
+    auth_owner: Option<String>,
     /// Separate from token refresh: `insufficient_scope` requires interactive
     /// consent and a new authorization, not another token from the old grant.
-    scope_reauthorize: Option<Arc<Mutex<ScopeReauthorizeFn>>>,
+    scope_reauthorize: Option<Arc<ScopeReauthorizeFn>>,
     /// Bound repeated browser prompts and retries per operation+scope on this
     /// connection, as required by the MCP step-up guidance.
     scope_upgrade_attempts: Arc<Mutex<HashSet<(String, String)>>>,
@@ -5363,7 +5387,12 @@ pub struct HttpTransport {
     /// with a working refresh token in the vault - the exact case the reactive
     /// fallback exists to serve. Only a token the server has never accepted keeps
     /// the budget spent.
-    forced_refresh_token: Option<String>,
+    forced_refresh_token: Arc<Mutex<Option<String>>>,
+    refresh_failure: Arc<Mutex<Option<HttpRefreshFailure>>>,
+    concurrency: Arc<HttpConcurrency>,
+    deadline: Option<Instant>,
+    auth_gate: Arc<HttpAuthGate>,
+    wire_cancel: Option<HttpCancelSignal>,
     server_handler: Option<ServerRequestHandler>,
     /// Open legacy SSE response suspended while a modern upstream client
     /// fulfills a server-initiated request in a separate round trip.
@@ -5399,9 +5428,358 @@ pub struct HttpTransport {
     draining: Option<Receiver<HttpAttemptOutcome>>,
 }
 
+struct HttpRefreshFailure {
+    recorded_at: Instant,
+    token: Option<String>,
+    error: String,
+}
+
+#[derive(Default)]
+struct HttpAuthGate {
+    busy: Mutex<bool>,
+    ready: std::sync::Condvar,
+}
+
+struct HttpAuthGuard<'a>(&'a HttpAuthGate);
+
+impl Drop for HttpAuthGuard<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        self.0.ready.notify_all();
+    }
+}
+
+/// Independent POSTs share connection state, never response readers. The worker
+/// cap includes cancelled attempts that ureq must drain until its socket deadline.
+#[derive(Default)]
+struct HttpConcurrency {
+    closed: AtomicBool,
+    workers: AtomicUsize,
+    pending: Mutex<HashMap<String, (Instant, PendingHttpMrtr)>>,
+}
+
+struct HttpCallTransport {
+    template: Mutex<HttpTransport>,
+}
+
+enum HttpDelivery {
+    ServerRequest(
+        Value,
+        std::sync::mpsc::SyncSender<Option<ServerRequestAction>>,
+    ),
+    Done(Box<HttpCallOutcome>),
+}
+
+struct HttpWorkerGuard(Arc<HttpConcurrency>);
+
+impl Drop for HttpWorkerGuard {
+    fn drop(&mut self) {
+        self.0.workers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl HttpTransport {
+    fn retire_http_pending(&mut self) {
+        if let Some(pending) = self.pending_mrtr.take() {
+            let response = json!({ "jsonrpc": "2.0", "id": pending.common.server_request["id"],
+                "error": { "code": JSONRPC_INTERNAL_ERROR, "message": CALL_ENDED } });
+            // Retirement uses the current bearer, without invoking auth callbacks.
+            self.refresh = None;
+            self.scope_reauthorize = None;
+            self.deadline = None;
+            self.wire_cancel = None;
+            self.inline_agent =
+                guarded_agent_with_timeout(self.block_private, HTTP_CANCEL_FORWARD_TIMEOUT);
+            let _ = self.send_post_no_response(&response);
+        }
+    }
+}
+
+impl ConcurrentTransport for HttpCallTransport {
+    fn is_closed(&self) -> bool {
+        self.template
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .concurrency
+            .closed
+            .load(Ordering::SeqCst)
+    }
+
+    fn suspended_calls(&self) -> usize {
+        self.template
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .concurrency
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    fn request_with_cancel_and_headers(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        headers: &[(String, String)],
+    ) -> Result<Value, TransportError> {
+        // Template -> pending is the only structural lock order. Neither is held
+        // over I/O, callbacks, channel waits, or a caller's server-request handler.
+        let mut owned = self
+            .template
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request_shell();
+        let shared = Arc::clone(&owned.concurrency);
+        if shared.closed.load(Ordering::SeqCst) {
+            return Err(TransportError::Unavailable(
+                "HTTP transport is closed".into(),
+            ));
+        }
+        if shared.workers.fetch_add(1, Ordering::SeqCst) >= 128 {
+            shared.workers.fetch_sub(1, Ordering::SeqCst);
+            return Err(TransportError::Busy(
+                "HTTP wire worker limit reached".into(),
+            ));
+        }
+        let guard = HttpWorkerGuard(Arc::clone(&shared));
+        let context = request_context();
+        let deadline = Instant::now() + owned.request_timeout;
+        owned.deadline = Some(deadline);
+        let mut retired = Vec::new();
+        let mut continuation_error = None;
+        let mut suspended_since = None;
+        {
+            let mut pending = shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.retain(|_, (since, request)| {
+                if since.elapsed() < SUSPENDED_LEGACY_MRTR_TTL {
+                    return true;
+                }
+                // Move the reader out without performing network I/O under lock.
+                retired.push(PendingHttpMrtr {
+                    common: request.common.clone(),
+                    reader: std::mem::replace(
+                        &mut request.reader,
+                        Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+                    ),
+                    bytes_read: request.bytes_read,
+                });
+                false
+            });
+            if let Some(token) = params.get("requestState").and_then(Value::as_str) {
+                // Like stdio, the random requestState plus method/base params is
+                // continuation proof. A sessionless retry has a new context nonce.
+                if let Some((since, request)) = pending.remove(token) {
+                    suspended_since = Some(since);
+                    owned.pending_mrtr = Some(request);
+                } else if !owned.is_modern() {
+                    continuation_error = Some(TransportError::Rpc(json!({"code":-32602,
+                        "message":"unknown or expired requestState; start the call again"})));
+                }
+            }
+        }
+        if !retired.is_empty() {
+            let mut shell = owned.request_shell();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + HTTP_CANCEL_FORWARD_TIMEOUT;
+                for pending in retired {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    shell.pending_mrtr = Some(pending);
+                    shell.retire_http_pending();
+                }
+            });
+        }
+        // Reserve exactly one id before the worker starts. A continuation keeps
+        // the id of its original POST; new calls use the shared atomic allocator.
+        let downstream_id = if let Some(pending) = &owned.pending_mrtr {
+            pending.common.downstream_request_id.clone()
+        } else {
+            let id = owned.next_id.fetch_add(1, Ordering::SeqCst);
+            owned.next_id = Arc::new(AtomicI64::new(id));
+            json!(id)
+        };
+        let signal = cancel
+            .clone()
+            .map(|cancel| HttpCancelSignal::new(cancel, owned.pending_mrtr.is_some()));
+        let worker_signal = signal.clone();
+        let handler = owned.server_handler.clone();
+        let cancellation_shell = owned.request_shell();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let server_sender = sender.clone();
+        owned.server_handler = Some(Arc::new(move |request| {
+            let (reply, answer) = std::sync::mpsc::sync_channel(1);
+            if server_sender
+                .send(HttpDelivery::ServerRequest(request.clone(), reply))
+                .is_ok()
+            {
+                if let Ok(action) =
+                    answer.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                {
+                    return action;
+                }
+            }
+            Some(ServerRequestAction::Respond(
+                json!({"jsonrpc":"2.0", "id":request["id"],
+                "error":{"code":JSONRPC_INTERNAL_ERROR,"message":CALL_ENDED}}),
+            ))
+        }));
+        let method = method.to_string();
+        let headers = headers.to_vec();
+        std::thread::spawn(move || {
+            let _guard = guard;
+            let result = match continuation_error {
+                Some(error) => Err(error),
+                None => owned.request_inner_with_cancel(
+                    &method,
+                    params,
+                    &headers,
+                    worker_signal.as_ref(),
+                ),
+            };
+            if worker_signal
+                .as_ref()
+                .is_some_and(HttpCancelSignal::is_cancelled)
+                || owned.concurrency.closed.load(Ordering::SeqCst)
+                || Instant::now() >= deadline
+            {
+                owned.retire_http_pending();
+            }
+            if let Err(error) = sender.send(HttpDelivery::Done(Box::new(HttpCallOutcome {
+                transport: owned,
+                result,
+            }))) {
+                if let HttpDelivery::Done(mut outcome) = error.0 {
+                    outcome.transport.retire_http_pending();
+                }
+            }
+        });
+        loop {
+            if shared.closed.load(Ordering::SeqCst)
+                || Instant::now() >= deadline
+                || cancel.as_ref().is_some_and(CancelContext::is_cancelled)
+            {
+                if let Some(signal) = &signal {
+                    if signal.cancel() {
+                        cancellation_shell
+                            .forward_cancel_async(downstream_id, cancel.as_ref().unwrap());
+                    }
+                }
+                retire_http_deliveries(&receiver);
+                return if shared.closed.load(Ordering::SeqCst) {
+                    Err(TransportError::Unavailable(
+                        "HTTP transport closed while waiting".into(),
+                    ))
+                } else if cancel.as_ref().is_some_and(CancelContext::is_cancelled) {
+                    Err(TransportError::Cancelled(
+                        "HTTP request cancelled by upstream client".into(),
+                    ))
+                } else {
+                    Err(TransportError::Fatal("HTTP request timed out".into()))
+                };
+            }
+            match receiver.recv_timeout(
+                HTTP_CANCEL_POLL.min(deadline.saturating_duration_since(Instant::now())),
+            ) {
+                Ok(HttpDelivery::ServerRequest(request, reply)) => {
+                    let eligible =
+                        !matches!(context, RequestContext::Background { sole_client: false });
+                    let action = if eligible {
+                        handler.as_ref().and_then(|handler| handler(&request))
+                    } else {
+                        None
+                    };
+                    let _ = reply.send(action.or_else(|| Some(ServerRequestAction::Respond(json!({
+                        "jsonrpc":"2.0", "id":request["id"], "error":{"code":JSONRPC_INTERNAL_ERROR,"message":NO_CLIENT_IN_FLIGHT}
+                    })))));
+                }
+                Ok(HttpDelivery::Done(mut outcome)) => {
+                    if cancel.as_ref().is_some_and(CancelContext::is_cancelled) {
+                        if signal.as_ref().is_some_and(HttpCancelSignal::cancel) {
+                            cancellation_shell
+                                .forward_cancel_async(downstream_id, cancel.as_ref().unwrap());
+                        }
+                        drop(outcome);
+                        retire_http_deliveries(&receiver);
+                        return Err(TransportError::Cancelled(
+                            "HTTP request cancelled by upstream client".into(),
+                        ));
+                    }
+                    if let Some(request) = outcome.transport.pending_mrtr.take() {
+                        let mut pending = shared
+                            .pending
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if pending.len() >= MAX_SUSPENDED_LEGACY_MRTR
+                            || shared.closed.load(Ordering::SeqCst)
+                        {
+                            drop(pending);
+                            outcome.transport.pending_mrtr = Some(request);
+                            drop(outcome);
+                            retire_http_deliveries(&receiver);
+                            return Err(TransportError::Busy(
+                                "HTTP suspended call limit reached".into(),
+                            ));
+                        }
+                        pending.insert(
+                            request.common.token.clone(),
+                            (suspended_since.unwrap_or_else(Instant::now), request),
+                        );
+                    }
+                    return std::mem::replace(&mut outcome.result, Ok(Value::Null));
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    retire_http_deliveries(&receiver);
+                    return Err(TransportError::Fatal(
+                        "HTTP worker exited without a response".into(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
 struct HttpAttemptOutcome {
     transport: HttpTransport,
     result: Result<Value, TransportError>,
+}
+
+// A result can be queued just as its caller exits. Ownership of a suspended
+// reader must retire with the outcome even when nobody receives the channel item.
+struct HttpCallOutcome {
+    transport: HttpTransport,
+    result: Result<Value, TransportError>,
+}
+
+impl Drop for HttpCallOutcome {
+    fn drop(&mut self) {
+        if let Some(pending) = self.transport.pending_mrtr.take() {
+            let mut shell = self.transport.request_shell();
+            shell.pending_mrtr = Some(pending);
+            std::thread::spawn(move || shell.retire_http_pending());
+        }
+    }
+}
+
+fn retire_http_deliveries(receiver: &Receiver<HttpDelivery>) {
+    while let Ok(delivery) = receiver.try_recv() {
+        if let HttpDelivery::ServerRequest(request, reply) = delivery {
+            let _ = reply.send(Some(ServerRequestAction::Respond(json!({
+                "jsonrpc":"2.0", "id":request["id"],
+                "error":{"code":JSONRPC_INTERNAL_ERROR,"message":CALL_ENDED}
+            }))));
+        }
+        // Done outcomes retire any suspended reader through Drop.
+    }
 }
 
 /// Per-wire-attempt cancellation state. Unlike CancelRegistry, this survives the
@@ -5526,13 +5904,19 @@ impl HttpTransport {
             inline_agent: guarded_agent_with_timeout(block_private, request_timeout),
             connect_timeout: request_timeout,
             request_timeout,
-            session_id: None,
-            next_id: 1,
+            session_id: Arc::new(Mutex::new(None)),
+            next_id: Arc::new(AtomicI64::new(1)),
             auth: Arc::new(Mutex::new(auth)),
-            refresh: refresh.map(|refresh| Arc::new(Mutex::new(refresh))),
+            refresh: refresh.map(Arc::new),
+            auth_owner: None,
             scope_reauthorize: None,
             scope_upgrade_attempts: Arc::new(Mutex::new(HashSet::new())),
-            forced_refresh_token: None,
+            forced_refresh_token: Arc::new(Mutex::new(None)),
+            refresh_failure: Arc::new(Mutex::new(None)),
+            concurrency: Arc::new(HttpConcurrency::default()),
+            deadline: None,
+            auth_gate: Arc::new(HttpAuthGate::default()),
+            wire_cancel: None,
             server_handler: None,
             pending_mrtr: None,
             resource_updated: None,
@@ -5549,7 +5933,7 @@ impl HttpTransport {
     }
 
     pub fn set_scope_reauthorize(&mut self, callback: Option<ScopeReauthorizeFn>) {
-        self.scope_reauthorize = callback.map(|callback| Arc::new(Mutex::new(callback)));
+        self.scope_reauthorize = callback.map(Arc::new);
     }
 
     pub fn set_connect_timeout(&mut self, timeout: Duration) {
@@ -5618,6 +6002,13 @@ impl HttpTransport {
         self.protocol_meta.is_some()
     }
 
+    fn request_shell(&self) -> Self {
+        let (_, receiver) = std::sync::mpsc::channel();
+        let mut shell = self.draining_shell(receiver);
+        shell.draining = None;
+        shell
+    }
+
     fn draining_shell(&self, receiver: Receiver<HttpAttemptOutcome>) -> Self {
         Self {
             url: self.url.clone(),
@@ -5626,12 +6017,18 @@ impl HttpTransport {
             connect_timeout: self.connect_timeout,
             request_timeout: self.request_timeout,
             session_id: self.session_id.clone(),
-            next_id: self.next_id,
+            next_id: Arc::clone(&self.next_id),
             auth: Arc::clone(&self.auth),
             refresh: self.refresh.clone(),
+            auth_owner: self.auth_owner.clone(),
             scope_reauthorize: self.scope_reauthorize.clone(),
             scope_upgrade_attempts: Arc::clone(&self.scope_upgrade_attempts),
-            forced_refresh_token: self.forced_refresh_token.clone(),
+            forced_refresh_token: Arc::clone(&self.forced_refresh_token),
+            refresh_failure: Arc::clone(&self.refresh_failure),
+            concurrency: Arc::clone(&self.concurrency),
+            deadline: self.deadline,
+            auth_gate: Arc::clone(&self.auth_gate),
+            wire_cancel: self.wire_cancel.clone(),
             server_handler: self.server_handler.clone(),
             pending_mrtr: None,
             resource_updated: self.resource_updated.clone(),
@@ -5678,7 +6075,7 @@ impl HttpTransport {
         self.pending_mrtr
             .as_ref()
             .map(|pending| pending.common.downstream_request_id.clone())
-            .unwrap_or_else(|| json!(self.next_id))
+            .unwrap_or_else(|| json!(self.next_id.load(Ordering::SeqCst)))
     }
 
     fn forward_cancel_async(&self, downstream_id: Value, cancel: &CancelContext) {
@@ -5690,7 +6087,11 @@ impl HttpTransport {
         let agent = guarded_agent_with_timeout(self.block_private, HTTP_CANCEL_FORWARD_TIMEOUT);
         let url = self.url.clone();
         let auth = Arc::clone(&self.auth);
-        let session_id = self.session_id.clone();
+        let session_id = self
+            .session_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let protocol_meta = self.protocol_meta.clone();
         let wire_version = self.wire_protocol_version();
         let reason = cancel.reason();
@@ -5751,6 +6152,7 @@ impl HttpTransport {
         headers: &[(String, String)],
         cancel: Option<&HttpCancelSignal>,
     ) -> Result<Value, TransportError> {
+        self.wire_cancel = cancel.cloned();
         if cancel.is_some_and(HttpCancelSignal::is_cancelled) {
             return Err(TransportError::Cancelled(
                 "request cancelled before it reached the HTTP server".to_string(),
@@ -5798,8 +6200,7 @@ impl HttpTransport {
             return Ok(resp.get("result").cloned().unwrap_or(Value::Null));
         }
 
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         let resp = self
             .post_with_headers_cancel(&body, true, headers, cancel)?
@@ -5814,33 +6215,108 @@ impl HttpTransport {
         if !is_server_initiated_request(v) {
             return None;
         }
+        if self.deadline.is_none()
+            && matches!(
+                request_context(),
+                RequestContext::Background { sole_client: false }
+            )
+        {
+            return Some(ServerRequestAction::Respond(
+                json!({"jsonrpc":"2.0", "id":v["id"],
+                "error":{"code":JSONRPC_INTERNAL_ERROR,"message":NO_CLIENT_IN_FLIGHT}}),
+            ));
+        }
         self.server_handler.as_ref().and_then(|handler| handler(v))
     }
 
-    /// Try to replace a token nearing expiry. Contention keeps the current token
-    /// through the safety window; a forced refresh after 401 still reports it.
-    /// Persistence failures reach the caller without an unlocked exchange.
+    /// Proactive work skips a busy auth gate. Contention keeps the current token;
+    /// storage failures reach the caller. Both leave later calls free to reread
+    /// the vault and recover without an unlocked exchange.
     fn refresh_before_send(&mut self) -> Result<(), TransportError> {
         if let Some(refresh) = &self.refresh {
-            if let Ok(refresh) = refresh.try_lock() {
-                match refresh(false) {
-                    Ok(Some(token)) => {
-                        *self
-                            .auth
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
-                    }
-                    Err(e)
-                        if crate::remote::is_refresh_storage_or_lock_error(&e)
-                            && !crate::remote::is_refresh_lock_error(&e) =>
-                    {
-                        return Err(TransportError::Fatal(e));
-                    }
-                    _ => {}
+            let mut busy = match self.auth_gate.busy.try_lock() {
+                Ok(busy) => busy,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+            };
+            if *busy {
+                return Ok(());
+            }
+            *busy = true;
+            drop(busy);
+            let _gate = HttpAuthGuard(&self.auth_gate);
+            let current = self
+                .auth
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let failed = self
+                .refresh_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+            // A read failure cannot revoke the token already in hand. The refresh
+            // callback can still return a valid pending rotation on this path.
+            if failed && self.reuse_stored_auth(&current).unwrap_or(false) {
+                return Ok(());
+            }
+            match refresh(false, None) {
+                Ok(Some(token)) => {
+                    *self
+                        .auth
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+                    *self
+                        .refresh_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 }
+                Err(error) => {
+                    self.record_refresh_failure(current, error.clone());
+                    if crate::remote::is_refresh_storage_or_lock_error(&error)
+                        && !crate::remote::is_refresh_lock_error(&error)
+                    {
+                        return Err(TransportError::Fatal(error));
+                    }
+                }
+                Ok(None) => {}
             }
         }
         Ok(())
+    }
+
+    fn record_refresh_failure(&self, token: Option<String>, error: String) {
+        if crate::remote::is_refresh_lock_error(&error) {
+            return;
+        }
+        *self
+            .refresh_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HttpRefreshFailure {
+            recorded_at: Instant::now(),
+            token,
+            error,
+        });
+    }
+
+    fn reuse_stored_auth(&self, rejected: &Option<String>) -> Result<bool, TransportError> {
+        let Some(owner) = &self.auth_owner else {
+            return Ok(false);
+        };
+        let stored = match rejected.as_deref() {
+            Some(rejected) => crate::remote::newer_credential(owner, rejected),
+            None => crate::remote::current_credential(owner),
+        }
+        .map_err(TransportError::Fatal)?;
+        if let Some(token) = stored {
+            self.publish_refreshed_auth(token);
+            *self
+                .refresh_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// True when the token currently in hand is one a forced refresh already
@@ -5850,38 +6326,115 @@ impl HttpTransport {
             .auth
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        auth.is_some() && *auth == self.forced_refresh_token
+        auth.is_some()
+            && *auth
+                == *self
+                    .forced_refresh_token
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[cfg(test)]
     fn force_refresh_after_auth_error(&mut self, code: u16) -> Result<(), TransportError> {
+        let rejected = self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        self.force_refresh_for_token(code, rejected)
+    }
+
+    fn force_refresh_for_token(
+        &mut self,
+        code: u16,
+        rejected: Option<String>,
+    ) -> Result<(), TransportError> {
+        let rejected_at = Instant::now();
+        // Lock order: auth gate, auth, budget/failure. Recheck after taking
+        // the callback gate: siblings rejected with the old bearer share its result.
+        let _gate = self.auth_gate_lock()?;
+        let current = self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if current != rejected {
+            return Ok(());
+        }
+        if let Some(failure) = self
+            .refresh_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            if failure.token == rejected && rejected_at <= failure.recorded_at {
+                return Err(TransportError::Fatal(failure.error.clone()));
+            }
+        }
         let Some(refresh) = self.refresh.as_ref() else {
             return Err(TransportError::Fatal(format!(
                 "HTTP {code} (needs authentication): no refresh callback configured"
             )));
         };
-        let refresh = refresh
-            .lock()
-            .map_err(|_| TransportError::Fatal("OAuth refresh callback lock poisoned".into()))?;
-        match refresh(true) {
+        if self.forced_refresh_spent() {
+            // Adoption is still allowed after spending the exchange budget. This
+            // lookup never leads to an exchange, so there is no check-then-act race.
+            if self.reuse_stored_auth(&rejected)? {
+                return Ok(());
+            }
+            return Err(TransportError::Fatal(format!(
+                "HTTP {code} (needs authentication): refreshed token rejected"
+            )));
+        }
+        let result = match refresh(true, rejected.as_deref()) {
             Ok(Some(token)) => {
-                *self
-                    .auth
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token.clone());
-                // Spend the budget for this token, so a later POST on the same
-                // connection does not force a second exchange for it (SOU-474).
-                self.forced_refresh_token = Some(token);
-                Ok(())
+                self.publish_refreshed_auth(token);
+                return Ok(());
             }
-            Ok(None) => Err(TransportError::Fatal(format!(
-                "HTTP {code} (needs authentication): token refresh returned no token"
-            ))),
-            Err(e) if crate::remote::is_refresh_storage_or_lock_error(&e) => {
-                Err(TransportError::Fatal(e))
+            Ok(None) => {
+                format!("HTTP {code} (needs authentication): token refresh returned no token")
             }
-            Err(e) => Err(TransportError::Fatal(format!(
-                "HTTP {code} (needs authentication): token refresh failed: {e}"
-            ))),
+            Err(e) if crate::remote::is_refresh_storage_or_lock_error(&e) => e,
+            Err(e) => format!("HTTP {code} (needs authentication): token refresh failed: {e}"),
+        };
+        self.record_refresh_failure(rejected, result.clone());
+        Err(TransportError::Fatal(result))
+    }
+
+    fn auth_gate_lock(&self) -> Result<HttpAuthGuard<'_>, TransportError> {
+        let deadline = self
+            .deadline
+            .unwrap_or_else(|| Instant::now() + self.request_timeout);
+        let mut busy = self
+            .auth_gate
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if Instant::now() >= deadline
+                || self.concurrency.closed.load(Ordering::SeqCst)
+                || self
+                    .wire_cancel
+                    .as_ref()
+                    .is_some_and(HttpCancelSignal::is_cancelled)
+            {
+                return Err(TransportError::Busy(
+                    "OAuth callback wait ended with the HTTP request".into(),
+                ));
+            }
+            if !*busy {
+                *busy = true;
+                return Ok(HttpAuthGuard(&self.auth_gate));
+            }
+            let (guard, _) = self
+                .auth_gate
+                .ready
+                .wait_timeout(
+                    busy,
+                    HTTP_CANCEL_POLL.min(deadline.saturating_duration_since(Instant::now())),
+                )
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            busy = guard;
         }
     }
 
@@ -5890,6 +6443,7 @@ impl HttpTransport {
         code: u16,
         operation: &str,
         challenge: crate::oauth::BearerChallenge,
+        rejected: Option<String>,
     ) -> Result<(), TransportError> {
         let required_scope = challenge
             .scope
@@ -5900,6 +6454,18 @@ impl HttpTransport {
                     "HTTP {code} (needs authentication): OAuth reported insufficient_scope without the required scope"
                 ))
             })?;
+        let callback = self.scope_reauthorize.as_ref().ok_or_else(|| {
+            TransportError::Fatal(format!("HTTP {code} (needs authentication): OAuth scope '{required_scope}' requires interactive authorization"))
+        })?;
+        let _gate = self.auth_gate_lock()?;
+        if *self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            != rejected
+        {
+            return Ok(());
+        }
         let attempt_key = (operation.to_string(), required_scope.clone());
         let first_attempt = self
             .scope_upgrade_attempts
@@ -5907,32 +6473,47 @@ impl HttpTransport {
             .map_err(|_| TransportError::Fatal("OAuth scope-attempt lock poisoned".into()))?
             .insert(attempt_key);
         if !first_attempt {
-            return Err(TransportError::Fatal(format!(
-                "HTTP {code} (needs authentication): OAuth scope '{required_scope}' was already requested for {operation} and remains insufficient"
-            )));
+            return Err(TransportError::Fatal(format!("HTTP {code} (needs authentication): OAuth scope '{required_scope}' was already requested for {operation} and remains insufficient")));
         }
-        let callback = self.scope_reauthorize.as_ref().ok_or_else(|| {
-            TransportError::Fatal(format!(
-                "HTTP {code} (needs authentication): OAuth scope '{required_scope}' requires interactive authorization"
-            ))
-        })?;
-        let token = callback
-            .lock()
-            .map_err(|_| TransportError::Fatal("OAuth scope callback lock poisoned".into()))?
-            (&required_scope)
+        let token = callback(&required_scope)
             .map_err(|e| {
                 TransportError::Fatal(format!(
                     "HTTP {code} (needs authentication): OAuth scope authorization failed for '{required_scope}': {e}"
                 ))
             })?;
-        *self
+        // A newly-authorized token shares the rejected-token budget too.
+        self.publish_refreshed_auth(token);
+        Ok(())
+    }
+
+    fn publish_refreshed_auth(&self, token: String) {
+        let mut auth = self
             .auth
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token.clone());
-        // Do not follow a freshly-authorized token's rejection with an automatic
-        // refresh-token exchange: it cannot add a scope the user did not grant.
-        self.forced_refresh_token = Some(token);
-        Ok(())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *auth = Some(token.clone());
+        *self
+            .forced_refresh_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+    }
+
+    fn accept_auth(&self, accepted: Option<String>) {
+        // A late success for an older bearer cannot reset the current budget.
+        let auth = self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *auth == accepted {
+            *self
+                .forced_refresh_token
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *self
+                .refresh_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
     }
 
     /// POST JSON-RPC without waiting for a response body (inline replies mid-SSE).
@@ -5950,9 +6531,18 @@ impl HttpTransport {
         self.shared_backoff_gate()?;
         let payload = body.to_string();
         self.refresh_before_send()?;
-        let mut refreshed = self.forced_refresh_spent();
+        let mut refreshed = false;
         let wire_version = self.wire_protocol_version();
-        let resp = loop {
+        let (resp, accepted_auth) = loop {
+            if self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+                || (self.deadline.is_some() && self.concurrency.closed.load(Ordering::SeqCst))
+            {
+                return Err(TransportError::Fatal(
+                    "HTTP request deadline ended before POST".into(),
+                ));
+            }
             if cancel.is_some_and(HttpCancelSignal::is_cancelled) {
                 return Err(TransportError::Cancelled(
                     "HTTP request cancelled by upstream client".to_string(),
@@ -5965,7 +6555,12 @@ impl HttpTransport {
                 .set("Accept", "application/json, text/event-stream")
                 .set("MCP-Protocol-Version", &wire_version);
             if !self.is_modern() {
-                if let Some(sid) = &self.session_id {
+                if let Some(sid) = self
+                    .session_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                {
                     req = req.set("Mcp-Session-Id", sid);
                 }
             }
@@ -5987,6 +6582,9 @@ impl HttpTransport {
                     "HTTP request cancelled by upstream client".to_string(),
                 ));
             }
+            if let Some(deadline) = self.deadline {
+                req = req.timeout(deadline.saturating_duration_since(Instant::now()));
+            }
             let response = req.send_string(&payload);
             if cancel.is_some_and(HttpCancelSignal::is_cancelled) {
                 return Err(TransportError::Cancelled(
@@ -5994,7 +6592,7 @@ impl HttpTransport {
                 ));
             }
             match response {
-                Ok(resp) => break resp,
+                Ok(resp) => break (resp, auth),
                 Err(ureq::Error::Status(code, resp))
                     if (code == 401 || code == 403)
                         && insufficient_scope_challenge(&resp).is_some() =>
@@ -6003,7 +6601,7 @@ impl HttpTransport {
                         .expect("match guard established an insufficient-scope challenge");
                     let _ = read_capped(resp, 8 * 1024);
                     let operation = authorization_operation(body);
-                    self.reauthorize_after_scope_challenge(code, &operation, challenge)?;
+                    self.reauthorize_after_scope_challenge(code, &operation, challenge, auth)?;
                     refreshed = true;
                 }
                 Err(ureq::Error::Status(code, resp))
@@ -6011,7 +6609,7 @@ impl HttpTransport {
                 {
                     let _ = read_capped(resp, 8 * 1024);
                     refreshed = true;
-                    self.force_refresh_after_auth_error(code)?;
+                    self.force_refresh_for_token(code, auth)?;
                 }
                 Err(ureq::Error::Status(429, r)) => {
                     // Record into the shared window like the main POST path
@@ -6028,9 +6626,13 @@ impl HttpTransport {
         };
         if !self.is_modern() {
             if let Some(sid) = resp.header("Mcp-Session-Id") {
-                self.session_id = Some(sid.to_string());
+                *self
+                    .session_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sid.to_string());
             }
         }
+        self.accept_auth(accepted_auth);
         // Drain so the connection returns to the pool without leaving bytes unread.
         let _ = read_capped(resp, 64 * 1024);
         Ok(())
@@ -6106,11 +6708,13 @@ impl HttpTransport {
                     }
                 }
                 if is_server_initiated_request(&v) {
-                    screen_url_elicitation_request(&mut v).map_err(|message| {
-                        TransportError::Fatal(format!(
+                    if let Err(message) = screen_url_elicitation_request(&mut v) {
+                        let _ = self.send_post_no_response(&json!({"jsonrpc":"2.0", "id":v["id"],
+                            "error":{"code":JSONRPC_INTERNAL_ERROR,"message":"Toolport refused unsafe URL elicitation"}}));
+                        return Err(TransportError::Fatal(format!(
                             "Toolport refused unsafe URL elicitation: {message}"
-                        ))
-                    })?;
+                        )));
+                    }
                 }
                 match self.inline_server_action(&v) {
                     Some(ServerRequestAction::Respond(response)) => {
@@ -6131,9 +6735,13 @@ impl HttpTransport {
                             "result": result
                         })));
                     }
+                    None if is_server_initiated_request(&v) => {
+                        self.send_post_no_response(&json!({"jsonrpc":"2.0", "id":v["id"], "error":{"code":JSONRPC_INTERNAL_ERROR, "message":NO_CLIENT_IN_FLIGHT}}))?;
+                        continue;
+                    }
                     None => {}
                 }
-                if ids_match(v.get("id"), Some(&wanted)) {
+                if http_response_id_matches(&v, Some(&wanted)) {
                     return Ok(Some(v));
                 }
             }
@@ -6200,9 +6808,18 @@ impl HttpTransport {
         // Per-token, not per-call: connect alone posts twice (`initialize`, then
         // the `server/discover` era probe) and must not spend two forced
         // exchanges on one expired token (SOU-474).
-        let mut refreshed = self.forced_refresh_spent();
+        let mut refreshed = false;
         let wire_version = self.wire_protocol_version();
-        let resp = loop {
+        let (resp, accepted_auth) = loop {
+            if self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+                || (self.deadline.is_some() && self.concurrency.closed.load(Ordering::SeqCst))
+            {
+                return Err(TransportError::Fatal(
+                    "HTTP request deadline ended before POST".into(),
+                ));
+            }
             if cancel.is_some_and(HttpCancelSignal::is_cancelled) {
                 return Err(TransportError::Cancelled(
                     "request cancelled before it reached the HTTP server".to_string(),
@@ -6215,7 +6832,12 @@ impl HttpTransport {
                 .set("Accept", "application/json, text/event-stream")
                 .set("MCP-Protocol-Version", &wire_version);
             if !self.is_modern() {
-                if let Some(sid) = &self.session_id {
+                if let Some(sid) = self
+                    .session_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                {
                     req = req.set("Mcp-Session-Id", sid);
                 }
             }
@@ -6241,6 +6863,9 @@ impl HttpTransport {
                     "request cancelled before it reached the HTTP server".to_string(),
                 ));
             }
+            if let Some(deadline) = self.deadline {
+                req = req.timeout(deadline.saturating_duration_since(Instant::now()));
+            }
             let response = req.send_string(&payload);
             // Cancellation wins even when the socket becomes readable at the same
             // instant. In particular, never launch scope reauthorization or rotate
@@ -6251,7 +6876,7 @@ impl HttpTransport {
                 ));
             }
             match response {
-                Ok(r) => break r,
+                Ok(r) => break (r, auth),
                 // Rate limited: return a Retry signal so the Router sleeps
                 // *outside* the per-server Mutex.
                 Err(ureq::Error::Status(429, r)) => {
@@ -6273,7 +6898,7 @@ impl HttpTransport {
                         .expect("match guard established an insufficient-scope challenge");
                     let _ = read_capped(r, 8 * 1024);
                     let operation = authorization_operation(body);
-                    self.reauthorize_after_scope_challenge(code, &operation, challenge)?;
+                    self.reauthorize_after_scope_challenge(code, &operation, challenge, auth)?;
                     refreshed = true;
                     continue;
                 }
@@ -6285,7 +6910,7 @@ impl HttpTransport {
                 {
                     let _ = read_capped(r, 8 * 1024);
                     refreshed = true;
-                    self.force_refresh_after_auth_error(code)?;
+                    self.force_refresh_for_token(code, auth)?;
                     continue;
                 }
                 Err(ureq::Error::Status(code, r)) => {
@@ -6293,7 +6918,7 @@ impl HttpTransport {
                     if code == 400 && self.is_modern() && expect_response {
                         if let Ok(response) = serde_json::from_str::<Value>(&detail) {
                             let request_id = body.get("id");
-                            if ids_match(response.get("id"), request_id) {
+                            if http_response_id_matches(&response, request_id) {
                                 if let Some(error) = response.get("error") {
                                     return Err(TransportError::Rpc(error.clone()));
                                 }
@@ -6323,11 +6948,15 @@ impl HttpTransport {
         };
         // The server accepted this token, so its forced-refresh budget is spent
         // on nothing and must be returned. See [`Self::forced_refresh_token`].
-        self.forced_refresh_token = None;
+        // A late success for an older token must not reset a newer token's budget.
+        self.accept_auth(accepted_auth);
 
         if !self.is_modern() {
             if let Some(sid) = resp.header("Mcp-Session-Id") {
-                self.session_id = Some(sid.to_string());
+                *self
+                    .session_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sid.to_string());
             }
         }
         if !expect_response {
@@ -6343,13 +6972,45 @@ impl HttpTransport {
         }
 
         let text = read_capped(resp, MAX_RESPONSE_BYTES);
-        serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|e| TransportError::Fatal(format!("bad JSON response: {e}")))
+        let response: Value = serde_json::from_str(&text)
+            .map_err(|e| TransportError::Fatal(format!("bad JSON response: {e}")))?;
+        if !http_response_id_matches(&response, body.get("id")) {
+            return Err(TransportError::Fatal(
+                "HTTP response id did not match its request".into(),
+            ));
+        }
+        Ok(Some(response))
     }
 }
 
+fn http_response_id_matches(response: &Value, request_id: Option<&Value>) -> bool {
+    ids_match(response.get("id"), request_id)
+        || (response.get("id").is_some_and(Value::is_null) && response.get("error").is_some())
+}
+
 impl Transport for HttpTransport {
+    fn set_server_id(&mut self, id: &str) {
+        self.auth_owner = Some(id.to_string());
+    }
+
+    fn connection_closed(&self) -> Option<bool> {
+        Some(self.concurrency.closed.load(Ordering::SeqCst))
+    }
+
+    fn suspended_calls(&self) -> usize {
+        self.concurrency
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    fn concurrent(&self) -> Option<Arc<dyn ConcurrentTransport>> {
+        Some(Arc::new(HttpCallTransport {
+            template: Mutex::new(self.request_shell()),
+        }))
+    }
+
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
         self.restore_drained()?;
         self.request_inner(method, params, &[])
@@ -6502,7 +7163,10 @@ impl Transport for HttpTransport {
             merge_declared_extensions(meta, &self.declared_extensions);
         }
         if self.protocol_meta.is_some() {
-            self.session_id = None;
+            *self
+                .session_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
     }
 
@@ -6511,8 +7175,8 @@ impl Transport for HttpTransport {
         filter: SubscriptionFilter,
     ) -> Result<(), TransportError> {
         self.restore_drained()?;
-        let id = self.next_id;
-        self.next_id += 1;
+        self.refresh_before_send()?;
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut params = filter.params();
         if let Some(protocol) = &self.protocol_meta {
             merge_protocol_meta(&mut params, protocol);
@@ -6529,9 +7193,7 @@ impl Transport for HttpTransport {
         let agent = self.agent.clone();
         let url = self.url.clone();
         let auth = Arc::clone(&self.auth);
-        let refresh = self.refresh.clone();
-        let scope_reauthorize = self.scope_reauthorize.clone();
-        let scope_upgrade_attempts = Arc::clone(&self.scope_upgrade_attempts);
+        let mut auth_shell = self.request_shell();
         let wire_version = self.wire_protocol_version();
         let dirty = self.change_dirty.clone();
         let resource_updated = self.resource_updated.clone();
@@ -6540,15 +7202,8 @@ impl Transport for HttpTransport {
         std::thread::spawn(move || {
             let mut retry_delay = Duration::from_millis(250);
             while live_generation.load(Ordering::SeqCst) == generation {
-                if let Some(refresh) = &refresh {
-                    if let Ok(refresh) = refresh.lock() {
-                        if let Ok(Some(token)) = refresh(false) {
-                            *auth
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
-                        }
-                    }
-                }
+                auth_shell.deadline = Some(Instant::now() + auth_shell.request_timeout);
+                let proactive = auth_shell.refresh_before_send();
                 // Shared 429 backoff (#874): the listener is its own egress
                 // path, so never connect while another gateway process holds
                 // the provider's window open. Re-consult after each capped
@@ -6559,6 +7214,12 @@ impl Transport for HttpTransport {
                 }
                 let mut forced_refresh = false;
                 let response = loop {
+                    if let Err(error) = &proactive {
+                        downstream_trace(&format!(
+                            "HTTP subscription proactive refresh failed: {error}"
+                        ));
+                        break None;
+                    }
                     let mut request = agent
                         .post(&url)
                         .set("Content-Type", "application/json")
@@ -6573,7 +7234,10 @@ impl Transport for HttpTransport {
                         request = request.set("Authorization", &bearer_header(token));
                     }
                     match request.send_string(&payload) {
-                        Ok(response) => break Some(response),
+                        Ok(response) => {
+                            auth_shell.accept_auth(token);
+                            break Some(response);
+                        }
                         Err(ureq::Error::Status(429, response)) => {
                             // Rate limited: record the shared window like
                             // every other egress path, then fall into the
@@ -6593,44 +7257,18 @@ impl Transport for HttpTransport {
                             let challenge = insufficient_scope_challenge(&response)
                                 .expect("match guard established an insufficient-scope challenge");
                             let _ = read_capped(response, 8 * 1024);
-                            let Some(scope) = challenge
-                                .scope
-                                .map(|scope| canonical_scope_set(&scope))
-                                .filter(|scope| !scope.is_empty())
-                            else {
-                                downstream_trace(
-                                    "subscriptions/listen insufficient_scope challenge omitted scope",
-                                );
-                                break None;
-                            };
-                            let attempt_key = ("subscriptions/listen".to_string(), scope.clone());
-                            let first_attempt = scope_upgrade_attempts
-                                .lock()
-                                .map(|mut attempts| attempts.insert(attempt_key))
-                                .unwrap_or(false);
-                            let upgraded = if first_attempt {
-                                scope_reauthorize.as_ref().and_then(|callback| {
-                                    callback
-                                        .lock()
-                                        .ok()
-                                        .and_then(|callback| callback(&scope).ok())
-                                })
-                            } else {
-                                None
-                            };
-                            match upgraded {
-                                Some(token) => {
-                                    *auth
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                        Some(token);
+                            match auth_shell.reauthorize_after_scope_challenge(
+                                code,
+                                "subscriptions/listen",
+                                challenge,
+                                token,
+                            ) {
+                                Ok(()) => {
                                     forced_refresh = true;
                                     continue;
                                 }
-                                None => {
-                                    downstream_trace(&format!(
-                                        "subscriptions/listen needs interactive OAuth scope '{scope}'"
-                                    ));
+                                Err(error) => {
+                                    downstream_trace(&error.to_string());
                                     break None;
                                 }
                             }
@@ -6638,26 +7276,16 @@ impl Transport for HttpTransport {
                         Err(ureq::Error::Status(code, response))
                             if (code == 401 || code == 403)
                                 && !forced_refresh
-                                && refresh.is_some() =>
+                                && auth_shell.refresh.is_some() =>
                         {
                             let _ = read_capped(response, 8 * 1024);
                             forced_refresh = true;
-                            let refreshed = refresh.as_ref().and_then(|refresh| {
-                                refresh
-                                    .lock()
-                                    .ok()
-                                    .and_then(|refresh| refresh(true).ok())
-                                    .flatten()
-                            });
-                            match refreshed {
-                                Some(token) => {
-                                    *auth
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                        Some(token);
-                                    continue;
+                            match auth_shell.force_refresh_for_token(code, token) {
+                                Ok(()) => continue,
+                                Err(error) => {
+                                    downstream_trace(&error.to_string());
+                                    break None;
                                 }
-                                None => break None,
                             }
                         }
                         Err(error) => {
@@ -6764,7 +7392,28 @@ impl Transport for HttpTransport {
 impl Drop for HttpTransport {
     fn drop(&mut self) {
         if self.owns_listener_generation {
+            self.concurrency.closed.store(true, Ordering::SeqCst);
             self.listener_generation.fetch_add(1, Ordering::SeqCst);
+            let pending = std::mem::take(
+                &mut *self
+                    .concurrency
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            if !pending.is_empty() {
+                let mut shell = self.request_shell();
+                std::thread::spawn(move || {
+                    let deadline = Instant::now() + HTTP_CANCEL_FORWARD_TIMEOUT;
+                    for (_, (_, pending)) in pending {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        shell.pending_mrtr = Some(pending);
+                        shell.retire_http_pending();
+                    }
+                });
+            }
         }
     }
 }
@@ -6844,6 +7493,7 @@ impl DownstreamServer {
     /// tools-only and fast and can't stall on a slow or hanging resources/prompts
     /// endpoint. The gateway calls `load_resources_prompts` to populate them.
     pub fn connect(id: String, mut transport: Box<dyn Transport>) -> Result<Self, String> {
+        transport.set_server_id(&id);
         // Fail the handshake fast so one unresponsive server can't stall the whole
         // batch probe / router rebuild for the full live-call timeout. The transport
         // picks the budget: download-then-run launchers (npx, uvx, ...) get a long
@@ -7138,16 +7788,12 @@ impl DownstreamServer {
     /// Whether a multiplexed connection has closed; `None` when calls to this
     /// server run one at a time.
     pub fn connection_closed(&self) -> Option<bool> {
-        self.transport
-            .concurrent()
-            .map(|transport| transport.is_closed())
+        self.transport.connection_closed()
     }
 
     /// Calls on a multiplexed connection that wait for the client's input.
     pub fn suspended_calls(&self) -> usize {
-        self.transport
-            .concurrent()
-            .map_or(0, |transport| transport.suspended_calls())
+        self.transport.suspended_calls()
     }
 
     pub fn call_handle(&self) -> Option<CallHandle> {
@@ -10252,6 +10898,49 @@ mod tests {
     }
 
     #[test]
+    fn http_mrtr_retry_keeps_the_original_suspension_deadline() {
+        let transport = HttpTransport::new("http://127.0.0.1:9/");
+        let common = super::PendingLegacyMrtr::new(
+            json!({"jsonrpc":"2.0","id":"roots","method":"roots/list","params":{}}),
+            json!(1),
+            "echo",
+            &json!({}),
+        )
+        .unwrap();
+        let token = common.token.clone();
+        let since = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        transport.concurrency.pending.lock().unwrap().insert(
+            token.clone(),
+            (
+                since,
+                super::PendingHttpMrtr {
+                    common,
+                    reader: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+                    bytes_read: 0,
+                },
+            ),
+        );
+        let handle = transport.concurrent().unwrap();
+        let result = handle
+            .request_with_cancel("echo", json!({"requestState":token}), None)
+            .unwrap();
+        assert_eq!(result["resultType"], "input_required");
+        assert_eq!(
+            transport
+                .concurrency
+                .pending
+                .lock()
+                .unwrap()
+                .get(&token)
+                .unwrap()
+                .0,
+            since
+        );
+        // This in-memory fixture has no open server request to retire over HTTP.
+        transport.concurrency.pending.lock().unwrap().clear();
+    }
+
+    #[test]
     fn http_sse_answers_inline_server_request_before_final_response() {
         use super::{
             HttpTransport, RefreshFn, ServerRequestAction, ServerRequestHandler, Transport,
@@ -10355,7 +11044,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/");
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&refresh_calls);
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             assert!(!force);
             if calls.fetch_add(1, Ordering::SeqCst) == 1 {
                 Ok(Some("fresh".to_string()))
@@ -13165,7 +13854,7 @@ mod tests {
         });
 
         let mut transport = HttpTransport::new(&format!("http://127.0.0.1:{port}/"));
-        transport.session_id = Some("legacy-session".to_string());
+        *transport.session_id.lock().unwrap() = Some("legacy-session".to_string());
         transport.set_protocol_meta(Some(super::protocol_meta_for(MODERN_PROTOCOL_VERSION)));
         transport
             .request_with_cancel_and_headers(
@@ -13192,7 +13881,7 @@ mod tests {
         );
         assert!(!headers.contains_key("mcp-session-id"));
         assert!(
-            transport.session_id.is_none(),
+            transport.session_id.lock().unwrap().is_none(),
             "modern responses cannot restore a legacy session"
         );
     }
@@ -13781,7 +14470,7 @@ mod tests {
 
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&refresh_calls);
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             assert!(
                 !force,
                 "successful proactive refresh should avoid a forced retry"
@@ -13811,11 +14500,13 @@ mod tests {
         let mut transport = HttpTransport::with_auth_refresh(
             "http://127.0.0.1:1/mcp",
             Some("pending-token".into()),
-            Some(Box::new(|_| panic!("a held callback must not be invoked"))),
+            Some(Box::new(|_, _| {
+                panic!("a held auth gate must skip the callback")
+            })),
         );
-        let callback = transport.refresh.as_ref().unwrap().clone();
-        let _holder = callback.lock().unwrap();
-        // Waiting for this guard would deadlock: a listener may hold it across I/O.
+        let gate = Arc::clone(&transport.auth_gate);
+        let _holder = gate.busy.lock().unwrap();
+        // Waiting for this guard would deadlock; pre-send refresh must skip it.
         transport.refresh_before_send().unwrap();
         assert_eq!(
             transport.auth.lock().unwrap().as_deref(),
@@ -13846,7 +14537,7 @@ mod tests {
             let _ = req.respond(tiny_http::Response::from_string(body).with_header(ct));
         });
 
-        let refresh: Option<RefreshFn> = Some(Box::new(|force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(|force, _| {
             assert!(!force);
             Err("temporary OAuth endpoint failure".to_string())
         }));
@@ -13862,6 +14553,399 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(*seen_auth.lock().unwrap(), "Bearer still-valid");
+    }
+
+    #[test]
+    fn connect_binds_the_http_credential_owner_before_initialize() {
+        struct Probe(HttpTransport);
+        impl Transport for Probe {
+            fn set_server_id(&mut self, id: &str) {
+                self.0.set_server_id(id);
+            }
+            fn request(&mut self, _: &str, _: Value) -> Result<Value, TransportError> {
+                assert_eq!(self.0.auth_owner.as_deref(), Some("credential-owner"));
+                Err(TransportError::Unavailable("probe finished".into()))
+            }
+            fn notify(&mut self, _: &str, _: Value) -> Result<(), TransportError> {
+                unreachable!()
+            }
+        }
+        let result = DownstreamServer::connect(
+            "credential-owner".into(),
+            Box::new(Probe(HttpTransport::new("http://127.0.0.1:1/"))),
+        );
+        assert_eq!(result.err().unwrap(), "probe finished");
+    }
+
+    #[test]
+    fn rejected_http_token_adopts_the_vault_winner_without_refreshing() {
+        use crate::secrets;
+        use std::time::Duration;
+        secrets::tests::with_isolated_vault(|| {
+            for concurrent in [false, true] {
+                let server_id = "http-vault-winner";
+                secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, "stale").unwrap();
+                let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+                let url = format!("http://{}/", server.server_addr());
+                let mut transport = HttpTransport::with_auth_refresh(
+                    &url,
+                    Some("stale".into()),
+                    Some(Box::new(move |force, rejected| {
+                        if force {
+                            crate::remote::refresh_token(server_id, rejected).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    })),
+                );
+                transport.set_server_id(server_id);
+                // Another process has already rotated the shared vault. No local expiry
+                // or OAuth grant exists, so attempting an exchange here must fail.
+                secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, "winner").unwrap();
+                let wire = std::thread::spawn(move || {
+                    let mut auths = Vec::new();
+                    for _ in 0..2 {
+                        let Some(mut request) =
+                            server.recv_timeout(Duration::from_secs(3)).unwrap()
+                        else {
+                            break;
+                        };
+                        let auth = request
+                            .headers()
+                            .iter()
+                            .find(|h| h.field.equiv("Authorization"))
+                            .unwrap()
+                            .value
+                            .as_str()
+                            .to_string();
+                        let mut text = String::new();
+                        request.as_reader().read_to_string(&mut text).unwrap();
+                        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        let response = if auth == "Bearer winner" {
+                            tiny_http::Response::from_string(serde_json::json!({"jsonrpc":"2.0","id":body["id"],"result":{"ok":true}}).to_string())
+                        } else {
+                            tiny_http::Response::from_string("revoked").with_status_code(401)
+                        };
+                        auths.push(auth);
+                        request.respond(response).unwrap();
+                    }
+                    auths
+                });
+                let result = if concurrent {
+                    transport.concurrent().unwrap().request_with_cancel(
+                        "echo",
+                        serde_json::json!({}),
+                        None,
+                    )
+                } else {
+                    transport.request("echo", serde_json::json!({}))
+                };
+                let auths = wire.join().unwrap();
+                assert_eq!(result.unwrap(), serde_json::json!({"ok":true}));
+                assert_eq!(auths, ["Bearer stale", "Bearer winner"]);
+            }
+        });
+    }
+
+    #[test]
+    fn http_refresh_failure_rereads_the_vault_before_retrying_callbacks() {
+        use crate::secrets;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        secrets::tests::with_isolated_vault(|| {
+            for proactive in [false, true] {
+                const BUSY: &str =
+                    "OAuth refresh is busy or its cross-process lock is unavailable; try again.";
+                let failure = if proactive {
+                    "could not read the vaulted OAuth state: temporarily locked"
+                } else {
+                    BUSY
+                };
+                let owner = "refresh-vault-recovery";
+                secrets::set_secret(owner, secrets::HTTP_AUTH_KEY, "old").unwrap();
+                let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+                let url = format!("http://{}/", server.server_addr());
+                let wire = std::thread::spawn(move || {
+                    for _ in 0..if proactive { 1 } else { 3 } {
+                        let mut request = server
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap()
+                            .unwrap();
+                        let fresh = request.headers().iter().any(|h| {
+                            h.field.equiv("Authorization") && h.value.as_str() == "Bearer winner"
+                        });
+                        let mut text = String::new();
+                        request.as_reader().read_to_string(&mut text).unwrap();
+                        let body: Value = serde_json::from_str(&text).unwrap();
+                        let response = if fresh {
+                            tiny_http::Response::from_string(
+                                json!({"jsonrpc":"2.0","id":body["id"],"result":{"ok":true}})
+                                    .to_string(),
+                            )
+                        } else {
+                            tiny_http::Response::from_string("revoked").with_status_code(401)
+                        };
+                        request.respond(response).unwrap();
+                    }
+                });
+                let callbacks = Arc::new(AtomicUsize::new(0));
+                let attempts = Arc::clone(&callbacks);
+                let mut transport = HttpTransport::with_auth_refresh(
+                    &url,
+                    Some("old".into()),
+                    Some(Box::new(move |force, rejected| {
+                        if force || proactive {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            if force {
+                                assert_eq!(rejected, Some("old"));
+                                if let Some(token) = crate::remote::newer_credential(owner, "old")?
+                                {
+                                    return Ok(Some(token));
+                                }
+                            }
+                            Err(failure.into())
+                        } else {
+                            Ok(None)
+                        }
+                    })),
+                );
+                transport.set_server_id(owner);
+                let error = transport.request("echo", json!({})).unwrap_err();
+                assert_eq!(error.to_string(), failure);
+                assert!(!crate::remote::is_auth_error(&error.to_string()));
+                secrets::set_secret(owner, secrets::HTTP_AUTH_KEY, "winner").unwrap();
+                assert_eq!(
+                    transport.request("echo", json!({})).unwrap(),
+                    json!({"ok":true})
+                );
+                wire.join().unwrap();
+                assert_eq!(
+                    callbacks.load(Ordering::SeqCst),
+                    if proactive { 1 } else { 2 }
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn proactive_http_refresh_keeps_its_token_when_credential_lookup_fails() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let owner = "http-read-failure";
+            let mut transport = HttpTransport::with_auth_refresh(
+                "http://127.0.0.1:1/",
+                Some("valid-pending-token".into()),
+                Some(Box::new(|force, rejected| {
+                    assert!(!force);
+                    assert_eq!(rejected, None);
+                    Ok(None)
+                })),
+            );
+            transport.set_server_id(owner);
+            transport.record_refresh_failure(Some("old".into()), "temporary vault failure".into());
+            crate::secrets::tests::with_failed_read(crate::secrets::HTTP_AUTH_KEY, || {
+                assert!(crate::remote::current_credential(owner).is_err());
+                transport.refresh_before_send().unwrap();
+                assert_eq!(
+                    transport.auth.lock().unwrap().as_deref(),
+                    Some("valid-pending-token")
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn http_lock_contention_is_never_cached() {
+        let mut transport = HttpTransport::with_auth_refresh(
+            "http://127.0.0.1:1/",
+            Some("old".into()),
+            Some(Box::new(|_, _| {
+                Err(
+                    "OAuth refresh is busy or its cross-process lock is unavailable; try again."
+                        .into(),
+                )
+            })),
+        );
+        transport.refresh_before_send().unwrap();
+        assert!(transport.refresh_failure.lock().unwrap().is_none());
+        assert!(transport.force_refresh_after_auth_error(401).is_err());
+        assert!(transport.refresh_failure.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn http_later_rejection_retries_after_cached_refresh_failure() {
+        let mut transport = HttpTransport::with_auth_refresh(
+            "http://127.0.0.1:1/",
+            Some("old".into()),
+            Some(Box::new(|force, _| {
+                assert!(force);
+                Ok(Some("fresh".into()))
+            })),
+        );
+        transport.record_refresh_failure(Some("old".into()), "temporary provider failure".into());
+        transport.force_refresh_after_auth_error(401).unwrap();
+        assert_eq!(transport.auth.lock().unwrap().as_deref(), Some("fresh"));
+    }
+
+    #[test]
+    fn proactive_http_refresh_does_not_wait_for_a_busy_auth_gate() {
+        let mut transport = super::HttpTransport::with_auth_refresh(
+            "http://127.0.0.1:1/",
+            Some("valid".into()),
+            Some(Box::new(|_, _| {
+                panic!("busy gate must skip proactive callback")
+            })),
+        );
+        *transport.auth_gate.busy.lock().unwrap() = true;
+        transport.deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(50));
+        transport.refresh_before_send().unwrap();
+        assert!(
+            std::time::Instant::now() < transport.deadline.unwrap(),
+            "proactive refresh consumed the call deadline"
+        );
+    }
+
+    fn pending_http_probe() -> super::PendingHttpMrtr {
+        super::PendingHttpMrtr {
+            common: super::PendingLegacyMrtr::new(
+                json!({"jsonrpc":"2.0","id":"server-probe","method":"roots/list"}),
+                json!(1),
+                "echo",
+                &json!({}),
+            )
+            .unwrap(),
+            reader: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+            bytes_read: 0,
+        }
+    }
+
+    #[test]
+    fn dropping_a_queued_http_outcome_refuses_its_suspended_request() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", server.server_addr());
+        let transport = super::HttpTransport::new(&url);
+        let mut owned = transport.request_shell();
+        owned.pending_mrtr = Some(pending_http_probe());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(super::HttpDelivery::Done(Box::new(
+                super::HttpCallOutcome {
+                    transport: owned,
+                    result: Ok(json!({})),
+                },
+            )))
+            .unwrap_or_else(|_| panic!("send failed"));
+        drop(receiver);
+        let mut reply = server
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .expect("abandoned queued outcome must retire its request");
+        let mut text = String::new();
+        reply.as_reader().read_to_string(&mut text).unwrap();
+        let response: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(response["id"], "server-probe");
+        assert_eq!(response["error"]["message"], super::CALL_ENDED);
+        reply.respond(tiny_http::Response::empty(202)).unwrap();
+    }
+
+    #[test]
+    fn expired_http_retirement_does_not_block_the_next_call() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", server.server_addr());
+        let (release, wait) = std::sync::mpsc::channel();
+        let wire = std::thread::spawn(move || {
+            let mut retirement = None;
+            for _ in 0..2 {
+                let Some(mut request) = server
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap()
+                else {
+                    break;
+                };
+                let mut text = String::new();
+                request.as_reader().read_to_string(&mut text).unwrap();
+                let body: Value = serde_json::from_str(&text).unwrap();
+                if body.get("error").is_some() {
+                    retirement = Some(request);
+                } else {
+                    request
+                        .respond(tiny_http::Response::from_string(
+                            json!({"jsonrpc":"2.0","id":body["id"],"result":{"ok":true}})
+                                .to_string(),
+                        ))
+                        .unwrap();
+                }
+            }
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(3));
+            if let Some(request) = retirement {
+                let _ = request.respond(tiny_http::Response::empty(202));
+            }
+        });
+        let mut transport = super::HttpTransport::new(&url);
+        transport.set_read_timeout(std::time::Duration::from_millis(500));
+        let pending = pending_http_probe();
+        transport.concurrency.pending.lock().unwrap().insert(
+            pending.common.token.clone(),
+            (
+                std::time::Instant::now() - super::SUSPENDED_LEGACY_MRTR_TTL,
+                pending,
+            ),
+        );
+        let handle = transport.concurrent().unwrap();
+        let (send_result, receive_result) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            send_result
+                .send(handle.request_with_cancel("echo", json!({}), None))
+                .unwrap();
+        });
+        let result = receive_result.recv_timeout(std::time::Duration::from_millis(500));
+        release.send(()).unwrap();
+        wire.join().unwrap();
+        caller.join().unwrap();
+        assert_eq!(
+            result.expect("next call waited on retirement").unwrap(),
+            json!({"ok":true})
+        );
+    }
+
+    #[test]
+    fn http_watchers_read_state_without_creating_call_snapshots() {
+        struct NoSnapshot;
+        impl Transport for NoSnapshot {
+            fn request(&mut self, _: &str, _: Value) -> Result<Value, TransportError> {
+                unreachable!()
+            }
+            fn notify(&mut self, _: &str, _: Value) -> Result<(), TransportError> {
+                unreachable!()
+            }
+            fn connection_closed(&self) -> Option<bool> {
+                None
+            }
+            fn suspended_calls(&self) -> usize {
+                0
+            }
+            fn concurrent(&self) -> Option<Arc<dyn super::ConcurrentTransport>> {
+                panic!("watcher cloned the transport")
+            }
+        }
+        let mut server = DownstreamServer::stopped("watcher".into(), vec![]);
+        server.transport = Box::new(NoSnapshot);
+        assert_eq!(server.connection_closed(), None);
+        assert_eq!(server.suspended_calls(), 0);
+        let transport = HttpTransport::new("http://127.0.0.1:1/");
+        let shared = Arc::clone(&transport.concurrency);
+        server.transport = Box::new(transport);
+        assert_eq!(server.connection_closed(), Some(false));
+        let pending = pending_http_probe();
+        shared.pending.lock().unwrap().insert(
+            pending.common.token.clone(),
+            (std::time::Instant::now(), pending),
+        );
+        assert_eq!(server.suspended_calls(), 1);
+        shared.pending.lock().unwrap().clear();
+        shared
+            .closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(server.connection_closed(), Some(true));
     }
 
     #[test]
@@ -13934,7 +15018,7 @@ mod tests {
 
         let forced_refreshes = Arc::new(AtomicUsize::new(0));
         let forced = Arc::clone(&forced_refreshes);
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             if force {
                 forced.fetch_add(1, Ordering::SeqCst);
             }
@@ -14017,7 +15101,7 @@ mod tests {
         });
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let refresh_count = Arc::clone(&refresh_calls);
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             if force {
                 refresh_count.fetch_add(1, Ordering::SeqCst);
             }
@@ -14083,7 +15167,7 @@ mod tests {
 
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let refresh_count = Arc::clone(&refresh_calls);
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             if force {
                 refresh_count.fetch_add(1, Ordering::SeqCst);
             }
@@ -14142,7 +15226,7 @@ mod tests {
             }
         });
 
-        let refresh: Option<RefreshFn> = Some(Box::new(|force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(|force, _| {
             if force {
                 Ok(Some("fresh".to_string()))
             } else {
@@ -14209,7 +15293,7 @@ mod tests {
         });
 
         let url = format!("http://127.0.0.1:{port}/");
-        let refresh: Option<RefreshFn> = Some(Box::new(|force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(|force, _| {
             if force {
                 Ok(Some("fresh".to_string()))
             } else {
@@ -14277,7 +15361,7 @@ mod tests {
 
         let forced = Arc::new(AtomicUsize::new(0));
         let fc = Arc::clone(&forced);
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             if force {
                 // Each forced call is a refresh-token exchange with the provider.
                 let n = fc.fetch_add(1, Ordering::SeqCst);
@@ -14371,7 +15455,7 @@ mod tests {
         let fc = Arc::clone(&forced);
         // No proactive deadline: the non-forced arm always declines, exactly like
         // a provider that reported no `expires_in`.
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             if force {
                 let n = fc.fetch_add(1, Ordering::SeqCst);
                 Ok(Some(format!("minted-{n}")))
@@ -14448,7 +15532,7 @@ mod tests {
         let fc = Arc::clone(&forced);
         let proactive = Arc::new(AtomicUsize::new(0));
         let pc = Arc::clone(&proactive);
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             if force {
                 let n = fc.fetch_add(1, Ordering::SeqCst);
                 Ok(Some(format!("forced-{n}")))
@@ -14517,7 +15601,7 @@ mod tests {
                         &b"application/json"[..],
                     )
                     .unwrap();
-                    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+                    let body = r#"{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#;
                     let _ = req.respond(tiny_http::Response::from_string(body).with_header(ct));
                 }
             }

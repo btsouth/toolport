@@ -236,3 +236,30 @@ fn one_hundred_parallel_calls_to_one_server_overlap() {
     }
     assert_eq!(total, 100);
 }
+
+mod http_support;
+
+#[test]
+fn one_hundred_http_calls_overlap_and_keep_client_results_separate() {
+    // Two waves of 50 stay within the router cap of 64. No reply is sent
+    // until all calls in its wave have reached the server.
+    let mock = http_support::HttpMock::with_rendezvous(50);
+    let router = mock.router();
+    let calls: Vec<_> = (0..100)
+        .map(|id| {
+            let router = std::sync::Arc::clone(&router);
+            thread::spawn(move || {
+                let text = format!("http-client-{id}");
+                assert_eq!(
+                    router
+                        .route_call("http__echo", json!({"text":text,"rendezvous":true}))
+                        .unwrap()["content"][0]["text"],
+                    text
+                );
+            })
+        })
+        .collect();
+    for call in calls {
+        call.join().unwrap();
+    }
+}

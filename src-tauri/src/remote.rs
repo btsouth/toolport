@@ -1111,7 +1111,7 @@ fn authed_transport(
         let next_refresh_at = Arc::clone(&next_refresh_at);
         let credential_update = Arc::clone(&credential_update);
         let refreshed_during_connect = Arc::clone(&refreshed_during_connect);
-        Some(Box::new(move |force| {
+        Some(Box::new(move |force, rejected| {
             let deadline = *next_refresh_at
                 .lock()
                 .map_err(|_| "OAuth refresh deadline lock poisoned".to_string())?;
@@ -1151,7 +1151,7 @@ fn authed_transport(
                 },
                 &mut update,
                 force,
-                None,
+                rejected,
             ) {
                 Ok(refreshed) => refreshed,
                 Err(e) => {
@@ -2388,6 +2388,104 @@ mod tests {
     }
 
     #[test]
+    fn http_rejection_adopts_unsaved_credentials_without_an_exchange() {
+        use crate::downstream::Transport;
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            endpoint.release.send(()).unwrap();
+            secrets::tests::with_failed_write(STATE_KEY, || {
+                assert_eq!(refresh_token("rotation", None).unwrap(), "token-1");
+            });
+            for (concurrent, pending) in
+                [(false, true), (true, true), (false, false), (true, false)]
+            {
+                let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+                let mut transport = HttpTransport::with_auth_refresh(
+                    &format!("http://{}/", server.server_addr()),
+                    Some("token-0".into()),
+                    Some(Box::new(|force, rejected| {
+                        if force {
+                            assert_eq!(rejected, Some("token-0"));
+                            refresh_token("rotation", rejected).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    })),
+                );
+                if !pending {
+                    // Exercise authed_transport's actual callback with a peer token
+                    // saved after construction, while proactive refresh is not due.
+                    let mut state = load_state("rotation").unwrap().unwrap();
+                    state.expires_at = Some(now_epoch_seconds() + 3600);
+                    secrets::set_secret(
+                        "rotation",
+                        STATE_KEY,
+                        &serde_json::to_string(&state).unwrap(),
+                    )
+                    .unwrap();
+                    secrets::set_secret("rotation", secrets::HTTP_AUTH_KEY, "token-0").unwrap();
+                    assert_eq!(
+                        current_credential("rotation").unwrap().as_deref(),
+                        Some("token-0")
+                    );
+                    transport = authed_transport(
+                        &format!("http://{}/", server.server_addr()),
+                        Some("token-0".into()),
+                        "rotation",
+                        false,
+                        Duration::from_secs(5),
+                    )
+                    .unwrap()
+                    .0;
+                    secrets::set_secret("rotation", secrets::HTTP_AUTH_KEY, "token-1").unwrap();
+                }
+                transport.set_server_id("rotation");
+                let wire = std::thread::spawn(move || {
+                    let mut auths = Vec::new();
+                    for _ in 0..2 {
+                        let mut request = server
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap()
+                            .unwrap();
+                        let auth = request
+                            .headers()
+                            .iter()
+                            .find(|h| h.field.equiv("Authorization"))
+                            .unwrap()
+                            .value
+                            .as_str()
+                            .to_string();
+                        let mut text = String::new();
+                        request.as_reader().read_to_string(&mut text).unwrap();
+                        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        let response = if auth == "Bearer token-1" {
+                            tiny_http::Response::from_string(serde_json::json!({"jsonrpc":"2.0","id":body["id"],"result":{"ok":true}}).to_string())
+                        } else {
+                            tiny_http::Response::from_string("revoked").with_status_code(401)
+                        };
+                        auths.push(auth);
+                        request.respond(response).unwrap();
+                    }
+                    auths
+                });
+                let result = if concurrent {
+                    transport.concurrent().unwrap().request_with_cancel(
+                        "echo",
+                        serde_json::json!({}),
+                        None,
+                    )
+                } else {
+                    transport.request("echo", serde_json::json!({}))
+                };
+                assert_eq!(result.unwrap(), serde_json::json!({"ok":true}));
+                assert_eq!(wire.join().unwrap(), ["Bearer token-0", "Bearer token-1"]);
+            }
+            assert_eq!(endpoint.count(), 1);
+        });
+    }
+
+    #[test]
     fn current_credential_vault_state_after_memory_wins_and_clear_removes_auth() {
         secrets::tests::with_isolated_vault(|| {
             let endpoint = RotatingEndpoint::new();
@@ -2566,7 +2664,7 @@ mod tests {
         let mut transport = HttpTransport::with_auth_refresh(
             &url,
             Some("old-token".into()),
-            Some(Box::new(|_| Err(OAUTH_REFRESH_LOCK_ERROR.into()))),
+            Some(Box::new(|_, _| Err(OAUTH_REFRESH_LOCK_ERROR.into()))),
         );
         let worker = std::thread::spawn(move || {
             let mut request = server
@@ -2616,7 +2714,7 @@ mod tests {
                 let mut transport = HttpTransport::with_auth_refresh(
                     &url,
                     Some("old-token".into()),
-                    Some(Box::new(move |force| {
+                    Some(Box::new(move |force, _| {
                         if proactive || force {
                             Err(callback_error.clone())
                         } else {
