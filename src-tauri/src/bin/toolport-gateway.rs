@@ -1824,16 +1824,26 @@ fn grouped_tool_defs(host: &HostState, catalog: &[Value]) -> Vec<Value> {
 }
 
 fn grouped_tool_defs_with_code_mode(code_mode: bool, catalog: &[Value]) -> Vec<Value> {
+    grouped_tool_defs_from_tools(code_mode, catalog.iter())
+}
+
+fn grouped_tool_defs_from_tools<'a>(
+    code_mode: bool,
+    catalog: impl IntoIterator<Item = &'a Value>,
+) -> Vec<Value> {
     let mut tools = floor_tool_defs_with_code_mode(code_mode);
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for t in catalog {
-        if let Some(p) = namespaced_prefix(t) {
-            *counts.entry(p).or_insert(0) += 1;
+    let mut counts = HashMap::<String, usize>::new();
+    let mut prefixes = Vec::new();
+    for tool in catalog {
+        if let Some(prefix) = namespaced_prefix(tool) {
+            if !counts.contains_key(&prefix) {
+                prefixes.push(prefix.clone());
+            }
+            *counts.entry(prefix).or_default() += 1;
         }
     }
-    for prefix in distinct_server_prefixes(catalog) {
-        let n = counts.get(&prefix).copied().unwrap_or(0);
-        tools.push(help_tool_def(&prefix, n));
+    for prefix in prefixes {
+        tools.push(help_tool_def(&prefix, counts[&prefix]));
     }
     tools
 }
@@ -3498,23 +3508,43 @@ fn mcp_app_tools_for_client(
     router: &Router,
     reg: &Registry,
 ) -> Vec<Value> {
-    if !relays_mcp_app_html_to_active_client(router, allowed) {
-        return Vec::new();
-    }
+    let (relays, servers) = if active_client_supports_mcp_app_html() {
+        router.mcp_app_html_visibility(|server| {
+            allowed.is_none_or(|scope| server_in_allowed_scope(server, scope))
+        })
+    } else {
+        (false, Vec::new())
+    };
     let owners = unique_prefix_owners(reg);
-    scope_tools(catalog, allowed, |name| {
-        owner_of_exposed_tool(Some(router), &owners, name)
-    })
-    .into_iter()
-    .filter(|tool| {
-        is_mcp_app_tool(tool)
-            && tool
-                .get("name")
-                .and_then(Value::as_str)
-                .and_then(|name| router.route_of(name))
-                .is_some_and(|(server, _)| server_supports_mcp_app_html(router, server))
-    })
-    .collect()
+    catalog
+        .iter()
+        .filter(|tool| {
+            allowed.is_none_or(|scope| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| {
+                        tool_in_scope(name, scope, &|name| {
+                            owner_of_exposed_tool(Some(router), &owners, name)
+                        })
+                    })
+            }) && mcp_app_tool_for_view(tool, router, relays, &servers)
+        })
+        .cloned()
+        .collect()
+}
+
+fn mcp_app_tool_for_view(tool: &Value, router: &Router, relays: bool, servers: &[String]) -> bool {
+    relays
+        && is_mcp_app_tool(tool)
+        && tool
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| router.route_of(name))
+            .is_some_and(|(server, _)| {
+                servers
+                    .binary_search_by(|id| id.as_str().cmp(server))
+                    .is_ok()
+            })
 }
 
 /// Whether a client scoped to `allowed` may see the exposed tool `name`. See
@@ -6192,7 +6222,7 @@ impl GatewayResponse {
 const TOOL_SURFACE_CACHE_VIEWS: usize = 8;
 const TOOL_SURFACE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct ToolSurfaceKey {
     catalog: usize,
     router: usize,
@@ -6213,25 +6243,47 @@ struct ToolSurfaceEntry {
     // fork mutable router publications. They do not retain parsed catalogs.
     _catalog: Weak<CatalogSnapshot>,
     _router: Weak<Router>,
-    full: Arc<savings::SerializedSurface>,
+    full: Arc<ToolSurfaceBaseline>,
     exposed: Arc<savings::SerializedSurface>,
     bytes: usize,
+}
+
+struct ToolSurfaceBaseline {
+    summary: Arc<savings::SurfaceSummary>,
+    key: ToolSurfaceKey,
+}
+
+impl std::ops::Deref for ToolSurfaceBaseline {
+    type Target = savings::SurfaceSummary;
+    fn deref(&self) -> &Self::Target {
+        &self.summary
+    }
+}
+
+type ToolSurfaces = (Arc<ToolSurfaceBaseline>, Arc<savings::SerializedSurface>);
+
+struct ToolSurfaceFlight {
+    key: ToolSurfaceKey,
+    catalog: Weak<CatalogSnapshot>,
+    router: Weak<Router>,
+    cell: Arc<OnceLock<ToolSurfaces>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TOOL_SURFACE_BUILD_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Default)]
 struct ToolSurfaceCache {
     entries: std::collections::VecDeque<ToolSurfaceEntry>,
+    flights: Vec<ToolSurfaceFlight>,
     bytes: usize,
 }
 
 impl ToolSurfaceCache {
-    fn get(
-        &mut self,
-        key: &ToolSurfaceKey,
-    ) -> Option<(
-        Arc<savings::SerializedSurface>,
-        Arc<savings::SerializedSurface>,
-    )> {
+    fn get(&mut self, key: &ToolSurfaceKey) -> Option<ToolSurfaces> {
+        self.prune();
         let index = self.entries.iter().position(|entry| &entry.key == key)?;
         let entry = self.entries.remove(index).expect("cache entry exists");
         let surfaces = (Arc::clone(&entry.full), Arc::clone(&entry.exposed));
@@ -6239,10 +6291,22 @@ impl ToolSurfaceCache {
         Some(surfaces)
     }
 
+    fn prune(&mut self) {
+        self.entries
+            .retain(|entry| entry._catalog.strong_count() > 0 && entry._router.strong_count() > 0);
+        self.bytes = self.entries.iter().map(|entry| entry.bytes).sum();
+        self.flights
+            .retain(|flight| flight.catalog.strong_count() > 0 && flight.router.strong_count() > 0);
+    }
+
     fn insert(&mut self, entry: ToolSurfaceEntry) {
+        self.prune();
         // A single oversized view is served without retaining it. No catalog
         // size can force the resident cache beyond its byte budget.
-        if entry.bytes > TOOL_SURFACE_CACHE_BYTES {
+        if entry.bytes > TOOL_SURFACE_CACHE_BYTES
+            || entry._catalog.strong_count() == 0
+            || entry._router.strong_count() == 0
+        {
             return;
         }
         while self.entries.len() >= TOOL_SURFACE_CACHE_VIEWS
@@ -6266,10 +6330,7 @@ fn cached_tool_surfaces(
     allowed: Option<&HashSet<String>>,
     profile: Option<&str>,
     mode: DiscoveryMode,
-) -> (
-    Arc<savings::SerializedSurface>,
-    Arc<savings::SerializedSurface>,
-) {
+) -> ToolSurfaces {
     use sha2::{Digest, Sha256};
     let mut allowed_key = allowed.map(|set| set.iter().cloned().collect::<Vec<_>>());
     if let Some(allowed) = &mut allowed_key {
@@ -6296,15 +6357,85 @@ fn cached_tool_surfaces(
         relays_apps,
         app_servers,
     };
-    // Single flight over immutable snapshots. A rebuild publishes different
-    // identities; it cannot overwrite or combine this view's surfaces.
-    let mut cache = host
-        .tool_surfaces
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(surfaces) = cache.get(&key) {
-        return surfaces;
+    // Request-local snapshots have no future hit. Empty snapshots read a live
+    // router, so its identity alone cannot describe their changing contents.
+    if Arc::strong_count(snapshot) == 1 || snapshot.tools.is_empty() {
+        return build_tool_surfaces(reg, router, snapshot, allowed, mode, &key);
     }
+    let cell = {
+        let mut cache = host
+            .tool_surfaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(surfaces) = cache.get(&key) {
+            return surfaces;
+        }
+        if let Some(flight) = cache.flights.iter().find(|flight| flight.key == key) {
+            Arc::clone(&flight.cell)
+        } else {
+            let cell = Arc::new(OnceLock::new());
+            cache.flights.push(ToolSurfaceFlight {
+                key: key.clone(),
+                catalog: Arc::downgrade(snapshot),
+                router: Arc::downgrade(router),
+                cell: Arc::clone(&cell),
+            });
+            cell
+        }
+    };
+    // OnceLock retries initialization after a panic. No global cache lock is
+    // held while building or waiting for this key.
+    cell.get_or_init(|| {
+        #[cfg(test)]
+        TOOL_SURFACE_BUILD_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let (full, exposed) = build_tool_surfaces(reg, router, snapshot, allowed, mode, &key);
+        let key_bytes = key.app_servers.capacity() * std::mem::size_of::<String>()
+            + key.app_servers.iter().map(String::capacity).sum::<usize>()
+            + key.profile.as_ref().map_or(0, String::capacity)
+            + key.connection_profile.as_ref().map_or(0, String::capacity)
+            + key.allowed.as_ref().map_or(0, |scope| {
+                scope.capacity() * std::mem::size_of::<String>()
+                    + scope.iter().map(String::capacity).sum::<usize>()
+            });
+        let bytes = std::mem::size_of::<ToolSurfaceEntry>()
+            + std::mem::size_of::<ToolSurfaceBaseline>()
+            + 2 * key_bytes
+            + exposed.retained_bytes()
+            + if Arc::ptr_eq(&full.summary, &exposed.summary) {
+                0
+            } else {
+                full.retained_bytes()
+            };
+        let mut cache = host
+            .tool_surfaces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.insert(ToolSurfaceEntry {
+            key: key.clone(),
+            _catalog: Arc::downgrade(snapshot),
+            _router: Arc::downgrade(router),
+            full: Arc::clone(&full),
+            exposed: Arc::clone(&exposed),
+            bytes,
+        });
+        cache.flights.retain(|flight| flight.key != key);
+        (full, exposed)
+    })
+    .clone()
+}
+
+fn build_tool_surfaces(
+    reg: &Registry,
+    router: &Router,
+    snapshot: &CatalogSnapshot,
+    allowed: Option<&HashSet<String>>,
+    mode: DiscoveryMode,
+    key: &ToolSurfaceKey,
+) -> ToolSurfaces {
     let live;
     let catalog = if snapshot.tools.is_empty() {
         live = router.aggregated_tools();
@@ -6347,79 +6478,44 @@ fn cached_tool_surfaces(
         allowed,
         DiscoveryMode::Full,
     );
-    let full = Arc::new(savings::SerializedSurface::from_tools(
-        floor.into_iter().chain(
+    let full_tools = || {
+        floor.iter().cloned().chain(
             scoped
                 .iter()
                 .copied()
                 .filter(|tool| relays_apps || mcp_app_tool_is_model_visible(tool))
                 .map(neutralized),
-        ),
-    ));
-    let exposed = if mode == DiscoveryMode::Full {
-        Arc::clone(&full)
-    } else {
-        let mut floor = floor_tool_defs_with_code_mode(key.code_mode);
-        if mode == DiscoveryMode::Grouped {
-            let mut counts = HashMap::<String, usize>::new();
-            let mut prefixes = Vec::new();
-            for tool in &scoped {
-                if let Some(prefix) = namespaced_prefix(tool) {
-                    if !counts.contains_key(&prefix) {
-                        prefixes.push(prefix.clone());
-                    }
-                    *counts.entry(prefix).or_default() += 1;
-                }
-            }
-            for prefix in prefixes {
-                floor.push(help_tool_def(&prefix, counts[&prefix]));
-            }
-        }
-        let apps = scoped
+        )
+    };
+    if mode == DiscoveryMode::Full {
+        let exposed = Arc::new(savings::SerializedSurface::from_tools(full_tools()));
+        return (
+            Arc::new(ToolSurfaceBaseline {
+                summary: Arc::clone(&exposed.summary),
+                key: key.clone(),
+            }),
+            exposed,
+        );
+    }
+    let full = Arc::new(ToolSurfaceBaseline {
+        summary: Arc::new(savings::SurfaceSummary::from_tools(full_tools())),
+        key: key.clone(),
+    });
+    let floor = grouped_tool_defs_from_tools(
+        key.code_mode,
+        scoped
             .iter()
             .copied()
-            .filter(|tool| {
-                relays_apps
-                    && is_mcp_app_tool(tool)
-                    && tool
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .and_then(|name| router.route_of(name))
-                        .is_some_and(|(server, _)| {
-                            key.app_servers
-                                .binary_search_by(|id| id.as_str().cmp(server))
-                                .is_ok()
-                        })
-            })
-            .map(neutralized);
-        Arc::new(savings::SerializedSurface::from_tools(
-            floor.into_iter().chain(apps),
-        ))
-    };
-    let key_bytes = key.app_servers.capacity() * std::mem::size_of::<String>()
-        + key.app_servers.iter().map(String::capacity).sum::<usize>()
-        + key.profile.as_ref().map_or(0, String::capacity)
-        + key.connection_profile.as_ref().map_or(0, String::capacity)
-        + key.allowed.as_ref().map_or(0, |scope| {
-            scope.capacity() * std::mem::size_of::<String>()
-                + scope.iter().map(String::capacity).sum::<usize>()
-        });
-    let bytes = std::mem::size_of::<ToolSurfaceEntry>()
-        + key_bytes
-        + full.retained_bytes()
-        + if Arc::ptr_eq(&full, &exposed) {
-            0
-        } else {
-            exposed.retained_bytes()
-        };
-    cache.insert(ToolSurfaceEntry {
-        key,
-        _catalog: Arc::downgrade(snapshot),
-        _router: Arc::downgrade(router),
-        full: Arc::clone(&full),
-        exposed: Arc::clone(&exposed),
-        bytes,
-    });
+            .filter(|_| mode == DiscoveryMode::Grouped),
+    );
+    let apps = scoped
+        .iter()
+        .copied()
+        .filter(|tool| mcp_app_tool_for_view(tool, router, relays_apps, &key.app_servers))
+        .map(neutralized);
+    let exposed = Arc::new(savings::SerializedSurface::from_tools(
+        floor.into_iter().chain(apps),
+    ));
     (full, exposed)
 }
 
@@ -14875,6 +14971,19 @@ fn process_request_wire(
                 client,
                 &full,
                 &exposed,
+                || {
+                    let rebuilt = build_tool_surfaces(
+                        &reg,
+                        &router,
+                        &cache_snapshot,
+                        allowed,
+                        DiscoveryMode::Full,
+                        &full.key,
+                    )
+                    .1;
+                    debug_assert_eq!(rebuilt.hash, full.hash);
+                    rebuilt.json.get().to_string()
+                },
                 |name| router.route_of(name).map(|(server, _)| server.to_string()),
             );
         }
@@ -37656,61 +37765,91 @@ mod tests {
         let (reg, router, snapshot) = tool_surface_fixture();
         *state.registry.lock().unwrap() = reg.clone();
         *state.router.lock().unwrap() = Arc::clone(&router);
-        *state.cached_tools.lock().unwrap() = snapshot;
         let allowed = HashSet::from(["alpha".to_string()]);
-        for code_mode in [false, true] {
-            state.set_code_mode(code_mode);
-            for mode in [
-                DiscoveryMode::Full,
-                DiscoveryMode::Lazy,
-                DiscoveryMode::Grouped,
-            ] {
-                state.set_discovery_mode(mode);
-                for modern in [false, true] {
-                    for scope in [None, Some(&allowed)] {
-                        let req = if modern {
-                            modern_req(
-                                7,
-                                "tools/list",
-                                json!({"cursor":"unchanged-existing-behavior"}),
-                            )
-                        } else {
-                            json!({"jsonrpc":"2.0", "id":7,"method":"tools/list", "params":{"cursor":"unchanged-existing-behavior"}})
-                        };
-                        let guard = SearchGuard::default();
-                        let run = || {
-                            process_request_wire(
-                                &state, &req, &guard, scope, None, None, None, None, None, mode,
-                            )
-                            .unwrap()
-                        };
-                        let cold = run();
-                        let warm = run();
-                        assert!(Arc::ptr_eq(
-                            cold.surface.as_ref().unwrap(),
-                            warm.surface.as_ref().unwrap()
-                        ));
-                        let expected = handle_request(
-                            &state,
-                            &req,
-                            &reg,
-                            &router,
-                            &state.cached_tools.lock().unwrap().tools,
-                            mode == DiscoveryMode::Lazy,
-                            None,
-                            &SearchGuard::default(),
-                            scope,
-                            None,
-                        )
-                        .unwrap();
-                        assert_eq!(
-                            serde_json::to_vec(&cold).unwrap(),
-                            serde_json::to_vec(&expected).unwrap()
-                        );
-                        assert_eq!(
-                            serde_json::to_vec(&warm).unwrap(),
-                            serde_json::to_vec(&expected).unwrap()
-                        );
+        for empty in [false, true] {
+            *state.cached_tools.lock().unwrap() = if empty {
+                Arc::new(CatalogSnapshot::default())
+            } else {
+                Arc::clone(&snapshot)
+            };
+            for strict in [false, true] {
+                let mut reg = reg.clone();
+                if strict {
+                    reg.set_safety_level(registry::SafetyLevel::Strict);
+                }
+                *state.registry.lock().unwrap() = reg.clone();
+                let view = if strict {
+                    let mut view = (*router).clone();
+                    view.requarantine(BTreeSet::from(["alpha__read".into()]));
+                    Arc::new(view)
+                } else {
+                    Arc::clone(&router)
+                };
+                *state.router.lock().unwrap() = Arc::clone(&view);
+                for code_mode in [false, true] {
+                    state.set_code_mode(code_mode);
+                    for mode in [
+                        DiscoveryMode::Full,
+                        DiscoveryMode::Lazy,
+                        DiscoveryMode::Grouped,
+                    ] {
+                        state.set_discovery_mode(mode);
+                        for era in 0..3 {
+                            for scope in [None, Some(&allowed)] {
+                                let req = if era == 2 {
+                                    modern_apps_req(
+                                        7,
+                                        "tools/list",
+                                        json!({"cursor":"unchanged-existing-behavior"}),
+                                    )
+                                } else if era == 1 {
+                                    modern_req(
+                                        7,
+                                        "tools/list",
+                                        json!({"cursor":"unchanged-existing-behavior"}),
+                                    )
+                                } else {
+                                    json!({"jsonrpc":"2.0", "id":7,"method":"tools/list", "params":{"cursor":"unchanged-existing-behavior"}})
+                                };
+                                let guard = SearchGuard::default();
+                                let run = || {
+                                    process_request_wire(
+                                        &state, &req, &guard, scope, None, None, None, None, None,
+                                        mode,
+                                    )
+                                    .unwrap()
+                                };
+                                let cold = run();
+                                let warm = run();
+                                if !empty {
+                                    assert!(Arc::ptr_eq(
+                                        cold.surface.as_ref().unwrap(),
+                                        warm.surface.as_ref().unwrap()
+                                    ));
+                                }
+                                let expected = handle_request(
+                                    &state,
+                                    &req,
+                                    &reg,
+                                    &view,
+                                    &state.cached_tools.lock().unwrap().tools,
+                                    mode == DiscoveryMode::Lazy,
+                                    None,
+                                    &SearchGuard::default(),
+                                    scope,
+                                    None,
+                                )
+                                .unwrap();
+                                assert_eq!(
+                                    serde_json::to_vec(&cold).unwrap(),
+                                    serde_json::to_vec(&expected).unwrap()
+                                );
+                                assert_eq!(
+                                    serde_json::to_vec(&warm).unwrap(),
+                                    serde_json::to_vec(&expected).unwrap()
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -37747,6 +37886,25 @@ mod tests {
                 .unwrap()
                 .contains("apps__app_only"));
             let visible = run(&apps);
+            for req in [&ordinary, &apps] {
+                let expected = handle_request(
+                    &state,
+                    req,
+                    &state.registry.lock().unwrap(),
+                    &state.router.lock().unwrap(),
+                    &state.cached_tools.lock().unwrap().tools,
+                    mode == DiscoveryMode::Lazy,
+                    None,
+                    &SearchGuard::default(),
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(
+                    serde_json::to_vec(&run(req)).unwrap(),
+                    serde_json::to_vec(&expected).unwrap()
+                );
+            }
             assert!(serde_json::to_string(&visible)
                 .unwrap()
                 .contains("apps__app_only"));
@@ -37820,6 +37978,7 @@ mod tests {
         router.add_with_reconnect(connect(true), Some(Box::new(move || Some(connect(false)))));
         let router = Arc::new(router);
         let snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        *host.cached_tools.lock().unwrap() = Arc::clone(&snapshot);
         let request = modern_apps_req(1, "tools/list", json!({}));
         let _caps = UpstreamCapabilitiesGuard::enter(&request);
         let get = || {
@@ -37841,7 +38000,7 @@ mod tests {
         assert!(!router.mcp_app_html_visibility(|_| true).0);
         let after = get();
         assert!(!Arc::ptr_eq(&before.1, &after.1));
-        assert!(!after.0.json.get().contains("apps__app_only"));
+        assert_ne!(before.0.hash, after.0.hash);
         assert!(!after.1.json.get().contains("apps__app_only"));
         assert!(Arc::ptr_eq(&after.1, &get().1));
     }
@@ -37851,6 +38010,7 @@ mod tests {
         let _env = DataDirTestEnv::new("tool-surface-invalidation");
         let host = dispatch_host(false);
         let (reg, mut router, snapshot) = tool_surface_fixture();
+        *host.cached_tools.lock().unwrap() = Arc::clone(&snapshot);
         let get = |reg: &Registry,
                    router: &Arc<Router>,
                    snapshot: &Arc<CatalogSnapshot>,
@@ -37961,11 +38121,217 @@ mod tests {
     }
 
     #[test]
+    fn tool_surface_cold_view_does_not_block_another_views_hit() {
+        let _env = DataDirTestEnv::new("tool-surface-independent-flight");
+        let host = dispatch_host(false);
+        let (reg, router, snapshot) = tool_surface_fixture();
+        *host.cached_tools.lock().unwrap() = Arc::clone(&snapshot);
+        let hit = cached_tool_surfaces(
+            &host,
+            &reg,
+            &router,
+            &snapshot,
+            None,
+            Some("b"),
+            DiscoveryMode::Full,
+        )
+        .1;
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let cold = scope.spawn(|| {
+                TOOL_SURFACE_BUILD_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                    }))
+                });
+                cached_tool_surfaces(
+                    &host,
+                    &reg,
+                    &router,
+                    &snapshot,
+                    None,
+                    Some("a"),
+                    DiscoveryMode::Full,
+                )
+            });
+            started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let (hit_tx, hit_rx) = std::sync::mpsc::channel();
+            let warm = scope.spawn(|| {
+                let next = cached_tool_surfaces(
+                    &host,
+                    &reg,
+                    &router,
+                    &snapshot,
+                    None,
+                    Some("b"),
+                    DiscoveryMode::Full,
+                )
+                .1;
+                hit_tx.send(Arc::ptr_eq(&hit, &next)).unwrap();
+            });
+            let completed = hit_rx.recv_timeout(Duration::from_secs(10));
+            release_tx.send(()).unwrap();
+            cold.join().unwrap();
+            warm.join().unwrap();
+            assert_eq!(
+                completed.unwrap(),
+                true,
+                "cached view waited for another key"
+            );
+        });
+    }
+
+    #[test]
+    fn tool_surface_single_flight_retries_after_builder_panic() {
+        let _env = DataDirTestEnv::new("tool-surface-panicked-flight");
+        let host = dispatch_host(false);
+        let (reg, router, snapshot) = tool_surface_fixture();
+        *host.cached_tools.lock().unwrap() = Arc::clone(&snapshot);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let failed = scope.spawn(|| {
+                TOOL_SURFACE_BUILD_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                        panic!("synthetic cold build panic");
+                    }))
+                });
+                cached_tool_surfaces(
+                    &host,
+                    &reg,
+                    &router,
+                    &snapshot,
+                    None,
+                    None,
+                    DiscoveryMode::Full,
+                )
+            });
+            started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let (retry_tx, retry_rx) = std::sync::mpsc::channel();
+            let retry = scope.spawn(|| {
+                let value = cached_tool_surfaces(
+                    &host,
+                    &reg,
+                    &router,
+                    &snapshot,
+                    None,
+                    None,
+                    DiscoveryMode::Full,
+                )
+                .1;
+                retry_tx.send(value).unwrap();
+            });
+            release_tx.send(()).unwrap();
+            assert!(failed.join().is_err());
+            let value = retry_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            retry.join().unwrap();
+            assert!(Arc::ptr_eq(
+                &value,
+                &cached_tool_surfaces(
+                    &host,
+                    &reg,
+                    &router,
+                    &snapshot,
+                    None,
+                    None,
+                    DiscoveryMode::Full
+                )
+                .1
+            ));
+        });
+        assert!(host.tool_surfaces.lock().unwrap().flights.is_empty());
+    }
+
+    #[test]
+    fn tool_surface_cache_skips_local_snapshots_and_prunes_dead_publications() {
+        let _env = DataDirTestEnv::new("tool-surface-retired-views");
+        let host = dispatch_host(false);
+        let (reg, router, snapshot) = tool_surface_fixture();
+        let get = |snapshot: &Arc<CatalogSnapshot>, router: &Arc<Router>| {
+            cached_tool_surfaces(
+                &host,
+                &reg,
+                router,
+                snapshot,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+        };
+        let local = Arc::new(CatalogSnapshot::new(snapshot.tools.clone()));
+        get(&local, &router);
+        assert!(host.tool_surfaces.lock().unwrap().entries.is_empty());
+        *host.cached_tools.lock().unwrap() = Arc::clone(&snapshot);
+        get(&snapshot, &router);
+        assert_eq!(host.tool_surfaces.lock().unwrap().entries.len(), 1);
+        let next = Arc::new(CatalogSnapshot::new(snapshot.tools.clone()));
+        *host.cached_tools.lock().unwrap() = Arc::clone(&next);
+        drop(snapshot);
+        get(&next, &router); // get prunes the retired catalog before insertion
+        assert_eq!(host.tool_surfaces.lock().unwrap().entries.len(), 1);
+        let weak = Arc::downgrade(&router);
+        drop(router);
+        assert_eq!(weak.strong_count(), 0);
+        let mut cache = host.tool_surfaces.lock().unwrap();
+        let mut entry = cache.entries.pop_front().unwrap();
+        cache.bytes = 0;
+        entry._router = Arc::downgrade(&Arc::new(Router::new()));
+        cache.insert(entry); // insert also prunes dead identities
+        cache.prune();
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn tool_surface_adapter_profile_matches_uncached_bytes() {
+        let _env = DataDirTestEnv::new("tool-surface-adapter-wire");
+        let host = dispatch_host(false);
+        let (mut reg, router, _) = tool_surface_fixture();
+        reg.profiles.push(registry::Profile {
+            id: "adapter".into(),
+            name: "Adapter".into(),
+            enabled_server_ids: vec!["alpha".into()],
+            tool_scope: HashMap::from([("alpha".into(), vec!["read".into()])]),
+            instructions: None,
+            unknown_fields: serde_json::Map::new(),
+        });
+        *host.router.lock().unwrap() = Arc::clone(&router);
+        let (view, snapshot) =
+            host.router_for_adapter_profile(Arc::clone(&router), &reg, "adapter");
+        let _profile = ConnectionProfileGuard::enter(Some("adapter".into()));
+        for mode in [
+            DiscoveryMode::Full,
+            DiscoveryMode::Lazy,
+            DiscoveryMode::Grouped,
+        ] {
+            let surfaces =
+                cached_tool_surfaces(&host, &reg, &view, &snapshot, None, Some("adapter"), mode);
+            let expected = tool_surface(&host, &reg, &view, &snapshot.tools, None, mode);
+            assert_eq!(
+                surfaces.1.json.get().as_bytes(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            let warm =
+                cached_tool_surfaces(&host, &reg, &view, &snapshot, None, Some("adapter"), mode);
+            assert_eq!(
+                warm.1.json.get().as_bytes(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            assert!(Arc::ptr_eq(&surfaces.1, &warm.1));
+        }
+    }
+
+    #[test]
     fn tool_surface_cache_bounds_bytes_and_evicts_least_recent_view() {
         let _env = DataDirTestEnv::new("tool-surface-lru");
         let host = dispatch_host(false);
         let (reg, router, _) = tool_surface_fixture();
         let snapshot = Arc::new(CatalogSnapshot::new(vec![json!({"name":"alpha__read"})]));
+        *host.cached_tools.lock().unwrap() = Arc::clone(&snapshot);
         let get = |profile: &str| {
             cached_tool_surfaces(
                 &host,
@@ -38003,6 +38369,7 @@ mod tests {
         let large = Arc::new(CatalogSnapshot::new((0..10_000).map(|i| json!({
             "name":format!("alpha__read_{i}"),"description":"x".repeat(2700),"inputSchema":{"type":"object"}
         })).collect()));
+        *host.cached_tools.lock().unwrap() = Arc::clone(&large);
         for profile in ["large-a", "large-b", "large-c"] {
             cached_tool_surfaces(
                 &host,
@@ -38020,7 +38387,7 @@ mod tests {
         let cache = host.tool_surfaces.lock().unwrap();
         eprintln!(
             "10k tool surface: {} JSON bytes; {} accounted cache bytes across {} views (limit {})",
-            cache.entries.back().unwrap().full.json.get().len(),
+            cache.entries.back().unwrap().full.bytes,
             cache.bytes,
             cache.entries.len(),
             TOOL_SURFACE_CACHE_BYTES
@@ -38114,7 +38481,10 @@ mod tests {
         })]);
 
         assert_eq!(old.search.surface_bytes, savings::surface_bytes(&old.tools));
-        assert_eq!(next.search.surface_bytes, savings::surface_bytes(&next.tools));
+        assert_eq!(
+            next.search.surface_bytes,
+            savings::surface_bytes(&next.tools)
+        );
         assert!(old.search.matches_catalog(&old.tools));
         assert!(next.search.matches_catalog(&next.tools));
         assert!(

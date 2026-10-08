@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const TOKENIZER: &str = "cl100k_base";
 
@@ -29,7 +29,7 @@ impl CatalogSession {
     fn first_exposure(
         &self,
         client: Option<&str>,
-        full: &SerializedSurface,
+        full: &SurfaceSummary,
         exposed: &SerializedSurface,
     ) -> bool {
         let mut hash = Sha256::new();
@@ -128,7 +128,9 @@ pub fn surface_bytes(tools: &[Value]) -> u64 {
 /// Serialize the array once while exposing each element's exact byte length to
 /// attribution. This produces the same bytes as serde_json::to_vec(tools).
 fn serialize_surface(tools: &[Value], on_tool: impl FnMut(&Value, u64)) -> u64 {
-    serialize_surface_text(tools, on_tool).len() as u64
+    let mut writer = SurfaceWriter::default();
+    write_surface(&mut writer, tools, on_tool);
+    writer.len
 }
 
 fn serialize_surface_text(tools: &[Value], mut on_tool: impl FnMut(&Value, u64)) -> String {
@@ -162,14 +164,113 @@ pub fn estimate_tokens(tools: &[Value]) -> u64 {
     bytes.div_ceil(4) as u64
 }
 
-/// Immutable, exact JSON bytes and their digest. Names and element sizes are
-/// retained for savings attribution without keeping another parsed catalog.
+/// Digest, exact length and per-name attribution without retaining schema text.
+#[derive(Debug)]
+pub struct SurfaceSummary {
+    pub hash: [u8; 32],
+    pub bytes: u64,
+    tools: BTreeMap<String, u64>,
+    count: usize,
+}
+
+#[derive(Default)]
+struct SurfaceWriter {
+    text: Option<Vec<u8>>,
+    hash: Option<Sha256>,
+    len: u64,
+}
+
+impl Write for SurfaceWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Some(text) = &mut self.text {
+            text.extend_from_slice(bytes);
+        }
+        if let Some(hash) = &mut self.hash {
+            hash.update(bytes);
+        }
+        self.len += bytes.len() as u64;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn write_surface<T: std::borrow::Borrow<Value>>(
+    writer: &mut SurfaceWriter,
+    tools: impl IntoIterator<Item = T>,
+    mut on_tool: impl FnMut(&Value, u64),
+) -> usize {
+    writer.write_all(b"[").unwrap();
+    let mut count = 0;
+    for tool in tools {
+        let tool = tool.borrow();
+        if count > 0 {
+            writer.write_all(b",").unwrap();
+        }
+        let start = writer.len;
+        serde_json::to_writer(&mut *writer, tool).expect("serde_json::Value serializes");
+        on_tool(tool, writer.len - start);
+        count += 1;
+    }
+    writer.write_all(b"]").unwrap();
+    count
+}
+
+impl SurfaceSummary {
+    pub fn from_tools<T: std::borrow::Borrow<Value>>(tools: impl IntoIterator<Item = T>) -> Self {
+        Self::build(&mut SurfaceWriter::default(), tools)
+    }
+
+    fn build<T: std::borrow::Borrow<Value>>(
+        writer: &mut SurfaceWriter,
+        tools: impl IntoIterator<Item = T>,
+    ) -> Self {
+        writer.hash = Some(Sha256::new());
+        let mut sizes = BTreeMap::new();
+        let count = write_surface(writer, tools, |tool, bytes| {
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                *sizes.entry(name.to_string()).or_default() += bytes;
+            }
+        });
+        Self {
+            hash: writer
+                .hash
+                .as_ref()
+                .expect("summary hashes bytes")
+                .clone()
+                .finalize()
+                .into(),
+            bytes: writer.len,
+            tools: sizes,
+            count,
+        }
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self
+                .tools
+                .keys()
+                .map(|name| name.capacity() + 128)
+                .sum::<usize>()
+    }
+}
+
+/// Immutable wire bytes with shared attribution metadata.
 #[derive(Debug)]
 pub struct SerializedSurface {
     pub json: Box<serde_json::value::RawValue>,
-    pub hash: [u8; 32],
-    tools: BTreeMap<String, u64>,
-    count: usize,
+    pub summary: Arc<SurfaceSummary>,
+}
+
+impl std::ops::Deref for SerializedSurface {
+    type Target = SurfaceSummary;
+
+    fn deref(&self) -> &Self::Target {
+        &self.summary
+    }
 }
 
 impl SerializedSurface {
@@ -177,44 +278,22 @@ impl SerializedSurface {
         Self::from_tools(tools)
     }
 
-    /// Serialize borrowed or individually-owned definitions without collecting
-    /// another parsed catalog. Only one temporary tool need exist at a time.
     pub fn from_tools<T: std::borrow::Borrow<Value>>(tools: impl IntoIterator<Item = T>) -> Self {
-        let mut sizes = BTreeMap::new();
-        let mut bytes = vec![b'['];
-        let mut count = 0;
-        for tool in tools {
-            let tool = tool.borrow();
-            if count > 0 {
-                bytes.push(b',');
-            }
-            let start = bytes.len();
-            serde_json::to_writer(&mut bytes, tool).expect("serde_json::Value serializes");
-            if let Some(name) = tool.get("name").and_then(Value::as_str) {
-                *sizes.entry(name.to_string()).or_default() += (bytes.len() - start) as u64;
-            }
-            count += 1;
-        }
-        bytes.push(b']');
-        let text = String::from_utf8(bytes).expect("JSON is UTF-8");
+        let mut writer = SurfaceWriter {
+            text: Some(Vec::new()),
+            ..SurfaceWriter::default()
+        };
+        let summary = Arc::new(SurfaceSummary::build(&mut writer, tools));
+        let text = String::from_utf8(writer.text.unwrap()).expect("JSON is UTF-8");
         Self {
-            hash: Sha256::digest(text.as_bytes()).into(),
+            summary,
             json: serde_json::value::RawValue::from_string(text)
                 .expect("serialized tools are valid JSON"),
-            tools: sizes,
-            count,
         }
     }
 
-    /// Includes a conservative allowance for B-tree nodes and owned names.
     pub fn retained_bytes(&self) -> usize {
-        self.json.get().len()
-            + std::mem::size_of::<Self>()
-            + self
-                .tools
-                .keys()
-                .map(|name| name.capacity() + 128)
-                .sum::<usize>()
+        self.json.get().len() + std::mem::size_of::<Self>() + self.summary.retained_bytes()
     }
 
     pub fn tool_count(&self) -> usize {
@@ -231,12 +310,14 @@ pub fn record_catalog(
     exposed: &[Value],
     route: impl Fn(&str) -> Option<String>,
 ) {
+    let full = SerializedSurface::new(full);
     record_catalog_surfaces(
         session,
         mode,
         client,
-        &SerializedSurface::new(full),
+        &full,
         &SerializedSurface::new(exposed),
+        || full.json.get().to_string(),
         route,
     );
 }
@@ -247,8 +328,9 @@ pub fn record_catalog_surfaces(
     session: &CatalogSession,
     mode: &str,
     client: Option<&str>,
-    full: &SerializedSurface,
+    full: &SurfaceSummary,
     exposed: &SerializedSurface,
+    full_text: impl FnOnce() -> String,
     route: impl Fn(&str) -> Option<String>,
 ) {
     if !session.first_exposure(client, full, exposed) {
@@ -262,7 +344,7 @@ pub fn record_catalog_surfaces(
             }
         }
     }
-    let full_bytes = full.json.get().len() as u64;
+    let full_bytes = full.bytes;
     let exposed_bytes = exposed.json.get().len() as u64;
     let avoided = full_bytes.saturating_sub(exposed_bytes);
     let extra = exposed_bytes.saturating_sub(full_bytes);
@@ -274,7 +356,7 @@ pub fn record_catalog_surfaces(
         "extraExposedSurfaceBytes": extra,
         "surfaceDeltaBytes": full_bytes as i64 - exposed_bytes as i64,
         "tokenizer": TOKENIZER,
-        "_fullText": full.json.get(), "_exposedText": exposed.json.get(),
+        "_fullText": full_text(), "_exposedText": exposed.json.get(),
         "byServerBytes": by_server_bytes,
     });
     if let Some(client) = client.filter(|client| !client.is_empty()) {
@@ -778,6 +860,16 @@ mod tests {
         assert_eq!(streamed.json.get(), surface.json.get());
         assert_eq!(streamed.hash, surface.hash);
         assert_eq!(streamed.tools, surface.tools);
+        let summary = SurfaceSummary::from_tools(&tools);
+        assert_eq!(summary.hash, surface.hash);
+        assert_eq!(summary.bytes, surface.json.get().len() as u64);
+        assert_eq!(summary.tools, surface.tools);
+        assert_eq!(summary.count, surface.count);
+        assert_eq!(surface_bytes(&tools), summary.bytes);
+        assert_eq!(
+            estimated_tokens(summary.bytes),
+            estimated_tokens(surface.json.get().len() as u64)
+        );
         let session = CatalogSession::default();
         let exposed = SerializedSurface::new(&[]);
         assert!(session.first_exposure(Some("client"), &surface, &exposed));
@@ -789,9 +881,70 @@ mod tests {
         assert!(session.first_exposure(Some("client"), &changed, &exposed));
         assert!(session.first_exposure(Some("client"), &surface, &surface));
         // A hit must stop before resolving attribution or copying schema texts.
-        record_catalog_surfaces(&session, "lazy", Some("client"), &surface, &exposed, |_| {
-            panic!("repeated exposure was attributed again")
-        });
+        record_catalog_surfaces(
+            &session,
+            "lazy",
+            Some("client"),
+            &surface,
+            &exposed,
+            || panic!("repeated exposure rebuilt text"),
+            |_| panic!("repeated exposure was attributed again"),
+        );
+    }
+
+    #[test]
+    fn summary_only_catalog_exposure_keeps_identical_savings() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let root =
+            std::env::temp_dir().join(format!("toolport-summary-savings-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&root);
+        try_clear().unwrap();
+        let full = vec![
+            json!({"name":"s__read", "description":"é\nrecord"}),
+            json!({"name":"s__write", "inputSchema":{"type":"object"}}),
+        ];
+        let exposed = vec![json!({"name":"toolport_search_tools"})];
+        record_catalog(
+            &CatalogSession::default(),
+            "lazy",
+            Some("client"),
+            &full,
+            &exposed,
+            |_| Some("s".into()),
+        );
+        let summary = SurfaceSummary::from_tools(&full);
+        let session = CatalogSession::default();
+        record_catalog_surfaces(
+            &session,
+            "lazy",
+            Some("client"),
+            &summary,
+            &SerializedSurface::new(&exposed),
+            || serde_json::to_string(&full).unwrap(),
+            |_| Some("s".into()),
+        );
+        record_catalog_surfaces(
+            &session,
+            "lazy",
+            Some("client"),
+            &summary,
+            &SerializedSurface::new(&exposed),
+            || panic!("warm exposure rebuilt text"),
+            |_| panic!("warm attribution"),
+        );
+        let mut rows = entries();
+        assert_eq!(rows.len(), 2);
+        for row in &mut rows {
+            row.as_object_mut().unwrap().remove("ts");
+        }
+        assert_eq!(
+            serde_json::to_vec(&rows[0]).unwrap(),
+            serde_json::to_vec(&rows[1]).unwrap()
+        );
+        try_clear().unwrap();
+        drop(_data);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
