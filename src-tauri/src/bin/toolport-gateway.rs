@@ -17794,7 +17794,7 @@ fn main() {
                         "{}",
                         serde_json::to_string(&results).expect("serializable disconnect results")
                     );
-                    std::process::exit(if results.iter().any(|result| result.error.is_some()) {
+                    conduit_lib::telemetry::exit_with(if results.iter().any(|result| result.error.is_some()) {
                         1
                     } else {
                         0
@@ -17802,7 +17802,7 @@ fn main() {
                 }
                 Err(error) => {
                     eprintln!("toolport-gateway --disconnect-all: {error}");
-                    std::process::exit(1);
+                    conduit_lib::telemetry::exit_with(1);
                 }
             }
         }
