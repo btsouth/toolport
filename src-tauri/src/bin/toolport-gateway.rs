@@ -33150,7 +33150,7 @@ mod tests {
             &state,
             &SearchGuard::default(),
             "POST",
-            &json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":1}})
+            &json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":1, "_meta":{"io.modelcontextprotocol/protocolVersion":MODERN_PROTOCOL_VERSION}}})
                 .to_string(),
             modern_http_headers("notifications/cancelled", None, None, None),
             None,
@@ -33160,7 +33160,7 @@ mod tests {
             Some(&owner),
             None,
         );
-        assert_eq!(out.status, 202);
+        assert_eq!(out.status, 202, "{}", out.body);
         assert!(!a.is_cancelled("1"));
     }
 
