@@ -12785,13 +12785,26 @@ impl Drop for McpSseReader {
         self.session.end_listen();
         if let Some((state, key)) = self.cleanup.take() {
             self.session.close();
-            state
-                .mcp_sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&key);
-            cleanup_resource_subs_for_session(&state, &key);
-            clear_mcp_session_tables(&key);
+            // A reconnect can reuse the adapter key before this old reader drops.
+            let removed = {
+                let mut sessions = state
+                    .mcp_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if sessions
+                    .get(&key)
+                    .is_some_and(|live| Arc::ptr_eq(live, &self.session))
+                {
+                    sessions.remove(&key);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed {
+                cleanup_resource_subs_for_session(&state, &key);
+                clear_mcp_session_tables(&key);
+            }
         }
     }
 }
@@ -33200,6 +33213,40 @@ mod tests {
         connection.close();
         assert!(lifetime.cancellations.is_cancelled("held"));
         drop(out);
+    }
+
+    #[test]
+    fn p08_old_lifetime_reader_cannot_remove_reopened_row() {
+        let state = http_state(false);
+        let key = "adapter-lifetime:p08-reopened".to_string();
+        let mut old = SessionState::new_http(None);
+        old.adapter_lifetime = true;
+        let old = Arc::new(old);
+        state
+            .mcp_sessions
+            .lock()
+            .unwrap()
+            .insert(key.clone(), old.clone());
+        let reader = McpSseReader::with_cleanup(old.clone(), state.clone(), key.clone());
+        old.close();
+        reap_stale_mcp_sessions(&state);
+        let mut replacement = SessionState::new_http(None);
+        replacement.adapter_lifetime = true;
+        let replacement = Arc::new(replacement);
+        assert!(replacement
+            .cancellations
+            .begin_client_request("held".into()));
+        state
+            .mcp_sessions
+            .lock()
+            .unwrap()
+            .insert(key.clone(), replacement.clone());
+        drop(reader);
+        let sessions = state.mcp_sessions.lock().unwrap();
+        assert!(sessions
+            .get(&key)
+            .is_some_and(|live| Arc::ptr_eq(live, &replacement)));
+        assert!(!replacement.cancellations.is_cancelled("held"));
     }
 
     #[test]

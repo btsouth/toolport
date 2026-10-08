@@ -906,7 +906,6 @@ fn notify_until_resolved_at_destination(
     destination: &str,
 ) {
     use gio::glib::{self, variant::ToVariant};
-    use gio::prelude::*;
     use std::cell::Cell;
     use std::rc::Rc;
     const BUS: &str = "org.freedesktop.Notifications";
