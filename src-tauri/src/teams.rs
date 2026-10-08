@@ -411,7 +411,7 @@ fn push_body(config: &Value, base_version: i64) -> Value {
 }
 
 fn push_status_message(status: u16) -> Option<&'static str> {
-    (status == 409).then_some(STALE_PUSH_MESSAGE)
+    match status { 409 => Some(STALE_PUSH_MESSAGE), 403 => Some("Finish this in the Teams dashboard"), _ => None }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -696,13 +696,63 @@ pub(crate) fn build_push_preview(
 }
 
 /// Admin push of a servers-only config update. Returns the new version.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigProposal {
+    pub id: String,
+    pub base_version: i64,
+    pub confirm_url: String,
+}
+
+#[derive(Debug)]
+pub enum PushOutcome {
+    Published(i64),
+    Confirmation(ConfigProposal),
+}
+
+impl From<i64> for PushOutcome {
+    fn from(version: i64) -> Self { Self::Published(version) }
+}
+
+pub fn validate_confirmation_url(server_url: &str, confirm_url: &str) -> Result<(), String> {
+    let server = url::Url::parse(server_url).map_err(|_| "Invalid Teams service URL")?;
+    let confirm = url::Url::parse(confirm_url).map_err(|_| "Invalid confirmation URL")?;
+    if confirm.scheme() != "https" || confirm.host_str() != server.host_str()
+        || confirm.port_or_known_default() != server.port_or_known_default()
+        || !confirm.username().is_empty() || confirm.password().is_some() {
+        return Err("Confirmation must open on the HTTPS Teams service host.".into());
+    }
+    Ok(())
+}
+
+pub fn open_confirmation(confirm_url: &str) -> Result<(), String> {
+    let reg = crate::registry::load()?;
+    let team = reg.team.as_ref().ok_or("not connected to a team")?;
+    validate_confirmation_url(&team.server_url, confirm_url)?;
+    crate::oauth::open_web_url(confirm_url)
+}
+
+fn parse_push_response(server_url: &str, status: u16, value: Value) -> Result<PushOutcome, String> {
+    if status == 202 {
+        let proposal: ConfigProposal = serde_json::from_value(value["proposal"].clone())
+            .map_err(|_| "Team server returned an invalid confirmation proposal")?;
+        if proposal.id.is_empty() || proposal.id.len() > 128 || proposal.base_version < 0 {
+            return Err("Team server returned an invalid confirmation proposal".into());
+        }
+        validate_confirmation_url(server_url, &proposal.confirm_url)?;
+        return Ok(PushOutcome::Confirmation(proposal));
+    }
+    value["version"].as_i64().map(PushOutcome::Published)
+        .ok_or_else(|| "team server did not return a version after push".to_string())
+}
+
 pub fn push_config(
     server_url: &str,
     team_id: &str,
     token: &str,
     config: &Value,
     base_version: i64,
-) -> Result<i64, String> {
+) -> Result<PushOutcome, String> {
     require_secure_team_url(server_url)?;
     let url = format!("{}/teams/{}/config", base(server_url), team_id);
     let body = push_body(config, base_version);
@@ -720,10 +770,9 @@ pub fn push_config(
         }
         Err(e) => return Err(stringify(e)),
     };
+    let status = resp.status();
     let v: Value = resp.into_json().map_err(|e| e.to_string())?;
-    v["version"]
-        .as_i64()
-        .ok_or_else(|| "team server did not return a version after push".to_string())
+    parse_push_response(server_url, status, v)
 }
 
 /// Report one UTC day's usage rollup (counts + estimates only, see `usage_report`).
@@ -768,6 +817,7 @@ fn post_usage_day(
 
 fn stringify(e: ureq::Error) -> String {
     match e {
+        ureq::Error::Status(403, _) => "Finish this in the Teams dashboard".into(),
         ureq::Error::Status(code, resp) => {
             let msg = resp.into_string().unwrap_or_default();
             format!("server returned {code}: {}", msg.trim())
@@ -816,6 +866,18 @@ pub fn parse_pair_link(raw: &str) -> Option<(String, String)> {
     }
     Some((u.origin().ascii_serialization(), team))
 }
+fn device_name() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok().or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string()))
+}
+
+fn pairing_body(team: &str, challenge: &str, device_name: Option<&str>, os: &str, app_version: &str) -> Value {
+    let truncate = |value: &str| value.chars().take(128).collect::<String>();
+    let mut body = json!({"teamId":team, "challenge":challenge, "os":truncate(os), "appVersion":truncate(app_version)});
+    if let Some(name) = device_name { body["deviceName"] = json!(truncate(name)); }
+    body
+}
+
 static PAIRING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Returned by [`pair_device`] when the person cancelled the request in the app.
 pub const PAIRING_CANCELLED: &str = "Connection request cancelled.";
@@ -840,7 +902,7 @@ pub fn pair_device(
     let challenge = crate::registry::sha256_hex(&verifier);
     let response = agent(origin)
         .post(&format!("{}/pairing/start", base(origin)))
-        .send_json(json!({"teamId":team,"challenge":challenge}))
+        .send_json(pairing_body(team, &challenge, device_name().as_deref(), std::env::consts::OS, env!("CARGO_PKG_VERSION")))
         .map_err(stringify)?;
     let data: Value = require_no_redirect(response)?
         .into_json()
@@ -977,11 +1039,10 @@ fn finish_connect(
         conn.team_name = team_name;
         conn.account_linked = account_linked;
     }
-    // Capture the org instructions before the closure consumes `pulled`; applied to disk after
-    // the save (outside the lock).
-    let desired_instr = pulled
-        .as_ref()
-        .map(|(version, cfg, _)| (*version, desired_instructions(cfg)));
+    let labels = match pulled.as_ref() {
+        Some((version, _, _)) => fetch_change_labels(&conn, &joined.member_token, 0, *version).unwrap_or_default(),
+        None => vec![],
+    };
     // Load-modify-save the fresh registry under the cross-process lock, so a concurrent write
     // during the join window's pull isn't reverted (SOU-23).
     let (reg, outcome) = crate::registry::update(|reg| {
@@ -989,7 +1050,7 @@ fn finish_connect(
         reg.team = Some(conn);
         let mut outcome = MergeOutcome::default();
         if let Some((version, cfg, etag)) = pulled {
-            outcome = apply_team_config(reg, &joined.team_id, &cfg);
+            outcome = stage_team_config(reg, &joined.team_id, &cfg, version, &labels)?;
             if let Some(t) = reg.team.as_mut() {
                 t.last_version = version;
                 t.last_etag = etag;
@@ -997,11 +1058,6 @@ fn finish_connect(
         }
         Ok(outcome)
     })?;
-    if let Some((version, desired)) = desired_instr {
-        apply_instructions(&joined.team_id, version, desired.as_deref()).map_err(|error| {
-            format!("Team joined, but instructions state was not saved: {error}")
-        })?;
-    }
     let conn = reg
         .team
         .clone()
@@ -1105,11 +1161,11 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         wait_secs,
     )?;
 
-    // Capture the org instructions before the closure consumes `pulled`; applied to disk after
-    // the save (outside the lock). `None` on a 304 (config unchanged) — nothing to reconcile.
-    let desired_instr = pulled
-        .as_ref()
-        .map(|(version, cfg, _)| (*version, desired_instructions(cfg)));
+    let since = member_review(&crate::registry::load()?)?.accepted_version;
+    let labels = match pulled.as_ref() {
+        Some((version, _, _)) => fetch_change_labels(&conn, &token, since, *version).unwrap_or_default(),
+        None => vec![],
+    };
     // Re-load a FRESH registry now, AFTER the (possibly multi-second) network round
     // trips, and apply the deltas to it. Loading at the top and saving here would clobber
     // any change another command made to the registry while we were on the network.
@@ -1131,7 +1187,7 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         let applied = match pulled {
             None => None,
             Some((version, cfg, etag)) => {
-                let outcome = apply_team_config(reg, &conn.team_id, &cfg);
+                let outcome = stage_team_config(reg, &conn.team_id, &cfg, version, &labels)?;
                 if let Some(t) = reg.team.as_mut() {
                     t.last_version = version;
                     t.last_etag = etag;
@@ -1168,14 +1224,11 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
             state_errors.push(error);
         }
     };
-    check_state(match desired_instr {
-        Some((version, desired)) => apply_instructions(&conn.team_id, version, desired.as_deref()),
-        // A 304 means the org text is unchanged, but a release can still move where a client
-        // reads its rules from (Goose/Zed under XDG, SBS-899). Re-run against the content we
-        // already applied so the block relocates on the next quiet cycle rather than waiting for
-        // an admin edit; `apply_instructions` returns immediately unless a target really moved.
-        None => relocate_stored_instructions(&conn.team_id),
-    });
+    // Only accepted instructions can be written or relocated after a sync.
+    let accepted = member_review(&crate::registry::load()?)?;
+    check_state(if let Some(content) = accepted.accepted.get("instructions") {
+        apply_instructions(&conn.team_id, accepted.version, content.as_str())
+    } else { relocate_stored_instructions(&conn.team_id) });
     // Best-effort showback after the config work: report today's/yesterday's per-server
     // usage rollup to the team server. Network failures retry next cycle;
     // local state-save failures must be visible after the config was applied.
@@ -2233,6 +2286,7 @@ pub fn use_managed_server(managed_id: &str) -> Result<Registry, String> {
 }
 
 fn apply_use_managed(reg: &mut Registry, managed_id: &str, profile: &str) -> Result<(), String> {
+    if server_change_held(reg, managed_id) { return Err("Review this change in Teams before using it.".into()); }
     let team = reg.team.as_ref().ok_or("not connected to a team")?;
     let personal_id = team
         .managed_server_ids
@@ -2325,17 +2379,27 @@ pub struct PublishResult {
     pub handoffs: Vec<LocalHandoff>,
     /// The notice both desktop shells show after sharing.
     pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<ConfigProposal>,
 }
 
 impl PublishResult {
     /// A whole-set push has no selections and no local handoff.
-    pub fn whole_set(version: i64) -> Self {
+    pub fn whole_set(outcome: impl Into<PushOutcome>) -> Self {
+        let version = match outcome.into() {
+            PushOutcome::Published(version) => version,
+            PushOutcome::Confirmation(proposal) => return Self {
+                version: proposal.base_version, published: false, local_setup_error: None,
+                handoffs: vec![], summary: "Sent for confirmation".into(), proposal: Some(proposal),
+            },
+        };
         Self {
             version,
             published: true,
             local_setup_error: None,
             handoffs: Vec::new(),
             summary: publish_summary(version, true, None, &[]),
+            proposal: None,
         }
     }
 
@@ -2664,7 +2728,10 @@ pub fn push_selected(
         .any(|(id, server)| before.get(id).is_none_or(|current| !same_definition(current, server)));
     let version = if published {
         let config = replace_server_set(config, servers)?;
-        push_config(&conn.server_url, &conn.team_id, &token, &config, version)?
+        match push_config(&conn.server_url, &conn.team_id, &token, &config, version)? {
+            PushOutcome::Published(version) => version,
+            outcome @ PushOutcome::Confirmation(_) => return Ok(PublishResult::whole_set(outcome)),
+        }
     } else {
         version
     };
@@ -2689,6 +2756,7 @@ pub fn push_selected(
         local_setup_error,
         handoffs,
         summary,
+        proposal: None,
     })
 }
 
@@ -2719,7 +2787,7 @@ pub fn preview_push_current() -> Result<PushPreview, String> {
 pub fn push_current(
     expected_base_version: i64,
     expected_local_fingerprint: &str,
-) -> Result<i64, String> {
+) -> Result<PushOutcome, String> {
     let reg = crate::registry::load()?;
     let conn = reg.team.clone().ok_or("not connected to a team")?;
     if conn.role != "admin" {
@@ -2801,6 +2869,294 @@ fn team_server_export(reg: &Registry) -> Value {
         })
         .collect();
     Value::Array(servers)
+}
+
+// Stored in TeamConnection's forward-compatible fields. Older registry readers preserve
+// this state and the existing server review flag, so no schema migration is needed.
+const MEMBER_REVIEW_FIELD: &str = "memberReview";
+const HELD_CHANGE_FIELD: &str = "teamHeldChange";
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MemberReview {
+    accepted: BTreeMap<String, Value>,
+    latest: BTreeMap<String, Value>,
+    pub pending: BTreeMap<String, MemberChange>,
+    rejected: BTreeMap<String, Vec<String>>,
+    pub accepted_version: i64,
+    version: i64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MemberChange {
+    pub key: String,
+    pub title: String,
+    pub hash: String,
+    pub fields: Vec<MemberChangeField>,
+    pub labels: Vec<Value>,
+    before: Value,
+    after: Value,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MemberChangeField {
+    pub field: String,
+    pub before: String,
+    pub after: String,
+}
+
+pub fn member_review(reg: &Registry) -> Result<MemberReview, String> {
+    match reg.team.as_ref().and_then(|t| t.unknown_fields.get(MEMBER_REVIEW_FIELD)) {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|_| "Team review state could not be read. Reconnect before accepting changes.".into()),
+        None => Ok(MemberReview::default()),
+    }
+}
+
+fn save_member_review(reg: &mut Registry, review: &MemberReview) {
+    if let Some(team) = &mut reg.team {
+        team.unknown_fields.insert(MEMBER_REVIEW_FIELD.into(), json!(review));
+    }
+}
+
+fn review_items(config: &Value) -> BTreeMap<String, Value> {
+    let mut items = BTreeMap::new();
+    for server in config["servers"].as_array().into_iter().flatten() {
+        if let Some(id) = team_entry_original_id(server) {
+            let key = format!("server:{id}");
+            // Duplicate identities are blocked by the existing merge. Never approve one
+            // ambiguous definition while displaying another.
+            if items.insert(key.clone(), server.clone()).is_some() {
+                items.insert(key, Value::Null);
+            }
+        }
+    }
+    items.insert("instructions".into(), desired_instructions(config).map_or(Value::Null, |s| json!(s)));
+    items.insert("policy".into(), json!({
+        "denyDestructive": config["denyDestructive"].as_bool().unwrap_or(false),
+        "screeningPolicy": config.get("screeningPolicy").cloned().unwrap_or(json!({})),
+        "rateLimits": config.get("rateLimits").cloned().unwrap_or(json!([])),
+    }));
+    items.insert("callAuditExport".into(), json!(config["callAuditExport"].as_bool().unwrap_or(false)));
+    items
+}
+
+fn item_hash(key: &str, value: &Value) -> String {
+    // serde_json's ordered maps make object key order irrelevant; array order is meaningful.
+    crate::registry::sha256_hex(&json!(["team-member-review-v1", key, value]).to_string())
+}
+
+fn floor(policy: &Value) -> crate::registry::SafetyLevel {
+    use crate::registry::SafetyLevel::{Ask, Off, Strict};
+    match policy["screeningPolicy"]["minSafetyLevel"].as_str() {
+        Some("strict") => Strict,
+        Some("ask") => Ask,
+        Some("off") => Off,
+        // Invalid floors fail closed; missing floors keep legacy semantics.
+        Some(_) => Strict,
+        None if policy["denyDestructive"] == true => Strict,
+        None if policy["screeningPolicy"]["forceHumanApproval"] == true => Ask,
+        None => Off,
+    }
+}
+
+fn current_policy(reg: &Registry) -> Value {
+    json!({"denyDestructive": reg.team_forced_deny_destructive,
+        "screeningPolicy": {
+            "minSafetyLevel": reg.team_min_safety_level,
+            "forceHumanApproval": reg.team_forced_human_approval,
+            "forceContentDefense": reg.team_forced_content_defense,
+            "forceQuarantineOnDrift": reg.team_forced_quarantine_on_drift,
+            "forceBlockOnInjection": reg.team_forced_block_on_injection,
+            "forcePiiRedaction": reg.team_forced_pii_redaction,
+        },
+        "rateLimits": reg.team.as_ref().map(|t| &t.rate_limits),
+    })
+}
+
+fn immediate_floors(policy: &mut Value, incoming: &Value, current: &Value) {
+    policy["screeningPolicy"]["minSafetyLevel"] = json!(floor(incoming).max(floor(current)));
+    for key in ["forceHumanApproval", "forceContentDefense", "forceQuarantineOnDrift", "forceBlockOnInjection", "forcePiiRedaction"] {
+        policy["screeningPolicy"][key] = json!(incoming["screeningPolicy"][key] == true || current["screeningPolicy"][key] == true);
+    }
+    policy["denyDestructive"] = json!(incoming["denyDestructive"] == true || current["denyDestructive"] == true);
+}
+
+fn diff_fields(before: &Value, after: &Value, prefix: &str, fields: &mut Vec<MemberChangeField>) {
+    if before == after { return; }
+    if before.is_object() || after.is_object() {
+        let keys: std::collections::BTreeSet<_> = before.as_object().into_iter().flat_map(|o| o.keys())
+            .chain(after.as_object().into_iter().flat_map(|o| o.keys())).collect();
+        for key in keys {
+            let path = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+            diff_fields(&before[key], &after[key], &path, fields);
+        }
+    } else {
+        let text = |value: &Value| match value {
+            Value::Null => "None".into(),
+            Value::String(s) => s.clone(),
+            _ => serde_json::to_string_pretty(value).unwrap_or_default(),
+        };
+        fields.push(MemberChangeField { field: if prefix.is_empty() { "Content".into() } else { prefix.into() }, before: text(before), after: text(after) });
+    }
+}
+
+fn display_server(value: &Value) -> Value {
+    if value.is_null() { return Value::Null; }
+    let preview = share_definition_preview("", value, "");
+    let mut display = json!({"name": value["name"], "transport": value["transport"]});
+    for field in preview.fields { display[&field.label] = json!(field.value); }
+    for key in ["allowedTools", "disabledTools", "requestTimeoutMs", "initializeTimeoutMs"] {
+        if let Some(value) = value.get(key) { display[key] = value.clone(); }
+    }
+    display
+}
+
+fn change_labels(key: &str, changes: &[Value]) -> Vec<Value> {
+    changes.iter().filter(|change| {
+        if let Some(id) = key.strip_prefix("server:") {
+            ["serversAdded", "serversChanged", "serversRemoved"].iter().any(|field| change["summary"][field].as_array().is_some_and(|ids| ids.iter().any(|v| v == id)))
+        } else { change["summary"][key] == true }
+    }).map(|change| json!({"author":change["author"], "at":change["at"], "via":change["via"], "approvedBy":change["approvedBy"]})).collect()
+}
+
+/// Metadata is useful only when it covers the entire interval since member consent.
+/// Missing version/baseVersion or a capped history yields an unlabelled full diff.
+fn covered_changes(data: Value, since: i64, version: i64) -> Vec<Value> {
+    let Some(changes) = data["changes"].as_array() else { return vec![]; };
+    let mut expected = version;
+    for change in changes {
+        if change["version"].as_i64() != Some(expected) { return vec![]; }
+        let Some(base) = change["baseVersion"].as_i64() else { return vec![]; };
+        if base >= expected { return vec![]; }
+        expected = base;
+        if expected <= since { return changes.iter().take_while(|c| c["version"].as_i64().unwrap_or(0) > since).cloned().collect(); }
+    }
+    vec![]
+}
+
+fn fetch_change_labels(conn: &TeamConnection, token: &str, since: i64, version: i64) -> Result<Vec<Value>, String> {
+    let response = match agent(&conn.server_url).get(&format!("{}/teams/{}/config/changes?since={since}", base(&conn.server_url), conn.team_id))
+        .set("authorization", &format!("Bearer {token}")).call() {
+        Ok(response) => require_no_redirect(response)?,
+        Err(ureq::Error::Status(404, _)) => return Ok(vec![]),
+        Err(error) => return Err(stringify(error)),
+    };
+    let data = response.into_json().map_err(|e| e.to_string())?;
+    Ok(covered_changes(data, since, version))
+}
+
+/// Stage every changed control-plane item. Definitions use the existing review gate;
+/// instructions, policy and export use the same queue and member decision.
+pub fn stage_team_config(reg: &mut Registry, team_id: &str, config: &Value, version: i64, labels: &[Value]) -> Result<MergeOutcome, String> {
+    let mut review = member_review(reg)?;
+    if review.accepted.is_empty() {
+        review.accepted = review_items(&json!({"servers":[]}));
+        if let Some(content) = reg.team.as_ref().and_then(|t| t.team_instructions_content.as_ref()) {
+            review.accepted.insert("instructions".into(), json!(content));
+        }
+    }
+    review.latest = review_items(config);
+    // Stopping export revokes prior consent. A later re-enable is a new review.
+    if review.latest.get("callAuditExport") == Some(&json!(false)) {
+        review.accepted.insert("callAuditExport".into(), json!(false));
+    }
+    review.version = version;
+    review.pending.clear();
+    let keys: std::collections::BTreeSet<String> = review.latest.keys().chain(review.accepted.keys()).cloned().collect();
+    for key in keys {
+        let before = review.accepted.get(&key).cloned().unwrap_or(Value::Null);
+        let after = review.latest.get(&key).cloned().unwrap_or(Value::Null);
+        if before == after || (before.is_null() && (after == false || (key == "policy" && after == json!({"denyDestructive":false,"screeningPolicy":{},"rateLimits":[]})))) { continue; }
+        let hash = item_hash(&key, &after);
+        if review.rejected.get(&key).is_some_and(|hashes| hashes.contains(&hash)) { continue; }
+        let title = if key.starts_with("server:") {
+            format!("Server: {}", after["name"].as_str().or(before["name"].as_str()).unwrap_or(&key[7..]))
+        } else { match key.as_str() { "instructions" => "Team instructions", "policy" => "Team policy", _ => "Call-log export" }.into() };
+        let (a, b) = if key.starts_with("server:") { (display_server(&before), display_server(&after)) } else { (before.clone(), after.clone()) };
+        let mut fields = Vec::new();
+        diff_fields(&a, &b, "", &mut fields);
+        review.pending.insert(key.clone(), MemberChange { key: key.clone(), title, hash, fields, labels: change_labels(&key, labels), before, after });
+    }
+    let outcome = apply_review_state(reg, team_id, &review, true)?;
+    if review.latest == review.accepted { review.accepted_version = version; }
+    save_member_review(reg, &review);
+    Ok(outcome)
+}
+
+fn apply_review_state(reg: &mut Registry, team_id: &str, review: &MemberReview, tighten: bool) -> Result<MergeOutcome, String> {
+    let mut policy = review.accepted.get("policy").cloned().unwrap_or(json!({"denyDestructive":false,"screeningPolicy":{},"rateLimits":[]}));
+    if tighten { immediate_floors(&mut policy, review.latest.get("policy").unwrap_or(&Value::Null), &current_policy(reg)); }
+    policy["screeningPolicy"]["minSafetyLevel"] = json!(floor(&policy));
+    let mut effective = policy;
+    effective["callAuditExport"] = review.accepted.get("callAuditExport").cloned().unwrap_or(json!(false));
+    // Export can stop immediately; re-enabling always requires a new decision.
+    if review.latest.get("callAuditExport") == Some(&json!(false)) { effective["callAuditExport"] = json!(false); }
+    let keys: std::collections::BTreeSet<_> = review.latest.keys().chain(review.accepted.keys()).filter(|k| k.starts_with("server:")).collect();
+    let mut held = HashSet::new();
+    let servers: Vec<Value> = keys.into_iter().filter_map(|key| {
+        let accepted = review.accepted.get(key).cloned().unwrap_or(Value::Null);
+        let latest = review.latest.get(key).cloned().unwrap_or(Value::Null);
+        if accepted != latest { held.insert(key[7..].to_string()); }
+        // A removed definition stays visible and off until its removal is accepted.
+        let definition = if latest.is_null() { accepted } else { latest };
+        (!definition.is_null()).then_some(definition)
+    }).collect();
+    effective["servers"] = json!(servers);
+    let mut outcome = apply_team_config(reg, team_id, &effective);
+    for server in reg.servers.iter_mut().filter(|s| s.source.as_deref() == Some(&tag_for(team_id))) {
+        if saved_team_original_id(server).is_some_and(|id| held.contains(id)) {
+            server.require_team_enable_review();
+            server.unknown_fields.insert(HELD_CHANGE_FIELD.into(), json!(true));
+            server.enabled = false;
+            for profile in &mut reg.profiles { profile.enabled_server_ids.retain(|id| id != &server.id); }
+        } else { server.unknown_fields.remove(HELD_CHANGE_FIELD); }
+    }
+    outcome.review = review.pending.len();
+    Ok(outcome)
+}
+
+pub fn server_change_held(reg: &Registry, server_id: &str) -> bool {
+    reg.servers.iter().any(|s| s.id == server_id && s.unknown_fields.get(HELD_CHANGE_FIELD) == Some(&json!(true)))
+}
+
+fn decide_member_change(reg: &mut Registry, key: &str, hash: &str, accept: bool) -> Result<(), String> {
+    let team_id = reg.team.as_ref().ok_or("not connected to a team")?.team_id.clone();
+    let mut review = member_review(reg)?;
+    let change = review.pending.get(key).ok_or("This change is no longer pending. Review the current queue.")?.clone();
+    if change.hash != hash || item_hash(key, review.latest.get(key).unwrap_or(&Value::Null)) != hash {
+        return Err("The team change was updated. Review its new content before accepting.".into());
+    }
+    if accept {
+        if change.after.is_null() && key.starts_with("server:") { review.accepted.remove(key); } else { review.accepted.insert(key.into(), change.after); }
+    } else { review.rejected.entry(key.into()).or_default().push(hash.into()); }
+    review.pending.remove(key);
+    // Accepting another item must never release a safety floor still awaiting review.
+    apply_review_state(reg, &team_id, &review, !(accept && key == "policy"))?;
+    if accept {
+        if let Some(original) = key.strip_prefix("server:") {
+            if let Some(id) = reg.servers.iter().find(|s| saved_team_original_id(s) == Some(original) && s.source.as_deref() == Some(&tag_for(&team_id))).map(|s| s.id.clone()) {
+                let profile = reg.active_profile_id();
+                crate::registry_controller::apply_server_enabled(reg, &profile, &id, true, true)?;
+            }
+        }
+    }
+    if review.latest == review.accepted { review.accepted_version = review.version; }
+    save_member_review(reg, &review);
+    Ok(())
+}
+
+pub fn review_team_change(key: &str, hash: &str, accept: bool) -> Result<Registry, String> {
+    let _sync = SYNC_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (reg, ()) = crate::registry::update(|reg| decide_member_change(reg, key, hash, accept))?;
+    if accept && key == "instructions" {
+        let review = member_review(&reg)?;
+        let team = reg.team.as_ref().ok_or("not connected to a team")?;
+        apply_instructions(&team.team_id, review.version, review.accepted.get("instructions").and_then(Value::as_str))
+            .map_err(|e| format!("Instructions accepted, but local setup needs attention: {e}"))?;
+    }
+    crate::registry::load()
 }
 
 // --- merge (pure, testable) ---
@@ -7346,6 +7702,7 @@ mod tests {
                 "Already shared with your team (version 4). Nothing new was uploaded.\nLinear: Now uses the Team copy in this profile."
             );
             let result = PublishResult {
+                proposal: None,
                 version: 5,
                 published: true,
                 local_setup_error: None,

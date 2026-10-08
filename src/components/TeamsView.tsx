@@ -13,6 +13,14 @@ import {
   ArrowUpRight,
   Check,
 } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from "@/components/ui/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -48,6 +56,23 @@ import { isEnabled, activeProfile } from "@/lib/types";
 import type { TeamPushPreview } from "@/lib/api";
 import type { Registry, InstructionsStatusView } from "@/lib/types";
 
+interface MemberChange {
+  key: string;
+  title: string;
+  hash: string;
+  fields: { field: string; before: string; after: string }[];
+  labels: {
+    author?: { name?: string };
+    at?: number;
+    via?: string;
+    approvedBy?: { name?: string };
+  }[];
+}
+
+interface MemberReviewState {
+  pending: Record<string, MemberChange>;
+}
+
 /**
  * Toolport Teams: join a team and have its shared MCP server set appear locally. The
  * team server holds only the server set + non-secret config, never a key, so after
@@ -63,6 +88,12 @@ export function TeamsView({
 }) {
   const team = registry?.team ?? null;
   const isAdmin = team?.role === "admin";
+  const review = (
+    team as (NonNullable<Registry["team"]> & { memberReview?: MemberReviewState }) | null
+  )?.memberReview;
+  const changes = Object.values(review?.pending ?? {});
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [proposal, setProposal] = useState<{ confirmUrl: string } | null>(null);
   const teamServers = (registry?.servers ?? []).filter((s) =>
     s.source?.startsWith("team:"),
   );
@@ -261,11 +292,30 @@ export function TeamsView({
       if (!pushPreview) throw new Error("Review the shared-server update before saving.");
       const v = await teamPush(pushPreview, selectedIds);
       setPushPreview(null);
+      setProposal(
+        (v as typeof v & { proposal?: { confirmUrl: string } }).proposal ?? null,
+      );
       // The summary names each selection and which route is on in this profile.
       if (v.localSetupError || v.handoffs.some((h) => h.outcome === "attention"))
         setSkipNote(v.summary);
       else setNotice(v.summary);
       onRegistryChange(await getRegistry());
+    });
+
+  const onReview = (change: MemberChange, accept: boolean) =>
+    run("review", async () => {
+      onRegistryChange(
+        await invoke<Registry>("team_review", {
+          key: change.key,
+          hash: change.hash,
+          accept,
+        }),
+      );
+      setNotice(
+        accept
+          ? "Accepted the reviewed change."
+          : "Rejected. This content stays held across syncs.",
+      );
     });
 
   // Member consent: enable a review server (local command / LAN URL) into the active
@@ -285,6 +335,7 @@ export function TeamsView({
   const renderTeamServer = (s: (typeof teamServers)[number]) => {
     const personal = personalServers.find((p) => p.id === team?.managedServerIds?.[s.id]);
     const on = registry ? isEnabled(registry, s.id) : false;
+    const held = (s as typeof s & { teamHeldChange?: boolean }).teamHeldChange === true;
     const isLocal = s.transport === "stdio" || !!s.command;
     const detail = s.command
       ? `Command: ${s.command}\nArguments: ${JSON.stringify(s.args ?? [])}\nWorking directory: ${s.cwd ?? "Inherit from client"}\nCredentials required: ${s.env.map((e) => e.key).join(", ") || "None declared"}`
@@ -309,7 +360,7 @@ export function TeamsView({
             </Badge>
           )}
         </div>
-        {personal && registry && isEnabled(registry, personal.id) && (
+        {!held && personal && registry && isEnabled(registry, personal.id) && (
           <ConfirmDialog
             trigger={
               <Button size="sm" variant="outline" disabled={busy !== null}>
@@ -332,7 +383,12 @@ export function TeamsView({
             }
           />
         )}
-        {!on && (
+        {!on && held && (
+          <p className="mt-2 text-xs text-muted-foreground">
+            This change is held off. Use the team change review above.
+          </p>
+        )}
+        {!on && !held && (
           <div className="mt-2 flex items-end justify-between gap-3">
             <div className="min-w-0">
               <p className="text-xs text-muted-foreground">
@@ -416,6 +472,102 @@ export function TeamsView({
           {notice}
         </Callout>
       )}
+      {proposal && (
+        <Button
+          variant="outline"
+          onClick={() =>
+            void run("confirmation", async () => {
+              await invoke("team_open_confirmation", { url: proposal.confirmUrl });
+            })
+          }
+          disabled={busy !== null}
+        >
+          Open confirmation
+        </Button>
+      )}
+      {changes.length > 0 && (
+        <Callout variant="warning" className="mb-4">
+          <p>
+            {changes.length} team change{changes.length === 1 ? " is" : "s are"} waiting
+            for your review. Held servers stay off and instructions stay unchanged. Safety
+            floors can tighten immediately.
+          </p>
+          <Button variant="outline" className="mt-2" onClick={() => setReviewOpen(true)}>
+            Review team changes
+          </Button>
+        </Callout>
+      )}
+      <Dialog open={reviewOpen} onOpenChange={setReviewOpen}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Review team changes</DialogTitle>
+            <DialogDescription>
+              Accept only the content you recognize. Each decision applies to this member
+              and the exact change shown.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[65vh] overflow-y-auto space-y-4">
+            {changes.length === 0 && <p>No changes waiting for review.</p>}
+            {changes.map((change) => (
+              <section
+                key={change.key}
+                className="rounded-lg border p-3 space-y-2"
+                aria-label={change.title}
+              >
+                <h3 className="font-medium">{change.title}</h3>
+                {change.labels.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    Full diff from your accepted configuration. Change history labels
+                    unavailable.
+                  </p>
+                ) : (
+                  change.labels.map((label, index) => (
+                    <p key={index} className="text-xs text-muted-foreground">
+                      {label.author?.name ?? "Unknown author"} ·{" "}
+                      {label.at ? new Date(label.at).toLocaleString() : "Unknown time"} ·
+                      via {label.via ?? "unknown"}
+                      {label.approvedBy?.name
+                        ? ` · approved by ${label.approvedBy.name}`
+                        : ""}
+                    </p>
+                  ))
+                )}
+                <dl className="space-y-2 text-sm">
+                  {change.fields.map((field) => (
+                    <div key={field.field}>
+                      <dt className="font-medium">{field.field}</dt>
+                      <dd className="whitespace-pre-wrap break-words rounded bg-muted p-2">
+                        <span className="text-muted-foreground">Before: </span>
+                        {field.before}
+                        {"\n"}
+                        <span className="text-muted-foreground">After: </span>
+                        {field.after}
+                      </dd>
+                    </div>
+                  ))}
+                </dl>
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    onClick={() => void onReview(change, true)}
+                    disabled={busy !== null}
+                  >
+                    Accept
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void onReview(change, false)}
+                    disabled={busy !== null}
+                  >
+                    Reject
+                  </Button>
+                </div>
+              </section>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {!team ? (
         <div className="grid gap-4">

@@ -552,6 +552,25 @@ impl TeamsPage {
         self.content.append(&summary);
         self.content.append(&gtk::Label::builder().label("Open Clients to use your enabled team servers from an AI client. Review any remaining servers below before enabling them. Successful managed calls are reported automatically.").wrap(true).xalign(0.0).build());
 
+        match crate::teams::member_review(&registry) {
+            Ok(review) if !review.pending.is_empty() => {
+                let button = gtk::Button::with_label(&format!("Review {} team changes", review.pending.len()));
+                let page = self.clone();
+                button.connect_clicked(move |_| {
+                    if let Some(parent) = page.app.active_window() {
+                        let dialog = member_review_dialog(&parent, &review);
+                        let extra = dialog.extra_child().unwrap();
+                        connect_member_decisions(&extra, &review, &page, &dialog);
+                        dialog.present();
+                    }
+                });
+                self.content.append(&gtk::Label::builder().label("Held servers stay off and instructions stay unchanged. Safety floors can tighten immediately.").wrap(true).xalign(0.0).build());
+                self.content.append(&button);
+            }
+            Err(error) => self.feedback.set_text(&error),
+            _ => {}
+        }
+
         let review = registry
             .servers
             .iter()
@@ -854,6 +873,20 @@ impl TeamsPage {
                     .await;
                     match result {
                         Ok(Ok(result)) => {
+                            if let Some(proposal) = &result.proposal {
+                                if let Some(parent) = page.app.active_window() {
+                                    let confirmation = adw::MessageDialog::new(Some(&parent), Some("Sent for confirmation"), Some("Finish publishing this update in the Teams dashboard."));
+                                    confirmation.add_response("close", "Close");
+                                    confirmation.add_response("open", "Open");
+                                    let url = proposal.confirm_url.clone();
+                                    let page = page.clone();
+                                    confirmation.connect_response(None, move |dialog, response| {
+                                        if response == "open" { if let Err(error) = crate::teams::open_confirmation(&url) { page.show_error(&error); } }
+                                        dialog.close();
+                                    });
+                                    confirmation.present();
+                                }
+                            }
                             *page.sync_notice.borrow_mut() =
                                 Some((result.summary.clone(), result.needs_attention()));
                             page.refresh();
@@ -1132,7 +1165,9 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
         "Review and enable"
     });
     enable.set_valign(gtk::Align::Center);
-    enable.set_sensitive(!already_enabled);
+    let held = server.unknown_fields.get("teamHeldChange") == Some(&serde_json::json!(true));
+    if held { enable.set_label("Held for team change review"); }
+    enable.set_sensitive(!already_enabled && !held);
     enable.add_css_class("toolport-secondary-action");
     let server_name = server.name.clone();
     let server_id = server.id.clone();
@@ -1332,6 +1367,80 @@ fn share_preview_content(preview: &crate::teams::PushPreview) -> gtk::ScrolledWi
         .propagate_natural_height(true)
         .child(&changes)
         .build()
+}
+
+fn member_label(label: &serde_json::Value) -> String {
+    let author = label["author"]["name"].as_str().unwrap_or("Unknown author");
+    let time = label["at"].as_i64().and_then(|ms| gtk::glib::DateTime::from_unix_utc(ms / 1000).ok())
+        .and_then(|date| date.format("%Y-%m-%d %H:%M UTC").ok()).map(|s| s.to_string()).unwrap_or_else(|| "Unknown time".into());
+    let via = label["via"].as_str().unwrap_or("unknown");
+    let approval = label["approvedBy"]["name"].as_str().map(|name| format!(" · approved by {name}")).unwrap_or_default();
+    format!("{author} · {time} · via {via}{approval}")
+}
+
+fn member_review_dialog(parent: &impl IsA<gtk::Window>, review: &crate::teams::MemberReview) -> adw::MessageDialog {
+    let dialog = adw::MessageDialog::new(Some(parent), Some("Review team changes"), Some("Each decision applies to this member and the exact content shown. Held servers stay off. Safety floors can tighten immediately."));
+    dialog.add_response("close", "Close");
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    for change in review.pending.values() {
+        let section = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        section.add_css_class("toolport-card");
+        section.append(&gtk::Label::builder().label(&change.title).xalign(0.0).css_classes(["heading"]).build());
+        if change.labels.is_empty() {
+            section.append(&gtk::Label::builder().label("Full diff from your accepted configuration. Change history labels unavailable.").wrap(true).xalign(0.0).build());
+        } else {
+            for label in &change.labels { section.append(&gtk::Label::builder().label(member_label(label)).wrap(true).xalign(0.0).build()); }
+        }
+        for field in &change.fields {
+            section.append(&gtk::Label::builder().label(format!("{}\nBefore: {}\nAfter: {}", field.field, field.before, field.after)).wrap(true).selectable(true).xalign(0.0).build());
+        }
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        for (name, accept) in [("Accept", true), ("Reject", false)] {
+            let button = gtk::Button::with_label(name);
+            button.set_widget_name(&format!("{}:{}", if accept { "accept" } else { "reject" }, change.key));
+            if accept { button.add_css_class("suggested-action"); }
+            buttons.append(&button);
+        }
+        section.append(&buttons);
+        content.append(&section);
+    }
+    let scroll = gtk::ScrolledWindow::builder().min_content_width(480).max_content_height(520).propagate_natural_height(true).child(&content).build();
+    dialog.set_extra_child(Some(&scroll));
+    dialog
+}
+
+fn connect_member_decisions(widget: &gtk::Widget, review: &crate::teams::MemberReview, page: &TeamsPage, dialog: &adw::MessageDialog) {
+    if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+        let name = button.widget_name();
+        if let Some((action, key)) = name.split_once(':') {
+            if let Some(change) = review.pending.get(key) {
+                let key = change.key.clone();
+                let hash = change.hash.clone();
+                let accept = action == "accept";
+                let page = page.clone();
+                let dialog = dialog.clone();
+                button.connect_clicked(move |button| {
+                    if page.busy.replace(true) { return; }
+                    button.set_sensitive(false);
+                    let (key, hash, page, dialog) = (key.clone(), hash.clone(), page.clone(), dialog.clone());
+                    gtk::glib::spawn_future_local(async move {
+                        let result = gtk::gio::spawn_blocking(move || crate::teams::review_team_change(&key, &hash, accept)).await;
+                        page.busy.set(false);
+                        match result {
+                            Ok(Ok(_)) => { dialog.close(); page.refresh(); }
+                            Ok(Err(error)) => { dialog.close(); page.show_error(&error); }
+                            Err(_) => { dialog.close(); page.show_error("Team review stopped unexpectedly. Review the current queue."); }
+                        }
+                    });
+                });
+            }
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        connect_member_decisions(&current, review, page, dialog);
+        child = current.next_sibling();
+    }
 }
 
 #[cfg(test)]

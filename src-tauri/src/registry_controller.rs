@@ -1923,6 +1923,9 @@ pub fn apply_server_enabled(
     enabled: bool,
     reviewed: bool,
 ) -> Result<(), String> {
+    if enabled && crate::teams::server_change_held(registry, server_id) {
+        return Err("Review this change in Teams before enabling it.".into());
+    }
     if reviewed { crate::local_auth::detach_changed(registry, server_id)?; }
     if enabled {
         if let Some(server) = registry
