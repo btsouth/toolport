@@ -530,6 +530,21 @@ mod tests {
     }
 
     #[test]
+    fn restores_tuple_pattern_and_additional_property_values() {
+        let mut schema = json!({"properties": {
+            "tuple": {"prefixItems": [{"properties": {"a b": {}}}], "items": {"properties": {"'x-Cwd'": {}}}},
+            "map": {"patternProperties": {"^known": {"properties": {"a b": {}}}}, "additionalProperties": {"properties": {"'x-Cwd'": {}}}}
+        }});
+        let plan = normalize(&mut schema);
+        let mut args = json!({"tuple": [{"a_b": 1}, {"x-Cwd": 2}], "map": {"known-key": {"a_b": 3}, "other-key": {"x-Cwd": 4}}});
+        plan.restore(&mut args).unwrap();
+        assert_eq!(
+            args,
+            json!({"tuple": [{"a b": 1}, {"'x-Cwd'": 2}], "map": {"known-key": {"a b": 3}, "other-key": {"'x-Cwd'": 4}}})
+        );
+    }
+
+    #[test]
     fn refuses_alias_and_original_instead_of_overwriting() {
         let mut schema = json!({"properties": {"'x-Cwd'": {}}});
         let plan = normalize(&mut schema);

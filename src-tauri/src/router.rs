@@ -4081,6 +4081,33 @@ mod tests {
     }
     use crate::downstream::{CancelRegistry, DownstreamServer, Transport};
 
+    #[test]
+    fn schema_compat_maps_survive_guarded_restoration_and_reindexing() {
+        let mut server = mock_server("s");
+        server.tools = vec![json!({"name": "echo", "inputSchema": {"properties": {"'x-Cwd'": {"type": "string"}}}})];
+        let raw = server.tools.clone();
+        let mut previous = Router::new();
+        previous.add(server);
+        let plan = Arc::clone(&previous.schema_arguments["s__echo"]);
+        for _ in 0..3 {
+            assert_eq!(previous.aggregated_tools()[0]["inputSchema"]["properties"]["x-Cwd"], json!({"type": "string"}));
+            assert!(Arc::ptr_eq(&plan, &previous.schema_arguments["s__echo"]));
+        }
+        assert_eq!(previous.raw_catalogs().unwrap()["s"], raw);
+        let reindexed = previous.reindexed();
+        let mut restored = Router::new();
+        let mut empty = mock_server("s");
+        empty.tools.clear();
+        restored.add(empty);
+        restored.adopt_restored_routes(&previous, &previous.aggregated_tools());
+        assert!(Arc::ptr_eq(&plan, &restored.schema_arguments["s__echo"]));
+        for view in [reindexed, restored.reindexed()] {
+            let mut args = json!({"x-Cwd": "/tmp"});
+            view.schema_arguments["s__echo"].restore(&mut args).unwrap();
+            assert_eq!(args, json!({"'x-Cwd'": "/tmp"}));
+        }
+    }
+
     /// A fake downstream server: advertises `echo` + `add`, echoes calls back.
     struct MockTransport {
         label: String,
