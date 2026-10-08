@@ -927,7 +927,7 @@ impl Session {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if lifetime_endpoint.as_deref() != Some(self.descriptor().endpoint.as_str()) {
+        if lifetime_endpoint.is_some_and(|endpoint| endpoint != self.descriptor().endpoint) {
             self.ensure_lifetime_stream();
         }
         // The old session is gone either way, and `initialize` must not send it.
