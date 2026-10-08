@@ -13396,7 +13396,7 @@ fn finish_self_heal_build(
 }
 
 /// Finish the startup background build: publish the freshly built router through the
-/// integrity gate, persist the catalog, and only then mark the gateway ready. Split
+/// integrity gate, mark the gateway ready, then persist and announce the catalog. Split
 /// out of the build thread so a test can drive the exact startup sequence with a
 /// router built in memory instead of spawning downstream processes.
 fn finish_startup_build(
@@ -13469,12 +13469,25 @@ fn finish_startup_build(
     // process, so ready must not wait on their fsync. Persistence stays after the
     // integrity gate (SEC-01) and after ready, all still under the build thread's
     // rebuild_lock, so no concurrent rebuild reads a half-written file.
+    // Use raw catalogs: the shared HTTP policy can hide every tool while
+    // adapter profiles still expose this server's catalog.
+    let announced_servers: BTreeSet<_> = live
+        .raw_catalogs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, tools)| !tools.is_empty())
+        .map(|(server, _)| server)
+        .collect();
     host.ready.store(true, Ordering::SeqCst);
     save_server_catalogs(&live, profile);
     if let Some(tools) = persisted_tools {
         save_tool_cache(&tools, profile);
     }
     notify_tools_changed(stdio, Some(&host.mcp_sessions));
+    glog(&format!(
+        "background build: initial catalog announced; servers={}",
+        serde_json::to_string(&announced_servers).unwrap()
+    ));
 }
 
 /// Fetch the upstream client's roots over stdio, update the shared `${ROOT}` path,
@@ -18170,6 +18183,32 @@ fn main() {
                 // Genuine cold start: no prior live set to keep (SBS-871).
                 None,
             );
+            // Force the startup-included path without timing guesses. Shipped
+            // gateways do not compile this conformance hook.
+            #[cfg(feature = "test-support")]
+            let built = if let Ok(ids) = std::env::var("TOOLPORT_TEST_STARTUP_CATALOG_SERVERS") {
+                let ids: Vec<String> =
+                    serde_json::from_str(&ids).expect("startup fixture server IDs");
+                let mut built = built;
+                let mut seen = conduit_lib::router::started_supervisors();
+                built.demand_servers(|id| ids.iter().any(|expected| expected == id));
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut adopted = BTreeSet::new();
+                while !ids.iter().all(|id| adopted.contains(id)) {
+                    adopted.extend(built.adopt_ready_reconnects());
+                    if ids.iter().all(|id| adopted.contains(id)) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "startup fixture catalogs did not connect"
+                    );
+                    seen = conduit_lib::router::wait_for_started_supervisor(seen, deadline);
+                }
+                built
+            } else {
+                built
+            };
             // Integrity runs inside: the gate must quarantine before `ready` is set,
             // not on the first watcher tick after startup.
             finish_startup_build(&host_for_build, built, p.as_deref(), &stdio);
