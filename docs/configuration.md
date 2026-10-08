@@ -1,16 +1,17 @@
 # Configuration
 
-Lazy discovery and the destructive-tool block are global settings, stored in the
-registry and toggled in the app's Settings view, so they apply to every client
-(lazy discovery is on by default). Per-client behavior is set via env vars on the
-gateway entry, written for you when you connect a client:
+Discovery defaults to Auto per identified client, based on native search and
+late tool-list refresh support. Choose an override in Clients. See
+[client capabilities and permission limits](client-discovery.md). Safety is a
+separate global policy, enforced in every discovery mode. Client identity is
+written automatically when you connect:
 
 - `TOOLPORT_CLIENT_ID=<id>` - identifies this client for live profile resolution
   (written automatically when you Connect a client).
 - `TOOLPORT_PROFILE=<name>` - initial profile scope for a scoped install. Unset =
   follow Default access (resolved live via `TOOLPORT_CLIENT_ID`).
-- `TOOLPORT_DISCOVERY=lazy|full|grouped` - optional per-client override of the global
-  discovery setting. Rarely needed; the gateway reads the registry default otherwise.
+- `TOOLPORT_DISCOVERY=lazy|full|grouped` - optional process default for a standalone
+  gateway. Shared daemon sessions use their per-client choice or Auto.
 - `TOOLPORT_REGISTRY=<path>` - override the registry file location. Defaults to a
   stable per-user path so packaged and unpackaged clients agree.
 - `TOOLPORT_DATA_DIR=<path>` - override the full Toolport data directory. A desktop
@@ -47,13 +48,10 @@ The adapter retains its in-process fallback when daemon spawning fails and its
 private gateway fallback when the shared daemon is unhealthy. Ambiguous startup
 failures still refuse to start a competing gateway.
 
-**Discovery mode per HTTP client.** The stdio gateway resolves one discovery mode for
-the client that spawned it. The headless HTTP/OpenAPI bridge serves several clients at
-once, so it also honors `clientDiscovery[<http-client-id>]` for the client its bearer
-token resolves to. Set `"full"` for a client that already has native tool search (Claude
-Code, Codex) and `"lazy"` for one that does not, in the same bridge process. Only `full`
-and `lazy` are per-client: `grouped` stays process-global, and a client without an entry
-inherits the process mode.
+**Discovery mode per HTTP client.** The stdio gateway resolves its client's
+per-client override or Auto. The HTTP/OpenAPI bridge honors all three explicit
+`clientDiscovery[<http-client-id>]` values for the bearer identity, including
+Grouped. An absent entry uses Auto. Anonymous connections use the global mode.
 
 **Server instructions per profile.** The gateway sends a block of instructions to every
 client when it connects. Some clients, including Claude Code, add each server's

@@ -1637,15 +1637,29 @@ fn parse_mode(s: &str) -> Option<DiscoveryMode> {
     }
 }
 
-/// Per-HTTP-client discovery override from `clientDiscovery[<client id>]`. Only
-/// `full` and `lazy` are honored per client: grouped still depends on
-/// host-wide publisher state, so a `grouped` value (or any unrecognized one)
-/// yields `None` and the request uses the host's mode.
+/// The bearer identity uses the same Auto and explicit modes as stdio adapters.
 fn http_client_discovery_override(reg: &Registry, client_id: &str) -> Option<DiscoveryMode> {
-    match reg.client_discovery_mode(client_id).and_then(parse_mode) {
-        Some(DiscoveryMode::Lazy) => Some(DiscoveryMode::Lazy),
-        Some(DiscoveryMode::Full) => Some(DiscoveryMode::Full),
-        _ => None,
+    parse_mode(conduit_lib::clients::client_discovery_mode(reg, client_id))
+}
+
+/// The adapter's generated PID identity attributes anonymous sessions; it is not
+/// a known client definition. Preserve their global default unless overridden.
+fn adapter_client_discovery_override(reg: &Registry, client_id: &str) -> Option<DiscoveryMode> {
+    let anonymous = client_id
+        .strip_prefix("adapter-pid-")
+        .is_some_and(|pid| pid.parse::<u32>().is_ok());
+    if anonymous && reg.client_discovery_mode(client_id).is_none() {
+        // Resolve from the live registry, independently of the named client
+        // that bootstrapped the shared host.
+        let (mode, _) = resolve_mode_from(
+            None,
+            None,
+            reg.discovery_mode.as_deref(),
+            reg.lazy_discovery,
+        );
+        Some(mode)
+    } else {
+        http_client_discovery_override(reg, client_id)
     }
 }
 
@@ -1653,7 +1667,7 @@ fn http_client_discovery_override(reg: &Registry, client_id: &str) -> Option<Dis
 /// [`resolve_mode_from`] for the precedence.
 fn discovery_mode_for(reg: &Registry, client_id: Option<&str>) -> DiscoveryMode {
     let env = conduit_lib::brand::env_var("TOOLPORT_DISCOVERY", "CONDUIT_DISCOVERY");
-    let client_mode = client_id.and_then(|id| reg.client_discovery_mode(id));
+    let client_mode = client_id.map(|id| conduit_lib::clients::client_discovery_mode(reg, id));
     let (mode, warning) = resolve_mode_from(
         env.as_deref(),
         client_mode,
@@ -1667,7 +1681,7 @@ fn discovery_mode_for(reg: &Registry, client_id: Option<&str>) -> DiscoveryMode 
 }
 
 /// Pure precedence: an explicit `CONDUIT_DISCOVERY` env var (hand-set in a client's config)
-/// wins, then the per-client override (`registry.client_discovery[client_id]`), then the
+/// wins, then the per-client override or capability-derived Auto for an identified client, then the
 /// registry's global `discovery_mode`, then its `lazy_discovery` bool. A SET env value that
 /// isn't lazy/grouped resolves to Full (exactly the old `env == "lazy" ? lazy : not-lazy`);
 /// an unrecognized per-client/global override is ignored (falls through).
@@ -3568,7 +3582,7 @@ fn resolve_adapter_caller(
                 tool_scope: Some(tool_scope),
                 scope: Some(scope),
             },
-            discovery: http_client_discovery_override(reg, client_id),
+            discovery: adapter_client_discovery_override(reg, client_id),
             profile: Some(profile),
         },
     )
@@ -13867,6 +13881,16 @@ fn process_request(
     });
     let _request = UpstreamRequestGuard::enter(client.map(str::to_string));
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    // One deadline includes startup and rooted composition, rather than granting
+    // each phase another budget. Warm tools lists never enter the catalog wait.
+    let tools_list_budget = if discovery == DiscoveryMode::Full {
+        Duration::from_millis(
+            clients::discovery_capabilities(client.unwrap_or("")).cold_full_list_wait_ms,
+        )
+    } else {
+        FIRST_CATALOG_WAIT
+    };
+    let tools_list_deadline = Instant::now() + tools_list_budget;
     if !state.http && upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
         state.stdio_upstream.mark_modern_upstream();
     }
@@ -13895,12 +13919,39 @@ fn process_request(
     }
 
     let wait = match method {
-        "tools/list" => state
-            .cached_tools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .tools
-            .is_empty(),
+        "tools/list" => {
+            let reg = state
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let base = state
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let (view, cached) = if state.daemon_mode.load(Ordering::SeqCst) {
+                adapter_profile
+                    .map(|profile| state.router_for_adapter_profile(base.clone(), &reg, profile))
+            } else {
+                None
+            }
+            .unwrap_or_else(|| {
+                (
+                    base,
+                    state
+                        .cached_tools
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
+                )
+            });
+            let owners = unique_prefix_owners(&reg);
+            scope_tools(&cached.tools, allowed, |name| {
+                owner_of_exposed_tool(Some(&view), &owners, name)
+            })
+            .is_empty()
+        }
         "tools/call"
         | "resources/list"
         | "resources/templates/list"
@@ -13913,7 +13964,11 @@ fn process_request(
         _ => false,
     };
     if wait {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = if method == "tools/list" {
+            tools_list_deadline
+        } else {
+            Instant::now() + Duration::from_secs(30)
+        };
         while !state.ready.load(Ordering::SeqCst) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -13950,29 +14005,14 @@ fn process_request(
         });
     }
 
-    // Tools can use their disk cache immediately. Other first lists wait for
-    // startup because the disk cache contains tools only. Every first list,
-    // including a cold tools/list, shares one short bound: a hanging start or a
-    // backoff retry is answered with whatever has loaded, and a server that
-    // connects later announces its catalog with list_changed. A server that has
-    // already connected and is being published is still awaited past the bound.
-    // Warm lists stay fast.
+    // Prompt/resource catalogs have no disk cache and keep the short first-list
+    // wait. Tools wait below, once we have the cache for this client's view.
     let catalog_list = matches!(
         method,
         "resources/list" | "resources/templates/list" | "prompts/list"
     );
     let catalog_deadline = Instant::now() + FIRST_CATALOG_WAIT;
-    if matches!(
-        method,
-        "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
-    ) && (method != "tools/list"
-        || state
-            .cached_tools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .tools
-            .is_empty())
-    {
+    if catalog_list {
         let deadline = Instant::now() + Duration::from_secs(30);
         let visible = |id: &str| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope));
         while Instant::now() < deadline {
@@ -14115,14 +14155,11 @@ fn process_request(
     }
     // Rooted composition can take a while, so its bound starts at its demand.
     let rooted_catalog_deadline = Instant::now() + FIRST_CATALOG_WAIT;
-    if daemon_adapter
-        && (rooted_list || method == "tools/list" && rooted_router.aggregated_tools().is_empty())
-    {
+    if daemon_adapter && rooted_list {
         let deadline = Instant::now() + Duration::from_secs(30);
         let visible = |id: &str| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope));
         while rooted_router.any_discovering(visible)
-            && (!rooted_list
-                || Instant::now() < rooted_catalog_deadline
+            && (Instant::now() < rooted_catalog_deadline
                 || rooted_router.any_publishing_first_catalog(visible))
             && Instant::now() < deadline
         {
@@ -14141,24 +14178,59 @@ fn process_request(
             rooted_router = state.router_for_root(base, &reg, adapter_root.as_deref(), allowed);
         }
     }
-    let (router, adapter_catalog) = if state.daemon_mode.load(Ordering::SeqCst) {
-        adapter_profile
-            .map(|profile| state.router_for_adapter_profile(rooted_router.clone(), &reg, profile))
-            .map(|(router, catalog)| (router, Some(catalog)))
-            .unwrap_or_else(|| (Arc::clone(&rooted_router), None))
-    } else {
-        (rooted_router, None)
-    };
-    // The shared HTTP cache reflects the fail-closed intersection across all
-    // profiles. An adapter needs the catalog indexed under its own tool scope,
-    // including search and code-mode calls, not that shared intersection.
-    let cache_snapshot = adapter_catalog.unwrap_or_else(|| {
-        state
+    let catalog_for_view = |rooted: Arc<Router>| {
+        // The shared HTTP cache is the intersection of all profiles. Adapter
+        // clients need their own tool scope, including when deciding coldness.
+        if state.daemon_mode.load(Ordering::SeqCst) {
+            if let Some(profile) = adapter_profile {
+                return state.router_for_adapter_profile(rooted, &reg, profile);
+            }
+        }
+        let cached = state
             .cached_tools
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    });
+            .clone();
+        (rooted, cached)
+    };
+    let (mut router, mut cache_snapshot) = catalog_for_view(rooted_router);
+    if method == "tools/list" {
+        let owners = unique_prefix_owners(&reg);
+        let visible = |id: &str| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope));
+        let cold = scope_tools(&cache_snapshot.tools, allowed, |name| {
+            owner_of_exposed_tool(Some(&router), &owners, name)
+        })
+        .is_empty();
+        if cold {
+            while Instant::now() < tools_list_deadline
+                && (router.any_discovering(visible) || router.any_publishing_first_catalog(visible))
+            {
+                if cancel
+                    .as_ref()
+                    .is_some_and(downstream::CancelContext::is_cancelled)
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+                let base = state
+                    .router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let rooted = if daemon_adapter {
+                    state.router_for_root(base, &reg, adapter_root.as_deref(), allowed)
+                } else {
+                    base
+                };
+                router = catalog_for_view(rooted).0;
+            }
+            // Ready slots can precede disk-cache publication. Read the live view
+            // after a cold wait so another client's cache cannot hide new tools.
+            cache_snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+            // Do not wait on rebuild_lock after the deadline: a slow publisher
+            // must not turn a bounded cold list into a client startup timeout.
+        }
+    }
     if method == "subscriptions/listen"
         && !state.http
         && upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION)
@@ -20215,6 +20287,140 @@ mod tests {
         drop(release);
     }
 
+    fn full_tools_list_for_client(
+        state: &GatewayState,
+        client: &str,
+        allowed: Option<&HashSet<String>>,
+    ) -> Value {
+        process_request(
+            state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            &SearchGuard::default(),
+            allowed,
+            None,
+            None,
+            None,
+            Some(client),
+            None,
+            DiscoveryMode::Full,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn supervisor_cold_full_no_refresh_waits_for_visible_first_catalog() {
+        let _env = DataDirTestEnv::new("cold-full-no-refresh");
+        let state = http_state(false);
+        // Another client's warm catalog must not shorten this view's cold wait.
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let mut live = Router::new();
+        live.add_supervised(
+            "late".into(),
+            Vec::new(),
+            Arc::new(move || {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        let live = Arc::new(live);
+        *state.router.lock().unwrap() = Arc::clone(&live);
+        let allowed = HashSet::from(["late".to_string()]);
+        std::thread::scope(|scope| {
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+            let state = &state;
+            let allowed = &allowed;
+            scope.spawn(move || {
+                reply_tx
+                    .send(full_tools_list_for_client(state, "cursor", Some(allowed)))
+                    .unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                matches!(
+                    reply_rx.recv_timeout(FIRST_CATALOG_WAIT + Duration::from_millis(100)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "no-refresh client returned before its larger budget"
+            );
+            release_tx.send(()).unwrap();
+            wait_for_supervisor_result(&live);
+            adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
+            let reply = reply_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(reply["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "late__cached"));
+            assert!(!reply["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "other__cached"));
+        });
+    }
+
+    #[test]
+    fn supervisor_cold_full_no_refresh_hanging_start_stops_at_client_budget() {
+        let _env = DataDirTestEnv::new("cold-full-client-budget");
+        let state = http_state(false);
+        let mut live = Router::new();
+        let release = hanging_supervisor(&mut live, "hang");
+        *state.router.lock().unwrap() = Arc::new(live);
+        let started = Instant::now();
+        let reply = full_tools_list_for_client(&state, "codex", None);
+        let waited = started.elapsed();
+        let budget =
+            Duration::from_millis(clients::discovery_capabilities("codex").cold_full_list_wait_ms);
+        assert!(waited >= budget, "cold list returned too early: {waited:?}");
+        assert!(
+            waited < budget + Duration::from_secs(1),
+            "cold list exceeded budget: {waited:?}"
+        );
+        assert!(state.router.lock().unwrap().lazy_starting("hang"));
+        assert!(!reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "hang__cached"));
+        drop(release);
+    }
+
+    #[test]
+    fn supervisor_warm_full_no_refresh_does_not_wait_for_hanging_start() {
+        let _env = DataDirTestEnv::new("warm-full-no-refresh");
+        let state = http_state(false);
+        let mut live = cache_router();
+        let release = hanging_supervisor(&mut live, "hang");
+        live.prepare_lazy_use("hang");
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(live.aggregated_tools()));
+        *state.router.lock().unwrap() = Arc::new(live);
+        state.ready.store(false, Ordering::SeqCst);
+        let started = Instant::now();
+        let reply = full_tools_list_for_client(&state, "codex", None);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "warm list waited for startup"
+        );
+        assert!(reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "cache__cached"));
+        drop(release);
+    }
+
     /// A cold tools/list (empty cache) shares the short first-catalog bound: a start
     /// that hangs is answered with an empty list, and the server that connects later
     /// reaches the client through the publish path's `tools/list_changed` instead of
@@ -20253,7 +20459,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Some("claude-code"),
             None,
             DiscoveryMode::Full,
         )
@@ -20348,7 +20554,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Some("claude-code"),
             None,
             DiscoveryMode::Full,
         )
@@ -26719,12 +26925,34 @@ mod tests {
         reg.set_client_discovery("c-claude-code", Some("lazy"));
         assert_eq!(resolve(&reg), Some(DiscoveryMode::Lazy));
 
-        // Grouped still depends on host-wide publisher state, so it is not a
-        // per-client override, and neither is an unset client.
+        // Grouped is scoped to this caller too; absence resolves conservative Auto.
         reg.set_client_discovery("c-claude-code", Some("grouped"));
-        assert_eq!(resolve(&reg), None);
+        assert_eq!(resolve(&reg), Some(DiscoveryMode::Grouped));
         reg.set_client_discovery("c-claude-code", None);
-        assert_eq!(resolve(&reg), None);
+        assert_eq!(resolve(&reg), Some(DiscoveryMode::Lazy));
+    }
+
+    #[test]
+    fn adapter_discovery_defaults_preserve_anonymous_and_explicit_choices() {
+        let mut reg = Registry::default();
+        reg.discovery_mode = Some("full".into());
+        let resolve = |reg: &Registry, id| resolve_adapter_caller(reg, id, None, None).1.discovery;
+        assert_eq!(resolve(&reg, "adapter-pid-123"), Some(DiscoveryMode::Full));
+        reg.discovery_mode = Some("lazy".into());
+        assert_eq!(resolve(&reg, "adapter-pid-123"), Some(DiscoveryMode::Lazy));
+        assert_eq!(
+            resolve(&reg, "adapter-pid-not-a-number"),
+            Some(DiscoveryMode::Lazy)
+        );
+        assert_eq!(resolve(&reg, "unknown-client"), Some(DiscoveryMode::Lazy));
+        assert_eq!(resolve(&reg, "claude-code"), Some(DiscoveryMode::Full));
+        reg.set_client_discovery("adapter-pid-123", Some("grouped"));
+        assert_eq!(
+            resolve(&reg, "adapter-pid-123"),
+            Some(DiscoveryMode::Grouped)
+        );
+        reg.set_client_discovery("unknown-client", Some("full"));
+        assert_eq!(resolve(&reg, "unknown-client"), Some(DiscoveryMode::Full));
     }
 
     /// SBS-866: route_of is authoritative; an override-renamed team tool must not
@@ -31199,6 +31427,11 @@ mod tests {
         .unwrap();
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("Found"));
+        // The reader's 500 ms UI budget can expire behind concurrent telemetry
+        // on Windows. Await the test barrier before asserting persisted bytes.
+        assert!(conduit_lib::telemetry::flush_for_test(
+            std::time::Duration::from_secs(5)
+        ));
         // Other tests can append telemetry while this one holds the data-dir
         // override, so the last row need not belong to this search.
         let trace = searchtrace::read_recent(usize::MAX)
@@ -34710,6 +34943,168 @@ mod tests {
         );
         assert!(!after.starts_with('x'), "did not cut on a line boundary");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn discovery_modes_share_access_safety_and_quarantine_for_list_search_and_call() {
+        let _env = DataDirTestEnv::new("discovery-policy-parity");
+        for mode in [
+            DiscoveryMode::Full,
+            DiscoveryMode::Lazy,
+            DiscoveryMode::Grouped,
+        ] {
+            for policy in [
+                "allow",
+                "server-access",
+                "global-off",
+                "tool-access",
+                "off",
+                "ask",
+                "strict",
+                "quarantine",
+            ] {
+                let host = dispatch_host(false);
+                host.set_discovery_mode(mode);
+                let mut reg = Registry::default();
+                reg.default_access_context_id = Some("default".into());
+                let mut server = stub_server("s", "S");
+                server.enabled = true;
+                reg.servers.push(server);
+                reg.set_client_scope("fixture-client", Some("default"));
+                reg.set_access_server("default", "s", policy != "server-access")
+                    .unwrap();
+                if policy == "global-off" {
+                    reg.set_global_server_enabled("s", false).unwrap();
+                }
+                reg.set_safety_level(match policy {
+                    "ask" => registry::SafetyLevel::Ask,
+                    "strict" => registry::SafetyLevel::Strict,
+                    _ => registry::SafetyLevel::Off,
+                });
+                if policy == "tool-access" {
+                    reg.set_profile_server_tools("default", "s", Some(vec!["another".into()]))
+                        .unwrap();
+                }
+                let (allowed, caller) = resolve_adapter_caller(&reg, "fixture-client", None, None);
+                let (router, calls, _) =
+                    counting_router(matches!(policy, "off" | "ask" | "strict"));
+                let mut router = Arc::try_unwrap(router).ok().unwrap();
+                router.apply_registry_policy(registry_policy(
+                    &reg,
+                    caller.profile.as_deref(),
+                    false,
+                    false,
+                ));
+                if policy == "quarantine" {
+                    router.requarantine(BTreeSet::from(["s__work".into()]));
+                }
+                let catalog = router.aggregated_tools();
+                let run = |request: Value| {
+                    handle_request(
+                        &host,
+                        &request,
+                        &reg,
+                        &router,
+                        &catalog,
+                        mode == DiscoveryMode::Lazy,
+                        Some("default"),
+                        &SearchGuard::default(),
+                        allowed.as_ref(),
+                        Some("fixture-client"),
+                    )
+                    .unwrap()
+                };
+                let visible = !matches!(
+                    policy,
+                    "server-access" | "global-off" | "tool-access" | "strict" | "quarantine"
+                );
+                let listed = run(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
+                if mode == DiscoveryMode::Full {
+                    assert_eq!(
+                        listed["result"]["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|tool| tool["name"] == "s__work"),
+                        visible,
+                        "{mode:?} {policy}"
+                    );
+                } else {
+                    let names: Vec<_> = listed["result"]["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|tool| tool["name"].as_str())
+                        .collect();
+                    assert!(!names.contains(&"s__work"), "{mode:?} {policy}");
+                    if mode == DiscoveryMode::Grouped {
+                        assert_eq!(names.contains(&"help_s"), visible, "{mode:?} {policy}");
+                    }
+                    let name = if mode == DiscoveryMode::Grouped {
+                        "help_s"
+                    } else {
+                        "toolport_search_tools"
+                    };
+                    let search = run(
+                        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":{"query":"work"}}}),
+                    );
+                    assert_eq!(
+                        search.to_string().contains("s__work"),
+                        visible,
+                        "{mode:?} {policy}: {search}"
+                    );
+                }
+                // Raw names must be blocked too, even when not advertised.
+                for wrapped in [false, true] {
+                    let (name, arguments) = if wrapped {
+                        (
+                            "toolport_call_tool",
+                            json!({"name":"s__work","arguments":{}}),
+                        )
+                    } else {
+                        ("s__work", json!({}))
+                    };
+                    let response = run(
+                        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
+                    );
+                    assert_eq!(
+                        response["result"]["isError"],
+                        !matches!(policy, "allow" | "off"),
+                        "{mode:?} {policy}: {response}"
+                    );
+                }
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    if matches!(policy, "allow" | "off") {
+                        2
+                    } else {
+                        0
+                    },
+                    "{mode:?} {policy}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_surface_token_measurement() {
+        let _env = DataDirTestEnv::new("discovery-token-cost");
+        let host = dispatch_host(false);
+        let reg = Registry::default();
+        let router = Router::new();
+        // A fixed small eager-client fixture. This is serialized MCP catalog cost,
+        // not the prompt cost after a vendor's own deferral or caching.
+        let catalog: Vec<Value> = (0..14).map(|i| json!({"name":format!("fixture__read_{i}"),"description":"Read a fixture record by its identifier.","inputSchema":{"type":"object","properties":{"id":{"type":"string","description":"Record identifier"}},"required":["id"]},"annotations":{"readOnlyHint":true}})).collect();
+        for mode in [DiscoveryMode::Lazy, DiscoveryMode::Full] {
+            let tools = tool_surface(&host, &reg, &router, &catalog, None, mode);
+            let serialized = serde_json::to_string(&tools).unwrap();
+            println!("DISCOVERY_COST mode={} fixture_tools=14 exposed_tools={} tokenizer={} tokens={} bytes={} code_mode=false", mode.as_str(), tools.len(), savings::TOKENIZER, savings::count_tokens(&serialized), serialized.len());
+        }
+        let empty_floor = tool_surface(&host, &reg, &router, &[], None, DiscoveryMode::Lazy);
+        assert_eq!(
+            empty_floor,
+            tool_surface(&host, &reg, &router, &catalog, None, DiscoveryMode::Lazy)
+        );
     }
 
     #[test]

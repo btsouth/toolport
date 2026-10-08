@@ -21,6 +21,8 @@
 //! `mock-mcp-server` fixture as the downstream. Every wait is bounded, so a
 //! case that hangs fails its own deadline rather than the CI job.
 
+mod discovery_support;
+
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -192,6 +194,11 @@ impl Default for AdapterOptions<'_> {
 
 fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
     let index = NEXT.fetch_add(1, Ordering::Relaxed);
+    let client_id = options
+        .client_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("matrix-{index}"));
+    discovery_support::select_full(dir, &client_id);
     let mut command = Command::new(env!("CARGO_BIN_EXE_toolport-gateway"));
     if !options.default_role {
         command.arg("--stdio-adapter");
@@ -201,13 +208,7 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
         .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
         .env_remove("TOOLPORT_GATEWAY_TOPOLOGY")
         .env_remove("CONDUIT_GATEWAY_TOPOLOGY")
-        .env(
-            "TOOLPORT_CLIENT_ID",
-            options
-                .client_id
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("matrix-{index}")),
-        )
+        .env("TOOLPORT_CLIENT_ID", client_id)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2076,6 +2077,7 @@ fn matrix_pooling_sessionless_modern_requests_keep_a_warm_root_launch() {
         vec![mock_server_entry("rooted", &transcript, Some("${ROOT}"))],
         vec![],
     );
+    discovery_support::select_full(&dir, "sessionless-root");
     let mut bootstrap = spawn_adapter(&dir, &AdapterOptions::default());
     bootstrap.initialize("matrix-sessionless-bootstrap");
     let descriptor = wait_for_descriptor(&dir, Duration::from_secs(10));
@@ -3008,6 +3010,7 @@ fn matrix_routing_live_profile_change_reopens_the_adapter_session() {
             profile("scope-two", &["two"]),
         ],
     );
+    discovery_support::select_full(&dir, "matrix-rescope");
     let mut reg = registry::load_from(&path).expect("load fixture registry");
     reg.client_scopes
         .insert("matrix-rescope".to_string(), "scope-one".to_string());

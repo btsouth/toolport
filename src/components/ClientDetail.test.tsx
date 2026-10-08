@@ -429,3 +429,62 @@ describe("ClientDetail legacy bearer migration", () => {
     expect(migrateClient).not.toHaveBeenCalled();
   });
 });
+
+describe("ClientDetail Auto discovery", () => {
+  it.each([true, null])(
+    "shows the capability default before connect (refresh=%s)",
+    (refresh) => {
+      render(
+        <ClientDetail
+          client={client({
+            id: "claude-code",
+            discovery: {
+              nativeToolSearch: true,
+              toolsListChanged: refresh,
+              evidence: "fixture",
+            },
+          })}
+          registry={emptyRegistry()}
+          onRegistryChange={vi.fn()}
+          onChanged={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("Auto (full)")).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "Full tool list. Client per-tool permission rules need Full mode.",
+        ),
+      ).toBeInTheDocument();
+    },
+  );
+  it.each(["grouped", " GROUPED "])(
+    "keeps an explicit override instead of Auto (%s)",
+    (mode) => {
+      render(
+        <ClientDetail
+          client={client({
+            gatewayInstalled: true,
+            entryState: "managed",
+            discovery: {
+              nativeToolSearch: true,
+              toolsListChanged: true,
+              evidence: "fixture",
+            },
+          })}
+          registry={{
+            ...emptyRegistry(),
+            clientDiscovery: { "claude-desktop": mode },
+          }}
+          onRegistryChange={vi.fn()}
+          onChanged={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("Grouped · per-server")).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "Browse a server, then call tools. Client per-tool permission rules need Full mode.",
+        ),
+      ).toBeInTheDocument();
+    },
+  );
+});

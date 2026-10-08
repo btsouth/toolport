@@ -920,6 +920,7 @@ mod tests {
             id: "codex".into(),
             name: "Codex".into(),
             uses_connectors: false,
+            discovery: crate::clients::discovery_capabilities("codex"),
             config_path: "/private/config.toml".into(),
             config_exists: true,
             app_present: true,

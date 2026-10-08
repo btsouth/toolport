@@ -15,6 +15,8 @@
 
 #![cfg(unix)]
 
+mod discovery_support;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -220,6 +222,8 @@ impl Client {
     /// `explicit` runs `--stdio-adapter`; otherwise the registry-selected role a
     /// real client gets, pinned to the daemon topology.
     fn spawn(dir: &Path, explicit: bool) -> Self {
+        let client_id = format!("health-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+        discovery_support::select_full(dir, &client_id);
         let mut command = gateway(dir);
         if explicit {
             command.arg("--stdio-adapter");
@@ -230,10 +234,7 @@ impl Client {
             .env("ADAPTER_AMBIENT_CREDENTIAL", "must-not-leak")
             // Force the inherit-env fallback to expose the gateway process boundary.
             .env("SHELL", dir.join("missing-login-shell"))
-            .env(
-                "TOOLPORT_CLIENT_ID",
-                format!("health-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
-            )
+            .env("TOOLPORT_CLIENT_ID", client_id)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

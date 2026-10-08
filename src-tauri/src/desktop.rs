@@ -4674,6 +4674,7 @@ mod tests {
         plugin_servers: Vec<&str>,
     ) -> clients::DetectedClient {
         clients::DetectedClient {
+            discovery: clients::discovery_capabilities("fixture"),
             id: id.into(),
             name: id.into(),
             uses_connectors: false,
