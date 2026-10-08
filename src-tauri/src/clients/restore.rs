@@ -1354,6 +1354,77 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), fresh);
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn exact_restore_exchange_replays_native_save() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-restore-exchange-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"mcpServers":{},"session":1}"#).unwrap();
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            edit_format(Format::JsonMcpServers, &path, Some(&entry()), true)
+        })
+        .unwrap();
+        crate::registry::client_file::HOOK.with(|slot| {
+            *slot.borrow_mut() = Some((
+                "commit",
+                Box::new(|path| {
+                    let mut native =
+                        parse_json_value(&std::fs::read_to_string(path).unwrap()).unwrap();
+                    native["session"] = serde_json::json!(2);
+                    let tmp = path.with_extension("native");
+                    std::fs::write(&tmp, native.to_string()).unwrap();
+                    #[cfg(windows)]
+                    std::fs::remove_file(path).unwrap();
+                    std::fs::rename(tmp, path).unwrap();
+                }),
+            ))
+        });
+        disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
+        let root = parse_json_value(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["session"], 2);
+        assert!(root["mcpServers"].get(GATEWAY_ENTRY_NAME).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn created_config_removal_preserves_racing_client_save() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-removal-race-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("config.json");
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            edit_format(Format::JsonMcpServers, &path, Some(&entry()), true)
+        })
+        .unwrap();
+        let native = r#"{"session":2,"mcpServers":{"native":{"command":"native"}}}"#;
+        crate::registry::client_file::HOOK.with(|slot| {
+            *slot.borrow_mut() = Some((
+                "remove",
+                Box::new(move |path| {
+                    let tmp = path.with_extension("native");
+                    std::fs::write(&tmp, native).unwrap();
+                    #[cfg(windows)]
+                    std::fs::remove_file(path).unwrap();
+                    std::fs::rename(tmp, path).unwrap();
+                }),
+            ))
+        });
+        assert!(disconnect("fixture", &path, Format::JsonMcpServers)
+            .unwrap_err()
+            .contains("conflict"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), native);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[cfg(unix)]
     #[test]
     fn exact_restore_preserves_original_config_mode() {

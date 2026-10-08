@@ -903,6 +903,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   className={result.error ? "text-destructive" : "text-muted-foreground"}
                 >
                   {result.clientId}: {result.error ?? "Client configuration restored"}
+                  {result.warnings?.length ? `; ${result.warnings.join("; ")}` : ""}
                 </li>
               ))
             )}

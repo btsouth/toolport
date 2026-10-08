@@ -944,6 +944,7 @@ export function setSafetyLevel(level: "off" | "ask" | "strict"): Promise<Registr
 }
 
 export interface DisconnectResult {
+  warnings?: string[];
   clientId: string;
   path: string;
   dryRun: boolean;

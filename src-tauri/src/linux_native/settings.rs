@@ -573,7 +573,7 @@ impl SettingsPage {
                     gtk::glib::spawn_future_local(async move {
                         match gtk::gio::spawn_blocking(|| crate::clients::disconnect_all(false)).await {
                             Ok(Ok(results)) => {
-                                let message = if results.is_empty() { "No client connections to remove.".into() } else { results.iter().map(|result| format!("{}: {}", result.client_id, result.error.as_deref().unwrap_or("Client configuration restored"))).collect::<Vec<_>>().join("\n") };
+                                let message = if results.is_empty() { "No client connections to remove.".into() } else { results.iter().map(|result| format!("{}: {}", result.client_id, result.error.clone().unwrap_or_else(|| std::iter::once("Client configuration restored".to_string()).chain(result.warnings.iter().cloned()).collect::<Vec<_>>().join("; ")))).collect::<Vec<_>>().join("\n") };
                                 results_label.set_label(&message);
                                 page.begin_mutation();
                                 page.refresh_quietly();
