@@ -263,7 +263,7 @@ struct ClientConfigReceipt {
 }
 
 impl ClientConfigReceipt {
-fn capture(outcome: &WriteOutcome) -> Result<Self, String> {
+    fn capture(outcome: &WriteOutcome) -> Result<Self, String> {
         let target = PathBuf::from(&outcome.path);
         let written = match std::fs::read(&target) {
             Ok(bytes) => Some(bytes),
@@ -284,7 +284,7 @@ fn capture(outcome: &WriteOutcome) -> Result<Self, String> {
         })
     }
 
-fn rollback(&self) -> Result<(), String> {
+    fn rollback(&self) -> Result<(), String> {
         if !self.exact_rollback {
             return Err("exact rollback is unavailable because the client saved after this operation; newer edits were left untouched".into());
         }
@@ -829,6 +829,11 @@ fn finish_client_config_mutation(
             "the client saved after this operation; exact rollback is unavailable for this write"
                 .into(),
         );
+        if let Some(file) = &outcome.recovery_path {
+            if let Err(error) = clients::record_config_capture_conflict(file, &receipt.target, outcome.revision.as_deref()) {
+                outcome.warnings.push(format!("could not record unavailable exact rollback: {error}"));
+            }
+        }
     }
     match write_registry(outcome.managed.clone()) {
         Ok(registry) => Ok(ClientMutationResult { registry, outcome }),
@@ -3106,7 +3111,7 @@ mod tests {
     }
 
     #[test]
-fn client_save_before_receipt_capture_updates_registry_with_warning() {
+    fn client_save_before_receipt_capture_updates_registry_with_warning() {
         let fixture = MoveFixture::new(&Registry::default());
         std::fs::write(fixture.claude(), "{\"mcpServers\":{}}").unwrap();
         let outcome = clients::install_gateway("claude-code", None).unwrap();
@@ -3133,12 +3138,14 @@ fn client_save_before_receipt_capture_updates_registry_with_warning() {
                 .unwrap()
                 .exact_rollback
         );
+        let snapshot: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(result.outcome.recovery_path.as_ref().unwrap()).unwrap()).unwrap();
+        assert_eq!(snapshot["exactEligible"], false);
         disconnect_client("claude-code").unwrap();
         assert_eq!(json_file(&fixture.claude())["session"], 2);
     }
 
     #[test]
-fn http_disconnect_finishes_before_failed_keychain_revocation() {
+    fn http_disconnect_finishes_before_failed_keychain_revocation() {
         let fixture = MoveFixture::new(&Registry::default());
         let original = "{ \"mcpServers\": {} }";
         std::fs::write(fixture.claude(), original).unwrap();
@@ -3178,7 +3185,7 @@ fn http_disconnect_finishes_before_failed_keychain_revocation() {
     }
 
     #[test]
-fn edited_toolport_entry_is_reported_after_disconnect() {
+    fn edited_toolport_entry_is_reported_after_disconnect() {
         let fixture = MoveFixture::new(&Registry::default());
         std::fs::write(fixture.claude(), "{}").unwrap();
         clients::install_gateway("claude-code", None).unwrap();

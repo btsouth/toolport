@@ -23,6 +23,7 @@ mod moved;
 mod mutation;
 mod restore;
 pub(crate) use restore::after_rollback as record_config_rollback;
+pub(crate) use restore::after_capture_conflict as record_config_capture_conflict;
 mod zcode;
 
 /// One MCP server, normalized across every client format.
