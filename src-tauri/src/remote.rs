@@ -1859,28 +1859,22 @@ mod tests {
                         .started
                         .recv_timeout(Duration::from_secs(5))
                         .unwrap();
-                    let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
-                    let (saved_tx, saved_rx) = std::sync::mpsc::channel();
-                    let waiter = scope.spawn(move || {
-                        refresh_token_with_lock("rotation", None, || {
-                            // This seam runs after the pre-lock vault snapshot. Try the
-                            // real lock while the peer holds it, then let it save.
-                            let contended = lock_oauth_refresh_for("rotation", Duration::ZERO);
-                            assert!(contended.is_err());
-                            snapshot_tx.send(()).unwrap();
-                            saved_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                            if timeout_after_save {
-                                contended
-                            } else {
-                                lock_oauth_refresh_for("rotation", Duration::ZERO)
-                            }
-                        })
-                    });
-                    snapshot_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                    endpoint.release.send(()).unwrap();
-                    assert_eq!(holder.join().unwrap().unwrap(), "token-1");
-                    saved_tx.send(()).unwrap();
-                    let winner = waiter.join().unwrap().unwrap();
+                    let winner = refresh_token_with_lock("rotation", None, || {
+                        // The waiter has taken its pre-lock snapshot. Keep the holder
+                        // blocked until contention is proved, then join its save before
+                        // rechecking the lock. Separate pending memory models a peer
+                        // process without a timed channel racing its vault writes.
+                        let contended = lock_oauth_refresh_for("rotation", Duration::ZERO);
+                        assert!(contended.is_err());
+                        endpoint.release.send(()).unwrap();
+                        assert_eq!(holder.join().unwrap().unwrap(), "token-1");
+                        if timeout_after_save {
+                            contended
+                        } else {
+                            lock_oauth_refresh_for("rotation", Duration::ZERO)
+                        }
+                    })
+                    .unwrap();
                     assert_eq!(winner.access_token, "token-1");
                     assert!(winner.expires_at.unwrap() > now_epoch_seconds());
                     assert_eq!(endpoint.count(), 1);
