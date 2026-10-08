@@ -104,14 +104,21 @@ impl Drop for Fixture {
                                 .parent()
                                 .unwrap()
                                 .join("toolport-gateway");
-                            assert!(image.is_ok_and(|image| image == private_image));
+                            let owned = image.is_ok_and(|image| image == private_image);
+                            if !std::thread::panicking() {
+                                assert!(owned);
+                            }
+                            if !owned {
+                                continue;
+                            }
                             // This daemon belongs to this disposable fixture. An active
                             // adapter listener can outlive its caller, so reap it before
                             // removing the executable or its private data.
-                            assert_eq!(
-                                unsafe { libc::kill(descriptor.pid as i32, libc::SIGKILL) },
-                                0
-                            );
+                            let killed =
+                                unsafe { libc::kill(descriptor.pid as i32, libc::SIGKILL) };
+                            if !std::thread::panicking() {
+                                assert_eq!(killed, 0);
+                            }
                             let deadline =
                                 std::time::Instant::now() + std::time::Duration::from_secs(10);
                             while std::fs::read_link(format!("/proc/{}/exe", descriptor.pid))
@@ -120,15 +127,22 @@ impl Drop for Fixture {
                             {
                                 std::thread::sleep(std::time::Duration::from_millis(10));
                             }
-                            assert!(std::fs::read_link(format!("/proc/{}/exe", descriptor.pid))
+                            if !std::thread::panicking() {
+                                assert!(std::fs::read_link(format!(
+                                    "/proc/{}/exe",
+                                    descriptor.pid
+                                ))
                                 .is_err());
+                            }
                         }
                         conduit_lib::daemon::clear_descriptor(&file.path());
-                        assert!(
-                            !running() && !file.path().exists(),
-                            "private fixture daemon {} did not shut down",
-                            descriptor.pid
-                        );
+                        if !std::thread::panicking() {
+                            assert!(
+                                !running() && !file.path().exists(),
+                                "private fixture daemon {} did not shut down",
+                                descriptor.pid
+                            );
+                        }
                     }
                 }
             }
@@ -184,12 +198,7 @@ fn run_private_fixture(test: &str) -> bool {
     .unwrap();
     let status = std::process::Command::new(&child)
         .env("TOOLPORT_REVIEWED_CHILD", "1")
-        .args([
-            "--exact",
-            test,
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .status()
         .unwrap();
     std::fs::remove_dir_all(dir).unwrap();
@@ -279,12 +288,24 @@ fn reviewed_setup_waits_for_slow_first_catalog() {
     }
     let _lock = registry::data_dir_test_lock();
     let fixture = Fixture::new();
-    let mock = std::env::current_exe().unwrap().parent().unwrap().join("mock-mcp-server");
-    std::fs::write(fixture.config(), json!({"mcpServers":{"slow":{
-        "command":mock,"env":{"MOCK_MCP_START_DELAY_MS":"3000"}
-    }}}).to_string()).unwrap();
+    let mock = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("mock-mcp-server");
+    std::fs::write(
+        fixture.config(),
+        json!({"mcpServers":{"slow":{
+            "command":mock,"env":{"MOCK_MCP_START_DELAY_MS":"3000"}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
     let review = controller::preview_client_setup("claude-code").unwrap();
     let outcome = migrate_fixture(&fixture, &["slow".into()], &review.revision);
     assert!(outcome.servers[0].tool_count > 0);
-    assert_eq!(conduit_lib::clients::discovery_capabilities("claude-code").cold_full_list_wait_ms, 2_000);
+    assert_eq!(
+        conduit_lib::clients::discovery_capabilities("claude-code").cold_full_list_wait_ms,
+        2_000
+    );
 }

@@ -1561,6 +1561,17 @@ fn undo_staged_value(
             complete
         }
         (Value::Array(latest), Value::Array(previous), Value::Array(staged)) => {
+            if previous
+                .iter()
+                .chain(staged)
+                .chain(latest.iter())
+                .any(|row| {
+                    row.get("id").and_then(Value::as_str).is_none()
+                        && row.get("key").and_then(Value::as_str).is_none()
+                })
+            {
+                return latest == previous;
+            }
             let mut complete = true;
             for written in staged {
                 let old = previous.iter().find(|v| same_row(v, written));
@@ -1751,7 +1762,7 @@ fn verify_setup_gateway(
     ];
     let transport = crate::downstream::StdioTransport::spawn(
         &gateway.to_string_lossy(),
-        &[],
+        &["--setup-review".into()],
         &env,
         None,
         false,
@@ -2599,8 +2610,16 @@ mod tests {
     #[test]
     fn reviewed_rollback_does_not_merge_positional_arguments() {
         for (previous, staged, latest) in [
-            (serde_json::json!(["--a", "x", "--a", "y"]), serde_json::json!(["--a", "new", "--a", "y"]), serde_json::json!(["--a", "new", "--a", "z"])),
-            (serde_json::json!(["a", "b"]), serde_json::json!(["b", "a"]), serde_json::json!(["b", "a", "c"])),
+            (
+                serde_json::json!(["--a", "x", "--a", "y"]),
+                serde_json::json!(["--a", "new", "--a", "y"]),
+                serde_json::json!(["--a", "new", "--a", "z"]),
+            ),
+            (
+                serde_json::json!(["a", "b"]),
+                serde_json::json!(["b", "a"]),
+                serde_json::json!(["b", "a", "c"]),
+            ),
         ] {
             let mut concurrent = latest.clone();
             assert!(!undo_staged_value(&mut concurrent, &previous, &staged));
