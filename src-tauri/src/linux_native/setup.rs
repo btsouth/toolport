@@ -740,6 +740,18 @@ mod tests {
             .find(|w| w.title().as_deref() == Some("Update fixture"))
             .unwrap();
         let widgets = descendants(window.upcast_ref());
+        assert!(widgets.iter().any(|widget| widget.is::<gtk::Expander>()));
+        assert!(
+            !widgets.iter().any(|widget| widget.is::<adw::ExpanderRow>()),
+            "setup must use the app's standard expander under Yaru"
+        );
+        for expander in widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Expander>())
+        {
+            expander.set_expanded(true);
+        }
+        let widgets = descendants(window.upcast_ref());
         assert!(widgets
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::Button>())
@@ -756,11 +768,6 @@ mod tests {
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::Label>())
             .any(|l| l.text() == "Environment, Launch settings"));
-        assert!(widgets.iter().any(|widget| widget.is::<gtk::Expander>()));
-        assert!(
-            !widgets.iter().any(|widget| widget.is::<adw::ExpanderRow>()),
-            "setup must use the app's standard expander under Yaru"
-        );
         window.close();
     }
 
