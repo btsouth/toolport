@@ -2597,6 +2597,21 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_rollback_does_not_merge_positional_arguments() {
+        for (previous, staged, latest) in [
+            (serde_json::json!(["--a", "x", "--a", "y"]), serde_json::json!(["--a", "new", "--a", "y"]), serde_json::json!(["--a", "new", "--a", "z"])),
+            (serde_json::json!(["a", "b"]), serde_json::json!(["b", "a"]), serde_json::json!(["b", "a", "c"])),
+        ] {
+            let mut concurrent = latest.clone();
+            assert!(!undo_staged_value(&mut concurrent, &previous, &staged));
+            assert_eq!(concurrent, latest);
+            let mut unchanged = staged.clone();
+            assert!(undo_staged_value(&mut unchanged, &previous, &staged));
+            assert_eq!(unchanged, previous);
+        }
+    }
+
+    #[test]
     fn reviewed_rollback_matches_server_ids_before_unknown_keys() {
         let previous = serde_json::json!([
             {"id":"other","key":"shared","enabled":false},

@@ -154,7 +154,7 @@ fn migrate_fixture(
 
 // Run the acceptance test beside private gateway and mock images. Both read-only
 // lookup and config publication then exercise the normal packaged resolver.
-fn run_private_fixture() -> bool {
+fn run_private_fixture(test: &str) -> bool {
     if std::env::var_os("TOOLPORT_REVIEWED_CHILD").is_some() {
         return false;
     }
@@ -186,7 +186,7 @@ fn run_private_fixture() -> bool {
         .env("TOOLPORT_REVIEWED_CHILD", "1")
         .args([
             "--exact",
-            "reviewed_setup_real_gateway_and_failed_launch",
+            test,
             "--nocapture",
             "--test-threads=1",
         ])
@@ -199,7 +199,7 @@ fn run_private_fixture() -> bool {
 
 #[test]
 fn reviewed_setup_real_gateway_and_failed_launch() {
-    if run_private_fixture() {
+    if run_private_fixture("reviewed_setup_real_gateway_and_failed_launch") {
         return;
     }
     let _lock = registry::data_dir_test_lock();
@@ -270,4 +270,21 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
     let restored: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(fixture.config()).unwrap()).unwrap();
     assert_eq!(restored["mcpServers"]["alpha"]["command"], mock);
+}
+
+#[test]
+fn reviewed_setup_waits_for_slow_first_catalog() {
+    if run_private_fixture("reviewed_setup_waits_for_slow_first_catalog") {
+        return;
+    }
+    let _lock = registry::data_dir_test_lock();
+    let fixture = Fixture::new();
+    let mock = std::env::current_exe().unwrap().parent().unwrap().join("mock-mcp-server");
+    std::fs::write(fixture.config(), json!({"mcpServers":{"slow":{
+        "command":mock,"env":{"MOCK_MCP_START_DELAY_MS":"3000"}
+    }}}).to_string()).unwrap();
+    let review = controller::preview_client_setup("claude-code").unwrap();
+    let outcome = migrate_fixture(&fixture, &["slow".into()], &review.revision);
+    assert!(outcome.servers[0].tool_count > 0);
+    assert_eq!(conduit_lib::clients::discovery_capabilities("claude-code").cold_full_list_wait_ms, 2_000);
 }
