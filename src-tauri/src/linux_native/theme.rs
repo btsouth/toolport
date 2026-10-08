@@ -812,6 +812,17 @@ button.toolport-activity-filter {{
   opacity: 0.6;
 }}
 
+.toolport-setup-expander.expander image.expander-row-arrow:dir(ltr),
+.toolport-setup-expander.expander image.expander-row-arrow:dir(rtl) {{
+    -gtk-icon-source: -gtk-icontheme("pan-end-symbolic");
+    -gtk-icon-transform: rotate(0turn);
+}}
+.toolport-setup-expander.expander:checked image.expander-row-arrow:dir(ltr),
+.toolport-setup-expander.expander:checked image.expander-row-arrow:dir(rtl) {{
+    -gtk-icon-source: -gtk-icontheme("pan-down-symbolic");
+    -gtk-icon-transform: rotate(0turn);
+}}
+
 .toolport-details-expander {{
   padding: 11px 14px;
   border: 1px solid alpha(@toolport_fg, 0.10);

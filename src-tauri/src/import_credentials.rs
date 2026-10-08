@@ -26,6 +26,9 @@ pub(crate) fn provided(value: &str) -> bool {
 
 pub(crate) fn secret_env(key: &str, value: Option<&str>) -> bool {
     let key = key.to_ascii_uppercase();
+    if key == "PATH" {
+        return false;
+    }
     if [
         "KEY",
         "TOKEN",
@@ -40,8 +43,10 @@ pub(crate) fn secret_env(key: &str, value: Option<&str>) -> bool {
         "PAT",
     ]
     .iter()
-    .any(|needle| key.contains(needle))
-    {
+    .any(|needle| {
+        key.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| word == *needle)
+    }) {
         return true;
     }
     let Some(value) = value else {
@@ -50,6 +55,15 @@ pub(crate) fn secret_env(key: &str, value: Option<&str>) -> bool {
     if ["sk-", "ghp_", "github_pat_", "xox", "AKIA", "-----BEGIN"]
         .iter()
         .any(|prefix| value.starts_with(prefix))
+    {
+        return true;
+    }
+    static PASSWORD: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)(password|pwd)\s*=").unwrap());
+    if url::Url::parse(value).is_ok_and(|url| {
+        !url.username().is_empty() || url.password().is_some() || url.query().is_some()
+    }) || PASSWORD.is_match(value)
+        || value.len() >= 32 && value.bytes().all(|b| b.is_ascii_hexdigit())
     {
         return true;
     }
@@ -81,6 +95,9 @@ impl VaultWrites {
         self.receipts
             .push((id.into(), key.into(), previous, value.into()));
         secrets::set_secret(id, key, value).map_err(|_| VAULT_FAILURE.into())
+    }
+    pub(crate) fn keep(&mut self) {
+        self.receipts.clear();
     }
     fn rollback(&mut self) -> Result<(), String> {
         let mut failed = false;
@@ -360,6 +377,25 @@ impl Import {
         let mask = registry::secret_arg_mask(&entry.args);
         let had_launch = entry.launch.is_some();
         let mut launch = entry.launch.take().unwrap_or_default();
+        // v1.24's HTTP bearer fallback only reads secret env entries. Keeping
+        // the endpoint in launch inputs prevents rollback from sending it as auth.
+        if values
+            .iter()
+            .any(|(key, _)| key == secrets::IMPORTED_URL_KEY)
+            && !launch
+                .inputs
+                .iter()
+                .any(|i| i.key == secrets::IMPORTED_URL_KEY)
+        {
+            launch.inputs.push(registry::LaunchInput {
+                key: secrets::IMPORTED_URL_KEY.into(),
+                label: "Imported endpoint".into(),
+                secret: true,
+                required: true,
+                value: None,
+                unknown_fields: Default::default(),
+            });
+        }
         for (index, secret) in mask.into_iter().enumerate() {
             if !secret || launch.bindings.iter().any(|binding| binding.index == index) {
                 continue;
@@ -409,6 +445,46 @@ impl Import {
         Ok(Self { entry, values })
     }
 
+    pub(crate) fn updates(&self, existing: &ServerEntry) -> Vec<String> {
+        let mut fields = Vec::new();
+        for (label, left, right) in [
+            (
+                "Environment",
+                serde_json::to_value(&existing.env).unwrap(),
+                serde_json::to_value(&self.entry.env).unwrap(),
+            ),
+            (
+                "Launch settings",
+                serde_json::to_value(&existing.launch).unwrap(),
+                serde_json::to_value(&self.entry.launch).unwrap(),
+            ),
+            (
+                "Arguments",
+                serde_json::to_value(&existing.args).unwrap(),
+                serde_json::to_value(&self.entry.args).unwrap(),
+            ),
+            (
+                "URL",
+                serde_json::to_value(&existing.url).unwrap(),
+                serde_json::to_value(&self.entry.url).unwrap(),
+            ),
+        ] {
+            if left != right {
+                fields.push(label.into());
+            }
+        }
+        if self.values.iter().any(|(key, value)| {
+            value.as_deref().is_some_and(provided)
+                && secrets::get_vault_secret_result(&existing.id, key)
+                    .ok()
+                    .flatten()
+                    != *value
+        }) {
+            fields.push("Credentials".into());
+        }
+        fields
+    }
+
     pub(crate) fn matches(&self, existing: &ServerEntry) -> Result<bool, String> {
         if existing.command != self.entry.command || existing.transport != self.entry.transport {
             return Ok(false);
@@ -427,11 +503,7 @@ impl Import {
         if args(existing, false)? != args(&self.entry, true)? {
             return Ok(false);
         }
-        let existing_url = if existing
-            .env
-            .iter()
-            .any(|e| e.key == secrets::IMPORTED_URL_KEY)
-        {
+        let existing_url = if has_imported_url(existing) {
             secrets::get_vault_secret_result(&existing.id, secrets::IMPORTED_URL_KEY)
                 .map_err(|_| VAULT_FAILURE)?
                 .or(existing.url.clone())
@@ -451,15 +523,20 @@ impl Import {
         &self,
         id: &str,
         writes: &mut VaultWrites,
+        existing: bool,
     ) -> Result<Vec<String>, String> {
-        self.transfer_with(id, secrets::get_vault_secret_result, |id, key, value| {
-            writes.write(id, key, value)
-        })
+        self.transfer_with(
+            id,
+            existing,
+            secrets::get_vault_secret_result,
+            |id, key, value| writes.write(id, key, value),
+        )
     }
 
     fn transfer_with(
         &self,
         id: &str,
+        existing: bool,
         mut read: impl FnMut(&str, &str) -> Result<Option<String>, String>,
         mut write: impl FnMut(&str, &str, &str) -> Result<(), String>,
     ) -> Result<Vec<String>, String> {
@@ -475,12 +552,12 @@ impl Import {
                         .map(|input| input.required)
                         .unwrap_or_else(|| launch.required_env.contains(key))
                 });
-                if required && current.is_none_or(|v| !provided(&v)) {
+                if required && (!existing || current.is_none_or(|v| !provided(&v))) {
                     missing.push(key.clone());
                 }
                 continue;
             };
-            if current.as_deref() == Some(value) {
+            if existing && current.as_deref() == Some(value) {
                 continue;
             }
             write(id, key, value).map_err(|_| VAULT_FAILURE.to_string())?;
@@ -505,6 +582,27 @@ impl Import {
         }
         Ok(missing)
     }
+}
+
+pub(crate) fn has_secrets(server: &ServerEntry) -> bool {
+    server.env.iter().any(|env| env.secret)
+        || server
+            .launch
+            .as_ref()
+            .is_some_and(|launch| launch.inputs.iter().any(|input| input.secret))
+}
+
+pub(crate) fn has_imported_url(server: &ServerEntry) -> bool {
+    server
+        .env
+        .iter()
+        .any(|env| env.key == secrets::IMPORTED_URL_KEY)
+        || server.launch.as_ref().is_some_and(|launch| {
+            launch
+                .inputs
+                .iter()
+                .any(|input| input.key == secrets::IMPORTED_URL_KEY)
+        })
 }
 
 pub(crate) fn ready(server: &ServerEntry) -> Result<bool, String> {
@@ -555,6 +653,42 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_secret_heuristics_cover_connection_strings_and_word_names() {
+        for (key, value) in [
+            ("DATABASE_URL", "postgres://u:p@host/db"),
+            ("CACHE", "redis://:pw@h:6379"),
+            (
+                "CONNECTION",
+                "Server=h; Password = private value; Database=d",
+            ),
+            ("CONNECTION", "Server=h;Pwd=secret"),
+            ("ENDPOINT", "https://host/mcp?v=1"),
+            ("VALUE", "0123456789abcdef0123456789abcdef"),
+            ("API_KEY", "small"),
+            ("PAT", "small"),
+        ] {
+            assert!(secret_env(key, Some(value)), "{key} was left plain");
+        }
+        for key in ["PATH", "MONKEY", "KEYBOARD", "COMPASS"] {
+            assert!(
+                !secret_env(key, Some("/usr/bin")),
+                "{key} was falsely vaulted"
+            );
+        }
+    }
+
+    #[test]
+    fn reviewed_url_reference_is_ignored_by_legacy_bearer_selection() {
+        let import = Import::prepare(entry(true), None).unwrap();
+        // v1.24.0 remote.rs:955-964 only examines secret env entries with no value.
+        assert!(!import
+            .entry
+            .env
+            .iter()
+            .any(|e| e.secret && e.value.is_none() && e.key == secrets::IMPORTED_URL_KEY));
+    }
+
+    #[test]
     fn exact_placeholders_do_not_reject_real_secret_prefixes() {
         for value in ["$actual-secret", "{real-secret}", "<actual-secret>"] {
             assert!(provided(value), "{value}");
@@ -592,6 +726,7 @@ mod tests {
         let missing = import
             .transfer_with(
                 "imported",
+                true,
                 |_, key| Ok(vault.borrow().get(key).cloned()),
                 |_, key, value| {
                     vault
@@ -639,6 +774,7 @@ mod tests {
             assert!(import
                 .transfer_with(
                     "imported",
+                    true,
                     |_, key| Ok(vault.borrow().get(key).cloned()),
                     |_, key, value| {
                         writes.set(writes.get() + 1);
@@ -668,6 +804,7 @@ mod tests {
         assert!(import
             .transfer_with(
                 "imported",
+                true,
                 |_, key| Ok(vault.borrow().get(key).cloned()),
                 |_, key, value| {
                     vault
@@ -721,6 +858,7 @@ mod tests {
             missing
                 .transfer_with(
                     "imported",
+                    true,
                     |_, _| Ok(None),
                     |_, _, _| panic!("placeholder is not a credential")
                 )
@@ -735,6 +873,7 @@ mod tests {
         let error = import
             .transfer_with(
                 "imported",
+                true,
                 |_, _| Ok(None),
                 |_, _, _| Err("provider echoed synthetic-pat-secret".into()),
             )
@@ -745,6 +884,7 @@ mod tests {
             import
                 .transfer_with(
                     "imported",
+                    true,
                     |_, _| Err("private provider error".into()),
                     |_, _, _| panic!("read failed")
                 )

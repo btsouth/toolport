@@ -59,6 +59,16 @@ function renderDialog(overrides: Partial<Parameters<typeof ImportReviewDialog>[0
 }
 
 describe("ImportReviewDialog", () => {
+  it("discloses changed settings on existing servers", () => {
+    renderDialog({
+      items: [
+        { ...items()[0], isNew: false, updates: ["Environment", "Launch settings"] },
+      ],
+    });
+    expect(screen.getByText("Updates existing server")).toBeVisible();
+    expect(screen.getByText("Changes: Environment, Launch settings")).toBeVisible();
+  });
+
   it("starts with every server selected and confirms them all", async () => {
     const { onConfirm } = renderDialog();
     // Button label reflects the full selection.
@@ -73,7 +83,8 @@ describe("ImportReviewDialog", () => {
         { ...items()[0], credentials: [{ key: "TOKEN", secret: true, present: false }] },
       ],
     });
-    await userEvent.click(screen.getByRole("button", { name: "Open Credentials" }));
+    expect(screen.getAllByText("Missing")).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "Enter value" }));
     await userEvent.type(screen.getByLabelText("TOKEN"), "synthetic-secret");
     await userEvent.click(screen.getByRole("button", { name: "Use for connection" }));
     await userEvent.click(screen.getByRole("button", { name: /import 1 server/i }));

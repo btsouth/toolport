@@ -154,7 +154,7 @@ function ImportReviewContent({
                       {item.credentials.some(
                         (env) => !env.present && !credentialInputs[item.name]?.[env.key],
                       )
-                        ? "Missing"
+                        ? "Needs input"
                         : item.credentials.some(
                               (env) => secretChoices[item.name]?.[env.key] ?? env.secret,
                             )
@@ -209,7 +209,7 @@ function ImportReviewContent({
                               setEditing({ name: item.name, key: env.key });
                             }}
                           >
-                            Open Credentials
+                            Enter value
                           </Button>
                         )}
                       </div>
@@ -321,10 +321,19 @@ export function ImportRow({ item, selected }: { item: ImportItem; selected?: boo
         <span className="truncate text-sm font-medium">{item.name}</span>
         {
           <span className="ml-auto shrink-0 text-xs text-muted-foreground">
-            {item.isNew ? "New" : "In Toolport"}
+            {item.updates?.length
+              ? "Updates existing server"
+              : item.isNew
+                ? "New"
+                : "In Toolport"}
           </span>
         }
       </div>
+      {!!item.updates?.length && (
+        <p className="mt-1 text-xs text-muted-foreground">
+          Changes: {item.updates.join(", ")}
+        </p>
+      )}
       {runs && (
         <p
           title={runs}

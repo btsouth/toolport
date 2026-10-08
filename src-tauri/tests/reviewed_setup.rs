@@ -310,6 +310,7 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
     let restored: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(fixture.config()).unwrap()).unwrap();
     assert_eq!(restored["mcpServers"]["alpha"]["command"], mock);
+    assert!(result.servers.iter().all(|s| s.credential_state == "none"));
     // Imported subprocess values are available to both the app probe and gateway.
     drop(fixture);
     let fixture = Fixture::new();
@@ -328,13 +329,17 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
     #[cfg(not(unix))]
     let secured_command = mock;
     let credential_config =
-        json!({"mcpServers":{"secured":{"command":secured_command,"env":{"PAT":"synthetic-setup-pat"}}}})
+        json!({"mcpServers":{"secured":{"command":secured_command,"env":{"PAT":"synthetic-setup-pat"}},"argument":{"command":mock,"args":["--token","synthetic-argument-only"]}}})
             .to_string();
     std::fs::write(fixture.config(), &credential_config).unwrap();
     let review = controller::preview_client_setup("claude-code").unwrap();
-    let result = migrate_fixture(&fixture, &["secured".into()], &review.revision);
+    let result = migrate_fixture(
+        &fixture,
+        &["secured".into(), "argument".into()],
+        &review.revision,
+    );
     let saved = registry::load().unwrap();
-    let entry = &saved.servers[0];
+    let entry = saved.servers.iter().find(|s| s.name == "secured").unwrap();
     assert_eq!(
         conduit_lib::secrets::get_vault_secret_result(&entry.id, "PAT")
             .unwrap()
@@ -344,7 +349,11 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
     assert!(!serde_json::to_string(&saved)
         .unwrap()
         .contains("synthetic-setup-pat"));
-    assert_eq!(result.moved, ["secured"]);
+    assert_eq!(result.moved, ["secured", "argument"]);
+    assert!(result
+        .servers
+        .iter()
+        .all(|s| s.credential_state == "stored"));
     controller::disconnect_client("claude-code").unwrap();
 
     // A credential-bearing URL is resolved only for the real HTTP transport.

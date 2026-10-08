@@ -606,7 +606,8 @@ pub fn import_client_servers_inputs(
         let mut added = 0;
         for import in prepared {
             let id = registry.add_server(import.entry.clone());
-            let missing = import.transfer_into(&id, writes)?;
+            let missing =
+                import.transfer_into(&id, writes, current.servers.iter().any(|s| s.id == id))?;
             if missing.is_empty() {
                 let profile = registry.default_access_id();
                 apply_server_enabled(&mut registry, &profile, &id, true, false)?;
@@ -694,7 +695,8 @@ pub fn add_reviewed_entry(entry: ServerEntry) -> Result<(Registry, String), Stri
         let mut entry = import.entry.clone();
         entry.enabled = false;
         let id = registry.add_server(entry);
-        let missing = import.transfer_into(&id, writes)?;
+        let missing =
+            import.transfer_into(&id, writes, current.servers.iter().any(|s| s.id == id))?;
         if missing.is_empty() {
             let profile = registry.default_access_id();
             if apply_server_enabled(&mut registry, &profile, &id, true, false).is_ok() {
@@ -781,7 +783,8 @@ fn add_snippet_imports(
                 continue;
             }
             let id = registry.add_server(import.entry.clone());
-            let missing = import.transfer_into(&id, writes)?;
+            let missing =
+                import.transfer_into(&id, writes, current.servers.iter().any(|s| s.id == id))?;
             let profile = registry.default_access_id();
             if missing.is_empty() {
                 apply_server_enabled(&mut registry, &profile, &id, true, false)?;
@@ -1552,6 +1555,10 @@ fn prepare_client_servers_for_migration(
         if let Some(values) = inputs.get(&server.name) {
             import.supply(values)?;
         }
+        let was_registered = registry
+            .servers
+            .iter()
+            .any(|entry| entry.name.eq_ignore_ascii_case(&server.name));
         let id = if let Some(existing) = registry
             .servers
             .iter()
@@ -1572,9 +1579,9 @@ fn prepare_client_servers_for_migration(
             imported += 1;
             registry.add_server(import.entry.clone())
         };
-        let missing = import.transfer_into(&id, writes)?;
+        let missing = import.transfer_into(&id, writes, was_registered)?;
         if !missing.is_empty() {
-            return Err(format!("{} needs credentials. Add the missing values in its native config or Credentials, then review again. Client config unchanged.", server.name));
+            return Err(format!("{} needs credentials. Enter the missing values in review or its native config, then review again. Client config unchanged.", server.name));
         }
     }
     if !moved.is_empty() {
@@ -1676,6 +1683,7 @@ pub struct SetupItem {
     pub is_new: bool,
     pub credentials: Vec<CredentialReview>,
     pub unsupported: Option<String>,
+    pub updates: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1707,6 +1715,17 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
                 server_from_detected(s, &client.id),
                 definition.as_ref(),
             );
+            let updates = prepared
+                .as_ref()
+                .ok()
+                .and_then(|import| {
+                    registry
+                        .servers
+                        .iter()
+                        .find(|existing| existing.name.eq_ignore_ascii_case(&s.name))
+                        .map(|existing| import.updates(existing))
+                })
+                .unwrap_or_default();
             let (credentials, unsupported) = match prepared {
                 Ok(import) => (
                     import
@@ -1723,6 +1742,7 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
                 Err(error) => (Vec::new(), Some(error)),
             };
             Ok(SetupItem {
+                updates,
                 credentials,
                 unsupported,
                 key: s.name.clone(),
@@ -2016,7 +2036,6 @@ fn migrate_client_reviewed_inputs_with(
             {
                 unsupported.push(server.name.clone());
                 false
-
             }
             Err(_) => true,
         }
@@ -2067,7 +2086,12 @@ fn migrate_client_reviewed_inputs_with(
                 Ok(result) => Ok(result),
                 Err(error) => match rollback_imports(&current, &staged) {
                     Ok(()) => Err(error),
-                    Err(rollback) => Err(format!("{error} {rollback}")),
+                    Err(rollback) => {
+                        writes.keep();
+                        Err(format!(
+                            "{error} {rollback} Imported credential values were kept."
+                        ))
+                    }
                 },
             }
         })?;
@@ -2119,7 +2143,7 @@ fn verify_setup_gateway(
             .ok_or("Reviewed server missing")?;
         if !crate::import_credentials::ready(server)? {
             return Err(format!(
-                "{} needs credentials. Open Credentials and retry. Client config unchanged.",
+                "{} needs credentials. Enter the missing values in review or fix the native config, then retry. Client config unchanged.",
                 server.name
             ));
         }
@@ -2194,7 +2218,7 @@ fn verify_setup_gateway(
         servers.push(SetupServerResult {
             name: server.name.clone(),
             tool_count: tool_counts[&server.id],
-            credential_state: if server.env.iter().any(|env| env.secret) {
+            credential_state: if crate::import_credentials::has_secrets(server) {
                 "stored"
             } else {
                 "none"
@@ -3014,6 +3038,137 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_new_import_never_uses_an_orphan_credential() {
+        let fixture = MoveFixture::new(&Registry::default());
+        crate::secrets::set_secret("one", "PAT", "stale-orphan").unwrap();
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"command":"one","env":{"PAT":"${PAT}"}}}}"#,
+        )
+        .unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        assert!(review.items[0].is_new);
+        assert!(!review.items[0].credentials[0].present);
+        let result = migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
+            |_, _, _, _| panic!("orphan must not satisfy a missing credential"),
+        );
+        assert!(result.is_err());
+        assert!(read_registry_exact().unwrap().servers.is_empty());
+        assert_eq!(
+            crate::secrets::get_vault_secret_result("one", "PAT")
+                .unwrap()
+                .as_deref(),
+            Some("stale-orphan")
+        );
+    }
+
+    #[test]
+    fn reviewed_failed_import_restores_orphan_and_concurrent_edit() {
+        let fixture = MoveFixture::new(&Registry::default());
+        crate::secrets::set_secret("one", "PAT", "stale-orphan").unwrap();
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"command":"one","env":{"PAT":"fresh-value"}}}}"#,
+        )
+        .unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        assert!(migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
+            |_, _, _, _| {
+                registry::update(|r| {
+                    r.add_server(server("concurrent"));
+                    Ok(())
+                })
+                .unwrap();
+                Err("Launch failed".into())
+            }
+        )
+        .is_err());
+        let saved = read_registry_exact().unwrap();
+        assert!(!saved.servers.iter().any(|s| s.id == "one"));
+        assert!(saved.servers.iter().any(|s| s.id == "concurrent"));
+        assert_eq!(
+            crate::secrets::get_vault_secret_result("one", "PAT")
+                .unwrap()
+                .as_deref(),
+            Some("stale-orphan")
+        );
+    }
+
+    #[test]
+    fn reviewed_conflicting_registry_edit_keeps_staged_vault_values() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"command":"one","env":{"PAT":"fresh-value"}}}}"#,
+        )
+        .unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        assert!(migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
+            |_, _, _, _| {
+                registry::update(|r| {
+                    r.servers[0].name = "Edited during verification".into();
+                    Ok(())
+                })
+                .unwrap();
+                Err("Launch failed".into())
+            }
+        )
+        .is_err());
+        assert_eq!(
+            read_registry_exact().unwrap().servers[0].name,
+            "Edited during verification"
+        );
+        assert_eq!(
+            crate::secrets::get_vault_secret_result("one", "PAT")
+                .unwrap()
+                .as_deref(),
+            Some("fresh-value")
+        );
+    }
+
+    #[test]
+    fn reviewed_same_definition_discloses_changed_settings() {
+        let mut reg = Registry::default();
+        let mut one = server("one");
+        one.command = Some("one".into());
+        one.env.push(crate::registry::EnvVar {
+            key: "PORT".into(),
+            value: Some("3000".into()),
+            secret: false,
+            unknown_fields: Default::default(),
+        });
+        reg.add_server(one);
+        let fixture = MoveFixture::new(&reg);
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"command":"one","env":{"PORT":"4000"}}}}"#,
+        )
+        .unwrap();
+        let review = serde_json::to_value(preview_client_setup("claude-code").unwrap()).unwrap();
+        assert!(
+            review["items"][0]["updates"]
+                .as_array()
+                .is_some_and(|fields| fields.iter().any(|f| f == "Environment")),
+            "changed environment must be disclosed: {review}"
+        );
+    }
+
+    #[test]
     fn reviewed_vault_rolls_back_prior_values_and_late_batch_failure() {
         let _fixture = MoveFixture::new(&Registry::default());
         crate::secrets::set_secret("one", "PAT", "synthetic-prior").unwrap();
@@ -3029,8 +3184,8 @@ mod tests {
         .unwrap();
         let result = crate::secrets::tests::with_failed_write("TOKEN", || {
             crate::import_credentials::transaction(|writes| {
-                first.transfer_into("one", writes)?;
-                second.transfer_into("two", writes)?;
+                first.transfer_into("one", writes, false)?;
+                second.transfer_into("two", writes, false)?;
                 Ok(())
             })
         });

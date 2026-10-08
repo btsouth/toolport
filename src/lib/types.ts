@@ -349,6 +349,7 @@ export interface ImportItem {
   url: string | null;
   /** False if a server with this name is already present (import skips it). */
   isNew: boolean;
+  updates?: string[];
 }
 
 export interface CatalogSearch {

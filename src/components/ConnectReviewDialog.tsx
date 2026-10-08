@@ -3,7 +3,6 @@ import { Check, Loader2 } from "lucide-react";
 import { migrateClient, previewClientSetup } from "@/lib/api";
 import type { ClientSetupReview, MigrateResult, Registry } from "@/lib/types";
 import { ImportReviewDialog } from "./ImportReviewDialog";
-import { SecretsDialog } from "./SecretsDialog";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "./ui/dialog";
 import { Button } from "./ui/button";
 
@@ -83,7 +82,6 @@ export function ConnectReviewDialog({
               <p>Restart {clientName} to load Toolport.</p>
               <ul className="divide-y rounded-lg border">
                 {result.servers.map((row) => {
-                  const server = result.registry.servers.find((s) => s.name === row.name);
                   return (
                     <li
                       key={row.name}
@@ -100,13 +98,6 @@ export function ConnectReviewDialog({
                               : "No credentials needed"}
                         </p>
                       </div>
-                      {server && row.credentialState !== "none" && (
-                        <SecretsDialog
-                          server={server}
-                          onSaved={onConnected}
-                          trigger={<Button variant="outline">Open Credentials</Button>}
-                        />
-                      )}
                     </li>
                   );
                 })}

@@ -2364,15 +2364,22 @@ pub trait ConcurrentTransport: Send + Sync {
     }
 }
 
+fn redact_trace_urls(msg: &str) -> String {
+    static URL: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"https?://[^\s\"'<>]+"#).unwrap());
+    URL.replace_all(msg, "<redacted endpoint>").into_owned()
+}
+
 fn downstream_trace(msg: &str) {
     if crate::brand::env_var_os("TOOLPORT_DEBUG", "CONDUIT_DEBUG").is_none() {
         return;
     }
+    let msg = redact_trace_urls(msg);
     if crate::registry::gateway_log_path().is_none() {
         eprintln!("toolport: {msg}");
         return;
     }
-    crate::gatewaylog::append(msg);
+    crate::gatewaylog::append(&msg);
 }
 
 /// Bitmask of which downstream list a `notifications/.../list_changed` announces.
@@ -9228,6 +9235,11 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn reviewed_debug_trace_redacts_endpoint_errors() {
+        assert_eq!(super::redact_trace_urls("subscriptions/listen HTTP open failed: http://user:pw@localhost/sk-secret?token=private%2Fvalue: connection refused (os error 111)"), "subscriptions/listen HTTP open failed: <redacted endpoint> connection refused (os error 111)");
+    }
 
     struct MrtrTransport {
         responses: VecDeque<Result<Value, TransportError>>,

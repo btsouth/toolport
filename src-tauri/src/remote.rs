@@ -1336,10 +1336,7 @@ pub fn connect_remote_with_handler(
     progress: Option<ProgressSink>,
     change_dirty: Option<Arc<AtomicU8>>,
 ) -> Result<DownstreamServer, String> {
-    let imported = server
-        .env
-        .iter()
-        .any(|e| e.key == secrets::IMPORTED_URL_KEY);
+    let imported = crate::import_credentials::has_imported_url(server);
     if !imported {
         return connect_remote_inner(
             server,
@@ -1379,15 +1376,55 @@ impl Redaction {
         if let Some(url) = &server.url {
             values.push(url.clone());
             if let Ok(parsed) = url::Url::parse(url) {
-                values.extend(parsed.query_pairs().map(|(_, value)| value.into_owned()));
+                let decoded = |value: &str| {
+                    url::form_urlencoded::parse(format!("v={value}").as_bytes())
+                        .next()
+                        .map(|(_, v)| v.into_owned())
+                        .unwrap_or_default()
+                };
+                let mut add = |value: &str| {
+                    values.push(value.into());
+                    values.push(decoded(value));
+                };
+                add(parsed.username());
                 if let Some(password) = parsed.password() {
-                    values.push(password.into());
+                    add(password);
+                }
+                for pair in parsed.query().unwrap_or("").split('&') {
+                    if let Some((key, value)) = pair.split_once('=') {
+                        if crate::import_credentials::secret_env(key, None)
+                            || decoded(value).len() >= 4
+                        {
+                            add(value);
+                        }
+                    }
+                }
+                for segment in parsed.path_segments().into_iter().flatten() {
+                    if crate::registry::arg_looks_secret(segment)
+                        || crate::import_credentials::secret_env("", Some(&decoded(segment)))
+                    {
+                        add(segment);
+                    }
                 }
             }
         }
         for env in server.env.iter().filter(|e| e.secret) {
             if let Some(value) = env.value.clone().or_else(|| {
                 secrets::get_secret_result(&server.id, &env.key)
+                    .ok()
+                    .flatten()
+            }) {
+                values.push(value);
+            }
+        }
+        for input in server
+            .launch
+            .iter()
+            .flat_map(|launch| &launch.inputs)
+            .filter(|input| input.secret)
+        {
+            if let Some(value) = input.value.clone().or_else(|| {
+                secrets::get_vault_secret_result(&server.id, &input.key)
                     .ok()
                     .flatten()
             }) {
@@ -1401,7 +1438,12 @@ impl Redaction {
     }
     fn text(&self, mut message: String) -> String {
         for value in &self.0 {
-            message = message.replace(value, "<redacted>");
+            if value.len() < 4 {
+                let token = regex::Regex::new(&format!(r"\b{}\b", regex::escape(value))).unwrap();
+                message = token.replace_all(&message, "<redacted>").into_owned();
+            } else {
+                message = message.replace(value, "<redacted>");
+            }
         }
         message
     }
@@ -1570,12 +1612,7 @@ fn safe_imported_error(server: &ServerEntry, error: String) -> String {
 }
 
 fn has_imported_credentials(server: &ServerEntry) -> bool {
-    server.env.iter().any(|e| {
-        matches!(
-            e.key.as_str(),
-            secrets::IMPORTED_URL_KEY | secrets::HTTP_AUTH_KEY
-        )
-    })
+    crate::import_credentials::has_secrets(server)
 }
 
 fn connect_remote_inner(
@@ -1744,6 +1781,35 @@ fn connect_remote_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewed_bearer_env_errors_are_redacted() {
+        secrets::tests::with_isolated_vault(|| {
+            let mut server = remote_server("https://example.invalid/mcp", None);
+            server.env.push(crate::registry::EnvVar {
+                key: "PAT".into(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            });
+            secrets::set_secret(&server.id, "PAT", "synthetic-codex-token").unwrap();
+            assert_eq!(
+                safe_imported_error(&server, "HTTP 500: synthetic-codex-token rejected".into()),
+                "HTTP 500: <redacted> rejected"
+            );
+        });
+    }
+
+    #[test]
+    fn reviewed_url_redaction_preserves_status_numbers() {
+        let server = remote_server("https://private-user:private-password@example.invalid/sk-private-path?token=private%2Fquery&v=1", None);
+        let redaction = Redaction::for_server(&server);
+        let result = redaction.text("HTTP 401: private-user private-password sk-private-path private%2Fquery private/query; attempt 1".into());
+        assert_eq!(
+            result,
+            "HTTP 401: <redacted> <redacted> <redacted> <redacted> <redacted>; attempt 1"
+        );
+    }
 
     #[test]
     fn imported_bearer_connect_error_does_not_echo_provider_credentials() {

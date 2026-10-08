@@ -62,7 +62,7 @@ pub(super) fn review(
         + Sync
         + 'static,
     finished: impl Fn() + 'static,
-    credential_page: Option<super::ServerPage>,
+    _credential_page: Option<super::ServerPage>,
 ) {
     let dialog = adw::Window::builder()
         .transient_for(parent)
@@ -113,6 +113,7 @@ pub(super) fn review(
             .title(&item.name)
             .subtitle(&command)
             .build();
+        row.add_css_class("toolport-setup-expander");
         row.set_subtitle_lines(1);
         middle_ellipsize(row.upcast_ref(), &command);
         let check = gtk::CheckButton::builder()
@@ -121,8 +122,21 @@ pub(super) fn review(
             .build();
         row.add_prefix(&check);
         check.set_sensitive(item.unsupported.is_none());
-        row.set_enable_expansion(!item.credentials.is_empty());
-        let tag = gtk::Label::new(Some(if item.is_new { "New" } else { "In Toolport" }));
+        row.set_enable_expansion(!item.credentials.is_empty() || !item.updates.is_empty());
+        let tag = gtk::Label::new(Some(if !item.updates.is_empty() {
+            "Updates existing server"
+        } else if item.is_new {
+            "New"
+        } else {
+            "In Toolport"
+        }));
+        if !item.updates.is_empty() {
+            let changes = adw::ActionRow::builder()
+                .title("Changes")
+                .subtitle(item.updates.join(", "))
+                .build();
+            row.add_row(&changes);
+        }
         tag.add_css_class("dim-label");
         row.add_suffix(&tag);
         let spinner = gtk::Spinner::new();
@@ -204,7 +218,7 @@ pub(super) fn review(
             value_row.set_activatable_widget(Some(&choice));
             row.add_row(&value_row);
             if !env.present {
-                let open = gtk::Button::with_label("Open Credentials");
+                let open = gtk::Button::with_label("Enter value");
                 let owner = dialog.clone();
                 let inputs = credential_inputs.clone();
                 let name = item.name.clone();
@@ -335,7 +349,6 @@ pub(super) fn review(
             completed.clone(),
         );
         let credential_choices = credential_choices.clone();
-        let credential_page = credential_page.clone();
         let (feedback, button, cancel, body, rows, details, lede) = (
             feedback.clone(),
             button.clone(),
@@ -401,28 +414,6 @@ pub(super) fn review(
                             .title(&server.name)
                             .subtitle(format!("{} tools · {}", server.tool_count, credential))
                             .build();
-                        if server.credential_state != "none" {
-                            if let Some(page) = &credential_page {
-                                let button = gtk::Button::with_label("Open Credentials");
-                                let page = page.clone();
-                                let name = server.name.clone();
-                                button.connect_clicked(move |_| {
-                                    if let Ok(registry) =
-                                        crate::registry_controller::registry_for_disconnect()
-                                    {
-                                        if let Some(server) =
-                                            super::state::RegistrySnapshot::from_registry(registry)
-                                                .servers
-                                                .into_iter()
-                                                .find(|s| s.name == name)
-                                        {
-                                            super::open_credentials_editor(server, page.clone());
-                                        }
-                                    }
-                                });
-                                row.add_suffix(&button);
-                            }
-                        }
                         results.append(&row);
                     }
                     body.append(&results);
@@ -582,6 +573,7 @@ pub(super) fn collection(
             is_new: true,
             credentials: Vec::new(),
             unsupported: None,
+            updates: Vec::new(),
         })
         .collect();
     review(parent,&format!("Review {name}"),items,"Review what each server runs. Valid servers turn on. Servers needing credentials or launch values stay off until setup is complete.","Add selected servers",move |keys,_choices,_inputs| {
@@ -662,6 +654,7 @@ mod tests {
                     present: true,
                 }],
                 unsupported: None,
+                updates: Vec::new(),
             }],
             "Fixture",
             "Connect",
@@ -744,7 +737,6 @@ mod tests {
     #[ignore = "manual isolated setup screenshot fixture"]
     fn setup_screenshot_fixture() {
         adw::init().unwrap();
-        let parent = gtk::Window::new();
         let state = std::env::var("TOOLPORT_SETUP_FIXTURE_STATE").unwrap_or_default();
         let scratch =
             std::env::temp_dir().join(format!("toolport-gtk-setup-fixture-{}", std::process::id()));
@@ -756,6 +748,10 @@ mod tests {
             .application_id("com.toolport.SetupFixture")
             .build();
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let parent = adw::ApplicationWindow::new(&app);
+        let theme = super::super::theme::ThemeController::new();
+        theme.attach(&parent);
+        let parent = parent.upcast::<gtk::Window>();
         let broker = crate::approval_broker::start_native();
         let (_, credential_page, _) = super::super::build_content(&app, broker);
         parent.set_title(Some("Toolport fixture"));
@@ -786,6 +782,7 @@ mod tests {
                     Vec::new()
                 },
                 unsupported: None,
+                updates: Vec::new(),
             })
             .collect();
         review(
@@ -806,7 +803,7 @@ mod tests {
                     return Err("Calendar could not start. Check its command and retry. Client config unchanged.".into());
                 }
                 if state == "missing" {
-                    return Err("Calendar needs credentials. Open Credentials and retry. Client config unchanged.".into());
+                    return Err("Calendar needs credentials. Enter value and retry. Client config unchanged.".into());
                 }
                 Ok(Completion {
                     message: "Claude Code connected. Restart it to load Toolport.".into(),
