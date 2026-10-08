@@ -3104,11 +3104,11 @@ pub fn detect_clients() -> Vec<DetectedClient> {
 /// Validate behavior the redacted inventory cannot carry before a ZCode import.
 /// Other adapters retain their existing import policy and public inventory ABI.
 pub(crate) fn import_definition(
-    client_id: &str,
+    client: &DetectedClient,
     name: &str,
 ) -> Result<Option<serde_json::Value>, String> {
-    let def = find_def(client_id).ok_or("Unknown client")?;
-    moved::definition(def.format, &resolved_definition_path(&def)?, name)
+    let def = find_def(&client.id).ok_or("Unknown client")?;
+    moved::definition(def.format, Path::new(&client.config_path), name)
         .map_err(|_| "Could not read imported credentials. Client config unchanged.".into())
 }
 

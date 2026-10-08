@@ -513,7 +513,8 @@ pub fn import_client_servers(selected: Vec<String>) -> Result<(Registry, usize),
             .as_deref()
             .and_then(|s| s.strip_prefix("imported:"))
             .ok_or("Missing import source")?;
-        let definition = clients::import_definition(client_id, &entry.name)?;
+        let client = detected.iter().find(|c| c.id == client_id).ok_or("Missing import client")?;
+        let definition = clients::import_definition(client, &entry.name)?;
         prepared.push(crate::import_credentials::Import::prepare(
             entry,
             definition.as_ref(),
@@ -1408,7 +1409,7 @@ pub(crate) fn import_client_servers_for_migration(
             continue;
         }
         moved.push(server.name.clone());
-        let definition = clients::import_definition(&client.id, &server.name)?;
+        let definition = clients::import_definition(client, &server.name)?;
         let import = crate::import_credentials::Import::prepare(
             server_from_detected(server, &client.id),
             definition.as_ref(),
