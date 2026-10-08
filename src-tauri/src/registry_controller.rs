@@ -1574,6 +1574,11 @@ fn prepare_client_servers_for_migration(
             entry.url = import.entry.url.clone();
             entry.env = import.entry.env.clone();
             entry.launch = import.entry.launch.clone();
+            if let Some(key) = import.entry.unknown_fields.get("importedUrlKey") {
+                entry
+                    .unknown_fields
+                    .insert("importedUrlKey".into(), key.clone());
+            }
             id
         } else {
             imported += 1;
@@ -3139,6 +3144,48 @@ mod tests {
                 .as_deref(),
             Some("fresh-value")
         );
+    }
+
+    #[test]
+    fn reviewed_existing_remote_keeps_vaulted_url_reference() {
+        let mut reg = Registry::default();
+        let mut one = server("one");
+        one.command = None;
+        one.transport = "http".into();
+        one.url = Some("https://example.invalid/mcp?token=synthetic-url-secret".into());
+        one.unknown_fields
+            .insert("custom".into(), serde_json::json!(true));
+        reg.add_server(one);
+        let fixture = MoveFixture::new(&reg);
+        std::fs::write(fixture.claude(), serde_json::json!({"mcpServers":{"one":{"url":"https://example.invalid/mcp?token=synthetic-url-secret"}}}).to_string()).unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
+            |registry, _, _, _| {
+                let entry = &registry.servers[0];
+                assert!(
+                    crate::import_credentials::has_imported_url(entry),
+                    "updated URL lost its vault reference"
+                );
+                assert_eq!(entry.unknown_fields["custom"], true);
+                assert_eq!(entry.url.as_deref(), Some("https://example.invalid/mcp"));
+                assert_eq!(
+                    crate::secrets::get_vault_secret_result(
+                        &entry.id,
+                        crate::secrets::IMPORTED_URL_KEY
+                    )
+                    .unwrap()
+                    .as_deref(),
+                    Some("https://example.invalid/mcp?token=synthetic-url-secret")
+                );
+                Ok(Vec::new().into())
+            },
+        )
+        .unwrap();
     }
 
     #[test]
