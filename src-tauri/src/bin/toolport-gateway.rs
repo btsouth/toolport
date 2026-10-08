@@ -18261,7 +18261,12 @@ fn proxy_public_http_connection(
     }
     // The daemon detects the public caller's full socket close. Keep the write
     // side open during the relay so waiting callers do not appear abandoned.
-    let _ = relay_http_response(&mut client, &mut upstream, Arc::new(|| {}), Arc::new(|| {}));
+    let _ = relay_http_response(
+        &mut client,
+        &mut upstream,
+        Arc::new(|| {}),
+        Arc::new(|| {}),
+    );
 }
 
 /// The desktop keeps this lightweight public listener as its child. The heavy
@@ -19055,10 +19060,7 @@ fn handle_connection(
         ),
         (b"Access-Control-Allow-Headers", allow_headers.as_bytes()),
         // Browser clients need session identity and untrusted-data provenance.
-        (
-            b"Access-Control-Expose-Headers",
-            EXPOSED_HTTP_HEADERS.as_bytes(),
-        ),
+        (b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()),
     ];
     for (name, value) in cors {
         // Skip a header that won't encode rather than panicking the thread.
@@ -19335,13 +19337,11 @@ fn main() {
                         "{}",
                         serde_json::to_string(&results).expect("serializable disconnect results")
                     );
-                    conduit_lib::telemetry::exit_with(
-                        if results.iter().any(|result| result.error.is_some()) {
-                            1
-                        } else {
-                            0
-                        },
-                    );
+                    conduit_lib::telemetry::exit_with(if results.iter().any(|result| result.error.is_some()) {
+                        1
+                    } else {
+                        0
+                    });
                 }
                 Err(error) => {
                     eprintln!("toolport-gateway --disconnect-all: {error}");
@@ -26162,7 +26162,14 @@ mod tests {
 
         let listener_inflight = Arc::clone(&inflight);
         std::thread::spawn(move || {
-            serve_http_loop_with_inflight(server, state, None, search, true, listener_inflight)
+            serve_http_loop_with_inflight(
+                server,
+                state,
+                None,
+                search,
+                true,
+                listener_inflight,
+            )
         });
         std::thread::sleep(Duration::from_millis(50));
 
@@ -35194,11 +35201,7 @@ mod tests {
             (**guard).clone()
         };
 
-        fail_closed_integrity_catalog(
-            &mut live,
-            Some("sbs714-gateway"),
-            set_of(&["srv__new_drift"]),
-        );
+        fail_closed_integrity_catalog(&mut live, Some("sbs714-gateway"), set_of(&["srv__new_drift"]));
 
         assert_eq!(
             live.quarantined(),

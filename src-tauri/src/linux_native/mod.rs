@@ -2934,12 +2934,7 @@ fn run_client_mutation(
                         "Disconnected {client_name} from Toolport. Restart {client_name} to apply it."
                     )
                 };
-                page.refresh_with_confirmation(
-                    std::iter::once(message)
-                        .chain(result.outcome.warnings)
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                );
+                page.refresh_with_confirmation(std::iter::once(message).chain(result.outcome.warnings).collect::<Vec<_>>().join(" "));
             }
             Ok(Err(error)) => page.show_error(&format!("{client_name}: {error}")),
             Err(_) => page.show_error(&format!("{client_name}: the operation stopped")),
