@@ -7,8 +7,9 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::AtomicU8;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::downstream::{
@@ -71,6 +72,7 @@ enum RefreshDecision {
     Reauthenticate,
 }
 
+#[derive(Clone)]
 struct RefreshedToken {
     access_token: String,
     expires_at: Option<u64>,
@@ -448,40 +450,136 @@ fn uses_client_credentials(server: &ServerEntry) -> bool {
 /// added to prevent, reached by another route (SBS-479). The app's existing OAuth lock
 /// covers only the interactive browser flow.
 ///
-/// Best-effort by design: with no resolvable data dir there is nowhere to put a lock, and
-/// refusing to refresh at all would be worse than the race it prevents. Contention waits long
-/// enough to cover the OAuth client's 30-second request timeout and metadata refresh before
-/// failing open visibly rather than silently dropping back to the original race (SBS-705).
+/// The bounded wait does not have to cover every metadata request: on timeout we
+/// reread the winner's saved token, or fail without exchanging. The OS releases
+/// this advisory lock on process death; never unlink its file to recover a holder.
 const OAUTH_REFRESH_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(65);
-
-fn lock_oauth_refresh_for(
-    server_id: &str,
-    timeout: std::time::Duration,
-) -> Result<Option<crate::registry::FileLock>, String> {
-    let Some(dir) = crate::registry::conduit_dir() else {
-        return Ok(None);
-    };
-    let leaf = format!(
-        "oauth-refresh-{}.lock",
-        crate::router::sanitize_segment(&crate::local_auth::owner(server_id)?)
-    );
-    crate::registry::lock_at_for(&dir.join(leaf), timeout).map(Some)
+const OAUTH_REFRESH_LOCK_ERROR: &str =
+    "OAuth refresh is busy or its cross-process lock is unavailable; try again.";
+const OAUTH_REFRESH_SAVE_ERROR: &str = "OAuth refresh succeeded but could not save";
+struct PendingRefresh {
+    state: String,
+    token: RefreshedToken,
 }
 
-fn lock_oauth_refresh(server_id: &str) -> Option<crate::registry::FileLock> {
-    match lock_oauth_refresh_for(server_id, OAUTH_REFRESH_LOCK_TIMEOUT) {
-        Ok(lock) => lock,
-        Err(error) => {
-            eprintln!(
-                "toolport: OAuth refresh for {server_id:?} is proceeding without the cross-process lock after waiting {}s: {error}",
-                OAUTH_REFRESH_LOCK_TIMEOUT.as_secs()
-            );
-            None
+#[derive(Default)]
+struct CredentialState {
+    pending: Option<PendingRefresh>,
+    token: Option<String>,
+    vaulted_access: Option<String>,
+    vaulted_state: Option<String>,
+    loaded: bool,
+}
+
+impl CredentialState {
+    fn read_vault(&mut self, server_id: &str) -> Result<bool, String> {
+        let access = secrets::get_secret_result(server_id, secrets::HTTP_AUTH_KEY)
+            .map_err(|e| format!("could not read the vaulted access token: {e}"))?;
+        let state = secrets::get_secret_result(server_id, STATE_KEY)
+            .map_err(|e| format!("could not read the vaulted OAuth state: {e}"))?;
+        let changed = self.loaded && (access != self.vaulted_access || state != self.vaulted_state);
+        // A timed-out save may have committed our metadata without its bearer.
+        let own_save = self.pending.as_ref().is_some_and(|pending| {
+            state.as_deref() == Some(pending.state.as_str())
+                && (access == self.vaulted_access
+                    || access.as_deref() == Some(pending.token.access_token.as_str()))
+        });
+        if own_save {
+            let pending = self.pending.take().expect("pending save matched");
+            self.token = Some(pending.token.access_token.clone());
+        } else if !self.loaded || changed {
+            self.pending = None;
+            self.token = access.clone();
+        }
+        self.vaulted_access = access;
+        self.vaulted_state = state;
+        self.loaded = true;
+        if own_save {
+            if let Some(token) = self.token.clone() {
+                self.save_access(server_id, &token);
+            }
+        }
+        Ok(changed && !own_save)
+    }
+
+    fn valid_pending_token(&self) -> Option<RefreshedToken> {
+        self.pending
+            .as_ref()
+            .filter(|pending| {
+                pending
+                    .token
+                    .expires_at
+                    .is_none_or(|expiry| expiry > now_epoch_seconds())
+            })
+            .map(|pending| pending.token.clone())
+    }
+
+    fn save_access(&mut self, server_id: &str, token: &str) {
+        self.token = Some(token.to_string());
+        if secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, token).is_ok() {
+            self.vaulted_access = Some(token.to_string());
+        } else {
+            eprintln!("OAuth refreshed access token could not be saved; using it in memory.");
         }
     }
 }
 
-/// After winning the refresh lock, decide whether another process already did the work.
+type CredentialUpdate = Arc<Mutex<CredentialState>>;
+type CredentialUpdates = HashMap<(Option<std::path::PathBuf>, String), CredentialUpdate>;
+
+// Share pending rotations across connect, request and subscription refreshes.
+// Only each server's mutex is held across I/O; unrelated servers stay independent.
+fn credential_update(server_id: &str) -> CredentialUpdate {
+    static UPDATES: OnceLock<Mutex<CredentialUpdates>> = OnceLock::new();
+    UPDATES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry((crate::registry::conduit_dir(), server_id.to_string()))
+        .or_default()
+        .clone()
+}
+
+/// Credential to send: an unsaved in-memory token wins while the vault is
+/// unchanged; a changed bearer or OAuth state replaces it and clears pending
+/// rotation. Otherwise retain the last known token, including failed access saves.
+/// Reads both bearer and OAuth metadata from the vault on every call (keychain I/O).
+/// A locked/unreadable keychain returns `Err`, even with an in-memory token. Callers
+/// must propagate that storage error, not interpret it as missing auth or force an exchange.
+pub fn current_credential(server_id: &str) -> Result<Option<String>, String> {
+    let update = credential_update(server_id);
+    let mut state = update
+        .lock()
+        .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
+    state.read_vault(server_id)?;
+    Ok(state.token.clone())
+}
+
+/// A different current credential permits one retry after 401 without an exchange.
+/// `None` means no replacement is available, including when auth was cleared.
+/// Has the vault cost/error behavior of [`current_credential`]. Pass the rejected
+/// token to [`refresh_token`] too: this lookup alone cannot serialize a later exchange.
+pub fn newer_credential(server_id: &str, rejected: &str) -> Result<Option<String>, String> {
+    Ok(current_credential(server_id)?.filter(|token| token != rejected))
+}
+
+fn lock_oauth_refresh_for(
+    server_id: &str,
+    timeout: std::time::Duration,
+) -> Result<crate::registry::FileLock, String> {
+    let dir = crate::registry::conduit_dir().ok_or(OAUTH_REFRESH_LOCK_ERROR)?;
+    let leaf = format!(
+        "oauth-refresh-{}",
+        crate::router::sanitize_segment(&crate::local_auth::owner(server_id)?)
+    );
+    crate::registry::lock_at_for(&dir.join(leaf), timeout)
+}
+
+fn lock_oauth_refresh(server_id: &str) -> Result<crate::registry::FileLock, String> {
+    lock_oauth_refresh_for(server_id, OAUTH_REFRESH_LOCK_TIMEOUT)
+}
+
+/// After waiting for the refresh lock, decide whether another process already did the work.
 ///
 /// Compares the vaulted access token against the snapshot taken BEFORE the lock. Unchanged
 /// means the refresh is still ours to do. Changed means someone rotated it while we were
@@ -564,33 +662,145 @@ fn reuse_racing_refresh(
     })
 }
 
-fn refresh_token_with_expiry(server_id: &str) -> Result<RefreshedToken, String> {
-    // Snapshot before locking: the comparison after we win is what tells us whether a
-    // racing process rotated the credential while we waited.
-    // A vault read failure is not "no token" (SBS-840).
-    let before_access = match secrets::get_secret_result(server_id, secrets::HTTP_AUTH_KEY) {
-        Ok(v) => v,
-        Err(e) => return Err(format!("could not read the vaulted access token: {e}")),
-    };
+fn refresh_token_with_expiry(
+    server_id: &str,
+    rejected: Option<&str>,
+) -> Result<RefreshedToken, String> {
+    refresh_token_with_lock(server_id, rejected, || lock_oauth_refresh(server_id))
+}
+
+fn refresh_token_with_lock(
+    server_id: &str,
+    rejected: Option<&str>,
+    lock: impl FnOnce() -> Result<crate::registry::FileLock, String>,
+) -> Result<RefreshedToken, String> {
+    let update = credential_update(server_id);
+    let mut pending = update
+        .lock()
+        .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
+    refresh_token_with_pending(server_id, lock, &mut pending, true, rejected)
+}
+
+fn refresh_token_with_pending(
+    server_id: &str,
+    lock: impl FnOnce() -> Result<crate::registry::FileLock, String>,
+    credentials: &mut CredentialState,
+    force: bool,
+    rejected: Option<&str>,
+) -> Result<RefreshedToken, String> {
+    let result = refresh_token_under_lock(server_id, lock, credentials, force, rejected);
+    match result {
+        Err(error) if !force && is_refresh_storage_or_lock_error(&error) => {
+            credentials.valid_pending_token().ok_or(error)
+        }
+        result => result,
+    }
+}
+
+fn refresh_token_under_lock(
+    server_id: &str,
+    lock: impl FnOnce() -> Result<crate::registry::FileLock, String>,
+    credentials: &mut CredentialState,
+    force: bool,
+    rejected: Option<&str>,
+) -> Result<RefreshedToken, String> {
+    // Read before the OS lock so a peer's saved winner remains distinguishable.
+    let had_pending = credentials.pending.is_some();
+    let changed_before = credentials.read_vault(server_id)?;
+    let before_access = credentials.vaulted_access.clone();
     // Held for the whole function, including the client-credentials branch, so two
     // processes cannot mint two tokens for the same server.
-    let _refresh_lock = lock_oauth_refresh(server_id);
-    if let Some(winner) = refreshed_while_waiting(server_id, before_access.as_deref())? {
+    let refresh_lock = lock();
+    if let Some(winner) = refreshed_while_waiting(server_id, before_access.as_deref())?
+        .filter(|winner| !force || rejected != Some(winner.access_token.as_str()))
+    {
+        credentials.read_vault(server_id)?;
+        credentials.pending = None;
+        credentials.token = Some(winner.access_token.clone());
         return Ok(winner);
     }
+    // Even on timeout, a peer may have saved a usable winner just before our
+    // reread. Otherwise no exchange is allowed without a held lock.
+    let _refresh_lock = refresh_lock.map_err(|cause| {
+        eprintln!("OAuth refresh lock unavailable: {cause}");
+        OAUTH_REFRESH_LOCK_ERROR.to_string()
+    })?;
     // Client-credentials servers have no refresh token by construction, so they
     // reacquire instead. Checked first because this is the seam BOTH the proactive
     // pre-expiry path and the reactive 401/403 retry go through; branching here
     // means neither has to know which flow a server uses.
     // A failed CC-state read must not fall through to interactive refresh (SBS-840).
-    if load_cc_state(server_id)?.is_some() {
-        return reacquire_client_credentials(server_id);
+    let changed_after = credentials.read_vault(server_id)?;
+    let cc_state = load_cc_state(server_id)?;
+    if force
+        && rejected.is_some()
+        && credentials
+            .token
+            .as_deref()
+            .is_some_and(|token| Some(token) != rejected)
+    {
+        let expires_at = match cc_state.as_ref() {
+            Some(state) => state.expires_at,
+            None => decode_vaulted_json::<OAuthState>(
+                Ok(credentials.vaulted_state.clone()),
+                "OAuth state",
+            )?
+            .and_then(|state| state.expires_at),
+        };
+        return Ok(RefreshedToken {
+            access_token: credentials.token.clone().expect("current token checked"),
+            expires_at: credentials
+                .pending
+                .as_ref()
+                .map(|pending| pending.token.expires_at)
+                .unwrap_or(expires_at),
+        });
     }
-    let state = match load_state(server_id) {
-        Ok(Some(s)) => s,
-        Ok(None) => return Err("no stored OAuth state to refresh".to_string()),
-        Err(e) => return Err(e),
-    };
+    if cc_state.is_some() {
+        let token = reacquire_client_credentials(server_id)?;
+        credentials.read_vault(server_id)?;
+        credentials.token = Some(token.access_token.clone());
+        return Ok(token);
+    }
+    let vaulted_state = credentials.vaulted_state.clone();
+    if had_pending && (changed_before || changed_after || (!force && credentials.pending.is_none()))
+    {
+        // A peer's sign-in or our completed save supersedes the unsaved pair.
+        if let Some(state) = load_state(server_id)? {
+            if let Some(access_token) = credentials.token.clone() {
+                if refresh_decision(&state, now_epoch_seconds()) == RefreshDecision::NotNeeded
+                    && (!force || rejected != Some(access_token.as_str()))
+                {
+                    return Ok(RefreshedToken {
+                        access_token,
+                        expires_at: state.expires_at,
+                    });
+                }
+            }
+        }
+    }
+    let mut source_state = vaulted_state.clone();
+    if let Some(p) = credentials.pending.as_ref() {
+        source_state = Some(p.state.clone());
+        let token = p.token.clone();
+        let json = p.state.clone();
+        if secrets::set_secret(server_id, STATE_KEY, &json).is_ok() {
+            credentials.vaulted_state = Some(json);
+            credentials.pending = None;
+            credentials.save_access(server_id, &token.access_token);
+        }
+        // Retry saving even before the deadline; rejected/expired tokens still
+        // exchange using the in-memory refresh token if storage remains unavailable.
+        if !force
+            && token
+                .expires_at
+                .is_none_or(|expiry| expiry > now_epoch_seconds())
+        {
+            return Ok(token);
+        }
+    }
+    let state: OAuthState = decode_vaulted_json(Ok(source_state), "OAuth state")?
+        .ok_or("no stored OAuth state to refresh")?;
     let rt = state
         .refresh_token
         .as_deref()
@@ -601,9 +811,8 @@ fn refresh_token_with_expiry(server_id: &str) -> Result<RefreshedToken, String> 
     // and register a fresh client instead of reusing the old credentials.
     let refreshed_endpoints = match (state.issuer.as_deref(), state.resource.as_deref()) {
         (Some(expected_issuer), Some(resource)) => {
-            let endpoints = oauth::discover(resource).map_err(|e| {
-                format!("could not verify the stored OAuth issuer; needs authentication: {e}")
-            })?;
+            let endpoints = oauth::discover(resource)
+                .map_err(|e| format!("could not verify the stored OAuth issuer: {e}"))?;
             issuer_bound_token_endpoint(expected_issuer, &endpoints)?;
             Some(endpoints)
         }
@@ -632,6 +841,10 @@ fn refresh_token_with_expiry(server_id: &str) -> Result<RefreshedToken, String> 
     // fails, the next attempt still has the new refresh token and can recover;
     // the reverse order could strand a new access token with an invalidated old
     // refresh token after a second-write failure.
+    let rotated = tokens
+        .refresh_token
+        .as_ref()
+        .is_some_and(|rt| Some(rt) != state.refresh_token.as_ref());
     let new_state = OAuthState {
         issuer: state.issuer,
         token_endpoint: token_endpoint.to_string(),
@@ -643,12 +856,32 @@ fn refresh_token_with_expiry(server_id: &str) -> Result<RefreshedToken, String> 
         expires_at: tokens.expires_at,
     };
     let json = serde_json::to_string(&new_state).map_err(|e| e.to_string())?;
-    secrets::set_secret(server_id, STATE_KEY, &json)?;
-    secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, &tokens.access_token)?;
-    Ok(RefreshedToken {
+    let token = RefreshedToken {
         access_token: tokens.access_token,
         expires_at: tokens.expires_at,
-    })
+    };
+    match secrets::set_secret(server_id, STATE_KEY, &json) {
+        Ok(()) => {
+            credentials.vaulted_state = Some(json.clone());
+            credentials.pending = None;
+            credentials.save_access(server_id, &token.access_token);
+        }
+        Err(_) => {
+            eprintln!("OAuth refresh metadata could not be saved; will retry.");
+            // An unchanged refresh token remains safe to retry from the vault.
+            // Preserve a previously pending rotation even if this response omits it.
+            if rotated || credentials.pending.is_some() {
+                credentials.pending = Some(PendingRefresh {
+                    state: json,
+                    token: token.clone(),
+                });
+            } else {
+                credentials.save_access(server_id, &token.access_token);
+            }
+        }
+    }
+    credentials.token = Some(token.access_token.clone());
+    Ok(token)
 }
 
 /// Complete an interactive step-up flow for a runtime `insufficient_scope`
@@ -691,8 +924,37 @@ fn reauthorize_for_scope(
     })
 }
 
-pub fn refresh_token(server_id: &str) -> Result<String, String> {
-    refresh_token_with_expiry(server_id).map(|token| token.access_token)
+/// Force a refresh after rejection, or reuse a different current credential under
+/// the credential-update and cross-process locks. `None` disables rejected-token
+/// coalescing. Pass the bearer actually rejected by the server to coalesce
+/// concurrent failures. Vault read errors propagate; callers
+/// should report the storage failure rather than request sign-in or exchange again.
+pub fn refresh_token(server_id: &str, rejected: Option<&str>) -> Result<String, String> {
+    refresh_token_with_expiry(server_id, rejected).map(|token| token.access_token)
+}
+
+fn refresh_token_for_connect(server_id: &str) -> Result<Option<String>, String> {
+    let update = credential_update(server_id);
+    let mut pending = update
+        .lock()
+        .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
+    let retry_pending = pending.valid_pending_token().is_some();
+    connect_refresh_result(
+        refresh_token_with_pending(
+            server_id,
+            || {
+                if retry_pending {
+                    lock_oauth_refresh_for(server_id, Duration::ZERO)
+                } else {
+                    lock_oauth_refresh(server_id)
+                }
+            },
+            &mut pending,
+            false,
+            None,
+        )
+        .map(|token| token.access_token),
+    )
 }
 
 /// Refresh before the known expiry. A legacy/provider state with no expiry is a
@@ -700,6 +962,14 @@ pub fn refresh_token(server_id: &str) -> Result<String, String> {
 /// no refresh token exists, return an auth-classified error so the existing
 /// per-server "Needs sign-in" UI appears before a failed tool call.
 fn refresh_token_if_needed(server_id: &str) -> Result<Option<String>, String> {
+    if credential_update(server_id)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pending
+        .is_some()
+    {
+        return refresh_token_for_connect(server_id);
+    }
     // Same pre-expiry rule for the headless flow, minus the "no refresh token"
     // branch: reacquiring needs no user interaction, so a near-deadline token is
     // simply replaced rather than surfaced as "needs sign-in".
@@ -710,7 +980,7 @@ fn refresh_token_if_needed(server_id: &str) -> Result<Option<String>, String> {
             // straight from here left the proactive headless path as the one arm of the
             // call graph still able to mint concurrently (SBS-479). Matches the shape of
             // the refresh-token arm below.
-            return Ok(refresh_token(server_id).ok());
+            return refresh_token_for_connect(server_id);
         }
         return Ok(None);
     }
@@ -721,13 +991,22 @@ fn refresh_token_if_needed(server_id: &str) -> Result<Option<String>, String> {
     };
     match refresh_decision(&state, now_epoch_seconds()) {
         RefreshDecision::NotNeeded => Ok(None),
-        // The token may still be valid throughout the safety window. A transient
-        // refresh failure falls back to it; a real 401/403 forces another refresh.
-        RefreshDecision::Refresh => Ok(refresh_token(server_id).ok()),
+        // Report contention and persistence failures rather than silently using
+        // an old credential and immediately attempting another exchange on 401.
+        RefreshDecision::Refresh => refresh_token_for_connect(server_id),
         RefreshDecision::Reauthenticate => Err(
             "OAuth access token expires soon and no refresh token is available; needs authentication"
                 .to_string(),
         ),
+    }
+}
+
+fn connect_refresh_result(result: Result<String, String>) -> Result<Option<String>, String> {
+    match result {
+        Ok(token) => Ok(Some(token)),
+        Err(e) if is_refresh_storage_or_lock_error(&e) || is_auth_error(&e) => Err(e),
+        // Discovery and network failures need not prevent using a current token.
+        Err(_) => Ok(None),
     }
 }
 
@@ -742,6 +1021,17 @@ fn mentions_status(s: &str, code: &str) -> bool {
         let after = s[i + code.len()..].chars().next();
         !before.is_some_and(|c| c.is_ascii_digit()) && !after.is_some_and(|c| c.is_ascii_digit())
     })
+}
+
+pub(crate) fn is_refresh_storage_or_lock_error(e: &str) -> bool {
+    is_refresh_lock_error(e)
+        || e.starts_with(OAUTH_REFRESH_SAVE_ERROR)
+        || e.contains("could not read the vaulted")
+        || e.contains("could not parse the vaulted")
+}
+
+pub(crate) fn is_refresh_lock_error(e: &str) -> bool {
+    e == OAUTH_REFRESH_LOCK_ERROR
 }
 
 pub fn is_auth_error(e: &str) -> bool {
@@ -783,14 +1073,27 @@ fn authed_transport(
     server_id: &str,
     block_private: bool,
     request_timeout: Duration,
-) -> Result<HttpTransport, String> {
+) -> Result<(HttpTransport, Arc<AtomicBool>), String> {
     if token.is_some() {
         require_secure_for_auth(url)?;
     }
     // Shared by ordinary refresh and scope step-up so a newly-authorized token's
     // expiry replaces the previous token's proactive deadline immediately.
     // A failed state read must not silently disable proactive refresh (SBS-840).
-    let oauth_state = load_state(server_id)?;
+    let oauth_state = load_state(server_id).or_else(|error| {
+        let update = credential_update(server_id);
+        let update = update
+            .lock()
+            .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
+        if update.valid_pending_token().is_some() {
+            decode_vaulted_json(
+                Ok(update.pending.as_ref().map(|pending| pending.state.clone())),
+                "OAuth state",
+            )
+        } else {
+            Err(error)
+        }
+    })?;
     let refresh_at = oauth_state
         .as_ref()
         .and_then(|state| state.expires_at)
@@ -799,18 +1102,34 @@ fn authed_transport(
     // The request path and the background subscription listener can refresh or
     // step up concurrently. Serialize credential-changing flows so an older
     // refresh result cannot overwrite a newer interactive authorization state.
-    let credential_update = Arc::new(Mutex::new(()));
+    let credential_update = credential_update(server_id);
+    let refreshed_during_connect = Arc::new(AtomicBool::new(false));
     let refresh: Option<RefreshFn> = if token.is_some() {
         let sid = server_id.to_string();
         // Keep the proactive deadline in memory. This avoids a keychain read on
         // every tool call while still updating the deadline after each refresh.
         let next_refresh_at = Arc::clone(&next_refresh_at);
         let credential_update = Arc::clone(&credential_update);
+        let refreshed_during_connect = Arc::clone(&refreshed_during_connect);
         Some(Box::new(move |force| {
-            let _update = credential_update
+            let deadline = *next_refresh_at
                 .lock()
-                .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
-            if !force {
+                .map_err(|_| "OAuth refresh deadline lock poisoned".to_string())?;
+            let valid_token = deadline.is_none_or(|deadline| {
+                deadline.saturating_add(PROACTIVE_REFRESH_SKEW_SECS) > now_epoch_seconds()
+            });
+            let mut update = if !force && valid_token {
+                match credential_update.try_lock() {
+                    Ok(update) => update,
+                    Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                    Err(_) => return Err("OAuth credential-update lock poisoned".into()),
+                }
+            } else {
+                credential_update
+                    .lock()
+                    .map_err(|_| "OAuth credential-update lock poisoned".to_string())?
+            };
+            if !force && update.pending.is_none() {
                 let deadline = *next_refresh_at
                     .lock()
                     .map_err(|_| "OAuth refresh deadline lock poisoned".to_string())?;
@@ -820,7 +1139,20 @@ fn authed_transport(
                 }
             }
 
-            let refreshed = match refresh_token_with_expiry(&sid) {
+            let retry_pending = !force && update.valid_pending_token().is_some();
+            let refreshed = match refresh_token_with_pending(
+                &sid,
+                || {
+                    if retry_pending {
+                        lock_oauth_refresh_for(&sid, Duration::ZERO)
+                    } else {
+                        lock_oauth_refresh(&sid)
+                    }
+                },
+                &mut update,
+                force,
+                None,
+            ) {
                 Ok(refreshed) => refreshed,
                 Err(e) => {
                     if !force {
@@ -829,17 +1161,10 @@ fn authed_transport(
                             .map_err(|_| "OAuth refresh deadline lock poisoned".to_string())? =
                             Some(now_epoch_seconds().saturating_add(PROACTIVE_REFRESH_RETRY_SECS));
                     }
-                    // A locked keychain is not "please sign in again" (SBS-840).
-                    if e.contains("could not read the vaulted")
-                        || e.contains("could not parse the vaulted")
-                    {
-                        return Err(e);
-                    }
-                    return Err(format!(
-                        "OAuth token refresh failed; needs authentication: {e}"
-                    ));
+                    return Err(e);
                 }
             };
+            refreshed_during_connect.store(true, Ordering::SeqCst);
             let deadline = refreshed
                 .expires_at
                 .map(|expires_at| expires_at.saturating_sub(PROACTIVE_REFRESH_SKEW_SECS));
@@ -858,10 +1183,13 @@ fn authed_transport(
         let next_refresh_at = Arc::clone(&next_refresh_at);
         let credential_update = Arc::clone(&credential_update);
         Some(Box::new(move |scope| {
-            let _update = credential_update
+            let mut update = credential_update
                 .lock()
                 .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
             let token = reauthorize_for_scope(&sid, &resource, scope)?;
+            update.pending = None;
+            update.read_vault(&sid)?;
+            update.token = Some(token.access_token.clone());
             let deadline = token
                 .expires_at
                 .map(|expires_at| expires_at.saturating_sub(PROACTIVE_REFRESH_SKEW_SECS));
@@ -895,7 +1223,7 @@ fn authed_transport(
             serde_json::json!({}),
         );
     }
-    Ok(transport)
+    Ok((transport, refreshed_during_connect))
 }
 
 /// Provenance Toolport doesn't trust to point at the user's private network. Shared
@@ -1033,7 +1361,18 @@ pub fn connect_remote_with_handler(
     //
     // Handled here because this is the only place that sees both the current entry
     // and the vault; the reacquire seam takes just a server id by design.
-    if client_credentials_state_is_stale(server, server_id, url)? {
+    let stale_cc = client_credentials_state_is_stale(server, server_id, url).or_else(|error| {
+        let update = credential_update(server_id);
+        let update = update
+            .lock()
+            .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
+        if !uses_client_credentials(server) && update.valid_pending_token().is_some() {
+            Ok(false)
+        } else {
+            Err(error)
+        }
+    })?;
+    if stale_cc {
         // Not ignored: leaving stale state would silently keep using the wrong
         // flow, or the wrong resource binding, for the rest of the session.
         reset_client_credentials(server_id)?;
@@ -1049,22 +1388,21 @@ pub fn connect_remote_with_handler(
     // A vault read failure is not "no token" (SBS-789): connecting anonymous on a
     // locked keychain would surface as a bogus 401/"needs sign-in" and can hand an
     // unauthenticated session to a server the user believes is authenticated.
-    let stored_auth = match secrets::get_secret_result(server_id, secrets::HTTP_AUTH_KEY) {
-        Ok(Some(v)) => Some(v),
-        Ok(None) => first_vaulted_secret(server)
-            .map_err(|e| format!("could not read the vaulted auth token: {e}"))?,
-        Err(e) => return Err(format!("could not read the vaulted auth token: {e}")),
-    };
     let auth = match refresh_token_if_needed(server_id)? {
         Some(fresh) => Some(fresh),
-        None => stored_auth,
+        None => match current_credential(server_id)? {
+            Some(token) => Some(token),
+            None => first_vaulted_secret(server)
+                .map_err(|e| format!("could not read the vaulted auth token: {e}"))?,
+        },
     };
     // Remember exactly what we hand the transport. The transport force-refreshes
     // internally on a 401/403 and vaults the result, so if the vaulted token
     // differs from this afterwards, an exchange already happened during this
     // connect (SOU-474).
     let sent_auth = auth.clone();
-    let mut transport = authed_transport(url, auth, server_id, block_private, request_timeout)?;
+    let (mut transport, refreshed_during_connect) =
+        authed_transport(url, auth, server_id, block_private, request_timeout)?;
     transport.set_connect_timeout(initialize_timeout);
     if let Some(ref handler) = server_handler {
         transport.set_server_request_handler(handler.clone());
@@ -1091,7 +1429,11 @@ pub fn connect_remote_with_handler(
             // described in words rather than quoted, because its text would make
             // `is_auth_error` classify a keychain fault as needs-sign-in and push the
             // user into a sign-in the same vault could not store.
-            let already_refreshed =
+            // A successful refresh can live only in memory after a vault write
+            // fails. Count it directly instead of relying solely on saved tokens.
+            let already_refreshed = if refreshed_during_connect.load(Ordering::SeqCst) {
+                true
+            } else {
                 match transport_refreshed_during_connect(server_id, sent_auth.as_deref()) {
                     Ok(refreshed) => refreshed,
                     Err(vault_error) => {
@@ -1108,13 +1450,14 @@ pub fn connect_remote_with_handler(
                              renewed, so no further token exchange was attempted)"
                         ));
                     }
-                };
+                }
+            };
             if already_refreshed {
                 return Err(e);
             }
-            match refresh_token(server_id) {
+            match refresh_token(server_id, sent_auth.as_deref()) {
                 Ok(fresh) => {
-                    let mut transport = authed_transport(
+                    let (mut transport, _) = authed_transport(
                         url,
                         Some(fresh),
                         server_id,
@@ -1134,6 +1477,9 @@ pub fn connect_remote_with_handler(
                             ds
                         },
                     )
+                }
+                Err(refresh_error) if is_refresh_storage_or_lock_error(&refresh_error) => {
+                    Err(refresh_error)
                 }
                 Err(_) => Err(e),
             }
@@ -1287,14 +1633,1078 @@ mod tests {
             OAUTH_REFRESH_LOCK_TIMEOUT >= std::time::Duration::from_secs(30),
             "the production wait must cover the token client's request timeout"
         );
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names
+            .iter()
+            .any(|name| name.starts_with("oauth-refresh-") && name.ends_with(".lock")));
+        assert!(!names.iter().any(|name| name.ends_with(".lock.lock")));
         drop((a, b));
 
         assert!(
-            lock_oauth_refresh("server-a").is_some(),
+            lock_oauth_refresh("server-a").is_ok(),
             "the lock must be reacquirable once released"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct RotatingEndpoint {
+        url: String,
+        exchanges: Arc<std::sync::atomic::AtomicUsize>,
+        reject_access: Arc<AtomicBool>,
+        started: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::SyncSender<()>,
+        server: Arc<tiny_http::Server>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl RotatingEndpoint {
+        fn new() -> Self {
+            Self::with_rotation(true)
+        }
+
+        fn with_rotation(rotates: bool) -> Self {
+            let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+            let url = format!("http://{}/token", server.server_addr());
+            let exchanges = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let reject_access = Arc::new(AtomicBool::new(false));
+            let reject = Arc::clone(&reject_access);
+            let (started_tx, started) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+            let endpoint = Arc::clone(&server);
+            let count = Arc::clone(&exchanges);
+            let worker = std::thread::spawn(move || {
+                let mut release_rx = Some(release_rx);
+                let mut handlers = Vec::new();
+                while let Ok(mut request) = endpoint.recv() {
+                    let mut body = String::new();
+                    request.as_reader().read_to_string(&mut body).unwrap();
+                    if !body.contains("grant_type=refresh_token") {
+                        if reject.load(Ordering::SeqCst) {
+                            request.respond(tiny_http::Response::empty(401)).unwrap();
+                            continue;
+                        }
+                        let message: serde_json::Value = serde_json::from_str(&body).unwrap();
+                        if message.get("id").is_none() {
+                            request.respond(tiny_http::Response::empty(202)).unwrap();
+                            continue;
+                        }
+                        let auth = request
+                            .headers()
+                            .iter()
+                            .find(|h| h.field.equiv("Authorization"))
+                            .map(|h| h.value.as_str())
+                            .unwrap_or("");
+                        let response = serde_json::json!({"jsonrpc":"2.0", "id":message["id"],
+                            "result":{"authorization":auth, "tools":[]}})
+                        .to_string();
+                        request
+                            .respond(
+                                tiny_http::Response::from_string(response).with_header(
+                                    tiny_http::Header::from_bytes(
+                                        "Content-Type",
+                                        "application/json",
+                                    )
+                                    .unwrap(),
+                                ),
+                            )
+                            .unwrap();
+                        continue;
+                    }
+                    let index = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let expected = if rotates { index } else { 0 };
+                    if !body.contains(&format!("refresh_token=rt-{expected}")) {
+                        request
+                            .respond(
+                                tiny_http::Response::from_string(r#"{"error":"invalid_grant"}"#)
+                                    .with_status_code(400),
+                            )
+                            .unwrap();
+                        continue;
+                    }
+                    let mut response = serde_json::json!({"access_token":format!("token-{}", index+1),
+                        "expires_in":3600,"token_type":"Bearer"});
+                    if rotates {
+                        response["refresh_token"] = format!("rt-{}", index + 1).into();
+                    }
+                    if index == 0 {
+                        let release_rx = release_rx.take().unwrap();
+                        let started_tx = started_tx.clone();
+                        handlers.push(std::thread::spawn(move || {
+                            started_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                            request
+                                .respond(tiny_http::Response::from_string(response.to_string()))
+                                .unwrap();
+                        }));
+                    } else {
+                        request
+                            .respond(tiny_http::Response::from_string(response.to_string()))
+                            .unwrap();
+                    }
+                }
+                for handler in handlers {
+                    handler.join().unwrap();
+                }
+            });
+            Self {
+                url,
+                exchanges,
+                reject_access,
+                started,
+                release,
+                server,
+                worker: Some(worker),
+            }
+        }
+
+        fn seed(&self) {
+            let state = OAuthState {
+                issuer: None,
+                token_endpoint: self.url.clone(),
+                client_id: "client".into(),
+                refresh_token: Some("rt-0".into()),
+                resource: None,
+                scope: None,
+                issued_at: Some(1),
+                expires_at: Some(2),
+            };
+            secrets::set_secret(
+                "rotation",
+                STATE_KEY,
+                &serde_json::to_string(&state).unwrap(),
+            )
+            .unwrap();
+            secrets::set_secret("rotation", secrets::HTTP_AUTH_KEY, "token-0").unwrap();
+        }
+
+        fn count(&self) -> usize {
+            self.exchanges.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for RotatingEndpoint {
+        fn drop(&mut self) {
+            let _ = self.release.try_send(());
+            self.server.unblock();
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+
+    #[test]
+    fn oauth_refresh_long_holder_never_allows_an_unlocked_exchange() {
+        secrets::tests::with_isolated_vault(|| {
+            std::thread::scope(|scope| {
+                let endpoint = RotatingEndpoint::new();
+                endpoint.seed();
+                // Separate pending memory models a holder in another process.
+                let holder = scope.spawn(|| {
+                    refresh_token_with_pending(
+                        "rotation",
+                        || lock_oauth_refresh("rotation"),
+                        &mut CredentialState::default(),
+                        true,
+                        None,
+                    )
+                    .map(|token| token.access_token)
+                });
+                endpoint
+                    .started
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                // Inject the wait deadline while the first exchange is still blocked.
+                // This is the old >65s race without a 65s wall-clock sleep.
+                let waited = refresh_token_with_lock("rotation", None, || {
+                    lock_oauth_refresh_for("rotation", Duration::ZERO)
+                });
+                endpoint.release.send(()).unwrap();
+                assert_eq!(holder.join().unwrap().unwrap(), "token-1");
+                let error = waited.err().unwrap();
+                assert_eq!(error, OAUTH_REFRESH_LOCK_ERROR);
+                assert!(!is_auth_error(&error));
+                assert_eq!(endpoint.count(), 1);
+                assert_eq!(
+                    load_state("rotation")
+                        .unwrap()
+                        .unwrap()
+                        .refresh_token
+                        .as_deref(),
+                    Some("rt-1")
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn oauth_refresh_independent_waiter_uses_the_saved_winner() {
+        for timeout_after_save in [false, true] {
+            secrets::tests::with_isolated_vault(|| {
+                std::thread::scope(|scope| {
+                    let endpoint = RotatingEndpoint::new();
+                    endpoint.seed();
+                    let holder = scope.spawn(|| {
+                        refresh_token_with_pending(
+                            "rotation",
+                            || lock_oauth_refresh("rotation"),
+                            &mut CredentialState::default(),
+                            true,
+                            None,
+                        )
+                        .map(|token| token.access_token)
+                    });
+                    endpoint
+                        .started
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+                    let (saved_tx, saved_rx) = std::sync::mpsc::channel();
+                    let waiter = scope.spawn(move || {
+                        refresh_token_with_lock("rotation", None, || {
+                            // This seam runs after the pre-lock vault snapshot. Try the
+                            // real lock while the peer holds it, then let it save.
+                            let contended = lock_oauth_refresh_for("rotation", Duration::ZERO);
+                            assert!(contended.is_err());
+                            snapshot_tx.send(()).unwrap();
+                            saved_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                            if timeout_after_save {
+                                contended
+                            } else {
+                                lock_oauth_refresh_for("rotation", Duration::ZERO)
+                            }
+                        })
+                    });
+                    snapshot_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    endpoint.release.send(()).unwrap();
+                    assert_eq!(holder.join().unwrap().unwrap(), "token-1");
+                    saved_tx.send(()).unwrap();
+                    let winner = waiter.join().unwrap().unwrap();
+                    assert_eq!(winner.access_token, "token-1");
+                    assert!(winner.expires_at.unwrap() > now_epoch_seconds());
+                    assert_eq!(endpoint.count(), 1);
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn oauth_refresh_access_save_failure_returns_token_after_saving_rotation() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            endpoint.release.send(()).unwrap();
+            let token = secrets::tests::with_failed_write(secrets::HTTP_AUTH_KEY, || {
+                refresh_token_if_needed("rotation").unwrap().unwrap()
+            });
+            assert_eq!(token, "token-1");
+            assert_eq!(
+                load_state("rotation")
+                    .unwrap()
+                    .unwrap()
+                    .refresh_token
+                    .as_deref(),
+                Some("rt-1")
+            );
+            assert_eq!(
+                secrets::get_secret("rotation", secrets::HTTP_AUTH_KEY).as_deref(),
+                Some("token-0")
+            );
+            assert_eq!(refresh_token("rotation", None).unwrap(), "token-2");
+        });
+    }
+
+    #[test]
+    fn oauth_connect_does_not_refresh_twice_after_a_failed_token_save() {
+        for key in [STATE_KEY, secrets::HTTP_AUTH_KEY] {
+            secrets::tests::with_isolated_vault(|| {
+                let endpoint = RotatingEndpoint::new();
+                endpoint.seed();
+                let mut state = load_state("rotation").unwrap().unwrap();
+                state.expires_at = Some(now_epoch_seconds() + 3600);
+                secrets::set_secret(
+                    "rotation",
+                    STATE_KEY,
+                    &serde_json::to_string(&state).unwrap(),
+                )
+                .unwrap();
+                endpoint.reject_access.store(true, Ordering::SeqCst);
+                endpoint.release.send(()).unwrap();
+                let mut server = remote_server(&endpoint.url, None);
+                server.id = "rotation".into();
+                let error = secrets::tests::with_failed_write(key, || {
+                    connect_remote(&server).err().unwrap()
+                });
+                assert!(is_auth_error(&error), "{error}");
+                assert_eq!(
+                    endpoint.count(),
+                    1,
+                    "connect must not perform another recovery exchange"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn oauth_refresh_unavailable_lock_is_a_retriable_failure() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            let error =
+                refresh_token_with_lock("rotation", None, || Err("cannot create lock".into()))
+                    .err()
+                    .unwrap();
+            assert_eq!(error, OAUTH_REFRESH_LOCK_ERROR);
+            assert!(!is_auth_error(&error));
+            assert_eq!(endpoint.count(), 0);
+        });
+    }
+
+    fn rotation_transport(endpoint: &RotatingEndpoint) -> HttpTransport {
+        authed_transport(
+            &endpoint.url,
+            Some("token-0".into()),
+            "rotation",
+            false,
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .0
+    }
+
+    fn request_auth(transport: &mut HttpTransport) -> String {
+        transport
+            .request("tools/list", serde_json::json!({}))
+            .unwrap()["authorization"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn oauth_refresh_nonrotating_save_failure_recovers() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::with_rotation(false);
+            endpoint.seed();
+            endpoint.release.send(()).unwrap();
+            let mut transport = rotation_transport(&endpoint);
+            secrets::tests::with_failed_write(STATE_KEY, || {
+                assert_eq!(request_auth(&mut transport), "Bearer token-1");
+            });
+            assert!(credential_update("rotation")
+                .lock()
+                .unwrap()
+                .pending
+                .is_none());
+            assert_eq!(refresh_token("rotation", None).unwrap(), "token-2");
+            assert_eq!(
+                load_state("rotation")
+                    .unwrap()
+                    .unwrap()
+                    .refresh_token
+                    .as_deref(),
+                Some("rt-0")
+            );
+            assert_eq!(endpoint.count(), 2);
+        });
+    }
+
+    #[test]
+    fn oauth_refresh_rotating_save_failure_uses_memory_and_retries_persistence() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            endpoint.release.send(()).unwrap();
+            let mut transport = rotation_transport(&endpoint);
+            secrets::tests::with_failed_write(STATE_KEY, || {
+                assert_eq!(request_auth(&mut transport), "Bearer token-1");
+                // This forced exchange must use RT1, although the vault still has RT0.
+                assert_eq!(refresh_token("rotation", None).unwrap(), "token-2");
+                assert_eq!(request_auth(&mut transport), "Bearer token-2");
+            });
+            assert_eq!(
+                load_state("rotation")
+                    .unwrap()
+                    .unwrap()
+                    .refresh_token
+                    .as_deref(),
+                Some("rt-0")
+            );
+            assert_eq!(
+                refresh_token_if_needed("rotation").unwrap().as_deref(),
+                Some("token-2")
+            );
+            assert_eq!(request_auth(&mut transport), "Bearer token-2");
+            assert_eq!(
+                load_state("rotation")
+                    .unwrap()
+                    .unwrap()
+                    .refresh_token
+                    .as_deref(),
+                Some("rt-2")
+            );
+            assert!(credential_update("rotation")
+                .lock()
+                .unwrap()
+                .pending
+                .is_none());
+            assert_eq!(endpoint.count(), 2);
+        });
+    }
+
+    #[test]
+    fn oauth_refresh_vault_change_discards_pending_rotation() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            endpoint.release.send(()).unwrap();
+            let mut transport = rotation_transport(&endpoint);
+            secrets::tests::with_failed_write(STATE_KEY, || {
+                assert_eq!(request_auth(&mut transport), "Bearer token-1");
+            });
+            let mut peer = load_state("rotation").unwrap().unwrap();
+            peer.refresh_token = Some("peer-rt".into());
+            peer.expires_at = Some(now_epoch_seconds() + 3600);
+            let peer_json = serde_json::to_string(&peer).unwrap();
+            secrets::set_secret("rotation", STATE_KEY, &peer_json).unwrap();
+            secrets::set_secret("rotation", secrets::HTTP_AUTH_KEY, "peer-token").unwrap();
+            assert_eq!(request_auth(&mut transport), "Bearer peer-token");
+            assert_eq!(
+                secrets::get_secret("rotation", STATE_KEY).unwrap(),
+                peer_json
+            );
+            assert!(credential_update("rotation")
+                .lock()
+                .unwrap()
+                .pending
+                .is_none());
+            assert_eq!(endpoint.count(), 1);
+        });
+    }
+
+    fn pending_rotation(endpoint: &RotatingEndpoint) -> HttpTransport {
+        endpoint.seed();
+        endpoint.release.send(()).unwrap();
+        let mut transport = rotation_transport(endpoint);
+        secrets::tests::with_failed_write(STATE_KEY, || {
+            assert_eq!(request_auth(&mut transport), "Bearer token-1");
+        });
+        transport
+    }
+
+    #[test]
+    fn oauth_pending_read_failure_uses_valid_token_for_requests_and_connect() {
+        for key in [secrets::HTTP_AUTH_KEY, STATE_KEY, CC_STATE_KEY] {
+            secrets::tests::with_isolated_vault(|| {
+                let endpoint = RotatingEndpoint::new();
+                let mut transport = pending_rotation(&endpoint);
+                secrets::tests::with_failed_read(key, || {
+                    assert_eq!(request_auth(&mut transport), "Bearer token-1");
+                    let mut server = remote_server(&endpoint.url, None);
+                    server.id = "rotation".into();
+                    assert!(connect_remote(&server).is_ok());
+                    assert!(credential_update("rotation")
+                        .lock()
+                        .unwrap()
+                        .pending
+                        .is_some());
+                    assert!(refresh_token("rotation", Some("token-1")).is_err());
+                    if key != CC_STATE_KEY {
+                        assert!(current_credential("rotation").is_err());
+                        assert!(newer_credential("rotation", "token-0").is_err());
+                    }
+                });
+                assert_eq!(request_auth(&mut transport), "Bearer token-1");
+                assert!(credential_update("rotation")
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .is_none());
+                assert_eq!(
+                    load_state("rotation")
+                        .unwrap()
+                        .unwrap()
+                        .refresh_token
+                        .as_deref(),
+                    Some("rt-1")
+                );
+                assert_eq!(endpoint.count(), 1);
+            });
+        }
+    }
+
+    #[test]
+    fn oauth_read_failure_without_valid_pending_token_fails_closed() {
+        for key in [secrets::HTTP_AUTH_KEY, STATE_KEY, CC_STATE_KEY] {
+            secrets::tests::with_isolated_vault(|| {
+                let endpoint = RotatingEndpoint::new();
+                endpoint.seed();
+                secrets::tests::with_failed_read(key, || {
+                    assert!(refresh_token_for_connect("rotation").is_err());
+                    let mut server = remote_server(&endpoint.url, None);
+                    server.id = "rotation".into();
+                    assert!(connect_remote(&server).is_err());
+                });
+                let _transport = pending_rotation(&endpoint);
+                credential_update("rotation")
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .as_mut()
+                    .unwrap()
+                    .token
+                    .expires_at = Some(0);
+                secrets::tests::with_failed_read(key, || {
+                    assert!(refresh_token_for_connect("rotation").is_err());
+                    let mut server = remote_server(&endpoint.url, None);
+                    server.id = "rotation".into();
+                    assert!(connect_remote(&server).is_err());
+                });
+                assert_eq!(endpoint.count(), 1);
+            });
+        }
+    }
+
+    #[test]
+    fn oauth_pending_save_that_landed_keeps_its_matching_access_token() {
+        for lookup_first in [false, true] {
+            secrets::tests::with_isolated_vault(|| {
+                let endpoint = RotatingEndpoint::new();
+                let mut transport = pending_rotation(&endpoint);
+                let json = credential_update("rotation")
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .state
+                    .clone();
+                // Emulate a D-Bus write committing after its caller reported a timeout.
+                secrets::set_secret("rotation", STATE_KEY, &json).unwrap();
+                assert_eq!(
+                    secrets::get_secret("rotation", secrets::HTTP_AUTH_KEY).as_deref(),
+                    Some("token-0")
+                );
+                if lookup_first {
+                    secrets::tests::with_failed_write(secrets::HTTP_AUTH_KEY, || {
+                        assert_eq!(
+                            current_credential("rotation").unwrap().as_deref(),
+                            Some("token-1")
+                        );
+                    });
+                }
+                assert_eq!(request_auth(&mut transport), "Bearer token-1");
+                assert_eq!(
+                    current_credential("rotation").unwrap().as_deref(),
+                    Some("token-1")
+                );
+                assert!(credential_update("rotation")
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .is_none());
+                if !lookup_first {
+                    assert_eq!(
+                        secrets::get_secret("rotation", secrets::HTTP_AUTH_KEY).as_deref(),
+                        Some("token-1")
+                    );
+                }
+                assert_eq!(endpoint.count(), 1);
+            });
+        }
+    }
+
+    #[test]
+    fn oauth_forced_refresh_rechecks_rejected_token_after_lookup() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            assert_eq!(newer_credential("rotation", "token-0").unwrap(), None);
+            endpoint.release.send(()).unwrap();
+            assert_eq!(refresh_token("rotation", None).unwrap(), "token-1");
+            assert_eq!(
+                refresh_token("rotation", Some("token-0")).unwrap(),
+                "token-1"
+            );
+            assert_eq!(endpoint.count(), 1);
+            assert_eq!(
+                refresh_token("rotation", Some("token-1")).unwrap(),
+                "token-2"
+            );
+            assert_eq!(endpoint.count(), 2);
+        });
+    }
+
+    #[test]
+    fn oauth_forced_refresh_does_not_reuse_rejected_lock_winner() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            endpoint.release.send(()).unwrap();
+            let token = refresh_token_with_lock("rotation", Some("rejected-peer"), || {
+                let lock = lock_oauth_refresh("rotation")?;
+                let mut peer = load_state("rotation")?.unwrap();
+                peer.expires_at = Some(now_epoch_seconds() + 3600);
+                secrets::set_secret(
+                    "rotation",
+                    STATE_KEY,
+                    &serde_json::to_string(&peer).unwrap(),
+                )?;
+                secrets::set_secret("rotation", secrets::HTTP_AUTH_KEY, "rejected-peer")?;
+                Ok(lock)
+            })
+            .unwrap();
+            assert_eq!(token.access_token, "token-1");
+            assert_eq!(endpoint.count(), 1);
+        });
+    }
+
+    #[test]
+    fn oauth_concurrent_rejections_exchange_once_even_when_save_fails() {
+        for failed_key in [STATE_KEY, secrets::HTTP_AUTH_KEY] {
+            secrets::tests::with_isolated_vault(|| {
+                let endpoint = RotatingEndpoint::new();
+                endpoint.seed();
+                let barrier = std::sync::Barrier::new(3);
+                std::thread::scope(|scope| {
+                    let callers: Vec<_> = (0..2)
+                        .map(|_| {
+                            let barrier = &barrier;
+                            scope.spawn(move || {
+                                barrier.wait();
+                                secrets::tests::with_failed_write(failed_key, || {
+                                    refresh_token("rotation", Some("token-0")).unwrap()
+                                })
+                            })
+                        })
+                        .collect();
+                    barrier.wait();
+                    endpoint
+                        .started
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    endpoint.release.send(()).unwrap();
+                    for caller in callers {
+                        assert_eq!(caller.join().unwrap(), "token-1");
+                    }
+                });
+                assert_eq!(endpoint.count(), 1);
+            });
+        }
+    }
+
+    #[test]
+    fn oauth_pending_busy_lock_keeps_requests_and_connect_usable() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            let mut transport = pending_rotation(&endpoint);
+            let holder = lock_oauth_refresh("rotation").unwrap();
+            assert_eq!(request_auth(&mut transport), "Bearer token-1");
+            let mut server = remote_server(&endpoint.url, None);
+            server.id = "rotation".into();
+            assert!(connect_remote(&server).is_ok());
+            assert!(credential_update("rotation")
+                .lock()
+                .unwrap()
+                .pending
+                .is_some());
+            // The same unavailable-lock result remains an error on the forced path.
+            let error = refresh_token_with_lock("rotation", Some("token-1"), || {
+                lock_oauth_refresh_for("rotation", Duration::ZERO)
+            })
+            .err()
+            .unwrap();
+            assert_eq!(error, OAUTH_REFRESH_LOCK_ERROR);
+            drop(holder);
+            assert_eq!(request_auth(&mut transport), "Bearer token-1");
+            assert!(credential_update("rotation")
+                .lock()
+                .unwrap()
+                .pending
+                .is_none());
+            assert_eq!(endpoint.count(), 1);
+        });
+    }
+
+    #[test]
+    fn oauth_pending_busy_update_mutex_keeps_valid_request_token() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            let mut transport = pending_rotation(&endpoint);
+            let update = credential_update("rotation");
+            let holder = update.lock().unwrap();
+            // A blocking mutex acquisition would deadlock this deterministic test.
+            assert_eq!(request_auth(&mut transport), "Bearer token-1");
+            drop(holder);
+            assert_eq!(request_auth(&mut transport), "Bearer token-1");
+            assert_eq!(endpoint.count(), 1);
+        });
+    }
+
+    #[test]
+    fn current_credential_memory_after_vault_wins_until_vault_changes() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            // Observe another process's token before this process rotates locally.
+            secrets::set_secret("rotation", secrets::HTTP_AUTH_KEY, "peer-before").unwrap();
+            assert_eq!(
+                current_credential("rotation").unwrap().as_deref(),
+                Some("peer-before")
+            );
+            endpoint.release.send(()).unwrap();
+            secrets::tests::with_failed_write(STATE_KEY, || {
+                assert_eq!(refresh_token("rotation", None).unwrap(), "token-1");
+            });
+            assert_eq!(
+                current_credential("rotation").unwrap().as_deref(),
+                Some("token-1")
+            );
+            assert_eq!(
+                newer_credential("rotation", "peer-before")
+                    .unwrap()
+                    .as_deref(),
+                Some("token-1")
+            );
+            assert_eq!(newer_credential("rotation", "token-1").unwrap(), None);
+            // A bearer-only peer update must supersede the unsaved local pair too.
+            secrets::set_secret("rotation", secrets::HTTP_AUTH_KEY, "peer-after").unwrap();
+            assert_eq!(
+                newer_credential("rotation", "token-1").unwrap().as_deref(),
+                Some("peer-after")
+            );
+            assert!(credential_update("rotation")
+                .lock()
+                .unwrap()
+                .pending
+                .is_none());
+            assert_eq!(
+                current_credential("rotation").unwrap().as_deref(),
+                Some("peer-after")
+            );
+            assert_eq!(endpoint.count(), 1, "credential lookup never exchanges");
+        });
+    }
+
+    #[test]
+    fn current_credential_vault_state_after_memory_wins_and_clear_removes_auth() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            assert_eq!(
+                current_credential("rotation").unwrap().as_deref(),
+                Some("token-0")
+            );
+            endpoint.release.send(()).unwrap();
+            secrets::tests::with_failed_write(STATE_KEY, || {
+                assert_eq!(refresh_token("rotation", None).unwrap(), "token-1");
+            });
+            assert_eq!(
+                current_credential("rotation").unwrap().as_deref(),
+                Some("token-1")
+            );
+            let mut peer = load_state("rotation").unwrap().unwrap();
+            peer.refresh_token = Some("peer-rt".into());
+            // State-only replacement counts, even if its bearer matches the old vault.
+            secrets::set_secret(
+                "rotation",
+                STATE_KEY,
+                &serde_json::to_string(&peer).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                current_credential("rotation").unwrap().as_deref(),
+                Some("token-0")
+            );
+            assert!(credential_update("rotation")
+                .lock()
+                .unwrap()
+                .pending
+                .is_none());
+            secrets::delete_secret("rotation", STATE_KEY).unwrap();
+            secrets::delete_secret("rotation", secrets::HTTP_AUTH_KEY).unwrap();
+            assert_eq!(current_credential("rotation").unwrap(), None);
+            assert_eq!(newer_credential("rotation", "token-0").unwrap(), None);
+            assert_eq!(endpoint.count(), 1);
+        });
+    }
+
+    #[test]
+    fn current_credential_retains_last_token_after_failed_access_save() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            endpoint.release.send(()).unwrap();
+            secrets::tests::with_failed_write(secrets::HTTP_AUTH_KEY, || {
+                assert_eq!(refresh_token("rotation", None).unwrap(), "token-1");
+            });
+            assert!(credential_update("rotation")
+                .lock()
+                .unwrap()
+                .pending
+                .is_none());
+            assert_eq!(
+                current_credential("rotation").unwrap().as_deref(),
+                Some("token-1")
+            );
+            assert_eq!(
+                newer_credential("rotation", "token-0").unwrap().as_deref(),
+                Some("token-1")
+            );
+            assert_eq!(newer_credential("rotation", "token-1").unwrap(), None);
+            secrets::set_secret("rotation", secrets::HTTP_AUTH_KEY, "peer-token").unwrap();
+            assert_eq!(
+                current_credential("rotation").unwrap().as_deref(),
+                Some("peer-token")
+            );
+        });
+        assert!(current_credential(RESERVED_VAULT_NS).is_err());
+    }
+
+    #[test]
+    fn oauth_refresh_lost_rotation_needs_authentication() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            endpoint.release.send(()).unwrap();
+            secrets::tests::with_failed_write(STATE_KEY, || {
+                assert_eq!(refresh_token("rotation", None).unwrap(), "token-1");
+            });
+            // Simulate a daemon restart losing the unsaved RT1.
+            *credential_update("rotation").lock().unwrap() = CredentialState::default();
+            let error = refresh_token_if_needed("rotation").unwrap_err();
+            assert!(is_auth_error(&error), "{error}");
+            assert!(!error.contains("rt-0"));
+        });
+    }
+
+    #[test]
+    fn oauth_connect_refresh_keeps_current_token_on_transient_failure() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            let mut state = load_state("rotation").unwrap().unwrap();
+            state.expires_at = Some(now_epoch_seconds() + 30);
+            // Invalid metadata/discovery URL fails immediately without network timing.
+            state.issuer = Some("https://issuer.example".into());
+            state.resource = Some("invalid resource URL".into());
+            secrets::set_secret(
+                "rotation",
+                STATE_KEY,
+                &serde_json::to_string(&state).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(refresh_token_if_needed("rotation").unwrap(), None);
+            let mut transport = rotation_transport(&endpoint);
+            assert_eq!(request_auth(&mut transport), "Bearer token-0");
+            assert_eq!(endpoint.count(), 0);
+            assert_eq!(
+                secrets::get_secret("rotation", secrets::HTTP_AUTH_KEY).as_deref(),
+                Some("token-0")
+            );
+        });
+        for error in [
+            "network unavailable",
+            "discovery unavailable",
+            "OAuth token endpoint returned status code 500",
+        ] {
+            assert_eq!(connect_refresh_result(Err(error.into())).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn oauth_connect_refresh_propagates_lock_storage_and_auth_errors() {
+        for error in [
+            OAUTH_REFRESH_LOCK_ERROR,
+            "could not read the vaulted OAuth state: locked",
+            "could not parse the vaulted OAuth state: malformed",
+            "OAuth refresh token was rejected; needs authentication",
+        ] {
+            assert_eq!(
+                connect_refresh_result(Err(error.into())).unwrap_err(),
+                error
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_refresh_token_endpoint_classifies_invalid_grant_and_401() {
+        for (code, body, auth) in [
+            (
+                400,
+                r#"{"error":"invalid_grant","description":"secret-token"}"#,
+                true,
+            ),
+            (401, "secret-token", true),
+            (400, r#"{"error":"temporarily_unavailable"}"#, false),
+            (500, "secret-token", false),
+        ] {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/token", server.server_addr());
+            let worker = std::thread::spawn(move || {
+                server
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .respond(tiny_http::Response::from_string(body).with_status_code(code))
+                    .unwrap();
+            });
+            let error = oauth::refresh(&url, "client", "secret-token", None, false)
+                .err()
+                .unwrap();
+            worker.join().unwrap();
+            assert_eq!(is_auth_error(&error), auth, "{error}");
+            assert!(!error.contains("secret-token"));
+        }
+    }
+
+    #[test]
+    fn oauth_refresh_lock_contention_uses_current_token_before_send() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", server.server_addr());
+        let mut transport = HttpTransport::with_auth_refresh(
+            &url,
+            Some("old-token".into()),
+            Some(Box::new(|_| Err(OAUTH_REFRESH_LOCK_ERROR.into()))),
+        );
+        let worker = std::thread::spawn(move || {
+            let mut request = server
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert!(request
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("Authorization") && h.value.as_str() == "Bearer old-token"));
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body).unwrap();
+            let message: serde_json::Value = serde_json::from_str(&body).unwrap();
+            request
+                .respond(
+                    tiny_http::Response::from_string(
+                        serde_json::json!({"jsonrpc":"2.0",
+                "id":message["id"],"result":{}})
+                        .to_string(),
+                    )
+                    .with_header(
+                        tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+                    ),
+                )
+                .unwrap();
+        });
+        transport
+            .request("tools/list", serde_json::json!({}))
+            .unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn oauth_refresh_errors_surface_through_proactive_and_forced_http_calls() {
+        for proactive in [true, false] {
+            for error in [
+                OAUTH_REFRESH_LOCK_ERROR.to_string(),
+                format!("{OAUTH_REFRESH_SAVE_ERROR} the rotated refresh token"),
+            ] {
+                // Contention is deliberately ignored only before sending.
+                if proactive && error == OAUTH_REFRESH_LOCK_ERROR {
+                    continue;
+                }
+                let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+                let url = format!("http://{}/mcp", server.server_addr());
+                let callback_error = error.clone();
+                let mut transport = HttpTransport::with_auth_refresh(
+                    &url,
+                    Some("old-token".into()),
+                    Some(Box::new(move |force| {
+                        if proactive || force {
+                            Err(callback_error.clone())
+                        } else {
+                            Ok(None)
+                        }
+                    })),
+                );
+                let worker = std::thread::spawn(move || {
+                    if !proactive {
+                        server
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap()
+                            .unwrap()
+                            .respond(tiny_http::Response::empty(401))
+                            .unwrap();
+                    }
+                });
+                let surfaced = transport
+                    .request("tools/list", serde_json::json!({}))
+                    .unwrap_err();
+                worker.join().unwrap();
+                assert_eq!(surfaced.to_string(), error);
+                assert!(!is_auth_error(&surfaced.to_string()));
+            }
+        }
+    }
+
+    // Spawn this exact headless test as a lock holder; the parent kills it rather
+    // than dropping the guard, proving OS recovery with the lock file retained.
+    #[test]
+    fn oauth_refresh_dead_holder_child() {
+        let Some(dir) = std::env::var_os("TOOLPORT_REFRESH_LOCK_CHILD") else {
+            return;
+        };
+        let _override = crate::registry::DataDirOverride::set(std::path::PathBuf::from(dir));
+        let _lock = lock_oauth_refresh("dead-holder").unwrap();
+        use std::io::Write;
+        println!("LOCKED");
+        std::io::stdout().flush().unwrap();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+    }
+
+    #[test]
+    fn oauth_refresh_recovers_the_lock_of_a_dead_process() {
+        secrets::tests::with_isolated_vault(|| {
+            use std::io::BufRead;
+            struct Holder(std::process::Child);
+            impl Drop for Holder {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let dir = crate::registry::conduit_dir().unwrap();
+            let mut child = Holder(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "remote::tests::oauth_refresh_dead_holder_child",
+                        "--nocapture",
+                    ])
+                    .env("TOOLPORT_REFRESH_LOCK_CHILD", &dir)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let stdout = child.0.stdout.take().unwrap();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if line.unwrap() == "LOCKED" {
+                        ready_tx.send(()).unwrap();
+                        break;
+                    }
+                }
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            reader.join().unwrap();
+            assert!(lock_oauth_refresh_for("dead-holder", Duration::ZERO).is_err());
+            let lock_file = dir.join("oauth-refresh-dead_holder.lock");
+            assert!(lock_file.exists());
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+            let _recovered = lock_oauth_refresh_for("dead-holder", Duration::ZERO).unwrap();
+            assert!(lock_file.exists());
+        });
     }
 
     #[test]
@@ -1937,7 +3347,7 @@ mod tests {
 
     #[test]
     fn refresh_token_reports_a_vault_read_failure_not_missing_state() {
-        let err = refresh_token(RESERVED_VAULT_NS)
+        let err = refresh_token(RESERVED_VAULT_NS, None)
             .expect_err("reserved namespace must fail the vault read");
         let lower = err.to_lowercase();
         assert!(

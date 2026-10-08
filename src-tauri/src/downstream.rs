@@ -5817,20 +5817,30 @@ impl HttpTransport {
         self.server_handler.as_ref().and_then(|handler| handler(v))
     }
 
-    /// Try to replace a token nearing expiry. Failure here is non-fatal because
-    /// the current token may remain valid throughout the safety window; a real
-    /// 401/403 will force one refresh attempt below.
-    fn refresh_before_send(&mut self) {
+    /// Try to replace a token nearing expiry. Contention keeps the current token
+    /// through the safety window; a forced refresh after 401 still reports it.
+    /// Persistence failures reach the caller without an unlocked exchange.
+    fn refresh_before_send(&mut self) -> Result<(), TransportError> {
         if let Some(refresh) = &self.refresh {
-            if let Ok(refresh) = refresh.lock() {
-                if let Ok(Some(token)) = refresh(false) {
-                    *self
-                        .auth
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+            if let Ok(refresh) = refresh.try_lock() {
+                match refresh(false) {
+                    Ok(Some(token)) => {
+                        *self
+                            .auth
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+                    }
+                    Err(e)
+                        if crate::remote::is_refresh_storage_or_lock_error(&e)
+                            && !crate::remote::is_refresh_lock_error(&e) =>
+                    {
+                        return Err(TransportError::Fatal(e));
+                    }
+                    _ => {}
                 }
             }
         }
+        Ok(())
     }
 
     /// True when the token currently in hand is one a forced refresh already
@@ -5866,6 +5876,9 @@ impl HttpTransport {
             Ok(None) => Err(TransportError::Fatal(format!(
                 "HTTP {code} (needs authentication): token refresh returned no token"
             ))),
+            Err(e) if crate::remote::is_refresh_storage_or_lock_error(&e) => {
+                Err(TransportError::Fatal(e))
+            }
             Err(e) => Err(TransportError::Fatal(format!(
                 "HTTP {code} (needs authentication): token refresh failed: {e}"
             ))),
@@ -5936,7 +5949,7 @@ impl HttpTransport {
         // inline reply is still egress and must not slip past an open window.
         self.shared_backoff_gate()?;
         let payload = body.to_string();
-        self.refresh_before_send();
+        self.refresh_before_send()?;
         let mut refreshed = self.forced_refresh_spent();
         let wire_version = self.wire_protocol_version();
         let resp = loop {
@@ -6179,7 +6192,7 @@ impl HttpTransport {
         // Refresh shortly before the known expiry, including before initialize.
         // The callback keeps the deadline in memory, so this is a cheap no-op on
         // ordinary calls and only touches vaulted OAuth state when refresh is due.
-        self.refresh_before_send();
+        self.refresh_before_send()?;
 
         // Token refresh is handled internally (it doesn't sleep, so no lock
         // contention). Only 429 and transport-retry signals bubble up as
@@ -13791,6 +13804,23 @@ mod tests {
         assert!(result.is_some());
         assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
         assert_eq!(*seen_auth.lock().unwrap(), "Bearer fresh");
+    }
+
+    #[test]
+    fn proactive_refresh_busy_callback_keeps_current_token() {
+        let mut transport = HttpTransport::with_auth_refresh(
+            "http://127.0.0.1:1/mcp",
+            Some("pending-token".into()),
+            Some(Box::new(|_| panic!("a held callback must not be invoked"))),
+        );
+        let callback = transport.refresh.as_ref().unwrap().clone();
+        let _holder = callback.lock().unwrap();
+        // Waiting for this guard would deadlock: a listener may hold it across I/O.
+        transport.refresh_before_send().unwrap();
+        assert_eq!(
+            transport.auth.lock().unwrap().as_deref(),
+            Some("pending-token")
+        );
     }
 
     #[test]

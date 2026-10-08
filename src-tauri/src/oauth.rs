@@ -1360,7 +1360,30 @@ pub fn refresh(
     let resp: TokenResponse = agent_no_redirect(block_private)
         .post(token_endpoint)
         .send_form(&form)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| match e {
+            ureq::Error::Status(401, _) => {
+                "OAuth refresh token was rejected; needs authentication".to_string()
+            }
+            ureq::Error::Status(400, response) => {
+                // Never expose the provider body, which may echo credentials.
+                if response
+                    .into_json::<serde_json::Value>()
+                    .ok()
+                    .and_then(|body| {
+                        body.get("error")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("invalid_grant")
+                {
+                    "OAuth refresh token expired or was revoked; needs authentication".to_string()
+                } else {
+                    "OAuth token endpoint returned status code 400".to_string()
+                }
+            }
+            other => other.to_string(),
+        })?
         .into_json()
         .map_err(|e| e.to_string())?;
     debug_log(&format!(
