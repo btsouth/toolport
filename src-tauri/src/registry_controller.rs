@@ -497,10 +497,11 @@ pub fn preview_client_imports() -> Result<Vec<ClientImportCandidate>, String> {
                     import
                         .review_credentials()
                         .into_iter()
-                        .map(|(key, secret, present)| CredentialReview {
+                        .map(|(key, secret, present, required)| CredentialReview {
                             key,
                             secret,
                             present,
+                            required,
                         })
                         .collect(),
                     None,
@@ -1673,6 +1674,7 @@ pub struct CredentialReview {
     pub key: String,
     pub secret: bool,
     pub present: bool,
+    pub required: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1734,12 +1736,18 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
             let (credentials, unsupported) = match prepared {
                 Ok(import) => (
                     import
-                        .review_credentials()
+                        .review_credentials_for(
+                            registry
+                                .servers
+                                .iter()
+                                .find(|existing| existing.name.eq_ignore_ascii_case(&s.name)),
+                        )?
                         .into_iter()
-                        .map(|(key, secret, present)| CredentialReview {
+                        .map(|(key, secret, present, required)| CredentialReview {
                             key,
                             secret,
                             present,
+                            required,
                         })
                         .collect(),
                     None,
@@ -1891,8 +1899,11 @@ fn undo_staged_value(
     }
 }
 
-fn rollback_imports(previous: &Registry, staged: &Registry) -> Result<(), String> {
-    let (_, complete) = registry::update(|latest| {
+fn rollback_imports(
+    previous: &Registry,
+    staged: &Registry,
+) -> Result<(bool, std::collections::BTreeSet<String>), String> {
+    let (restored, complete) = registry::update(|latest| {
         let mut value = serde_json::to_value(&*latest).map_err(|e| e.to_string())?;
         let complete = undo_staged_value(
             &mut value,
@@ -1902,11 +1913,21 @@ fn rollback_imports(previous: &Registry, staged: &Registry) -> Result<(), String
         *latest = serde_json::from_value(value).map_err(|e| e.to_string())?;
         Ok(complete)
     })?;
-    if complete {
-        Ok(())
-    } else {
-        Err("Registry changed during setup. Concurrent edits were kept. Review Servers before retrying.".into())
+    let mut retained = std::collections::BTreeSet::new();
+    for written in &staged.servers {
+        if let Some(current) = restored.servers.iter().find(|row| row.id == written.id) {
+            let old = previous.servers.iter().find(|row| row.id == written.id);
+            let mut current = serde_json::to_value(current).map_err(|e| e.to_string())?;
+            if !undo_staged_value(
+                &mut current,
+                &serde_json::to_value(old).map_err(|e| e.to_string())?,
+                &serde_json::to_value(written).map_err(|e| e.to_string())?,
+            ) {
+                retained.insert(written.id.clone());
+            }
+        }
     }
+    Ok((complete, retained))
 }
 
 fn migrate_client_reviewed_with(
@@ -2050,8 +2071,8 @@ fn migrate_client_reviewed_inputs_with(
             "Client config changed. Review it again before connecting. Config unchanged.".into(),
         );
     }
-    let (mut result, imported, moved, verification) =
-        crate::import_credentials::transaction(|writes| {
+    let (mut result, imported, moved, verification) = crate::import_credentials::transaction(
+        |writes| {
             let mut prepared = current.clone();
             let (imported, moved) = prepare_client_servers_for_migration(
                 &mut prepared,
@@ -2090,7 +2111,11 @@ fn migrate_client_reviewed_inputs_with(
             match attempt {
                 Ok(result) => Ok(result),
                 Err(error) => match rollback_imports(&current, &staged) {
-                    Ok(()) => Err(error),
+                    Ok((true, _)) => Err(error),
+                    Ok((false, retained)) => {
+                        writes.keep_servers(&retained);
+                        Err(format!("{error} Registry changed during setup. Concurrent edits were kept. Review Servers before retrying. Credentials for retained servers were kept."))
+                    }
                     Err(rollback) => {
                         writes.keep();
                         Err(format!(
@@ -2099,7 +2124,8 @@ fn migrate_client_reviewed_inputs_with(
                     }
                 },
             }
-        })?;
+        },
+    )?;
     if !unsupported.is_empty() {
         result.outcome.warnings.push(format!(
             "Unsupported servers stayed in the client: {}",
@@ -3114,20 +3140,56 @@ mod tests {
         let mut previous = Registry::default();
         let mut a = server("a");
         a.command = Some("a".into());
-        a.env.push(crate::registry::EnvVar { key:"PAT".into(), value:None, secret:true, unknown_fields:Default::default() });
+        a.env.push(crate::registry::EnvVar {
+            key: "PAT".into(),
+            value: None,
+            secret: true,
+            unknown_fields: Default::default(),
+        });
         previous.add_server(a);
         let fixture = MoveFixture::new(&previous);
         crate::secrets::set_secret("a", "PAT", "old").unwrap();
         std::fs::write(fixture.claude(), r#"{"mcpServers":{"a":{"command":"a","env":{"PAT":"new"}},"b":{"command":"b","env":{"PAT":"new-b"}}}}"#).unwrap();
         let review = preview_client_setup("claude-code").unwrap();
-        let error = migrate_client_reviewed_with("claude-code", None, false, &["a".into(), "b".into()], &review.revision, |_,_,_,_| {
-            registry::update(|r| { r.servers.iter_mut().find(|s| s.id == "b").unwrap().name = "Concurrent B".into(); Ok(()) }).unwrap();
-            Err("Launch failed".into())
-        }).unwrap_err();
+        let error = migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["a".into(), "b".into()],
+            &review.revision,
+            |_, _, _, _| {
+                registry::update(|r| {
+                    r.servers.iter_mut().find(|s| s.id == "b").unwrap().name =
+                        "Concurrent B".into();
+                    Ok(())
+                })
+                .unwrap();
+                Err("Launch failed".into())
+            },
+        )
+        .unwrap_err();
         assert!(error.contains("Concurrent edits"));
-        assert_eq!(read_registry_exact().unwrap().servers.iter().find(|s| s.id == "a").unwrap(), &previous.servers[0]);
-        assert_eq!(crate::secrets::get_vault_secret_result("a", "PAT").unwrap().as_deref(), Some("old"));
-        assert_eq!(crate::secrets::get_vault_secret_result("b", "PAT").unwrap().as_deref(), Some("new-b"));
+        assert_eq!(
+            read_registry_exact()
+                .unwrap()
+                .servers
+                .iter()
+                .find(|s| s.id == "a")
+                .unwrap(),
+            &previous.servers[0]
+        );
+        assert_eq!(
+            crate::secrets::get_vault_secret_result("a", "PAT")
+                .unwrap()
+                .as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            crate::secrets::get_vault_secret_result("b", "PAT")
+                .unwrap()
+                .as_deref(),
+            Some("new-b")
+        );
     }
 
     #[test]
@@ -3136,7 +3198,11 @@ mod tests {
         previous.add_server(server("one"));
         let fixture = MoveFixture::new(&previous);
         crate::secrets::set_secret("one", "PAT", "old").unwrap();
-        std::fs::write(fixture.claude(), r#"{"mcpServers":{"one":{"command":"one","env":{"PAT":"${PAT}"}}}}"#).unwrap();
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"command":"one","env":{"PAT":"${PAT}"}}}}"#,
+        )
+        .unwrap();
         let review = serde_json::to_value(preview_client_setup("claude-code").unwrap()).unwrap();
         assert_eq!(review["items"][0]["credentials"][0]["present"], true);
         assert_eq!(review["items"][0]["credentials"][0]["required"], true);

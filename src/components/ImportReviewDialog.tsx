@@ -18,6 +18,7 @@ interface Props {
   description?: string;
   confirmLabel?: string;
   allowEmpty?: boolean;
+  requireCredentials?: boolean;
   details?: string;
   error?: string;
   onOpenChange: (open: boolean) => void;
@@ -37,6 +38,7 @@ export function ImportReviewDialog({
   description,
   confirmLabel,
   allowEmpty = false,
+  requireCredentials = false,
   details,
   error,
   onOpenChange,
@@ -53,6 +55,7 @@ export function ImportReviewDialog({
         description={description}
         confirmLabel={confirmLabel}
         allowEmpty={allowEmpty}
+        requireCredentials={requireCredentials}
         details={details}
         error={error}
         onOpenChange={onOpenChange}
@@ -69,6 +72,7 @@ function ImportReviewContent({
   description,
   confirmLabel,
   allowEmpty = false,
+  requireCredentials = false,
   details,
   error,
   onOpenChange,
@@ -99,6 +103,21 @@ function ImportReviewContent({
   const [editing, setEditing] = useState<{ name: string; key: string } | null>(null);
   const [value, setValue] = useState("");
   const selectedCount = selected.size;
+  const missingRequired = requireCredentials
+    ? keyedItems.flatMap(({ item, key }) =>
+        selected.has(key)
+          ? (item.credentials ?? [])
+              .filter(
+                (env) =>
+                  env.required &&
+                  !env.present &&
+                  !credentialInputs[item.name]?.[env.key]?.trim(),
+              )
+              .map((env) => `Enter ${env.key} or deselect ${item.name}`)
+          : [],
+      )
+    : [];
+
   return (
     <DialogContent className="sm:max-w-lg">
       <DialogHeader>
@@ -170,51 +189,59 @@ function ImportReviewContent({
                   )}
                 </button>
                 {!!item.credentials?.length && (
-                  <div className="flex flex-col gap-2 px-3 pb-3 text-xs">
-                    {item.credentials.map((env) => (
-                      <div key={env.key} className="flex items-center gap-2">
-                        <label className="flex items-center gap-2">
-                          <input
-                            type="checkbox"
-                            disabled={
-                              busy || !!item.unsupported || env.key.startsWith("__")
-                            }
-                            checked={secretChoices[item.name]?.[env.key] ?? env.secret}
-                            onChange={(e) =>
-                              setSecretChoices((previous) => ({
-                                ...previous,
-                                [item.name]: {
-                                  ...previous[item.name],
-                                  [env.key]: e.target.checked,
-                                },
-                              }))
-                            }
-                          />
-                          Keep {env.key} in keychain{" "}
-                          <span className="ml-auto text-muted-foreground">
-                            {env.present
-                              ? "Found"
-                              : credentialInputs[item.name]?.[env.key]
-                                ? "Ready for connection"
-                                : "Missing"}
-                          </span>
-                        </label>
-                        {!env.present && (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={busy}
-                            onClick={() => {
-                              setValue(credentialInputs[item.name]?.[env.key] ?? "");
-                              setEditing({ name: item.name, key: env.key });
-                            }}
-                          >
-                            Enter value
-                          </Button>
-                        )}
-                      </div>
-                    ))}
-                  </div>
+                  <details className="px-3 pb-3 text-xs">
+                    <summary className="cursor-pointer">
+                      {item.name} credentials and settings
+                    </summary>
+                    <div className="flex flex-col gap-2 pt-2">
+                      {item.credentials.map((env) => (
+                        <div key={env.key} className="flex items-center gap-2">
+                          <label className="flex items-center gap-2">
+                            <input
+                              type="checkbox"
+                              disabled={
+                                busy || !!item.unsupported || env.key.startsWith("__")
+                              }
+                              checked={secretChoices[item.name]?.[env.key] ?? env.secret}
+                              onChange={(e) =>
+                                setSecretChoices((previous) => ({
+                                  ...previous,
+                                  [item.name]: {
+                                    ...previous[item.name],
+                                    [env.key]: e.target.checked,
+                                  },
+                                }))
+                              }
+                            />
+                            Keep {env.key} in keychain{" "}
+                            {!env.required && (
+                              <span className="text-muted-foreground">Optional</span>
+                            )}
+                            <span className="ml-auto text-muted-foreground">
+                              {env.present
+                                ? "Found"
+                                : credentialInputs[item.name]?.[env.key]
+                                  ? "Ready for connection"
+                                  : "Missing"}
+                            </span>
+                          </label>
+                          {!env.present && (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={busy}
+                              onClick={() => {
+                                setValue(credentialInputs[item.name]?.[env.key] ?? "");
+                                setEditing({ name: item.name, key: env.key });
+                              }}
+                            >
+                              Enter value
+                            </Button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </details>
                 )}
                 {item.unsupported && (
                   <p className="px-3 pb-2 text-xs text-warning">
@@ -272,6 +299,11 @@ function ImportReviewContent({
           </DialogContent>
         </Dialog>
       )}
+      {missingRequired.map((reason) => (
+        <p key={reason} className="text-sm text-warning">
+          {reason}
+        </p>
+      ))}
       <DialogFooter className="justify-between">
         <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
           Cancel
@@ -288,7 +320,9 @@ function ImportReviewContent({
               );
             else onConfirm(Array.from(selected));
           }}
-          disabled={busy || (!allowEmpty && selectedCount === 0)}
+          disabled={
+            busy || missingRequired.length > 0 || (!allowEmpty && selectedCount === 0)
+          }
         >
           <Check className="size-4" />
           {confirmLabel ??

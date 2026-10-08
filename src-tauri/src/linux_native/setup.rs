@@ -53,6 +53,7 @@ pub(super) fn review(
     items: Vec<SetupItem>,
     disclosure: &str,
     confirm_label: &str,
+    require_credentials: bool,
     action: impl Fn(
             Vec<String>,
             std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
@@ -102,6 +103,60 @@ pub(super) fn review(
             String,
             std::collections::BTreeMap<String, String>,
         >::new()));
+    let busy = std::rc::Rc::new(std::cell::Cell::new(false));
+    let required_fields = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(
+        gtk::glib::WeakRef<gtk::CheckButton>,
+        String,
+        Vec<crate::registry_controller::CredentialReview>,
+    )>::new()));
+    let missing_reason = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .build();
+    missing_reason.add_css_class("warning");
+    let refresh_confirm: std::rc::Rc<dyn Fn()> = std::rc::Rc::new({
+        let (button, fields, inputs, reason, busy) = (
+            confirm.downgrade(),
+            required_fields.clone(),
+            credential_inputs.clone(),
+            missing_reason.downgrade(),
+            busy.clone(),
+        );
+        move || {
+            let missing = if require_credentials {
+                fields
+                    .borrow()
+                    .iter()
+                    .filter(|(check, _, _)| check.upgrade().is_some_and(|check| check.is_active()))
+                    .flat_map(|(_, name, fields)| {
+                        fields
+                            .iter()
+                            .filter(|field| {
+                                field.required
+                                    && !field.present
+                                    && !inputs
+                                        .borrow()
+                                        .get(name)
+                                        .and_then(|values| values.get(&field.key))
+                                        .is_some_and(|v| !v.trim().is_empty())
+                            })
+                            .map(|field| format!("Enter {} or deselect {name}", field.key))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if let Some(button) = button.upgrade() {
+                button.set_sensitive(!busy.get() && missing.is_empty());
+            }
+            if let Some(reason) = reason.upgrade() {
+                reason.set_label(&missing.join("\n"));
+                reason.set_visible(!missing.is_empty());
+            }
+        }
+    });
     for item in items {
         let command = item
             .command
@@ -119,10 +174,18 @@ pub(super) fn review(
             .active(item.unsupported.is_none())
             .valign(gtk::Align::Center)
             .build();
+        required_fields.borrow_mut().push((
+            check.downgrade(),
+            item.name.clone(),
+            item.credentials.clone(),
+        ));
+        let refresh = refresh_confirm.clone();
+        check.connect_toggled(move |_| refresh());
         row.add_prefix(&check);
         check.set_sensitive(item.unsupported.is_none());
         row.set_activatable_widget(Some(&check));
-        let (settings, content) = details_expander("Credentials and settings");
+        let (settings, content) =
+            details_expander(&format!("{} credentials and settings", item.name));
         let credential_rows = gtk::ListBox::new();
         credential_rows.set_selection_mode(gtk::SelectionMode::None);
         content.append(&credential_rows);
@@ -166,6 +229,7 @@ pub(super) fn review(
         >::new()));
         let fields = std::rc::Rc::new(item.credentials.clone());
         let refresh_state: std::rc::Rc<dyn Fn()> = std::rc::Rc::new({
+            let refresh_confirm = refresh_confirm.clone();
             let (state, fields, choices, inputs, name) = (
                 state.clone(),
                 fields.clone(),
@@ -199,6 +263,7 @@ pub(super) fn review(
                     state.remove_css_class("dim-label");
                     state.add_css_class(if found { "dim-label" } else { "warning" });
                 }
+                refresh_confirm();
             }
         });
         if let Some(reason) = &item.unsupported {
@@ -219,7 +284,13 @@ pub(super) fn review(
             );
             let value_row = adw::ActionRow::builder()
                 .title(&env.key)
-                .subtitle(if env.present { "Found" } else { "Missing" })
+                .subtitle(if !env.required {
+                    "Optional"
+                } else if env.present {
+                    "Found"
+                } else {
+                    "Missing"
+                })
                 .build();
             value_row.add_suffix(&choice);
             value_row.set_activatable_widget(Some(&choice));
@@ -261,6 +332,8 @@ pub(super) fn review(
         selected.push((check, row, spinner, item.key, item.name));
     }
     body.append(&rows);
+    body.append(&missing_reason);
+    refresh_confirm();
     let (details, content) = details_expander("Details");
     let path = gtk::Label::builder()
         .label(disclosure)
@@ -288,7 +361,6 @@ pub(super) fn review(
         .build();
     root.append(&scroller);
     dialog.set_content(Some(&root));
-    let busy = std::rc::Rc::new(std::cell::Cell::new(false));
     let closing = dialog.clone();
     let busy_cancel = busy.clone();
     cancel.connect_clicked(move |_| {
@@ -359,6 +431,7 @@ pub(super) fn review(
             completed.clone(),
         );
         let credential_choices = credential_choices.clone();
+        let refresh_confirm = refresh_confirm.clone();
         let (feedback, button, cancel, body, rows, details, lede) = (
             feedback.clone(),
             button.clone(),
@@ -473,6 +546,7 @@ pub(super) fn review(
                     feedback.set_label(&error);
                     feedback.add_css_class("error");
                     button.set_label("Retry");
+                    refresh_confirm();
                     for (_, row, _, _, name) in selected.iter() {
                         if error.contains(name) {
                             row.add_css_class("error");
@@ -513,6 +587,7 @@ pub(super) fn connect(
                     preview.items,
                     &disclosure,
                     "Connect to Toolport",
+                    true,
                     move |selected, choices, inputs| {
                         let outcome = crate::registry_controller::migrate_client_reviewed_inputs(
                             &client_id,
@@ -542,6 +617,7 @@ pub(super) fn connect(
                 Vec::new(),
                 &error,
                 "Close",
+                false,
                 |_, _, _| Err("Fix the client config and retry.".into()),
                 || {},
                 None,
@@ -552,6 +628,7 @@ pub(super) fn connect(
                 Vec::new(),
                 "Client review stopped.",
                 "Close",
+                false,
                 |_, _, _| Err("Retry from Clients.".into()),
                 || {},
                 None,
@@ -592,7 +669,7 @@ pub(super) fn collection(
             updates: Vec::new(),
         })
         .collect();
-    review(parent,&format!("Review {name}"),items,"Review what each server runs. Valid servers turn on. Servers needing credentials or launch values stay off until setup is complete.","Add selected servers",move |keys,_choices,_inputs| {
+    review(parent,&format!("Review {name}"),items,"Review what each server runs. Valid servers turn on. Servers needing credentials or launch values stay off until setup is complete.","Add selected servers",false,move |keys,_choices,_inputs| {
         let selected=entries.iter().enumerate().filter(|(i,_)|keys.contains(&i.to_string())).map(|(_,e)|e.clone()).collect();
         let (_,added)=crate::registry_controller::add_catalog_stack(selected)?;
         Ok(format!("Added {added} servers. Check status and complete any missing setup inputs under Servers.").into())
@@ -629,6 +706,7 @@ mod tests {
             Vec::new(),
             "Invalid fixture config",
             "Close",
+            false,
             |_, _, _| Err("not an import".into()),
             || {},
             None,
@@ -668,12 +746,14 @@ mod tests {
                     key: "PORT".into(),
                     secret: false,
                     present: true,
+                    required: true,
                 }],
                 unsupported: None,
                 updates: Vec::new(),
             }],
             "Fixture",
             "Connect",
+            true,
             |_, _, _| Err("fixture".into()),
             || {},
             None,
@@ -730,12 +810,14 @@ mod tests {
                     key: "PAT".into(),
                     secret: true,
                     present: false,
+                    required: true,
                 }],
                 unsupported: None,
                 updates: vec!["Environment".into(), "Launch settings".into()],
             }],
             "Fixture",
             "Connect",
+            true,
             |_, _, _| Err("fixture".into()),
             || {},
             None,
@@ -746,6 +828,25 @@ mod tests {
             .find(|w| w.title().as_deref() == Some("Update fixture"))
             .unwrap();
         let widgets = descendants(window.upcast_ref());
+        let confirm = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Button>())
+            .find(|b| b.label().as_deref() == Some("Connect"))
+            .unwrap();
+        assert!(!confirm.is_sensitive());
+        assert!(widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .any(|l| l.text() == "Enter PAT or deselect One"));
+        let selected = widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::CheckButton>())
+            .find(|check| check.label().is_none())
+            .unwrap();
+        selected.set_active(false);
+        assert!(confirm.is_sensitive());
+        selected.set_active(true);
+        assert!(!confirm.is_sensitive());
         assert!(widgets.iter().any(|widget| widget.is::<gtk::Expander>()));
         assert!(
             !widgets.iter().any(|widget| widget.is::<adw::ExpanderRow>()),
@@ -788,6 +889,7 @@ mod tests {
             Vec::new(),
             "Fixture",
             "Connect",
+            true,
             |_, _, _| Ok("Claude Code connected. Restart it to load Toolport.".into()),
             || {},
             None,
@@ -866,7 +968,8 @@ mod tests {
                     vec![crate::registry_controller::CredentialReview {
                         key: "PAT".into(),
                         secret: true,
-                        present: state != "missing",
+                        present: state != "missing" && state != "optional",
+                        required: state != "optional",
                     }]
                 } else {
                     Vec::new()
@@ -881,6 +984,7 @@ mod tests {
             items,
             "Config: /home/sbx/.claude.json\nBackups will be saved in Toolport/backups/claude-code",
             "Connect",
+            true,
             move |_, _, _| {
                 if state == "verifying" {
                     use std::io::Read;

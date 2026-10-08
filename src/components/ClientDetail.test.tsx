@@ -127,7 +127,7 @@ it("uses bulk review storage choices and leaves unsupported servers unchecked", 
       ...server,
       key: "reviewed-safe",
       isNew: true,
-      credentials: [{ key: "PORT", secret: false, present: true }],
+      credentials: [{ key: "PORT", secret: false, present: true, required: true }],
     },
     {
       ...unsupported,

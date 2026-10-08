@@ -226,7 +226,14 @@ const setupItems = ["Notes", "Calendar"].map((name) => ({
   isNew: true,
   credentials:
     name === "Calendar"
-      ? [{ key: "PAT", secret: true, present: setupFailure !== "credential" }]
+      ? [
+          {
+            key: "PAT",
+            secret: true,
+            present: setupFailure !== "credential" && setupFailure !== "optional",
+            required: setupFailure !== "optional",
+          },
+        ]
       : [],
 }));
 function fixtureAdd(entry: ServerEntry) {

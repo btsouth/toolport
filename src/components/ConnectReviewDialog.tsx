@@ -159,6 +159,7 @@ export function ConnectReviewDialog({
       items={review.items}
       busy={busy}
       allowEmpty
+      requireCredentials
       error={error}
       details={`Config: ${review.configPath}\nBackups will be saved in ${review.backupDir}`}
       title={`Review and connect ${clientName}`}

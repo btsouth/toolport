@@ -29,24 +29,27 @@ pub(crate) fn secret_env(key: &str, value: Option<&str>) -> bool {
     if key == "PATH" {
         return false;
     }
-    if [
-        "KEY",
-        "TOKEN",
-        "SECRET",
-        "PASSWORD",
-        "PASS",
-        "AUTH",
-        "CREDENTIAL",
-        "BEARER",
-        "COOKIE",
-        "PRIVATE",
-        "PAT",
-    ]
-    .iter()
-    .any(|needle| {
-        key.split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|word| word == *needle)
-    }) {
+    let words = key.split(|c: char| !c.is_ascii_alphanumeric());
+    if words.clone().any(|word| word == "PAT")
+        || words
+            .filter(|word| !matches!(*word, "KEYBOARD" | "MONKEY" | "COMPASS"))
+            .any(|word| {
+                [
+                    "KEY",
+                    "TOKEN",
+                    "SECRET",
+                    "PASSWORD",
+                    "PASS",
+                    "AUTH",
+                    "CREDENTIAL",
+                    "BEARER",
+                    "COOKIE",
+                    "PRIVATE",
+                ]
+                .iter()
+                .any(|needle| word.contains(needle))
+            })
+    {
         return true;
     }
     let Some(value) = value else {
@@ -98,6 +101,9 @@ impl VaultWrites {
     }
     pub(crate) fn keep(&mut self) {
         self.receipts.clear();
+    }
+    pub(crate) fn keep_servers(&mut self, retained: &std::collections::BTreeSet<String>) {
+        self.receipts.retain(|(id, _, _, _)| !retained.contains(id));
     }
     fn rollback(&mut self) -> Result<(), String> {
         let mut failed = false;
@@ -210,18 +216,55 @@ pub(crate) struct Import {
 }
 
 impl Import {
-    pub(crate) fn review_credentials(&self) -> Vec<(String, bool, bool)> {
+    fn required(&self, key: &str) -> bool {
+        self.entry.launch.as_ref().is_none_or(|launch| {
+            launch
+                .inputs
+                .iter()
+                .find(|input| input.key == key)
+                .map(|input| input.required)
+                .unwrap_or_else(|| launch.required_env.iter().any(|env| env == key))
+        })
+    }
+
+    pub(crate) fn review_credentials(&self) -> Vec<(String, bool, bool, bool)> {
         self.values
             .iter()
-            .map(|(key, value)| (key.clone(), true, value.as_deref().is_some_and(provided)))
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    true,
+                    value.as_deref().is_some_and(provided),
+                    self.required(key),
+                )
+            })
             .chain(self.entry.env.iter().filter(|env| !env.secret).map(|env| {
                 (
                     env.key.clone(),
                     false,
                     env.value.as_deref().is_some_and(provided),
+                    self.required(&env.key),
                 )
             }))
             .collect()
+    }
+
+    pub(crate) fn review_credentials_for(
+        &self,
+        existing: Option<&ServerEntry>,
+    ) -> Result<Vec<(String, bool, bool, bool)>, String> {
+        let mut credentials = self.review_credentials();
+        if let Some(existing) = existing {
+            for (key, secret, present, _) in &mut credentials {
+                if *secret && !*present {
+                    *present = secrets::get_vault_secret_result(&existing.id, key)
+                        .map_err(|_| VAULT_FAILURE)?
+                        .as_deref()
+                        .is_some_and(provided);
+                }
+            }
+        }
+        Ok(credentials)
     }
 
     /// Missing values entered in review stay in memory until the transaction succeeds.
@@ -268,6 +311,7 @@ impl Import {
         {
             return Err("The command contains a credential. Move it to an environment setting and review again. Client config unchanged.".into());
         }
+        let mut bearer_env = std::collections::BTreeSet::new();
         if let Some(definition) = definition {
             for field in ["env", "environment", "envs", "headers", "http_headers"] {
                 if let Some(settings) = definition.get(field).and_then(|v| v.as_object()) {
@@ -288,6 +332,7 @@ impl Import {
             }
             for field in ["bearerTokenEnvVar", "bearer_token_env_var"] {
                 if let Some(key) = definition.get(field).and_then(|v| v.as_str()) {
+                    bearer_env.insert(key.to_string());
                     if !entry.env.iter().any(|e| e.key == key) {
                         entry.env.push(registry::EnvVar {
                             key: key.into(),
@@ -331,7 +376,10 @@ impl Import {
                         secret_env(&env.key, value.as_deref())
                     }
                 });
-            if secret || env.key.eq_ignore_ascii_case("authorization") {
+            if secret
+                || env.key.eq_ignore_ascii_case("authorization")
+                || bearer_env.contains(&env.key)
+            {
                 values.push((env.key.clone(), value));
             } else {
                 let mut env = env.clone();
@@ -675,13 +723,26 @@ mod tests {
             ("ENDPOINT", "https://host/mcp?v=1"),
             ("VALUE", "0123456789abcdef0123456789abcdef"),
             ("API_KEY", "small"),
-            ("APIKEY", "x"), ("apiKey", "x"), ("accessToken", "x"),
-            ("GPG_PASSPHRASE", "x"), ("DB_PASSWD", "x"), ("API_KEYS", "x"), ("CLIENTSECRET", "x"),
+            ("APIKEY", "x"),
+            ("apiKey", "x"),
+            ("accessToken", "x"),
+            ("GPG_PASSPHRASE", "x"),
+            ("DB_PASSWD", "x"),
+            ("API_KEYS", "x"),
+            ("CLIENTSECRET", "x"),
             ("PAT", "small"),
         ] {
             assert!(secret_env(key, Some(value)), "{key} was left plain");
         }
-        for key in ["PATH", "MONKEY", "KEYBOARD", "COMPASS", "COMPATIBILITY", "PATTERN", "PORT"] {
+        for key in [
+            "PATH",
+            "MONKEY",
+            "KEYBOARD",
+            "COMPASS",
+            "COMPATIBILITY",
+            "PATTERN",
+            "PORT",
+        ] {
             assert!(
                 !secret_env(key, Some("/usr/bin")),
                 "{key} was falsely vaulted"
@@ -695,9 +756,25 @@ mod tests {
             let mut raw = entry(true);
             raw.env.clear();
             raw.url = Some("https://example.invalid/mcp".into());
-            let import = Import::prepare_with_choices(raw, Some(&json!({"bearerTokenEnvVar":key})), Some(&std::collections::BTreeMap::from([(key.into(), false)]))).unwrap();
-            assert!(import.entry.env.iter().find(|env| env.key == key).unwrap().secret);
-            assert!(import.review_credentials().iter().any(|env| env.0 == key && env.1));
+            let import = Import::prepare_with_choices(
+                raw,
+                Some(&json!({"bearerTokenEnvVar":key})),
+                Some(&std::collections::BTreeMap::from([(key.into(), false)])),
+            )
+            .unwrap();
+            assert!(
+                import
+                    .entry
+                    .env
+                    .iter()
+                    .find(|env| env.key == key)
+                    .unwrap()
+                    .secret
+            );
+            assert!(import
+                .review_credentials()
+                .iter()
+                .any(|env| env.0 == key && env.1));
         }
     }
 
