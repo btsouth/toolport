@@ -2087,6 +2087,18 @@ impl Router {
         }
     }
 
+    /// A current launch has neither published a catalog nor loaded valid cached tools.
+    pub fn any_missing_catalog(&self, visible: impl Fn(&str) -> bool) -> bool {
+        self.servers.iter().any(|slot| {
+            visible(&slot.id)
+                && !slot.catalog_complete()
+                && slot
+                    .inner
+                    .try_lock()
+                    .map_or(true, |inner| inner.tools.is_empty())
+        })
+    }
+
     /// Whether a visible server is starting to load its first full catalog.
     pub fn any_discovering(&self, visible: impl Fn(&str) -> bool) -> bool {
         self.servers.iter().any(|slot| {
