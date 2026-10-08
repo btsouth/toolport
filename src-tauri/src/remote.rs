@@ -1431,6 +1431,13 @@ impl Redaction {
                 values.push(value);
             }
         }
+        if crate::import_credentials::has_imported_url(server) {
+            if let Ok(Some(value)) =
+                secrets::get_vault_secret_result(&server.id, secrets::IMPORTED_URL_KEY)
+            {
+                values.push(value);
+            }
+        }
         values.retain(|value| !value.is_empty());
         values.sort_by_key(|value| std::cmp::Reverse(value.len()));
         values.dedup();

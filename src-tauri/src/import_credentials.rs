@@ -364,6 +364,11 @@ impl Import {
                 if secret {
                     values.push((secrets::IMPORTED_URL_KEY.into(), Some(url.clone())));
                     entry.url = Some(shown_url(url));
+                    // Older builds preserve unknown metadata but never use it for auth.
+                    entry.unknown_fields.insert(
+                        "importedUrlKey".into(),
+                        serde_json::json!(secrets::IMPORTED_URL_KEY),
+                    );
                 }
             }
         }
@@ -377,25 +382,6 @@ impl Import {
         let mask = registry::secret_arg_mask(&entry.args);
         let had_launch = entry.launch.is_some();
         let mut launch = entry.launch.take().unwrap_or_default();
-        // v1.24's HTTP bearer fallback only reads secret env entries. Keeping
-        // the endpoint in launch inputs prevents rollback from sending it as auth.
-        if values
-            .iter()
-            .any(|(key, _)| key == secrets::IMPORTED_URL_KEY)
-            && !launch
-                .inputs
-                .iter()
-                .any(|i| i.key == secrets::IMPORTED_URL_KEY)
-        {
-            launch.inputs.push(registry::LaunchInput {
-                key: secrets::IMPORTED_URL_KEY.into(),
-                label: "Imported endpoint".into(),
-                secret: true,
-                required: true,
-                value: None,
-                unknown_fields: Default::default(),
-            });
-        }
         for (index, secret) in mask.into_iter().enumerate() {
             if !secret || launch.bindings.iter().any(|binding| binding.index == index) {
                 continue;
@@ -427,7 +413,9 @@ impl Import {
         }
         entry.env = values
             .iter()
-            .filter(|(key, _)| !launch.inputs.iter().any(|i| &i.key == key))
+            .filter(|(key, _)| {
+                key != secrets::IMPORTED_URL_KEY && !launch.inputs.iter().any(|i| &i.key == key)
+            })
             .map(|(key, _)| registry::EnvVar {
                 key: key.clone(),
                 value: None,
@@ -585,7 +573,8 @@ impl Import {
 }
 
 pub(crate) fn has_secrets(server: &ServerEntry) -> bool {
-    server.env.iter().any(|env| env.secret)
+    has_imported_url(server)
+        || server.env.iter().any(|env| env.secret)
         || server
             .launch
             .as_ref()
@@ -594,18 +583,24 @@ pub(crate) fn has_secrets(server: &ServerEntry) -> bool {
 
 pub(crate) fn has_imported_url(server: &ServerEntry) -> bool {
     server
-        .env
-        .iter()
-        .any(|env| env.key == secrets::IMPORTED_URL_KEY)
-        || server.launch.as_ref().is_some_and(|launch| {
-            launch
-                .inputs
-                .iter()
-                .any(|input| input.key == secrets::IMPORTED_URL_KEY)
-        })
+        .unknown_fields
+        .get("importedUrlKey")
+        .and_then(|value| value.as_str())
+        == Some(secrets::IMPORTED_URL_KEY)
+        || server
+            .env
+            .iter()
+            .any(|env| env.key == secrets::IMPORTED_URL_KEY)
 }
 
 pub(crate) fn ready(server: &ServerEntry) -> Result<bool, String> {
+    if has_imported_url(server)
+        && secrets::get_vault_secret_result(&server.id, secrets::IMPORTED_URL_KEY)
+            .map_err(|_| VAULT_FAILURE.to_string())?
+            .is_none_or(|value| !provided(&value))
+    {
+        return Ok(false);
+    }
     for env in &server.env {
         if !env.secret
             && env.value.as_deref().is_none_or(|value| !provided(value))
