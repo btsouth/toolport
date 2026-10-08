@@ -13469,18 +13469,21 @@ fn finish_startup_build(
     // process, so ready must not wait on their fsync. Persistence stays after the
     // integrity gate (SEC-01) and after ready, all still under the build thread's
     // rebuild_lock, so no concurrent rebuild reads a half-written file.
+    // Use raw catalogs: the shared HTTP policy can hide every tool while
+    // adapter profiles still expose this server's catalog.
+    let announced_servers: BTreeSet<_> = live
+        .raw_catalogs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, tools)| !tools.is_empty())
+        .map(|(server, _)| server)
+        .collect();
     host.ready.store(true, Ordering::SeqCst);
     save_server_catalogs(&live, profile);
     if let Some(tools) = persisted_tools {
         save_tool_cache(&tools, profile);
     }
     notify_tools_changed(stdio, Some(&host.mcp_sessions));
-    let announced_servers: BTreeSet<_> = live
-        .aggregated_tools()
-        .iter()
-        .filter_map(|tool| live.route_of(tool["name"].as_str()?))
-        .map(|(server, _)| server.to_string())
-        .collect();
     glog(&format!(
         "background build: initial catalog announced; servers={}",
         serde_json::to_string(&announced_servers).unwrap()
