@@ -6342,27 +6342,7 @@ pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) -> Result<(), S
     Ok(())
 }
 
-/// Replace a client's entire server list with just the Toolport gateway. Used by
-/// "migrate": after the client's servers are imported into Toolport, this leaves
-/// the client talking only to the gateway. Backs up first; unrelated config keys
-/// are preserved. Caller is responsible for importing first so nothing is lost.
-/// Explicit migration writes the stdio adapter entry.
-pub fn migrate_to_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOutcome, String> {
-    let revision = setup_revision(client_id)?;
-    let client = detect_clients()
-        .into_iter()
-        .find(|c| c.id == client_id)
-        .ok_or("Unknown client")?;
-    let names = client
-        .servers
-        .iter()
-        .filter(|s| !detected_is_gateway(s))
-        .map(|s| s.name.clone())
-        .collect::<Vec<_>>();
-    migrate_reviewed(client_id, profile, &names, &revision, || Ok(()))
-}
-
-/// Snapshot token binds review to the whole config, including credential changes.
+/// Snapshot token binds review to the server container, including credential changes.
 /// Only its hash crosses the UI boundary.
 pub fn setup_revision(client_id: &str) -> Result<String, String> {
     let def = find_def(client_id).ok_or("Unknown client")?;
@@ -6372,6 +6352,8 @@ pub fn setup_revision(client_id: &str) -> Result<String, String> {
     } else {
         String::new()
     };
+    let root = mutation::value(def.format, Some(&content))?;
+    let content = moved::server_container(def.format, &root);
     Ok(crate::registry::sha256_hex(&format!(
         "{}:{}:{content}",
         path.display(),
@@ -6399,7 +6381,7 @@ pub(crate) fn migrate_reviewed(
         }
         prepare()?;
         let backup = backup_file(client_id, &path)?;
-        moved::record(client_id, def.format, &path)?;
+        moved::record(client_id, def.format, &path, names)?;
         moved::remove_selected(def.format, &path, names)?;
         let entry = gateway_entry(profile, client_id)?;
         edit_format(

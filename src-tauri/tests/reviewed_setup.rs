@@ -106,7 +106,15 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
         json!({"mcpServers":{"broken":{"command":"/not-a-real-toolport-setup-command"}}})
             .to_string();
     std::fs::write(fixture.config(), &original).unwrap();
-    assert!(controller::migrate_client("claude-code", None, false).is_err());
+    let review = controller::preview_client_setup("claude-code").unwrap();
+    assert!(controller::migrate_client_reviewed(
+        "claude-code",
+        None,
+        false,
+        &["broken".into()],
+        &review.revision
+    )
+    .is_err());
     assert_eq!(std::fs::read_to_string(fixture.config()).unwrap(), original);
 
     // Start again with an empty registry so the failed import cannot affect this cutover.
@@ -122,6 +130,14 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
     let review = controller::preview_client_setup("claude-code").unwrap();
     let result = migrate_fixture(&fixture, &["alpha".into(), "beta".into()], &review.revision);
     assert_eq!(result.moved, ["alpha", "beta"]);
+    assert_eq!(result.servers.len(), 2);
+    assert!(result.servers.iter().all(|s| s.tool_count > 0));
+    assert!(result
+        .result
+        .outcome
+        .warnings
+        .iter()
+        .any(|w| w.contains("Unrelated")));
     // Claude Code's lazy discovery actually exposes gateway meta-tools to the agent.
     assert_eq!(
         result

@@ -69,6 +69,7 @@ export interface ClientSetupReview {
 export interface MigrateResult {
   registry: Registry;
   imported: number;
+  servers: { name: string; toolCount: number; credentialState: string }[];
   moved: string[];
   tools: { name: string; description?: string }[];
   outcome: WriteOutcome;

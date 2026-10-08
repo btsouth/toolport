@@ -82,6 +82,17 @@ fn container(format: Format) -> Container {
     }
 }
 
+pub(super) fn server_container(format: Format, root: &serde_json::Value) -> serde_json::Value {
+    match container(format) {
+        Container::Json { key, nested } => {
+            let value = &root[key];
+            nested.map_or_else(|| value.clone(), |key| value[key].clone())
+        }
+        Container::Toml => root["mcp_servers"].clone(),
+        Container::YamlMap(key) | Container::YamlList(key) => root[key].clone(),
+    }
+}
+
 fn record_path(client_id: &str) -> Result<PathBuf, String> {
     Ok(backup_dir(client_id)
         .ok_or("Could not resolve backup dir")?
@@ -140,7 +151,12 @@ pub(super) fn recorded_paths() -> Vec<(String, PathBuf, Result<Format, String>)>
 /// Copy every non-gateway entry in `path` into the client's move record before
 /// migration strips them. Entries already recorded by an earlier move are kept;
 /// a name moved again takes its newest definition.
-pub(super) fn record(client_id: &str, format: Format, path: &Path) -> Result<(), String> {
+pub(super) fn record(
+    client_id: &str,
+    format: Format,
+    path: &Path,
+    names: &[String],
+) -> Result<(), String> {
     let record_file = record_path(client_id)?;
     let previous = match std::fs::read_to_string(&record_file) {
         Ok(bytes) => Some(bytes),
@@ -167,7 +183,10 @@ pub(super) fn record(client_id: &str, format: Format, path: &Path) -> Result<(),
     if entries.is_empty() && record.entries.is_empty() {
         return Ok(());
     }
-    for entry in entries {
+    for entry in entries
+        .into_iter()
+        .filter(|entry| names.contains(&entry.name))
+    {
         record
             .entries
             .retain(|kept| !kept.name.eq_ignore_ascii_case(&entry.name));

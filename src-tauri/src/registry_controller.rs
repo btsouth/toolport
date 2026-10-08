@@ -899,8 +899,14 @@ fn finish_client_config_mutation(
                 .into(),
         );
         if let Some(file) = &outcome.recovery_path {
-            if let Err(error) = clients::record_config_capture_conflict(file, &receipt.target, outcome.revision.as_deref()) {
-                outcome.warnings.push(format!("could not record unavailable exact rollback: {error}"));
+            if let Err(error) = clients::record_config_capture_conflict(
+                file,
+                &receipt.target,
+                outcome.revision.as_deref(),
+            ) {
+                outcome.warnings.push(format!(
+                    "could not record unavailable exact rollback: {error}"
+                ));
             }
         }
     }
@@ -1299,6 +1305,30 @@ pub struct MigrateOutcome {
     /// Names of the servers moved out of the client's config.
     pub moved: Vec<String>,
     pub tools: Vec<serde_json::Value>,
+    pub servers: Vec<SetupServerResult>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupServerResult {
+    pub name: String,
+    pub tool_count: usize,
+    pub credential_state: String,
+}
+
+#[derive(Debug, Default)]
+struct SetupVerification {
+    tools: Vec<serde_json::Value>,
+    servers: Vec<SetupServerResult>,
+}
+
+impl From<Vec<serde_json::Value>> for SetupVerification {
+    fn from(tools: Vec<serde_json::Value>) -> Self {
+        Self {
+            tools,
+            servers: Vec::new(),
+        }
+    }
 }
 
 /// Import the servers a client directly manages before its config is replaced
@@ -1403,29 +1433,6 @@ pub(crate) fn apply_import_entry(registry: &mut Registry, entry: ServerEntry) ->
     id
 }
 
-/// Migrate a client to Toolport: import its directly-configured servers into the
-/// registry, then rewrite the client's config to contain only the Toolport
-/// gateway (optionally scoped to `profile`). The client is left managing nothing
-/// directly - everything routes through Toolport. Backs the config up first.
-///
-/// Plugin servers (read-only, outside the config file) are left untouched.
-/// When the live gateway entry is user-customized, pass `force: true` after the
-/// UI confirms overwrite (SOU-406); otherwise migration is refused before any
-/// config rewrite. Explicit migration connects through the stdio adapter.
-pub fn migrate_client(
-    client_id: &str,
-    profile: Option<&str>,
-    force: bool,
-) -> Result<MigrateOutcome, String> {
-    let review = preview_client_setup(client_id)?;
-    let names = review
-        .items
-        .iter()
-        .map(|item| item.name.clone())
-        .collect::<Vec<_>>();
-    migrate_client_reviewed(client_id, profile, force, &names, &review.revision)
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetupItem {
@@ -1518,7 +1525,7 @@ fn migrate_client_reviewed_with(
         &[String],
         &str,
         Option<&str>,
-    ) -> Result<Vec<serde_json::Value>, String>,
+    ) -> Result<SetupVerification, String>,
 ) -> Result<MigrateOutcome, String> {
     let current = read_registry_exact_or_default()?;
     refuse_customized_client(
@@ -1540,7 +1547,7 @@ fn migrate_client_reviewed_with(
     client.servers.retain(|s| names.contains(&s.name));
     let mut imported = 0;
     let mut moved = Vec::new();
-    let mut tools = Vec::new();
+    let mut verification = SetupVerification::default();
     let mut staged = None;
     let outcome = clients::migrate_reviewed(client_id, profile, names, revision, || {
         let (registry, result) = registry::update(|registry| {
@@ -1552,7 +1559,7 @@ fn migrate_client_reviewed_with(
         imported = result.0;
         moved = result.1;
         staged = Some((result.2, registry.clone()));
-        tools = verify(&registry, &moved, client_id, profile)?;
+        verification = verify(&registry, &moved, client_id, profile)?;
         Ok(())
     });
     let outcome = match outcome {
@@ -1577,7 +1584,7 @@ fn migrate_client_reviewed_with(
             return Err(error);
         }
     };
-    let result = finish_client_stdio_mutation(client_id, outcome, |managed_entry| {
+    let mut result = finish_client_stdio_mutation(client_id, outcome, |managed_entry| {
         registry::update(|registry| {
             Ok(apply_client_stdio_update(
                 registry,
@@ -1587,11 +1594,26 @@ fn migrate_client_reviewed_with(
             ))
         })
     })?;
+    let context = result.registry.resolve_profile_id(profile.unwrap_or(""));
+    let others = result
+        .registry
+        .servers
+        .iter()
+        .filter(|s| result.registry.is_enabled(&context, &s.id) && !moved.contains(&s.name))
+        .map(|s| s.name.clone())
+        .collect::<Vec<_>>();
+    if !others.is_empty() {
+        result.outcome.warnings.push(format!(
+            "Other servers were not verified during this connection: {}",
+            others.join(", ")
+        ));
+    }
     Ok(MigrateOutcome {
         result,
         imported,
         moved,
-        tools,
+        tools: verification.tools,
+        servers: verification.servers,
     })
 }
 
@@ -1602,15 +1624,10 @@ fn verify_setup_gateway(
     moved: &[String],
     client_id: &str,
     profile: Option<&str>,
-) -> Result<Vec<serde_json::Value>, String> {
-    let context = registry.resolve_profile_id(profile.unwrap_or(""));
-    let mut intended = moved.to_vec();
-    for server in &registry.servers {
-        if registry.is_enabled(&context, &server.id) && !intended.contains(&server.name) {
-            intended.push(server.name.clone());
-        }
-    }
-    for name in &intended {
+) -> Result<SetupVerification, String> {
+    let intended = moved;
+    let mut servers = Vec::new();
+    for name in intended {
         let server = registry
             .servers
             .iter()
@@ -1654,7 +1671,7 @@ fn verify_setup_gateway(
     let mut gateway =
         crate::downstream::DownstreamServer::connect("setup-review".into(), Box::new(transport))
             .map_err(|_| "Gateway did not answer. Client config unchanged.")?;
-    for name in &intended {
+    for name in intended {
         let server = registry
             .servers
             .iter()
@@ -1674,8 +1691,21 @@ fn verify_setup_gateway(
         if catalog.is_empty() || response["isError"].as_bool() == Some(true) {
             return Err(format!("{} has no verified gateway tools. Retry after it is ready. Client config unchanged.", server.name));
         }
+        servers.push(SetupServerResult {
+            name: server.name.clone(),
+            tool_count: catalog.len(),
+            credential_state: if server.env.iter().any(|env| env.secret) {
+                "stored"
+            } else {
+                "none"
+            }
+            .into(),
+        });
     }
-    Ok(gateway.tools.clone())
+    Ok(SetupVerification {
+        tools: gateway.tools.clone(),
+        servers,
+    })
 }
 
 pub fn connect_client_stdio(
@@ -2383,7 +2413,7 @@ mod tests {
         }
     }
 
-    fn migrate_client(
+    fn connect_fixture(
         client_id: &str,
         profile: Option<&str>,
         force: bool,
@@ -2400,7 +2430,7 @@ mod tests {
             force,
             &names,
             &review.revision,
-            |_, _, _, _| Ok(Vec::new()),
+            |_, _, _, _| Ok(Vec::new().into()),
         )
     }
 
@@ -2417,7 +2447,7 @@ mod tests {
             &review.revision,
             |_, moved, _, _| {
                 assert_eq!(moved, &["chosen"]);
-                Ok(vec![serde_json::json!({"name":"chosen__read"})])
+                Ok(vec![serde_json::json!({"name":"chosen__read"})].into())
             },
         )
         .unwrap();
@@ -2435,7 +2465,15 @@ mod tests {
         std::fs::write(fixture.claude(), r#"{"numStartups":1,"mcpServers":{"chosen":{"command":"chosen"},"kept":{"command":"kept"}}}"#).unwrap();
         let review = preview_client_setup("claude-code").unwrap();
         std::fs::write(fixture.claude(), r#"{"numStartups":2,"mcpServers":{"chosen":{"command":"chosen"},"kept":{"command":"kept"}}}"#).unwrap();
-        migrate_client_reviewed_with("claude-code", None, false, &["chosen".into()], &review.revision, |_,_,_,_| Ok(Vec::new())).unwrap();
+        migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["chosen".into()],
+            &review.revision,
+            |_, _, _, _| Ok(Vec::new().into()),
+        )
+        .unwrap();
         let record = json_file(&fixture.move_record("claude-code"));
         assert_eq!(record["entries"].as_array().unwrap().len(), 1);
         assert_eq!(record["entries"][0]["name"], "chosen");
@@ -2542,7 +2580,7 @@ mod tests {
             false,
             &["one".into()],
             &review.revision,
-            |_, _, _, _| Ok(vec![serde_json::json!({"name":"toolport_search_tools"})]),
+            |_, _, _, _| Ok(vec![serde_json::json!({"name":"toolport_search_tools"})].into()),
         )
         .unwrap();
         assert_eq!(result.moved, ["one"]);
@@ -3642,7 +3680,7 @@ mod tests {
             )
             .unwrap();
             let result = if migrate {
-                migrate_client("claude-code", Some("default"), true)
+                connect_fixture("claude-code", Some("default"), true)
                     .unwrap()
                     .result
             } else {
@@ -3703,7 +3741,10 @@ mod tests {
                 .unwrap()
                 .exact_rollback
         );
-        let snapshot: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(result.outcome.recovery_path.as_ref().unwrap()).unwrap()).unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(result.outcome.recovery_path.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(snapshot["exactEligible"], false);
         disconnect_client("claude-code").unwrap();
         assert_eq!(json_file(&fixture.claude())["session"], 2);
@@ -3801,7 +3842,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = migrate_client("claude-code", None, false).unwrap();
+        let outcome = connect_fixture("claude-code", None, false).unwrap();
         let mut moved = outcome.moved.clone();
         moved.sort();
         assert_eq!(moved, ["memory", "seq-thinking"]);
@@ -3847,7 +3888,7 @@ mod tests {
             serde_json::to_string(&serde_json::json!({ "mcpServers": servers })).unwrap(),
         )
         .unwrap();
-        migrate_client("claude-code", None, false).unwrap();
+        connect_fixture("claude-code", None, false).unwrap();
         let moved_config = std::fs::read_to_string(fixture.claude()).unwrap();
 
         let error =
@@ -3873,10 +3914,14 @@ mod tests {
         let fixture = MoveFixture::new(&Registry::default());
         let original = r#"{ "mcpServers": {"native":{"command":"native"}}, "setting": 7 }"#;
         std::fs::write(fixture.claude(), original).unwrap();
-        migrate_client("claude-code", None, false).unwrap();
-        disconnect_client_stdio_with("claude-code", false, |_| Err("registry full".into())).unwrap_err();
+        connect_fixture("claude-code", None, false).unwrap();
+        disconnect_client_stdio_with("claude-code", false, |_| Err("registry full".into()))
+            .unwrap_err();
         let result = disconnect_client("claude-code").unwrap();
-        assert_eq!(std::fs::read_to_string(&result.outcome.path).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(&result.outcome.path).unwrap(),
+            original
+        );
     }
 
     /// UX-03 for Codex: the moved TOML tables come back (nested env table too) into
@@ -3905,7 +3950,7 @@ DOCS_TOKEN = "tok"
 "#;
         std::fs::write(fixture.codex(), original).unwrap();
 
-        let outcome = migrate_client("codex", Some("Work"), false).unwrap();
+        let outcome = connect_fixture("codex", Some("Work"), false).unwrap();
         assert_eq!(
             enabled_names(&outcome.result.registry, "work"),
             ["docs", "memory"]
@@ -3953,7 +3998,7 @@ DOCS_TOKEN = "tok"
         let original = r#"{"mcpServers":{"memory":{"command":"npx","args":["server-memory"]}}}"#;
         std::fs::write(fixture.claude(), original).unwrap();
 
-        let error = migrate_client("claude-code", Some("missing"), false).unwrap_err();
+        let error = connect_fixture("claude-code", Some("missing"), false).unwrap_err();
         assert!(error.contains("left unchanged"), "{error}");
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
         assert!(read_registry_exact().unwrap().servers.is_empty());

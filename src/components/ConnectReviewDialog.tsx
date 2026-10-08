@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
+import { Check, Loader2 } from "lucide-react";
 import { migrateClient, previewClientSetup } from "@/lib/api";
 import type { ClientSetupReview, MigrateResult, Registry } from "@/lib/types";
 import { ImportReviewDialog } from "./ImportReviewDialog";
+import { SecretsDialog } from "./SecretsDialog";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "./ui/dialog";
 import { Button } from "./ui/button";
 
@@ -58,7 +60,7 @@ export function ConnectReviewDialog({
       setBusy(false);
     }
   }
-  if (result || !review || error)
+  if (result || !review)
     return (
       <Dialog
         open
@@ -69,40 +71,83 @@ export function ConnectReviewDialog({
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
-              {result ? `Connected to ${clientName}` : `Connect ${clientName}`}
+              {result ? `${clientName} connected` : `Connect ${clientName}`}
             </DialogTitle>
           </DialogHeader>
-          {error ? (
+          {result ? (
+            <div className="flex flex-col gap-3 text-sm">
+              <Check className="mx-auto size-10 text-success" />
+              <p>Restart {clientName} to load Toolport.</p>
+              <ul className="divide-y rounded-lg border">
+                {result.servers.map((row) => {
+                  const server = result.registry.servers.find((s) => s.name === row.name);
+                  return (
+                    <li
+                      key={row.name}
+                      className="flex items-center justify-between gap-3 p-3"
+                    >
+                      <div>
+                        <p className="font-medium">{row.name}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {row.toolCount} tools ·{" "}
+                          {row.credentialState === "stored"
+                            ? "Stored in keychain"
+                            : row.credentialState === "missing"
+                              ? "Needs input"
+                              : "No credentials needed"}
+                        </p>
+                      </div>
+                      {server && row.credentialState !== "none" && (
+                        <SecretsDialog
+                          server={server}
+                          onSaved={onConnected}
+                          trigger={<Button variant="outline">Open Credentials</Button>}
+                        />
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+              {result.outcome.warnings?.map((warning) => (
+                <p key={warning} className="text-xs text-muted-foreground">
+                  {warning}
+                </p>
+              ))}
+              <details>
+                <summary>What your agent sees</summary>
+                <ul className="mt-2 font-mono text-xs">
+                  {result.tools.map((t) => (
+                    <li key={t.name}>{t.name}</li>
+                  ))}
+                </ul>
+              </details>
+              <details>
+                <summary>Details</summary>
+                <p className="mt-2 break-all">Config: {result.outcome.path}</p>
+                {result.outcome.backup && (
+                  <p className="break-all">Backup: {result.outcome.backup}</p>
+                )}
+              </details>
+              <Button onClick={onClose}>Done</Button>
+            </div>
+          ) : error ? (
             <>
-              <p role="alert" className="text-sm text-warning">
+              <p role="alert" className="text-warning">
                 {error}
               </p>
               <Button
                 onClick={() => {
                   setError("");
-                  if (!review) setAttempt(attempt + 1);
+                  setAttempt(attempt + 1);
                 }}
               >
-                {review ? "Back to review" : "Retry"}
+                Retry
               </Button>
             </>
-          ) : result ? (
-            <div className="flex flex-col gap-3 text-sm">
-              <p>Restart {clientName} to load Toolport.</p>
-              <p className="break-all">Config: {result.outcome.path}</p>
-              {result.outcome.backup && (
-                <p className="break-all">Backup: {result.outcome.backup}</p>
-              )}
-              <p>Gateway tools your agent will see:</p>
-              <ul className="max-h-60 overflow-auto font-mono text-xs">
-                {result.tools.map((t) => (
-                  <li key={t.name}>{t.name}</li>
-                ))}
-              </ul>
-              <Button onClick={onClose}>Done</Button>
-            </div>
           ) : (
-            <p>Reading client config...</p>
+            <p>
+              <Loader2 className="inline size-4 animate-spin" /> Reading client config...
+            </p>
           )}
         </DialogContent>
       </Dialog>
@@ -113,9 +158,13 @@ export function ConnectReviewDialog({
       items={review.items}
       busy={busy}
       allowEmpty
+      error={error}
+      details={`Config: ${review.configPath}\nBackups will be saved in ${review.backupDir}`}
       title={`Review and connect ${clientName}`}
-      confirmLabel={busy ? "Checking gateway..." : "Connect to Toolport"}
-      description={`Config: ${review.configPath}. Backup saved to ${review.backupDir}. Selected direct entries move into Toolport after verification. Unchecked entries and plugin servers stay in place.${force ? " This replaces the customized Toolport entry." : ""}`}
+      confirmLabel={
+        busy ? "Checking gateway..." : error ? "Retry" : "Connect to Toolport"
+      }
+      description={`Selected entries move into Toolport after verification.${force ? " This replaces the customized Toolport entry." : ""}`}
       onOpenChange={(open) => {
         if (!open && !busy) onClose();
       }}

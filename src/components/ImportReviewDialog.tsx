@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, ShieldAlert } from "lucide-react";
+import { Check, Loader2, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -18,6 +18,8 @@ interface Props {
   description?: string;
   confirmLabel?: string;
   allowEmpty?: boolean;
+  details?: string;
+  error?: string;
   onOpenChange: (open: boolean) => void;
   onConfirm: (keys: string[]) => void;
 }
@@ -31,6 +33,8 @@ export function ImportReviewDialog({
   description,
   confirmLabel,
   allowEmpty = false,
+  details,
+  error,
   onOpenChange,
   onConfirm,
 }: Props) {
@@ -45,6 +49,8 @@ export function ImportReviewDialog({
         description={description}
         confirmLabel={confirmLabel}
         allowEmpty={allowEmpty}
+        details={details}
+        error={error}
         onOpenChange={onOpenChange}
         onConfirm={onConfirm}
       />
@@ -59,6 +65,8 @@ function ImportReviewContent({
   description,
   confirmLabel,
   allowEmpty = false,
+  details,
+  error,
   onOpenChange,
   onConfirm,
 }: Omit<Props, "open">) {
@@ -81,6 +89,19 @@ function ImportReviewContent({
           {description ??
             "Review the commands and URLs before adding them. Leave any server unchecked to keep it as it is."}
         </p>
+        {details && (
+          <details>
+            <summary className="text-xs">Details</summary>
+            <p className="mt-2 whitespace-pre-wrap break-all text-xs text-muted-foreground">
+              {details}
+            </p>
+          </details>
+        )}
+        {error && (
+          <p role="alert" className="text-sm text-warning">
+            {error}
+          </p>
+        )}
         <div className="flex max-h-72 flex-col gap-2 overflow-y-auto">
           {keyedItems.map(({ item, key }) => {
             const isSelected = selected.has(key);
@@ -89,8 +110,14 @@ function ImportReviewContent({
                 key={key}
                 type="button"
                 aria-pressed={isSelected}
+                disabled={busy}
+                data-failed={!!error?.includes(item.name)}
                 className={`rounded-md text-left transition-colors ${
-                  isSelected ? "ring-1 ring-success/60" : "opacity-60"
+                  error?.includes(item.name)
+                    ? "ring-1 ring-warning"
+                    : isSelected
+                      ? "ring-1 ring-success/60"
+                      : "opacity-60"
                 }`}
                 onClick={() =>
                   setSelected((previous) => {
@@ -102,6 +129,12 @@ function ImportReviewContent({
                 }
               >
                 <ImportRow item={item} selected={isSelected} />
+                {busy && isSelected && (
+                  <p role="status" className="flex gap-2 px-3 pb-2 text-xs">
+                    <Loader2 className="size-3 animate-spin" />
+                    Checking {item.name}...
+                  </p>
+                )}
               </button>
             );
           })}
@@ -144,18 +177,18 @@ export function ImportRow({ item, selected }: { item: ImportItem; selected?: boo
           />
         )}
         <span className="truncate text-sm font-medium">{item.name}</span>
-        {!item.isNew && (
+        {
           <span className="ml-auto shrink-0 text-xs text-muted-foreground">
-            already added
+            {item.isNew ? "New" : "In Toolport"}
           </span>
-        )}
+        }
       </div>
       {runs && (
         <p className="mt-1 font-mono text-xs break-all text-muted-foreground">{runs}</p>
       )}
       {!!item.envKeys?.length && (
         <p className="mt-1 text-xs text-warning">
-          Credentials: {item.envKeys.join(", ")}. Required before connection can finish.
+          Credentials: {item.envKeys.join(", ")}. Review their status before connecting.
         </p>
       )}
       {shell && (

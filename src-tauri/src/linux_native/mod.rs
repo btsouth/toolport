@@ -2511,10 +2511,9 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             connect.add_css_class("suggested-action");
             let client_for_connect = client.clone();
             let page_for_connect = page.clone();
-            connect.connect_clicked(move |button| {
+            connect.connect_clicked(move |_| {
                 confirm_client_migrate(
                     &client_for_connect,
-                    button.clone(),
                     page_for_connect.clone(),
                 );
             });
@@ -2542,7 +2541,7 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
     card
 }
 
-fn confirm_client_migrate(client: &state::ClientView, _button: gtk::Button, page: ClientPage) {
+fn confirm_client_migrate(client: &state::ClientView, page: ClientPage) {
     let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else {
         return;
     };
@@ -2650,11 +2649,10 @@ fn connected_client_actions_menu(client: state::ClientView, page: ClientPage) ->
         let client_for_migrate = client.clone();
         let page_for_migrate = page.clone();
         let menu_for_migrate = menu.clone();
-        migrate.connect_clicked(move |button| {
+        migrate.connect_clicked(move |_| {
             menu_for_migrate.popdown();
             confirm_client_migrate(
                 &client_for_migrate,
-                button.clone(),
                 page_for_migrate.clone(),
             );
         });

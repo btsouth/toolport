@@ -268,6 +268,11 @@ mockIPC(
         return {
           registry: structuredClone(registry),
           imported: 1,
+          servers: (args.selected as string[]).map((name) => ({
+            name,
+            toolCount: 3,
+            credentialState: "none",
+          })),
           moved: args.selected,
           tools: [{ name: "notes__read" }],
           outcome: {

@@ -625,6 +625,7 @@ struct MigrateResult {
     moved: Vec<String>,
     tools: Vec<serde_json::Value>,
     outcome: clients::WriteOutcome,
+    servers: Vec<crate::registry_controller::SetupServerResult>,
 }
 
 #[tauri::command]
@@ -671,6 +672,7 @@ async fn migrate_client(
         imported: outcome.imported,
         moved: outcome.moved,
         tools: outcome.tools,
+        servers: outcome.servers,
         outcome: outcome.result.outcome,
     })
 }
