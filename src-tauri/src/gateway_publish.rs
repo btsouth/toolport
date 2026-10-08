@@ -908,14 +908,9 @@ fn record_restart_client(report: &mut ReapReport, proc: &GatewayProcess) {
     }
 }
 
-fn reap_with_context(ctx: &ReapContext) -> ReapReport {
-    reap_listed(ctx, list_gateway_processes)
-}
-
-/// Body of [`reap_with_context`], taking the enumerator so a caller can bound which
-/// processes the pass may consider.
+/// Reap only processes supplied by the caller's scoped inventory.
 ///
-/// Production always passes [`list_gateway_processes`]. Tests pass an enumerator
+/// Tests pass an enumerator
 /// scoped to their own fixtures: driving the real plan/kill/verify path against the
 /// *global* process table would otherwise mean a real gateway that starts during the
 /// pass (including inside the 150ms verify window below, which re-enumerates) is not
