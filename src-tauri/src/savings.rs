@@ -133,21 +133,6 @@ fn serialize_surface(tools: &[Value], on_tool: impl FnMut(&Value, u64)) -> u64 {
     writer.len
 }
 
-fn serialize_surface_text(tools: &[Value], mut on_tool: impl FnMut(&Value, u64)) -> String {
-    let mut bytes = Vec::new();
-    bytes.push(b'[');
-    for (index, tool) in tools.iter().enumerate() {
-        if index > 0 {
-            bytes.push(b',');
-        }
-        let start = bytes.len();
-        serde_json::to_writer(&mut bytes, tool).expect("serde_json::Value serializes");
-        on_tool(tool, (bytes.len() - start) as u64);
-    }
-    bytes.push(b']');
-    String::from_utf8(bytes).expect("JSON is UTF-8")
-}
-
 pub fn estimated_tokens(bytes: u64) -> u64 {
     bytes.div_ceil(4)
 }

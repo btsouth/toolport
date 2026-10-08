@@ -1783,6 +1783,7 @@ fn namespaced_prefix(t: &Value) -> Option<String> {
 
 /// Distinct server prefixes in a catalog, in first-seen order, so the advertised
 /// `help_<server>` tools have a stable order across lists.
+#[cfg(test)]
 fn distinct_server_prefixes(catalog: &[Value]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -37779,7 +37780,8 @@ mod tests {
                 }
                 *state.registry.lock().unwrap() = reg.clone();
                 let view = if strict {
-                    let mut view = (*router).clone();
+                    let mut view =
+                        (*tool_surface_fixture_for_safety(registry::SafetyLevel::Strict).1).clone();
                     view.requarantine(BTreeSet::from(["alpha__read".into()]));
                     Arc::new(view)
                 } else {
@@ -38278,13 +38280,22 @@ mod tests {
         drop(router);
         assert_eq!(weak.strong_count(), 0);
         let mut cache = host.tool_surfaces.lock().unwrap();
-        let mut entry = cache.entries.pop_front().unwrap();
-        cache.bytes = 0;
-        entry._router = Arc::downgrade(&Arc::new(Router::new()));
-        cache.insert(entry); // insert also prunes dead identities
-        cache.prune();
-        assert!(cache.entries.is_empty());
-        assert_eq!(cache.bytes, 0);
+        let retired = cache.entries.front().unwrap();
+        let replacement_router = Arc::new(Router::new());
+        let mut key = retired.key.clone();
+        key.router = Arc::as_ptr(&replacement_router) as usize;
+        let replacement = ToolSurfaceEntry {
+            key,
+            _catalog: Arc::downgrade(&next),
+            _router: Arc::downgrade(&replacement_router),
+            full: Arc::clone(&retired.full),
+            exposed: Arc::clone(&retired.exposed),
+            bytes: retired.bytes,
+        };
+        cache.insert(replacement); // insert prunes the dead router's existing entry
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries.front().unwrap()._router.strong_count() > 0);
+        assert_eq!(cache.bytes, cache.entries.front().unwrap().bytes);
     }
 
     #[test]
