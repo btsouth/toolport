@@ -88,7 +88,7 @@ beforeEach(() => {
 it("imports the reviewed definition when another client has the same server name", async () => {
   const server = {
     name: "calendar",
-    transport: "stdio",
+    transport: "stdio" as const,
     command: "calendar-mcp",
     args: ["--workspace", "reviewed"],
     envKeys: [],
