@@ -853,8 +853,8 @@ fn notification_host(host: BrokerHost, show: ShowPendingNotification) -> BrokerH
     }
 }
 
-/// Notify the human that a call is held: an OS notification plus a taskbar-attention
-/// flash on the main window. Best-effort and non-blocking - if either fails (permission
+/// Notify the human that a call is held: a retractable Linux OS notification plus
+/// taskbar attention on the main window. Best-effort and non-blocking - if either fails (permission
 /// off, no window) the in-app overlay is still the source of truth. We flash rather than
 /// force-focus so we don't yank the user out of what they're doing.
 #[cfg(feature = "desktop")]
@@ -895,6 +895,16 @@ fn notify_pending(app: &AppHandle, view: &PendingView, resolved: std::sync::mpsc
 
 #[cfg(all(feature = "desktop", target_os = "linux"))]
 fn notify_until_resolved(title: &str, body: &str, resolved: std::sync::mpsc::Receiver<()>) {
+    notify_until_resolved_at_destination(title, body, resolved, "org.freedesktop.Notifications");
+}
+
+#[cfg(all(feature = "desktop", target_os = "linux"))]
+fn notify_until_resolved_at_destination(
+    title: &str,
+    body: &str,
+    resolved: std::sync::mpsc::Receiver<()>,
+    destination: &str,
+) {
     use gio::glib::{self, variant::ToVariant};
     use gio::prelude::*;
     use std::cell::Cell;
@@ -912,7 +922,7 @@ fn notify_until_resolved(title: &str, body: &str, resolved: std::sync::mpsc::Rec
         let shown = Rc::new(Cell::new(0u32));
         let tracked = shown.clone();
         let signal = bus.signal_subscribe(
-            Some(BUS),
+            Some(destination),
             Some(BUS),
             Some("NotificationClosed"),
             Some(PATH),
@@ -929,7 +939,7 @@ fn notify_until_resolved(title: &str, body: &str, resolved: std::sync::mpsc::Rec
         let notify = |id: u32, title: &str, body: &str, urgency: u8, expiry: i32| {
             let hints = HashMap::from([("urgency".to_string(), urgency.to_variant())]);
             bus.call_sync(
-                Some(BUS),
+                Some(destination),
                 PATH,
                 BUS,
                 "Notify",
@@ -979,7 +989,7 @@ fn notify_until_resolved(title: &str, body: &str, resolved: std::sync::mpsc::Rec
             // with a short, non-actionable expiry before closing, as GTK does.
             let id = notify(shown.get(), "Approval handled", "", 0, 1000).unwrap_or(shown.get());
             let _ = bus.call_sync(
-                Some(BUS),
+                Some(destination),
                 PATH,
                 BUS,
                 "CloseNotification",
@@ -1041,6 +1051,57 @@ mod tests {
         ));
         (host.resolved)("other");
         other.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[cfg(all(feature = "desktop", target_os = "linux"))]
+    #[test]
+    fn p08_tauri_os_toast_is_replaced_and_closed_on_withdrawal() {
+        use gio::glib::{self, variant::ToVariant};
+        let (ready_tx, ready_rx) = channel();
+        let (calls_tx, calls_rx) = channel();
+        let (stop_tx, stop_rx) = channel::<()>();
+        let server = std::thread::spawn(move || {
+            let context = glib::MainContext::new();
+            context.with_thread_default(|| {
+                let bus = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).expect("run this notification test in omabox");
+                let node = gio::DBusNodeInfo::for_xml("<node><interface name='org.freedesktop.Notifications'><method name='Notify'><arg type='s' direction='in'/><arg type='u' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='as' direction='in'/><arg type='a{sv}' direction='in'/><arg type='i' direction='in'/><arg type='u' direction='out'/></method><method name='CloseNotification'><arg type='u' direction='in'/></method></interface></node>").unwrap();
+                let registration = bus.register_object("/org/freedesktop/Notifications", &node.lookup_interface("org.freedesktop.Notifications").unwrap(),
+                    move |_, _, _, _, method, parameters, invocation| {
+                        calls_tx.send((method.to_string(), parameters)).unwrap();
+                        invocation.return_value(Some(&if method == "Notify" { (42u32,).to_variant() } else { ().to_variant() }));
+                    }, |_, _, _, _, _| ().to_variant(), |_, _, _, _, _, _| false).unwrap();
+                ready_tx.send(bus.unique_name().unwrap().to_string()).unwrap();
+                loop {
+                    while context.pending() { context.iteration(false); }
+                    if !matches!(stop_rx.recv_timeout(Duration::from_millis(2)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) { break; }
+                }
+                bus.unregister_object(registration).unwrap();
+            }).unwrap();
+        });
+        let destination = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (resolved_tx, resolved_rx) = channel();
+        let worker = std::thread::spawn(move || {
+            notify_until_resolved_at_destination(
+                "Approval required",
+                "s/t",
+                resolved_rx,
+                &destination,
+            )
+        });
+        let (method, pending) = calls_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(method, "Notify");
+        assert_eq!(pending.child_value(1).get::<u32>(), Some(0));
+        resolved_tx.send(()).unwrap();
+        let (method, handled) = calls_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(method, "Notify");
+        assert_eq!(handled.child_value(1).get::<u32>(), Some(42));
+        assert_eq!(handled.child_value(7).get::<i32>(), Some(1000));
+        let (method, closed) = calls_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(method, "CloseNotification");
+        assert_eq!(closed.child_value(0).get::<u32>(), Some(42));
+        worker.join().unwrap();
+        stop_tx.send(()).unwrap();
+        server.join().unwrap();
     }
 
     fn broker() -> ApprovalBroker {
