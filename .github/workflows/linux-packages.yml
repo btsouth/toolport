@@ -19,7 +19,9 @@ jobs:
       - name: Test removal script contracts
         run: python3 scripts/test-uninstall-hooks.py
       - name: Install native build dependencies
-        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev libgtk-4-dev libadwaita-1-dev zip nodejs rpm
+        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev libgtk-4-dev libadwaita-1-dev zip nodejs rpm nsis
+      - name: Compile Windows installer hooks
+        run: scripts/test-nsis-hooks.sh
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: src-tauri

@@ -63,7 +63,9 @@ class RemovalHooks(unittest.TestCase):
 
     def test_su_fallback_has_no_login_shell_and_handles_spaces(self):
         self.accounts(["alice"])
-        (self.root / "alice/.config/Toolport").mkdir(parents=True)
+        spaced = self.root / "alice home"
+        (spaced / ".config/Toolport").mkdir(parents=True)
+        self.passwd.write_text(self.passwd.read_text().replace(str(self.root / "alice") + ":", str(spaced) + ":"))
         # Model su's shell argument forwarding, without switching a real account.
         su = self.bin / "su"
         su.write_text('#!/bin/sh\ntest "$1" = -s && test "$2" = /bin/sh && test "$3" = -c && test "$5" = -- || exit 99\ncmd=$4\nshift 6\nexec /bin/sh -c "$cmd" "$@"\n')
@@ -76,6 +78,11 @@ class RemovalHooks(unittest.TestCase):
         self.accounts(["empty"])
         self.run_script(self.helper)
         self.assertFalse(self.calls.exists())
+
+    def test_account_enumeration_failure_prints_recovery(self):
+        self.accounts(["empty"])
+        (self.bin / "getent").write_text("#!/bin/sh\nexit 2\n")
+        self.assertIn("could not enumerate", self.run_script(self.helper).stderr)
 
     def test_missing_binary_prints_recovery_and_succeeds(self):
         self.accounts(["empty"])
