@@ -123,7 +123,6 @@ pub(super) fn remove(path: &Path) -> Result<(), String> {
     })
 }
 
-
 pub(super) fn value(format: Format, text: Option<&str>) -> Result<Value, String> {
     let Some(text) = text.filter(|text| !text.trim().is_empty()) else {
         return Ok(serde_json::json!({}));
@@ -297,7 +296,6 @@ fn run_inner<T>(
                 recovery.rollback()?;
             }
             commit
-
         })();
         if commit.is_err() {
             for receipt in auxiliary_recovery.into_iter().rev() {

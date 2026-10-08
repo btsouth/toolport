@@ -259,6 +259,7 @@ struct ClientConfigReceipt {
     backup: Option<PathBuf>,
     written: Option<Vec<u8>>,
     recovery_path: Option<PathBuf>,
+    exact_rollback: bool,
 }
 
 impl ClientConfigReceipt {
@@ -269,20 +270,22 @@ impl ClientConfigReceipt {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(format!("could not verify the updated client config: {e}")),
         };
-        if outcome.recovery_path.is_some() && written.as_deref().map(|bytes| registry::sha256_hex(std::str::from_utf8(bytes).unwrap_or(""))) != outcome.revision {
-            return Err("the client config changed after the operation; newer edits were left untouched".into());
-        }
+        let exact_rollback = outcome.recovery_path.is_none()
+            || written.as_deref().map(|bytes| registry::sha256_hex(std::str::from_utf8(bytes).unwrap_or(""))) == outcome.revision;
         Ok(Self {
             target,
             backup: outcome.backup.as_deref().map(PathBuf::from),
             written,
             recovery_path: outcome.recovery_path.clone(),
+            exact_rollback,
         })
     }
 
     fn rollback(&self) -> Result<(), String> {
-        let dir = self.recovery_path.as_deref().and_then(std::path::Path::parent).and_then(std::path::Path::parent).and_then(std::path::Path::parent)
-            .or_else(|| self.target.parent()).ok_or("Could not resolve mutation lock dir")?;
+        if !self.exact_rollback {
+            return Err("exact rollback is unavailable because the client saved after this operation; newer edits were left untouched".into());
+        }
+        let dir = registry::conduit_dir().ok_or("Could not resolve mutation lock dir")?;
         let _lock = registry::lock_at(&dir.join("client-config-mutation"))?;
         let revision = registry::client_file::read(&self.target)?;
         if revision.text.as_deref().map(str::as_bytes) != self.written.as_deref() {
@@ -292,7 +295,6 @@ impl ClientConfigReceipt {
         registry::client_file::commit(&self.target, &revision, original.as_deref())?;
         if let Some(file) = &self.recovery_path { clients::record_config_rollback(file, &self.target, original.as_deref())?; }
         Ok(())
-
     }
 }
 
@@ -806,10 +808,13 @@ fn refuse_customized_client(state: Option<GatewayEntryState>, force: bool) -> Re
 }
 
 fn finish_client_config_mutation(
-    outcome: WriteOutcome,
+    mut outcome: WriteOutcome,
     write_registry: impl FnOnce(Option<ManagedEntry>) -> Result<Registry, String>,
 ) -> Result<ClientMutationResult, String> {
     let receipt = ClientConfigReceipt::capture(&outcome)?;
+    if !receipt.exact_rollback {
+        outcome.warnings.push("the client saved after this operation; exact rollback is unavailable for this write".into());
+    }
     match write_registry(outcome.managed.clone()) {
         Ok(registry) => Ok(ClientMutationResult { registry, outcome }),
         Err(registry_error) => match receipt.rollback() {
@@ -1376,13 +1381,16 @@ fn random_token() -> Result<String, String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn revoke_client_http_token(client_id: &str) -> Result<(), String> {
-    let http_id = format!("client:{client_id}");
-    registry::update(|registry| {
-        registry.http_clients.retain(|row| row.id != http_id);
-        Ok(())
-    })?;
-    crate::secrets::delete_secret(CLIENT_HTTP_VAULT_SERVER, client_id)
+fn finish_http_disconnect(
+    client_id: &str,
+    result: &mut ClientMutationResult,
+    revoke: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    clients::finish_uninstall(client_id, &result.outcome)?;
+    if let Err(error) = revoke() {
+        result.outcome.warnings.push(format!("config restored; could not remove the revoked keychain token: {error}"));
+    }
+    Ok(())
 }
 
 pub(crate) fn registry_for_disconnect() -> Result<Registry, String> {
@@ -1390,6 +1398,10 @@ pub(crate) fn registry_for_disconnect() -> Result<Registry, String> {
 }
 
 pub fn disconnect_client(client_id: &str) -> Result<ClientMutationResult, String> {
+    disconnect_client_with_revocation(client_id, || crate::secrets::delete_secret(CLIENT_HTTP_VAULT_SERVER, client_id))
+}
+
+fn disconnect_client_with_revocation(client_id: &str, revoke: impl FnOnce() -> Result<(), String>) -> Result<ClientMutationResult, String> {
     let current = read_registry_exact_or_default()?;
     let http_id = format!("client:{client_id}");
     let has_shared_http_token = current
@@ -1409,14 +1421,17 @@ pub fn disconnect_client(client_id: &str) -> Result<ClientMutationResult, String
 
     let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
     let outcome = clients::uninstall_gateway(client_id)?;
-    revoke_client_http_token(client_id)?;
-    let (registry, ()) = registry::update(|registry| {
-        registry.set_client_scope(client_id, None);
-        registry.clear_client_managed_entry(client_id);
-        Ok(())
+    let mut result = finish_client_config_mutation(outcome, |_| {
+        let (registry, ()) = registry::update(|registry| {
+            registry.set_client_scope(client_id, None);
+            registry.clear_client_managed_entry(client_id);
+            registry.http_clients.retain(|row| row.id != http_id);
+            Ok(())
+        })?;
+        Ok(registry)
     })?;
-    clients::finish_uninstall(client_id, &outcome)?;
-    Ok(ClientMutationResult { registry, outcome })
+    finish_http_disconnect(client_id, &mut result, revoke)?;
+    Ok(result)
 }
 
 pub fn disconnect_client_stdio(client_id: &str) -> Result<ClientMutationResult, String> {
@@ -2738,6 +2753,7 @@ mod tests {
             restored: Vec::new(),
             used_move_record: false,
             revision: None,
+            warnings: Vec::new(),
             recovery_path: None,
         };
 
@@ -2769,6 +2785,7 @@ mod tests {
             restored: Vec::new(),
             used_move_record: false,
             revision: None,
+            warnings: Vec::new(),
             recovery_path: None,
         };
 
@@ -2802,6 +2819,7 @@ mod tests {
             restored: Vec::new(),
             used_move_record: false,
             revision: None,
+            warnings: Vec::new(),
             recovery_path: None,
         };
         let target_for_write = target.clone();
@@ -3063,6 +3081,69 @@ mod tests {
     #[test]
     fn migrate_to_stdio_revokes_shared_http_row_and_secret() {
         assert_stdio_conversion_revokes_shared_http(true);
+    }
+
+    #[test]
+    fn client_save_before_receipt_capture_updates_registry_with_warning() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(fixture.claude(), "{\"mcpServers\":{}}").unwrap();
+        let outcome = clients::install_gateway("claude-code", None).unwrap();
+        let mut native = json_file(&fixture.claude());
+        native["session"] = serde_json::json!(2);
+        let native = native.to_string();
+        std::fs::write(fixture.claude(), &native).unwrap();
+        let result = finish_client_config_mutation(outcome, |managed| {
+            let (registry, ()) = registry::update(|registry| {
+                registry.set_client_managed_entry("claude-code", managed.unwrap());
+                Ok(())
+            })?;
+            Ok(registry)
+        }).unwrap();
+        assert!(result.registry.client_managed_entries.contains_key("claude-code"));
+        assert!(result.outcome.warnings[0].contains("exact rollback is unavailable"));
+        assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), native);
+        assert!(!ClientConfigReceipt::capture(&result.outcome).unwrap().exact_rollback);
+        disconnect_client("claude-code").unwrap();
+        assert_eq!(json_file(&fixture.claude())["session"], 2);
+    }
+
+    #[test]
+    fn http_disconnect_finishes_before_failed_keychain_revocation() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let original = "{ \"mcpServers\": {} }";
+        std::fs::write(fixture.claude(), original).unwrap();
+        clients::install_gateway("claude-code", None).unwrap();
+        registry::update(|registry| {
+            registry.http_clients.push(registry::HttpClient {
+                id: "client:claude-code".into(), label: "Claude Code".into(), token_sha256: registry::sha256_hex("fixture"),
+                profile: String::new(), unknown_fields: Default::default()
+            });
+            Ok(())
+        }).unwrap();
+        let result = disconnect_client_with_revocation("claude-code", || {
+            let record = fixture.root.join("data/backups/claude-code");
+            let snapshot = std::fs::read_dir(record).unwrap().filter_map(Result::ok).find(|entry| entry.file_name().to_string_lossy().starts_with("original-")).unwrap();
+            let record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(snapshot.path()).unwrap()).unwrap();
+            assert_eq!(record["disconnected"], true);
+            assert!(record["disconnectBefore"].is_null());
+            assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
+            Err("keychain unreachable".into())
+        }).unwrap();
+        assert!(result.registry.http_clients.is_empty());
+        assert!(result.outcome.warnings.iter().any(|warning| warning.contains("keychain unreachable")));
+    }
+
+    #[test]
+    fn edited_toolport_entry_is_reported_after_disconnect() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(fixture.claude(), "{}").unwrap();
+        clients::install_gateway("claude-code", None).unwrap();
+        let mut native = json_file(&fixture.claude());
+        native["mcpServers"][clients::GATEWAY_ENTRY_NAME]["args"] = serde_json::json!(["--custom"]);
+        std::fs::write(fixture.claude(), native.to_string()).unwrap();
+        let result = disconnect_client("claude-code").unwrap();
+        assert!(result.outcome.warnings.iter().any(|warning| warning.contains("kept your edited toolport entry")));
+        assert_eq!(json_file(&fixture.claude()), native);
     }
 
     /// UX-02 and UX-03 for Claude Code: a move turns the servers on (including one

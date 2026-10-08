@@ -412,3 +412,9 @@ Unchanged configs return to their original bytes, including an originally absent
 file. Native or user edits are preserved when Toolport reverses its entries. A
 concurrent edit to the same entry stops that client with a conflict. Review any
 failed result before continuing an uninstall.
+
+Run `toolport-gateway --disconnect-all [--dry-run]` as the desktop user whose
+Toolport installation you are removing. Running as root reads root's data dir
+and can return `[]`. The command prints a hint to stderr when no data dir exists.
+Per-client `warnings` report keychain cleanup failures or edited Toolport entries
+kept for manual removal. Warnings do not make successfully restored configs fail.

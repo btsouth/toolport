@@ -3162,6 +3162,8 @@ pub struct WriteOutcome {
     /// Servers Disconnect put back from the "Move into gateway" record (UX-03).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub restored: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// Disconnect used this client's move record. The caller drops it with
     /// [`finish_uninstall`] once the whole Disconnect has succeeded.
     #[serde(skip)]
@@ -3182,6 +3184,13 @@ fn revision_outcome(client_id: &str, result: Result<WriteOutcome, String>) -> Re
         None
     };
     Ok(outcome)
+}
+
+fn disconnect_warnings(format: Format, path: &Path) -> Result<Vec<String>, String> {
+    if !mutation::exists(path) { return Ok(Vec::new()); }
+    let kept = parse_client_content(format, &read_config_file(path)?)?.iter().any(|server|
+        server.name.eq_ignore_ascii_case(GATEWAY_ENTRY_NAME) || detected_is_gateway(server));
+    Ok(if kept { vec!["kept your edited toolport entry; remove it by hand if you uninstall".into()] } else { Vec::new() })
 }
 
 /// Result of launch-time re-point (SOU-405/406).
@@ -5493,6 +5502,7 @@ fn write_servers_inner(client_id: &str, servers: &[ServerEntry]) -> Result<Write
         restored: Vec::new(),
         used_move_record: false,
         revision: None,
+        warnings: Vec::new(),
         recovery_path: None,
     })
 }
@@ -6119,6 +6129,7 @@ fn install_or_remove_inner(
         restored: Vec::new(),
         used_move_record: false,
         revision: None,
+        warnings: Vec::new(),
         recovery_path: None,
     })
 }
@@ -6163,7 +6174,9 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
-        revision_outcome(client_id, uninstall_gateway_inner(client_id))
+        let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
+        outcome.warnings.extend(disconnect_warnings(def.format, &path)?);
+        Ok(outcome)
     })
 }
 
@@ -6186,6 +6199,7 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             restored: restored_names,
             used_move_record: moved::matches_path(client_id, &path)?,
             revision: None,
+        warnings: Vec::new(),
         recovery_path: None,
         });
     }
@@ -6200,6 +6214,7 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             restored: Vec::new(),
             used_move_record: false,
             revision: None,
+        warnings: Vec::new(),
         recovery_path: None,
         });
     }

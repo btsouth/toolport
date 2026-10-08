@@ -17785,6 +17785,9 @@ fn main() {
             conduit_lib::telemetry::exit_with(0);
         }
         ArgAction::DisconnectAll { dry_run } => {
+            if conduit_lib::registry::conduit_dir().is_none_or(|dir| !dir.exists()) {
+                eprintln!("No Toolport data dir found. Run --disconnect-all as the desktop user; root reads root's data dir.");
+            }
             match conduit_lib::clients::disconnect_all(dry_run) {
                 Ok(results) => {
                     println!(

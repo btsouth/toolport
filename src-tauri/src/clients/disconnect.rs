@@ -8,6 +8,8 @@ pub struct ClientResult {
     pub path: String,
     pub dry_run: bool,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 pub fn all(dry_run: bool) -> Result<Vec<ClientResult>, String> {
@@ -23,7 +25,9 @@ pub fn all(dry_run: bool) -> Result<Vec<ClientResult>, String> {
     let mut results = run(
         targets.map(|client| (client.id, client.config_path)),
         dry_run,
-        |id| crate::registry_controller::disconnect_client(id).map(|_| ()),
+        |id| {
+            crate::registry_controller::disconnect_client(id).map(|result| result.outcome.warnings)
+        },
     );
     // Secondary Claude profiles and settings have path-specific recovery records
     // too. They are restored even if the profile's config override has changed.
@@ -38,6 +42,7 @@ pub fn all(dry_run: bool) -> Result<Vec<ClientResult>, String> {
                     path: path.to_string_lossy().into_owned(),
                     dry_run,
                     error: Some(error),
+                    warnings: Vec::new(),
                 });
                 continue;
             }
@@ -49,7 +54,7 @@ pub fn all(dry_run: bool) -> Result<Vec<ClientResult>, String> {
             continue;
         }
         let result = if dry_run {
-            Ok(())
+            Ok(Vec::new())
         } else {
             restore_path(&id, &path, format, current.client_managed_entries.get(&id))
         };
@@ -57,6 +62,7 @@ pub fn all(dry_run: bool) -> Result<Vec<ClientResult>, String> {
             client_id: id,
             path: path.to_string_lossy().into_owned(),
             dry_run,
+            warnings: result.as_ref().cloned().unwrap_or_default(),
             error: result.err(),
         });
     }
@@ -68,7 +74,7 @@ fn restore_path(
     path: &Path,
     format: Format,
     managed: Option<&ManagedEntry>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let (revision, used_move_record) = restore::run(id, path, format, || {
         mutation::disconnecting();
         backup_file(id, path)?;
@@ -85,6 +91,7 @@ fn restore_path(
             .map(crate::registry::sha256_hex);
         Ok((revision, moved::matches_path(id, path)?))
     })?;
+    let warnings = disconnect_warnings(format, path)?;
     finish_uninstall(
         id,
         &WriteOutcome {
@@ -94,29 +101,32 @@ fn restore_path(
             restored: Vec::new(),
             used_move_record,
             revision,
+            warnings: Vec::new(),
             recovery_path: None,
         },
-    )
+    )?;
+    Ok(warnings)
 }
 
 fn run(
     targets: impl IntoIterator<Item = (String, String)>,
     dry_run: bool,
-    mut disconnect: impl FnMut(&str) -> Result<(), String>,
+    mut disconnect: impl FnMut(&str) -> Result<Vec<String>, String>,
 ) -> Vec<ClientResult> {
     targets
         .into_iter()
         .map(|(client_id, path)| {
-            let error = if dry_run {
-                None
+            let result = if dry_run {
+                Ok(Vec::new())
             } else {
-                disconnect(&client_id).err()
+                disconnect(&client_id)
             };
             ClientResult {
                 client_id,
                 path,
                 dry_run,
-                error,
+                warnings: result.as_ref().cloned().unwrap_or_default(),
+                error: result.err(),
             }
         })
         .collect()
@@ -138,7 +148,7 @@ mod tests {
             if id == "broken" {
                 Err("read-only config".into())
             } else {
-                Ok(())
+                Ok(Vec::new())
             }
         });
         assert_eq!(called, ["first", "broken", "last"]);
@@ -146,6 +156,16 @@ mod tests {
         assert_eq!(results[1].error.as_deref(), Some("read-only config"));
         assert!(results[2].error.is_none());
         run(targets, true, |_| panic!("dry run must not mutate"));
+    }
+    #[test]
+    fn bulk_disconnect_serializes_warnings_without_errors() {
+        let result = run(vec![("client".into(), "/config".into())], false, |_| {
+            Ok(vec!["keychain unreachable".into()])
+        });
+        assert!(result.iter().all(|client| client.error.is_none()));
+        let json = serde_json::to_value(result).unwrap();
+        assert_eq!(json[0]["warnings"][0], "keychain unreachable");
+        assert!(json[0]["error"].is_null());
     }
     #[test]
     fn bulk_restore_reports_bad_config_and_restores_the_remaining_files() {
@@ -200,7 +220,7 @@ mod tests {
                 .unwrap();
             let path = dir.join(id);
             mutation::run(id, &path, *format, || {
-                restore::apply(id, *format, &path).map(|_| ())
+                restore::apply(id, *format, &path).map(|_| Vec::new())
             })
         });
         assert!(results[0].error.is_none());

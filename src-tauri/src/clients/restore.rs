@@ -144,7 +144,11 @@ pub(super) fn remember(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.to_string()),
     };
-    let mut record = match load(client_id, path)? {
+    let loaded = load(client_id, path)?;
+    let fresh = loaded.as_ref().is_none_or(|record| {
+        record.disconnected && record.disconnect_before.is_none() && !disconnecting
+    });
+    let mut record = match loaded.filter(|_| !fresh) {
         Some(record) => record,
         None => {
             let created_parents = missing_parents(path);
@@ -173,7 +177,7 @@ pub(super) fn remember(
     if released && !disconnecting {
         record.created_parents = missing_parents(path);
     }
-    if previous.is_some() && before.map(crate::registry::sha256_hex) != record.last_written_hash {
+    if !fresh && before.map(crate::registry::sha256_hex) != record.last_written_hash {
         record.exact_eligible = false;
         let previous_written = mutation::value(format, record.last_written.as_deref())?;
         let native = mutation::value(format, before)?;
@@ -1314,6 +1318,74 @@ mod tests {
         assert_eq!(read_config_file(&path).unwrap(), removed);
         assert!(!removed.contains("--toolport-hook"));
         assert!(removed.contains("user-hook"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn reconnect_captures_fresh_original_and_releases_old_payloads() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-fresh-original-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"secret":"old-secret","mcpServers":{}}"#).unwrap();
+        let connect = || {
+            mutation::run("fixture", &path, Format::JsonMcpServers, || {
+                edit_format(Format::JsonMcpServers, &path, Some(&entry()), true)
+            })
+        };
+        connect().unwrap();
+        disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
+        let fresh = "{ \"mcpServers\": {}, \"session\": 2 }";
+        std::fs::write(&path, fresh).unwrap();
+        connect().unwrap();
+        let record = load("fixture", &path).unwrap().unwrap();
+        assert_eq!(record.original.as_deref(), Some(fresh));
+        assert!(record.exact_eligible);
+        assert!(
+            !std::fs::read_to_string(record_path("fixture", &path).unwrap())
+                .unwrap()
+                .contains("old-secret")
+        );
+        disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), fresh);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn exact_restore_preserves_original_config_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-restore-mode-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            edit_format(Format::JsonMcpServers, &path, Some(&entry()), true)
+        })
+        .unwrap();
+        disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            std::fs::metadata(record_path("fixture", &path).unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
