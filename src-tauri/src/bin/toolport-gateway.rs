@@ -4206,18 +4206,7 @@ fn execute_call(
                     conduit_lib::rate_limits::check_and_count(&team.rate_limits, server_id, tool)
                 {
                     // Count as a failed call with a clear reason so Activity / export show the block.
-                    audit::record_routed_call(
-                        reg,
-                        server_id,
-                        tool,
-                        false,
-                        None,
-                        Some("rate_limit"),
-                        client,
-                        client_name,
-                        None,
-                        None,
-                    );
+                    audit::record_routed_call(reg, server_id, tool, false, None, Some("rate_limit"), client, client_name, None, None);
                     return json!({
                         "content": [{ "type": "text", "text": msg }],
                         "isError": true
@@ -9071,9 +9060,8 @@ type IntegrityCheckFailure = (String, BTreeSet<String>);
 /// prove the drifted definition is never published in the first place. Registered and
 /// consumed on one thread, so a parallel test's gate cannot trigger it.
 #[cfg(test)]
-static INTEGRITY_GATE_OBSERVER: Mutex<
-    Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>,
-> = Mutex::new(None);
+static INTEGRITY_GATE_OBSERVER: Mutex<Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>> =
+    Mutex::new(None);
 
 #[cfg(test)]
 fn observe_integrity_gate() {
@@ -17397,12 +17385,7 @@ fn proxy_public_http_connection(
     };
     drop(pending_read);
     let Some(_active) = try_acquire_inflight(active, http_max_connections()) else {
-        write_ingress_response(
-            &mut client,
-            503,
-            "Service Unavailable",
-            "gateway busy; retry later",
-        );
+        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway busy; retry later");
         return;
     };
     // Authenticate the cached daemon before every new public request. A failed
@@ -17522,23 +17505,13 @@ fn serve_http_proxy(port: u16) -> Result<(), String> {
             match listener.accept() {
                 Ok((mut client, _)) => {
                     if client.set_nonblocking(false).is_err() {
-                        write_ingress_response(
-                            &mut client,
-                            503,
-                            "Service Unavailable",
-                            "gateway unavailable",
-                        );
+                        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
                         continue;
                     }
                     let Some(pending) =
                         try_acquire_inflight(&pending_reads, http_max_connections())
                     else {
-                        write_ingress_response(
-                            &mut client,
-                            503,
-                            "Service Unavailable",
-                            "gateway busy; retry later",
-                        );
+                        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway busy; retry later");
                         continue;
                     };
                     let state = Arc::clone(&state);
@@ -17650,11 +17623,7 @@ fn respond_mcp_sse_listen(request: tiny_http::Request, mut out: HttpOut, allow_h
         .unwrap(),
         tiny_http::Header::from_bytes(b"Access-Control-Allow-Headers", allow_headers.as_bytes())
             .unwrap(),
-        tiny_http::Header::from_bytes(
-            b"Access-Control-Expose-Headers",
-            EXPOSED_HTTP_HEADERS.as_bytes(),
-        )
-        .unwrap(),
+        tiny_http::Header::from_bytes(b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()).unwrap(),
     ];
     for (name, value) in out.extra {
         let safe = sanitize_header_value(&value);
@@ -18233,10 +18202,7 @@ fn handle_connection(
         ),
         (b"Access-Control-Allow-Headers", allow_headers.as_bytes()),
         // Browser clients need session identity and untrusted-data provenance.
-        (
-            b"Access-Control-Expose-Headers",
-            EXPOSED_HTTP_HEADERS.as_bytes(),
-        ),
+        (b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()),
     ];
     for (name, value) in cors {
         // Skip a header that won't encode rather than panicking the thread.
@@ -18513,13 +18479,11 @@ fn main() {
                         "{}",
                         serde_json::to_string(&results).expect("serializable disconnect results")
                     );
-                    conduit_lib::telemetry::exit_with(
-                        if results.iter().any(|result| result.error.is_some()) {
-                            1
-                        } else {
-                            0
-                        },
-                    );
+                    conduit_lib::telemetry::exit_with(if results.iter().any(|result| result.error.is_some()) {
+                        1
+                    } else {
+                        0
+                    });
                 }
                 Err(error) => {
                     eprintln!("toolport-gateway --disconnect-all: {error}");
@@ -25276,7 +25240,14 @@ mod tests {
 
         let listener_inflight = Arc::clone(&inflight);
         std::thread::spawn(move || {
-            serve_http_loop_with_inflight(server, state, None, search, true, listener_inflight)
+            serve_http_loop_with_inflight(
+                server,
+                state,
+                None,
+                search,
+                true,
+                listener_inflight,
+            )
         });
         std::thread::sleep(Duration::from_millis(50));
 
@@ -33910,11 +33881,7 @@ mod tests {
             (**guard).clone()
         };
 
-        fail_closed_integrity_catalog(
-            &mut live,
-            Some("sbs714-gateway"),
-            set_of(&["srv__new_drift"]),
-        );
+        fail_closed_integrity_catalog(&mut live, Some("sbs714-gateway"), set_of(&["srv__new_drift"]));
 
         assert_eq!(
             live.quarantined(),
