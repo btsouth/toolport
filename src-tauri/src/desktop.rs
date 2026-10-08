@@ -5876,6 +5876,7 @@ mod tests {
         let _serial = GEN_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let data = registry::DataDirTestEnv::new("bump-failure");
         let _env = registry::REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5885,8 +5886,7 @@ mod tests {
         // registry and fails on state it just saved. Take the same lock those
         // tests hold (as clear_auth_token_propagates_reload_failure... already
         // does) so the two can never overlap.
-        let _data = registry::data_dir_test_lock();
-        let dir = unique_update_test_dir("bump-failure");
+        let dir = data.dir.clone();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(dir.join("registry.json")).unwrap();
 
@@ -5909,8 +5909,6 @@ mod tests {
             err.contains("could not reload the running gateway"),
             "unexpected error: {err}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The happy path: the bump persists the incremented generation so a running gateway
@@ -5920,13 +5918,13 @@ mod tests {
         let _serial = GEN_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let data = registry::DataDirTestEnv::new("bump-success");
         let _env = registry::REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Same reason as above: this sets the process-global TOOLPORT_REGISTRY,
         // which outranks any concurrent test's data-dir override.
-        let _data = registry::data_dir_test_lock();
-        let dir = unique_update_test_dir("bump-success");
+        let dir = data.dir.clone();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("registry.json");
 
@@ -5947,8 +5945,6 @@ mod tests {
         bump_secrets_generation(&state).expect("bump should succeed");
         let persisted = registry::load_from(&path).expect("registry should exist");
         assert_eq!(persisted.secrets_generation, 1);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The three partial-failure messages are the exact copy users see (the frontend
@@ -6005,10 +6001,10 @@ mod tests {
         let _serial = GEN_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _data = registry::data_dir_test_lock();
         let _env = registry::REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = registry::data_dir_test_lock();
         let dir = unique_update_test_dir("clear-auth-reload-fail");
         std::fs::create_dir_all(&dir).unwrap();
         let _override = registry::DataDirOverride::set(&dir);

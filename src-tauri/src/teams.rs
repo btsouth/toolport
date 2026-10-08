@@ -3781,8 +3781,8 @@ mod tests {
 
         // Both guards: the test sets GOOSE_PATH_ROOT and redirects the data dir, and both are
         // process-global.
-        let _env = crate::clients::env_test_lock();
         let _dirs = crate::registry::data_dir_test_lock();
+        let _env = crate::clients::env_test_lock();
         let base = std::env::temp_dir().join(format!("toolport-relocate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let _data_dir = crate::registry::DataDirOverride::set(base.join("data"));
@@ -3864,8 +3864,8 @@ mod tests {
     fn unchanged_instructions_ignore_an_unrelated_config_version_bump() {
         use crate::instructions::{Scope, Strategy, Target};
 
-        let _env = crate::clients::env_test_lock();
         let _dirs = crate::registry::data_dir_test_lock();
+        let _env = crate::clients::env_test_lock();
         let scratch =
             std::env::temp_dir().join(format!("toolport-sbs917-version-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
@@ -3997,8 +3997,8 @@ mod tests {
     fn apply_instructions_keeps_last_good_when_rewrite_is_refused() {
         use crate::instructions::{ApplyState, Scope, Strategy, Target};
 
-        let _env = crate::clients::env_test_lock();
         let _dirs = crate::registry::data_dir_test_lock();
+        let _env = crate::clients::env_test_lock();
         let scratch =
             std::env::temp_dir().join(format!("toolport-sbs917-keep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
@@ -4099,8 +4099,8 @@ mod tests {
     fn unchanged_instructions_remove_a_retained_path_when_its_client_disappears() {
         use crate::instructions::{Scope, Strategy, Target};
 
-        let _env = crate::clients::env_test_lock();
         let _dirs = crate::registry::data_dir_test_lock();
+        let _env = crate::clients::env_test_lock();
         let scratch = std::env::temp_dir().join(format!(
             "toolport-sbs917-uninstalled-{}",
             std::process::id()
@@ -4148,8 +4148,8 @@ mod tests {
     fn apply_instructions_still_removes_last_good_when_org_clears_instructions() {
         use crate::instructions::{Scope, Strategy, Target};
 
-        let _env = crate::clients::env_test_lock();
         let _dirs = crate::registry::data_dir_test_lock();
+        let _env = crate::clients::env_test_lock();
         let scratch =
             std::env::temp_dir().join(format!("toolport-sbs917-clear-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
@@ -4182,8 +4182,8 @@ mod tests {
 
     #[test]
     fn failed_instruction_cleanup_stays_recorded_and_retries() {
-        let _env = crate::clients::env_test_lock();
         let _dirs = crate::registry::data_dir_test_lock();
+        let _env = crate::clients::env_test_lock();
         let scratch =
             std::env::temp_dir().join(format!("toolport-sbs917-cleanup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
@@ -4234,8 +4234,8 @@ mod tests {
     fn a_lost_record_race_hands_written_paths_to_the_winner_instead_of_deleting_them() {
         use crate::instructions::{self, ApplyState, Scope, Strategy, Target};
 
-        let _env = crate::clients::env_test_lock();
         let _dirs = crate::registry::data_dir_test_lock();
+        let _env = crate::clients::env_test_lock();
         let scratch =
             std::env::temp_dir().join(format!("toolport-sbs914-race-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);

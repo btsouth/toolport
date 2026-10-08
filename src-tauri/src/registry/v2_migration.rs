@@ -558,10 +558,10 @@ mod tests {
 
     #[test]
     fn brandon_like_v1_registry_migrates_to_v2() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("brandon");
         let _override = DataDirOverride::set(&dir);
         let client_files = seed_user_files(&dir);
@@ -730,10 +730,10 @@ mod tests {
 
     #[test]
     fn brandon_like_v1_to_v3_preserves_every_clients_existing_access() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         for active in ["default", "work", " Work ", "deleted", ""] {
             let dir = scratch_dir("brandon-v3");
             let _override = DataDirOverride::set(&dir);
@@ -904,10 +904,10 @@ mod tests {
 
     #[test]
     fn migration_is_idempotent() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("idempotent");
         let _override = DataDirOverride::set(&dir);
         seed_user_files(&dir);
@@ -965,10 +965,10 @@ mod tests {
 
     #[test]
     fn backup_and_exports_are_written_before_the_primary() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("ordering");
         let _override = DataDirOverride::set(&dir);
         seed_user_files(&dir);
@@ -984,10 +984,10 @@ mod tests {
 
     #[test]
     fn a_failure_mid_migration_leaves_the_v1_file_intact() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("mid-failure");
         let _override = DataDirOverride::set(&dir);
         seed_user_files(&dir);
@@ -1037,10 +1037,10 @@ mod tests {
 
     #[test]
     fn a_1x_reader_derives_the_same_level_from_a_migrated_registry() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("1x-reader");
         let _override = DataDirOverride::set(&dir);
         let path = dir.join("registry.json");
@@ -1117,10 +1117,10 @@ mod tests {
     /// `v2.json` what the real migration writes for `v1.json`.
     #[test]
     fn rollback_fixture_is_a_real_migration() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("rollback-fixture");
         let _override = DataDirOverride::set(&dir);
         let path = dir.join("registry.json");
@@ -1160,10 +1160,10 @@ mod tests {
 
     #[test]
     fn ordinary_save_preserves_migrated_nested_fields() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("migrated-nested-save");
         let _override = DataDirOverride::set(&dir);
         let path = dir.join("registry.json");
@@ -1191,10 +1191,10 @@ mod tests {
 
     #[test]
     fn catalog_migration_preserves_migrated_nested_fields() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("migrated-nested-catalog");
         let _override = DataDirOverride::set(&dir);
         let path = dir.join("registry.json");
@@ -1222,10 +1222,10 @@ mod tests {
 
     #[test]
     fn v2_save_preserves_unknown_fields_at_every_persisted_depth() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("v2-nested-save");
         let _override = DataDirOverride::set(&dir);
         let path = dir.join("registry.json");

@@ -892,6 +892,9 @@ mod platform {
         /// first attempt could not.
         #[test]
         fn a_secret_service_op_retries_once_when_the_daemon_dies_mid_call() {
+            let _data = crate::registry::DataDirTestEnv::new(
+                "a_secret_service_op_retries_once_when_the_daemon_dies_mid_call",
+            );
             let calls = AtomicUsize::new(0);
             let result = with_service_after(Duration::ZERO, || {
                 if calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -909,6 +912,9 @@ mod platform {
         /// D-Bus traffic that causes the crash in the first place.
         #[test]
         fn a_secret_service_op_does_not_retry_a_definitive_answer() {
+            let _data = crate::registry::DataDirTestEnv::new(
+                "a_secret_service_op_does_not_retry_a_definitive_answer",
+            );
             let calls = AtomicUsize::new(0);
             let result = with_service_after(Duration::ZERO, || {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -925,6 +931,9 @@ mod platform {
         /// a second unlock prompt — so it must be attempted once only.
         #[test]
         fn a_secret_service_op_does_not_retry_a_locked_keyring() {
+            let _data = crate::registry::DataDirTestEnv::new(
+                "a_secret_service_op_does_not_retry_a_locked_keyring",
+            );
             let calls = AtomicUsize::new(0);
             let result = with_service_after(Duration::ZERO, || {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -1019,6 +1028,9 @@ mod platform {
         /// (SBS-789), so the error has to reach them.
         #[test]
         fn a_secret_service_op_gives_up_after_a_single_retry() {
+            let _data = crate::registry::DataDirTestEnv::new(
+                "a_secret_service_op_gives_up_after_a_single_retry",
+            );
             let calls = AtomicUsize::new(0);
             let result = with_service_after(Duration::ZERO, || {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -1033,6 +1045,9 @@ mod platform {
         /// once, which is what races gnome-keyring's per-client bookkeeping.
         #[test]
         fn secret_service_ops_never_overlap_across_threads() {
+            let _data = crate::registry::DataDirTestEnv::new(
+                "secret_service_ops_never_overlap_across_threads",
+            );
             static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
             static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
@@ -1622,9 +1637,16 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn with_isolated_vault(test: impl FnOnce()) {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _data = crate::registry::data_dir_test_lock();
-        let dir = std::env::temp_dir().join(format!("toolport-publisher-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-publisher-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let _override = crate::registry::DataDirOverride::set(&dir);
         struct Cleanup(std::path::PathBuf, Option<std::ffi::OsString>);
@@ -1725,6 +1747,7 @@ pub(crate) mod tests {
         ignore = "data-protection keychain needs a signed build w/ provisioning profile (Phase 7)"
     )]
     fn set_get_delete_round_trip() {
+        let _data = crate::registry::DataDirTestEnv::new("set_get_delete_round_trip");
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let sid = "conduit-test-server";
         let key = "CONDUIT_TEST_KEY";
@@ -1738,6 +1761,9 @@ pub(crate) mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_oversized_secret_round_trips_updates_and_deletes() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_oversized_secret_round_trips_updates_and_deletes",
+        );
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1788,6 +1814,9 @@ pub(crate) mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_chunk_reader_survives_concurrent_generation_swaps() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_chunk_reader_survives_concurrent_generation_swaps",
+        );
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1855,6 +1884,9 @@ pub(crate) mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_absent_base_credential_is_retried_before_reporting_none() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_absent_base_credential_is_retried_before_reporting_none",
+        );
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1897,6 +1929,9 @@ pub(crate) mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_chunk_error_survives_trailing_absent_base_reads() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_chunk_error_survives_trailing_absent_base_reads",
+        );
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1928,6 +1963,8 @@ pub(crate) mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_secret_cleanup_guard_deletes_on_unwind() {
+        let _data =
+            crate::registry::DataDirTestEnv::new("windows_secret_cleanup_guard_deletes_on_unwind");
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2095,8 +2132,8 @@ pub(crate) mod tests {
     /// Without the load-modify-save lock, last atomic_write wins and loses peers.
     #[test]
     fn file_backend_concurrent_sets_preserve_all_keys() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _data_dir = crate::registry::data_dir_test_lock();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // This asserts no key is LOST, not that every writer wins the lock inside the
         // production budget. On a loaded runner the 5s default expires, a writer
         // correctly gives up, and this fails for the machine's timing (SBS-895).

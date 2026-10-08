@@ -2556,8 +2556,8 @@ mod tests {
                 current_credential("rotation").unwrap().as_deref(),
                 Some("peer-token")
             );
+            assert!(current_credential(RESERVED_VAULT_NS).is_err());
         });
-        assert!(current_credential(RESERVED_VAULT_NS).is_err());
     }
 
     #[test]
@@ -2749,6 +2749,7 @@ mod tests {
         let Some(dir) = std::env::var_os("TOOLPORT_REFRESH_LOCK_CHILD") else {
             return;
         };
+        let _data_lock = crate::registry::data_dir_test_lock();
         let _override = crate::registry::DataDirOverride::set(std::path::PathBuf::from(dir));
         let _lock = lock_oauth_refresh("dead-holder").unwrap();
         use std::io::Write;
@@ -3445,6 +3446,9 @@ mod tests {
 
     #[test]
     fn refresh_token_reports_a_vault_read_failure_not_missing_state() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "refresh_token_reports_a_vault_read_failure_not_missing_state",
+        );
         let err = refresh_token(RESERVED_VAULT_NS, None)
             .expect_err("reserved namespace must fail the vault read");
         let lower = err.to_lowercase();
@@ -3465,6 +3469,9 @@ mod tests {
 
     #[test]
     fn refresh_token_if_needed_reports_a_vault_read_failure_not_ok_none() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "refresh_token_if_needed_reports_a_vault_read_failure_not_ok_none",
+        );
         let result = refresh_token_if_needed(RESERVED_VAULT_NS);
         assert!(
             matches!(result, Err(_)),

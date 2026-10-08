@@ -228,6 +228,9 @@ mod tests {
 
     #[test]
     fn prewarm_allows_missing_environment_credentials_after_binding_args() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "prewarm_allows_missing_environment_credentials_after_binding_args",
+        );
         let mut server: ServerEntry = serde_json::from_str(
             r#"{"name":"Example","transport":"stdio","command":"npx","args":["-y","example-server","<launch-input>"],"env":[{"key":"API_KEY","secret":true}]}"#,
         )

@@ -7944,6 +7944,8 @@ mod tests {
     /// ENOTDIR on unix but ERROR_PATH_NOT_FOUND (NotFound) on Windows.
     #[test]
     fn write_servers_aborts_when_backup_stat_fails() {
+        let _data =
+            crate::registry::DataDirTestEnv::new("write_servers_aborts_when_backup_stat_fails");
         // Serialize against other tests that mutate the process-global
         // CLAUDE_CONFIG_DIR (e.g. client_config_paths_match_current_platform):
         // without the lock, that test could resolve the default home config

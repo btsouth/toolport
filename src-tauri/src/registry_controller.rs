@@ -2893,10 +2893,10 @@ mod tests {
 
     #[test]
     fn persisted_secret_round_trip_keeps_the_value_out_of_the_registry() {
+        let _data = registry::data_dir_test_lock();
         let _env = registry::REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = registry::data_dir_test_lock();
         let dir = std::env::temp_dir().join(format!(
             "toolport-controller-secret-roundtrip-{}-{}",
             std::process::id(),
@@ -2968,11 +2968,11 @@ mod tests {
 
     impl MoveFixture {
         fn new(registry: &Registry) -> Self {
+            let data_lock = registry::data_dir_test_lock();
             let registry_lock = registry::REGISTRY_ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let env_lock = clients::env_test_lock();
-            let data_lock = registry::data_dir_test_lock();
             let root = std::env::temp_dir().join(format!(
                 "toolport-controller-move-{}-{}",
                 std::process::id(),
