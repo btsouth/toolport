@@ -1611,6 +1611,7 @@ fn removed_meta_tool_error(name: &str) -> String {
     )
 }
 
+
 // --- Grouped discovery mode (CONDUIT_DISCOVERY=grouped) ---
 //
 // Between `lazy` (a constant handful of meta-tools; best for a capable model that
@@ -17530,7 +17531,12 @@ fn proxy_public_http_connection(
     }
     // The daemon detects the public caller's full socket close. Keep the write
     // side open during the relay so waiting callers do not appear abandoned.
-    let _ = relay_http_response(&mut client, &mut upstream, Arc::new(|| {}), Arc::new(|| {}));
+    let _ = relay_http_response(
+        &mut client,
+        &mut upstream,
+        Arc::new(|| {}),
+        Arc::new(|| {}),
+    );
 }
 
 /// The desktop keeps this lightweight public listener as its child. The heavy
@@ -24453,6 +24459,7 @@ mod tests {
                 .unwrap();
         assert!(explicit_on.code_mode);
     }
+
 
     /// A failed registry load must not advertise or run Code Mode, even when
     /// a later request snapshot contains an explicit opt-in.
