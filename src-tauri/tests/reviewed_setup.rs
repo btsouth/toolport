@@ -95,7 +95,7 @@ impl Drop for Fixture {
                                 .parent()
                                 .unwrap()
                                 .join("toolport-gateway");
-                            assert_eq!(image.as_deref(), Ok(private_image.as_path()));
+                            assert!(image.is_ok_and(|image| image == private_image));
                             // This daemon belongs to this disposable fixture. An active
                             // adapter listener can outlive its caller, so reap it before
                             // removing the executable or its private data.
