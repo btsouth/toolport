@@ -2542,21 +2542,6 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
     card
 }
 
-/// The feedback line after a one-shot migration. States what moved, what was
-/// newly imported, and that a backup exists - the user is about to restart the
-/// client and needs to know the old config is recoverable.
-fn migrate_feedback(client_name: &str, imported: usize, moved: usize, backup: bool) -> String {
-    let mut message = format!(
-        "Moved {moved} {} into Toolport ({imported} newly imported). {client_name} now uses only the Toolport gateway.",
-        if moved == 1 { "server" } else { "servers" }
-    );
-    if backup {
-        message.push_str(" The previous config was backed up.");
-    }
-    message.push_str(" Restart the client to pick this up.");
-    message
-}
-
 fn confirm_client_migrate(client: &state::ClientView, _button: gtk::Button, page: ClientPage) {
     let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else { return; };
     setup::connect(&parent, client.id.clone(), client.scope_id.clone(), client.gateway_state == state::ClientGatewayState::Customized, move || page.refresh());
@@ -8607,7 +8592,7 @@ fn open_server_editor_prefilled(
         let url_for_fill = url.clone();
         let cwd_for_fill = cwd.clone();
         let env_for_fill = snippet_env.clone();
-        fill.connect_clicked(move |_| {
+        fill.connect_clicked(move |fill| {
             let buffer = snippet.buffer();
             let text = buffer
                 .text(&buffer.start_iter(), &buffer.end_iter(), false)
@@ -10073,21 +10058,6 @@ mod tests {
         first.requires_review = !first.requires_review;
         assert_eq!(server_order_key(&first), before);
         assert!(server_order_key(&first) < server_order_key(&second));
-    }
-
-    #[test]
-    fn migrate_feedback_reports_moved_imported_and_the_backup() {
-        assert_eq!(
-            migrate_feedback("Claude Desktop", 2, 3, true),
-            "Moved 3 servers into Toolport (2 newly imported). Claude Desktop now uses only \
-             the Toolport gateway. The previous config was backed up. Restart the client to \
-             pick this up."
-        );
-        assert_eq!(
-            migrate_feedback("Zed", 0, 1, false),
-            "Moved 1 server into Toolport (0 newly imported). Zed now uses only the Toolport \
-             gateway. Restart the client to pick this up."
-        );
     }
 
     #[test]
