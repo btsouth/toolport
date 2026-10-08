@@ -3,6 +3,7 @@
 import readline from "node:readline";
 import { readFileSync } from "node:fs";
 import { URL } from "node:url";
+import http from "node:http";
 
 const pins = JSON.parse(
   readFileSync(new URL("../src-tauri/catalog-pins.json", import.meta.url), "utf8"),
@@ -62,6 +63,18 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
   if (!Object.hasOwn(request, "id")) continue;
   let result = {};
   if (request.method === "initialize") {
+    // The gateway fixture can hold one handshake until a partial catalog was
+    // observed. Release comes from the test, not an elapsed-time assumption.
+    if (process.env.TOOLPORT_FIXTURE_CATALOG_GATE) {
+      await new Promise((resolve, reject) => {
+        http
+          .get(process.env.TOOLPORT_FIXTURE_CATALOG_GATE, (response) => {
+            response.resume();
+            response.on("end", resolve);
+          })
+          .on("error", reject);
+      });
+    }
     result = {
       protocolVersion: request.params.protocolVersion,
       capabilities: { tools: {} },
