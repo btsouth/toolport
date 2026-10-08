@@ -54,7 +54,9 @@ impl Fixture {
             )),
         )
         .unwrap();
-        registry::save(&registry::Registry::default()).unwrap();
+        let mut registry = registry::Registry::default();
+        registry.set_client_discovery("claude-code", Some("lazy"));
+        registry::save(&registry).unwrap();
         fixture
     }
     fn set(&mut self, key: &str, value: Option<std::ffi::OsString>) {
@@ -181,7 +183,9 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
     assert_eq!(std::fs::read_to_string(fixture.config()).unwrap(), original);
 
     // Start again with an empty registry so the failed import cannot affect this cutover.
-    registry::save(&registry::Registry::default()).unwrap();
+    let mut empty = registry::Registry::default();
+    empty.set_client_discovery("claude-code", Some("lazy"));
+    registry::save(&empty).unwrap();
     let mock_path = std::env::current_exe()
         .unwrap()
         .parent()
