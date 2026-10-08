@@ -741,17 +741,40 @@ describe("telemetry health", () => {
 it("uses one server filter and one identity, time and wait meta line", async () => {
   const ts = Date.now() - 120000;
   getAuditLog.mockResolvedValue([
-    entry({ ts, server: "team_slack", serverId: "team-slack", kind: "approval", decision: "denied", client: "adapter:claude-code", clientName: "Claude Code", clientLabel: "Claude Code 2.1", heldMs: 1500 }),
-    entry({ ts, server: "team_slack", serverId: "team-slack", clientName: "Claude Code", durationMs: 850 }),
+    entry({
+      ts,
+      server: "team_slack",
+      serverId: "team-slack",
+      kind: "approval",
+      decision: "denied",
+      client: "adapter:claude-code",
+      clientName: "Claude Code",
+      clientLabel: "Claude Code 2.1",
+      heldMs: 1500,
+    }),
+    entry({
+      ts,
+      server: "team_slack",
+      serverId: "team-slack",
+      clientName: "Claude Code",
+      durationMs: 850,
+    }),
   ]);
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   await user.click(await screen.findByRole("button", { name: /recent calls/i }));
-  expect(screen.getByText("Claude Code 2.1 · 2m ago · waited 1.5 s")).toHaveAttribute("title", expect.stringContaining("adapter:claude-code"));
+  expect(screen.getByText("Claude Code 2.1 · 2m ago · waited 1.5 s")).toHaveAttribute(
+    "title",
+    expect.stringContaining("adapter:claude-code"),
+  );
   expect(screen.queryByText("adapter:claude-code")).not.toBeInTheDocument();
   await user.click(screen.getByRole("combobox"));
-  expect(screen.getAllByRole("option", { name: "team_slack", exact: true })).toHaveLength(1);
-  expect(screen.queryByRole("option", { name: "team-slack", exact: true })).not.toBeInTheDocument();
+  expect(screen.getAllByRole("option", { name: "team_slack", exact: true })).toHaveLength(
+    1,
+  );
+  expect(
+    screen.queryByRole("option", { name: "team-slack", exact: true }),
+  ).not.toBeInTheDocument();
 });
 
 it("uses one server option for hyphenated call and approval identities", async () => {

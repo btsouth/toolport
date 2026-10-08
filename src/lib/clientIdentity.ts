@@ -9,7 +9,10 @@ export function shortenClientLabel(label: string, limit: number): string {
 }
 
 /** One compact identity for an Activity meta line, with reports kept explicit. */
-export function activityClientName(client: { clientName?: string | null; clientLabel?: string | null }): string {
+export function activityClientName(client: {
+  clientName?: string | null;
+  clientLabel?: string | null;
+}): string {
   const name = trustedClientName(client);
   const label = client.clientLabel;
   if (!label || label === name) return name;

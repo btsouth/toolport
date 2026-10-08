@@ -4469,7 +4469,7 @@ fn execute_call(
                             incoming,
                         ) {
                             Ok(token) => return modern_hitl_input_required(&token),
-                            Err(decision) => (decision, 0, current_fp.clone(), false),
+                            Err(decision) => (decision, 0, current_fp.clone(), true),
                         }
                     }
                 }
@@ -9577,9 +9577,8 @@ type IntegrityCheckFailure = (String, BTreeSet<String>);
 /// prove the drifted definition is never published in the first place. Registered and
 /// consumed on one thread, so a parallel test's gate cannot trigger it.
 #[cfg(test)]
-static INTEGRITY_GATE_OBSERVER: Mutex<
-    Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>,
-> = Mutex::new(None);
+static INTEGRITY_GATE_OBSERVER: Mutex<Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>> =
+    Mutex::new(None);
 
 #[cfg(test)]
 fn observe_integrity_gate() {
