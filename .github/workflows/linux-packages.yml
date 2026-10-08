@@ -16,6 +16,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - name: Test removal script contracts
+        run: python3 scripts/test-uninstall-hooks.py
       - name: Install native build dependencies
         run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev libgtk-4-dev libadwaita-1-dev zip nodejs rpm
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2

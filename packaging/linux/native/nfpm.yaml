@@ -15,6 +15,10 @@ description: |
   Manage MCP servers once and share them across AI clients, with approvals,
   audit history and local credential storage.
 contents:
+  - src: packaging/linux/native/disconnect-users.sh
+    dst: /usr/share/toolport/disconnect-users.sh
+    file_info:
+      mode: 0o755
   - src: src-tauri/target/release/toolport-gtk
     dst: /usr/bin/toolport-gtk
     file_info:
@@ -73,6 +77,8 @@ contents:
     packager: deb
 overrides:
   deb:
+    scripts:
+      preremove: packaging/linux/native/preremove-deb.sh
     # Ubuntu 24.04 ABI floor; GTK/adwaita pull the rendering dependencies.
     depends:
       - libgtk-4-1 (>= 4.14)
@@ -85,6 +91,8 @@ overrides:
     suggests:
       - gnome-keyring
   rpm:
+    scripts:
+      preremove: packaging/linux/native/preremove-rpm.sh
     depends:
       - gtk4 >= 4.14
       - libadwaita >= 1.5

@@ -17642,11 +17642,12 @@ enum ArgAction {
     /// was removed in 2.0; the flag stays so a stale client hook still exits 0 with an
     /// allow. Carries the agent name.
     Guard(String),
-    /// Nothing that changes startup mode; fall through to normal gateway
-    /// startup.
+    /// Standalone manual installer session check.
+    InstallerPreflight(std::path::PathBuf),
     DisconnectAll {
         dry_run: bool,
     },
+    /// Fall through to normal gateway startup.
     Run,
 }
 
@@ -17664,6 +17665,16 @@ fn parse_args(args: &[String]) -> ArgAction {
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         return ArgAction::Version;
+    }
+    if args.first().map(String::as_str) == Some("--installer-preflight") {
+        return match args {
+            [_, path] if std::path::Path::new(path).is_absolute() => {
+                ArgAction::InstallerPreflight(path.into())
+            }
+            _ => ArgAction::Unknown(
+                "--installer-preflight requires one absolute install directory".into(),
+            ),
+        };
     }
     if args.iter().any(|arg| arg == "--disconnect-all") {
         if let Some(arg) = args
@@ -17745,6 +17756,7 @@ fn usage() -> String {
          \x20                        the in-process gateway (Phase 2; opt-in)\n\
          \x20   --private-gateway    One adapter's own gateway while the host daemon is\n\
          \x20                        unresponsive (internal)\n\
+         \x20   --installer-preflight <absolute-install-dir> Defer installation while client gateways are open\n\
          \x20   --disconnect-all [--dry-run] Restore all client configs and exit; JSON per-client results\n\
          \x20   --selftest-secrets    Diagnostic: read every vaulted secret and report\n\
          \x20   --toolport-hook EVENT Deprecated no-op accepted so hook entries an\n\
@@ -17862,6 +17874,15 @@ fn main() {
                 Err(error) => {
                     eprintln!("toolport-gateway --disconnect-all: {error}");
                     conduit_lib::telemetry::exit_with(1);
+                }
+            }
+        }
+        ArgAction::InstallerPreflight(path) => {
+            match conduit_lib::gateway_publish::installer_preflight(&path) {
+                Ok(()) => std::process::exit(0),
+                Err(clients) => {
+                    println!("Toolport installation deferred:\n{}", clients.join("\n"));
+                    std::process::exit(1);
                 }
             }
         }
@@ -18459,6 +18480,22 @@ mod tests {
     /// tools out of the catalog. The destructive fallback scans the tool name for
     /// verbs, and a cached entry carries the namespaced `server__tool` form, so
     /// judging it whole lets the prefix decide for every tool on that server.
+    #[test]
+    fn installer_preflight_requires_exact_standalone_arguments() {
+        let absolute = std::env::temp_dir().to_string_lossy().into_owned();
+        assert_eq!(
+            parse_args(&["--installer-preflight".into(), absolute.clone()]),
+            ArgAction::InstallerPreflight(absolute.clone().into())
+        );
+        for args in [
+            vec!["--installer-preflight".into()],
+            vec!["--installer-preflight".into(), "relative".into()],
+            vec!["--installer-preflight".into(), absolute, "--daemon".into()],
+        ] {
+            assert!(matches!(parse_args(&args), ArgAction::Unknown(_)));
+        }
+    }
+
     #[test]
     fn disconnect_all_is_a_standalone_role_and_dry_run_cannot_start_gateway() {
         assert_eq!(parse_args(&["--disconnect-all".into()]), ArgAction::DisconnectAll { dry_run: false });

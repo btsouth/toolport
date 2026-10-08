@@ -1005,74 +1005,98 @@ fn log_reap_report(kind: &str, report: &ReapReport) {
     }
 }
 
-/// Terminate every Toolport/Conduit gateway process (all platforms). Used before
-/// in-app update so locked binaries can be replaced. Does not touch parent apps.
-/// Returns the complete shutdown report. The updater must refuse installation
-/// while either `failed` or `remaining` is non-empty.
-pub fn stop_spawned_gateways() -> ReapReport {
-    let daemons = live_host_daemons();
-    for descriptor in &daemons {
-        let _ = crate::daemon::request_shutdown_if_idle(descriptor);
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while daemons
-        .iter()
-        .any(|descriptor| pid_is_running(descriptor.pid))
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    // The process table is global, while descriptors above cover only this
-    // data directory. A daemon from another data directory must still veto
-    // installation rather than fall through to kill-all below.
-    let active: Vec<_> = list_gateway_processes()
-        .into_iter()
-        .filter(|process| {
-            process.pid != std::process::id() && process.is_host_daemon != Some(false)
-        })
-        .collect();
-    if !active.is_empty() {
-        let report = ReapReport {
-            failed: active
-                .iter()
-                .map(|process| {
-                    if process.is_host_daemon == Some(true) {
-                        format!(
-                            "shared gateway daemon (pid {}) is still running; close its MCP sessions and retry the update",
-                            process.pid
-                        )
-                    } else {
-                        format!(
-                            "gateway process (pid {}) could not be inspected; close it and retry the update",
-                            process.pid
-                        )
-                    }
-                })
-                .collect(),
-            ..ReapReport::default()
-        };
-        log_reap_report("updater reaper", &report);
-        return report;
-    }
-    let ctx = ReapContext {
-        current_version: env!("CARGO_PKG_VERSION").to_string(),
-        keep_paths: Vec::new(),
-        // Even the updater's kill-all must not kill the process running it.
-        keep_pids: vec![std::process::id()],
-        kill_all: true,
+/// Manual installers only own their install directory and this user's published
+/// gateways. A same-named process elsewhere is never an installer target.
+fn installer_owns_process(
+    process: &GatewayProcess,
+    install_dir: &Path,
+    data_dir: Option<&Path>,
+) -> bool {
+    let Some(path) = process.path.as_ref() else {
+        return false;
     };
-    let mut report = reap_with_context(&ctx);
-    // A daemon may start after the first inventory. It is never sent a kill
-    // signal, and a final observation must still block the installer.
-    for process in list_gateway_processes() {
-        if process.pid != std::process::id() && process.is_host_daemon != Some(false) {
-            report.remaining.push(format!(
-                "shared or uninspectable gateway (pid {}) is still running",
-                process.pid
-            ));
+    if !path.is_absolute() || !install_dir.is_absolute() {
+        return false;
+    }
+    let installed = ["toolport-gateway", "conduit-gateway"].iter().any(|name| {
+        paths_equal(
+            path,
+            &install_dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+        )
+    });
+    installed
+        || (is_gateway_basename(&process.basename)
+            && data_dir.is_some_and(|dir| in_explicit_reap_scope(process, Some(&dir.join("bin")))))
+}
+
+fn installer_blockers(processes: &[GatewayProcess]) -> Vec<String> {
+    processes.iter().map(|process| {
+        let client = process.parent.as_ref()
+            .map(|parent| format!("{} (pid {})", parent.basename, parent.pid))
+            .unwrap_or_else(|| "an unidentified client or service".into());
+        format!("{client}: {}. Close this client's MCP session, then retry; cancel to defer installation", label_process(process))
+    }).collect()
+}
+
+/// Refuse manual installation while a client gateway is open. Only authenticated
+/// idle shutdown is requested; no process is force-killed, even on older installs.
+pub fn installer_preflight(install_dir: &Path) -> Result<(), Vec<String>> {
+    if !install_dir.is_absolute() {
+        return Err(vec!["Installer path must be absolute".into()]);
+    }
+    let data_dir = crate::registry::conduit_dir();
+    let inventory = || {
+        list_gateway_processes()
+            .into_iter()
+            .filter(|process| {
+                process.pid != std::process::id()
+                    && (process.path.is_none()
+                        || installer_owns_process(process, install_dir, data_dir.as_deref()))
+            })
+            .collect::<Vec<_>>()
+    };
+    let initial = inventory();
+    if initial.is_empty() {
+        return Ok(());
+    }
+    // A stdio adapter, private host or old gateway is an open client connection.
+    // Unknown command lines cannot be treated as idle.
+    if initial
+        .iter()
+        .any(|process| process.is_host_daemon != Some(true))
+    {
+        return Err(installer_blockers(&initial));
+    }
+    for descriptor in live_host_daemons() {
+        if initial.iter().any(|process| process.pid == descriptor.pid) {
+            let _ = crate::daemon::request_shutdown_if_idle(&descriptor);
         }
     }
-    log_reap_report("updater reaper", &report);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let remaining = inventory();
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(installer_blockers(&remaining));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// In-app updates use the same close/defer policy as manual installers.
+pub fn stop_spawned_gateways() -> ReapReport {
+    let result = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .ok_or_else(|| vec!["Could not resolve Toolport's install directory".into()])
+        .and_then(|dir| installer_preflight(&dir));
+    let report = ReapReport {
+        failed: result.err().unwrap_or_default(),
+        ..ReapReport::default()
+    };
+    log_reap_report("updater preflight", &report);
     report
 }
 
@@ -2165,6 +2189,37 @@ mod tests {
             }),
             ..proc(pid, basename, path)
         }
+    }
+
+    #[test]
+    fn installer_matches_paths_and_never_a_foreign_basename() {
+        let dir = ScratchDir::new("installer-scope");
+        let install = dir.join("install");
+        let data = dir.join("data");
+        let name = format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX);
+        let owned = proc_with_parent(41, &name, install.join(&name).to_str(), 42, "Cursor");
+        assert!(installer_owns_process(&owned, &install, Some(&data)));
+        let published = proc(
+            43,
+            "toolport-gateway-2.0.0.exe",
+            data.join("bin/toolport-gateway-2.0.0.exe").to_str(),
+        );
+        assert!(installer_owns_process(&published, &install, Some(&data)));
+        let foreign = proc(44, &name, dir.join("other").join(&name).to_str());
+        assert!(!installer_owns_process(&foreign, &install, Some(&data)));
+        assert!(!installer_owns_process(
+            &proc(45, &name, None),
+            &install,
+            Some(&data)
+        ));
+        assert!(!installer_owns_process(
+            &owned,
+            Path::new("relative"),
+            Some(&data)
+        ));
+        let blockers = installer_blockers(&[owned]);
+        assert!(blockers[0].contains("Cursor (pid 42)"));
+        assert!(blockers[0].contains("cancel to defer"));
     }
 
     #[test]
