@@ -504,6 +504,8 @@ fn registry_matches(left: &Registry, right: &Registry) -> Result<bool, String> {
     let mut right = right.clone();
     left.normalize_profile_references();
     right.normalize_profile_references();
+    left.sync_legacy_safety_mirror();
+    right.sync_legacy_safety_mirror();
     Ok(serde_json::to_value(&left).map_err(|e| e.to_string())?
         == serde_json::to_value(&right).map_err(|e| e.to_string())?)
 }
