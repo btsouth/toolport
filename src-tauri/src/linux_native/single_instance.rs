@@ -181,36 +181,65 @@ pub(super) fn show_failure(error: &str) {
     let app = adw::Application::builder()
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
-    let error = error.to_owned();
-    app.connect_activate(move |app| {
-        let window = adw::ApplicationWindow::builder()
-            .application(app)
-            .title("Toolport could not start")
-            .default_width(460)
-            .default_height(180)
-            .build();
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 16);
-        content.set_margin_top(24);
-        content.set_margin_bottom(24);
-        content.set_margin_start(24);
-        content.set_margin_end(24);
-        content.append(&gtk::Label::builder()
-            .label(format!("{error}\n\nQuit the running Toolport from its tray menu, then launch Toolport again."))
-            .wrap(true)
-            .build());
-        let close = gtk::Button::with_label("Close");
+    app.connect_activate(|app| {
+        let dialog = failure_dialog(app);
         let app = app.clone();
-        close.connect_clicked(move |_| app.quit());
-        content.append(&close);
-        window.set_content(Some(&content));
-        window.present();
+        dialog.connect_response(None, move |_, _| app.quit());
+        dialog.present();
     });
     app.run_with_args(&["toolport"]);
+}
+
+#[allow(deprecated)]
+fn failure_dialog(app: &adw::Application) -> adw::MessageDialog {
+    // A standalone modal MessageDialog advertises an xdg dialog to the
+    // compositor without mapping a tiled application window behind it.
+    let dialog = adw::MessageDialog::new(
+        None::<&gtk::Window>,
+        Some("Toolport is still running"),
+        Some("The previous version did not close. Quit it from its tray menu, then open Toolport again."),
+    );
+    dialog.set_application(Some(app));
+    dialog.set_title(Some("Toolport is still running"));
+    dialog.set_modal(true);
+    dialog.set_resizable(false);
+    dialog.add_response("close", "Close");
+    dialog.set_close_response("close");
+    dialog.set_default_response(Some("close"));
+    dialog
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    #[allow(deprecated)]
+    fn failure_is_a_standalone_modal_alert() {
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let dialog = failure_dialog(&app);
+        assert!(dialog.is_modal());
+        assert!(!dialog.is_resizable());
+        assert!(dialog.transient_for().is_none());
+        assert_eq!(
+            dialog.heading().as_deref(),
+            Some("Toolport is still running")
+        );
+        assert_eq!(dialog.body(), "The previous version did not close. Quit it from its tray menu, then open Toolport again.");
+        assert_eq!(dialog.response_label("close"), "Close");
+        assert_eq!(dialog.close_response(), "close");
+        assert_eq!(app.windows().len(), 1);
+        let responded = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = responded.clone();
+        dialog.connect_response(None, move |_, response| seen.set(response == "close"));
+        dialog.response("close");
+        assert!(responded.get());
+    }
 
     #[test]
     fn same_executable_activates() {
