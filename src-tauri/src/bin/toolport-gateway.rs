@@ -13868,6 +13868,16 @@ fn process_request(
     });
     let _request = UpstreamRequestGuard::enter(client.map(str::to_string));
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    // One deadline includes startup and rooted composition, rather than granting
+    // each phase another budget. Warm tools lists never enter the catalog wait.
+    let tools_list_budget = if discovery == DiscoveryMode::Full {
+        Duration::from_millis(
+            clients::discovery_capabilities(client.unwrap_or("")).cold_full_list_wait_ms,
+        )
+    } else {
+        FIRST_CATALOG_WAIT
+    };
+    let tools_list_deadline = Instant::now() + tools_list_budget;
     if !state.http && upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
         state.stdio_upstream.mark_modern_upstream();
     }
@@ -13914,7 +13924,11 @@ fn process_request(
         _ => false,
     };
     if wait {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = if method == "tools/list" {
+            tools_list_deadline
+        } else {
+            Instant::now() + Duration::from_secs(30)
+        };
         while !state.ready.load(Ordering::SeqCst) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -13951,29 +13965,14 @@ fn process_request(
         });
     }
 
-    // Tools can use their disk cache immediately. Other first lists wait for
-    // startup because the disk cache contains tools only. Every first list,
-    // including a cold tools/list, shares one short bound: a hanging start or a
-    // backoff retry is answered with whatever has loaded, and a server that
-    // connects later announces its catalog with list_changed. A server that has
-    // already connected and is being published is still awaited past the bound.
-    // Warm lists stay fast.
+    // Prompt/resource catalogs have no disk cache and keep the short first-list
+    // wait. Tools wait below, once we have the cache for this client's view.
     let catalog_list = matches!(
         method,
         "resources/list" | "resources/templates/list" | "prompts/list"
     );
     let catalog_deadline = Instant::now() + FIRST_CATALOG_WAIT;
-    if matches!(
-        method,
-        "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
-    ) && (method != "tools/list"
-        || state
-            .cached_tools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .tools
-            .is_empty())
-    {
+    if catalog_list {
         let deadline = Instant::now() + Duration::from_secs(30);
         let visible = |id: &str| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope));
         while Instant::now() < deadline {
@@ -14116,14 +14115,11 @@ fn process_request(
     }
     // Rooted composition can take a while, so its bound starts at its demand.
     let rooted_catalog_deadline = Instant::now() + FIRST_CATALOG_WAIT;
-    if daemon_adapter
-        && (rooted_list || method == "tools/list" && rooted_router.aggregated_tools().is_empty())
-    {
+    if daemon_adapter && rooted_list {
         let deadline = Instant::now() + Duration::from_secs(30);
         let visible = |id: &str| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope));
         while rooted_router.any_discovering(visible)
-            && (!rooted_list
-                || Instant::now() < rooted_catalog_deadline
+            && (Instant::now() < rooted_catalog_deadline
                 || rooted_router.any_publishing_first_catalog(visible))
             && Instant::now() < deadline
         {
@@ -14142,24 +14138,56 @@ fn process_request(
             rooted_router = state.router_for_root(base, &reg, adapter_root.as_deref(), allowed);
         }
     }
-    let (router, adapter_catalog) = if state.daemon_mode.load(Ordering::SeqCst) {
-        adapter_profile
-            .map(|profile| state.router_for_adapter_profile(rooted_router.clone(), &reg, profile))
-            .map(|(router, catalog)| (router, Some(catalog)))
-            .unwrap_or_else(|| (Arc::clone(&rooted_router), None))
-    } else {
-        (rooted_router, None)
-    };
-    // The shared HTTP cache reflects the fail-closed intersection across all
-    // profiles. An adapter needs the catalog indexed under its own tool scope,
-    // including search and code-mode calls, not that shared intersection.
-    let cache_snapshot = adapter_catalog.unwrap_or_else(|| {
-        state
+    let catalog_for_view = |rooted: Arc<Router>| {
+        // The shared HTTP cache is the intersection of all profiles. Adapter
+        // clients need their own tool scope, including when deciding coldness.
+        if state.daemon_mode.load(Ordering::SeqCst) {
+            if let Some(profile) = adapter_profile {
+                return state.router_for_adapter_profile(rooted, &reg, profile);
+            }
+        }
+        let cached = state
             .cached_tools
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    });
+            .clone();
+        (rooted, cached)
+    };
+    let (mut router, mut cache_snapshot) = catalog_for_view(rooted_router);
+    if method == "tools/list" {
+        let owners = unique_prefix_owners(&reg);
+        let visible = |id: &str| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope));
+        let cold = scope_tools(&cache_snapshot.tools, allowed, |name| {
+            owner_of_exposed_tool(Some(&router), &owners, name)
+        })
+        .is_empty();
+        if cold {
+            while Instant::now() < tools_list_deadline
+                && (router.any_discovering(visible) || router.any_publishing_first_catalog(visible))
+            {
+                if cancel
+                    .as_ref()
+                    .is_some_and(downstream::CancelContext::is_cancelled)
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+                let base = state
+                    .router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let rooted = if daemon_adapter {
+                    state.router_for_root(base, &reg, adapter_root.as_deref(), allowed)
+                } else {
+                    base
+                };
+                (router, cache_snapshot) = catalog_for_view(rooted);
+            }
+            // Do not wait on rebuild_lock after the deadline: a slow publisher
+            // must not turn a bounded cold list into a client startup timeout.
+        }
+    }
     if method == "subscriptions/listen"
         && !state.http
         && upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION)
@@ -20190,6 +20218,140 @@ mod tests {
         drop(release);
     }
 
+    fn full_tools_list_for_client(
+        state: &GatewayState,
+        client: &str,
+        allowed: Option<&HashSet<String>>,
+    ) -> Value {
+        process_request(
+            state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            &SearchGuard::default(),
+            allowed,
+            None,
+            None,
+            None,
+            Some(client),
+            None,
+            DiscoveryMode::Full,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn supervisor_cold_full_no_refresh_waits_for_visible_first_catalog() {
+        let _env = DataDirTestEnv::new("cold-full-no-refresh");
+        let state = http_state(false);
+        // Another client's warm catalog must not shorten this view's cold wait.
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let mut live = Router::new();
+        live.add_supervised(
+            "late".into(),
+            Vec::new(),
+            Arc::new(move || {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        let live = Arc::new(live);
+        *state.router.lock().unwrap() = Arc::clone(&live);
+        let allowed = HashSet::from(["late".to_string()]);
+        std::thread::scope(|scope| {
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+            let state = &state;
+            let allowed = &allowed;
+            scope.spawn(move || {
+                reply_tx
+                    .send(full_tools_list_for_client(&state, "cursor", Some(&allowed)))
+                    .unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                matches!(
+                    reply_rx.recv_timeout(FIRST_CATALOG_WAIT + Duration::from_millis(100)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "no-refresh client returned before its larger budget"
+            );
+            release_tx.send(()).unwrap();
+            wait_for_supervisor_result(&live);
+            adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
+            let reply = reply_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(reply["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "late__cached"));
+            assert!(!reply["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "other__cached"));
+        });
+    }
+
+    #[test]
+    fn supervisor_cold_full_no_refresh_hanging_start_stops_at_client_budget() {
+        let _env = DataDirTestEnv::new("cold-full-client-budget");
+        let state = http_state(false);
+        let mut live = Router::new();
+        let release = hanging_supervisor(&mut live, "hang");
+        *state.router.lock().unwrap() = Arc::new(live);
+        let started = Instant::now();
+        let reply = full_tools_list_for_client(&state, "codex", None);
+        let waited = started.elapsed();
+        let budget =
+            Duration::from_millis(clients::discovery_capabilities("codex").cold_full_list_wait_ms);
+        assert!(waited >= budget, "cold list returned too early: {waited:?}");
+        assert!(
+            waited < budget + Duration::from_secs(1),
+            "cold list exceeded budget: {waited:?}"
+        );
+        assert!(state.router.lock().unwrap().lazy_starting("hang"));
+        assert!(!reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "hang__cached"));
+        drop(release);
+    }
+
+    #[test]
+    fn supervisor_warm_full_no_refresh_does_not_wait_for_hanging_start() {
+        let _env = DataDirTestEnv::new("warm-full-no-refresh");
+        let state = http_state(false);
+        let mut live = cache_router();
+        let release = hanging_supervisor(&mut live, "hang");
+        live.prepare_lazy_use("hang");
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(live.aggregated_tools()));
+        *state.router.lock().unwrap() = Arc::new(live);
+        state.ready.store(false, Ordering::SeqCst);
+        let started = Instant::now();
+        let reply = full_tools_list_for_client(&state, "codex", None);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "warm list waited for startup"
+        );
+        assert!(reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "cache__cached"));
+        drop(release);
+    }
+
     /// A cold tools/list (empty cache) shares the short first-catalog bound: a start
     /// that hangs is answered with an empty list, and the server that connects later
     /// reaches the client through the publish path's `tools/list_changed` instead of
@@ -20228,7 +20390,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Some("claude-code"),
             None,
             DiscoveryMode::Full,
         )
@@ -20323,7 +20485,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Some("claude-code"),
             None,
             DiscoveryMode::Full,
         )

@@ -130,13 +130,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     });
   }
 
-  // Absence is Auto; the backend capability table requires native search and
-  // late tool-list refreshes before choosing Full.
-  const autoMode =
-    client.discovery?.nativeToolSearch === true &&
-    client.discovery?.toolsListChanged === true
-      ? "full"
-      : "lazy";
+  // Absence is Auto; native search or deferred loading selects Full.
+  const autoMode = client.discovery?.nativeToolSearch === true ? "full" : "lazy";
   const storedMode = registry?.clientDiscovery?.[client.id]?.trim().toLowerCase();
   const clientMode = storedMode && DISCOVERY_HINT[storedMode] ? storedMode : "";
   const effectiveMode = clientMode || autoMode;

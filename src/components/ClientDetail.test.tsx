@@ -449,14 +449,10 @@ describe("ClientDetail Auto discovery", () => {
           onChanged={vi.fn()}
         />,
       );
-      expect(
-        screen.getByText(refresh ? "Auto (full)" : "Auto (lazy)"),
-      ).toBeInTheDocument();
+      expect(screen.getByText("Auto (full)")).toBeInTheDocument();
       expect(
         screen.getByText(
-          refresh
-            ? "Full tool list. Client per-tool permission rules need Full mode."
-            : "Search, then call tools. Client per-tool permission rules need Full mode.",
+          "Full tool list. Client per-tool permission rules need Full mode.",
         ),
       ).toBeInTheDocument();
     },

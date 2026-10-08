@@ -1,5 +1,4 @@
-//! Evidence-backed discovery defaults. Unknown capabilities stay lazy: a cold
-//! catalog returns in two seconds and late tools require list_changed refreshes.
+//! Evidence-backed discovery defaults and bounded cold Full catalog waits.
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -7,6 +6,7 @@ use serde::Serialize;
 pub struct DiscoveryCapabilities {
     pub native_tool_search: Option<bool>,
     pub tools_list_changed: Option<bool>,
+    pub cold_full_list_wait_ms: u64,
     pub evidence: &'static str,
 }
 
@@ -21,7 +21,7 @@ impl DiscoveryCapabilities {
     }
 
     pub fn auto_mode(self) -> &'static str {
-        if self.native_tool_search == Some(true) && self.tools_list_changed == Some(true) {
+        if self.native_tool_search == Some(true) {
             "full"
         } else {
             "lazy"
@@ -36,37 +36,44 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
         "claude-code" => DiscoveryCapabilities {
             native_tool_search: Some(true),
             tools_list_changed: Some(true),
+            cold_full_list_wait_ms: 2_000,
             evidence: "https://code.claude.com/docs/en/mcp",
         },
         "codex" => DiscoveryCapabilities {
             native_tool_search: Some(true),
-            tools_list_changed: None,
+            tools_list_changed: Some(false),
+            cold_full_list_wait_ms: 8_000,
             evidence: "https://developers.openai.com/codex/config-reference",
         },
         "cursor" => DiscoveryCapabilities {
             native_tool_search: Some(true),
             tools_list_changed: None,
+            cold_full_list_wait_ms: 5_000,
             evidence: "https://cursor.com/blog/dynamic-context-discovery",
         },
         "anthropic-api" => DiscoveryCapabilities {
             native_tool_search: Some(true),
             tools_list_changed: None,
+            cold_full_list_wait_ms: 5_000,
             evidence:
                 "https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool",
         },
         "openai-api" => DiscoveryCapabilities {
             native_tool_search: Some(true),
             tools_list_changed: None,
+            cold_full_list_wait_ms: 5_000,
             evidence: "https://developers.openai.com/api/docs/guides/tools-tool-search",
         },
         "lm-studio" | "jan" | "anythingllm" => DiscoveryCapabilities {
             native_tool_search: None,
             tools_list_changed: None,
+            cold_full_list_wait_ms: 5_000,
             evidence: "docs/clients.md (local-model clients)",
         },
         _ => DiscoveryCapabilities {
             native_tool_search: None,
             tools_list_changed: None,
+            cold_full_list_wait_ms: 5_000,
             evidence: "docs/clients.md (adapter notes; discovery support unverified)",
         },
     }
@@ -140,24 +147,25 @@ mod tests {
     }
 
     #[test]
-    fn auto_requires_search_and_late_catalog_refresh() {
-        assert_eq!(capabilities("claude-code").auto_mode(), "full");
-        for id in [
-            "codex",
-            "cursor",
-            "anthropic-api",
-            "openai-api",
-            "lm-studio",
-            "jan",
-            "anythingllm",
-            "unknown",
+    fn auto_uses_native_search_with_per_client_cold_budgets() {
+        for (id, budget) in [
+            ("claude-code", 2_000),
+            ("codex", 8_000),
+            ("cursor", 5_000),
+            ("anthropic-api", 5_000),
+            ("openai-api", 5_000),
         ] {
+            assert_eq!(capabilities(id).auto_mode(), "full", "{id}");
+            assert_eq!(capabilities(id).cold_full_list_wait_ms, budget, "{id}");
+        }
+        for id in ["lm-studio", "jan", "anythingllm", "unknown"] {
             assert_eq!(capabilities(id).auto_mode(), "lazy", "{id}");
         }
         assert_eq!(
             DiscoveryCapabilities {
                 native_tool_search: None,
                 tools_list_changed: Some(true),
+                cold_full_list_wait_ms: 2_000,
                 evidence: "fixture"
             }
             .auto_mode(),

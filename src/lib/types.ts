@@ -30,10 +30,11 @@ export interface DetectedClient {
   id: string;
   name: string;
   usesConnectors: boolean;
-  /** Backend capability evidence; missing or unknown support resolves to lazy. */
+  /** Backend capability evidence; missing or unknown native search resolves to lazy. */
   discovery?: {
     nativeToolSearch: boolean | null;
     toolsListChanged: boolean | null;
+    coldFullListWaitMs?: number;
     evidence: string;
   };
   configPath: string;
