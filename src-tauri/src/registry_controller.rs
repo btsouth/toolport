@@ -1569,7 +1569,9 @@ fn migrate_client_reviewed_with(
                     Ok(unchanged)
                 })?;
                 if !restored {
-                    return Err(format!("{error} Registry changed during setup. Review Servers before retrying."));
+                    return Err(format!(
+                        "{error} Registry changed during setup. Review Servers before retrying."
+                    ));
                 }
             }
             return Err(error);
@@ -2455,14 +2457,27 @@ mod tests {
         std::fs::write(fixture.claude(), original).unwrap();
         let review = preview_client_setup("claude-code").unwrap();
         let error = migrate_client_reviewed_with(
-            "claude-code", None, false, &["one".into()], &review.revision,
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
             |_, _, _, _| {
-                registry::update(|registry| { registry.add_server(server("concurrent")); Ok(()) }).unwrap();
+                registry::update(|registry| {
+                    registry.add_server(server("concurrent"));
+                    Ok(())
+                })
+                .unwrap();
                 Err("Launch failed".into())
             },
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert!(error.contains("Registry changed during setup"));
-        assert!(read_registry_exact().unwrap().servers.iter().any(|server| server.name == "concurrent"));
+        assert!(read_registry_exact()
+            .unwrap()
+            .servers
+            .iter()
+            .any(|server| server.name == "concurrent"));
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
         assert!(!fixture.move_record("claude-code").exists());
     }
