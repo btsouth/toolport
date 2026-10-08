@@ -81,14 +81,23 @@ impl Drop for Fixture {
                     if let Some(descriptor) = conduit_lib::daemon::read_descriptor(&file.path()) {
                         let deadline =
                             std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        let running = || {
+                            #[cfg(target_os = "linux")]
+                            return std::fs::read_link(format!("/proc/{}/exe", descriptor.pid))
+                                .is_ok();
+                            #[cfg(not(target_os = "linux"))]
+                            file.path().exists()
+                        };
                         // The adapter deletes its session asynchronously after EOF.
                         // Keep the private data and descriptor until shutdown is accepted.
-                        while file.path().exists() && std::time::Instant::now() < deadline {
-                            let _ = conduit_lib::daemon::request_shutdown_if_idle(&descriptor);
+                        while running() && std::time::Instant::now() < deadline {
+                            if file.path().exists() {
+                                let _ = conduit_lib::daemon::request_shutdown_if_idle(&descriptor);
+                            }
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
                         #[cfg(target_os = "linux")]
-                        if file.path().exists() {
+                        if running() {
                             let image = std::fs::read_link(format!("/proc/{}/exe", descriptor.pid));
                             let private_image = std::env::current_exe()
                                 .unwrap()
@@ -113,10 +122,10 @@ impl Drop for Fixture {
                             }
                             assert!(std::fs::read_link(format!("/proc/{}/exe", descriptor.pid))
                                 .is_err());
-                            conduit_lib::daemon::clear_descriptor(&file.path());
                         }
+                        conduit_lib::daemon::clear_descriptor(&file.path());
                         assert!(
-                            !file.path().exists(),
+                            !running() && !file.path().exists(),
                             "private fixture daemon {} did not shut down",
                             descriptor.pid
                         );
