@@ -2652,6 +2652,30 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_failed_setup_rolls_back_vault_and_allows_changed_retry() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let original = r#"{"mcpServers":{"one":{"command":"fixture","env":{"PAT":"synthetic-first"}}}}"#;
+        std::fs::write(fixture.claude(), original).unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        assert!(migrate_client_reviewed_with("claude-code",None,false,&["one".into()],&review.revision,|_,_,_,_| Err("Launch failed".into())).is_err());
+        assert!(crate::secrets::get_vault_secret_result("one", "PAT").unwrap().is_none());
+        assert!(read_registry_exact().unwrap().servers.is_empty());
+        std::fs::write(fixture.claude(), original.replace("synthetic-first", "synthetic-retry")).unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        migrate_client_reviewed_with("claude-code",None,false,&["one".into()],&review.revision,|_,_,_,_| Ok(Vec::new().into())).unwrap();
+        assert_eq!(crate::secrets::get_vault_secret_result("one", "PAT").unwrap().as_deref(),Some("synthetic-retry"));
+    }
+
+    #[test]
+    fn reviewed_multi_paste_is_atomic_on_invalid_later_server() {
+        let _fixture = MoveFixture::new(&Registry::default());
+        let text = r#"{"mcpServers":{"first":{"command":"fixture","env":{"PAT":"synthetic-first"}},"second":{"command":"fixture","env":{"BAD=NAME":"synthetic-second"}}}}"#;
+        assert!(add_snippet_servers(text,&["0".into(),"1".into()]).is_err());
+        assert!(read_registry_exact().unwrap().servers.is_empty());
+        assert!(crate::secrets::get_vault_secret_result("first", "PAT").unwrap().is_none());
+    }
+
+    #[test]
     fn reviewed_import_vaults_values_and_failed_vault_keeps_native_config() {
         let fixture = MoveFixture::new(&Registry::default());
         let original = r#"{"mcpServers":{"one":{"command":"fixture","env":{"PAT":"synthetic-native-pat","PORT":3000}}}}"#;

@@ -327,6 +327,20 @@ mod tests {
     }
 
     #[test]
+    fn exact_placeholders_do_not_reject_real_secret_prefixes() {
+        for value in ["$actual-secret", "{real-secret}", "<actual-secret>"] { assert!(provided(value), "{value}"); }
+        for value in ["${TOKEN}", "<your-key>", ""] { assert!(!provided(value), "{value}"); }
+    }
+
+    #[test]
+    fn ordinary_environment_values_stay_plain() {
+        let import = Import::prepare(entry(false), Some(&json!({"env":{"PAT":"synthetic-pat-secret","PORT":3000}}))).unwrap();
+        let port = import.entry.env.iter().find(|env| env.key == "PORT").unwrap();
+        assert!(!port.secret);
+        assert_eq!(port.value.as_deref(), Some("3000"));
+    }
+
+    #[test]
     fn reviewed_values_are_references_and_transfer_once() {
         let mut raw = entry(false);
         raw.args = vec!["--token".into(), "synthetic-argument-secret".into()];
