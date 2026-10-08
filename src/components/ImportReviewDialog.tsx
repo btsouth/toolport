@@ -238,7 +238,7 @@ function ImportReviewContent({
               <DialogTitle>{editing.name} credentials</DialogTitle>
             </DialogHeader>
             <p className="text-sm text-muted-foreground">
-              This value is used only for the selected server. It goes to the keychain if
+              This value is used only for the selected server. It is saved only if
               connection succeeds.
             </p>
             <label className="flex flex-col gap-2 text-sm">

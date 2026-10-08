@@ -128,7 +128,7 @@ pub(super) fn review(
         let spinner = gtk::Spinner::new();
         spinner.set_visible(false);
         row.add_suffix(&spinner);
-        if !item.credentials.is_empty() {
+        let state = if !item.credentials.is_empty() {
             let found = item.credentials.iter().all(|env| env.present);
             let secret = item.credentials.iter().any(|env| env.secret);
             let state = gtk::Label::new(Some(if !found {
@@ -140,7 +140,43 @@ pub(super) fn review(
             }));
             state.add_css_class(if found { "dim-label" } else { "warning" });
             row.add_suffix(&state);
-        }
+            Some(state)
+        } else {
+            None
+        };
+        let row_choices = std::rc::Rc::new(std::cell::RefCell::new(Vec::<gtk::CheckButton>::new()));
+        let fields = std::rc::Rc::new(item.credentials.clone());
+        let refresh_state: std::rc::Rc<dyn Fn()> = std::rc::Rc::new({
+            let (state, fields, choices, inputs, name) = (
+                state.clone(),
+                fields.clone(),
+                row_choices.clone(),
+                credential_inputs.clone(),
+                item.name.clone(),
+            );
+            move || {
+                if let Some(state) = &state {
+                    let inputs = inputs.borrow();
+                    let found = fields.iter().all(|env| {
+                        env.present
+                            || inputs
+                                .get(&name)
+                                .and_then(|values| values.get(&env.key))
+                                .is_some_and(|value| !value.is_empty())
+                    });
+                    state.set_label(if !found {
+                        "Missing"
+                    } else if choices.borrow().iter().any(|choice| choice.is_active()) {
+                        "Found, goes to keychain"
+                    } else {
+                        "Found"
+                    });
+                    state.remove_css_class("warning");
+                    state.remove_css_class("dim-label");
+                    state.add_css_class(if found { "dim-label" } else { "warning" });
+                }
+            }
+        });
         if let Some(reason) = &item.unsupported {
             row.set_subtitle(&format!("Unsupported: {reason}"));
         }
@@ -149,6 +185,9 @@ pub(super) fn review(
                 .label(format!("Keep {} in keychain", env.key))
                 .active(env.secret)
                 .build();
+            row_choices.borrow_mut().push(choice.clone());
+            let refresh = refresh_state.clone();
+            choice.connect_toggled(move |_| refresh());
             choice.set_sensitive(item.unsupported.is_none() && !env.key.starts_with("__"));
             let value_row = adw::ActionRow::builder()
                 .title(&env.key)
@@ -163,20 +202,22 @@ pub(super) fn review(
                 let inputs = credential_inputs.clone();
                 let name = item.name.clone();
                 let key = env.key.clone();
+                let refresh_state = refresh_state.clone();
                 let value_row_for_input = value_row.clone();
                 open.connect_clicked(move |_| {
-                    let prompt = adw::MessageDialog::new(Some(&owner), Some(&format!("{name} credentials")), Some(&format!("Enter {key}. This value is used only for the selected server. It goes to the keychain if connection succeeds.")));
+                    let prompt = adw::MessageDialog::new(Some(&owner), Some(&format!("{name} credentials")), Some(&format!("Enter {key}. This value is used only for the selected server. It is saved only if connection succeeds.")));
                     let entry = gtk::PasswordEntry::builder().show_peek_icon(true).build();
                     prompt.set_extra_child(Some(&entry));
                     prompt.add_responses(&[("cancel", "Cancel"), ("save", "Use for connection")]);
                     prompt.set_response_appearance("save", adw::ResponseAppearance::Suggested);
                     prompt.set_default_response(Some("save"));
                     prompt.set_close_response("cancel");
-                    let (inputs, name, key, value_row) = (inputs.clone(), name.clone(), key.clone(), value_row_for_input.clone());
+                    let (inputs, name, key, value_row, refresh) = (inputs.clone(), name.clone(), key.clone(), value_row_for_input.clone(), refresh_state.clone());
                     prompt.connect_response(None, move |_, response| {
                         if response == "save" && !entry.text().is_empty() {
                             inputs.borrow_mut().entry(name.clone()).or_default().insert(key.clone(), entry.text().to_string());
                             value_row.set_subtitle("Ready for connection");
+                            refresh();
                         }
                     });
                     prompt.present();
