@@ -211,16 +211,16 @@ fn a_cached_server_stays_lazy_then_stops_when_idle_and_restarts_on_use() {
             std::fs::read_to_string(scratch.join("tool-cache.servers.json"))
                 .ok()
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-                .is_some_and(|cache| cache["servers"]["lazy"]["spec"].is_string())
+                .is_some_and(|cache| has_cached_echo(&cache))
         });
     }
     std::fs::remove_file(&pids).unwrap();
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "lazy-client");
     assert!(client.wait_for_tool("lazy__echo", CATALOG));
-    // Give the watcher and catalog publication time to run. Cached discovery
-    // alone must never launch this server.
-    std::thread::sleep(Duration::from_secs(3));
+    // Exercise another full list after startup publication. Neither list may
+    // demand a server whose persisted catalog already covers the tool.
+    assert!(client.tool_names().contains(&"lazy__echo".to_string()));
     assert!(!pids.exists(), "cached discovery spawned a lazy server");
     assert!(chaos_support::reply_ok(
         &client.call("lazy__echo", json!({"text":"chaos"})),
@@ -246,4 +246,24 @@ fn a_cached_server_stays_lazy_then_stops_when_idle_and_restarts_on_use() {
     let second = std::fs::read_to_string(&pids).unwrap();
     assert_eq!(second.lines().count(), first.lines().count() + 1);
     assert_ne!(second.lines().last(), first.lines().last());
+}
+
+// Startup persists a spec before first-use discovery has populated its tools.
+// A matching spec alone cannot prove that a restart will stay lazy.
+fn has_cached_echo(cache: &serde_json::Value) -> bool {
+    cache["version"] == 2
+        && cache["servers"]["lazy"]["spec"].is_string()
+        && cache["servers"]["lazy"]["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "echo"))
+}
+
+#[test]
+fn an_empty_persisted_catalog_is_not_a_warm_cache() {
+    let mut cache = json!({"version":2,"servers":{"lazy":{"spec":"current","tools":[]}}});
+    assert!(!has_cached_echo(&cache));
+    cache["servers"]["lazy"]["tools"] = json!([{"name":"echo"}]);
+    assert!(has_cached_echo(&cache));
+    cache["version"] = json!(1);
+    assert!(!has_cached_echo(&cache));
 }
