@@ -177,10 +177,7 @@ function ImportReviewContent({
                           <input
                             type="checkbox"
                             disabled={
-                              busy ||
-                              !!item.unsupported ||
-                              env.key.startsWith("__") ||
-                              env.key === "IMPORTED_URL"
+                              busy || !!item.unsupported || env.key.startsWith("__")
                             }
                             checked={secretChoices[item.name]?.[env.key] ?? env.secret}
                             onChange={(e) =>

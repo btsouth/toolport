@@ -9,7 +9,7 @@ const INTERNAL_SERVER_ID: &str = "__toolport_internal__";
 const TASK_HANDLE_KEY: &str = "__task_handle_key__";
 
 /// Vault reference for a reviewed endpoint containing inline credentials.
-pub(crate) const IMPORTED_URL_KEY: &str = "IMPORTED_URL";
+pub(crate) const IMPORTED_URL_KEY: &str = "__imported_endpoint_url__";
 
 /// Reserved secret key for an http server's bearer token (Tier A auth, and where
 /// the OAuth flow stores its access token).
