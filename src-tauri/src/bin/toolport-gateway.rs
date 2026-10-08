@@ -31388,6 +31388,11 @@ mod tests {
         .unwrap();
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("Found"));
+        // The reader's 500 ms UI budget can expire behind concurrent telemetry
+        // on Windows. Await the test barrier before asserting persisted bytes.
+        assert!(conduit_lib::telemetry::flush_for_test(
+            std::time::Duration::from_secs(5)
+        ));
         // Other tests can append telemetry while this one holds the data-dir
         // override, so the last row need not belong to this search.
         let trace = searchtrace::read_recent(usize::MAX)
