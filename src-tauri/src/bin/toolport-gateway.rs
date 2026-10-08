@@ -14209,7 +14209,7 @@ fn process_request(
                 } else {
                     base
                 };
-                (router, cache_snapshot) = catalog_for_view(rooted);
+                router = catalog_for_view(rooted).0;
             }
             // Ready slots can precede disk-cache publication. Read the live view
             // after a cold wait so another client's cache cannot hide new tools.
@@ -20303,7 +20303,7 @@ mod tests {
             let allowed = &allowed;
             scope.spawn(move || {
                 reply_tx
-                    .send(full_tools_list_for_client(&state, "cursor", Some(&allowed)))
+                    .send(full_tools_list_for_client(state, "cursor", Some(allowed)))
                     .unwrap();
             });
             started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
