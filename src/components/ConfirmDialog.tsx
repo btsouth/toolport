@@ -88,18 +88,18 @@ export function ConfirmDialog({
       >
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
-          {description &&
-            (richDescription ? (
-              <div
-                id={descriptionId}
-                className="text-sm text-muted-foreground *:[a]:underline *:[a]:underline-offset-3 *:[a]:hover:text-foreground"
-              >
-                {description}
-              </div>
-            ) : (
-              <DialogDescription>{description}</DialogDescription>
-            ))}
         </DialogHeader>
+        {description &&
+          (richDescription ? (
+            <div
+              id={descriptionId}
+              className="text-sm text-muted-foreground *:[a]:underline *:[a]:underline-offset-3 *:[a]:hover:text-foreground"
+            >
+              {description}
+            </div>
+          ) : (
+            <DialogDescription>{description}</DialogDescription>
+          ))}
         <DialogFooter>
           <Button variant="ghost" onClick={() => setOpen(false)} disabled={busy}>
             {cancelLabel}

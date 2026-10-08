@@ -17,14 +17,21 @@ export function AccessUpgradeNotice({
   return (
     <div
       role="status"
-      className="flex flex-wrap items-center gap-3 border-b bg-info/10 px-6 py-3 text-sm"
+      className="access-upgrade-notice flex shrink-0 flex-wrap items-center gap-2 border-b bg-info/10 px-3 py-2 text-sm sm:gap-3 sm:px-6 sm:py-3"
     >
-      <p className="min-w-0 flex-1">
+      {/* eslint-disable jsx-a11y/no-noninteractive-tabindex -- The labelled scroll region needs keyboard focus. */}
+      <p
+        role="region"
+        aria-label="Upgrade details"
+        tabIndex={0}
+        className="min-w-0 flex-1"
+      >
         Old Toolport gateways may still be running from before the upgrade. Stop old
         gateways, then restart any apps still using them so they use the new client access
         controls.
         {result && <span className="block">{result}</span>}
       </p>
+      {/* eslint-enable jsx-a11y/no-noninteractive-tabindex */}
       <button
         disabled={busy}
         onClick={async () => {

@@ -360,6 +360,8 @@ fn build_window(
         let notice = gtk::Box::new(gtk::Orientation::Vertical, 8);
         notice.add_css_class("toolport-setting-row");
         notice.append(&gtk::Label::builder().label(
+            "Stop old Toolport gateways, then restart apps to use client access controls."
+        ).tooltip_text(
             "Old Toolport gateways may still be running from before the upgrade. Stop old gateways, then restart any apps still using them so they use the new client access controls."
         ).wrap(true).xalign(0.0).build());
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -811,6 +813,9 @@ fn build_sidebar(
         if target == "settings" {
             row.append(&quarantine_badge);
         }
+        if let Some(index) = NAV_SHORTCUTS.iter().position(|name| *name == target) {
+            button.set_tooltip_text(Some(&format!("{label} (Ctrl+{})", index + 1)));
+        }
         button.set_child(Some(&row));
         button.add_css_class("flat");
         button.add_css_class("toolport-nav-item");
@@ -907,8 +912,8 @@ fn build_sidebar(
         .child(&nav)
         .build();
     root.append(&nav_scroll);
-
     install_star_prompt(&root);
+
     (
         root,
         quarantine_badge,
@@ -917,8 +922,8 @@ fn build_sidebar(
 }
 
 /// The one-off "star the repo" ask, shown once ever, only to someone actually
-/// using Toolport (a server enabled), and only after the window has been on
-/// screen a while. Dismissing or starring retires it permanently.
+/// using Toolport (three servers and calls on two UTC dates), and only after the window has been on
+/// screen a while. Showing it retires it permanently.
 fn install_star_prompt(container: &gtk::Box) {
     fn marker() -> Option<std::path::PathBuf> {
         Some(crate::registry::conduit_dir()?.join(".gtk-star-prompt-done"))
@@ -977,30 +982,70 @@ fn install_star_prompt(container: &gtk::Box) {
     let card_for_timer = card.clone();
     gtk::glib::timeout_add_seconds_local_once(8, move || {
         gtk::glib::spawn_future_local(async move {
-            let enabled = gtk::gio::spawn_blocking(|| {
+            let eligible = gtk::gio::spawn_blocking(|| {
                 crate::registry::load()
                     .map(|registry| {
                         let profile = registry.active_profile_id();
                         registry
                             .servers
                             .iter()
-                            .filter(|server| registry.is_enabled(&profile, &server.id))
+                            .filter(|server| {
+                                !crate::clients::is_gateway_server(server)
+                                    && registry.is_enabled(&profile, &server.id)
+                            })
                             .count()
                     })
-                    .unwrap_or(0)
+                    .map(|enabled| {
+                        star_value_reached(enabled, &crate::audit::read_all().unwrap_or_default())
+                    })
+                    .unwrap_or(false)
             })
             .await
-            .unwrap_or(0);
+            .unwrap_or(false);
             // The card itself is hidden (thus unmapped); "on screen" means its
             // sidebar parent is mapped, i.e. the window is actually shown.
             let sidebar_on_screen = card_for_timer
                 .parent()
                 .is_some_and(|parent| parent.is_mapped());
-            if enabled >= 1 && sidebar_on_screen {
-                card_for_timer.set_visible(true);
+            let window = card_for_timer.root().and_downcast::<gtk::Window>();
+            let unobstructed = window.as_ref().is_some_and(|window| window.is_active())
+                && !gtk::Window::list_toplevels().iter().any(|widget| {
+                    widget
+                        .downcast_ref::<gtk::Window>()
+                        .is_some_and(|window| window.is_modal() && window.is_visible())
+                });
+            if star_should_show(eligible, sidebar_on_screen, unobstructed) {
+                if marker().is_some_and(|marker| spend_star_prompt(&marker)) {
+                    card_for_timer.set_visible(true);
+                }
             }
         });
     });
+}
+
+fn spend_star_prompt(marker: &std::path::Path) -> bool {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+        .is_ok()
+}
+
+fn star_value_reached(enabled: usize, entries: &[serde_json::Value]) -> bool {
+    let days: std::collections::HashSet<_> = entries
+        .iter()
+        .filter(|entry| {
+            crate::audit::tool_call_ok(entry) == Some(true)
+                && entry.get("held").and_then(serde_json::Value::as_bool) != Some(true)
+        })
+        .filter_map(|entry| entry.get("ts").and_then(serde_json::Value::as_u64))
+        .filter(|ts| *ts > 0)
+        .map(|ts| ts / 86_400_000)
+        .collect();
+    enabled >= 3 && days.len() >= 2
+}
+fn star_should_show(eligible: bool, mapped: bool, unobstructed: bool) -> bool {
+    eligible && mapped && unobstructed
 }
 
 #[derive(Clone)]
@@ -1586,19 +1631,8 @@ impl ServerPage {
             return;
         }
 
-        // Group like the shipping list: servers needing attention first, then
-        // unprobed, ready, and disabled last. Ranks come from the last finished
-        // probes so rows do not jump around while probes are in flight.
         let mut servers = snapshot.servers.iter().collect::<Vec<_>>();
-        {
-            let health = self.health.borrow();
-            servers.sort_by_key(|server| {
-                (
-                    server_health_rank(server, health.result(&server.id)),
-                    server.name.to_lowercase(),
-                )
-            });
-        }
+        servers.sort_by_key(|server| server_order_key(server));
         let mut rows = Vec::with_capacity(servers.len());
         for server in servers {
             let card = server_card(server, &snapshot.active_profile_id, self.clone());
@@ -3345,6 +3379,7 @@ impl ActivityPage {
             .accept_label("Export")
             .initial_name(format!("toolport-activity.{format}"))
             .build();
+        set_file_dialog_folder(&dialog);
         let page = self.clone();
         dialog.save(Some(&parent), gtk::gio::Cancellable::NONE, move |result| {
             let Ok(file) = result else {
@@ -5677,13 +5712,13 @@ fn build_content(
     menu_popover.set_child(Some(&menu_content));
     let menu_button = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
-        .tooltip_text("Toolport menu")
+        .tooltip_text("Help and setup menu (Ctrl+Q to quit)")
         .build();
     menu_button.set_popover(Some(&menu_popover));
     header.pack_end(&menu_button);
     let check_servers = gtk::Button::builder()
         .icon_name("view-refresh-symbolic")
-        .tooltip_text("Check servers again")
+        .tooltip_text("Check servers again (Ctrl+R)")
         .build();
     header.pack_end(&check_servers);
     root.append(&header);
@@ -5709,7 +5744,7 @@ fn build_content(
     page.append(&intro);
 
     let description = gtk::Label::builder()
-        .label("Your MCP servers, available everywhere. Follows the active Omarchy palette and behaves like a regular Hyprland window.")
+        .label("Your MCP servers, available everywhere.")
         .halign(gtk::Align::Fill)
         .wrap(true)
         .xalign(0.0)
@@ -5744,7 +5779,12 @@ fn build_content(
         summary.attach(&item, column as i32, 0, 1, 1);
     }
     page.append(&summary);
-
+    let short = adw::Breakpoint::new(
+        adw::BreakpointCondition::parse("max-height: 450px").expect("static short-window condition"),
+    );
+    short.add_setter(&intro, "visible", Some(&false.to_value()));
+    short.add_setter(&description, "visible", Some(&false.to_value()));
+    short.add_setter(&summary, "visible", Some(&false.to_value()));
     let profile_actions = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
         .tooltip_text("Server actions")
@@ -5791,7 +5831,14 @@ fn build_content(
     page.append(&list);
 
     scroller.set_child(Some(&page));
-    root.append(&scroller);
+    let adaptive = adw::BreakpointBin::builder()
+        .child(&scroller)
+        .width_request(200)
+        .height_request(200)
+        .vexpand(true)
+        .build();
+    adaptive.add_breakpoint(short);
+    root.append(&adaptive);
     let server_page = (
         root,
         ServerPage {
@@ -6177,6 +6224,7 @@ fn share_setup(page: ServerPage) {
                 .accept_label("Export")
                 .modal(true)
                 .build();
+            set_file_dialog_folder(&dialog);
             let export = export.clone();
             let feedback = feedback.clone();
             dialog.save(
@@ -6344,6 +6392,15 @@ fn choose_setup_export(page: ServerPage) {
             }
         });
     });
+}
+
+fn set_file_dialog_folder(dialog: &gtk::FileDialog) {
+    if let Some(folder) = dirs::download_dir()
+        .filter(|folder| folder.is_dir())
+        .or_else(dirs::home_dir)
+    {
+        dialog.set_initial_folder(Some(&gtk::gio::File::for_path(folder)));
+    }
 }
 
 fn choose_setup_import(page: ServerPage) {
@@ -6735,26 +6792,24 @@ fn posture_line(ready: usize, auth: usize, errors: usize, pending: usize, total:
     parts.join(" · ")
 }
 
-/// Grouping rank for the server list: needs-attention first, then unprobed,
-/// ready, and disabled last. Review-gated team servers count as attention too.
-fn server_health_rank(
-    server: &state::ServerView,
-    probe: Option<&crate::server_runtime::ProbeResult>,
-) -> u8 {
-    if server.requires_review {
-        return 0;
-    }
-    if !server.enabled {
-        return 3;
-    }
-    match probe {
-        Some(probe) if !probe.ok => 0,
-        None => 1,
-        Some(_) => 2,
-    }
+/// Enabling or probing servers must not move the next toggle target.
+fn server_order_key(server: &state::ServerView) -> (String, String) {
+    (server.name.to_lowercase(), server.id.clone())
+}
+
+fn bounded_title(name: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(name)
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(24)
+        .tooltip_text(name)
+        .build()
 }
 
 fn open_server_details(server: &state::ServerView, page: &ServerPage, show_tools: bool) {
+    let parent = page.app.active_window();
     let window = adw::Window::builder()
         .application(&page.app)
         .title(&server.name)
@@ -6762,10 +6817,10 @@ fn open_server_details(server: &state::ServerView, page: &ServerPage, show_tools
         .default_height(760)
         .modal(true)
         .build();
-    window.set_transient_for(page.app.active_window().as_ref());
+    window.set_transient_for(parent.as_ref());
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&gtk::Label::new(Some(&server.name))));
+    header.set_title_widget(Some(&bounded_title(&server.name)));
     root.append(&header);
     let stack = gtk::Stack::new();
     stack.set_vexpand(true);
@@ -6778,7 +6833,9 @@ fn open_server_details(server: &state::ServerView, page: &ServerPage, show_tools
             &gtk::Label::builder()
                 .label(text)
                 .xalign(0.0)
-                .wrap(true)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .max_width_chars(24)
+                .tooltip_text(text)
                 .build(),
         );
     }
@@ -6815,10 +6872,10 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
     let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
     text.set_hexpand(true);
     let details = gtk::Button::builder()
-        .label(&server.name)
-        .halign(gtk::Align::Start)
+        .child(&bounded_title(&server.name))
+        .halign(gtk::Align::Fill)
         .css_classes(["flat", "heading"])
-        .tooltip_text("Open server details")
+        .tooltip_text(&server.name)
         .build();
     let server_for_details = server.clone();
     let page_for_details = page.clone();
@@ -9098,6 +9155,38 @@ mod tests {
         assert_ne!(access, registry.all_access_id());
     }
 
+    #[test]
+    fn star_prompt_is_spent_once_even_without_a_click() {
+        let dir = preview_scratch("star-prompt");
+        let marker = dir.join(".gtk-star-prompt-done");
+        assert!(spend_star_prompt(&marker));
+        assert!(!spend_star_prompt(&marker));
+        assert!(!spend_star_prompt(&dir.join("missing/marker")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn star_prompt_waits_for_value_and_an_unobstructed_window() {
+        let entries = vec![
+            serde_json::json!({"ts":86400000,"ok":true}),
+            serde_json::json!({"ts":172800000,"ok":true}),
+        ];
+        assert!(!star_value_reached(2, &entries));
+        assert!(!star_value_reached(3, &entries[..1]));
+        assert!(star_value_reached(3, &entries));
+        assert!(!star_value_reached(
+            3,
+            &[
+                entries[0].clone(),
+                serde_json::json!({"ts":172800000,"ok":true,"kind":"approval"})
+            ]
+        ));
+        assert!(!star_should_show(true, true, false));
+        assert!(!star_should_show(true, false, true));
+        assert!(!star_should_show(false, true, true));
+        assert!(star_should_show(true, true, true));
+    }
+
     /// The 2.0 sidebar is the four fixed views in order, with Team appended only
     /// on a paired install. Catalog is no longer a row even though
     /// their pages and actions stay reachable.
@@ -9826,30 +9915,15 @@ mod tests {
     }
 
     #[test]
-    fn attention_outranks_ready_and_disabled_sinks() {
-        let mut server = server("github", "Remote HTTP");
-        server.enabled = true;
-        let failing = crate::server_runtime::ProbeResult {
-            server_id: "s".into(),
-            ok: false,
-            tool_count: 0,
-            error: Some("boom".into()),
-            auth_required: false,
-        };
-        let ready = crate::server_runtime::ProbeResult {
-            server_id: "s".into(),
-            ok: true,
-            tool_count: 3,
-            error: None,
-            auth_required: false,
-        };
-        assert_eq!(server_health_rank(&server, Some(&failing)), 0);
-        assert_eq!(server_health_rank(&server, None), 1);
-        assert_eq!(server_health_rank(&server, Some(&ready)), 2);
-        server.enabled = false;
-        assert_eq!(server_health_rank(&server, Some(&ready)), 3);
-        server.requires_review = true;
-        assert_eq!(server_health_rank(&server, None), 0);
+    fn server_order_ignores_enable_review_and_probe_state() {
+        let mut first = server("alpha", "Remote HTTP");
+        first.name = "Alpha".into();
+        let second = server("beta", "Local command");
+        let before = server_order_key(&first);
+        first.enabled = !first.enabled;
+        first.requires_review = !first.requires_review;
+        assert_eq!(server_order_key(&first), before);
+        assert!(server_order_key(&first) < server_order_key(&second));
     }
 
     #[test]

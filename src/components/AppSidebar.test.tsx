@@ -6,6 +6,7 @@ import type { ReactNode } from "react";
 import type { Registry } from "@/lib/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppSidebar } from "./AppSidebar";
+import { getVersion } from "@tauri-apps/api/app";
 
 const getSavingsSummary = vi.fn();
 const listQuarantined = vi.fn();
@@ -15,6 +16,7 @@ const toastInfo = vi.fn();
 const toastError = vi.fn();
 const openDataDir = vi.fn();
 const openExternal = vi.fn();
+const exitApp = vi.fn().mockResolvedValue(undefined);
 const eventListeners = new Map<string, (event: { payload: unknown }) => void>();
 
 vi.mock("sonner", () => ({
@@ -41,6 +43,10 @@ vi.mock("@/lib/openUrl", () => ({
 
 vi.mock("@tauri-apps/api/app", () => ({
   getVersion: vi.fn().mockResolvedValue("1.0.0"),
+}));
+
+vi.mock("@tauri-apps/plugin-process", () => ({
+  exit: (...args: unknown[]) => exitApp(...args),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -109,6 +115,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="clients"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -131,6 +138,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={onSelectView}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -160,6 +168,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={onSelectView}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -180,6 +189,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -205,6 +215,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -238,6 +249,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -265,6 +277,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -303,6 +316,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -338,6 +352,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -376,6 +391,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -407,6 +423,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -434,6 +451,7 @@ describe("AppSidebar quarantine badge", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -568,6 +586,26 @@ describe("AppSidebar quarantine badge", () => {
 });
 
 describe("AppSidebar open data folder", () => {
+  it("keeps Help and Quit reachable when the version lookup fails", async () => {
+    vi.mocked(getVersion).mockRejectedValueOnce(new Error("unavailable"));
+    const user = userEvent.setup();
+    render(
+      <TooltipProvider>
+        <AppSidebar
+          registry={null}
+          onRegistryChange={vi.fn()}
+          view="servers"
+          onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
+          onReplayOnboarding={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+    await user.click(screen.getByRole("button", { name: "Help" }));
+    await user.click(screen.getByRole("button", { name: "Quit Toolport" }));
+    expect(exitApp).toHaveBeenCalledWith(0);
+  });
+
   it("shows an error toast when opening the data folder fails", async () => {
     openDataDir.mockRejectedValue(new Error("no such directory"));
     const user = userEvent.setup();
@@ -579,12 +617,14 @@ describe("AppSidebar open data folder", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
     );
 
-    await user.click(await screen.findByLabelText("Open data folder"));
+    await user.click(await screen.findByRole("button", { name: /Help/ }));
+    await user.click(await screen.findByRole("button", { name: "Open data folder" }));
 
     await waitFor(() => {
       expect(toastError).toHaveBeenCalledWith("Couldn't open data folder");
@@ -608,6 +648,7 @@ it("shows negative net savings with the tokenizer method and excludes legacy est
         onRegistryChange={vi.fn()}
         view="servers"
         onSelectView={vi.fn()}
+        onShortcuts={vi.fn()}
         onReplayOnboarding={vi.fn()}
       />
     </TooltipProvider>,

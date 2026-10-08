@@ -5,6 +5,12 @@ import { GitHubStarPrompt } from "./GitHubStarPrompt";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { STAR_PROMPT_KEY, STAR_REPO_URL } from "@/lib/starPrompt";
 
+let auditEntries = [
+  { ts: 86400000, ok: true },
+  { ts: 172800000, ok: true },
+];
+const getAuditLog = vi.fn(() => Promise.resolve(auditEntries));
+vi.mock("@/lib/api", () => ({ getAuditLog: () => getAuditLog() }));
 const openExternal = vi.fn();
 vi.mock("@/lib/openUrl", () => ({
   openExternal: (...a: unknown[]) => openExternal(...a),
@@ -60,96 +66,14 @@ const user = () => userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
 
 beforeEach(() => {
   openExternal.mockReset();
+  auditEntries = [
+    { ts: 86400000, ok: true },
+    { ts: 172800000, ok: true },
+  ];
+  getAuditLog.mockClear();
   localStorage.clear();
   windowVisible = true;
   vi.useFakeTimers({ shouldAdvanceTime: true });
-});
-
-describe("a new install", () => {
-  it("shows nothing until onboarding is finished", async () => {
-    const { rerender } = render(
-      <GitHubStarPrompt justOnboarded={false} enabledCount={9} />,
-    );
-    await flushDelays();
-    expect(onboardingCard()).toBeNull();
-    // 9 servers is past the chip threshold, but a fresh user must not get both
-    // asks, and must never get the existing-user card.
-    expect(chip()).toBeNull();
-    expect(returningCard()).toBeNull();
-
-    rerender(<GitHubStarPrompt justOnboarded={true} enabledCount={9} />);
-    await flushDelays();
-    expect(onboardingCard()).not.toBeNull();
-  });
-
-  it("opens the repo and never asks again once starred", async () => {
-    const u = user();
-    render(<GitHubStarPrompt justOnboarded={true} enabledCount={0} />);
-    await flushDelays();
-
-    await u.click(starButton());
-
-    expect(openExternal).toHaveBeenCalledWith(STAR_REPO_URL);
-    expect(localStorage.getItem(STAR_PROMPT_KEY)).toBe("done");
-    expect(onboardingCard()).toBeNull();
-  });
-
-  it("does not hand off to the chip in the same session", async () => {
-    // Onboarding adds servers, so an immediate chip would read as nagging.
-    const u = user();
-    const { rerender } = render(
-      <GitHubStarPrompt justOnboarded={true} enabledCount={6} />,
-    );
-    await flushDelays();
-    await u.click(screen.getByRole("button", { name: /^later$/i }));
-
-    rerender(<GitHubStarPrompt justOnboarded={true} enabledCount={7} />);
-    expect(chip()).toBeNull();
-  });
-
-  it("hands off to the chip on the next launch, once enough servers are on", async () => {
-    const u = user();
-    const first = render(<GitHubStarPrompt justOnboarded={true} enabledCount={6} />);
-    await flushDelays();
-    await u.click(screen.getByRole("button", { name: /^later$/i }));
-    expect(localStorage.getItem(STAR_PROMPT_KEY)).toBe("later");
-    first.unmount();
-
-    const { rerender } = render(
-      <GitHubStarPrompt justOnboarded={false} enabledCount={1} />,
-    );
-    await flushDelays();
-    expect(chip()).toBeNull(); // still under the threshold
-
-    rerender(<GitHubStarPrompt justOnboarded={false} enabledCount={6} />);
-    expect(chip()).not.toBeNull();
-    expect(onboardingCard()).toBeNull();
-  });
-
-  it("closing the chip ends the prompt for good", async () => {
-    const u = user();
-    localStorage.setItem(STAR_PROMPT_KEY, "later");
-    const first = render(<GitHubStarPrompt justOnboarded={false} enabledCount={5} />);
-    await u.click(screen.getByRole("button", { name: /dismiss/i }));
-    expect(localStorage.getItem(STAR_PROMPT_KEY)).toBe("done");
-    first.unmount();
-
-    render(<GitHubStarPrompt justOnboarded={false} enabledCount={5} />);
-    await flushDelays();
-    expect(chip()).toBeNull();
-  });
-
-  it("opens the repo from the chip", async () => {
-    const u = user();
-    localStorage.setItem(STAR_PROMPT_KEY, "later");
-    render(<GitHubStarPrompt justOnboarded={false} enabledCount={3} />);
-
-    await u.click(chip()!);
-
-    expect(openExternal).toHaveBeenCalledWith(STAR_REPO_URL);
-    expect(localStorage.getItem(STAR_PROMPT_KEY)).toBe("done");
-    expect(chip()).toBeNull();
-  });
 });
 
 describe("an install that predates the prompt", () => {
@@ -174,7 +98,8 @@ describe("an install that predates the prompt", () => {
     // Nothing was spent, so the ask is still owed once they enable a server.
     expect(localStorage.getItem(STAR_PROMPT_KEY)).toBeNull();
 
-    rerender(<GitHubStarPrompt justOnboarded={false} enabledCount={1} />);
+    rerender(<GitHubStarPrompt justOnboarded={false} enabledCount={3} />);
+    await flushDelays();
     expect(returningCard()).not.toBeNull();
   });
 
@@ -196,7 +121,7 @@ describe("an install that predates the prompt", () => {
   it("opens the repo when starred", async () => {
     const u = user();
     existingInstall();
-    render(<GitHubStarPrompt justOnboarded={false} enabledCount={2} />);
+    render(<GitHubStarPrompt justOnboarded={false} enabledCount={3} />);
     await flushDelays();
 
     await u.click(starButton());
@@ -219,17 +144,6 @@ describe("an ask is spent when it is shown", () => {
     await flushDelays();
     expect(returningCard()).toBeNull();
   });
-
-  it("still owes the chip when the onboarding card was ignored", async () => {
-    const first = render(<GitHubStarPrompt justOnboarded={true} enabledCount={5} />);
-    await flushDelays();
-    expect(onboardingCard()).not.toBeNull();
-    expect(localStorage.getItem(STAR_PROMPT_KEY)).toBe("later");
-    first.unmount();
-
-    render(<GitHubStarPrompt justOnboarded={false} enabledCount={5} />);
-    expect(chip()).not.toBeNull();
-  });
 });
 
 describe("a server toggled off and back on", () => {
@@ -240,9 +154,11 @@ describe("a server toggled off and back on", () => {
     const { rerender } = render(
       <GitHubStarPrompt justOnboarded={false} enabledCount={3} />,
     );
+    await flushDelays();
     expect(chip()).not.toBeNull();
 
     rerender(<GitHubStarPrompt justOnboarded={false} enabledCount={2} />);
+    await flushDelays();
     expect(chip()).not.toBeNull();
 
     rerender(<GitHubStarPrompt justOnboarded={false} enabledCount={3} />);
@@ -252,7 +168,7 @@ describe("a server toggled off and back on", () => {
   it("does not make the existing-user card flicker either", async () => {
     existingInstall();
     const { rerender } = render(
-      <GitHubStarPrompt justOnboarded={false} enabledCount={1} />,
+      <GitHubStarPrompt justOnboarded={false} enabledCount={3} />,
     );
     await flushDelays();
     expect(returningCard()).not.toBeNull();
@@ -273,7 +189,7 @@ describe("a server toggled off and back on", () => {
     expect(chip()).toBeNull();
   });
 
-  it("reports one surface change, not a flicker, to the toast offset", () => {
+  it("reports one surface change, not a flicker, to the toast offset", async () => {
     const onVisibleChange = vi.fn();
     localStorage.setItem(STAR_PROMPT_KEY, "later");
     const { rerender } = render(
@@ -283,6 +199,7 @@ describe("a server toggled off and back on", () => {
         onVisibleChange={onVisibleChange}
       />,
     );
+    await flushDelays();
     onVisibleChange.mockClear();
 
     rerender(
@@ -454,72 +371,99 @@ describe("a launch that ends before a delay does", () => {
   });
 });
 
-describe("starring while a delay is still in flight", () => {
-  it("leaves storage at done, whatever lands afterwards", async () => {
-    // The card spends the ask as "later" when it appears, so a pending delay or
-    // a late flush after the click must not downgrade a finished ask and bring
-    // the chip back next launch.
-    const u = user();
-    const first = render(<GitHubStarPrompt justOnboarded={true} enabledCount={5} />);
-    await flushDelays();
-
-    await u.click(starButton());
-    expect(localStorage.getItem(STAR_PROMPT_KEY)).toBe("done");
-
-    await flushDelays();
-    expect(localStorage.getItem(STAR_PROMPT_KEY)).toBe("done");
-    expect(onboardingCard()).toBeNull();
-    first.unmount();
-
-    render(<GitHubStarPrompt justOnboarded={false} enabledCount={5} />);
-    await flushDelays();
-    expect(chip()).toBeNull();
-  });
-});
-
 describe("the toast-offset callback", () => {
-  it("reports the surface on screen, and clears it on unmount", async () => {
-    const u = user();
-    const onVisibleChange = vi.fn();
-    const first = render(
-      <GitHubStarPrompt
-        justOnboarded={true}
-        enabledCount={4}
-        onVisibleChange={onVisibleChange}
-      />,
-    );
-    await flushDelays();
-    expect(onVisibleChange).toHaveBeenLastCalledWith("card");
-
-    await u.click(screen.getByRole("button", { name: /^later$/i }));
-    expect(onVisibleChange).toHaveBeenLastCalledWith(null);
-    first.unmount();
-
-    onVisibleChange.mockClear();
-    const second = render(
-      <GitHubStarPrompt
-        justOnboarded={false}
-        enabledCount={4}
-        onVisibleChange={onVisibleChange}
-      />,
-    );
-    expect(onVisibleChange).toHaveBeenLastCalledWith("chip");
-
-    second.unmount();
-    expect(onVisibleChange).toHaveBeenLastCalledWith(null);
-  });
-
   it("reports the existing-user card too", async () => {
     const onVisibleChange = vi.fn();
     existingInstall();
     render(
       <GitHubStarPrompt
         justOnboarded={false}
-        enabledCount={2}
+        enabledCount={3}
         onVisibleChange={onVisibleChange}
       />,
     );
     await flushDelays();
     expect(onVisibleChange).toHaveBeenLastCalledWith("returning");
+  });
+});
+
+describe("the value gate", () => {
+  it.each([false, true])(
+    "never asks during onboarding (returning=%s)",
+    async (returning) => {
+      if (returning) existingInstall();
+      const { rerender } = render(
+        <GitHubStarPrompt justOnboarded={false} onboardingOpen enabledCount={9} />,
+      );
+      await flushDelays();
+      expect(screen.queryByRole("status")).toBeNull();
+      rerender(<GitHubStarPrompt justOnboarded enabledCount={9} />);
+      await flushDelays();
+      expect(screen.queryByRole("status")).toBeNull();
+    },
+  );
+  it.each(["later", "returning"])(
+    "waits for real calls on two dates (%s)",
+    async (stage) => {
+      if (stage === "later") localStorage.setItem(STAR_PROMPT_KEY, stage);
+      else existingInstall();
+      auditEntries = [
+        { ts: 86400000, ok: true },
+        { ts: 86400001, ok: true },
+      ];
+      const { rerender } = render(
+        <GitHubStarPrompt justOnboarded={false} enabledCount={3} />,
+      );
+      await flushDelays();
+      expect(screen.queryByRole("status")).toBeNull();
+      auditEntries.push({ ts: 172800000, ok: true });
+      rerender(
+        <GitHubStarPrompt justOnboarded={false} enabledCount={3} refreshKey={1} />,
+      );
+      await flushDelays();
+      expect(screen.queryByRole("status")).not.toBeNull();
+      expect(localStorage.getItem(STAR_PROMPT_KEY)).toBe("done");
+    },
+  );
+  it.each(["later", "returning"])(
+    "requires three enabled servers (%s)",
+    async (stage) => {
+      if (stage === "later") localStorage.setItem(STAR_PROMPT_KEY, stage);
+      else existingInstall();
+      const { rerender } = render(
+        <GitHubStarPrompt justOnboarded={false} enabledCount={2} />,
+      );
+      await flushDelays();
+      expect(screen.queryByRole("status")).toBeNull();
+      rerender(<GitHubStarPrompt justOnboarded={false} enabledCount={3} />);
+      await flushDelays();
+      expect(screen.queryByRole("status")).not.toBeNull();
+    },
+  );
+  it("does not re-show an ignored chip", async () => {
+    localStorage.setItem(STAR_PROMPT_KEY, "later");
+    const first = render(<GitHubStarPrompt justOnboarded={false} enabledCount={3} />);
+    await flushDelays();
+    expect(chip()).not.toBeNull();
+    first.unmount();
+    render(<GitHubStarPrompt justOnboarded={false} enabledCount={3} />);
+    await flushDelays();
+    expect(chip()).toBeNull();
+  });
+  it("opens the repo from the chip", async () => {
+    localStorage.setItem(STAR_PROMPT_KEY, "later");
+    render(<GitHubStarPrompt justOnboarded={false} enabledCount={3} />);
+    await flushDelays();
+    await user().click(chip()!);
+    expect(openExternal).toHaveBeenCalledWith(STAR_REPO_URL);
+    expect(chip()).toBeNull();
+  });
+  it("fails closed on unreadable activity", async () => {
+    existingInstall();
+    getAuditLog.mockRejectedValueOnce(new Error("unreadable"));
+    render(<GitHubStarPrompt justOnboarded={false} enabledCount={3} />);
+    await flushDelays();
+    expect(returningCard()).toBeNull();
+    expect(localStorage.getItem(STAR_PROMPT_KEY)).toBeNull();
   });
 });

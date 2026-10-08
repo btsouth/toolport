@@ -160,7 +160,9 @@ export function RegistryServerRow({
 
         <ServerLogo name={server.name} transport={server.transport} size={28} />
 
-        <span className="min-w-0 truncate text-sm font-medium">{server.name}</span>
+        <span title={server.name} className="min-w-0 flex-1 truncate text-sm font-medium">
+          {server.name}
+        </span>
 
         {isTeam ? (
           <span className="hidden shrink-0 items-center gap-1 rounded bg-info/15 px-1.5 py-0.5 text-[11px] font-medium text-info md:inline-flex">

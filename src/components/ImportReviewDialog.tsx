@@ -1,7 +1,13 @@
 import { useState } from "react";
 import { Check, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import type { ImportItem, ServerEntry } from "@/lib/types";
 
 interface Props {
@@ -26,15 +32,13 @@ export function ImportReviewDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
-        <ImportReviewContent
-          items={items}
-          busy={busy}
-          title={title}
-          onOpenChange={onOpenChange}
-          onConfirm={onConfirm}
-        />
-      </DialogContent>
+      <ImportReviewContent
+        items={items}
+        busy={busy}
+        title={title}
+        onOpenChange={onOpenChange}
+        onConfirm={onConfirm}
+      />
     </Dialog>
   );
 }
@@ -56,7 +60,7 @@ function ImportReviewContent({
 
   const selectedCount = selected.size;
   return (
-    <>
+    <DialogContent className="sm:max-w-lg">
       <DialogHeader>
         <DialogTitle>{title}</DialogTitle>
       </DialogHeader>
@@ -90,22 +94,22 @@ function ImportReviewContent({
             );
           })}
         </div>
-        <div className="flex items-center justify-between gap-2 border-t pt-3">
-          <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
-            Cancel
-          </Button>
-          <Button
-            onClick={() => onConfirm(Array.from(selected))}
-            disabled={busy || selectedCount === 0}
-          >
-            <Check className="size-4" />
-            {selectedCount === 0
-              ? "Select a server"
-              : `Import ${selectedCount} server${selectedCount === 1 ? "" : "s"}`}
-          </Button>
-        </div>
       </div>
-    </>
+      <DialogFooter className="justify-between">
+        <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
+          Cancel
+        </Button>
+        <Button
+          onClick={() => onConfirm(Array.from(selected))}
+          disabled={busy || selectedCount === 0}
+        >
+          <Check className="size-4" />
+          {selectedCount === 0
+            ? "Select a server"
+            : `Import ${selectedCount} server${selectedCount === 1 ? "" : "s"}`}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
   );
 }
 

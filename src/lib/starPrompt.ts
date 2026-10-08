@@ -1,13 +1,10 @@
 /**
  * One-time "star us on GitHub" ask.
  *
- * Two audiences, deliberately different:
- *
- * - New install: a card right after onboarding, and (only if that card was
- *   deferred) a small chip on a later launch, once a few servers are enabled.
- * - Existing install, i.e. someone who onboarded before this prompt shipped:
- *   exactly one card, a few seconds into a launch. They have used the app for
- *   months; one ask is the polite amount, so there is no chip afterwards.
+ * New installs get a deferred chip, never a card after onboarding. Existing
+ * installs keep their one-off delayed card. Both wait for three enabled servers
+ * and successful gateway tool calls on two distinct UTC dates in retained local
+ * Activity. No new usage tracking is written.
  *
  * An ask is spent when it is shown, not when it is clicked. Ignoring a prompt
  * and quitting therefore does not bring it back on the next launch, which is
@@ -23,13 +20,27 @@ export const STAR_REPO_URL = "https://github.com/btsouth/toolport";
  *  recorded at all. Never read back, so a leftover from a crash is harmless. */
 const STORAGE_PROBE_KEY = "toolport.starPrompt.probe";
 
-/** Enabled servers before the chip is allowed to appear. The point is to ask
- *  someone who got value out of the app, not someone who just installed it. */
-export const CHIP_MIN_ENABLED_SERVERS = 3;
+export const STAR_MIN_ENABLED_SERVERS = 3;
 
-/** Enabled servers before the existing-user card appears. Only skips installs
- *  that were never actually set up. */
-export const RETURNING_MIN_ENABLED_SERVERS = 1;
+/** Audit includes governance rows as well as calls. Match audit::tool_call_ok. */
+export function toolCallDays(
+  entries: readonly { ts: number; ok: boolean; held?: boolean; kind?: string }[],
+): number {
+  return new Set(
+    entries
+      .filter(
+        (entry) =>
+          entry.ok === true &&
+          !entry.held &&
+          !["approval", "routine", "advisor", "suggestion", "candidate"].includes(
+            entry.kind ?? "",
+          ) &&
+          Number.isFinite(entry.ts) &&
+          entry.ts > 0,
+      )
+      .map((entry) => Math.floor(entry.ts / 86_400_000)),
+  ).size;
+}
 
 /**
  * What this install is owed next.

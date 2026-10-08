@@ -128,3 +128,35 @@ describe("when storage is unusable", () => {
     expect(setItem).not.toHaveBeenCalled();
   });
 });
+
+describe("value days", () => {
+  it("counts distinct UTC dates", () => {
+    expect(
+      mod.toolCallDays([
+        { ts: 86400000, ok: true },
+        { ts: 86400001, ok: true },
+      ]),
+    ).toBe(1);
+    expect(
+      mod.toolCallDays([
+        { ts: 86400000, ok: true },
+        { ts: 172800000, ok: true },
+      ]),
+    ).toBe(2);
+  });
+  it("excludes failures, holds, governance and invalid dates", () => {
+    expect(
+      mod.toolCallDays([
+        { ts: 86400000, ok: false },
+        { ts: 172800000, ok: true, held: true },
+        ...["approval", "routine", "advisor", "suggestion", "candidate"].map((kind) => ({
+          ts: 259200000,
+          ok: true,
+          kind,
+        })),
+        { ts: NaN, ok: true },
+        { ts: 0, ok: true },
+      ]),
+    ).toBe(0);
+  });
+});

@@ -82,6 +82,22 @@ describe("ServerDialog", () => {
     vi.clearAllMocks();
   });
 
+  it("waits for each field to blur before showing its validation error", async () => {
+    const user = userEvent.setup();
+    render(<ServerDialog autoOpen onSaved={vi.fn()} />);
+    expect(screen.queryByText("Give the server a name.")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Enter the command to run/)).not.toBeInTheDocument();
+    await user.click(screen.getByLabelText("Name"));
+    await user.tab();
+    expect(screen.getByText("Give the server a name.")).toBeInTheDocument();
+    expect(screen.queryByText(/Enter the command to run/)).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText("Name"), "demo");
+    expect(screen.queryByText("Give the server a name.")).not.toBeInTheDocument();
+    await user.click(screen.getByLabelText("Command"));
+    await user.tab();
+    expect(screen.getByText(/Enter the command to run/)).toBeInTheDocument();
+  });
+
   it("vaults composed launch inputs and clears bindings when arguments change", async () => {
     const initial: ServerEntry = {
       id: "",

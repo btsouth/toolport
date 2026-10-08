@@ -1,20 +1,17 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { CircleCheck, Star, X } from "lucide-react";
+import { Star, X } from "lucide-react";
+import { getAuditLog } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { openExternal } from "@/lib/openUrl";
 import { modalLayerOpen, useModalOpen, useWindowVisible } from "@/lib/windowVisible";
 import {
-  CHIP_MIN_ENABLED_SERVERS,
-  RETURNING_MIN_ENABLED_SERVERS,
+  STAR_MIN_ENABLED_SERVERS,
+  toolCallDays,
   STAR_REPO_URL,
   readStarStage,
   writeStarStage,
   type StarStage,
 } from "@/lib/starPrompt";
-
-/** Lets the onboarding dialog finish closing before the card slides in, so the
- *  two do not animate over each other. */
-const CARD_DELAY_MS = 700;
 
 /** How long an existing user is left alone before the one-off card appears. The
  *  clock only runs while the window is actually on screen: Toolport lives in the
@@ -27,13 +24,15 @@ const SHELL =
   "pointer-events-auto animate-in fade-in slide-in-from-bottom-2 border bg-popover/95 text-popover-foreground shadow-2xl backdrop-blur";
 
 /** Which surface is on screen (null when none), for the toast-offset callback. */
-export type StarSurface = "card" | "returning" | "chip" | null;
+export type StarSurface = "returning" | "chip" | null;
 
 interface Props {
-  /** True once the wizard has been finished in this session (card trigger). */
+  /** True once the wizard has been finished in this session (no ask in that session). */
   justOnboarded: boolean;
   /** Enabled servers in the active profile. */
   enabledCount: number;
+  onboardingOpen?: boolean;
+  refreshKey?: number;
   /** Told which surface is on screen, so the toast stack can move up by the
    *  right amount instead of landing on top of it. Both live bottom-right. */
   onVisibleChange?: (surface: StarSurface) => void;
@@ -45,21 +44,16 @@ interface Props {
 export function GitHubStarPrompt({
   justOnboarded,
   enabledCount,
+  onboardingOpen = false,
+  refreshKey = 0,
   onVisibleChange,
 }: Props) {
-  // Frozen at mount, so a stage change made during this session cannot promote
-  // one surface into another. A "Later" answered by a chip minutes later would
-  // be nagging; the chip belongs to the next launch.
+  // Freeze the audience for this launch; onboarding books a future chip.
   const [stage] = useState<StarStage>(readStarStage);
   const [dismissed, setDismissed] = useState(false);
-  const [cardReady, setCardReady] = useState(false);
+  const [days, setDays] = useState(0);
+  const [shown, setShown] = useState(false);
   const [returningReady, setReturningReady] = useState(false);
-  // The most servers that have been enabled at once this session. The count is
-  // a gate for reaching the ask, not a condition to keep meeting: without the
-  // high-water mark, toggling a server off and back on retracts a prompt and
-  // then shows it again, which is flicker for an ask that is already spent.
-  const [peakEnabled, setPeakEnabled] = useState(enabledCount);
-  if (enabledCount > peakEnabled) setPeakEnabled(enabledCount);
   // Nothing is shown, and so nothing is spent, unless the corner is genuinely
   // reachable. The app sits in the tray and the gateway can enable servers from
   // there, which would otherwise let the chip appear and burn its one showing
@@ -67,26 +61,40 @@ export function GitHubStarPrompt({
   // since it covers the corner, traps focus and aria-hides everything under it.
   const windowVisible = useWindowVisible();
   const modalOpen = useModalOpen();
-  const reachable = windowVisible && !modalOpen;
+  const reachable = windowVisible && !modalOpen && !onboardingOpen && !justOnboarded;
 
+  const eligible = shown || (enabledCount >= STAR_MIN_ENABLED_SERVERS && days >= 2);
   const surface: StarSurface =
-    dismissed || !reachable
+    dismissed || !reachable || !eligible
       ? null
-      : stage === "card" && justOnboarded && cardReady
-        ? "card"
-        : stage === "returning" &&
-            returningReady &&
-            peakEnabled >= RETURNING_MIN_ENABLED_SERVERS
-          ? "returning"
-          : stage === "later" && peakEnabled >= CHIP_MIN_ENABLED_SERVERS
-            ? "chip"
-            : null;
+      : stage === "returning" && returningReady
+        ? "returning"
+        : stage === "later"
+          ? "chip"
+          : null;
 
   useEffect(() => {
-    if (stage !== "card" || !justOnboarded) return;
-    const timer = setTimeout(() => setCardReady(true), CARD_DELAY_MS);
-    return () => clearTimeout(timer);
-  }, [stage, justOnboarded]);
+    if (
+      !reachable ||
+      stage === "done" ||
+      shown ||
+      enabledCount < STAR_MIN_ENABLED_SERVERS
+    )
+      return;
+    let cancelled = false;
+    // The retained audit file is already bounded by the gateway. Read all retained
+    // rows so a busy day cannot hide an older qualifying day behind a page limit.
+    void getAuditLog(2_147_483_647)
+      .then((entries) => {
+        if (!cancelled) setDays(toolCallDays(entries));
+      })
+      .catch(() => {
+        if (!cancelled) setDays(0);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reachable, stage, shown, enabledCount, refreshKey]);
 
   useEffect(() => {
     if (stage !== "returning" || !reachable) return;
@@ -94,32 +102,19 @@ export function GitHubStarPrompt({
     return () => clearTimeout(timer);
   }, [stage, reachable]);
 
-  // Finishing the wizard is what makes this install definitely a new one, and
-  // that fact is only in storage while the session lasts. The card itself is
-  // delayed and gated on the window, so a launch that hides to the tray in
-  // between would record nothing at all, and the next launch would read an
-  // onboarding flag with no star record and mistake a day-old install for a
-  // months-old one. Booking the chip fallback here costs a new user nothing:
-  // it is the same value the card writes when it appears.
+  // Book the deferred chip before the onboarding flag marks this as returning.
   useEffect(() => {
     if (stage === "card" && justOnboarded) writeStarStage("later");
   }, [stage, justOnboarded]);
 
-  // Showing is what spends the ask. Quitting without answering must not earn a
-  // second showing of the same surface. The new-user card falls back to the
-  // chip; everything else is the last ask this install gets.
-  //
-  // Recorded a beat after the render rather than during it, because "shown" is
-  // a claim about the screen and the screen is not settled yet. A dialog going
-  // up in the same beat raises its overlay through a portal, which React mounts
-  // on a later commit, so a surface can render into a corner that is about to
-  // be covered. Letting the DOM settle and re-reading it is what stops the one
-  // ask being spent behind a blurred overlay nobody can click through.
+  // Spend only after the DOM settles, so a modal mounting in the same commit
+  // cannot consume an ask behind its overlay.
   useEffect(() => {
     if (!surface || modalOpen) return;
     const spend = setTimeout(() => {
       if (modalLayerOpen()) return;
-      writeStarStage(surface === "card" ? "later" : "done");
+      writeStarStage("done");
+      setShown(true);
     });
     return () => clearTimeout(spend);
   }, [surface, modalOpen]);
@@ -168,23 +163,15 @@ export function GitHubStarPrompt({
         className={`${SHELL} w-[min(20rem,calc(100vw-2rem))] rounded-xl p-4`}
       >
         <div className="flex items-start gap-2">
-          {surface === "card" ? (
-            <CircleCheck className="mt-0.5 size-4 shrink-0 text-success" />
-          ) : (
-            <Star className="mt-0.5 size-4 shrink-0 text-warning" />
-          )}
-          <p className="flex-1 text-sm font-medium">
-            {surface === "card" ? "You're all set" : "Enjoying Toolport?"}
-          </p>
+          <Star className="mt-0.5 size-4 shrink-0 text-warning" />
+          <p className="flex-1 text-sm font-medium">Enjoying Toolport?</p>
           <CloseButton
             onClick={() => setDismissed(true)}
             className="-mt-0.5 -mr-0.5 rounded p-0.5"
           />
         </div>
         <p className="mt-1.5 text-sm text-muted-foreground">
-          {surface === "card"
-            ? "If Toolport is useful, a GitHub star helps other developers find it."
-            : "A GitHub star helps other developers find it."}
+          A GitHub star helps other developers find it.
         </p>
         <div className="mt-3 flex items-center gap-2">
           <Button size="sm" onClick={star}>
@@ -192,9 +179,7 @@ export function GitHubStarPrompt({
             Star on GitHub
           </Button>
           <Button size="sm" variant="ghost" onClick={() => setDismissed(true)}>
-            {/* "Later" is only honest on the new-user card, which really does
-                get a second (and final) chance as the chip. */}
-            {surface === "card" ? "Later" : "No thanks"}
+            No thanks
           </Button>
         </div>
       </div>

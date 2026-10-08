@@ -15,6 +15,7 @@ const setAllEnabled = vi.fn();
 // invoke onProbe exactly the way the Done step does.
 const captured: {
   onProbe: (() => Promise<ProbeResult[]>) | null;
+  onFinish?: () => void;
 } = { onProbe: null };
 
 vi.mock("@/lib/api", () => ({
@@ -81,8 +82,12 @@ vi.mock("@/components/PendingApprovals", () => ({ PendingApprovals: () => null }
 vi.mock("@/components/QuarantineAlert", () => ({ QuarantineAlert: () => null }));
 
 vi.mock("@/components/Onboarding", () => ({
-  Onboarding: (props: { onProbe: () => Promise<ProbeResult[]> }) => {
+  Onboarding: (props: {
+    onProbe: () => Promise<ProbeResult[]>;
+    onFinish: () => void;
+  }) => {
     captured.onProbe = props.onProbe;
+    captured.onFinish = props.onFinish;
     return null;
   },
 }));
@@ -97,6 +102,9 @@ function deferred<T>() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  setServerEnabled.mockReset();
+  setAllEnabled.mockReset();
+  probeServers.mockReset();
   localStorage.clear();
   captured.onProbe = null;
   getRegistry.mockResolvedValue({
@@ -182,9 +190,9 @@ describe("App health visibility", () => {
     render(<App />);
 
     expect(
-      await screen.findByRole("button", { name: /checking 1/i }),
+      await screen.findByRole("status", { name: "Checking connection" }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: /^Ready,/i })).not.toBeInTheDocument();
   });
 
   it("drops stale health when a server is re-enabled", async () => {
@@ -229,19 +237,20 @@ describe("App health visibility", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: /ready 1/i })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("status", { name: /^Ready, 1 tool$/i }),
+    ).toBeInTheDocument();
     await userEvent.click(screen.getByLabelText("Toggle Example"));
     await waitFor(() =>
       expect(setServerEnabled).toHaveBeenCalledWith("default", "server-1", false, false),
     );
 
-    await userEvent.click(screen.getByRole("button", { name: /disabled 1/i }));
     await userEvent.click(screen.getByLabelText("Toggle Example"));
 
     expect(
-      await screen.findByRole("button", { name: /checking 1/i }),
+      await screen.findByRole("status", { name: "Checking connection" }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: /^Ready,/i })).not.toBeInTheDocument();
     expect(
       screen.queryByText(/1 of 1 enabled servers reachable/i),
     ).not.toBeInTheDocument();
@@ -289,7 +298,9 @@ describe("App health visibility", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: /ready 1/i })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("status", { name: /^Ready, 1 tool$/i }),
+    ).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "More actions" }));
     await userEvent.click(screen.getByText("Disable all"));
     await waitFor(() => expect(setAllEnabled).toHaveBeenCalledWith("default", false));
@@ -298,9 +309,9 @@ describe("App health visibility", () => {
     await userEvent.click(screen.getByText("Enable all"));
 
     expect(
-      await screen.findByRole("button", { name: /checking 1/i }),
+      await screen.findByRole("status", { name: "Checking connection" }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: /^Ready,/i })).not.toBeInTheDocument();
   });
 
   it("invalidates health and probes after changing default access", async () => {
@@ -340,13 +351,77 @@ describe("App health visibility", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: /ready 1/i })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("status", { name: /^Ready, 1 tool$/i }),
+    ).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Change default access" }));
 
     await waitFor(() => expect(probeServers).toHaveBeenCalledTimes(2));
     expect(
-      await screen.findByRole("button", { name: /checking 1/i }),
+      await screen.findByRole("status", { name: "Checking connection" }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: /^Ready,/i })).not.toBeInTheDocument();
+  });
+});
+
+describe("server list stability and automatic prompts", () => {
+  it("keeps adjacent toggle targets in place when enabled state changes", async () => {
+    const servers = ["Zulu", "Alpha", "Beta"].map((name) => ({
+      id: name,
+      enabled: false,
+      name,
+      transport: "stdio",
+      command: "fixture",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+    }));
+    const registry = {
+      version: 3,
+      servers,
+      profiles: [{ id: "p", name: "Default", enabledServerIds: [] as string[] }],
+      activeProfileId: "p",
+    } as Registry;
+    getRegistry.mockResolvedValue(registry);
+    probeServers.mockResolvedValue([]);
+    setServerEnabled.mockImplementation((_profile, id, enabled) =>
+      Promise.resolve({
+        ...registry,
+        servers: servers.map((server) =>
+          server.id === id ? { ...server, enabled } : server,
+        ),
+      }),
+    );
+    render(<App />);
+    await screen.findByRole("switch", { name: "Toggle Alpha" });
+    const order = () =>
+      screen.getAllByRole("switch").map((row) => row.getAttribute("aria-label"));
+    const before = order();
+    await userEvent.click(screen.getByRole("switch", { name: "Toggle Alpha" }));
+    await waitFor(() => expect(setServerEnabled).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "Toggle Alpha" })).toBeChecked(),
+    );
+    expect(order()).toEqual(before);
+    expect(before).toEqual(["Toggle Alpha", "Toggle Beta", "Toggle Zulu"]);
+  });
+  it("never asks for a star after finishing onboarding or returning", async () => {
+    probeServers.mockResolvedValue([]);
+    const { unmount } = render(<App />);
+    await waitFor(() => expect(captured.onFinish).toBeDefined());
+    act(() => captured.onFinish!());
+    vi.useFakeTimers();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(16000);
+    });
+    expect(screen.queryByText(/Star.*GitHub/i)).not.toBeInTheDocument();
+    unmount();
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(16000);
+    });
+    expect(screen.queryByText(/Star.*GitHub/i)).not.toBeInTheDocument();
+    vi.useRealTimers();
   });
 });

@@ -883,8 +883,9 @@ button.toolport-activity-filter {{
 }}
 
 .toolport-card-icon {{
-  min-width: 28px;
-  min-height: 28px;
+  min-width: 32px;
+  min-height: 32px;
+  margin: 1px;
   border-radius: 9px;
   background-color: alpha(@toolport_accent, 0.12);
   color: @toolport_accent;
@@ -957,6 +958,10 @@ button.toolport-catalog-action {{
   color: @toolport_bg_dark;
   background-color: @toolport_accent;
   border-color: alpha(@toolport_accent, 0.82);
+}}
+
+.toolport-native switch:checked slider {{
+  background-color: @toolport_bg_dark;
 }}
 
 .toolport-native switch slider {{

@@ -96,10 +96,6 @@ describe("team enable review dialog", () => {
     { timeout: 20000 },
     async () => {
       render(<App />);
-      // The (only) server is off, so it sits in the collapsed Disabled group.
-      await userEvent.click(
-        await screen.findByRole("button", { name: /Disabled/ }, { timeout: 3000 }),
-      );
       const toggle = await screen.findByRole("switch", { name: "Toggle Team tool" });
       await userEvent.click(toggle);
       expect(await screen.findByText(/npx -y old-tool/)).toBeInTheDocument();
