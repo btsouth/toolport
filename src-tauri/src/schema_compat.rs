@@ -208,18 +208,38 @@ fn normalize_number(object: &mut Map<String, Value>, key: &str) {
     let Some(value) = object.get(key) else {
         return;
     };
-    if value.is_number() {
-        return;
-    }
-    let number = value.as_str().and_then(|s| {
-        serde_json::from_str::<Number>(s)
-            .ok()
-            .or_else(|| s.parse::<f64>().ok().and_then(Number::from_f64))
+    let number = value.as_number().cloned().or_else(|| {
+        value.as_str().and_then(|s| {
+            serde_json::from_str::<Number>(s)
+                .ok()
+                .or_else(|| s.parse::<f64>().ok().and_then(Number::from_f64))
+        })
+    });
+    let number = number.filter(|number| {
+        let value = number.as_f64().unwrap_or(f64::NAN);
+        if matches!(
+            key,
+            "minLength"
+                | "maxLength"
+                | "minItems"
+                | "maxItems"
+                | "minProperties"
+                | "maxProperties"
+                | "minContains"
+                | "maxContains"
+        ) {
+            value >= 0.0 && value.fract() == 0.0
+        } else if key == "multipleOf" {
+            value > 0.0
+        } else {
+            value.is_finite()
+        }
     });
     match number {
-        Some(number) => {
+        Some(number) if !value.is_number() => {
             object.insert(key.to_string(), Value::Number(number));
         }
+        Some(_) => {}
         None => {
             object.remove(key);
         }
@@ -479,6 +499,31 @@ mod tests {
         let mut schema = json!({"maximum": "18446744073709551615"});
         normalize(&mut schema);
         assert_eq!(schema["maximum"].as_u64(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn count_bounds_stay_nonnegative_integers_and_multiple_of_positive() {
+        for key in [
+            "minLength",
+            "maxLength",
+            "minItems",
+            "maxItems",
+            "minProperties",
+            "maxProperties",
+            "minContains",
+            "maxContains",
+        ] {
+            for value in [json!("-1"), json!("2.5"), json!(-1), json!(2.5)] {
+                let mut schema = json!({key: value});
+                normalize(&mut schema);
+                assert!(schema.get(key).is_none(), "{schema}");
+            }
+        }
+        for value in [json!("0"), json!("-1"), json!(0)] {
+            let mut schema = json!({"multipleOf": value});
+            normalize(&mut schema);
+            assert!(schema.get("multipleOf").is_none());
+        }
     }
 
     #[test]
