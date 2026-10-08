@@ -13797,9 +13797,8 @@ fn poll_modern_hitl(
     client: Option<&str>,
     input_responses: Option<Value>,
 ) -> ModernHitlPoll {
-    let (poll, remove) = session_tables()
-        .hitl()
-        .with(token, |pending| {
+    let mut approvals = session_tables().hitl();
+    let (poll, remove) = approvals.with(token, |pending| {
             if pending.name != name
                 || pending.args_hash != args_hash
                 || pending.scope != conversation_scope(client)
@@ -13874,7 +13873,7 @@ fn poll_modern_hitl(
         })
         .unwrap_or((ModernHitlPoll::Missing, false));
     if remove {
-        session_tables().hitl().remove(token);
+        approvals.remove(token);
     }
     poll
 }
