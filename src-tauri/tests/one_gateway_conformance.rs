@@ -2674,6 +2674,15 @@ fn matrix_pooling_root_restarts_only_when_its_effective_spec_changes() {
 
 #[test]
 fn matrix_pooling_rooted_subscription_survives_an_effective_spec_change() {
+    rooted_subscription_rollover(false);
+}
+
+#[test]
+fn matrix_pooling_rooted_subscription_survives_a_slow_replacement_call() {
+    rooted_subscription_rollover(true);
+}
+
+fn rooted_subscription_rollover(slow_call: bool) {
     let _guard = CASE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2715,21 +2724,35 @@ fn matrix_pooling_rooted_subscription_survives_an_effective_spec_change() {
         secret: false,
         unknown_fields: Default::default(),
     });
+    if slow_call {
+        // Delay only the replacement. Its first demand completes after the
+        // rollover deadline, but inside the existing RPC budget.
+        reg.servers[0].env.push(EnvVar {
+            key: "MOCK_MCP_CALL_DELAY_MS".into(),
+            value: Some("11000".into()),
+            secret: false,
+            unknown_fields: Default::default(),
+        });
+    }
     registry::save_to(&path, &reg).expect("rotate secret generation");
     let deadline = Instant::now() + Duration::from_secs(10);
     while transcript_initialize_count(&transcript) < 2 {
-        client.call_tool(&pwd, json!({}));
         assert!(
             Instant::now() < deadline,
             "replacement rooted child was not launched"
         );
-        std::thread::sleep(Duration::from_millis(100));
+        // A synchronous demand may itself finish the replacement after this
+        // scheduling deadline. Check its result before judging the next wait.
+        client.call_tool(&pwd, json!({}));
     }
     assert_eq!(
         transcript_method_count(&transcript, "resources/subscribe"),
         2,
         "the replacement child did not resume the subscription"
     );
+    if slow_call {
+        return;
+    }
     while client.lines.try_recv().is_ok() {}
 
     client.next_id += 1;
