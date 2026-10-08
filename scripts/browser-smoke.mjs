@@ -272,7 +272,10 @@ try {
   await page.getByRole("button", { name: "Add server", exact: true }).click();
   await page.getByLabel("Name", { exact: true }).fill("Manual notes");
   await page.getByLabel("Command", { exact: true }).fill("fixture-manual");
-  await page.getByRole("button", { name: "Add server", exact: true }).last().click();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Add", exact: true })
+    .click();
   await expect(
     page.getByRole("switch", { name: "Toggle Manual notes", exact: true }),
   ).toBeChecked();
@@ -297,8 +300,8 @@ try {
   await expect(page.getByText("Alpha", { exact: true })).toBeVisible();
   await expect(page.getByText("Beta", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Catalog", exact: true }).click();
-  await expect(page.getByText("NoteKit", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Add Collection", exact: true }).click();
+  await expect(page.getByText("NoteKit", { exact: true }).last()).toBeVisible();
+  await page.getByRole("button", { name: "Add 2", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Review Local notes" })).toBeVisible();
   await expect(page.getByText(/Credentials: PAT/)).toBeVisible();
   await page.screenshot({ path: path.join(output, "setup-collection-review.png") });
