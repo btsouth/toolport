@@ -88,6 +88,44 @@ impl Import {
         {
             return Err("The command contains a credential. Move it to an environment setting and review again. Client config unchanged.".into());
         }
+        if let Some(definition) = definition {
+            for field in ["env", "environment", "envs", "headers", "http_headers"] {
+                if let Some(settings) = definition.get(field).and_then(|v| v.as_object()) {
+                    for key in settings.keys() {
+                        if key.is_empty() || key.contains(['=', '\0']) {
+                            return Err("An imported credential has an invalid name. Fix its native config and review again.".into());
+                        }
+                        if !entry.env.iter().any(|e| &e.key == key) {
+                            entry.env.push(registry::EnvVar {
+                                key: key.clone(),
+                                value: None,
+                                secret: true,
+                                unknown_fields: Default::default(),
+                            });
+                        }
+                    }
+                }
+            }
+            for field in ["bearerTokenEnvVar", "bearer_token_env_var"] {
+                if let Some(key) = definition.get(field).and_then(|v| v.as_str()) {
+                    if !entry.env.iter().any(|e| e.key == key) {
+                        entry.env.push(registry::EnvVar {
+                            key: key.into(),
+                            value: None,
+                            secret: true,
+                            unknown_fields: Default::default(),
+                        });
+                    }
+                }
+            }
+            if definition
+                .get("env_http_headers")
+                .and_then(|v| v.as_object())
+                .is_some_and(|v| !v.is_empty())
+            {
+                return Err("This server uses HTTP headers from environment variables. Keep its native entry until those headers are supported.".into());
+            }
+        }
         let mut values = Vec::new();
         for env in &entry.env {
             let value = definition
