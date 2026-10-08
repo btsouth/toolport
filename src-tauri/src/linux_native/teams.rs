@@ -1058,9 +1058,8 @@ fn team_review_line(review: usize, blocked: usize) -> Option<String> {
     let mut parts = Vec::new();
     if review > 0 {
         parts.push(format!(
-            "{review} team {} off until you review and enable {} below. Check the command, address and authentication before enabling.",
-            if review == 1 { "server is" } else { "servers are" },
-            if review == 1 { "it" } else { "them" },
+            "{review} team {} waiting for your review. Held servers stay off; review queued changes above.",
+            if review == 1 { "change is" } else { "changes are" },
         ));
     }
     if blocked > 0 {
@@ -1760,13 +1759,11 @@ mod tests {
         assert_eq!(team_review_line(0, 0), None);
         assert_eq!(
             team_review_line(1, 0).unwrap(),
-            "1 team server is off until you review and enable it below. \
-             Check the command, address and authentication before enabling."
+            "1 team change is waiting for your review. Held servers stay off; review queued changes above."
         );
         assert_eq!(
             team_review_line(2, 1).unwrap(),
-            "2 team servers are off until you review and enable them below. \
-             Check the command, address and authentication before enabling. \
+            "2 team changes are waiting for your review. Held servers stay off; review queued changes above. \
              1 was blocked as unsafe (link-local or cloud-metadata URLs)."
         );
     }

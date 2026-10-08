@@ -699,7 +699,7 @@ pub(crate) fn build_push_preview(
     })
 }
 
-/// Admin push of a servers-only config update. Returns the new version.
+/// A desktop push either publishes directly or waits for dashboard confirmation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigProposal {
@@ -8488,12 +8488,12 @@ mod member_pairing_regression {
         });
         let result = finish_connect(
             &origin,
+            None,
             Joined {
                 team_id: "review-team".into(),
                 member_token: "fixture-token".into(),
                 role: "member".into(),
             },
-            None,
         );
         service.join().unwrap();
         result.unwrap();

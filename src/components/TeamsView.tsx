@@ -161,7 +161,7 @@ export function TeamsView({
       const parts: string[] = [];
       if (review > 0)
         parts.push(
-          `${review} team server${review === 1 ? "" : "s"} ${review === 1 ? "is" : "are"} off until you review and enable ${review === 1 ? "it" : "them"} below. Check the command, address and authentication before enabling.`,
+          `${review} team change${review === 1 ? " is" : "s are"} waiting for your review. Held servers stay off; review queued changes above.`,
         );
       if (blocked > 0)
         parts.push(
