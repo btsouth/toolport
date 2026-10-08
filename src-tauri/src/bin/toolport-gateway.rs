@@ -37741,11 +37741,20 @@ mod tests {
     }
 
     fn tool_surface_fixture() -> (Registry, Arc<Router>, Arc<CatalogSnapshot>) {
+        tool_surface_fixture_for_safety(registry::SafetyLevel::Off)
+    }
+
+    fn tool_surface_fixture_for_safety(
+        level: registry::SafetyLevel,
+    ) -> (Registry, Arc<Router>, Arc<CatalogSnapshot>) {
         let mut reg = Registry {
-            safety_level: Some(registry::SafetyLevel::Off),
+            safety_level: Some(level),
             ..Registry::default()
         };
-        let mut router = Router::new();
+        let mut router = Router::with_policy(ToolPolicy {
+            deny_destructive: reg.deny_destructive_effective(),
+            ..ToolPolicy::default()
+        });
         for server in ["alpha", "beta"] {
             reg.servers.push(stub_server(server, server));
             router.add(DownstreamServer::connect(server.into(), Box::new(MockRoute {
