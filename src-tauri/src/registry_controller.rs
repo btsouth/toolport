@@ -1520,7 +1520,7 @@ fn migrate_client_reviewed_with(
         Option<&str>,
     ) -> Result<Vec<serde_json::Value>, String>,
 ) -> Result<MigrateOutcome, String> {
-    let current = read_registry_exact()?;
+    let current = read_registry_exact_or_default()?;
     refuse_customized_client(
         client_gateway_state(&current.client_managed_entries, client_id),
         force,
@@ -2447,6 +2447,29 @@ mod tests {
         assert!(error.contains("changed"));
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), changed);
         assert!(read_registry_exact().unwrap().servers.is_empty());
+    }
+
+    #[test]
+    fn reviewed_setup_creates_registry_on_first_run() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::remove_file(registry::resolved_path().unwrap()).unwrap();
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"command":"one"}}}"#,
+        )
+        .unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        let result = migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
+            |_, _, _, _| Ok(vec![serde_json::json!({"name":"toolport_search_tools"})]),
+        )
+        .unwrap();
+        assert_eq!(result.moved, ["one"]);
+        assert!(read_registry_exact().unwrap().servers[0].enabled);
     }
 
     #[test]
