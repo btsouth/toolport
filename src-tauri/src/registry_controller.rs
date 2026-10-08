@@ -353,29 +353,30 @@ fn nonempty(value: Option<String>) -> Option<String> {
 }
 
 pub fn apply_add_server(registry: &mut Registry, fields: ServerFields) -> Result<String, String> {
+    Ok(apply_add_entry(registry, entry_from_fields(fields)?))
+}
+
+fn entry_from_fields(fields: ServerFields) -> Result<ServerEntry, String> {
     let fields = fields.normalized()?;
-    Ok(apply_add_entry(
-        registry,
-        ServerEntry {
-            enabled: false,
-            inherit_env: false,
-            id: String::new(),
-            name: fields.name,
-            transport: fields.transport,
-            command: fields.command,
-            args: fields.args,
-            env: Vec::new(),
-            url: fields.url,
-            cwd: fields.cwd,
-            source: Some("manual".into()),
-            disabled_tools: Vec::new(),
-            client_credentials: None,
-            request_timeout_ms: None,
-            initialize_timeout_ms: None,
-            launch: None,
-            unknown_fields: serde_json::Map::new(),
-        },
-    ))
+    Ok(ServerEntry {
+        enabled: false,
+        inherit_env: false,
+        id: String::new(),
+        name: fields.name,
+        transport: fields.transport,
+        command: fields.command,
+        args: fields.args,
+        env: Vec::new(),
+        url: fields.url,
+        cwd: fields.cwd,
+        source: Some("manual".into()),
+        disabled_tools: Vec::new(),
+        client_credentials: None,
+        request_timeout_ms: None,
+        initialize_timeout_ms: None,
+        launch: None,
+        unknown_fields: serde_json::Map::new(),
+    })
 }
 
 pub fn apply_add_entry(registry: &mut Registry, mut entry: ServerEntry) -> String {
@@ -482,9 +483,18 @@ pub fn preview_client_imports() -> Result<Vec<ClientImportCandidate>, String> {
             key: clients::import_dedupe_key(&server.name, server.command.as_deref(), &server.args),
             name: server.name,
             transport: server.transport,
-            command: server.command,
-            args: server.args,
-            url: server.url,
+            command: server.command.map(|c| {
+                if registry::arg_looks_secret(&c) {
+                    "<command>".into()
+                } else {
+                    c
+                }
+            }),
+            args: crate::import_credentials::shown_args(&server.args),
+            url: server
+                .url
+                .as_deref()
+                .map(crate::import_credentials::shown_url),
         })
         .collect())
 }
@@ -494,14 +504,44 @@ pub fn import_client_servers(selected: Vec<String>) -> Result<(Registry, usize),
     let selected = selected
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
-    registry::update(|registry| {
-        let servers = selected_servers_to_import(&detected, registry, Some(&selected))?;
-        let added = servers.len();
-        for server in servers {
-            apply_import_entry(registry, server);
+    let current = read_registry_exact_or_default()?;
+    let servers = selected_servers_to_import(&detected, &current, Some(&selected))?;
+    let mut prepared = Vec::new();
+    for entry in servers {
+        let client_id = entry
+            .source
+            .as_deref()
+            .and_then(|s| s.strip_prefix("imported:"))
+            .ok_or("Missing import source")?;
+        let definition = clients::import_definition(client_id, &entry.name)?;
+        prepared.push(crate::import_credentials::Import::prepare(
+            entry,
+            definition.as_ref(),
+        )?);
+    }
+    let (registry, added) = registry::update(|registry| {
+        let mut added = 0;
+        for import in prepared {
+            // Concurrent imports may already have created this definition.
+            if registry
+                .servers
+                .iter()
+                .any(|s| s.name.eq_ignore_ascii_case(&import.entry.name))
+            {
+                continue;
+            }
+            let id = registry.add_server(import.entry.clone());
+            let missing = import.transfer(&id)?;
+            if missing.is_empty() {
+                let profile = registry.default_access_id();
+                apply_server_enabled(registry, &profile, &id, true, false)?;
+                let _ = registry.set_access_server(&profile, &id, true);
+            }
+            added += 1;
         }
         Ok(added)
-    })
+    })?;
+    Ok((registry, added))
 }
 
 pub fn apply_update_entry(registry: &mut Registry, entry: ServerEntry) -> Result<(), String> {
@@ -545,9 +585,41 @@ pub fn apply_remove_server(registry: &mut Registry, server_id: &str) -> Result<(
     registry.remove_server(server_id)
 }
 
-pub fn add_server(fields: ServerFields) -> Result<Registry, String> {
-    let (registry, _) = registry::update(|registry| apply_add_server(registry, fields))?;
+pub fn add_reviewed_entry(entry: ServerEntry) -> Result<Registry, String> {
+    let env = entry
+        .env
+        .iter()
+        .map(|e| {
+            (
+                e.key.clone(),
+                e.value
+                    .clone()
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let definition = serde_json::json!({"env":env});
+    let import = crate::import_credentials::Import::prepare(entry, Some(&definition))?;
+    let (registry, ()) = registry::update(|registry| {
+        let mut entry = import.entry.clone();
+        entry.enabled = false;
+        let id = registry.add_server(entry);
+        let missing = import.transfer(&id)?;
+        if missing.is_empty() {
+            let profile = registry.default_access_id();
+            if apply_server_enabled(registry, &profile, &id, true, false).is_ok() {
+                let _ = registry.set_access_server(&profile, &id, true);
+            }
+        }
+        registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
+        Ok(())
+    })?;
     Ok(registry)
+}
+
+pub fn add_server(fields: ServerFields) -> Result<Registry, String> {
+    Ok(add_snippet_server(fields, Vec::new())?.registry)
 }
 
 pub fn add_server_with_launch(
@@ -595,51 +667,35 @@ pub fn add_snippet_server(
     fields: ServerFields,
     env: Vec<(String, Option<String>)>,
 ) -> Result<SnippetAddOutcome, String> {
-    let (registry, id) = registry::update(|registry| {
-        let id = apply_add_server(registry, fields)?;
-        if !env.is_empty() {
-            registry.set_global_server_enabled(&id, false)?;
-        }
-        Ok(id)
-    })?;
+    let mut entry = entry_from_fields(fields)?;
+    entry.env = env
+        .iter()
+        .map(|(key, _)| registry::EnvVar {
+            key: key.clone(),
+            value: None,
+            secret: true,
+            unknown_fields: Default::default(),
+        })
+        .collect();
+    let definition = serde_json::json!({"env": env.into_iter().map(|(key, value)| (key, value.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null))).collect::<serde_json::Map<_, _>>()});
+    let import = crate::import_credentials::Import::prepare(entry, Some(&definition))?;
+    let (registry, id) =
+        registry::update(|registry| Ok(registry.add_server(import.entry.clone())))?;
     let mut outcome = SnippetAddOutcome {
         registry,
         declared_without_value: Vec::new(),
         failed: Vec::new(),
     };
-    for (key, value) in env {
-        match value.as_deref().filter(|value| {
-            !value.trim().is_empty()
-                && !value.starts_with("${")
-                && !value.starts_with("<")
-                && !value.starts_with("YOUR_")
-                && !value.starts_with("REPLACE_")
-        }) {
-            Some(value) => match set_server_secret(&id, &key, value) {
-                Ok(registry) => outcome.registry = registry,
-                Err(_) => outcome.failed.push(key),
-            },
-            None => match normalize_secret_key(&key).and_then(|normalized| {
-                let (registry, ()) = registry::update(|registry| {
-                    apply_secret_declaration(registry, &id, &normalized)
-                })?;
-                Ok((registry, normalized))
-            }) {
-                Ok((registry, normalized)) => {
-                    outcome.registry = registry;
-                    outcome.declared_without_value.push(normalized);
-                }
-                Err(_) => outcome.failed.push(key),
-            },
-        }
+    match import.transfer(&id) {
+        Ok(missing) => outcome.declared_without_value = missing,
+        Err(_) => outcome.failed.push("credentials".into()),
     }
     if outcome.failed.is_empty() && outcome.declared_without_value.is_empty() {
         let (registry, ()) = registry::update(|registry| {
             let profile = registry.default_access_id();
             apply_server_enabled(registry, &profile, &id, true, false)?;
-            if registry.access_profile(&profile).is_some() {
-                registry.set_access_server(&profile, &id, true)?;
-            }
+            let _ = registry.set_access_server(&profile, &id, true);
+            registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
             Ok(())
         })?;
         outcome.registry = registry;
@@ -1352,26 +1408,35 @@ pub(crate) fn import_client_servers_for_migration(
             continue;
         }
         moved.push(server.name.clone());
-        let exists = registry
-            .servers
-            .iter()
-            .any(|entry| entry.name.eq_ignore_ascii_case(&server.name));
-        if let Some(existing) = registry
+        let definition = clients::import_definition(&client.id, &server.name)?;
+        let import = crate::import_credentials::Import::prepare(
+            server_from_detected(server, &client.id),
+            definition.as_ref(),
+        )?;
+        let id = if let Some(existing) = registry
             .servers
             .iter()
             .find(|entry| entry.name.eq_ignore_ascii_case(&server.name))
         {
-            if existing.command != server.command
-                || existing.args != server.args
-                || existing.url != server.url
-                || existing.transport != server.transport
+            if existing.command != import.entry.command
+                || existing.args != import.entry.args
+                || existing.url != import.entry.url
+                || existing.transport != import.entry.transport
             {
                 return Err(format!("{} already exists with a different definition. Resolve it under Servers before connecting. Client config unchanged.", server.name));
             }
-        }
-        if !exists {
-            registry.add_server(server_from_detected(server, &client.id));
+            let id = existing.id.clone();
+            let entry = registry.servers.iter_mut().find(|e| e.id == id).unwrap();
+            entry.env = import.entry.env.clone();
+            entry.launch = import.entry.launch.clone();
+            id
+        } else {
             imported += 1;
+            registry.add_server(import.entry.clone())
+        };
+        let missing = import.transfer(&id)?;
+        if !missing.is_empty() {
+            return Err(format!("{} needs credentials. Add the missing values in its native config or Credentials, then review again. Client config unchanged.", server.name));
         }
     }
     Ok((imported, moved))
@@ -1473,9 +1538,15 @@ pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String
             key: s.name.clone(),
             name: s.name.clone(),
             transport: s.transport.clone(),
-            command: s.command.clone(),
-            args: s.args.clone(),
-            url: s.url.clone(),
+            command: s.command.as_ref().map(|c| {
+                if registry::arg_looks_secret(c) {
+                    "<command>".into()
+                } else {
+                    c.clone()
+                }
+            }),
+            args: crate::import_credentials::shown_args(&s.args),
+            url: s.url.as_deref().map(crate::import_credentials::shown_url),
             env_keys: s.env_keys.clone(),
             is_new: !registry
                 .servers
@@ -1731,6 +1802,12 @@ fn verify_setup_gateway(
             .iter()
             .find(|s| s.name.eq_ignore_ascii_case(name))
             .ok_or("Reviewed server missing")?;
+        if !crate::import_credentials::ready(server)? {
+            return Err(format!(
+                "{} needs credentials. Open Credentials and retry. Client config unchanged.",
+                server.name
+            ));
+        }
         let probe = crate::server_runtime::probe_one_bounded(server);
         if !probe.ok {
             return Err(if probe.auth_required {
@@ -1748,7 +1825,7 @@ fn verify_setup_gateway(
         .ok_or("Could not locate the Toolport gateway. Client config unchanged.")?;
     let mode = clients::discovery_capabilities(client_id)
         .resolve_mode(registry.client_discovery.get(client_id).map(String::as_str));
-    let env = vec![
+    let mut env = vec![
         (
             "TOOLPORT_DATA_DIR".into(),
             registry::conduit_dir()
@@ -1760,6 +1837,14 @@ fn verify_setup_gateway(
         ("TOOLPORT_DISCOVERY".into(), mode.to_string()),
         (crate::brand::CLIENT_ID.into(), client_id.to_string()),
     ];
+    if let Some(key) =
+        std::env::var_os("TOOLPORT_SECRET_KEY").or_else(|| std::env::var_os("CONDUIT_SECRET_KEY"))
+    {
+        env.push((
+            "TOOLPORT_SECRET_KEY".into(),
+            key.to_string_lossy().into_owned(),
+        ));
+    }
     let transport = crate::downstream::StdioTransport::spawn(
         &gateway.to_string_lossy(),
         &["--setup-review".into()],
@@ -2253,6 +2338,28 @@ pub fn delete_server_secret_with(
 }
 
 pub fn set_server_secret(server_id: &str, key: &str, value: &str) -> Result<Registry, String> {
+    if !crate::import_credentials::provided(value) {
+        return Err("Enter a credential value. Placeholder values cannot be saved.".into());
+    }
+    let registry = read_registry_exact()?;
+    let remote = registry
+        .servers
+        .iter()
+        .find(|s| s.id == server_id)
+        .is_some_and(|s| s.transport != "stdio");
+    let (key, value) = if remote && key.eq_ignore_ascii_case("authorization") {
+        let (scheme, token) = value
+            .split_once(' ')
+            .ok_or("Enter a Bearer token for Authorization")?;
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            return Err(
+                "Only Bearer authentication is supported for imported Authorization headers".into(),
+            );
+        }
+        (crate::secrets::HTTP_AUTH_KEY, token)
+    } else {
+        (key, value)
+    };
     set_server_secret_with(server_id, key, value, |server_id, key| {
         let (registry, ()) =
             registry::update(|registry| apply_secret_declaration(registry, server_id, key))?;
@@ -2532,6 +2639,76 @@ mod tests {
             &review.revision,
             |_, _, _, _| Ok(Vec::new().into()),
         )
+    }
+
+    #[test]
+    fn reviewed_import_vaults_values_and_failed_vault_keeps_native_config() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let original = r#"{"mcpServers":{"one":{"command":"fixture","env":{"PAT":"synthetic-native-pat","PORT":3000}}}}"#;
+        std::fs::write(fixture.claude(), original).unwrap();
+        let (registry, count) = import_client_servers(vec!["name:one".into()]).unwrap();
+        assert_eq!(count, 1);
+        let entry = &registry.servers[0];
+        assert!(entry.enabled);
+        assert_eq!(
+            crate::secrets::get_vault_secret_result(&entry.id, "PAT")
+                .unwrap()
+                .as_deref(),
+            Some("synthetic-native-pat")
+        );
+        assert_eq!(
+            crate::secrets::get_vault_secret_result(&entry.id, "PORT")
+                .unwrap()
+                .as_deref(),
+            Some("3000")
+        );
+        let saved = serde_json::to_string(&registry).unwrap();
+        assert!(!saved.contains("synthetic-native-pat"));
+        assert!(
+            !crate::sharing_controller::build_export(&registry, None, None, None)
+                .to_string()
+                .contains("synthetic-native-pat")
+        );
+        assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
+        assert_eq!(import_client_servers(vec!["name:one".into()]).unwrap().1, 0);
+        let before = preview_client_setup("claude-code").unwrap();
+        std::fs::write(fixture.root.join("data/secrets.enc"), "unreadable-vault").unwrap();
+        let error = migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &before.revision,
+            |_, _, _, _| panic!("vault failure must stop verification"),
+        )
+        .unwrap_err();
+        assert!(error.contains("Keychain unavailable"));
+        assert!(!error.contains("synthetic-native-pat"));
+        assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
+        assert!(!fixture.move_record("claude-code").exists());
+    }
+
+    #[test]
+    fn reviewed_missing_input_keeps_native_config_and_does_not_claim_success() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let original = r#"{"mcpServers":{"one":{"command":"fixture","env":{"PAT":"${PAT}"}}}}"#;
+        std::fs::write(fixture.claude(), original).unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        let error = migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
+            |_, _, _, _| panic!("missing input must stop verification"),
+        )
+        .unwrap_err();
+        assert!(error.contains("needs credentials"));
+        assert!(!error.contains("Keychain unavailable"));
+        assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
+        let (registry, _) = import_client_servers(vec!["name:one".into()]).unwrap();
+        assert!(!registry.servers[0].enabled);
+        assert!(registry.servers[0].env[0].value.is_none());
     }
 
     #[test]
@@ -3755,6 +3932,10 @@ mod tests {
             let vars = vec![
                 clients::EnvRestore::set("CLAUDE_CONFIG_DIR", &root.join("claude")),
                 clients::EnvRestore::set("CODEX_HOME", &root.join("codex")),
+                clients::EnvRestore::set(
+                    "TOOLPORT_SECRET_KEY",
+                    std::path::Path::new("synthetic-import-fixture"),
+                ),
             ];
             registry::save(registry).unwrap();
             Self {

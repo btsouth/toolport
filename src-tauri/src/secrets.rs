@@ -10,6 +10,8 @@ const TASK_HANDLE_KEY: &str = "__task_handle_key__";
 
 /// Reserved secret key for an http server's bearer token (Tier A auth, and where
 /// the OAuth flow stores its access token).
+pub(crate) const IMPORTED_URL_KEY: &str = "__imported_url__";
+
 pub const HTTP_AUTH_KEY: &str = "__http_auth__";
 
 /// Reserved secret key for the OAuth client-credentials client secret (SBS-524).

@@ -80,7 +80,7 @@ pub fn resolve_args_with(
         return Ok(ResolvedArgs {
             args,
             sensitive,
-            has_binding: false,
+            has_binding: server.env.iter().any(|e| e.secret),
         });
     };
     launch.validate(&args, false)?;
@@ -134,7 +134,7 @@ pub fn resolve_args_with(
     Ok(ResolvedArgs {
         args,
         sensitive,
-        has_binding: !launch.bindings.is_empty(),
+        has_binding: !launch.bindings.is_empty() || server.env.iter().any(|e| e.secret),
     })
 }
 

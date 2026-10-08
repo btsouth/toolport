@@ -31,7 +31,8 @@ vi.mock("@/lib/api", () => ({
     ],
   }),
   setClientDiscovery: vi.fn(),
-  addServer: vi.fn(),
+  importServers: vi.fn(),
+  previewImportServers: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock("sonner", () => ({

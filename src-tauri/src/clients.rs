@@ -35,10 +35,13 @@ pub struct McpServer {
     pub name: String,
     /// "stdio" | "http" | "sse" | "unknown"
     pub transport: String,
+    #[serde(serialize_with = "crate::import_credentials::serialize_command")]
     pub command: Option<String>,
+    #[serde(serialize_with = "crate::import_credentials::serialize_args")]
     pub args: Vec<String>,
     /// Names of env vars only. Values are deliberately omitted (secrets).
     pub env_keys: Vec<String>,
+    #[serde(serialize_with = "crate::import_credentials::serialize_url")]
     pub url: Option<String>,
 }
 
@@ -3095,6 +3098,15 @@ pub fn detect_clients() -> Vec<DetectedClient> {
 
 /// Validate behavior the redacted inventory cannot carry before a ZCode import.
 /// Other adapters retain their existing import policy and public inventory ABI.
+pub(crate) fn import_definition(
+    client_id: &str,
+    name: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let def = find_def(client_id).ok_or("Unknown client")?;
+    moved::definition(def.format, &resolved_definition_path(&def)?, name)
+        .map_err(|_| "Could not read imported credentials. Client config unchanged.".into())
+}
+
 pub(crate) fn validate_client_import(
     client: &DetectedClient,
     names: &[String],

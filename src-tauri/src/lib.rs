@@ -22,6 +22,7 @@ pub mod guard_cleanup;
 pub mod hooks;
 pub mod hostenv;
 pub mod http_bridge;
+mod import_credentials;
 pub mod inspect;
 pub mod instructions;
 pub mod integrity;

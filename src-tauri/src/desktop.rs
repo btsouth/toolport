@@ -186,18 +186,19 @@ async fn import_servers(
     state: State<'_, RegistryState>,
     selected: Option<Vec<String>>,
 ) -> Result<Registry, String> {
-    let detected = tauri::async_runtime::spawn_blocking(clients::detect_clients)
-        .await
-        .map_err(|e| e.to_string())?;
-    let selected: Option<std::collections::HashSet<String>> =
-        selected.map(|keys| keys.into_iter().collect());
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        for server in selected_servers_to_import(&detected, reg, selected.as_ref())? {
-            crate::registry_controller::apply_import_entry(reg, server);
-        }
-        Ok(())
-    })?;
-    Ok(reg)
+    let selected = match selected {
+        Some(selected) => selected,
+        None => crate::registry_controller::preview_client_imports()?
+            .into_iter()
+            .map(|item| item.key)
+            .collect(),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::registry_controller::import_client_servers(selected)
+    })
+    .await
+    .map_err(|_| "Import stopped".to_string())??;
+    reload_into_state(state.inner())
 }
 
 #[tauri::command]
@@ -236,12 +237,9 @@ fn parse_server_snippet(text: String) -> Result<Vec<clients::ParsedSnippetServer
 #[tauri::command]
 fn add_server(state: State<RegistryState>, mut entry: ServerEntry) -> Result<Registry, String> {
     entry.enabled = false;
-    let (reg, id) = write_registry(state.inner(), |reg| {
-        Ok(crate::registry_controller::apply_add_entry(reg, entry))
-    })?;
-    // Warm the launcher for the entry we just added, found by its assigned id (a concurrent
-    // add under the lock could otherwise make `last` a different server).
-    if let Some(saved) = reg.servers.iter().find(|s| s.id == id) {
+    crate::registry_controller::add_reviewed_entry(entry)?;
+    let reg = reload_into_state(state.inner())?;
+    if let Some(saved) = reg.servers.last() {
         prewarm_launcher(saved);
     }
     Ok(reg)
@@ -2463,22 +2461,16 @@ struct ImportItem {
 /// registry. The same import key is accepted by `import_servers` after review.
 #[tauri::command]
 async fn preview_import_servers(
-    state: State<'_, RegistryState>,
+    _state: State<'_, RegistryState>,
 ) -> Result<Vec<ImportItem>, String> {
-    let detected = tauri::async_runtime::spawn_blocking(clients::detect_clients)
-        .await
-        .map_err(|e| e.to_string())?;
-    let reg = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok(servers_to_import(&detected, &reg)
+    let candidates =
+        tauri::async_runtime::spawn_blocking(crate::registry_controller::preview_client_imports)
+            .await
+            .map_err(|_| "Import preview stopped".to_string())??;
+    Ok(candidates
         .into_iter()
         .map(|server| ImportItem {
-            key: Some(clients::import_dedupe_key(
-                &server.name,
-                server.command.as_deref(),
-                &server.args,
-            )),
+            key: Some(server.key),
             name: server.name,
             transport: server.transport,
             command: server.command,

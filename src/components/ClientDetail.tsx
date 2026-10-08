@@ -15,7 +15,8 @@ import {
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
 import {
-  addServer,
+  importServers,
+  previewImportServers,
   installGateway,
   setClientDiscovery,
   uninstallGateway,
@@ -29,7 +30,6 @@ import {
   type ImportItem,
   type McpServer,
   type Registry,
-  type ServerEntry,
 } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -263,18 +263,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     })) ?? null;
 
   async function importOne(server: McpServer) {
-    const isPlugin = pluginNames.has(server.name.toLowerCase());
-    const entry: ServerEntry = {
-      id: "",
-      name: server.name,
-      transport: server.transport,
-      command: server.command,
-      args: server.args,
-      env: server.envKeys.map((key) => ({ key, value: null, secret: true })),
-      url: server.url,
-      source: `imported:${client.id}${isPlugin ? "-plugin" : ""}`,
-    };
-    const next = await addServer(entry);
+    const review = await previewImportServers();
+    const candidate = review.find((item) => item.name === server.name);
+    if (!candidate?.key)
+      throw new Error("Server changed. Refresh the client and review again.");
+    const next = await importServers([candidate.key]);
     onRegistryChange(next);
     return next;
   }

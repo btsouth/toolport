@@ -1282,7 +1282,7 @@ fn guard_connect_target(server: &ServerEntry) -> Result<(), String> {
 /// anonymous exactly like the `HTTP_AUTH_KEY` path used to.
 fn first_vaulted_secret(server: &ServerEntry) -> Result<Option<String>, String> {
     for e in &server.env {
-        if e.secret && e.value.is_none() {
+        if e.secret && e.value.is_none() && e.key != secrets::IMPORTED_URL_KEY {
             if let Some(v) = secrets::get_secret_result(&server.id, &e.key)? {
                 return Ok(Some(v));
             }
@@ -1330,6 +1330,209 @@ pub fn connect_remote(server: &ServerEntry) -> Result<DownstreamServer, String> 
 /// routes `notifications/progress` back to the client that minted the token
 /// (SOU-444).
 pub fn connect_remote_with_handler(
+    server: &ServerEntry,
+    server_handler: Option<ServerRequestHandler>,
+    resource_updated: Option<ResourceUpdatedSink>,
+    progress: Option<ProgressSink>,
+    change_dirty: Option<Arc<AtomicU8>>,
+) -> Result<DownstreamServer, String> {
+    let imported = server
+        .env
+        .iter()
+        .any(|e| e.key == secrets::IMPORTED_URL_KEY);
+    if !imported {
+        return connect_remote_inner(
+            server,
+            server_handler,
+            resource_updated,
+            progress,
+            change_dirty,
+        );
+    }
+    let url = secrets::get_vault_secret_result(&server.id, secrets::IMPORTED_URL_KEY)
+        .map_err(|_| "Keychain unavailable. Unlock it and retry.")?
+        .ok_or("Missing imported endpoint. Import its native definition again.")?;
+    if server.url.as_deref() != Some(&crate::import_credentials::shown_url(&url)) {
+        return Err("The endpoint changed. Review and import its credentials again.".into());
+    }
+    let mut resolved = server.clone();
+    resolved.url = Some(url);
+    connect_remote_inner(
+        &resolved,
+        server_handler,
+        resource_updated,
+        progress,
+        change_dirty,
+    )
+    .map_err(|error| safe_imported_error(&resolved, error))
+}
+
+/// Keep provider errors from echoing a credential-bearing endpoint after connect.
+struct ImportedTransport(Box<dyn Transport>);
+struct ImportedConcurrent(Arc<dyn crate::downstream::ConcurrentTransport>);
+fn opaque_transport_error(
+    error: crate::downstream::TransportError,
+) -> crate::downstream::TransportError {
+    use crate::downstream::TransportError as E;
+    let message = if is_auth_error(&error.to_string()) {
+        "HTTP 401. Imported credentials were rejected."
+    } else {
+        "Imported server request failed. Check its endpoint and credentials."
+    }
+    .to_string();
+    match error {
+        E::Fatal(_) => E::Fatal(message),
+        E::Unavailable(_) => E::Unavailable(message),
+        E::Retry { retry_after, .. } => E::Retry {
+            retry_after,
+            message,
+        },
+        E::Cancelled(_) => E::Cancelled(message),
+        E::Busy(_) => E::Busy(message),
+        E::Rpc(value) => E::Rpc(serde_json::json!({"code":value["code"],"message":message})),
+    }
+}
+impl crate::downstream::ConcurrentTransport for ImportedConcurrent {
+    fn request_with_cancel_and_headers(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        cancel: Option<crate::downstream::CancelContext>,
+        headers: &[(String, String)],
+    ) -> Result<serde_json::Value, crate::downstream::TransportError> {
+        self.0
+            .request_with_cancel_and_headers(method, params, cancel, headers)
+            .map_err(opaque_transport_error)
+    }
+    fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+    fn suspended_calls(&self) -> usize {
+        self.0.suspended_calls()
+    }
+}
+impl Transport for ImportedTransport {
+    fn request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, crate::downstream::TransportError> {
+        self.0
+            .request(method, params)
+            .map_err(opaque_transport_error)
+    }
+    fn notify(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<(), crate::downstream::TransportError> {
+        self.0
+            .notify(method, params)
+            .map_err(opaque_transport_error)
+    }
+    fn request_with_cancel(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        cancel: Option<crate::downstream::CancelContext>,
+    ) -> Result<serde_json::Value, crate::downstream::TransportError> {
+        self.0
+            .request_with_cancel(method, params, cancel)
+            .map_err(opaque_transport_error)
+    }
+    fn request_with_cancel_and_headers(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        cancel: Option<crate::downstream::CancelContext>,
+        headers: &[(String, String)],
+    ) -> Result<serde_json::Value, crate::downstream::TransportError> {
+        self.0
+            .request_with_cancel_and_headers(method, params, cancel, headers)
+            .map_err(opaque_transport_error)
+    }
+    fn cancel_matching_pending_request(
+        &mut self,
+        method: &str,
+        params: &serde_json::Value,
+        cancel: &crate::downstream::CancelContext,
+    ) -> bool {
+        self.0
+            .cancel_matching_pending_request(method, params, cancel)
+    }
+    fn set_protocol_meta(&mut self, meta: Option<serde_json::Value>) {
+        self.0.set_protocol_meta(meta)
+    }
+    fn set_subscription_listener(
+        &mut self,
+        filter: crate::downstream::SubscriptionFilter,
+    ) -> Result<(), crate::downstream::TransportError> {
+        self.0
+            .set_subscription_listener(filter)
+            .map_err(opaque_transport_error)
+    }
+    fn supports_request_headers(&self) -> bool {
+        self.0.supports_request_headers()
+    }
+    fn set_read_timeout(&mut self, timeout: Duration) {
+        self.0.set_read_timeout(timeout)
+    }
+    fn connect_timeout(&self) -> Duration {
+        self.0.connect_timeout()
+    }
+    fn initialize_complete(&mut self) {
+        self.0.initialize_complete()
+    }
+    fn arm_tools_watch(&mut self) {
+        self.0.arm_tools_watch()
+    }
+    fn set_server_request_handler(&mut self, handler: ServerRequestHandler) {
+        self.0.set_server_request_handler(handler)
+    }
+    fn set_server_id(&mut self, id: &str) {
+        self.0.set_server_id(id)
+    }
+    fn concurrent(&self) -> Option<Arc<dyn crate::downstream::ConcurrentTransport>> {
+        self.0.concurrent().map(|transport| {
+            Arc::new(ImportedConcurrent(transport))
+                as Arc<dyn crate::downstream::ConcurrentTransport>
+        })
+    }
+    fn connection_closed(&self) -> Option<bool> {
+        self.0.connection_closed()
+    }
+    fn suspended_calls(&self) -> usize {
+        self.0.suspended_calls()
+    }
+}
+fn reviewed_transport(server: &ServerEntry, transport: HttpTransport) -> Box<dyn Transport> {
+    if server
+        .env
+        .iter()
+        .any(|e| e.key == secrets::IMPORTED_URL_KEY)
+    {
+        Box::new(ImportedTransport(Box::new(transport)))
+    } else {
+        Box::new(transport)
+    }
+}
+
+fn safe_imported_error(server: &ServerEntry, error: String) -> String {
+    if !server
+        .env
+        .iter()
+        .any(|e| e.key == secrets::IMPORTED_URL_KEY)
+    {
+        return error;
+    }
+    if is_auth_error(&error) {
+        "HTTP 401. Imported credentials were rejected. Open Credentials and retry.".into()
+    } else {
+        "Could not connect using imported credentials. Check the endpoint and unlock the keychain, then retry.".into()
+    }
+}
+
+fn connect_remote_inner(
     server: &ServerEntry,
     server_handler: Option<ServerRequestHandler>,
     resource_updated: Option<ResourceUpdatedSink>,
@@ -1410,7 +1613,9 @@ pub fn connect_remote_with_handler(
     transport.set_resource_updated_sink(resource_updated.clone());
     transport.set_progress_sink(progress.clone());
     transport.set_change_sink(change_dirty.clone());
-    match DownstreamServer::connect(server_id.to_string(), Box::new(transport)) {
+    match DownstreamServer::connect(server_id.to_string(), reviewed_transport(server, transport))
+        .map_err(|e| safe_imported_error(server, e))
+    {
         Ok(mut ds) => {
             ds.set_call_timeout(request_timeout);
             Ok(ds)
@@ -1471,12 +1676,14 @@ pub fn connect_remote_with_handler(
                     transport.set_resource_updated_sink(resource_updated);
                     transport.set_progress_sink(progress);
                     transport.set_change_sink(change_dirty);
-                    DownstreamServer::connect(server_id.to_string(), Box::new(transport)).map(
-                        |mut ds| {
-                            ds.set_call_timeout(request_timeout);
-                            ds
-                        },
+                    DownstreamServer::connect(
+                        server_id.to_string(),
+                        reviewed_transport(server, transport),
                     )
+                    .map(|mut ds| {
+                        ds.set_call_timeout(request_timeout);
+                        ds
+                    })
                 }
                 Err(refresh_error) if is_refresh_storage_or_lock_error(&refresh_error) => {
                     Err(refresh_error)
