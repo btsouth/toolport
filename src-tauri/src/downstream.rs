@@ -863,6 +863,48 @@ fn read_capped_line<R: BufRead>(
     Ok(n)
 }
 
+/// Read one raw frame without a decoded copy or an allocation past the cap.
+/// On a full unterminated frame the connection must reset; never drain its tail.
+fn read_downstream_frame<R: BufRead>(
+    reader: &mut R,
+    bytes: &mut Vec<u8>,
+    max_bytes: usize,
+    delimiter: Option<u8>,
+) -> std::io::Result<usize> {
+    loop {
+        if delimiter.is_some() && bytes.len() == max_bytes {
+            return Err(oversized_frame_error(max_bytes));
+        }
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(bytes.len());
+        }
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        if remaining == 0 {
+            return Err(oversized_frame_error(max_bytes));
+        }
+        let chunk = &available[..available.len().min(remaining)];
+        let newline =
+            delimiter.and_then(|delimiter| chunk.iter().position(|byte| *byte == delimiter));
+        let count = newline.map_or(chunk.len(), |index| index + 1);
+        if bytes.len() + count > bytes.capacity() {
+            let capacity =
+                (bytes.capacity().saturating_mul(2).max(bytes.len() + count)).min(max_bytes);
+            bytes.reserve_exact(capacity - bytes.len());
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        reader.consume(count);
+        if newline.is_some() {
+            return Ok(bytes.len());
+        }
+    }
+}
+
+fn oversized_frame_error(max_bytes: usize) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData,
+        format!("downstream frame exceeded the {max_bytes}-byte limit; connection reset. In-flight operations may have completed; check before retrying them"))
+}
+
 fn is_unterminated_capped_line(n: usize, line: &str, max_bytes: u64) -> bool {
     n as u64 >= max_bytes && !line.ends_with('\n')
 }
@@ -954,6 +996,9 @@ pub enum TransportError {
     /// responded with an error (or the response was structurally invalid). Does NOT
     /// count against server health - a bad tool call is not a dead server.
     Fatal(String),
+    /// An oversized frame retired the connection. Counts against health, but a
+    /// dispatched operation must never be replayed, even when it is read-only.
+    FrameRejected(String),
     /// The server returned a JSON-RPC *error object*, preserved structurally.
     ///
     /// Previously these were flattened with `Fatal(err.to_string())`, which threw
@@ -1236,7 +1281,9 @@ impl TransportError {
     pub fn is_health_failure(&self) -> bool {
         matches!(
             self,
-            TransportError::Unavailable(_) | TransportError::Retry { .. }
+            TransportError::Unavailable(_)
+                | TransportError::FrameRejected(_)
+                | TransportError::Retry { .. }
         )
     }
 
@@ -1320,7 +1367,7 @@ impl TransportError {
 impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransportError::Fatal(msg) => write!(f, "{msg}"),
+            TransportError::Fatal(msg) | TransportError::FrameRejected(msg) => write!(f, "{msg}"),
             // Rendered exactly as the flattened form was, so nothing user-facing
             // changes now that the error is carried structurally.
             TransportError::Rpc(err) => write!(f, "{err}"),
@@ -2169,6 +2216,12 @@ pub trait Transport: Send {
     fn concurrent(&self) -> Option<Arc<dyn ConcurrentTransport>> {
         None
     }
+    /// A protocol violation invalidated this connection. Only a fresh caller may
+    /// reconnect; calls dispatched on the rejected stream must never replay.
+    fn connection_reset_reason(&self) -> Option<String> {
+        None
+    }
+
     /// Transports with direct shared-state getters avoid constructing a snapshot.
     /// Keep the concurrent-handle fallback for other multiplexed transports.
     fn connection_closed(&self) -> Option<bool> {
@@ -3158,6 +3211,7 @@ enum Delivery {
     ServerRequest(Value),
     Cancelled,
     Closed(String),
+    Rejected(String),
 }
 
 /// One request waiting for its response.
@@ -3227,6 +3281,7 @@ struct StdioCore {
     /// dies on startup (bad package name, missing API key) explains itself here,
     /// so we can report that instead of a bare "closed the connection".
     stderr: Arc<Mutex<String>>,
+    read_failure: Arc<Mutex<Option<String>>>,
     next_id: AtomicI64,
     state: Mutex<StdioCoreState>,
     /// Answers server-initiated JSON-RPC (e.g. `roots/list`) by forwarding to the
@@ -3297,6 +3352,7 @@ impl StdioCoreState {
 }
 
 impl StdioCore {
+    #[cfg(test)]
     fn start(
         child: Child,
         stdin: Arc<Mutex<ChildStdin>>,
@@ -3305,10 +3361,31 @@ impl StdioCore {
         launcher: bool,
         label: String,
     ) -> Arc<Self> {
+        Self::start_with_failure(
+            child,
+            stdin,
+            stderr,
+            lines,
+            launcher,
+            label,
+            Arc::new(Mutex::new(None)),
+        )
+    }
+
+    fn start_with_failure(
+        child: Child,
+        stdin: Arc<Mutex<ChildStdin>>,
+        stderr: Arc<Mutex<String>>,
+        lines: Receiver<String>,
+        launcher: bool,
+        label: String,
+        read_failure: Arc<Mutex<Option<String>>>,
+    ) -> Arc<Self> {
         let core = Arc::new(StdioCore {
             child: Mutex::new(child),
             stdin,
             stderr,
+            read_failure,
             next_id: AtomicI64::new(1),
             state: Mutex::new(StdioCoreState::default()),
             server_handler: Mutex::new(None),
@@ -3325,6 +3402,15 @@ impl StdioCore {
                 let Some(core) = weak.upgrade() else {
                     return;
                 };
+                if core
+                    .read_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some()
+                {
+                    core.close();
+                    return;
+                }
                 core.route_line(&line);
             }
             if let Some(core) = weak.upgrade() {
@@ -3549,6 +3635,9 @@ impl StdioCore {
                     )));
                 }
                 Ok(Delivery::Closed(message)) => return Err(TransportError::Unavailable(message)),
+                Ok(Delivery::Rejected(message)) => {
+                    return Err(TransportError::FrameRejected(message))
+                }
                 Err(RecvTimeoutError::Timeout) => {
                     self.abandon(&mut waiter, &rx);
                     // A launcher child that is alive but never answered `initialize`
@@ -4049,13 +4138,37 @@ impl StdioCore {
     /// The child's stdout closed: fail every waiter, and every later request,
     /// with the exit status and stderr tail.
     fn close(&self) {
-        let message = self.closed_error();
-        let mut state = self.lock_state();
-        state.closed = Some(message.clone());
-        for (_, waiter) in state.pending.drain() {
-            let _ = waiter.tx.send(Delivery::Closed(message.clone()));
+        let rejected = self
+            .read_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let message = rejected.clone().unwrap_or_else(|| self.closed_error());
+        {
+            let mut state = self.lock_state();
+            state.closed = Some(message.clone());
+            for (_, waiter) in state.pending.drain() {
+                let delivery = if rejected.is_some() {
+                    Delivery::Rejected(message.clone())
+                } else {
+                    Delivery::Closed(message.clone())
+                };
+                let _ = waiter.tx.send(delivery);
+            }
+            state.unclaimed.clear();
+            state.suspended.clear();
         }
-        state.unclaimed.clear();
+        if rejected.is_some() {
+            let mut child = self
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(unix)]
+            kill_process_group(&mut child);
+            #[cfg(not(unix))]
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -4870,6 +4983,8 @@ impl StdioTransport {
         // when the receiver is dropped (transport closed). `forward_line` also
         // flags `dirty` when an armed server announces a tool-list change.
         let (tx, rx) = std::sync::mpsc::channel();
+        let read_failure = Arc::new(Mutex::new(None));
+        let rejected = read_failure.clone();
         let armed = Arc::new(AtomicBool::new(false));
         let drain_armed = Arc::clone(&armed);
         let progress: Arc<Mutex<Option<ProgressSink>>> = Arc::new(Mutex::new(None));
@@ -4877,21 +4992,27 @@ impl StdioTransport {
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
-                let mut line = String::new();
-                // Bound each line to the same cap as an HTTP response body: a broken or
-                // hostile server that emits one newline-less multi-gigabyte line can't
-                // grow this String without limit (a plain `read_line` would). `take`
-                // stops at the cap; a full-cap line with no terminator is a protocol
-                // violation, so we close the connection.
-                match read_capped_line(&mut reader, &mut line, MAX_RESPONSE_BYTES) {
+                let mut bytes = Vec::new();
+                match read_downstream_frame(
+                    &mut reader,
+                    &mut bytes,
+                    MAX_RESPONSE_BYTES as usize,
+                    Some(b'\n'),
+                ) {
                     Ok(0) => break,
-                    Ok(n) => {
-                        if is_unterminated_capped_line(n, &line, MAX_RESPONSE_BYTES) {
-                            eprintln!(
-                                "toolport: downstream emitted an unterminated line >= {MAX_RESPONSE_BYTES} bytes; closing connection"
-                            );
-                            break;
-                        }
+                    Ok(_) => {
+                        let line = match String::from_utf8(bytes) {
+                            Ok(line) => line,
+                            Err(_) => {
+                                *rejected
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+                                    "downstream stdout frame was not UTF-8; connection reset"
+                                        .into(),
+                                );
+                                break;
+                            }
+                        };
                         if !forward_line(
                             line,
                             &tx,
@@ -4903,7 +5024,15 @@ impl StdioTransport {
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(error) => {
+                        if error.kind() == std::io::ErrorKind::InvalidData {
+                            *rejected
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(error.to_string());
+                        }
+                        break;
+                    }
                 }
             }
         });
@@ -4924,13 +5053,14 @@ impl StdioTransport {
             );
         });
 
-        let core = StdioCore::start(
+        let core = StdioCore::start_with_failure(
             child,
             stdin,
             stderr_buf,
             rx,
             launcher,
             command_basename(command),
+            read_failure,
         );
         Ok(StdioTransport {
             core,
@@ -5055,6 +5185,14 @@ impl Transport for StdioTransport {
             .map_err(|error| TransportError::Unavailable(error.to_string()))?;
         self.subscription_listener_id = Some(id);
         Ok(())
+    }
+
+    fn connection_reset_reason(&self) -> Option<String> {
+        self.core
+            .read_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn connection_closed(&self) -> Option<bool> {
@@ -6652,9 +6790,7 @@ impl HttpTransport {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-        let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(
-            resp.into_reader().take(MAX_RESPONSE_BYTES + 1),
-        ));
+        let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(resp.into_reader()));
         self.read_sse_stream(reader, wanted, method, &params, 0)
     }
 
@@ -6666,21 +6802,18 @@ impl HttpTransport {
         params: &Value,
         mut bytes_read: u64,
     ) -> Result<Option<Value>, TransportError> {
-        let mut line = String::new();
         loop {
-            line.clear();
-            let n = reader
-                .read_line(&mut line)
-                .map_err(|e| TransportError::Fatal(e.to_string()))?;
+            let mut bytes = Vec::new();
+            let remaining = MAX_RESPONSE_BYTES.saturating_sub(bytes_read) as usize;
+            let n = read_downstream_frame(&mut reader, &mut bytes, remaining, Some(b'\n'))
+                .map_err(|error| TransportError::Fatal(error.to_string()))?;
+            let line = String::from_utf8(bytes).map_err(|error| {
+                TransportError::Fatal(format!("SSE response was not UTF-8: {error}"))
+            })?;
             if n == 0 {
                 break;
             }
             bytes_read += n as u64;
-            if bytes_read > MAX_RESPONSE_BYTES {
-                return Err(TransportError::Fatal(format!(
-                    "SSE response exceeded {MAX_RESPONSE_BYTES} bytes"
-                )));
-            }
             let trimmed = line.trim_start();
             if let Some(data) = trimmed.strip_prefix("data:") {
                 let data = data.trim();
@@ -6971,8 +7104,11 @@ impl HttpTransport {
             return self.read_sse_response(resp, body);
         }
 
-        let text = read_capped(resp, MAX_RESPONSE_BYTES);
-        let response: Value = serde_json::from_str(&text)
+        let mut reader = BufReader::new(resp.into_reader());
+        let mut bytes = Vec::new();
+        read_downstream_frame(&mut reader, &mut bytes, MAX_RESPONSE_BYTES as usize, None)
+            .map_err(|error| TransportError::Fatal(error.to_string()))?;
+        let response: Value = serde_json::from_slice(&bytes)
             .map_err(|e| TransportError::Fatal(format!("bad JSON response: {e}")))?;
         if !http_response_id_matches(&response, body.get("id")) {
             return Err(TransportError::Fatal(
@@ -7321,8 +7457,13 @@ impl Transport for HttpTransport {
                     if live_generation.load(Ordering::SeqCst) != generation {
                         return;
                     }
-                    let mut line = String::new();
-                    let read = match (&mut reader).take(MAX_RESPONSE_BYTES).read_line(&mut line) {
+                    let mut bytes = Vec::new();
+                    let read = match read_downstream_frame(
+                        &mut reader,
+                        &mut bytes,
+                        MAX_RESPONSE_BYTES as usize,
+                        Some(b'\n'),
+                    ) {
                         Ok(read) => read,
                         Err(error) => {
                             downstream_trace(&format!(
@@ -7334,10 +7475,10 @@ impl Transport for HttpTransport {
                     if read == 0 {
                         break;
                     }
-                    if read as u64 >= MAX_RESPONSE_BYTES && !line.ends_with('\n') {
-                        downstream_trace("subscriptions/listen emitted an oversized SSE line");
+                    let Ok(line) = String::from_utf8(bytes) else {
+                        downstream_trace("subscriptions/listen emitted a non-UTF-8 SSE line");
                         break;
-                    }
+                    };
                     if live_generation.load(Ordering::SeqCst) != generation {
                         return;
                     }
@@ -7787,6 +7928,10 @@ impl DownstreamServer {
     /// (catalog refresh, subscriptions, reconnect) keep using `&mut self`.
     /// Whether a multiplexed connection has closed; `None` when calls to this
     /// server run one at a time.
+    pub fn connection_reset_reason(&self) -> Option<String> {
+        self.transport.connection_reset_reason()
+    }
+
     pub fn connection_closed(&self) -> Option<bool> {
         self.transport.connection_closed()
     }
@@ -11754,6 +11899,246 @@ mod tests {
                 .iter()
                 .any(|frame| frame["id"] == "srv-a" && frame.get("error").is_some()),
             "{frames:?}"
+        );
+    }
+
+    #[test]
+    fn p09_infinite_unterminated_frame_stops_at_the_memory_budget() {
+        struct Infinite {
+            chunk: [u8; 8192],
+            consumed: usize,
+        }
+        impl std::io::Read for Infinite {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                unreachable!()
+            }
+        }
+        impl std::io::BufRead for Infinite {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                Ok(&self.chunk)
+            }
+            fn consume(&mut self, count: usize) {
+                self.consumed += count;
+            }
+        }
+        for budget in [1000, super::MAX_RESPONSE_BYTES as usize] {
+            let mut reader = Infinite {
+                chunk: [b'x'; 8192],
+                consumed: 0,
+            };
+            let mut bytes = Vec::new();
+            let error = super::read_downstream_frame(&mut reader, &mut bytes, budget, Some(b'\n'))
+                .unwrap_err();
+            assert!(error.to_string().contains(&format!("{budget}-byte limit")));
+            assert_eq!(reader.consumed, budget, "must not drain an infinite tail");
+            assert_eq!(bytes.len(), budget);
+            assert!(
+                bytes.capacity() <= budget,
+                "{} > {budget}",
+                bytes.capacity()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p09_oversized_stdio_frame_fails_owned_calls_and_allows_explicit_reconnect() {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            std::env::temp_dir().join(format!("toolport-p09-downstream-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let bad = dir.0.join("oversized.py");
+        std::fs::write(&bad, r#"import json, sys
+ready = json.loads(sys.stdin.readline())
+print(json.dumps({'jsonrpc':'2.0','id':ready['id'],'result':{'ready':True}}), flush=True)
+requests = [json.loads(sys.stdin.readline()) for _ in range(2)]
+sys.stdout.buffer.write(b'x' * (16 * 1024 * 1024 + 1))
+sys.stdout.buffer.write(b'\n' + json.dumps({'jsonrpc':'2.0','id':requests[1]['id'],'result':{'ok':True}}).encode() + b'\n')
+sys.stdout.buffer.flush()
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'ok':True}}), flush=True)
+"#).unwrap();
+        let mut transport = super::StdioTransport::spawn(
+            "/usr/bin/python3",
+            &[bad.to_string_lossy().into_owned()],
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+        // Establish child readiness before measuring the bounded call phase.
+        transport.set_read_timeout(super::STDIO_CONNECT_TIMEOUT);
+        assert_eq!(transport.request("ping", json!({})).unwrap()["ready"], true);
+        transport.read_timeout = std::time::Duration::from_secs(3);
+        let handle = transport.concurrent().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        let mut callers = Vec::new();
+        for name in ["oversized", "other"] {
+            let handle = handle.clone();
+            let done = done_tx.clone();
+            let ready = ready_tx.clone();
+            let (release, released) = std::sync::mpsc::channel();
+            releases.push(release);
+            callers.push(std::thread::spawn(move || {
+                ready.send(()).unwrap();
+                released
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+                done.send(handle.request_with_cancel("tools/call", json!({"name":name}), None))
+                    .unwrap();
+            }));
+        }
+        for _ in 0..2 {
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+        }
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for _ in 0..2 {
+            let result = done_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            let Err(TransportError::FrameRejected(message)) = result else {
+                panic!("in-flight result: {result:?}");
+            };
+            assert!(message.contains("16777216-byte limit"), "{message}");
+            assert!(message.contains("may have completed"), "{message}");
+        }
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        assert_eq!(transport.connection_closed(), Some(true));
+        assert!(transport
+            .request("tools/call", json!({"name":"later"}))
+            .is_err());
+        drop(handle);
+        drop(transport);
+        let good = dir.0.join("bounded.py");
+        std::fs::write(
+            &good,
+            r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'ok':True}}), flush=True)
+"#,
+        )
+        .unwrap();
+        let mut fresh = super::StdioTransport::spawn(
+            "/usr/bin/python3",
+            &[good.to_string_lossy().into_owned()],
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            fresh
+                .request("tools/call", json!({"name":"later"}))
+                .unwrap()["ok"],
+            true
+        );
+    }
+
+    #[test]
+    fn p09_http_oversized_frames_do_not_poison_the_next_response() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", server.server_addr());
+        let worker = std::thread::spawn(move || {
+            for kind in ["text/event-stream", "application/json"] {
+                for oversized in [true, false] {
+                    let mut request = server
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .unwrap()
+                        .unwrap();
+                    let mut body = String::new();
+                    request.as_reader().read_to_string(&mut body).unwrap();
+                    let message: Value = serde_json::from_str(&body).unwrap();
+                    let response = if oversized {
+                        "x".repeat(super::MAX_RESPONSE_BYTES as usize + 1)
+                    } else {
+                        json!({"jsonrpc":"2.0","id":message["id"],"result":{"ok":true}}).to_string()
+                    };
+                    let content_type = if oversized { kind } else { "application/json" };
+                    let response = tiny_http::Response::from_string(response).with_header(
+                        tiny_http::Header::from_bytes("Content-Type", content_type).unwrap(),
+                    );
+                    let _ = request.respond(response);
+                }
+            }
+        });
+        let mut transport = super::HttpTransport::new(&url);
+        for _ in 0..2 {
+            let error = transport
+                .request("tools/call", json!({"name":"oversized"}))
+                .unwrap_err();
+            assert!(
+                matches!(error, TransportError::Fatal(message) if message.contains("16777216-byte limit"))
+            );
+            assert_eq!(
+                transport
+                    .request("tools/call", json!({"name":"other"}))
+                    .unwrap()["ok"],
+                true
+            );
+        }
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn p09_reset_retires_suspended_calls_and_preserves_cancellation() {
+        let mut fixture = CoreFixture::new("rejected-mrtr", "");
+        *fixture.core.server_handler.lock().unwrap() =
+            Some(Arc::new(|_| Some(ServerRequestAction::InputRequired)));
+        let held = fixture.request("held", json!({"name":"interactive"}), None);
+        fixture.wait_for_pending(1);
+        fixture.server_says(server_request("input", "elicitation/create"));
+        let input = held.join().unwrap().unwrap();
+        assert_eq!(input["resultType"], "input_required");
+        let registry = CancelRegistry::new();
+        assert!(registry.begin_client_request("cancelled".into()));
+        let cancelled = fixture.request(
+            "cancelled",
+            json!({"name":"cancelled"}),
+            Some(registry.context("cancelled".into())),
+        );
+        let other = fixture.request("other", json!({"name":"other"}), None);
+        fixture.wait_for_pending(3);
+        registry.cancel("cancelled", None);
+        assert!(matches!(
+            cancelled.join().unwrap(),
+            Err(TransportError::Cancelled(_))
+        ));
+        *fixture.core.read_failure.lock().unwrap() =
+            Some("oversized stdout frame; connection reset".into());
+        fixture.close_stdout();
+        assert!(
+            matches!(other.join().unwrap(), Err(TransportError::FrameRejected(message)) if message.contains("oversized"))
+        );
+        assert!(fixture.core.lock_state().suspended.is_empty());
+        let retry = fixture.request(
+            "held",
+            json!({"name":"interactive","requestState":input["requestState"],"inputResponses":{}}),
+            None,
+        );
+        assert!(retry.join().unwrap().is_err());
+        let frames = fixture.finish();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["method"] == "tools/call")
+                .count(),
+            3
         );
     }
 
