@@ -2413,6 +2413,7 @@ mod tests {
 
     #[test]
     fn reviewed_setup_launch_and_missing_credentials_are_not_success() {
+        let _fixture = MoveFixture::new(&Registry::default());
         let mut reg = Registry::default();
         let mut entry = server("broken");
         entry.command = Some("/does-not-exist-toolport-setup".into());
