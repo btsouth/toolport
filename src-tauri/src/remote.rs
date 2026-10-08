@@ -1790,6 +1790,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reviewed_url_only_vault_is_recognized_as_owned_credentials() {
+        secrets::tests::with_isolated_vault(|| {
+            let mut server = remote_server("https://example.invalid/mcp", None);
+            server.unknown_fields.insert(
+                "importedUrlKey".into(),
+                serde_json::json!(secrets::IMPORTED_URL_KEY),
+            );
+            secrets::set_secret(
+                &server.id,
+                secrets::IMPORTED_URL_KEY,
+                "https://example.invalid/mcp?token=private",
+            )
+            .unwrap();
+            assert!(secrets::has_own_credentials(&server).unwrap());
+            assert_eq!(first_vaulted_secret(&server).unwrap(), None);
+        });
+    }
+
+    #[test]
     fn reviewed_bearer_env_errors_are_redacted() {
         secrets::tests::with_isolated_vault(|| {
             let mut server = remote_server("https://example.invalid/mcp", None);

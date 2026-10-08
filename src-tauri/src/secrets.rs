@@ -1312,6 +1312,9 @@ pub(crate) fn has_own_credentials(server: &crate::registry::ServerEntry) -> Resu
                 .map(|i| i.key.as_str()),
         );
     }
+    if crate::import_credentials::has_imported_url(server) {
+        keys.push(IMPORTED_URL_KEY);
+    }
     keys.extend([
         HTTP_AUTH_KEY,
         CLIENT_SECRET_KEY,
