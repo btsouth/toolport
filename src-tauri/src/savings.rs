@@ -744,6 +744,36 @@ fn aggregate(entries: &[Value]) -> Value {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn serialized_surface_keeps_exact_bytes_hash_and_repeat_credit() {
+        let tools = vec![
+            json!({"name":"s__read", "description":"é\nrecord", "inputSchema":{"type":"object"}}),
+        ];
+        let surface = SerializedSurface::new(&tools);
+        assert_eq!(
+            surface.json.get().as_bytes(),
+            serde_json::to_vec(&tools).unwrap()
+        );
+        assert_eq!(
+            surface.hash,
+            <[u8; 32]>::from(Sha256::digest(surface.json.get().as_bytes()))
+        );
+        let session = CatalogSession::default();
+        let exposed = SerializedSurface::new(&[]);
+        assert!(session.first_exposure(Some("client"), &surface, &exposed));
+        assert!(!session.first_exposure(Some("client"), &surface, &exposed));
+        assert!(session.first_exposure(Some("other"), &surface, &exposed));
+        let changed = SerializedSurface::new(&[
+            json!({"name":"s__read", "inputSchema":{"type":"object","properties":{"new":{"type":"string"}}}}),
+        ]);
+        assert!(session.first_exposure(Some("client"), &changed, &exposed));
+        assert!(session.first_exposure(Some("client"), &surface, &surface));
+        // A hit must stop before resolving attribution or copying schema texts.
+        record_catalog_surfaces(&session, "lazy", Some("client"), &surface, &exposed, |_| {
+            panic!("repeated exposure was attributed again")
+        });
+    }
+
+    #[test]
     fn rotation_failure_is_reported_and_keeps_history() {
         use crate::registry::tests::{with_atomic_failure, FailingAtomicWriteStep::*};
         let root = std::env::temp_dir().join(format!(

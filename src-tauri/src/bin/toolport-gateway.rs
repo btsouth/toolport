@@ -2203,6 +2203,7 @@ struct CatalogSearchIndex {
     documents: Vec<SearchDocument>,
     document_frequency: HashMap<String, usize>,
     catalog_address: usize,
+    surface_bytes: u64,
 }
 
 impl CatalogSearchIndex {
@@ -2238,6 +2239,7 @@ impl CatalogSearchIndex {
             documents,
             document_frequency,
             catalog_address: tools.as_ptr() as usize,
+            surface_bytes: savings::surface_bytes(tools),
         }
     }
 
@@ -6928,7 +6930,9 @@ fn handle_request_with_cancel(
                 );
                 let response_content_bytes = text.len() as u64;
                 let matched_schema_bytes = savings::surface_bytes(&matches);
-                let catalog_schema_bytes = savings::surface_bytes(source);
+                let catalog_schema_bytes = source_index
+                    .filter(|index| index.matches_catalog(source))
+                    .map_or_else(|| savings::surface_bytes(source), |index| index.surface_bytes);
                 if mode != DiscoveryMode::Full {
                     savings::record_discovery(&text, matched_schema_bytes);
                 }
