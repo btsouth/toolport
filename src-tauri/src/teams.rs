@@ -3329,7 +3329,7 @@ fn seed_member_review(reg: &Registry, team_id: &str, config: &Value, review: &mu
             imported == saved
         });
         let mut definition = incoming.filter(|_| matches).cloned().unwrap_or_else(|| {
-            let mut definition = display_server(&saved);
+            let mut definition = saved.clone();
             definition["id"] = json!(original);
             definition
         });
@@ -8479,6 +8479,21 @@ mod member_review_tests {
             .unwrap()
             .pending
             .contains_key("server:remote"));
+    }
+
+    #[test]
+    fn member_review_upgrade_keeps_saved_secret_arguments_while_held() {
+        let mut reg = registry();
+        let mut cfg = config("first");
+        cfg["servers"][0]["args"] = json!(["--token", "saved-secret"]);
+        apply_team_config(&mut reg, "review-team", &cfg);
+        cfg["servers"][0]["args"] = json!(["--token", "changed-secret"]);
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        let server = reg.servers.iter().find(|s| saved_team_original_id(s) == Some("stdio")).unwrap();
+        assert_eq!(server.args, ["--token", "saved-secret"]);
+        assert!(server_change_held(&reg, &server.id));
+        let review = member_review(&reg).unwrap();
+        assert!(!json!(review.pending["server:stdio"].fields).to_string().contains("saved-secret"));
     }
 
     #[test]
