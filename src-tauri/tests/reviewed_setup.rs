@@ -42,6 +42,7 @@ impl Fixture {
             Some(fixture.dir.join("client").into_os_string()),
         );
         fixture.set("APPIMAGE", None);
+        fixture.set("TOOLPORT_SECRET_KEY", Some("synthetic-import-integration".into()));
         fixture.set(
             "TOOLPORT_DATA_DIR",
             Some(fixture.dir.join("data").into_os_string()),
@@ -307,11 +308,8 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
         serde_json::from_str(&std::fs::read_to_string(fixture.config()).unwrap()).unwrap();
     assert_eq!(restored["mcpServers"]["alpha"]["command"], mock);
     // Imported subprocess values are available to both the app probe and gateway.
-    registry::save(&registry::Registry::default()).unwrap();
-    fixture.set(
-        "TOOLPORT_SECRET_KEY",
-        Some("synthetic-import-integration".into()),
-    );
+    drop(fixture);
+    let fixture = Fixture::new();
     #[cfg(unix)]
     let secured_command = {
         use std::os::unix::fs::PermissionsExt;
@@ -325,7 +323,7 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
         path.to_string_lossy().into_owned()
     };
     #[cfg(not(unix))]
-    let secured_command = mock.clone();
+    let secured_command = mock;
     let credential_config =
         json!({"mcpServers":{"secured":{"command":secured_command,"env":{"PAT":"synthetic-setup-pat"}}}})
             .to_string();
@@ -346,8 +344,9 @@ fn reviewed_setup_real_gateway_and_failed_launch() {
     controller::disconnect_client("claude-code").unwrap();
 
     // A credential-bearing URL is resolved only for the real HTTP transport.
+    drop(fixture);
+    let fixture = Fixture::new();
     let http = HttpFixture::new();
-    registry::save(&registry::Registry::default()).unwrap();
     std::fs::write(fixture.config(),json!({"mcpServers":{"remote":{"url":format!("{}?token=synthetic-url-key",http.url),"headers":{"Authorization":"Bearer synthetic-setup-pat"}}}}).to_string()).unwrap();
     let result = controller::migrate_client("claude-code", None, false).unwrap();
     assert_eq!(result.moved, ["remote"]);
