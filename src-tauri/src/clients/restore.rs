@@ -719,6 +719,30 @@ pub(super) fn finish(client_id: &str, path: &Path, expected: Option<&str>) -> Re
     Ok(())
 }
 
+pub(crate) fn after_capture_conflict(
+    file: &Path,
+    target: &Path,
+    expected: Option<&str>,
+) -> Result<(), String> {
+    let dir = crate::registry::conduit_dir().ok_or("Could not resolve mutation lock dir")?;
+    let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
+    let mut record: Snapshot =
+        serde_json::from_str(&std::fs::read_to_string(file).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if record.config_path != target.to_string_lossy() {
+        return Err("Client receipt recovery path mismatch".into());
+    }
+    // A newer Toolport generation owns its own eligibility decision.
+    if record.last_written_hash.as_deref() == expected {
+        record.exact_eligible = false;
+        crate::registry::atomic_write(
+            file,
+            &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn after_rollback(
     file: &Path,
     target: &Path,
