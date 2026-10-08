@@ -2437,6 +2437,29 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_catalog_and_collection_add_enable_valid_definitions() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let entry = |name: &str, env: Vec<&str>| serde_json::from_value::<crate::catalog::CatalogEntry>(serde_json::json!({"name":name,"description":"fixture","transport":"stdio","command":"fixture","args":[],"url":null,"envKeys":env,"source":"curated","homepage":null,"category":"Local tools"})).unwrap();
+        assert!(add_catalog_entry(entry("catalog",vec![])).unwrap().servers[0].enabled);
+        let (registry, count) = add_catalog_stack(vec![entry("collection",vec![]),entry("missing",vec!["PAT"])]).unwrap();
+        assert_eq!(count,2);
+        assert!(registry.servers.iter().find(|s| s.name == "collection").unwrap().enabled);
+        assert!(!registry.servers.iter().find(|s| s.name == "missing").unwrap().enabled);
+        drop(fixture);
+    }
+
+    #[test]
+    fn reviewed_multi_paste_adds_selection_and_leaves_placeholders_off() {
+        let _fixture = MoveFixture::new(&Registry::default());
+        let outcome = add_snippet_servers(r#"{"mcpServers":{"ready":{"command":"fixture"},"needs":{"command":"fixture","env":{"PAT":"${PAT}"}},"skipped":{"command":"fixture"}}}"#, &["0".into(),"1".into()]).unwrap();
+        // JSON maps have sorted keys: needs, ready, skipped.
+        assert_eq!(outcome.registry.servers.len(),2);
+        assert!(!outcome.registry.servers.iter().find(|s| s.name == "needs").unwrap().enabled);
+        assert!(outcome.registry.servers.iter().find(|s| s.name == "ready").unwrap().enabled);
+        assert_eq!(outcome.declared_without_value,["PAT"]);
+    }
+
+    #[test]
     fn reviewed_manual_add_enables_valid_definition() {
         let mut reg = Registry::default();
         let mut entry = server("one");
@@ -3578,6 +3601,8 @@ mod tests {
     fn move_enables_servers_and_disconnect_restores_claude_code() {
         let mut existing = server("seq-thinking");
         existing.id = "seq-thinking".into();
+        existing.command = Some("npx".into());
+        existing.args = vec!["-y".into(), "@modelcontextprotocol/server-sequential-thinking".into()];
         let mut registry = Registry::default();
         registry.servers.push(existing);
         let fixture = MoveFixture::new(&registry);

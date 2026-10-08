@@ -45,11 +45,7 @@ import {
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ConnectReviewDialog } from "@/components/ConnectReviewDialog";
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
-import {
-  clientRestartHint,
-  clientRestartHintAfterRemoval,
-  connectSuccessDescription,
-} from "@/lib/clientConnect";
+import { clientRestartHint, clientRestartHintAfterRemoval } from "@/lib/clientConnect";
 
 interface Props {
   client: DetectedClient;
@@ -339,18 +335,6 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           },
         );
         noteRestartNeeded("removed");
-      } else {
-        const outcome = await installGateway(client.id, profile || undefined, false);
-        // Restart is the load-bearing line (SOU-317): MCP clients typically do not
-        // pick up a new gateway entry until relaunch. Scope/backup are secondary.
-        toast.success(`Connected Toolport to ${client.name}`, {
-          description: connectSuccessDescription(client.name, [
-            profile ? `Access: ${accessLabel(profile)}.` : null,
-            !profile && outcome.backup ? "Previous config backed up." : null,
-            ...(outcome.warnings ?? []),
-          ]),
-        });
-        noteRestartNeeded("applied");
       }
       onChanged();
     } catch (e) {
