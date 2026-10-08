@@ -14786,7 +14786,7 @@ fn process_request_wire(
         _ => false,
     };
     if wait {
-        let deadline = if method == "tools/list" {
+        let deadline = if method == "tools/list" || search_server.is_some() {
             tools_list_deadline
         } else {
             Instant::now() + Duration::from_secs(30)
@@ -22134,6 +22134,45 @@ mod tests {
             .unwrap()
             .iter()
             .any(|tool| tool["name"] == "other__cached"));
+    }
+
+    #[test]
+    fn reviewed_scoped_search_bounds_bootstrap_by_client_budget() {
+        let _env = DataDirTestEnv::new("reviewed-search-bootstrap-budget");
+        let state = http_state(false);
+        state.ready.store(false, Ordering::SeqCst);
+        let mut live = Router::new();
+        live.add(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap());
+        *state.router.lock().unwrap() = Arc::new(live);
+        let requester = state.clone();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let request = std::thread::spawn(move || {
+            let reply = process_request(
+                &requester,
+                &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"","server":"late"}}}),
+                &SearchGuard::default(), None, None, None, None, Some("claude-code"), None, DiscoveryMode::Lazy,
+            ).unwrap();
+            reply_tx.send(reply).unwrap();
+        });
+        let bound = Duration::from_millis(
+            clients::discovery_capabilities("claude-code").cold_full_list_wait_ms,
+        ) + Duration::from_secs(1);
+        let early = reply_rx.recv_timeout(bound);
+        // Release the bootstrap flag even on the negative control, then join.
+        // The fixture cannot leave a request running against a removed data dir.
+        state.ready.store(true, Ordering::SeqCst);
+        let reply = early
+            .clone()
+            .unwrap_or_else(|_| reply_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        request.join().unwrap();
+        assert!(
+            early.is_ok(),
+            "scoped search used the generic 30-second bootstrap wait"
+        );
+        assert!(reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("late__cached"));
     }
 
     #[test]
