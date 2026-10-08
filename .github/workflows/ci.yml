@@ -267,6 +267,8 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     name: Headless Rust tests (${{ matrix.os }})
     timeout-minutes: 30
+    env:
+      TOOLPORT_TEST_FAILURE_LOG_DIR: ${{ github.workspace }}/.verify/one-gateway-failures
     strategy:
       fail-fast: false
       matrix:
@@ -331,6 +333,16 @@ jobs:
       # regression in asset selection, checksum enforcement, or the silent-install
       # flag reaches users with no build step in between. Nothing else in CI runs
       # it. Its own job because it needs neither Rust nor Node (SBS-713).
+      - name: Save failed gateway conformance logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: one-gateway-failures-${{ matrix.os }}
+          path: .verify/one-gateway-failures/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Save Rust compilation timings
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -13475,7 +13475,16 @@ fn finish_startup_build(
         save_tool_cache(&tools, profile);
     }
     notify_tools_changed(stdio, Some(&host.mcp_sessions));
-    glog("background build: initial catalog announced");
+    let announced_servers: BTreeSet<_> = live
+        .aggregated_tools()
+        .iter()
+        .filter_map(|tool| live.route_of(tool["name"].as_str()?))
+        .map(|(server, _)| server.to_string())
+        .collect();
+    glog(&format!(
+        "background build: initial catalog announced; servers={}",
+        serde_json::to_string(&announced_servers).unwrap()
+    ));
 }
 
 /// Fetch the upstream client's roots over stdio, update the shared `${ROOT}` path,
@@ -18134,6 +18143,32 @@ fn main() {
                 // Genuine cold start: no prior live set to keep (SBS-871).
                 None,
             );
+            // Force the startup-included path without timing guesses. Shipped
+            // gateways do not compile this conformance hook.
+            #[cfg(feature = "test-support")]
+            let built = if let Ok(ids) = std::env::var("TOOLPORT_TEST_STARTUP_CATALOG_SERVERS") {
+                let ids: Vec<String> =
+                    serde_json::from_str(&ids).expect("startup fixture server IDs");
+                let mut built = built;
+                let mut seen = conduit_lib::router::started_supervisors();
+                built.demand_servers(|id| ids.iter().any(|expected| expected == id));
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut adopted = BTreeSet::new();
+                while !ids.iter().all(|id| adopted.contains(id)) {
+                    adopted.extend(built.adopt_ready_reconnects());
+                    if ids.iter().all(|id| adopted.contains(id)) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "startup fixture catalogs did not connect"
+                    );
+                    seen = conduit_lib::router::wait_for_started_supervisor(seen, deadline);
+                }
+                built
+            } else {
+                built
+            };
             // Integrity runs inside: the gate must quarantine before `ready` is set,
             // not on the first watcher tick after startup.
             finish_startup_build(&host_for_build, built, p.as_deref(), &stdio);

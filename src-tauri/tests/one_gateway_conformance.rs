@@ -82,6 +82,23 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         for dir in &self.dirs {
             kill_daemons(dir);
+            if std::thread::panicking() {
+                if let Some(output) = std::env::var_os("TOOLPORT_TEST_FAILURE_LOG_DIR") {
+                    let output = PathBuf::from(output).join(dir.file_name().unwrap());
+                    let _ = std::fs::create_dir_all(&output);
+                    if let Ok(entries) = std::fs::read_dir(dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.file_name().is_some_and(|name| name == "gateway.log")
+                                || path.extension().is_some_and(|ext| ext == "jsonl")
+                            {
+                                let _ = std::fs::copy(&path, output.join(entry.file_name()));
+                            }
+                        }
+                    }
+                    eprintln!("conformance failure logs: {}", output.display());
+                }
+            }
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -141,6 +158,8 @@ struct AdapterClient {
 struct AdapterOptions<'a> {
     /// Exercise the registry-selected role with no explicit gateway flag.
     default_role: bool,
+    /// Test-only startup publication control for the two notification rows.
+    startup_catalog_servers: &'a [&'a str],
     topology_override: Option<&'a str>,
     client_id: Option<&'a str>,
     /// Named registry profile this client runs under (the per-principal row).
@@ -159,6 +178,7 @@ impl Default for AdapterOptions<'_> {
     fn default() -> Self {
         Self {
             default_role: false,
+            startup_catalog_servers: &[],
             topology_override: None,
             client_id: None,
             profile: None,
@@ -191,6 +211,12 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if !options.startup_catalog_servers.is_empty() {
+        command.env(
+            "TOOLPORT_TEST_STARTUP_CATALOG_SERVERS",
+            serde_json::to_string(options.startup_catalog_servers).unwrap(),
+        );
+    }
     if let Some(topology) = options.topology_override {
         command.env("TOOLPORT_GATEWAY_TOPOLOGY", topology);
     }
@@ -1094,15 +1120,73 @@ fn wait_until(mut predicate: impl FnMut() -> bool, label: &str, within: Duration
     panic!("timed out waiting for {label}");
 }
 
+/// Only completed publication markers count, including timestamped gateway logs.
+fn initial_catalog_announced(log: &str, servers: &[&str]) -> bool {
+    let startup = log.lines().find_map(|line| {
+        let (_, ids) = line.split_once("background build: initial catalog announced; servers=")?;
+        serde_json::from_str::<Vec<String>>(ids).ok()
+    });
+    startup.is_some()
+        && servers.iter().all(|server| {
+            startup.as_ref().unwrap().iter().any(|id| id == server)
+                || log.lines().any(|line| {
+                    line.split_once("reconnected ")
+                        .and_then(|(_, rest)| rest.split_once(" after retrying;"))
+                        .is_some_and(|(ids, _)| ids.split(", ").any(|id| id == *server))
+                })
+        })
+}
+
+#[test]
+fn initial_catalog_barrier_accepts_startup_reconnect_and_mixed_publications() {
+    let startup = "2026-10-07T00:00:00Z pid=1 role=daemon background build: initial catalog announced; servers=[\"one\"]\n";
+    let reconnect = "2026-10-07T00:00:01Z pid=1 role=daemon reconnected two after retrying; 8 tools, sent tools/list_changed\n";
+    assert!(initial_catalog_announced(startup, &["one"]));
+    assert!(!initial_catalog_announced(startup, &["two"]));
+    assert!(!initial_catalog_announced(reconnect, &["two"]));
+    assert!(initial_catalog_announced(
+        &format!("{startup}{reconnect}"),
+        &["one", "two"]
+    ));
+    let empty = "background build: initial catalog announced; servers=[]\n";
+    assert!(initial_catalog_announced(
+        &format!("{empty}{reconnect}"),
+        &["two"]
+    ));
+    assert!(!initial_catalog_announced(
+        "background build: 8 tools from 1 servers\nconnected 'one' (8 tools)\n",
+        &["one"],
+    ));
+}
+
 /// Finish startup and each server's first publication before opening the
 /// sessions whose later notifications a case attributes to one scoped change.
 /// Seeing a tool in tools/list is insufficient: persistence and SSE fanout can
 /// still be running, and a quiet period cannot prove they finished.
 fn warm_initial_catalog(dir: &Path, servers: &[&str]) -> AdapterClient {
+    let mode = std::env::var("TOOLPORT_TEST_INITIAL_CATALOG_PATH").unwrap_or_default();
+    assert!(
+        matches!(mode.as_str(), "" | "fast" | "slow"),
+        "unknown catalog path: {mode}"
+    );
+    if mode == "slow" {
+        let path = dir.join("registry.json");
+        let mut reg = registry::load_from(&path).expect("load warmup registry");
+        for server in &mut reg.servers {
+            server.env.push(EnvVar {
+                key: "MOCK_MCP_START_DELAY_MS".to_string(),
+                value: Some("250".to_string()),
+                secret: false,
+                unknown_fields: Default::default(),
+            });
+        }
+        registry::save_to(&path, &reg).expect("delay fixture startups");
+    }
     let mut warmup = spawn_adapter(
         dir,
         &AdapterOptions {
             profile: Some(registry::ALL_ENABLED_ACCESS),
+            startup_catalog_servers: if mode == "fast" { servers } else { &[] },
             ..AdapterOptions::default()
         },
     );
@@ -1114,19 +1198,30 @@ fn warm_initial_catalog(dir: &Path, servers: &[&str]) -> AdapterClient {
     wait_until(
         || {
             let log = std::fs::read_to_string(dir.join("gateway.log")).unwrap_or_default();
-            log.lines()
-                .any(|line| line == "background build: initial catalog announced")
-                && servers.iter().all(|server| {
-                    log.lines().any(|line| {
-                        line.strip_prefix("reconnected ")
-                            .and_then(|rest| rest.split_once(" after retrying;"))
-                            .is_some_and(|(ids, _)| ids.split(", ").any(|id| id == *server))
-                    })
-                })
+            initial_catalog_announced(&log, servers)
         },
         "the startup and first-server catalog announcements",
         RESPONSE_TIMEOUT,
     );
+    if !mode.is_empty() {
+        let log = std::fs::read_to_string(dir.join("gateway.log")).unwrap();
+        let startup = log
+            .lines()
+            .find_map(|line| {
+                let (_, ids) =
+                    line.split_once("background build: initial catalog announced; servers=")?;
+                serde_json::from_str::<Vec<String>>(ids).ok()
+            })
+            .unwrap();
+        for server in servers {
+            assert_eq!(
+                startup.iter().any(|id| id == server),
+                mode == "fast",
+                "wrong startup path for {server}: {log}"
+            );
+        }
+        eprintln!("confirmed {mode} initial catalog path for {servers:?}");
+    }
     warmup
 }
 
