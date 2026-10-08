@@ -1639,7 +1639,6 @@ fn removed_meta_tool_error(name: &str) -> String {
     )
 }
 
-
 // --- Grouped discovery mode (CONDUIT_DISCOVERY=grouped) ---
 //
 // Between `lazy` (a constant handful of meta-tools; best for a capable model that
@@ -6055,8 +6054,8 @@ fn execute_script_dispatch(
     // (SBS-881). Run the defense here, before the script's own result is returned,
     // so nothing unscanned reaches the model. The failure envelope was defended
     // part by part above and is all Toolport text now.
-    let untrusted = result["isError"] != true
-        && !defend_script_aggregate(reg, client, &owner, &mut result);
+    let untrusted =
+        result["isError"] != true && !defend_script_aggregate(reg, client, &owner, &mut result);
 
     // Intermediate calls were not shaped (full bodies stayed in the sandbox). The
     // script's aggregate can still blow the transport/context budget, so shape only
@@ -9580,8 +9579,9 @@ type IntegrityCheckFailure = (String, BTreeSet<String>);
 /// prove the drifted definition is never published in the first place. Registered and
 /// consumed on one thread, so a parallel test's gate cannot trigger it.
 #[cfg(test)]
-static INTEGRITY_GATE_OBSERVER: Mutex<Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>> =
-    Mutex::new(None);
+static INTEGRITY_GATE_OBSERVER: Mutex<
+    Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>,
+> = Mutex::new(None);
 
 #[cfg(test)]
 fn observe_integrity_gate() {
@@ -14671,7 +14671,11 @@ fn process_request_wire(
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     // One deadline includes startup and rooted composition, rather than granting
     // each phase another budget. Warm tools lists never enter the catalog wait.
-    let tools_list_budget = if discovery == DiscoveryMode::Full {
+    let search_server = (method == "tools/call"
+        && req["params"]["name"] == "toolport_search_tools")
+        .then(|| req["params"]["arguments"]["server"].as_str())
+        .flatten();
+    let tools_list_budget = if discovery == DiscoveryMode::Full || search_server.is_some() {
         Duration::from_millis(
             clients::discovery_capabilities(client.unwrap_or("")).cold_full_list_wait_ms,
         )
@@ -15013,10 +15017,18 @@ fn process_request_wire(
         (rooted, cached)
     };
     let (mut router, mut cache_snapshot) = catalog_for_view(rooted_router);
-    if method == "tools/list" {
-        let visible = |id: &str| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope));
+    if method == "tools/list" || search_server.is_some() {
+        let visible = |id: &str| {
+            search_server.is_none_or(|server| server == id)
+                && allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
+        };
+        if search_server.is_some() {
+            router.demand_servers(visible);
+            router.discover_uncached(visible);
+        }
         let cold = !has_scoped_tools(&cache_snapshot.tools, allowed, &router, &reg)
-            || discovery == DiscoveryMode::Full && router.any_missing_catalog(visible);
+            || (discovery == DiscoveryMode::Full || search_server.is_some())
+                && router.any_missing_catalog(visible);
         if cold {
             #[cfg(test)]
             COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
@@ -19071,7 +19083,10 @@ fn handle_connection(
         ),
         (b"Access-Control-Allow-Headers", allow_headers.as_bytes()),
         // Browser clients need session identity and untrusted-data provenance.
-        (b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()),
+        (
+            b"Access-Control-Expose-Headers",
+            EXPOSED_HTTP_HEADERS.as_bytes(),
+        ),
     ];
     for (name, value) in cors {
         // Skip a header that won't encode rather than panicking the thread.
@@ -19348,11 +19363,13 @@ fn main() {
                         "{}",
                         serde_json::to_string(&results).expect("serializable disconnect results")
                     );
-                    conduit_lib::telemetry::exit_with(if results.iter().any(|result| result.error.is_some()) {
-                        1
-                    } else {
-                        0
-                    });
+                    conduit_lib::telemetry::exit_with(
+                        if results.iter().any(|result| result.error.is_some()) {
+                            1
+                        } else {
+                            0
+                        },
+                    );
                 }
                 Err(error) => {
                     eprintln!("toolport-gateway --disconnect-all: {error}");
@@ -19979,10 +19996,22 @@ mod tests {
 
     #[test]
     fn disconnect_all_is_a_standalone_role_and_dry_run_cannot_start_gateway() {
-        assert_eq!(parse_args(&["--disconnect-all".into()]), ArgAction::DisconnectAll { dry_run: false });
-        assert_eq!(parse_args(&["--disconnect-all".into(), "--dry-run".into()]), ArgAction::DisconnectAll { dry_run: true });
-        assert!(matches!(parse_args(&["--dry-run".into()]), ArgAction::Unknown(_)));
-        assert!(matches!(parse_args(&["--disconnect-all".into(), "--daemon".into()]), ArgAction::Unknown(_)));
+        assert_eq!(
+            parse_args(&["--disconnect-all".into()]),
+            ArgAction::DisconnectAll { dry_run: false }
+        );
+        assert_eq!(
+            parse_args(&["--disconnect-all".into(), "--dry-run".into()]),
+            ArgAction::DisconnectAll { dry_run: true }
+        );
+        assert!(matches!(
+            parse_args(&["--dry-run".into()]),
+            ArgAction::Unknown(_)
+        ));
+        assert!(matches!(
+            parse_args(&["--disconnect-all".into(), "--daemon".into()]),
+            ArgAction::Unknown(_)
+        ));
     }
 
     /// A server whose NAME contains a write verb must not drag its read-only
@@ -22161,6 +22190,86 @@ mod tests {
             .unwrap()
             .iter()
             .any(|tool| tool["name"] == "other__cached"));
+    }
+
+    #[test]
+    fn reviewed_scoped_search_waits_for_first_catalog() {
+        let _env = DataDirTestEnv::new("reviewed-scoped-search");
+        let state = http_state(false);
+        // Another client's warm catalog must not shorten this view's cold wait.
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let mut live = Router::new();
+        live.add_supervised(
+            "late".into(),
+            Vec::new(),
+            Arc::new(move || {
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        let live = Arc::new(live);
+        *state.router.lock().unwrap() = Arc::clone(&live);
+        let publisher = state.clone();
+        COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
+            hook.replace(Some(Box::new(move |snapshot| {
+                assert!(snapshot.aggregated_tools().is_empty());
+                assert!(snapshot.any_discovering(|id| id == "late"));
+                // Force the request to retain the old router across publication.
+                // Wait for the actual supervisor result, not a scheduler delay.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut seen = started_supervisors();
+                release_tx.send(()).unwrap();
+                while !live.has_ready_reconnects() && Instant::now() < deadline {
+                    seen = wait_for_started_supervisor(seen, deadline);
+                }
+                assert!(live.has_ready_reconnects(), "fixture did not connect");
+                adopt_reconnected_servers(
+                    &publisher.host,
+                    &publisher.stdio_upstream,
+                    &publisher.profile,
+                );
+                assert!(!snapshot.any_discovering(|_| true));
+                assert!(!snapshot.any_publishing_first_catalog(|_| true));
+                assert!(snapshot.aggregated_tools().is_empty());
+                assert!(publisher
+                    .router
+                    .lock()
+                    .unwrap()
+                    .aggregated_tools()
+                    .iter()
+                    .any(|tool| tool["name"] == "late__cached"));
+            })));
+        });
+        let allowed = HashSet::from(["late".to_string()]);
+        let started = Instant::now();
+        let reply = process_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"","server":"late"}}}),
+            &SearchGuard::default(), Some(&allowed), None, None, None, Some("cursor"), None, DiscoveryMode::Lazy,
+        ).unwrap();
+        assert!(
+            started.elapsed()
+                < Duration::from_millis(
+                    clients::discovery_capabilities("cursor").cold_full_list_wait_ms,
+                ),
+            "fixture exceeded the client's budget"
+        );
+        assert!(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("late__cached"),
+            "first search read an unpublished catalog: {reply}"
+        );
     }
 
     #[test]
@@ -25263,7 +25372,6 @@ mod tests {
         assert!(explicit_on.code_mode);
     }
 
-
     /// A failed registry load must not advertise or run Code Mode, even when
     /// a later request snapshot contains an explicit opt-in.
     #[test]
@@ -25279,10 +25387,7 @@ mod tests {
         let host = dispatch_host(seed_code_mode_after_registry_load(Err(())));
         let mut reg = Registry::default();
         reg.code_mode = true;
-        assert!(
-            reg.code_mode,
-            "the request fixture explicitly opts in"
-        );
+        assert!(reg.code_mode, "the request fixture explicitly opts in");
 
         let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
         let list = handle_request(
@@ -26173,14 +26278,7 @@ mod tests {
 
         let listener_inflight = Arc::clone(&inflight);
         std::thread::spawn(move || {
-            serve_http_loop_with_inflight(
-                server,
-                state,
-                None,
-                search,
-                true,
-                listener_inflight,
-            )
+            serve_http_loop_with_inflight(server, state, None, search, true, listener_inflight)
         });
         std::thread::sleep(Duration::from_millis(50));
 
@@ -27475,10 +27573,14 @@ mod tests {
         let ok = post("/s__work");
         assert_eq!(ok.status, 200, "body={}", ok.body);
         assert_eq!(ok.body, "\"called\"");
-        assert!(ok.extra.contains(&("X-Toolport-Content-Trust".into(), "untrusted".into())));
+        assert!(ok
+            .extra
+            .contains(&("X-Toolport-Content-Trust".into(), "untrusted".into())));
         for (name, _) in &ok.extra {
             assert!(
-                EXPOSED_HTTP_HEADERS.split(", ").any(|exposed| exposed.eq_ignore_ascii_case(name)),
+                EXPOSED_HTTP_HEADERS
+                    .split(", ")
+                    .any(|exposed| exposed.eq_ignore_ascii_case(name)),
                 "browser cannot read provenance header {name}"
             );
         }
@@ -28833,8 +28935,10 @@ mod tests {
         reg.servers.push(stub_server("team-slack", "Team Slack"));
         reg.servers.push(stub_server("team_slack", "slack"));
         let personal = reg.add_profile("Personal");
-        reg.set_access_server(&personal, "team-slack", true).unwrap();
-        reg.set_access_server("default", "team_slack", true).unwrap();
+        reg.set_access_server(&personal, "team-slack", true)
+            .unwrap();
+        reg.set_access_server("default", "team_slack", true)
+            .unwrap();
         reg.set_server_enabled(&personal, "team-slack", true)
             .unwrap();
         reg.set_server_enabled("default", "team_slack", true)
@@ -31462,7 +31566,10 @@ mod tests {
                 .get("instructions")
                 .cloned()
         };
-        assert_eq!(handshake(&state), Some(json!(DISCOVER_INSTRUCTIONS_PREAMBLE)));
+        assert_eq!(
+            handshake(&state),
+            Some(json!(DISCOVER_INSTRUCTIONS_PREAMBLE))
+        );
         *state.profile.lock().unwrap() = Some("media".into());
         assert_eq!(handshake(&state), Some(json!("Media only.")));
         *state.profile.lock().unwrap() = Some("postgres".into());
@@ -31767,10 +31874,8 @@ mod tests {
     fn lazy_discovery_keeps_ui_linked_tools_only_for_apps_hosts() {
         let _lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-apps-measure-{}",
-            new_correlation_id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("toolport-apps-measure-{}", new_correlation_id()));
         let _data = registry::DataDirOverride::set(&dir);
         let host = dispatch_host(false);
         let reg = Registry::default();
@@ -33266,7 +33371,11 @@ mod tests {
         let host = dispatch_host(false);
         host.set_code_mode(false);
         let tools = floor_tool_defs(&host);
-        assert_eq!(tools.len(), 4, "Code Mode off means the floor is the core four");
+        assert_eq!(
+            tools.len(),
+            4,
+            "Code Mode off means the floor is the core four"
+        );
         let tools_json = serde_json::to_string(&tools).expect("floor tools serialize");
         let bytes = tools_json.len() + DISCOVER_INSTRUCTIONS_PREAMBLE.len();
         assert!(
@@ -33470,10 +33579,8 @@ mod tests {
     fn catalog_measurement_uses_actual_surfaces_for_modes_scope_and_dynamic_defs() {
         let _lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-catalog-measure-{}",
-            new_correlation_id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("toolport-catalog-measure-{}", new_correlation_id()));
         let _data = registry::DataDirOverride::set(&dir);
         let mut router = Router::new();
         for server in ["alpha", "beta"] {
@@ -33626,10 +33733,8 @@ mod tests {
     fn search_measurement_includes_lead_and_guidance_text() {
         let _lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-search-measure-{}",
-            new_correlation_id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("toolport-search-measure-{}", new_correlation_id()));
         let _data = registry::DataDirOverride::set(&dir);
         let response = handle_request(
             &dispatch_host(false),
@@ -35218,7 +35323,11 @@ mod tests {
             (**guard).clone()
         };
 
-        fail_closed_integrity_catalog(&mut live, Some("sbs714-gateway"), set_of(&["srv__new_drift"]));
+        fail_closed_integrity_catalog(
+            &mut live,
+            Some("sbs714-gateway"),
+            set_of(&["srv__new_drift"]),
+        );
 
         assert_eq!(
             live.quarantined(),
@@ -35260,7 +35369,10 @@ mod tests {
     fn team_quarantine_at_member_off_enforces_drift_and_survives_watcher_reconciliation() {
         let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("toolport-team-quarantine-off-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-team-quarantine-off-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
@@ -35526,14 +35638,17 @@ mod tests {
                 let live = live_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let advertises = live.aggregated_tools().iter().any(|t| t["name"] == "srv__read");
-                *seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(advertises);
+                let advertises = live
+                    .aggregated_tools()
+                    .iter()
+                    .any(|t| t["name"] == "srv__read");
+                *seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(advertises);
             }),
         ));
 
-        let published =
-            publish_built_router(&state.registry, &state.router, drifted, profile);
+        let published = publish_built_router(&state.registry, &state.router, drifted, profile);
 
         *INTEGRITY_GATE_OBSERVER
             .lock()
@@ -35556,7 +35671,10 @@ mod tests {
             "the quarantine must be on the router the moment it becomes live"
         );
         assert!(
-            !live.aggregated_tools().iter().any(|t| t["name"] == "srv__read"),
+            !live
+                .aggregated_tools()
+                .iter()
+                .any(|t| t["name"] == "srv__read"),
             "the published router must not advertise the drifted tool"
         );
     }
@@ -39794,7 +39912,11 @@ mod tests {
         let anonymous = probe(&state, None, false);
         assert_eq!(anonymous.status, 401, "body={}", anonymous.body);
         let registered_client = probe(&state, Some(&caller), false);
-        assert_eq!(registered_client.status, 401, "body={}", registered_client.body);
+        assert_eq!(
+            registered_client.status, 401,
+            "body={}",
+            registered_client.body
+        );
         let registered_topology = handle_http_with_headers(
             &state,
             &SearchGuard::default(),

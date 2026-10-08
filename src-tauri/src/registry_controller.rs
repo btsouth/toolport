@@ -1514,6 +1514,96 @@ pub fn migrate_client_reviewed(
     )
 }
 
+// Undo only fields written by setup. A concurrent edit wins over its staged
+// value; unrelated server/profile additions do not prevent rollback.
+fn undo_staged_value(
+    latest: &mut serde_json::Value,
+    previous: &serde_json::Value,
+    staged: &serde_json::Value,
+) -> bool {
+    use serde_json::Value;
+    if previous == staged {
+        return true;
+    }
+    if latest == staged {
+        *latest = previous.clone();
+        return true;
+    }
+    match (latest, previous, staged) {
+        (Value::Object(latest), Value::Object(previous), Value::Object(staged)) => {
+            let mut complete = true;
+            for key in previous
+                .keys()
+                .chain(staged.keys())
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                let old = previous.get(key).unwrap_or(&Value::Null);
+                let written = staged.get(key).unwrap_or(&Value::Null);
+                if old == written {
+                    continue;
+                }
+                let current = latest.entry(key.clone()).or_insert(Value::Null);
+                complete &= undo_staged_value(current, old, written);
+                if current.is_null() && !previous.contains_key(key) {
+                    latest.remove(key);
+                }
+            }
+            complete
+        }
+        (Value::Array(latest), Value::Array(previous), Value::Array(staged)) => {
+            let mut complete = true;
+            for written in staged {
+                let old = previous.iter().find(|v| {
+                    v.get("id").is_some() && v.get("id") == written.get("id") || *v == written
+                });
+                let current = latest.iter().position(|v| {
+                    v.get("id").is_some() && v.get("id") == written.get("id") || v == written
+                });
+                match (old, current) {
+                    (Some(old), Some(index)) => {
+                        complete &= undo_staged_value(&mut latest[index], old, written)
+                    }
+                    (None, Some(index)) if latest[index] == *written => {
+                        latest.remove(index);
+                    }
+                    (None, Some(_)) => complete = false,
+                    (Some(old), None) if old != written => complete = false,
+                    _ => {}
+                }
+            }
+            for old in previous.iter().filter(|old| {
+                !staged
+                    .iter()
+                    .any(|v| v.get("id").is_some() && v.get("id") == old.get("id") || v == *old)
+            }) {
+                if !latest.contains(old) {
+                    latest.push(old.clone());
+                }
+            }
+            complete
+        }
+        (latest, _, _) => latest == previous,
+    }
+}
+
+fn rollback_imports(previous: &Registry, staged: &Registry) -> Result<(), String> {
+    let (_, complete) = registry::update(|latest| {
+        let mut value = serde_json::to_value(&*latest).map_err(|e| e.to_string())?;
+        let complete = undo_staged_value(
+            &mut value,
+            &serde_json::to_value(previous).map_err(|e| e.to_string())?,
+            &serde_json::to_value(staged).map_err(|e| e.to_string())?,
+        );
+        *latest = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        Ok(complete)
+    })?;
+    if complete {
+        Ok(())
+    } else {
+        Err("Registry changed during setup. Concurrent edits were kept. Review Servers before retrying.".into())
+    }
+}
+
 fn migrate_client_reviewed_with(
     client_id: &str,
     profile: Option<&str>,
@@ -1566,19 +1656,8 @@ fn migrate_client_reviewed_with(
         Ok(outcome) => outcome,
         Err(error) => {
             if let Some((previous, prepared)) = staged {
-                let (_, restored) = registry::update(|latest| {
-                    // Never overwrite an edit made while the gateway was checking.
-                    let unchanged = serde_json::to_value(&*latest).map_err(|e| e.to_string())?
-                        == serde_json::to_value(&prepared).map_err(|e| e.to_string())?;
-                    if unchanged {
-                        *latest = previous;
-                    }
-                    Ok(unchanged)
-                })?;
-                if !restored {
-                    return Err(format!(
-                        "{error} Registry changed during setup. Review Servers before retrying."
-                    ));
+                if let Err(rollback) = rollback_imports(&previous, &prepared) {
+                    return Err(format!("{error} {rollback}"));
                 }
             }
             return Err(error);
@@ -1638,7 +1717,7 @@ fn verify_setup_gateway(
         if !probe.ok {
             return Err(if probe.auth_required {
                 format!(
-                    "{} needs credentials. Open Credentials and retry. Client config unchanged.",
+                    "{} needs credentials. Enter the missing values in review or fix the native config, then retry. Client config unchanged.",
                     server.name
                 )
             } else {
@@ -1661,6 +1740,7 @@ fn verify_setup_gateway(
         ),
         ("TOOLPORT_PROFILE".into(), profile.unwrap_or("").to_string()),
         ("TOOLPORT_DISCOVERY".into(), mode.to_string()),
+        (crate::brand::CLIENT_ID.into(), client_id.to_string()),
     ];
     let transport = crate::downstream::StdioTransport::spawn(
         &gateway.to_string_lossy(),
@@ -2531,7 +2611,15 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.contains("Registry changed during setup"));
+        assert!(error.contains("Launch failed"));
+        assert!(
+            !read_registry_exact()
+                .unwrap()
+                .servers
+                .iter()
+                .any(|s| s.id == "one"),
+            "failed staged import must be removed despite unrelated edits"
+        );
         assert!(read_registry_exact()
             .unwrap()
             .servers

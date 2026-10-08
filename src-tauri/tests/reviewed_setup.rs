@@ -77,7 +77,19 @@ impl Drop for Fixture {
                     && file.path().extension().is_some_and(|e| e == "json")
                 {
                     if let Some(descriptor) = conduit_lib::daemon::read_descriptor(&file.path()) {
-                        let _ = conduit_lib::daemon::request_shutdown_if_idle(&descriptor);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        // The adapter deletes its session asynchronously after EOF.
+                        // Keep the private data and descriptor until shutdown is accepted.
+                        while file.path().exists() && std::time::Instant::now() < deadline {
+                            let _ = conduit_lib::daemon::request_shutdown_if_idle(&descriptor);
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        assert!(
+                            !file.path().exists(),
+                            "private fixture daemon {} did not shut down",
+                            descriptor.pid
+                        );
                     }
                 }
             }

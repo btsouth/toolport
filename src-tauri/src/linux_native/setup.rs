@@ -39,12 +39,12 @@ fn middle_ellipsize(widget: &gtk::Widget, text: &str) {
     }
 }
 
-fn boxed_expander(row: &adw::ExpanderRow) -> gtk::ListBox {
-    let list = gtk::ListBox::new();
-    list.set_selection_mode(gtk::SelectionMode::None);
-    list.add_css_class("boxed-list");
-    list.append(row);
-    list
+fn details_expander(title: &str) -> (gtk::Expander, gtk::Box) {
+    let expander = gtk::Expander::new(Some(title));
+    expander.add_css_class("toolport-details-expander");
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    expander.set_child(Some(&content));
+    (expander, content)
 }
 
 pub(super) fn review(
@@ -123,7 +123,7 @@ pub(super) fn review(
         selected.push((check, row, spinner, item.key, item.name));
     }
     body.append(&rows);
-    let details = adw::ExpanderRow::builder().title("Details").build();
+    let (details, content) = details_expander("Details");
     let path = gtk::Label::builder()
         .label(disclosure)
         .wrap(true)
@@ -134,8 +134,7 @@ pub(super) fn review(
         .margin_start(12)
         .margin_end(12)
         .build();
-    details.add_row(&path);
-    let details = boxed_expander(&details);
+    content.append(&path);
     body.append(&details);
     let feedback = gtk::Label::builder()
         .xalign(0.0)
@@ -262,26 +261,24 @@ pub(super) fn review(
                     }
                     body.append(&results);
                     if !outcome.tools.is_empty() {
-                        let agent = adw::ExpanderRow::builder()
-                            .title("What your agent sees")
-                            .build();
+                        let (agent, content) = details_expander("What your agent sees");
                         for tool in outcome.tools {
                             let row = adw::ActionRow::builder()
                                 .title(tool["name"].as_str().unwrap_or("Tool"))
                                 .build();
-                            agent.add_row(&row);
+                            content.append(&row);
                         }
-                        body.append(&boxed_expander(&agent));
+                        body.append(&agent);
                     }
                     if let Some(backup) = outcome.backup {
-                        let detail = adw::ExpanderRow::builder().title("Details").build();
+                        let (detail, content) = details_expander("Details");
                         let label = gtk::Label::builder()
                             .label(format!("Backup: {backup}"))
                             .wrap(true)
                             .selectable(true)
                             .build();
-                        detail.add_row(&label);
-                        body.append(&boxed_expander(&detail));
+                        content.append(&label);
+                        body.append(&detail);
                     }
                     finished();
                 }
@@ -446,8 +443,8 @@ mod tests {
         let window = review_window();
         assert!(descendants(window.upcast_ref())
             .iter()
-            .filter(|w| w.is::<adw::ExpanderRow>())
-            .all(|w| w.parent().is_some_and(|parent| parent.is::<gtk::ListBox>())));
+            .filter(|w| w.is::<gtk::Expander>())
+            .all(|w| w.has_css_class("toolport-details-expander")));
         let button = descendants(window.upcast_ref())
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::Button>().ok())
