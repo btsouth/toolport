@@ -1234,7 +1234,7 @@ fn tool_publication_count(dir: &Path) -> usize {
     std::fs::read_to_string(dir.join("gateway.log"))
         .unwrap_or_default()
         .lines()
-        .filter(|line| *line == "downstream tool catalog publication completed")
+        .filter(|line| line.ends_with("downstream tool catalog publication completed"))
         .count()
 }
 
