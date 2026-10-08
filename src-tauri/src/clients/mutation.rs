@@ -63,8 +63,17 @@ pub(super) fn write(path: &Path, contents: &str) -> Result<(), String> {
             let parent = path.parent().ok_or("Auxiliary path has no parent")?;
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let dir = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
-            let parent = std::fs::canonicalize(parent).map_err(|e| e.to_string())?;
-            if !parent.starts_with(dir) || path.is_symlink() {
+            let ancestor = parent
+                .ancestors()
+                .find(|ancestor| ancestor.exists())
+                .ok_or("Auxiliary path has no existing ancestor")?;
+            let ancestor = std::fs::canonicalize(ancestor).map_err(|e| e.to_string())?;
+            if !ancestor.starts_with(dir)
+                || path
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir)
+                || path.is_symlink()
+            {
                 return Err(
                     "Auxiliary config writes must stay inside the Toolport data dir".into(),
                 );

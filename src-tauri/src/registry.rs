@@ -530,27 +530,6 @@ fn atomic_write_with_ops(
     atomic_write_checked_with_ops(path, contents, ops, || Ok(()))
 }
 
-pub(crate) fn atomic_write_checked(
-    path: &Path,
-    contents: &str,
-    check: impl Fn() -> Result<(), String>,
-) -> Result<(), String> {
-    atomic_write_checked_with_ops(path, contents, &FsAtomicWriteOps, check)
-}
-
-pub(crate) fn remove_file_checked(
-    path: &Path,
-    check: impl Fn() -> Result<(), String>,
-) -> Result<(), String> {
-    let dest = resolve_atomic_write_dest(path)?;
-    check()?;
-    match std::fs::remove_file(dest) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
 fn atomic_write_checked_with_ops(
     path: &Path,
     contents: &str,

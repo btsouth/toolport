@@ -43,7 +43,14 @@ pub(crate) struct Revision {
 }
 
 pub(crate) fn read(path: &Path) -> Result<Revision, String> {
-    let file = match File::open(path) {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Revision {
@@ -52,7 +59,12 @@ pub(crate) fn read(path: &Path) -> Result<Revision, String> {
                 permissions: None,
             })
         }
-        Err(e) => return Err(e.to_string()),
+        Err(e) => {
+            return Err(format!(
+                "could not stat/open {} before editing: {e}",
+                path.display()
+            ))
+        }
     };
     let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() || meta.len() > crate::clients::MAX_CONFIG_BYTES {
