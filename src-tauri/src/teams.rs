@@ -413,7 +413,6 @@ fn push_body(config: &Value, base_version: i64) -> Value {
 fn push_status_message(status: u16) -> Option<&'static str> {
     match status {
         409 => Some(STALE_PUSH_MESSAGE),
-        403 => Some("Finish this in the Teams dashboard"),
         _ => None,
     }
 }
@@ -773,11 +772,19 @@ pub fn push_config(
         .send_json(body)
     {
         Ok(resp) => require_no_redirect(resp)?,
-        Err(e @ ureq::Error::Status(status, _)) => {
+        Err(ureq::Error::Status(status, resp)) => {
             if let Some(message) = push_status_message(status) {
                 return Err(message.into());
             }
-            return Err(stringify(e));
+            let body = resp.into_string().unwrap_or_default();
+            let not_admin_session = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|value| value["error"].as_str().map(str::to_owned))
+                .is_some_and(|message| message.contains("not an admin session"));
+            if status == 403 && not_admin_session {
+                return Err("Finish this in the Teams dashboard".into());
+            }
+            return Err(format!("server returned {status}: {}", body.trim()));
         }
         Err(e) => return Err(stringify(e)),
     };
@@ -3019,9 +3026,34 @@ fn review_items(config: &Value) -> BTreeMap<String, Value> {
     items
 }
 
-fn item_hash(key: &str, value: &Value) -> String {
-    // serde_json's ordered maps make object key order irrelevant; array order is meaningful.
+fn normalized_server(value: &Value) -> Value {
+    match classify_team_server(value, "team:member-review") {
+        TeamClass::Ready(entry) | TeamClass::Review(entry) => {
+            let mut imported = json!(entry);
+            // Tool scopes are applied separately from the imported server entry.
+            imported["allowedTools"] = json!(parse_allowed_tools(value));
+            imported
+        }
+        // Invalid definitions remain distinct and cannot gain consent by normalization.
+        _ => value.clone(),
+    }
+}
+
+fn comparable_item(key: &str, value: &Value) -> Value {
+    if key.starts_with("server:") {
+        normalized_server(value)
+    } else {
+        value.clone()
+    }
+}
+
+fn raw_item_hash(key: &str, value: &Value) -> String {
     crate::registry::sha256_hex(&json!(["team-member-review-v1", key, value]).to_string())
+}
+
+fn item_hash(key: &str, value: &Value) -> String {
+    // Compare what is actually imported, including secret flags and launch literals.
+    raw_item_hash(key, &comparable_item(key, value))
 }
 
 fn floor(policy: &Value) -> crate::registry::SafetyLevel {
@@ -3052,8 +3084,8 @@ fn current_policy(reg: &Registry) -> Value {
     })
 }
 
-fn immediate_floors(policy: &mut Value, incoming: &Value, current: &Value) {
-    policy["screeningPolicy"]["minSafetyLevel"] = json!(floor(incoming).max(floor(current)));
+fn immediate_floors(policy: &mut Value, incoming: &Value, accepted: &Value) {
+    policy["screeningPolicy"]["minSafetyLevel"] = json!(floor(incoming).max(floor(accepted)));
     for key in [
         "forceHumanApproval",
         "forceContentDefense",
@@ -3062,11 +3094,28 @@ fn immediate_floors(policy: &mut Value, incoming: &Value, current: &Value) {
         "forcePiiRedaction",
     ] {
         policy["screeningPolicy"][key] = json!(
-            incoming["screeningPolicy"][key] == true || current["screeningPolicy"][key] == true
+            incoming["screeningPolicy"][key] == true || accepted["screeningPolicy"][key] == true
         );
     }
     policy["denyDestructive"] =
-        json!(incoming["denyDestructive"] == true || current["denyDestructive"] == true);
+        json!(incoming["denyDestructive"] == true || accepted["denyDestructive"] == true);
+}
+
+fn immediate_rate_limits(policy: &mut Value, incoming: &Value) {
+    let mut caps = crate::rate_limits::parse_caps(policy);
+    for cap in crate::rate_limits::parse_caps(incoming) {
+        // Counters use window and tool scope, not the cap's display id. Keep both
+        // scopes when one changes so tightening cannot release an accepted limit.
+        if let Some(accepted) = caps
+            .iter_mut()
+            .find(|old| old.window == cap.window && old.tool == cap.tool)
+        {
+            accepted.max_calls = accepted.max_calls.min(cap.max_calls);
+        } else {
+            caps.push(cap);
+        }
+    }
+    policy["rateLimits"] = json!(caps);
 }
 
 fn diff_fields(before: &Value, after: &Value, prefix: &str, fields: &mut Vec<MemberChangeField>) {
@@ -3373,6 +3422,7 @@ pub fn stage_team_config(
     if latest.get("instructions") != review.latest.get("instructions") {
         review.instructions_version = version;
     }
+    let previous_keys: Vec<_> = review.latest.keys().cloned().collect();
     review.latest = latest;
     // Stopping export revokes prior acceptance. Rejected enablement hashes stay rejected.
     if review.latest.get("callAuditExport") == Some(&json!(false)) {
@@ -3386,12 +3436,33 @@ pub fn stage_team_config(
         .latest
         .keys()
         .chain(review.accepted.keys())
+        .chain(review.rejected.keys())
+        .chain(previous_keys.iter())
         .cloned()
         .collect();
     for key in keys {
         let before = review.accepted.get(&key).cloned().unwrap_or(Value::Null);
         let after = review.latest.get(&key).cloned().unwrap_or(Value::Null);
-        if before == after
+        // Removal is a tightening. Forget consent and rejection history so the
+        // same identity returning later always starts a fresh new-server review.
+        if key.starts_with("server:") && !review.latest.contains_key(&key) {
+            if let Some(managed) = reg
+                .servers
+                .iter()
+                .find(|server| {
+                    server.source.as_deref() == Some(&tag_for(team_id))
+                        && saved_team_original_id(server) == Some(&key[7..])
+                })
+                .map(|server| server.id.clone())
+            {
+                crate::local_auth::restore_personal_route(reg, team_id, &managed);
+            }
+            review.accepted.remove(&key);
+            review.rejected.remove(&key);
+            review.held_access.remove(&key[7..]);
+            continue;
+        }
+        if comparable_item(&key, &before) == comparable_item(&key, &after)
             || (before.is_null()
                 && (after == false
                     || (key == "policy"
@@ -3401,11 +3472,9 @@ pub fn stage_team_config(
             continue;
         }
         let hash = item_hash(&key, &after);
-        if review
-            .rejected
-            .get(&key)
-            .is_some_and(|hashes| hashes.contains(&hash))
-        {
+        if review.rejected.get(&key).is_some_and(|hashes| {
+            hashes.contains(&hash) || hashes.contains(&raw_item_hash(&key, &after))
+        }) {
             continue;
         }
         let title = if key.starts_with("server:") {
@@ -3481,7 +3550,12 @@ pub fn stage_team_config(
             });
     }
     let outcome = apply_review_state(reg, team_id, &review, true)?;
-    if review.latest == review.accepted {
+    if review.latest.len() == review.accepted.len()
+        && review.latest.iter().all(|(key, value)| {
+            comparable_item(key, value)
+                == comparable_item(key, review.accepted.get(key).unwrap_or(&Value::Null))
+        })
+    {
         review.accepted_version = version;
     }
     review.held_access.retain(|id, _| {
@@ -3504,11 +3578,10 @@ fn apply_review_state(
         .cloned()
         .unwrap_or(json!({"denyDestructive":false,"screeningPolicy":{},"rateLimits":[]}));
     if tighten {
-        immediate_floors(
-            &mut policy,
-            review.latest.get("policy").unwrap_or(&Value::Null),
-            &current_policy(reg),
-        );
+        let accepted = policy.clone();
+        let latest = review.latest.get("policy").unwrap_or(&Value::Null);
+        immediate_floors(&mut policy, latest, &accepted);
+        immediate_rate_limits(&mut policy, latest);
     }
     policy["screeningPolicy"]["minSafetyLevel"] = json!(floor(&policy));
     let mut effective = policy;
@@ -3652,19 +3725,22 @@ fn decide_member_change(
     if let Some(original) = key.strip_prefix("server:") {
         review.held_access.remove(original);
     }
-    if review.latest == review.accepted {
+    if review.latest.len() == review.accepted.len()
+        && review.latest.iter().all(|(key, value)| {
+            comparable_item(key, value)
+                == comparable_item(key, review.accepted.get(key).unwrap_or(&Value::Null))
+        })
+    {
         review.accepted_version = review.version;
     }
     save_member_review(reg, &review);
     Ok(())
 }
 
-static INSTRUCTIONS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn apply_accepted_instructions(team_id: &str) -> Result<(), String> {
-    let _instructions = INSTRUCTIONS_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let path = crate::registry::resolved_path().ok_or("Could not resolve registry path")?;
+    // Serialize desktop and daemon writers before reading the accepted content.
+    let _instructions = crate::registry::lock_at(&path.with_file_name("team-instructions"))?;
     let reg = crate::registry::load()?;
     let Some(team) = reg.team.as_ref().filter(|team| team.team_id == team_id) else {
         return Ok(());
@@ -8389,6 +8465,231 @@ mod member_review_tests {
     }
 
     #[test]
+    fn member_review_round2_removal_is_immediate_and_readd_needs_consent() {
+        let mut reg = registry();
+        reg.version = 3;
+        let cfg = config("first");
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "server:remote", true);
+        let managed = reg
+            .servers
+            .iter()
+            .find(|s| s.id == remote_id(&reg))
+            .unwrap()
+            .clone();
+        let mut personal = managed.clone();
+        personal.id = "remote".into();
+        personal.source = None;
+        personal.unknown_fields.remove(TEAM_ORIGINAL_ID_FIELD);
+        personal.enabled = false;
+        reg.servers.push(personal.clone());
+        crate::local_auth::bind(&mut reg, &managed, &personal).unwrap();
+        let removed = json!({"servers":[]});
+        for version in [2, 5] {
+            stage_team_config(&mut reg, "review-team", &removed, version, &[]).unwrap();
+            let review = member_review(&reg).unwrap();
+            assert!(!review.pending.contains_key("server:remote"));
+            assert!(!review.accepted.contains_key("server:remote"));
+            assert!(!review.held_access.contains_key("remote"));
+            assert!(reg
+                .servers
+                .iter()
+                .all(|s| s.source.as_deref() != Some("team:review-team")));
+            assert!(reg.server_enabled("remote") && reg.is_enabled("default", "remote"));
+            assert_eq!(
+                reg.servers.iter().find(|s| s.id == "remote").unwrap().url,
+                personal.url
+            );
+            stage_team_config(&mut reg, "review-team", &removed, version + 1, &[]).unwrap();
+            assert_eq!(reg.servers.len(), 1);
+            stage_team_config(&mut reg, "review-team", &cfg, version + 2, &[]).unwrap();
+            assert!(member_review(&reg)
+                .unwrap()
+                .pending
+                .contains_key("server:remote"));
+            let id = remote_id(&reg);
+            assert!(server_change_held(&reg, &id));
+            assert!(!reg.server_enabled(&id));
+            decide(&mut reg, "server:remote", true);
+        }
+    }
+
+    #[test]
+    fn member_review_round2_reverted_floors_return_to_accepted_policy() {
+        use crate::registry::SafetyLevel::{Off, Strict};
+        let mut reg = registry();
+        let accepted = json!({"servers":[], "denyDestructive":false, "screeningPolicy":{"minSafetyLevel":"off"}});
+        stage_team_config(&mut reg, "review-team", &accepted, 1, &[]).unwrap();
+        // Off already matches the member's accepted policy when review is seeded.
+        let strict = json!({"servers":[], "denyDestructive":true, "screeningPolicy":{
+            "minSafetyLevel":"strict", "forceHumanApproval":true, "forceContentDefense":true,
+            "forceQuarantineOnDrift":true, "forceBlockOnInjection":true, "forcePiiRedaction":true}});
+        stage_team_config(&mut reg, "review-team", &strict, 2, &[]).unwrap();
+        assert_eq!(reg.team_min_safety_level, Strict);
+        assert!(reg.team_forced_deny_destructive);
+        stage_team_config(&mut reg, "review-team", &accepted, 3, &[]).unwrap();
+        assert!(member_review(&reg).unwrap().pending.is_empty());
+        assert_eq!(reg.team_min_safety_level, Off);
+        assert!(
+            !reg.team_forced_deny_destructive
+                && !reg.team_forced_human_approval
+                && !reg.team_forced_content_defense
+                && !reg.team_forced_quarantine_on_drift
+                && !reg.team_forced_block_on_injection
+                && !reg.team_forced_pii_redaction
+        );
+    }
+
+    #[test]
+    fn member_review_round2_description_does_not_hold_working_server() {
+        ignored_field_does_not_hold("description");
+    }
+
+    #[test]
+    fn member_review_round2_env_value_does_not_hold_working_server() {
+        ignored_field_does_not_hold("env-value");
+    }
+
+    fn ignored_field_does_not_hold(field: &str) {
+        let mut reg = registry();
+        let mut cfg = config("first");
+        cfg["servers"][1]["env"] = json!([{"key":"TOKEN", "secret":true}]);
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "server:remote", true);
+        let id = remote_id(&reg);
+        if field == "description" {
+            cfg["servers"][1]["description"] = json!("Documentation only");
+        } else {
+            cfg["servers"][1]["env"][0]["value"] = json!("ignored-value");
+        }
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert!(!member_review(&reg)
+            .unwrap()
+            .pending
+            .contains_key("server:remote"));
+        assert!(!server_change_held(&reg, &id));
+        assert!(reg.server_enabled(&id));
+        cfg["servers"][1]["env"][0]["secret"] = json!(false);
+        stage_team_config(&mut reg, "review-team", &cfg, 4, &[]).unwrap();
+        assert!(server_change_held(&reg, &id));
+        assert!(!reg.server_enabled(&id));
+    }
+
+    #[test]
+    fn member_review_round2_launch_literal_changes_still_require_review() {
+        let mut reg = registry();
+        let mut cfg = config("first");
+        cfg["servers"][0]["args"] = json!(["<launch-input>"]);
+        cfg["servers"][0]["launch"] =
+            json!({"bindings":[{"index":0,"parts":[{"kind":"literal","value":"/"}]}],"inputs":[]});
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "server:stdio", true);
+        cfg["servers"][0]["launch"]["bindings"][0]["parts"][0]["value"] = json!(":");
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert!(
+            member_review(&reg).unwrap().pending["server:stdio"]
+                .fields
+                .iter()
+                .any(|f| f.before.contains("\"value\": \"/\"")
+                    && f.after.contains("\"value\": \":\""))
+        );
+    }
+
+    #[test]
+    fn member_review_round2_push_403_preserves_authorization_errors() {
+        for body in [
+            json!({"error":"forbidden"}),
+            json!({"error":"admin role was revoked"}),
+            json!({"error":"Confirm two-factor authentication to continue", "code":"step_up_required"}),
+        ] {
+            let (url, server) = serve(403, body.clone());
+            let error = push_config(
+                &url,
+                "review-team",
+                "fixture-token",
+                &json!({"servers":[]}),
+                4,
+            )
+            .unwrap_err();
+            server.join().unwrap();
+            assert_eq!(error, format!("server returned 403: {body}"));
+        }
+    }
+
+    #[test]
+    fn member_review_round2_new_and_stricter_rate_caps_apply_immediately() {
+        let mut reg = registry();
+        let mut cfg =
+            json!({"servers":[], "rateLimits":[{"id":"calls", "window":"day", "maxCalls":10}]});
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 10);
+        decide(&mut reg, "policy", true);
+        cfg["rateLimits"][0]["maxCalls"] = json!(5);
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 5);
+        cfg["rateLimits"][0]["maxCalls"] = json!(10);
+        stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 10);
+        assert!(member_review(&reg).unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn member_review_round2_stricter_rate_cap_applies_before_review() {
+        let mut reg = registry();
+        let mut cfg =
+            json!({"servers":[], "rateLimits":[{"id":"calls", "window":"day", "maxCalls":10}]});
+        apply_team_config(&mut reg, "review-team", &cfg);
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        cfg["rateLimits"][0]["maxCalls"] = json!(5);
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 5);
+        assert!(member_review(&reg).unwrap().pending.contains_key("policy"));
+    }
+
+    #[test]
+    fn member_review_round2_removed_rejected_new_server_returns_as_fresh_review() {
+        let mut reg = registry();
+        let cfg = config("first");
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "server:remote", false);
+        stage_team_config(&mut reg, "review-team", &json!({"servers":[]}), 2, &[]).unwrap();
+        assert!(reg.servers.is_empty());
+        stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
+        assert!(member_review(&reg)
+            .unwrap()
+            .pending
+            .contains_key("server:remote"));
+        assert!(server_change_held(&reg, &remote_id(&reg)));
+    }
+
+    #[test]
+    fn member_review_round2_rate_cap_loosening_and_removal_wait_for_consent() {
+        let mut reg = registry();
+        let mut cfg =
+            json!({"servers":[], "rateLimits":[{"id":"calls", "window":"day", "maxCalls":5}]});
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "policy", true);
+        cfg["rateLimits"][0]["maxCalls"] = json!(10);
+        // A simultaneous new cap applies, but cannot release the accepted cap.
+        cfg["rateLimits"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"monthly", "window":"month", "maxCalls":100}));
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 5);
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits.len(), 2);
+        decide(&mut reg, "policy", false);
+        stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 5);
+        cfg["rateLimits"] = json!([]);
+        stage_team_config(&mut reg, "review-team", &cfg, 4, &[]).unwrap();
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 5);
+        assert!(member_review(&reg).unwrap().pending.contains_key("policy"));
+        decide(&mut reg, "policy", true);
+        assert!(reg.team.as_ref().unwrap().rate_limits.is_empty());
+    }
+
+    #[test]
     fn member_review_preserves_every_access_set_and_disabled_switch() {
         for version in [2, 3] {
             for enabled in [false, true] {
@@ -8672,7 +8973,7 @@ mod member_review_tests {
             .team_instructions_content
             .is_none());
         assert!(!reg.team.as_ref().unwrap().call_audit_export);
-        assert!(reg.team.as_ref().unwrap().rate_limits.is_empty());
+        assert_eq!(reg.team.as_ref().unwrap().rate_limits[0].max_calls, 5);
         // The required safety floor still takes effect before consent.
         assert_eq!(reg.team_min_safety_level, crate::registry::SafetyLevel::Ask);
         let id = reg.servers[0].id.clone();
@@ -8746,7 +9047,7 @@ mod member_review_tests {
     }
 
     #[test]
-    fn member_review_changed_remote_and_removal_are_held() {
+    fn member_review_changed_remote_is_held_and_removal_is_immediate() {
         let mut reg = registry();
         let mut cfg = config("first");
         stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
@@ -8760,15 +9061,10 @@ mod member_review_tests {
         assert!(reg.servers.iter().all(|s| !s.enabled));
         cfg["servers"] = json!([]);
         stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
-        assert!(member_review(&reg)
+        assert!(!member_review(&reg)
             .unwrap()
             .pending
             .contains_key("server:remote"));
-        assert!(reg
-            .servers
-            .iter()
-            .any(|s| saved_team_original_id(s) == Some("remote")));
-        decide(&mut reg, "server:remote", true);
         assert!(!reg
             .servers
             .iter()
@@ -8935,10 +9231,7 @@ mod member_review_tests {
             "Finish this in the Teams dashboard"
         );
         server.join().unwrap();
-        assert_eq!(
-            push_status_message(403),
-            Some("Finish this in the Teams dashboard")
-        );
+        assert_eq!(push_status_message(403), None);
     }
 
     #[test]
@@ -9114,8 +9407,8 @@ mod member_pairing_regression {
             "pairing enabled unreviewed call-log export"
         );
         assert!(
-            registry.team.as_ref().unwrap().rate_limits.is_empty(),
-            "pairing applied unreviewed policy caps"
+            registry.team.as_ref().unwrap().rate_limits[0].max_calls == 5,
+            "pairing did not apply the tightening rate cap"
         );
         assert_eq!(
             registry.team_min_safety_level,
