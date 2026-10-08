@@ -3748,6 +3748,8 @@ fn render_json_config(
     root: &serde_json::Value,
     changed_key: &str,
 ) -> Result<String, String> {
+    let bom = original.is_some_and(|text| text.starts_with('\u{feff}'));
+    let original = original.map(|text| text.strip_prefix('\u{feff}').unwrap_or(text));
     let pretty = || serde_json::to_string_pretty(root).map_err(|e| e.to_string());
 
     let out = match (original, root.get(changed_key)) {
@@ -3761,7 +3763,7 @@ fn render_json_config(
         }
         _ => pretty()?,
     };
-    Ok(out)
+    Ok(if bom { format!("\u{feff}{out}") } else { out })
 }
 
 /// Convert a `toml::Value` into a `toml_edit::Item` so we can splice a rewritten
