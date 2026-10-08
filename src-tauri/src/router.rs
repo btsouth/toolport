@@ -3170,6 +3170,33 @@ impl Router {
             // call is the half-open probe of a tripped breaker.
             breaker.consecutive_failures >= BREAKER_FAILURE_THRESHOLD
         };
+        let (reset, generation, successes) = {
+            let server = slot
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                server.connection_reset_reason(),
+                slot.generation.load(Ordering::Acquire),
+                slot.successes.load(Ordering::Acquire),
+            )
+        };
+        if let Some(reason) = reset {
+            // This caller has not dispatched. Retired calls receive FrameRejected and
+            // never reach recovery; only this new operation uses the fresh stream.
+            if let Some(result) =
+                self.reconnect_and_retry(slot, cancel, None, generation, successes, access, &mut f)
+            {
+                return result;
+            }
+            // A failed reconnect is still a health failure. Otherwise a
+            // factory that cannot rebuild this rejected stream would storm too.
+            slot.breaker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record_failure(Instant::now());
+            return Err(format!("{reason}; downstream reconnect required"));
+        }
         let mut attempt = 0u32;
         loop {
             if !dispatch_cancelled_continuation && cancel.is_some_and(CancelContext::is_cancelled) {
@@ -3203,6 +3230,15 @@ impl Router {
                     attempt += 1;
                 }
                 Err(e) => {
+                    if matches!(e, TransportError::FrameRejected(_)) {
+                        // Retire every owned call without replay, including read-only
+                        // calls. Concurrent failures of one stream count once.
+                        slot.breaker
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .record_concurrent_failure(started, Instant::now());
+                        return Err(e.to_string());
+                    }
                     // Only a health failure (timeout / dead connection / exhausted
                     // retries) counts toward the breaker; a normal error response does
                     // not disable the server.
@@ -3368,6 +3404,20 @@ impl Router {
                 .reconnect_gate
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A caller may have waited at the gate while another fresh
+            // connection failed and opened the breaker. Do not spawn past it.
+            if let Some(remaining) = slot
+                .breaker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .open_remaining(Instant::now())
+            {
+                return Some(Err(format!(
+                    "server '{}' is temporarily unavailable (too many recent failures; retrying in {}s)",
+                    slot.id,
+                    remaining.as_secs() + 1
+                )));
+            }
             if slot.generation.load(Ordering::Acquire) == generation {
                 eprintln!("toolport: server '{}' is down; re-spawning it", slot.id);
                 let Some(fresh) = factory() else {
@@ -4936,6 +4986,284 @@ mod tests {
             DownstreamServer::connect("s".into(), Box::new(DeadOnCallTransport)).unwrap(),
             reconnect,
         ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p09_rejected_frame_never_replays_and_next_call_reconnects() {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            std::env::temp_dir().join(format!("toolport-p09-router-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let script = dir.0.join("oversized.py");
+        let calls = dir.0.join("calls");
+        std::fs::write(
+            &script,
+            r#"import json, os, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'initialize':
+        result = {'protocolVersion':'2025-06-18','capabilities':{}}
+    elif method == 'tools/list':
+        result = {'tools':[{'name':'echo'}]}
+    elif method == 'tools/call':
+        with open(sys.argv[1], 'a') as calls:
+            calls.write('dispatch\n')
+        for _ in range(2049):
+            os.write(1, b'x' * 8192)
+        os.write(1, b'\n')
+        result = {'ok':True}
+    else:
+        result = {}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let transport = crate::downstream::StdioTransport::spawn(
+            "/usr/bin/python3",
+            &[
+                script.to_string_lossy().into_owned(),
+                calls.to_string_lossy().into_owned(),
+            ],
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+        struct ObservedReset {
+            inner: crate::downstream::StdioTransport,
+            seen: std::sync::mpsc::Sender<()>,
+        }
+        impl Transport for ObservedReset {
+            fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
+                self.inner.request(method, params)
+            }
+            fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
+                self.inner.notify(method, params)
+            }
+            fn concurrent(&self) -> Option<Arc<dyn crate::downstream::ConcurrentTransport>> {
+                self.inner.concurrent()
+            }
+            fn connection_closed(&self) -> Option<bool> {
+                self.inner.connection_closed()
+            }
+            fn connection_reset_reason(&self) -> Option<String> {
+                let reason = self.inner.connection_reset_reason();
+                if reason.is_some() {
+                    self.seen.send(()).unwrap();
+                }
+                reason
+            }
+        }
+        let (seen, observed) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let released = Mutex::new(released);
+        let bad = DownstreamServer::connect(
+            "s".into(),
+            Box::new(ObservedReset {
+                inner: transport,
+                seen,
+            }),
+        )
+        .unwrap();
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = spawns.clone();
+        let mut router = Router::new();
+        router.add_with_reconnect(
+            bad,
+            Some(Box::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
+                Some(mock_server("s"))
+            })),
+        );
+        let error = router
+            .route_call("s__echo", json!({"text":"original"}))
+            .unwrap_err();
+        assert!(error.contains("16777216-byte limit"), "{error}");
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            0,
+            "must not recover by replaying the original call"
+        );
+        let router = Arc::new(router);
+        let (done, completed) = std::sync::mpsc::channel();
+        let mut callers = Vec::new();
+        for _ in 0..10 {
+            let router = router.clone();
+            let done = done.clone();
+            callers.push(std::thread::spawn(move || {
+                done.send(router.route_call("s__echo", json!({"text":"fresh"})))
+                    .unwrap();
+            }));
+        }
+        for _ in 0..10 {
+            observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+        release.send(()).unwrap();
+        for _ in 0..10 {
+            assert!(completed
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .is_ok());
+        }
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read_to_string(calls).unwrap(), "dispatch\n");
+    }
+
+    #[test]
+    fn p09_read_only_probe_never_replays_a_rejected_frame() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counted = spawns.clone();
+        let slot = dead_slot(Some(Box::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Some(mock_server("s"))
+        })));
+        slot.breaker.lock().unwrap().consecutive_failures = BREAKER_FAILURE_THRESHOLD;
+        let error = Router::new()
+            .call_with_retry(
+                &slot,
+                None,
+                false,
+                ReplayPolicy::ReadOnly,
+                SlotAccess::Shared,
+                |_| {
+                    Err::<Value, _>(TransportError::FrameRejected(
+                        "oversized frame; connection reset".into(),
+                    ))
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error, "oversized frame; connection reset");
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert!(slot
+            .breaker
+            .lock()
+            .unwrap()
+            .open_remaining(Instant::now())
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p09_always_oversized_server_trips_breaker_until_cooldown() {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(
+            std::env::temp_dir().join(format!("toolport-p09-breaker-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let script = dir.0.join("oversized.py");
+        std::fs::write(
+            &script,
+            r#"import json, os, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request: continue
+    method = request['method']
+    if method == 'initialize': result = {'protocolVersion':'2025-06-18','capabilities':{}}
+    elif method == 'tools/list': result = {'tools':[{'name':'echo'}]}
+    elif method == 'tools/call':
+        for _ in range(2049): os.write(1, b'x' * 8192)
+        continue
+    else: result = {}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counted = spawns.clone();
+        let fail_reconnect = Arc::new(AtomicBool::new(false));
+        let failed = fail_reconnect.clone();
+        let factory = move || {
+            if failed.load(Ordering::SeqCst) {
+                return None;
+            }
+            counted.fetch_add(1, Ordering::SeqCst);
+            let transport = crate::downstream::StdioTransport::spawn(
+                "/usr/bin/python3",
+                &[script.to_string_lossy().into_owned()],
+                &[],
+                None,
+                false,
+            )
+            .unwrap();
+            Some(DownstreamServer::connect("s".into(), Box::new(transport)).unwrap())
+        };
+        let mut router = Router::new();
+        router.add_with_reconnect(factory().unwrap(), Some(Box::new(factory)));
+        for _ in 0..BREAKER_FAILURE_THRESHOLD {
+            let error = router.route_call("s__echo", json!({})).unwrap_err();
+            assert!(error.contains("16777216-byte limit"), "{error}");
+        }
+        let started = Instant::now();
+        for _ in 0..12 {
+            let error = router.route_call("s__echo", json!({})).unwrap_err();
+            assert!(
+                error.contains("too many recent failures; retrying in"),
+                "{error}"
+            );
+        }
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            BREAKER_FAILURE_THRESHOLD as usize
+        );
+        let slot = router.slot_for("s").unwrap();
+        let mut breaker = slot.breaker.lock().unwrap();
+        assert_eq!(breaker.consecutive_failures, BREAKER_FAILURE_THRESHOLD);
+        let remaining = breaker.open_remaining(Instant::now()).unwrap();
+        assert!(remaining <= BREAKER_COOLDOWN);
+        breaker.open_until = Some(Instant::now());
+        drop(breaker);
+        let error = router.route_call("s__echo", json!({})).unwrap_err();
+        assert!(error.contains("16777216-byte limit"), "{error}");
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            BREAKER_FAILURE_THRESHOLD as usize + 1
+        );
+        assert!(slot
+            .breaker
+            .lock()
+            .unwrap()
+            .open_remaining(Instant::now())
+            .is_some());
+        // A cooldown probe whose factory fails must reopen the breaker too.
+        fail_reconnect.store(true, Ordering::SeqCst);
+        slot.breaker.lock().unwrap().open_until = Some(Instant::now());
+        let error = router.route_call("s__echo", json!({})).unwrap_err();
+        assert!(error.contains("downstream reconnect required"), "{error}");
+        assert!(slot
+            .breaker
+            .lock()
+            .unwrap()
+            .open_remaining(Instant::now())
+            .is_some());
+        let error = router.route_call("s__echo", json!({})).unwrap_err();
+        assert!(
+            error.contains("too many recent failures; retrying in"),
+            "{error}"
+        );
     }
 
     #[test]
