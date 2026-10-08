@@ -183,10 +183,12 @@ fn unreadable_bytes_never_default_or_overwrite_from_last_good() {
     std::fs::write(&path, original).unwrap();
     let backup = serde_json::to_vec(&Registry::default()).unwrap();
     std::fs::write(scratch.0.join("registry.json.bak"), &backup).unwrap();
-    assert!(registry::load_from(&path)
-        .unwrap_err()
-        .contains("Could not read registry"));
+    let (_, source) = registry::load_from_with_source(&path).unwrap();
+    assert_eq!(source, registry::LoadSource::Backup);
+    assert!(!source.is_authoritative());
+    std::fs::remove_file(scratch.0.join("registry.json.bak")).unwrap();
     assert_gateway_refuses(&scratch.0, "--daemon", "Could not read registry");
+    std::fs::write(scratch.0.join("registry.json.bak"), &backup).unwrap();
     let error = registry::save_to(&path, &Registry::default()).unwrap_err();
     assert!(
         error.contains("Refusing to replace unreadable bytes"),

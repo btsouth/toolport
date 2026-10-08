@@ -3090,7 +3090,7 @@ const RECOVERY_NOTICE_FILE: &str = "registry-recovery.json";
 #[serde(rename_all = "camelCase")]
 pub struct RegistryRecoveryNotice {
     pub recovered_at_ms: u128,
-    /// `"missing"` when the primary was absent; `"corrupt"` when it was unreadable.
+    /// Why the primary could not be used, including any preservation failure.
     pub reason: String,
     pub quarantine_path: Option<String>,
 }
@@ -3366,18 +3366,18 @@ fn migrate_document(
 
 /// Recover the registry from the backups `save_to` maintains, newest-first by
 /// filesystem modification time across both `.bak` and rolling generations.
-/// Returns the first that parses (and
-/// best-effort rewrites the primary from it so a later read self-heals), or None
-/// when nothing usable remains. Walking the journal means one stale or corrupt
+/// Returns the first that parses, optionally best-effort restoring the primary,
+/// or None when nothing usable remains. Walking the journal means one stale or corrupt
 /// `.bak` no longer strands recovery when fresher snapshots exist.
 ///
 /// A candidate whose schema is newer than `target_version` is skipped, never
 /// recovered: rewriting it in this build's shape would destroy a newer build's
 /// data, the same loss the primary-path version check exists to prevent.
-fn restore_from_backup(
+fn load_from_backup(
     path: &Path,
     migrations: &[Migration],
     target_version: u32,
+    restore_primary: bool,
 ) -> Option<Registry> {
     let single_backup = backup_path(path);
     let single_sequence = std::fs::read_to_string(backup_sequence_path(path))
@@ -3431,9 +3431,9 @@ fn restore_from_backup(
             continue;
         }
         if from_version < target_version {
-            // Preserve this backup too before migrating it, then migrate the
-            // in-memory copy; the write-back below publishes the new version.
-            if write_migration_backup(path, &content, from_version).is_err() {
+            // Before restoring, journal this backup before migrating it. When
+            // loading only into memory, its original bytes stay in the backup.
+            if restore_primary && write_migration_backup(path, &content, from_version).is_err() {
                 continue;
             }
             let context = MigrationContext::for_registry(path);
@@ -3444,12 +3444,13 @@ fn restore_from_backup(
         let Ok(registry) = serde_json::from_value::<Registry>(value.clone()) else {
             continue;
         };
-        let Ok(restored) = serde_json::to_string_pretty(&value) else {
-            continue;
-        };
-        // Best-effort: restore the primary so we don't keep reading a backup.
-        // Recovery still succeeds if this write fails.
-        let _ = atomic_write(path, &restored);
+        // Never replace primary bytes that could not be read or preserved.
+        // Recovery still succeeds if a permitted restore fails.
+        if restore_primary {
+            if let Ok(restored) = serde_json::to_string_pretty(&value) {
+                let _ = atomic_write(path, &restored);
+            }
+        }
         return Some(registry);
     }
     None
@@ -3461,8 +3462,8 @@ enum ReadOutcome {
     /// Still missing or empty after retries: genuinely absent, not a race.
     Absent,
     /// The file is there but every read failed with something other than
-    /// not-found (sharing violation, permissions, I/O error). Refuse recovery:
-    /// we cannot preserve bytes we could not read before replacing the primary.
+    /// not-found (sharing violation, permissions, I/O error). A usable backup
+    /// can keep the app running, but must not replace bytes we could not read.
     Unreadable,
 }
 
@@ -3471,11 +3472,18 @@ enum ReadOutcome {
 /// `\\localhost\C$` twin, where rename windows are wider) can expose: a brief
 /// not-found, empty, or sharing-violation moment during the rename. A reader
 /// that mistakes that moment for "the registry is gone" used to fall into
-/// `restore_from_backup`, which REWRITES the primary from a possibly-days-old
+/// backup restoration, which REWRITES the primary from a possibly-days-old
 /// .bak - the exact mechanism that destroyed a real user registry (manual
 /// servers added over three days lost to a self-heal from a stale backup).
-/// Retrying a few times before concluding anything makes that race unloseable.
+/// Retry briefly before falling back, and never substitute defaults for a read error.
 fn read_registry_file(path: &Path) -> ReadOutcome {
+    read_registry_file_with(|| std::fs::read_to_string(path), std::thread::sleep)
+}
+
+fn read_registry_file_with(
+    mut read: impl FnMut() -> std::io::Result<String>,
+    mut backoff: impl FnMut(std::time::Duration),
+) -> ReadOutcome {
     const ATTEMPTS: u32 = 4;
     const BACKOFF_MS: u64 = 75;
     // Why the last attempt failed, so a file we were never allowed to read is not
@@ -3483,7 +3491,7 @@ fn read_registry_file(path: &Path) -> ReadOutcome {
     // must not be overwritten or treated as a first run.
     let mut last_error: Option<std::io::ErrorKind> = None;
     for attempt in 0..ATTEMPTS {
-        match std::fs::read_to_string(path) {
+        match read() {
             Ok(content) if !content.trim().is_empty() => return ReadOutcome::Content(content),
             // An empty read is the rename window itself, not an error.
             Ok(_) => last_error = None,
@@ -3492,7 +3500,7 @@ fn read_registry_file(path: &Path) -> ReadOutcome {
             Err(e) => last_error = Some(e.kind()),
         }
         if attempt + 1 < ATTEMPTS {
-            std::thread::sleep(std::time::Duration::from_millis(BACKOFF_MS));
+            backoff(std::time::Duration::from_millis(BACKOFF_MS));
         }
     }
     match last_error {
@@ -3587,7 +3595,7 @@ pub enum LoadSource {
     /// No registry file and no backup worth recovering: a genuine first run.
     /// Empty here is the truth.
     FirstRun,
-    /// The primary was absent or unparseable, and the registry came
+    /// The primary was absent, unreadable or unparseable, and the registry came
     /// from a backup. `save_to` snapshots the PRE-write content, so the newest
     /// backup is state N-1: the save that registered the first HTTP client is
     /// exactly the one whose backup still has none.
@@ -3616,24 +3624,40 @@ fn load_from_inner_with(
     migrations: &[Migration],
     target_version: u32,
 ) -> Result<(Registry, LoadSource), String> {
-    let (mut registry, source) = match read_registry_file(path) {
+    load_from_inner_with_outcome(path, migrations, target_version, read_registry_file(path))
+}
+
+fn load_from_inner_with_outcome(
+    path: &Path,
+    migrations: &[Migration],
+    target_version: u32,
+    outcome: ReadOutcome,
+) -> Result<(Registry, LoadSource), String> {
+    let (mut registry, source) = match outcome {
         // Genuinely missing or empty (not a rename race - read_registry_file
         // already waited that out): recover the last-known-good from the .bak
         // sibling if one survived, else this is a first run.
         ReadOutcome::Absent => {
-            if let Some(reg) = restore_from_backup(path, migrations, target_version) {
+            if let Some(reg) = load_from_backup(path, migrations, target_version, true) {
                 record_registry_recovery("missing", None);
                 Ok((reg, LoadSource::Backup))
             } else {
                 Ok((Registry::default(), LoadSource::FirstRun))
             }
         }
-        // We never saw the primary's bytes, so neither an empty default nor
-        // overwriting it from a backup is safe. Leave the evidence intact.
-        ReadOutcome::Unreadable => Err(format!(
-            "Could not read registry at {}. Check file permissions and contents, then try again. The registry and its backups have not been changed.",
-            path.display()
-        )),
+        // Keep running from a backup without replacing bytes we never saw.
+        // Its empty fields remain non-authoritative for security decisions.
+        ReadOutcome::Unreadable => {
+            if let Some(reg) = load_from_backup(path, migrations, target_version, false) {
+                record_registry_recovery("unreadable", None);
+                Ok((reg, LoadSource::Backup))
+            } else {
+                Err(format!(
+                    "Could not read registry at {}. Check file permissions and contents, then try again. The registry and its backups have not been changed.",
+                    path.display()
+                ))
+            }
+        }
         ReadOutcome::Content(content) => {
             // Parse the envelope first so the version is a fact we can check
             // BEFORE deserializing the data model. A newer schema that happens to
@@ -3675,9 +3699,8 @@ fn load_from_inner_with(
                     }
                 }
                 // Present but unparseable by THIS build: corrupt, or a newer
-                // schema that is not even JSON. Quarantine the evidence BEFORE
-                // restore_from_backup self-heals the primary from .bak, so
-                // nothing is ever silently destroyed.
+                // schema that is not even JSON. Preserve the evidence before
+                // any restore; otherwise recovery leaves the primary untouched.
                 Err(e) => {
                     corrupt_registry(path, &content, e.to_string(), migrations, target_version)
                 }
@@ -3700,7 +3723,8 @@ fn load_from_inner_with(
 }
 
 /// Handle a primary registry that is not a parseable document at a supported
-/// version: quarantine the exact bytes, then try the backups. Kept separate so
+/// version: try to quarantine the exact bytes, then load a backup. Only restore
+/// the primary if preservation succeeded. Kept separate so
 /// the newer-version refusal above can never fall into this path (it must not
 /// quarantine or recover anything).
 fn corrupt_registry(
@@ -3710,13 +3734,21 @@ fn corrupt_registry(
     migrations: &[Migration],
     target_version: u32,
 ) -> Result<(Registry, LoadSource), String> {
-    let quarantine = quarantine_unreadable(path, content)?;
-    match restore_from_backup(path, migrations, target_version) {
+    let quarantine = quarantine_unreadable(path, content);
+    match load_from_backup(path, migrations, target_version, quarantine.is_ok()) {
         Some(registry) => {
-            record_registry_recovery("corrupt", Some(quarantine));
+            match quarantine {
+                Ok(path) => record_registry_recovery("corrupt", Some(path)),
+                Err(error) => record_registry_recovery(
+                    &format!("corrupt registry could not be preserved: {error}"),
+                    None,
+                ),
+            }
             Ok((registry, LoadSource::Backup))
         }
-        None => Err(format!("Corrupt registry: {parse_error}")),
+        None => Err(quarantine
+            .err()
+            .unwrap_or_else(|| format!("Corrupt registry: {parse_error}"))),
     }
 }
 
@@ -4452,9 +4484,8 @@ pub fn load_resolved() -> Result<Registry, String> {
 }
 
 /// [`load_resolved`] plus where the result came from. `Ok` alone does not mean the
-/// registry on disk was read: it also covers a recovery from a backup and a
-/// default standing in for a file that could not be read, both of which are empty
-/// for reasons that are not "the user configured nothing" (SBS-900).
+/// registry on disk was read: a backup can be empty for reasons that are not
+/// "the user configured nothing" (SBS-900). Unreadable primaries never default.
 pub fn load_resolved_with_source() -> Result<(Registry, LoadSource), String> {
     let (registry, source) = match resolved_path() {
         Some(path) => load_from_with_source(&path),
@@ -7016,6 +7047,89 @@ pub(crate) mod tests {
         clear_registry_files(&path);
     }
 
+    #[test]
+    fn transient_unreadable_registry_retries_before_using_backup() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("reg-read-retry");
+        let path = dir.join("registry.json");
+        let mut current = Registry::default();
+        current.add_server(sample_server("current"));
+        let bytes = serde_json::to_string_pretty(&current).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let backup = serde_json::to_string_pretty(&Registry::default()).unwrap();
+        std::fs::write(backup_path(&path), &backup).unwrap();
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        let outcome = read_registry_file_with(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                } else {
+                    std::fs::read_to_string(&path)
+                }
+            },
+            |delay| delays.push(delay),
+        );
+        assert_eq!(attempts, 3);
+        assert_eq!(delays, vec![std::time::Duration::from_millis(75); 2]);
+        let (loaded, source) =
+            load_from_inner_with_outcome(&path, MIGRATIONS, REGISTRY_VERSION, outcome).unwrap();
+        assert_eq!(source, LoadSource::File);
+        assert_eq!(loaded.servers[0].id, "current");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read_to_string(backup_path(&path)).unwrap(), backup);
+        assert!(take_recovery_notice().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_unreadable_registry_loads_backup_without_replacing_primary() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("reg-read-fallback");
+        let path = dir.join("registry.json");
+        let bytes = [0xff, 0xfe, 0x80];
+        std::fs::write(&path, bytes).unwrap();
+        let mut good = Registry::default();
+        good.add_server(sample_server("last-good"));
+        let backup = serde_json::to_string_pretty(&good).unwrap();
+        std::fs::write(backup_path(&path), &backup).unwrap();
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        let outcome = read_registry_file_with(
+            || {
+                attempts += 1;
+                std::fs::read_to_string(&path)
+            },
+            |delay| delays.push(delay),
+        );
+        assert_eq!(attempts, 4);
+        assert_eq!(delays, vec![std::time::Duration::from_millis(75); 3]);
+        let (loaded, source) =
+            load_from_inner_with_outcome(&path, MIGRATIONS, REGISTRY_VERSION, outcome).unwrap();
+        assert_eq!(source, LoadSource::Backup);
+        assert!(!source.is_authoritative());
+        assert_eq!(loaded.servers[0].id, "last-good");
+        assert_eq!(take_recovery_notice().unwrap().reason, "unreadable");
+        assert!(save_to(&path, &loaded)
+            .unwrap_err()
+            .contains("Refusing to replace unreadable bytes"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read_to_string(backup_path(&path)).unwrap(), backup);
+        std::fs::remove_file(backup_path(&path)).unwrap();
+        let error = load_from_inner_with_outcome(
+            &path,
+            MIGRATIONS,
+            REGISTRY_VERSION,
+            ReadOutcome::Unreadable,
+        )
+        .unwrap_err();
+        assert!(error.contains("Could not read registry"), "{error}");
+        assert!(error.contains("Check file permissions"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// SBS-900: `read_registry_file` used to fold every read failure into
     /// "absent", so a registry this process was not allowed to read came back as
     /// a first run. Unix-only: it needs a mode the current user is denied.
@@ -7267,8 +7381,16 @@ pub(crate) mod tests {
             sha256_hex(corrupt)
         ));
         std::fs::create_dir(&dest).unwrap();
-        assert!(load_from(&path).unwrap_err().contains("Could not preserve"));
-        assert!(save_to(&path, &Registry::default())
+        let (loaded, source) = load_from_with_source(&path).unwrap();
+        assert_eq!(source, LoadSource::Backup);
+        assert!(!source.is_authoritative());
+        let notice = take_recovery_notice().unwrap();
+        assert!(notice
+            .reason
+            .starts_with("corrupt registry could not be preserved:"));
+        assert!(notice.reason.contains("Could not preserve"));
+        assert!(notice.quarantine_path.is_none());
+        assert!(save_to(&path, &loaded)
             .unwrap_err()
             .contains("Could not preserve"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
@@ -7324,13 +7446,18 @@ pub(crate) mod tests {
         std::fs::write(backup_path(&path), &good).unwrap();
         // Creation and named-file access work, but enumeration is prohibited.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
-        let result = load_from(&path);
+        let result = load_from_with_source(&path);
+        let error = save_to(&path, &Registry::default()).unwrap_err();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error = result.unwrap_err();
+        assert_eq!(result.unwrap().1, LoadSource::Backup);
         assert!(
             error.contains("Could not list preserved registry copies"),
             "{error}"
         );
+        assert!(take_recovery_notice()
+            .unwrap()
+            .reason
+            .contains("Could not list preserved registry copies"));
         assert!(quarantine_files(&path).is_empty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
         assert_eq!(std::fs::read_to_string(backup_path(&path)).unwrap(), good);
