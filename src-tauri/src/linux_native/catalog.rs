@@ -1122,12 +1122,9 @@ mod tests {
                 existing,
                 None,
             );
-            window.present();
-            page.search
-                .set_text(if state == "outage" { "github" } else { "" });
-            // Programmatic text changes do not always emit SearchEntry's user
-            // search signal. Exercise its connected handlers explicitly.
-            page.search.emit_by_name::<()>("search-changed", &[]);
+            if state == "normal" {
+                window.present();
+            }
             assert_eq!(
                 labels(&page.list)
                     .iter()
@@ -1137,10 +1134,26 @@ mod tests {
             );
             assert!(!page.feedback.is_visible());
             let main_loop = gtk::glib::MainLoop::new(None, false);
+            let ready = Rc::new(Cell::new(false));
+            let prepared = ready.clone();
+            let fixture_page = page.clone();
+            // Apply each state on GTK's main loop after the window is mapped.
+            gtk::glib::idle_add_local_once(move || {
+                fixture_page
+                    .search
+                    .set_text(if state == "outage" { "github" } else { "" });
+                fixture_page
+                    .search
+                    .emit_by_name::<()>("search-changed", &[]);
+                prepared.set(true);
+            });
             let frames = Rc::new(Cell::new(0));
             let observed_frames = frames.clone();
             let finished = main_loop.clone();
             window.add_tick_callback(move |_, _| {
+                if !ready.get() {
+                    return gtk::glib::ControlFlow::Continue;
+                }
                 frames.set(frames.get() + 1);
                 if frames.get() >= 2 {
                     finished.quit();
