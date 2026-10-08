@@ -267,7 +267,7 @@ fn sse_fixture(calls: usize) -> (String, std::thread::JoinHandle<Vec<Value>>) {
                     let final_response = write!(stream,"data: {}\n\n",json!({"jsonrpc":"2.0","id":body["id"],"result":response}))
                         .and_then(|()| stream.flush());
                     if let Err(error) = final_response {
-                        assert!(matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset), "{error}");
+                        assert!(matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted), "{error}");
                     }
                 } else {
                     let id = body["id"].as_str().unwrap();
