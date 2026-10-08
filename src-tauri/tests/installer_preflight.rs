@@ -4,6 +4,30 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+struct TempDir(PathBuf);
+impl TempDir {
+    fn new(label: &str) -> Self {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "toolport-installer-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 struct Gateway(Child);
 impl Drop for Gateway {
     fn drop(&mut self) {
@@ -33,7 +57,7 @@ fn copied_gateway(root: &Path, name: &str) -> PathBuf {
 
 #[test]
 fn busy_client_defers_and_foreign_gateway_is_never_stopped() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = TempDir::new("busy");
     let installed = copied_gateway(temp.path(), "install");
     let foreign = copied_gateway(temp.path(), "foreign");
     let data = temp.path().join("data");
@@ -72,7 +96,7 @@ fn busy_client_defers_and_foreign_gateway_is_never_stopped() {
 
 #[test]
 fn idle_daemon_exits_gracefully_before_installation() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = TempDir::new("idle");
     let installed = copied_gateway(temp.path(), "install");
     let data = temp.path().join("data");
     let mut daemon = Gateway(command(&installed, &data).arg("--daemon").spawn().unwrap());
