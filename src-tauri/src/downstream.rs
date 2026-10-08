@@ -1042,11 +1042,13 @@ struct CancelState {
     hooks: HashMap<String, HashMap<u64, CancelCallback>>,
     next_hook: u64,
     closed: bool,
+    finished: bool,
 }
 
 #[derive(Clone)]
 struct CancelEntry {
     stdin: Arc<Mutex<ChildStdin>>,
+    forwarder: StdioForwarder,
     downstream_id: Value,
     /// The stdio request waiting on `downstream_id`, woken with `Cancelled` so a
     /// cancelled call stops waiting instead of holding its thread until the read
@@ -1194,6 +1196,15 @@ impl CancelRegistry {
         true
     }
 
+    /// A finite HTTP exchange completed. Its suspended work belongs to the
+    /// next round, so closing this old socket must no longer cancel it.
+    pub fn finish_connection(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finished = true;
+    }
+
     /// Closing is terminal: even a worker arriving after close cannot dispatch.
     pub fn close(&self) {
         let hooks = {
@@ -1201,7 +1212,7 @@ impl CancelRegistry {
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.closed {
+            if state.closed || state.finished {
                 return;
             }
             state.closed = true;
@@ -1244,47 +1255,53 @@ impl CancelRegistry {
     }
 }
 
-/// Forwards must never block a drain thread or disappear when writers are busy.
-/// At most 64 writers run; excess work queues until one finishes. Each queued
-/// cancel owns one existing in-flight request, rather than another blocked thread.
+/// Each stdio connection has one writer for cancels and refusals. A stuck
+/// child cannot occupy another server's writer or accumulate unlimited work.
+/// Budget one cancel and one refusal per allowed in-flight request, plus the
+/// existing unsolicited server-request allowance. Overflow retires the child.
+const MAX_STDIO_PENDING: usize = 256;
+const MAX_STDIO_FORWARDS: usize = 2 * MAX_STDIO_PENDING + MAX_UNCLAIMED_SERVER_REQUESTS;
 type ForwardWork = Box<dyn FnOnce() + Send>;
-#[derive(Default)]
-struct ForwardQueue {
-    active: usize,
-    pending: VecDeque<ForwardWork>,
+#[derive(Clone)]
+struct StdioForwarder {
+    tx: std::sync::mpsc::SyncSender<ForwardWork>,
+    retired: Arc<AtomicBool>,
+    child: Weak<Mutex<Child>>,
 }
-const MAX_CANCEL_THREADS: usize = 64;
 
-fn enqueue_forward(work: ForwardWork) {
-    static QUEUE: OnceLock<Mutex<ForwardQueue>> = OnceLock::new();
-    let queue = QUEUE.get_or_init(Mutex::default);
-    let mut state = queue
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if state.active >= MAX_CANCEL_THREADS {
-        state.pending.push_back(work);
-        return;
-    }
-    state.active += 1;
-    drop(state);
-    std::thread::spawn(move || {
-        let mut work = work;
-        loop {
-            work();
-            let mut state = queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match state.pending.pop_front() {
-                Some(next) => {
-                    work = next;
-                }
-                None => {
-                    state.active -= 1;
+impl StdioForwarder {
+    fn new(child: Weak<Mutex<Child>>) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ForwardWork>(MAX_STDIO_FORWARDS);
+        let retired = Arc::new(AtomicBool::new(false));
+        let stopped = retired.clone();
+        std::thread::spawn(move || {
+            while let Ok(work) = rx.recv() {
+                if stopped.load(Ordering::Acquire) {
                     break;
                 }
+                work();
+            }
+        });
+        Self { tx, retired, child }
+    }
+
+    fn enqueue(&self, work: ForwardWork) {
+        if self.retired.load(Ordering::Acquire) || self.tx.try_send(work).is_ok() {
+            return;
+        }
+        if !self.retired.swap(true, Ordering::AcqRel) {
+            eprintln!("toolport: retiring downstream with a saturated cancel/refusal queue");
+            if let Some(child) = self.child.upgrade() {
+                let mut child = child
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                #[cfg(unix)]
+                kill_process_group(&mut child);
+                #[cfg(not(unix))]
+                let _ = child.kill();
             }
         }
-    });
+    }
 }
 
 impl CancelEntry {
@@ -1296,7 +1313,7 @@ impl CancelEntry {
             core.cancel_waiter(&self.downstream_id);
         }
         let entry = self.clone();
-        enqueue_forward(Box::new(move || {
+        self.forwarder.enqueue(Box::new(move || {
             if let Err(err) = entry.send_cancel(reason.as_deref()) {
                 eprintln!("toolport: failed to forward cancellation downstream: {err}");
             }
@@ -3355,9 +3372,10 @@ struct StdioCoreState {
 
 /// The request machinery of one stdio connection. A request registers a waiter
 /// under its id, writes its frame, and waits on its own channel; the demux thread
-/// routes each response to its waiter, so any number of requests share the pipe.
+/// routes each response to its waiter, with bounded concurrent requests on the pipe.
 struct StdioCore {
-    child: Mutex<Child>,
+    child: Arc<Mutex<Child>>,
+    forwarder: StdioForwarder,
     stdin: Arc<Mutex<ChildStdin>>,
     /// Tail of the child's stderr, drained on a background thread. A server that
     /// dies on startup (bad package name, missing API key) explains itself here,
@@ -3463,8 +3481,10 @@ impl StdioCore {
         label: String,
         read_failure: Arc<Mutex<Option<String>>>,
     ) -> Arc<Self> {
+        let child = Arc::new(Mutex::new(child));
         let core = Arc::new(StdioCore {
-            child: Mutex::new(child),
+            forwarder: StdioForwarder::new(Arc::downgrade(&child)),
+            child,
             stdin,
             stderr,
             read_failure,
@@ -3633,6 +3653,7 @@ impl StdioCore {
                 ctx.client_request_id.clone(),
                 CancelEntry {
                     stdin: Arc::clone(&self.stdin),
+                    forwarder: self.forwarder.clone(),
                     downstream_id: downstream_id.clone(),
                     waiter: Some(Arc::downgrade(self)),
                     forwarded: forwarded.clone(),
@@ -3826,6 +3847,13 @@ impl StdioCore {
             let mut state = self.lock_state();
             if let Some(closed) = &state.closed {
                 return Err(TransportError::Unavailable(closed.clone()));
+            }
+            if state.pending.len() >= MAX_STDIO_PENDING
+                || self.forwarder.retired.load(Ordering::Acquire)
+            {
+                return Err(TransportError::Busy(
+                    "downstream stdio connection is busy".into(),
+                ));
             }
             let seq = state.next_seq;
             state.next_seq += 1;
@@ -4023,6 +4051,7 @@ impl StdioCore {
     fn retire(&self, suspended: SuspendedLegacyMrtr, reason: Option<String>) {
         CancelEntry {
             stdin: Arc::clone(&self.stdin),
+            forwarder: self.forwarder.clone(),
             downstream_id: suspended.pending.downstream_request_id.clone(),
             waiter: None,
             forwarded: suspended.forwarded.clone(),
@@ -4237,7 +4266,7 @@ impl StdioCore {
             "error": { "code": JSONRPC_INTERNAL_ERROR, "message": message }
         });
         let stdin = Arc::clone(&self.stdin);
-        enqueue_forward(Box::new(move || {
+        self.forwarder.enqueue(Box::new(move || {
             let mut stdin = stdin
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13051,6 +13080,7 @@ for line in sys.stdin:
             "between".into(),
             super::CancelEntry {
                 stdin: recorder.stdin.clone(),
+                forwarder: super::StdioForwarder::new(Weak::new()),
                 downstream_id: json!(41),
                 waiter: None,
                 forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13080,6 +13110,7 @@ for line in sys.stdin:
                 key,
                 super::CancelEntry {
                     stdin: fixture.recorder.stdin.clone(),
+                    forwarder: fixture.core.forwarder.clone(),
                     downstream_id: json!(id),
                     waiter: None,
                     forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13093,7 +13124,13 @@ for line in sys.stdin:
                 "caller left",
             );
         }
+        let healthy = CoreFixture::new("independent-forwarder", "");
+        healthy
+            .core
+            .refuse(&json!({"id": "healthy"}), "caller left");
+        healthy.wait_for_frame("healthy server refusal", |frame| frame["id"] == "healthy");
         drop(locked);
+        healthy.finish();
         for id in 0..100 {
             fixture.wait_for_frame("queued forward", |frame| {
                 if id < 80 {
@@ -13107,6 +13144,48 @@ for line in sys.stdin:
         drop(guards);
         let frames = fixture.finish();
         assert_eq!(frames.len(), 100, "{frames:?}");
+    }
+
+    #[test]
+    fn p08_chatty_stuck_connection_retires_at_its_forward_bound() {
+        let child = Arc::new(Mutex::new(placeholder_child()));
+        let forwarder = super::StdioForwarder::new(Arc::downgrade(&child));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        forwarder.enqueue(Box::new(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        for _ in 0..super::MAX_STDIO_FORWARDS {
+            forwarder.enqueue(Box::new(|| {}));
+        }
+        assert!(!forwarder.retired.load(Ordering::Acquire));
+        forwarder.enqueue(Box::new(|| {}));
+        assert!(
+            forwarder.retired.load(Ordering::Acquire),
+            "overflow must retire instead of accumulating work"
+        );
+        release_tx.send(()).unwrap();
+        child.lock().unwrap().wait().unwrap();
+    }
+
+    #[test]
+    fn p08_stdio_inflight_limit_matches_its_forward_budget() {
+        let fixture = CoreFixture::new("forward-budget", "");
+        let mut receivers = Vec::new();
+        for id in 0..super::MAX_STDIO_PENDING {
+            let (tx, rx) = std::sync::mpsc::channel();
+            fixture.core.register(&json!(id), tx).unwrap();
+            receivers.push(rx);
+        }
+        let (tx, _) = std::sync::mpsc::channel();
+        assert!(matches!(
+            fixture.core.register(&json!("overflow"), tx),
+            Err(TransportError::Busy(_))
+        ));
+        drop(receivers);
+        fixture.finish();
     }
 
     /// The `forwarded` latch: once a cancellation has reached the downstream
@@ -13124,6 +13203,7 @@ for line in sys.stdin:
             "c-2".to_string(),
             CancelEntry {
                 stdin: Arc::clone(&recorder.stdin),
+                forwarder: super::StdioForwarder::new(Weak::new()),
                 downstream_id: json!(41),
                 waiter: None,
                 forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13166,6 +13246,7 @@ for line in sys.stdin:
             "c-3".to_string(),
             CancelEntry {
                 stdin: Arc::clone(&first_recorder.stdin),
+                forwarder: super::StdioForwarder::new(Weak::new()),
                 downstream_id: json!(41),
                 waiter: None,
                 forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13181,6 +13262,7 @@ for line in sys.stdin:
             "c-3".to_string(),
             CancelEntry {
                 stdin: Arc::clone(&second_recorder.stdin),
+                forwarder: super::StdioForwarder::new(Weak::new()),
                 downstream_id: json!(42),
                 waiter: None,
                 forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -15742,13 +15742,13 @@ fn handle_http_with_headers(
             return HttpOut::json_err(400, "missing adapter instance");
         };
         if method == "DELETE" {
-            if let Some(session) = state
+            let session = state
                 .mcp_sessions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&key)
-                .cloned()
-            {
+                .cloned();
+            if let Some(session) = session {
                 if session.owner.as_ref() != session_owner {
                     return HttpOut::json_err(403, "foreign adapter instance");
                 }
@@ -16501,16 +16501,6 @@ fn relay_http_response(
                 disconnected();
                 return Err(error);
             }
-            if sockets[0].revents != 0 {
-                let mut byte = [0];
-                match client.peek(&mut byte) {
-                    Ok(0) | Err(_) => {
-                        disconnected();
-                        return Ok(());
-                    }
-                    Ok(_) => sockets[0].fd = -1, // No HTTP pipelining on this ingress.
-                }
-            }
             if sockets[1].revents != 0 {
                 let count = upstream.read(&mut bytes)?;
                 if count == 0 {
@@ -16519,6 +16509,16 @@ fn relay_http_response(
                 if let Err(error) = client.write_all(&bytes[..count]) {
                     disconnected();
                     return Err(error);
+                }
+            }
+            if sockets[0].revents != 0 {
+                let mut byte = [0];
+                match client.peek(&mut byte) {
+                    Ok(0) | Err(_) => {
+                        disconnected();
+                        return Ok(());
+                    }
+                    Ok(_) => sockets[0].fd = -1, // No HTTP pipelining on this ingress.
                 }
             }
         }
@@ -17841,6 +17841,20 @@ fn healthz_out(state: &GatewayState, method: &str) -> HttpOut {
     }
 }
 
+fn respond_http<R: Read>(request: tiny_http::Request, response: tiny_http::Response<R>) {
+    let cancellations = request.remote_addr().and_then(|peer| {
+        http_connection_cancellations()
+            .lock()
+            .ok()
+            .and_then(|connections| connections.get(peer).cloned())
+    });
+    if request.respond(response).is_ok() {
+        if let Some(cancellations) = cancellations {
+            cancellations.finish_connection();
+        }
+    }
+}
+
 /// Handle one accepted HTTP request end to end: parse, CORS, auth/scope, dispatch,
 /// and respond. A pure function of the request plus the shared state and guards, so
 /// it is safe to run on many worker threads concurrently.
@@ -17963,7 +17977,7 @@ fn handle_connection(
             healthz_out(state, &method)
         };
         let response = tiny_http::Response::from_string(out.body).with_status_code(out.status);
-        let _ = request.respond(response);
+        respond_http(request, response);
         return;
     }
 
@@ -18229,7 +18243,7 @@ fn handle_connection(
             response = response.with_header(h);
         }
     }
-    let _ = request.respond(response);
+    respond_http(request, response);
 }
 
 /// Flags `toolport-gateway` recognizes on the command line today, kept in one
@@ -33078,6 +33092,125 @@ mod tests {
         assert!(
             !other.stdio_broken(),
             "one connection's write failure must not mark another session broken"
+        );
+    }
+
+    #[test]
+    fn p08_completed_exchange_must_not_fire_retained_hooks() {
+        let (server, _ingress, address) =
+            bind_deadline_http_server("127.0.0.1:0", HttpReadDeadlines::default()).unwrap();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let f2 = fired.clone();
+        let n = 400;
+        let worker = std::thread::spawn(move || {
+            let mut guards = Vec::new();
+            let mut peers = Vec::new();
+            for _ in 0..n {
+                let request = server.recv().unwrap();
+                peers.push(*request.remote_addr().unwrap());
+                let registry = http_connection_cancellations()
+                    .lock()
+                    .unwrap()
+                    .get(request.remote_addr().unwrap())
+                    .unwrap()
+                    .clone();
+                assert!(registry.begin_client_request("1".into()));
+                let seen = f2.clone();
+                guards.push(registry.context("1".into()).on_cancel(Arc::new(move |_| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                })));
+                registry.finish_client_request("1");
+                respond_http(
+                    request,
+                    tiny_http::Response::from_string(
+                        "{\"resultType\":\"input_required\",\"requestState\":\"x\"}",
+                    ),
+                );
+            }
+            (guards, peers)
+        });
+        for _ in 0..n {
+            let mut c = TcpStream::connect(address).unwrap();
+            c.write_all(b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")
+                .unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let k = c.read(&mut chunk).unwrap();
+                if k == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..k]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            drop(c); // client got the full response and closes, as HTTP/1.0-style clients do
+        }
+        let (guards, peers) = worker.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while {
+            let connections = http_connection_cancellations().lock().unwrap();
+            peers.iter().any(|peer| connections.contains_key(peer))
+        } {
+            assert!(Instant::now() < deadline, "completed relays must exit");
+            std::thread::yield_now();
+        }
+        let f = fired.load(Ordering::SeqCst);
+        println!("retained hooks fired after completed exchanges: {f}/{n}");
+        drop(guards);
+        assert_eq!(f, 0);
+    }
+
+    #[test]
+    fn p08_lifetime_delete_releases_sessions_lock_before_cancel_hooks() {
+        let state = http_state(false);
+        let caller = test_caller("adapter:p08-delete-lock", None);
+        let key = "adapter-lifetime:p08-delete-lock".to_string();
+        let session = Arc::new(SessionState::new_http(Some(caller.session_owner.clone())));
+        state
+            .mcp_sessions
+            .lock()
+            .unwrap()
+            .insert(key, session.clone());
+        let calls = session.cancellations();
+        assert!(calls.begin_client_request("held".into()));
+        let free = Arc::new(AtomicBool::new(false));
+        let observed = free.clone();
+        let sessions = state.mcp_sessions.clone();
+        let _hook = calls.context("held".into()).on_cancel(Arc::new(move |_| {
+            observed.store(sessions.try_lock().is_ok(), Ordering::SeqCst);
+        }));
+        let _scope = HttpConnectionScope(
+            HTTP_CONNECTION_CANCEL.with(|c| c.replace(None)),
+            HTTP_ADAPTER_INSTANCE.with(|c| c.replace(Some("p08-delete-lock".into()))),
+        );
+        let mut headers = modern_http_headers("", None, None, None);
+        headers.private_daemon_bearer = true;
+        let out = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            "DELETE",
+            "/adapter/lifetime",
+            "",
+            headers,
+            None,
+            Some(&caller),
+        );
+        assert_eq!(out.status, 204);
+        assert!(
+            free.load(Ordering::SeqCst),
+            "cancel hooks must run outside the sessions lock"
         );
     }
 

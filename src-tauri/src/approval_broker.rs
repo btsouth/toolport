@@ -642,6 +642,38 @@ fn preflight(
     Preflight::AskHuman
 }
 
+fn disconnect_decision(reader: &mut impl Read) -> ApprovalDecision {
+    let mut byte = [0];
+    loop {
+        match reader.read(&mut byte) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return ApprovalDecision::Timeout;
+            }
+            _ => return ApprovalDecision::Denied,
+        }
+    }
+}
+
+#[cfg(any(feature = "desktop", test))]
+fn show_pending_os_toast(
+    retractable: bool,
+    resolved: std::sync::mpsc::Receiver<()>,
+    show_retractable: impl FnOnce(std::sync::mpsc::Receiver<()>),
+    show_persistent: impl FnOnce(),
+) {
+    if retractable {
+        show_retractable(resolved);
+    } else if resolved.try_recv().is_err() {
+        show_persistent();
+    }
+}
+
 /// Serve one gateway connection: read the request, authenticate it, park it for a human
 /// decision (or a fail-closed timeout), and write the decision back.
 fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, host: BrokerHost) {
@@ -761,8 +793,7 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, host: BrokerHost) {
     let watching = broker.clone();
     let id = req.id.clone();
     let disconnected = std::thread::spawn(move || {
-        let mut byte = [0];
-        let _ = reader.read(&mut byte);
+        let decision = disconnect_decision(&mut reader);
         if let Some(waiter) = watching
             .inner
             .pending
@@ -770,7 +801,7 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, host: BrokerHost) {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id)
         {
-            let _ = waiter.decide.send(ApprovalDecision::Denied);
+            let _ = waiter.decide.send(decision);
         }
     });
 
@@ -853,7 +884,7 @@ fn notification_host(host: BrokerHost, show: ShowPendingNotification) -> BrokerH
     }
 }
 
-/// Notify the human that a call is held: a retractable Linux OS notification plus
+/// Notify the human that a call is held: an OS notification plus
 /// taskbar attention on the main window. Best-effort and non-blocking - if either fails (permission
 /// off, no window) the in-app overlay is still the source of truth. We flash rather than
 /// force-focus so we don't yank the user out of what they're doing.
@@ -881,13 +912,29 @@ fn notify_pending(app: &AppHandle, view: &PendingView, resolved: std::sync::mpsc
             ),
         )
     };
-    #[cfg(target_os = "linux")]
-    std::thread::spawn(move || notify_until_resolved(title, &body, resolved));
-    // The desktop plugin exposes no retractable toast on Windows or macOS.
-    // Keep the pending overlay and taskbar attention there, so an abandoned
-    // approval cannot leave an actionable OS notification behind.
-    #[cfg(not(target_os = "linux"))]
-    let _ = (title, body, resolved);
+    show_pending_os_toast(
+        cfg!(target_os = "linux"),
+        resolved,
+        |resolved| {
+            #[cfg(target_os = "linux")]
+            std::thread::spawn({
+                let body = body.clone();
+                move || notify_until_resolved(title, &body, resolved)
+            });
+            #[cfg(not(target_os = "linux"))]
+            let _ = resolved;
+        },
+        || {
+            // The plugin discards the native handle and exposes no per-toast
+            // identifier/tag or removal API on Windows/macOS. Keep showing the
+            // toast there: a stale notice is preferable to a missed approval.
+            #[cfg(not(target_os = "linux"))]
+            {
+                use tauri_plugin_notification::NotificationExt;
+                let _ = app.notification().builder().title(title).body(&body).show();
+            }
+        },
+    );
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.request_user_attention(Some(tauri::UserAttentionType::Critical));
     }
@@ -1006,6 +1053,36 @@ fn notify_until_resolved_at_destination(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p08_broker_read_timeout_is_timeout_and_eof_is_denied() {
+        struct Timeout;
+        impl Read for Timeout {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::TimedOut))
+            }
+        }
+        assert_eq!(disconnect_decision(&mut Timeout), ApprovalDecision::Timeout);
+        assert_eq!(
+            disconnect_decision(&mut io::empty()),
+            ApprovalDecision::Denied
+        );
+    }
+
+    #[test]
+    fn p08_non_retractable_platforms_still_show_pending_os_toasts() {
+        for platform in ["Windows", "macOS"] {
+            let (_tx, rx) = channel();
+            let shown = std::cell::Cell::new(false);
+            show_pending_os_toast(
+                false,
+                rx,
+                |_| panic!("unexpected Linux path"),
+                || shown.set(true),
+            );
+            assert!(shown.get(), "{platform} must surface a pending approval");
+        }
+    }
 
     #[test]
     fn p08_tauri_notification_resolution_withdraws_only_its_toast_even_after_late_show() {
