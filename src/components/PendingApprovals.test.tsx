@@ -130,19 +130,25 @@ describe("PendingApprovals refresh ordering", () => {
 describe("PendingApprovals client identity", () => {
   it("shows the authenticated client before an escaped secondary label", async () => {
     listPendingApprovals.mockResolvedValue([
-      { ...approval({ client: "client:c1", clientName: "Claude Code" }), clientLabel: "<b>Claude Code</b> 1" },
+      {
+        ...approval({ client: "client:c1", clientName: "Claude Code" }),
+        clientLabel: "<b>Claude Code</b> 1",
+      },
     ]);
     const { container } = render(<PendingApprovals />);
     await act(async () => {});
-    expect(screen.getByText("Claude Code wants to run this · destructive tool")).toBeInTheDocument();
-    expect(screen.getByText("Reports itself as: <b>Claude Code</b> 1")).toBeInTheDocument();
+    expect(
+      screen.getByText("Claude Code wants to run this · destructive tool"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Reports itself as: <b>Claude Code</b> 1"),
+    ).toBeInTheDocument();
     expect(container.querySelector("b")).toBeNull();
     expect(container.textContent!.indexOf("Claude Code wants")).toBeLessThan(
       container.textContent!.indexOf("<b>Claude Code"),
     );
   });
 });
-
 
 it("omits a redundant report and limits long reports with a full tooltip", async () => {
   const label = "界".repeat(70);

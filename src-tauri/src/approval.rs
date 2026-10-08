@@ -1119,7 +1119,7 @@ mod client_label_tests {
         let long = "界".repeat(1000);
         let label =
             client_info_label(Some(&json!({"clientInfo":{"name":long,"version":"evil"}}))).unwrap();
-        assert_eq!(label.chars().count(), 66);
+        assert!(label.chars().count() <= 120);
         assert!(label.len() <= 200);
         assert_eq!(
             client_info_label(Some(

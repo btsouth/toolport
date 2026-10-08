@@ -181,7 +181,8 @@ export function PendingApprovals() {
           {pending.map((a) => {
             const reason = REASON[a.reason];
             const clientName = trustedClientName(a);
-            const reportedLabel = a.clientLabel && a.clientLabel !== clientName ? a.clientLabel : null;
+            const reportedLabel =
+              a.clientLabel && a.clientLabel !== clientName ? a.clientLabel : null;
             const urlElicitation = a.urlElicitation;
             const piiRelease = a.piiRelease;
             // Count down to the broker's authoritative deadline; fall back to
@@ -218,11 +219,15 @@ export function PendingApprovals() {
                         </>
                       )}
                     </div>
-                    <div
-                      className="mt-1 text-xs"
-                      title={a.client ?? undefined}
-                    >
-                      {clientName} wants to run this · {a.reason === "destructive" ? "destructive tool" : a.reason === "destructive_and_untrusted" ? "destructive tool from an untrusted source" : a.reason === "pii_cross_server" ? "cross-server data release" : "untrusted source"}
+                    <div className="mt-1 text-xs" title={a.client ?? undefined}>
+                      {clientName} wants to run this ·{" "}
+                      {a.reason === "destructive"
+                        ? "destructive tool"
+                        : a.reason === "destructive_and_untrusted"
+                          ? "destructive tool from an untrusted source"
+                          : a.reason === "pii_cross_server"
+                            ? "cross-server data release"
+                            : "untrusted source"}
                     </div>
                     {reportedLabel && (
                       <div
