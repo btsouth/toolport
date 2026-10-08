@@ -1556,7 +1556,6 @@ fn fetch_result_tool_def() -> Value {
 /// The fixed 2.0 agent-facing floor: the meta-tools every connection advertises,
 /// plus `toolport_run_script` only when Code Mode is on. Grouped discovery adds a
 /// per-server `help_<server>` browse tool on top of this.
-#[cfg(test)]
 fn floor_tool_defs(host: &HostState) -> Vec<Value> {
     floor_tool_defs_with_code_mode(host.code_mode_enabled())
 }
@@ -1820,7 +1819,6 @@ fn help_tool_def(prefix: &str, tool_count: usize) -> Value {
 /// The tool set advertised in lazy mode: the fixed agent-facing floor, plus
 /// (in grouped mode) one `help_<server>` browse tool per server. `catalog` must
 /// already be scoped to the calling client.
-#[cfg(test)]
 fn grouped_tool_defs(host: &HostState, catalog: &[Value]) -> Vec<Value> {
     grouped_tool_defs_with_code_mode(host.code_mode_enabled(), catalog)
 }
