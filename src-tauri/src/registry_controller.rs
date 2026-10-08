@@ -1627,6 +1627,7 @@ fn verify_setup_gateway(
 ) -> Result<SetupVerification, String> {
     let intended = moved;
     let mut servers = Vec::new();
+    let mut tool_counts = std::collections::BTreeMap::new();
     for name in intended {
         let server = registry
             .servers
@@ -1644,6 +1645,7 @@ fn verify_setup_gateway(
                 format!("{} could not start. Check its command or URL and retry. Client config unchanged.", server.name)
             });
         }
+        tool_counts.insert(server.id.clone(), probe.tool_count);
     }
     let gateway = clients::resolve_gateway_path_readonly()
         .ok_or("Could not locate the Toolport gateway. Client config unchanged.")?;
@@ -1693,7 +1695,7 @@ fn verify_setup_gateway(
         }
         servers.push(SetupServerResult {
             name: server.name.clone(),
-            tool_count: catalog.len(),
+            tool_count: tool_counts[&server.id],
             credential_state: if server.env.iter().any(|env| env.secret) {
                 "stored"
             } else {
