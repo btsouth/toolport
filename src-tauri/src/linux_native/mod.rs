@@ -4987,7 +4987,10 @@ fn format_duration(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms} ms")
     } else if ms < 60000 {
-        format!("{:.1} s", ms as f64 / 1000.0)
+        {
+        let tenths = (ms + 50) / 100;
+        format!("{}.{:01} s", tenths / 10, tenths % 10)
+        }
     } else {
         let seconds = ms.saturating_add(500) / 1000;
         format!("{}m {}s", seconds / 60, seconds % 60)
@@ -9583,7 +9586,7 @@ mod tests {
             events.push(event);
         }
         events.push(call("github", false));
-        assert_eq!(filter_calls(&events, None, false).len(), 6);
+        assert_eq!(filter_calls(&events, None, false).len(), 7);
         assert_eq!(filter_calls(&events, None, true).len(), 1);
     }
 

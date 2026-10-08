@@ -58,7 +58,10 @@ export function stableListKeys<T>(items: T[], identity: (item: T) => string): st
 export function fmtMs(ms: number | null): string {
   if (ms == null) return "-";
   if (ms < 1000) return `${ms} ms`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)} s`;
+  if (ms < 60000) {
+    const tenths = Math.round(ms / 100);
+    return `${Math.floor(tenths / 10)}.${tenths % 10} s`;
+  }
   const seconds = Math.round(ms / 1000);
   return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }

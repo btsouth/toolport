@@ -226,6 +226,17 @@ try {
   await page.getByRole("button", { name: "Activity", exact: true }).click();
   await page.getByRole("button", { name: /recent calls/i }).click();
   await expect(page.getByText("team_slack", { exact: true }).first()).toBeVisible();
+  for (const label of [
+    "Approved",
+    "Denied",
+    "No answer",
+    "Withdrawn",
+    "Changed after approval",
+    "No approver available",
+  ]) {
+    await expect(page.getByText(label, { exact: true })).toBeVisible();
+  }
+  await expect(page.getByText("Claude Code 2.1 · 2m ago · waited 1m 30s")).toBeVisible();
   await page.screenshot({ path: path.join(output, "approval-activity.png") });
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   await page.goto(`${baseURL}/fixtures/?logos`);
