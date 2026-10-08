@@ -1,5 +1,7 @@
 // Separate development entry. Never imported by the shipping application.
 import { mockIPC } from "@tauri-apps/api/mocks";
+import { useState } from "react";
+import { TeamsView } from "@/components/TeamsView";
 import { createRoot } from "react-dom/client";
 import { ClientLogo } from "@/components/ClientLogo";
 import { ServerLogo } from "@/components/ServerLogo";
@@ -34,6 +36,76 @@ const registry: Registry = {
   accessUpgradeNoticeDismissed: false,
   clientScopes: { codex: "" },
 };
+const memberReviewFixture = new URLSearchParams(location.search).has("teams-review");
+if (memberReviewFixture) {
+  registry.team = {
+    teamId: "fixture-team",
+    teamName: "Example team",
+    serverUrl: "https://teams.toolport.app",
+    role: "member",
+    lastVersion: 12,
+    memberReview: {
+      pending: {
+        "server:remote": {
+          key: "server:remote",
+          title: "Server: Project tools",
+          hash: "fixture-remote-hash",
+          labels: [
+            {
+              author: { name: "Alice" },
+              at: 1791417600000,
+              via: "dashboard",
+              approvedBy: { name: "Bob" },
+            },
+          ],
+          fields: [
+            {
+              field: "url",
+              before: "https://old.example/mcp",
+              after: "https://new.example/mcp",
+            },
+            {
+              field: "allowedTools",
+              before: '["list_projects"]',
+              after: '["list_projects", "create_project"]',
+            },
+          ],
+        },
+        instructions: {
+          key: "instructions",
+          title: "Team instructions",
+          hash: "fixture-instructions-hash",
+          labels: [],
+          fields: [
+            {
+              field: "Content",
+              before: "Use the project issue tracker.",
+              after:
+                "Use the project issue tracker. Include the project ID in every update.",
+            },
+          ],
+        },
+        policy: {
+          key: "policy",
+          title: "Team policy",
+          hash: "fixture-policy-hash",
+          labels: [],
+          fields: [
+            { field: "screeningPolicy.minSafetyLevel", before: "strict", after: "ask" },
+          ],
+        },
+        callAuditExport: {
+          key: "callAuditExport",
+          title: "Call-log export",
+          hash: "fixture-export-hash",
+          labels: [],
+          fields: [{ field: "Content", before: "false", after: "true" }],
+        },
+      },
+    },
+  } as NonNullable<Registry["team"]>;
+}
+
 const auditRows = Array.from({ length: 200 }, (_, i) => ({
   ts: 1_700_000_000_000 - i * 1000,
   server: "GitHub",
@@ -81,6 +153,16 @@ mockIPC(
         : {};
     calls[command] = (calls[command] ?? 0) + 1;
     switch (command) {
+      case "team_instructions_status":
+        return null;
+      case "team_review": {
+        const team = registry.team as NonNullable<Registry["team"]> & {
+          memberReview: { pending: Record<string, unknown> };
+        };
+        delete team.memberReview.pending[String(args.key)];
+        return structuredClone(registry);
+      }
+
       case "dismiss_access_upgrade_notice":
         registry.accessUpgradeNoticeDismissed = true;
         return registry;
@@ -266,6 +348,16 @@ if (new URLSearchParams(location.search).has("logos")) {
       ))}
     </main>,
   );
+} else if (memberReviewFixture) {
+  function ReviewFixture() {
+    const [current, setCurrent] = useState(registry);
+    return (
+      <main className="max-w-4xl mx-auto p-6">
+        <TeamsView registry={current} onRegistryChange={setCurrent} />
+      </main>
+    );
+  }
+  createRoot(document.getElementById("root")!).render(<ReviewFixture />);
 } else {
   await import("../main");
 }

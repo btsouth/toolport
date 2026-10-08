@@ -164,6 +164,35 @@ try {
   const fixture = await page.evaluate(() => window.toolportFixture);
   expect(fixture.missing).toEqual([]);
   expect(errors).toEqual([]);
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto(`${baseURL}/fixtures/?teams-review`);
+  await page.getByRole("button", { name: "Review team changes", exact: true }).click();
+  const memberReview = page.getByRole("dialog");
+  await expect(
+    memberReview.getByText("Server: Project tools", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    memberReview.getByText(/Alice.*via dashboard.*approved by Bob/),
+  ).toBeVisible();
+  await expect(memberReview.getByText("Call-log export", { exact: true })).toBeVisible();
+  await expect(
+    memberReview.getByRole("button", { name: "Accept", exact: true }),
+  ).toHaveCount(4);
+  await expect(
+    memberReview.getByRole("button", { name: "Reject", exact: true }),
+  ).toHaveCount(4);
+  await page.evaluate(() => document.fonts.ready);
+  await page.screenshot({ path: path.join(output, "teams-member-review.png") });
+  await memberReview.getByRole("button", { name: "Reject", exact: true }).first().click();
+  await expect(
+    memberReview.getByText("Server: Project tools", { exact: true }),
+  ).toHaveCount(0);
+  await memberReview.getByRole("button", { name: "Accept", exact: true }).first().click();
+  await expect(memberReview.getByText("Team instructions", { exact: true })).toHaveCount(
+    0,
+  );
+  expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
+  expect(errors).toEqual([]);
   await page.goto(`${baseURL}/fixtures/?logos`);
   await expect(page.getByText("Dark logo fixture")).toBeVisible();
   await page.evaluate(() => document.fonts.ready);

@@ -837,3 +837,44 @@ describe("Teams member review", () => {
     expect(onRegistryChange).not.toHaveBeenCalled();
   });
 });
+
+it("shows a 202 proposal with an Open action instead of a webview link", async () => {
+  vi.clearAllMocks();
+  const preview = {
+    baseVersion: 7,
+    localFingerprint: "hash",
+    added: ["Personal GitHub"],
+    changed: [],
+    removed: [],
+    definitions: [],
+    selections: [],
+  };
+  api.teamPushPreview.mockResolvedValue(preview);
+  api.teamPush.mockResolvedValue({
+    version: 7,
+    published: false,
+    localSetupError: null,
+    handoffs: [],
+    summary: "Sent for confirmation",
+    proposal: {
+      id: "p",
+      baseVersion: 7,
+      confirmUrl: "https://teams.toolport.app/#changes=t/p",
+    },
+  });
+  api.getRegistry.mockResolvedValue(registry);
+  invoke.mockResolvedValue(undefined);
+  render(<TeamsView registry={registry} onRegistryChange={vi.fn()} />);
+  if (!(screen.getByRole("checkbox") as HTMLInputElement).checked)
+    await userEvent.click(screen.getByRole("checkbox"));
+  await userEvent.click(screen.getByRole("button", { name: "Share selected servers" }));
+  await screen.findByRole("dialog");
+  await userEvent.click(screen.getByRole("button", { name: "Share selected" }));
+  expect(await screen.findByText("Sent for confirmation")).toBeVisible();
+  const open = screen.getByRole("button", { name: "Open confirmation" });
+  expect(screen.queryByRole("link", { name: "Open confirmation" })).toBeNull();
+  await userEvent.click(open);
+  expect(invoke).toHaveBeenCalledWith("team_open_confirmation", {
+    url: "https://teams.toolport.app/#changes=t/p",
+  });
+});

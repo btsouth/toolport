@@ -411,7 +411,11 @@ fn push_body(config: &Value, base_version: i64) -> Value {
 }
 
 fn push_status_message(status: u16) -> Option<&'static str> {
-    match status { 409 => Some(STALE_PUSH_MESSAGE), 403 => Some("Finish this in the Teams dashboard"), _ => None }
+    match status {
+        409 => Some(STALE_PUSH_MESSAGE),
+        403 => Some("Finish this in the Teams dashboard"),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -711,15 +715,20 @@ pub enum PushOutcome {
 }
 
 impl From<i64> for PushOutcome {
-    fn from(version: i64) -> Self { Self::Published(version) }
+    fn from(version: i64) -> Self {
+        Self::Published(version)
+    }
 }
 
 pub fn validate_confirmation_url(server_url: &str, confirm_url: &str) -> Result<(), String> {
     let server = url::Url::parse(server_url).map_err(|_| "Invalid Teams service URL")?;
     let confirm = url::Url::parse(confirm_url).map_err(|_| "Invalid confirmation URL")?;
-    if confirm.scheme() != "https" || confirm.host_str() != server.host_str()
+    if confirm.scheme() != "https"
+        || confirm.host_str() != server.host_str()
         || confirm.port_or_known_default() != server.port_or_known_default()
-        || !confirm.username().is_empty() || confirm.password().is_some() {
+        || !confirm.username().is_empty()
+        || confirm.password().is_some()
+    {
         return Err("Confirmation must open on the HTTPS Teams service host.".into());
     }
     Ok(())
@@ -742,7 +751,9 @@ fn parse_push_response(server_url: &str, status: u16, value: Value) -> Result<Pu
         validate_confirmation_url(server_url, &proposal.confirm_url)?;
         return Ok(PushOutcome::Confirmation(proposal));
     }
-    value["version"].as_i64().map(PushOutcome::Published)
+    value["version"]
+        .as_i64()
+        .map(PushOutcome::Published)
         .ok_or_else(|| "team server did not return a version after push".to_string())
 }
 
@@ -867,14 +878,28 @@ pub fn parse_pair_link(raw: &str) -> Option<(String, String)> {
     Some((u.origin().ascii_serialization(), team))
 }
 fn device_name() -> Option<String> {
-    std::env::var("COMPUTERNAME").ok().or_else(|| std::env::var("HOSTNAME").ok())
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string()))
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
 }
 
-fn pairing_body(team: &str, challenge: &str, device_name: Option<&str>, os: &str, app_version: &str) -> Value {
+fn pairing_body(
+    team: &str,
+    challenge: &str,
+    device_name: Option<&str>,
+    os: &str,
+    app_version: &str,
+) -> Value {
     let truncate = |value: &str| value.chars().take(128).collect::<String>();
     let mut body = json!({"teamId":team, "challenge":challenge, "os":truncate(os), "appVersion":truncate(app_version)});
-    if let Some(name) = device_name { body["deviceName"] = json!(truncate(name)); }
+    if let Some(name) = device_name {
+        body["deviceName"] = json!(truncate(name));
+    }
     body
 }
 
@@ -902,7 +927,13 @@ pub fn pair_device(
     let challenge = crate::registry::sha256_hex(&verifier);
     let response = agent(origin)
         .post(&format!("{}/pairing/start", base(origin)))
-        .send_json(pairing_body(team, &challenge, device_name().as_deref(), std::env::consts::OS, env!("CARGO_PKG_VERSION")))
+        .send_json(pairing_body(
+            team,
+            &challenge,
+            device_name().as_deref(),
+            std::env::consts::OS,
+            env!("CARGO_PKG_VERSION"),
+        ))
         .map_err(stringify)?;
     let data: Value = require_no_redirect(response)?
         .into_json()
@@ -1040,7 +1071,9 @@ fn finish_connect(
         conn.account_linked = account_linked;
     }
     let labels = match pulled.as_ref() {
-        Some((version, _, _)) => fetch_change_labels(&conn, &joined.member_token, 0, *version).unwrap_or_default(),
+        Some((version, _, _)) => {
+            fetch_change_labels(&conn, &joined.member_token, 0, *version).unwrap_or_default()
+        }
         None => vec![],
     };
     // Load-modify-save the fresh registry under the cross-process lock, so a concurrent write
@@ -1163,7 +1196,9 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
 
     let since = member_review(&crate::registry::load()?)?.accepted_version;
     let labels = match pulled.as_ref() {
-        Some((version, _, _)) => fetch_change_labels(&conn, &token, since, *version).unwrap_or_default(),
+        Some((version, _, _)) => {
+            fetch_change_labels(&conn, &token, since, *version).unwrap_or_default()
+        }
         None => vec![],
     };
     // Re-load a FRESH registry now, AFTER the (possibly multi-second) network round
@@ -1226,9 +1261,13 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
     };
     // Only accepted instructions can be written or relocated after a sync.
     let accepted = member_review(&crate::registry::load()?)?;
-    check_state(if let Some(content) = accepted.accepted.get("instructions") {
-        apply_instructions(&conn.team_id, accepted.version, content.as_str())
-    } else { relocate_stored_instructions(&conn.team_id) });
+    check_state(
+        if let Some(content) = accepted.accepted.get("instructions") {
+            apply_instructions(&conn.team_id, accepted.version, content.as_str())
+        } else {
+            relocate_stored_instructions(&conn.team_id)
+        },
+    );
     // Best-effort showback after the config work: report today's/yesterday's per-server
     // usage rollup to the team server. Network failures retry next cycle;
     // local state-save failures must be visible after the config was applied.
@@ -2286,7 +2325,9 @@ pub fn use_managed_server(managed_id: &str) -> Result<Registry, String> {
 }
 
 fn apply_use_managed(reg: &mut Registry, managed_id: &str, profile: &str) -> Result<(), String> {
-    if server_change_held(reg, managed_id) { return Err("Review this change in Teams before using it.".into()); }
+    if server_change_held(reg, managed_id) {
+        return Err("Review this change in Teams before using it.".into());
+    }
     let team = reg.team.as_ref().ok_or("not connected to a team")?;
     let personal_id = team
         .managed_server_ids
@@ -2388,10 +2429,16 @@ impl PublishResult {
     pub fn whole_set(outcome: impl Into<PushOutcome>) -> Self {
         let version = match outcome.into() {
             PushOutcome::Published(version) => version,
-            PushOutcome::Confirmation(proposal) => return Self {
-                version: proposal.base_version, published: false, local_setup_error: None,
-                handoffs: vec![], summary: "Sent for confirmation".into(), proposal: Some(proposal),
-            },
+            PushOutcome::Confirmation(proposal) => {
+                return Self {
+                    version: proposal.base_version,
+                    published: false,
+                    local_setup_error: None,
+                    handoffs: vec![],
+                    summary: "Sent for confirmation".into(),
+                    proposal: Some(proposal),
+                }
+            }
         };
         Self {
             version,
@@ -2907,16 +2954,22 @@ pub struct MemberChangeField {
 }
 
 pub fn member_review(reg: &Registry) -> Result<MemberReview, String> {
-    match reg.team.as_ref().and_then(|t| t.unknown_fields.get(MEMBER_REVIEW_FIELD)) {
-        Some(value) => serde_json::from_value(value.clone())
-            .map_err(|_| "Team review state could not be read. Reconnect before accepting changes.".into()),
+    match reg
+        .team
+        .as_ref()
+        .and_then(|t| t.unknown_fields.get(MEMBER_REVIEW_FIELD))
+    {
+        Some(value) => serde_json::from_value(value.clone()).map_err(|_| {
+            "Team review state could not be read. Reconnect before accepting changes.".into()
+        }),
         None => Ok(MemberReview::default()),
     }
 }
 
 fn save_member_review(reg: &mut Registry, review: &MemberReview) {
     if let Some(team) = &mut reg.team {
-        team.unknown_fields.insert(MEMBER_REVIEW_FIELD.into(), json!(review));
+        team.unknown_fields
+            .insert(MEMBER_REVIEW_FIELD.into(), json!(review));
     }
 }
 
@@ -2932,13 +2985,28 @@ fn review_items(config: &Value) -> BTreeMap<String, Value> {
             }
         }
     }
-    items.insert("instructions".into(), desired_instructions(config).map_or(Value::Null, |s| json!(s)));
-    items.insert("policy".into(), json!({
-        "denyDestructive": config["denyDestructive"].as_bool().unwrap_or(false),
-        "screeningPolicy": config.get("screeningPolicy").cloned().unwrap_or(json!({})),
-        "rateLimits": config.get("rateLimits").cloned().unwrap_or(json!([])),
-    }));
-    items.insert("callAuditExport".into(), json!(config["callAuditExport"].as_bool().unwrap_or(false)));
+    items.insert(
+        "instructions".into(),
+        desired_instructions(config).map_or(Value::Null, |s| json!(s)),
+    );
+    let screening = config.get("screeningPolicy").cloned().unwrap_or(json!({}));
+    let screening = if screening.is_object() {
+        screening
+    } else {
+        json!({"minSafetyLevel":"strict"})
+    };
+    items.insert(
+        "policy".into(),
+        json!({
+            "denyDestructive": config["denyDestructive"].as_bool().unwrap_or(false),
+            "screeningPolicy": screening,
+            "rateLimits": config.get("rateLimits").cloned().unwrap_or(json!([])),
+        }),
+    );
+    items.insert(
+        "callAuditExport".into(),
+        json!(config["callAuditExport"].as_bool().unwrap_or(false)),
+    );
     items
 }
 
@@ -2977,19 +3045,38 @@ fn current_policy(reg: &Registry) -> Value {
 
 fn immediate_floors(policy: &mut Value, incoming: &Value, current: &Value) {
     policy["screeningPolicy"]["minSafetyLevel"] = json!(floor(incoming).max(floor(current)));
-    for key in ["forceHumanApproval", "forceContentDefense", "forceQuarantineOnDrift", "forceBlockOnInjection", "forcePiiRedaction"] {
-        policy["screeningPolicy"][key] = json!(incoming["screeningPolicy"][key] == true || current["screeningPolicy"][key] == true);
+    for key in [
+        "forceHumanApproval",
+        "forceContentDefense",
+        "forceQuarantineOnDrift",
+        "forceBlockOnInjection",
+        "forcePiiRedaction",
+    ] {
+        policy["screeningPolicy"][key] = json!(
+            incoming["screeningPolicy"][key] == true || current["screeningPolicy"][key] == true
+        );
     }
-    policy["denyDestructive"] = json!(incoming["denyDestructive"] == true || current["denyDestructive"] == true);
+    policy["denyDestructive"] =
+        json!(incoming["denyDestructive"] == true || current["denyDestructive"] == true);
 }
 
 fn diff_fields(before: &Value, after: &Value, prefix: &str, fields: &mut Vec<MemberChangeField>) {
-    if before == after { return; }
+    if before == after {
+        return;
+    }
     if before.is_object() || after.is_object() {
-        let keys: std::collections::BTreeSet<_> = before.as_object().into_iter().flat_map(|o| o.keys())
-            .chain(after.as_object().into_iter().flat_map(|o| o.keys())).collect();
+        let keys: std::collections::BTreeSet<_> = before
+            .as_object()
+            .into_iter()
+            .flat_map(|o| o.keys())
+            .chain(after.as_object().into_iter().flat_map(|o| o.keys()))
+            .collect();
         for key in keys {
-            let path = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
             diff_fields(&before[key], &after[key], &path, fields);
         }
     } else {
@@ -2998,19 +3085,76 @@ fn diff_fields(before: &Value, after: &Value, prefix: &str, fields: &mut Vec<Mem
             Value::String(s) => s.clone(),
             _ => serde_json::to_string_pretty(value).unwrap_or_default(),
         };
-        fields.push(MemberChangeField { field: if prefix.is_empty() { "Content".into() } else { prefix.into() }, before: text(before), after: text(after) });
+        fields.push(MemberChangeField {
+            field: if prefix.is_empty() {
+                "Content".into()
+            } else {
+                prefix.into()
+            },
+            before: text(before),
+            after: text(after),
+        });
     }
 }
 
 fn display_server(value: &Value) -> Value {
-    if value.is_null() { return Value::Null; }
-    let preview = share_definition_preview("", value, "");
-    let mut display = json!({"name": value["name"], "transport": value["transport"]});
-    for field in preview.fields { display[&field.label] = json!(field.value); }
-    for key in ["allowedTools", "disabledTools", "requestTimeoutMs", "initializeTimeoutMs"] {
-        if let Some(value) = value.get(key) { display[key] = value.clone(); }
+    if value.is_null() {
+        return Value::Null;
     }
-    display
+    let mut display = serde_json::Map::new();
+    for key in [
+        "id",
+        "name",
+        "transport",
+        "command",
+        "args",
+        "cwd",
+        "launch",
+        "url",
+        "env",
+        "headerKeys",
+        "allowedTools",
+        "disabledTools",
+        "clientCredentials",
+        "requestTimeoutMs",
+        "initializeTimeoutMs",
+    ] {
+        if let Some(field) = value.get(key) {
+            display.insert(key.into(), stored_definition(field));
+        }
+    }
+    if let Some(args) = value["args"].as_array() {
+        let args: Vec<String> = args
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        display.insert(
+            "args".into(),
+            json!(args
+                .iter()
+                .zip(crate::registry::secret_arg_mask(&args))
+                .map(|(arg, secret)| if secret { "<redacted>" } else { arg.as_str() })
+                .collect::<Vec<_>>()),
+        );
+    }
+    if let Some(endpoint) = value["url"].as_str() {
+        display.insert("url".into(), json!(preview_endpoint(endpoint)));
+    }
+    if let Some(credentials) = value.get("clientCredentials").filter(|v| !v.is_null()) {
+        if let Ok(mut credentials) =
+            serde_json::from_value::<crate::registry::ClientCredentials>(credentials.clone())
+        {
+            credentials.strip_secret_fields();
+            display.insert("clientCredentials".into(), json!(credentials));
+        } else {
+            display.insert(
+                "clientCredentials".into(),
+                json!("Invalid authentication definition"),
+            );
+        }
+    }
+    Value::Object(display)
 }
 
 fn change_labels(key: &str, changes: &[Value]) -> Vec<Value> {
@@ -3024,21 +3168,47 @@ fn change_labels(key: &str, changes: &[Value]) -> Vec<Value> {
 /// Metadata is useful only when it covers the entire interval since member consent.
 /// Missing version/baseVersion or a capped history yields an unlabelled full diff.
 fn covered_changes(data: Value, since: i64, version: i64) -> Vec<Value> {
-    let Some(changes) = data["changes"].as_array() else { return vec![]; };
+    let Some(changes) = data["changes"].as_array() else {
+        return vec![];
+    };
     let mut expected = version;
     for change in changes {
-        if change["version"].as_i64() != Some(expected) { return vec![]; }
-        let Some(base) = change["baseVersion"].as_i64() else { return vec![]; };
-        if base >= expected { return vec![]; }
+        if change["version"].as_i64() != Some(expected) {
+            return vec![];
+        }
+        let Some(base) = change["baseVersion"].as_i64() else {
+            return vec![];
+        };
+        if base >= expected {
+            return vec![];
+        }
         expected = base;
-        if expected <= since { return changes.iter().take_while(|c| c["version"].as_i64().unwrap_or(0) > since).cloned().collect(); }
+        if expected <= since {
+            return changes
+                .iter()
+                .take_while(|c| c["version"].as_i64().unwrap_or(0) > since)
+                .cloned()
+                .collect();
+        }
     }
     vec![]
 }
 
-fn fetch_change_labels(conn: &TeamConnection, token: &str, since: i64, version: i64) -> Result<Vec<Value>, String> {
-    let response = match agent(&conn.server_url).get(&format!("{}/teams/{}/config/changes?since={since}", base(&conn.server_url), conn.team_id))
-        .set("authorization", &format!("Bearer {token}")).call() {
+fn fetch_change_labels(
+    conn: &TeamConnection,
+    token: &str,
+    since: i64,
+    version: i64,
+) -> Result<Vec<Value>, String> {
+    let response = match agent(&conn.server_url)
+        .get(&format!(
+            "{}/teams/{}/config/changes?since={since}",
+            base(&conn.server_url),
+            conn.team_id
+        ))
+        .set("authorization", &format!("Bearer {token}"))
+        .call()
+    {
         Ok(response) => require_no_redirect(response)?,
         Err(ureq::Error::Status(404, _)) => return Ok(vec![]),
         Err(error) => return Err(stringify(error)),
@@ -3049,112 +3219,259 @@ fn fetch_change_labels(conn: &TeamConnection, token: &str, since: i64, version: 
 
 /// Stage every changed control-plane item. Definitions use the existing review gate;
 /// instructions, policy and export use the same queue and member decision.
-pub fn stage_team_config(reg: &mut Registry, team_id: &str, config: &Value, version: i64, labels: &[Value]) -> Result<MergeOutcome, String> {
+pub fn stage_team_config(
+    reg: &mut Registry,
+    team_id: &str,
+    config: &Value,
+    version: i64,
+    labels: &[Value],
+) -> Result<MergeOutcome, String> {
     let mut review = member_review(reg)?;
     if review.accepted.is_empty() {
         review.accepted = review_items(&json!({"servers":[]}));
-        if let Some(content) = reg.team.as_ref().and_then(|t| t.team_instructions_content.as_ref()) {
-            review.accepted.insert("instructions".into(), json!(content));
+        if let Some(content) = reg
+            .team
+            .as_ref()
+            .and_then(|t| t.team_instructions_content.as_ref())
+        {
+            review
+                .accepted
+                .insert("instructions".into(), json!(content));
         }
     }
     review.latest = review_items(config);
     // Stopping export revokes prior consent. A later re-enable is a new review.
     if review.latest.get("callAuditExport") == Some(&json!(false)) {
-        review.accepted.insert("callAuditExport".into(), json!(false));
+        review
+            .accepted
+            .insert("callAuditExport".into(), json!(false));
     }
     review.version = version;
     review.pending.clear();
-    let keys: std::collections::BTreeSet<String> = review.latest.keys().chain(review.accepted.keys()).cloned().collect();
+    let keys: std::collections::BTreeSet<String> = review
+        .latest
+        .keys()
+        .chain(review.accepted.keys())
+        .cloned()
+        .collect();
     for key in keys {
         let before = review.accepted.get(&key).cloned().unwrap_or(Value::Null);
         let after = review.latest.get(&key).cloned().unwrap_or(Value::Null);
-        if before == after || (before.is_null() && (after == false || (key == "policy" && after == json!({"denyDestructive":false,"screeningPolicy":{},"rateLimits":[]})))) { continue; }
+        if before == after
+            || (before.is_null()
+                && (after == false
+                    || (key == "policy"
+                        && after
+                            == json!({"denyDestructive":false,"screeningPolicy":{},"rateLimits":[]}))))
+        {
+            continue;
+        }
         let hash = item_hash(&key, &after);
-        if review.rejected.get(&key).is_some_and(|hashes| hashes.contains(&hash)) { continue; }
+        if review
+            .rejected
+            .get(&key)
+            .is_some_and(|hashes| hashes.contains(&hash))
+        {
+            continue;
+        }
         let title = if key.starts_with("server:") {
-            format!("Server: {}", after["name"].as_str().or(before["name"].as_str()).unwrap_or(&key[7..]))
-        } else { match key.as_str() { "instructions" => "Team instructions", "policy" => "Team policy", _ => "Call-log export" }.into() };
-        let (a, b) = if key.starts_with("server:") { (display_server(&before), display_server(&after)) } else { (before.clone(), after.clone()) };
+            format!(
+                "Server: {}",
+                after["name"]
+                    .as_str()
+                    .or(before["name"].as_str())
+                    .unwrap_or(&key[7..])
+            )
+        } else {
+            match key.as_str() {
+                "instructions" => "Team instructions",
+                "policy" => "Team policy",
+                _ => "Call-log export",
+            }
+            .into()
+        };
+        let (a, b) = if key.starts_with("server:") {
+            (display_server(&before), display_server(&after))
+        } else {
+            (before.clone(), after.clone())
+        };
         let mut fields = Vec::new();
         diff_fields(&a, &b, "", &mut fields);
-        review.pending.insert(key.clone(), MemberChange { key: key.clone(), title, hash, fields, labels: change_labels(&key, labels), before, after });
+        review.pending.insert(
+            key.clone(),
+            MemberChange {
+                key: key.clone(),
+                title,
+                hash,
+                fields,
+                labels: change_labels(&key, labels),
+                before,
+                after,
+            },
+        );
     }
     let outcome = apply_review_state(reg, team_id, &review, true)?;
-    if review.latest == review.accepted { review.accepted_version = version; }
+    if review.latest == review.accepted {
+        review.accepted_version = version;
+    }
     save_member_review(reg, &review);
     Ok(outcome)
 }
 
-fn apply_review_state(reg: &mut Registry, team_id: &str, review: &MemberReview, tighten: bool) -> Result<MergeOutcome, String> {
-    let mut policy = review.accepted.get("policy").cloned().unwrap_or(json!({"denyDestructive":false,"screeningPolicy":{},"rateLimits":[]}));
-    if tighten { immediate_floors(&mut policy, review.latest.get("policy").unwrap_or(&Value::Null), &current_policy(reg)); }
+fn apply_review_state(
+    reg: &mut Registry,
+    team_id: &str,
+    review: &MemberReview,
+    tighten: bool,
+) -> Result<MergeOutcome, String> {
+    let mut policy = review
+        .accepted
+        .get("policy")
+        .cloned()
+        .unwrap_or(json!({"denyDestructive":false,"screeningPolicy":{},"rateLimits":[]}));
+    if tighten {
+        immediate_floors(
+            &mut policy,
+            review.latest.get("policy").unwrap_or(&Value::Null),
+            &current_policy(reg),
+        );
+    }
     policy["screeningPolicy"]["minSafetyLevel"] = json!(floor(&policy));
     let mut effective = policy;
-    effective["callAuditExport"] = review.accepted.get("callAuditExport").cloned().unwrap_or(json!(false));
+    effective["callAuditExport"] = review
+        .accepted
+        .get("callAuditExport")
+        .cloned()
+        .unwrap_or(json!(false));
     // Export can stop immediately; re-enabling always requires a new decision.
-    if review.latest.get("callAuditExport") == Some(&json!(false)) { effective["callAuditExport"] = json!(false); }
-    let keys: std::collections::BTreeSet<_> = review.latest.keys().chain(review.accepted.keys()).filter(|k| k.starts_with("server:")).collect();
+    if review.latest.get("callAuditExport") == Some(&json!(false)) {
+        effective["callAuditExport"] = json!(false);
+    }
+    let keys: std::collections::BTreeSet<_> = review
+        .latest
+        .keys()
+        .chain(review.accepted.keys())
+        .filter(|k| k.starts_with("server:"))
+        .collect();
     let mut held = HashSet::new();
-    let servers: Vec<Value> = keys.into_iter().filter_map(|key| {
-        let accepted = review.accepted.get(key).cloned().unwrap_or(Value::Null);
-        let latest = review.latest.get(key).cloned().unwrap_or(Value::Null);
-        if accepted != latest { held.insert(key[7..].to_string()); }
-        // A removed definition stays visible and off until its removal is accepted.
-        let definition = if latest.is_null() { accepted } else { latest };
-        (!definition.is_null()).then_some(definition)
-    }).collect();
+    let servers: Vec<Value> = keys
+        .into_iter()
+        .filter_map(|key| {
+            let accepted = review.accepted.get(key).cloned().unwrap_or(Value::Null);
+            let latest = review.latest.get(key).cloned().unwrap_or(Value::Null);
+            if accepted != latest {
+                held.insert(key[7..].to_string());
+            }
+            // A removed definition stays visible and off until its removal is accepted.
+            let definition = if latest.is_null() { accepted } else { latest };
+            (!definition.is_null()).then_some(definition)
+        })
+        .collect();
     effective["servers"] = json!(servers);
     let mut outcome = apply_team_config(reg, team_id, &effective);
-    for server in reg.servers.iter_mut().filter(|s| s.source.as_deref() == Some(&tag_for(team_id))) {
+    for server in reg
+        .servers
+        .iter_mut()
+        .filter(|s| s.source.as_deref() == Some(&tag_for(team_id)))
+    {
         if saved_team_original_id(server).is_some_and(|id| held.contains(id)) {
             server.require_team_enable_review();
-            server.unknown_fields.insert(HELD_CHANGE_FIELD.into(), json!(true));
+            server
+                .unknown_fields
+                .insert(HELD_CHANGE_FIELD.into(), json!(true));
             server.enabled = false;
-            for profile in &mut reg.profiles { profile.enabled_server_ids.retain(|id| id != &server.id); }
-        } else { server.unknown_fields.remove(HELD_CHANGE_FIELD); }
+            for profile in &mut reg.profiles {
+                profile.enabled_server_ids.retain(|id| id != &server.id);
+            }
+        } else {
+            server.unknown_fields.remove(HELD_CHANGE_FIELD);
+        }
     }
     outcome.review = review.pending.len();
     Ok(outcome)
 }
 
 pub fn server_change_held(reg: &Registry, server_id: &str) -> bool {
-    reg.servers.iter().any(|s| s.id == server_id && s.unknown_fields.get(HELD_CHANGE_FIELD) == Some(&json!(true)))
+    reg.servers
+        .iter()
+        .any(|s| s.id == server_id && s.unknown_fields.get(HELD_CHANGE_FIELD) == Some(&json!(true)))
 }
 
-fn decide_member_change(reg: &mut Registry, key: &str, hash: &str, accept: bool) -> Result<(), String> {
-    let team_id = reg.team.as_ref().ok_or("not connected to a team")?.team_id.clone();
+fn decide_member_change(
+    reg: &mut Registry,
+    key: &str,
+    hash: &str,
+    accept: bool,
+) -> Result<(), String> {
+    let team_id = reg
+        .team
+        .as_ref()
+        .ok_or("not connected to a team")?
+        .team_id
+        .clone();
     let mut review = member_review(reg)?;
-    let change = review.pending.get(key).ok_or("This change is no longer pending. Review the current queue.")?.clone();
-    if change.hash != hash || item_hash(key, review.latest.get(key).unwrap_or(&Value::Null)) != hash {
+    let change = review
+        .pending
+        .get(key)
+        .ok_or("This change is no longer pending. Review the current queue.")?
+        .clone();
+    if change.hash != hash || item_hash(key, review.latest.get(key).unwrap_or(&Value::Null)) != hash
+    {
         return Err("The team change was updated. Review its new content before accepting.".into());
     }
     if accept {
-        if change.after.is_null() && key.starts_with("server:") { review.accepted.remove(key); } else { review.accepted.insert(key.into(), change.after); }
-    } else { review.rejected.entry(key.into()).or_default().push(hash.into()); }
+        if change.after.is_null() && key.starts_with("server:") {
+            review.accepted.remove(key);
+        } else {
+            review.accepted.insert(key.into(), change.after);
+        }
+    } else {
+        review
+            .rejected
+            .entry(key.into())
+            .or_default()
+            .push(hash.into());
+    }
     review.pending.remove(key);
     // Accepting another item must never release a safety floor still awaiting review.
     apply_review_state(reg, &team_id, &review, !(accept && key == "policy"))?;
     if accept {
         if let Some(original) = key.strip_prefix("server:") {
-            if let Some(id) = reg.servers.iter().find(|s| saved_team_original_id(s) == Some(original) && s.source.as_deref() == Some(&tag_for(&team_id))).map(|s| s.id.clone()) {
+            if let Some(id) = reg
+                .servers
+                .iter()
+                .find(|s| {
+                    saved_team_original_id(s) == Some(original)
+                        && s.source.as_deref() == Some(&tag_for(&team_id))
+                })
+                .map(|s| s.id.clone())
+            {
                 let profile = reg.active_profile_id();
                 crate::registry_controller::apply_server_enabled(reg, &profile, &id, true, true)?;
             }
         }
     }
-    if review.latest == review.accepted { review.accepted_version = review.version; }
+    if review.latest == review.accepted {
+        review.accepted_version = review.version;
+    }
     save_member_review(reg, &review);
     Ok(())
 }
 
 pub fn review_team_change(key: &str, hash: &str, accept: bool) -> Result<Registry, String> {
-    let _sync = SYNC_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _sync = SYNC_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (reg, ()) = crate::registry::update(|reg| decide_member_change(reg, key, hash, accept))?;
     if accept && key == "instructions" {
         let review = member_review(&reg)?;
         let team = reg.team.as_ref().ok_or("not connected to a team")?;
-        apply_instructions(&team.team_id, review.version, review.accepted.get("instructions").and_then(Value::as_str))
-            .map_err(|e| format!("Instructions accepted, but local setup needs attention: {e}"))?;
+        apply_instructions(
+            &team.team_id,
+            review.version,
+            review.accepted.get("instructions").and_then(Value::as_str),
+        )
+        .map_err(|e| format!("Instructions accepted, but local setup needs attention: {e}"))?;
     }
     crate::registry::load()
 }
@@ -7751,14 +8068,22 @@ mod member_review_tests {
             assert!(server.needs_team_enable_review());
             assert!(server.check_enable_allowed(false).is_err());
         }
-        assert!(reg.team.as_ref().unwrap().team_instructions_content.is_none());
+        assert!(reg
+            .team
+            .as_ref()
+            .unwrap()
+            .team_instructions_content
+            .is_none());
         assert!(!reg.team.as_ref().unwrap().call_audit_export);
         assert!(reg.team.as_ref().unwrap().rate_limits.is_empty());
         // The required safety floor still takes effect before consent.
         assert_eq!(reg.team_min_safety_level, crate::registry::SafetyLevel::Ask);
         let id = reg.servers[0].id.clone();
         let profile = reg.active_profile_id();
-        assert!(crate::registry_controller::apply_server_enabled(&mut reg, &profile, &id, true, true).is_err());
+        assert!(crate::registry_controller::apply_server_enabled(
+            &mut reg, &profile, &id, true, true
+        )
+        .is_err());
         reg.set_all_enabled(&profile, true).unwrap();
         assert!(reg.servers.iter().all(|s| !reg.is_enabled(&profile, &s.id)));
     }
@@ -7785,7 +8110,10 @@ mod member_review_tests {
         assert!(pending.contains_key("policy"));
         assert!(!pending.contains_key("callAuditExport"));
         stage_team_config(&mut reg, "review-team", &first, 4, &[]).unwrap();
-        assert!(!member_review(&reg).unwrap().pending.contains_key("server:stdio"));
+        assert!(!member_review(&reg)
+            .unwrap()
+            .pending
+            .contains_key("server:stdio"));
         assert!(reg.servers.iter().all(|s| !s.enabled));
         assert!(!reg.team.as_ref().unwrap().call_audit_export);
     }
@@ -7794,19 +8122,30 @@ mod member_review_tests {
     fn member_review_stale_accept_cannot_accept_a_later_definition() {
         let mut reg = registry();
         stage_team_config(&mut reg, "review-team", &config("first"), 1, &[]).unwrap();
-        let hash = member_review(&reg).unwrap().pending["server:stdio"].hash.clone();
+        let hash = member_review(&reg).unwrap().pending["server:stdio"]
+            .hash
+            .clone();
         stage_team_config(&mut reg, "review-team", &config("changed"), 2, &[]).unwrap();
         let before = serde_json::to_value(&reg).unwrap();
-        assert!(decide_member_change(&mut reg, "server:stdio", &hash, true).unwrap_err().contains("updated"));
+        assert!(decide_member_change(&mut reg, "server:stdio", &hash, true)
+            .unwrap_err()
+            .contains("updated"));
         assert_eq!(serde_json::to_value(&reg).unwrap(), before);
         decide(&mut reg, "server:stdio", true);
-        let server = reg.servers.iter().find(|s| saved_team_original_id(s) == Some("stdio")).unwrap();
+        let server = reg
+            .servers
+            .iter()
+            .find(|s| saved_team_original_id(s) == Some("stdio"))
+            .unwrap();
         assert_eq!(server.command.as_deref(), Some("changed"));
         assert!(server.enabled);
         assert!(reg.is_enabled(&reg.active_profile_id(), &server.id));
         assert!(!server_change_held(&reg, &server.id));
         stage_team_config(&mut reg, "review-team", &config("changed"), 3, &[]).unwrap();
-        assert!(!member_review(&reg).unwrap().pending.contains_key("server:stdio"));
+        assert!(!member_review(&reg)
+            .unwrap()
+            .pending
+            .contains_key("server:stdio"));
     }
 
     #[test]
@@ -7817,14 +8156,26 @@ mod member_review_tests {
         decide(&mut reg, "server:remote", true);
         cfg["servers"][1]["url"] = json!("https://1.2.3.5/mcp");
         stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
-        assert!(member_review(&reg).unwrap().pending["server:remote"].fields.iter().any(|f| f.before.contains("1.2.3.4") && f.after.contains("1.2.3.5")));
+        assert!(member_review(&reg).unwrap().pending["server:remote"]
+            .fields
+            .iter()
+            .any(|f| f.before.contains("1.2.3.4") && f.after.contains("1.2.3.5")));
         assert!(reg.servers.iter().all(|s| !s.enabled));
         cfg["servers"] = json!([]);
         stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
-        assert!(member_review(&reg).unwrap().pending.contains_key("server:remote"));
-        assert!(reg.servers.iter().any(|s| saved_team_original_id(s) == Some("remote")));
+        assert!(member_review(&reg)
+            .unwrap()
+            .pending
+            .contains_key("server:remote"));
+        assert!(reg
+            .servers
+            .iter()
+            .any(|s| saved_team_original_id(s) == Some("remote")));
         decide(&mut reg, "server:remote", true);
-        assert!(!reg.servers.iter().any(|s| saved_team_original_id(s) == Some("remote")));
+        assert!(!reg
+            .servers
+            .iter()
+            .any(|s| saved_team_original_id(s) == Some("remote")));
     }
 
     #[test]
@@ -7865,15 +8216,54 @@ mod member_review_tests {
         cfg["callAuditExport"] = json!(true);
         stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
         assert!(!reg.team.as_ref().unwrap().call_audit_export);
-        assert!(member_review(&reg).unwrap().pending.contains_key("callAuditExport"));
+        assert!(member_review(&reg)
+            .unwrap()
+            .pending
+            .contains_key("callAuditExport"));
+    }
+
+    #[test]
+    fn member_review_malformed_floor_fails_closed() {
+        let mut reg = registry();
+        for screening in [json!("invalid"), json!({"minSafetyLevel":"invalid"})] {
+            stage_team_config(
+                &mut reg,
+                "review-team",
+                &json!({"servers":[], "screeningPolicy":screening}),
+                1,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                reg.team_min_safety_level,
+                crate::registry::SafetyLevel::Strict
+            );
+            decide(&mut reg, "policy", true);
+            assert_eq!(
+                reg.team_min_safety_level,
+                crate::registry::SafetyLevel::Strict
+            );
+        }
     }
 
     #[test]
     fn member_review_hash_is_full_content_and_stable_for_object_key_order() {
-        assert_eq!(item_hash("server:s", &json!({"a":1,"b":2})), item_hash("server:s", &json!({"b":2,"a":1})));
-        assert_ne!(item_hash("server:s", &json!({"a":1})), item_hash("server:s", &json!({"a":2})));
-        assert_ne!(item_hash("server:s", &json!({"args":["a","b"]})), item_hash("server:s", &json!({"args":["b","a"]})));
-        assert_ne!(item_hash("server:s", &json!({})), item_hash("server:t", &json!({})));
+        assert_eq!(
+            item_hash("server:s", &json!({"a":1,"b":2})),
+            item_hash("server:s", &json!({"b":2,"a":1}))
+        );
+        assert_ne!(
+            item_hash("server:s", &json!({"a":1})),
+            item_hash("server:s", &json!({"a":2}))
+        );
+        assert_ne!(
+            item_hash("server:s", &json!({"args":["a","b"]})),
+            item_hash("server:s", &json!({"args":["b","a"]}))
+        );
+        assert_ne!(
+            item_hash("server:s", &json!({})),
+            item_hash("server:t", &json!({}))
+        );
     }
 
     #[test]
@@ -7885,7 +8275,10 @@ mod member_review_tests {
         assert_eq!(covered_changes(changes.clone(), 9, 12).len(), 2);
         assert!(covered_changes(changes.clone(), 8, 12).is_empty());
         let mut missing = changes.clone();
-        missing["changes"][0].as_object_mut().unwrap().remove("baseVersion");
+        missing["changes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("baseVersion");
         assert!(covered_changes(missing, 9, 12).is_empty());
         let labels = change_labels("server:stdio", &covered_changes(changes, 9, 12));
         assert_eq!(labels[0]["author"]["name"], "Alice");
@@ -7893,15 +8286,28 @@ mod member_review_tests {
         assert_eq!(labels[0]["via"], "dashboard");
     }
 
-    fn serve(status: u16, body: Value) -> (String, std::thread::JoinHandle<(String, Value)>) {
+    fn serve(status: u16, mut body: Value) -> (String, std::thread::JoinHandle<(String, Value)>) {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let address = format!("http://{}", server.server_addr());
+        if body["proposal"]["confirmUrl"] == "<service>" {
+            body["proposal"]["confirmUrl"] = json!(format!(
+                "{}/#changes=team/p1",
+                address.replacen("http://", "https://", 1)
+            ));
+        }
         let handle = std::thread::spawn(move || {
-            let mut request = server.recv_timeout(std::time::Duration::from_secs(5)).unwrap().expect("Teams request");
+            let mut request = server
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .expect("Teams request");
             let path = request.url().to_string();
             let mut payload = String::new();
             request.as_reader().read_to_string(&mut payload).unwrap();
-            request.respond(tiny_http::Response::from_string(body.to_string()).with_status_code(status)).unwrap();
+            request
+                .respond(
+                    tiny_http::Response::from_string(body.to_string()).with_status_code(status),
+                )
+                .unwrap();
             (path, serde_json::from_str(&payload).unwrap_or(Value::Null))
         });
         (address, handle)
@@ -7912,12 +8318,30 @@ mod member_review_tests {
         let (url, server) = serve(404, json!({}));
         let mut conn = registry().team.unwrap();
         conn.server_url = url;
-        assert!(fetch_change_labels(&conn, "fixture-token", 4, 5).unwrap().is_empty());
-        assert_eq!(server.join().unwrap().0, "/teams/review-team/config/changes?since=4");
+        assert!(fetch_change_labels(&conn, "fixture-token", 4, 5)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            server.join().unwrap().0,
+            "/teams/review-team/config/changes?since=4"
+        );
         let (url, server) = serve(403, json!({"error":"device token is not an admin session"}));
-        assert_eq!(push_config(&url, "review-team", "fixture-token", &json!({"servers":[]}), 4).unwrap_err(), "Finish this in the Teams dashboard");
+        assert_eq!(
+            push_config(
+                &url,
+                "review-team",
+                "fixture-token",
+                &json!({"servers":[]}),
+                4
+            )
+            .unwrap_err(),
+            "Finish this in the Teams dashboard"
+        );
         server.join().unwrap();
-        assert_eq!(push_status_message(403), Some("Finish this in the Teams dashboard"));
+        assert_eq!(
+            push_status_message(403),
+            Some("Finish this in the Teams dashboard")
+        );
     }
 
     #[test]
@@ -7929,19 +8353,74 @@ mod member_review_tests {
         assert!(!result.published);
         assert!(result.handoffs.is_empty());
         assert_eq!(result.proposal.unwrap().base_version, 7);
-        for url in ["http://teams.toolport.app/#changes=p1", "https://evil.example/", "https://teams.toolport.app.evil.example/", "https://user@teams.toolport.app/", "file:///tmp/config", "https://teams.toolport.app:444/"] {
-            assert!(validate_confirmation_url(HOSTED_TEAMS_URL, url).is_err(), "{url}");
+        for url in [
+            "http://teams.toolport.app/#changes=p1",
+            "https://evil.example/",
+            "https://teams.toolport.app.evil.example/",
+            "https://user@teams.toolport.app/",
+            "file:///tmp/config",
+            "https://teams.toolport.app:444/",
+        ] {
+            assert!(
+                validate_confirmation_url(HOSTED_TEAMS_URL, url).is_err(),
+                "{url}"
+            );
         }
-        assert!(matches!(parse_push_response(HOSTED_TEAMS_URL, 200, json!({"version":8})).unwrap(), PushOutcome::Published(8)));
+        assert!(matches!(
+            parse_push_response(HOSTED_TEAMS_URL, 200, json!({"version":8})).unwrap(),
+            PushOutcome::Published(8)
+        ));
+    }
+
+    #[test]
+    fn member_review_pairing_start_sends_device_fields_and_push_202_is_not_an_error() {
+        let (origin, server) = serve(200, json!({"transaction":"a".repeat(64)}));
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            pair_device(&origin, "review-team", &cancel, |_, _| cancel
+                .store(true, std::sync::atomic::Ordering::SeqCst))
+            .unwrap_err(),
+            PAIRING_CANCELLED
+        );
+        let (path, body) = server.join().unwrap();
+        assert_eq!(path, "/pairing/start");
+        assert_eq!(body["os"], std::env::consts::OS);
+        assert_eq!(body["appVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["teamId"], "review-team");
+        assert_eq!(body["challenge"].as_str().unwrap().len(), 64);
+        let (origin, server) = serve(
+            202,
+            json!({"proposal":{"id":"p1", "baseVersion":3,"confirmUrl":"<service>"}}),
+        );
+        let outcome = push_config(
+            &origin,
+            "review-team",
+            "fixture-token",
+            &json!({"servers":[]}),
+            3,
+        )
+        .unwrap();
+        assert!(matches!(outcome, PushOutcome::Confirmation(_)));
+        assert_eq!(server.join().unwrap().1["base_version"], 3);
     }
 
     #[test]
     fn member_review_pairing_device_fields_are_optional_and_bounded() {
-        let body = pairing_body("t", "challenge", Some(&"界".repeat(150)), &"o".repeat(140), &"v".repeat(140));
+        let body = pairing_body(
+            "t",
+            "challenge",
+            Some(&"界".repeat(150)),
+            &"o".repeat(140),
+            &"v".repeat(140),
+        );
         assert_eq!(body["teamId"], "t");
         assert_eq!(body["challenge"], "challenge");
-        for key in ["deviceName", "os", "appVersion"] { assert_eq!(body[key].as_str().unwrap().chars().count(), 128); }
-        assert!(pairing_body("t", "c", None, "linux", "2.0").get("deviceName").is_none());
+        for key in ["deviceName", "os", "appVersion"] {
+            assert_eq!(body[key].as_str().unwrap().chars().count(), 128);
+        }
+        assert!(pairing_body("t", "c", None, "linux", "2.0")
+            .get("deviceName")
+            .is_none());
     }
 
     #[test]
@@ -7954,7 +8433,10 @@ mod member_review_tests {
             let mut value = serde_json::to_value(&reg).unwrap();
             value["version"] = json!(version);
             let reloaded: Registry = serde_json::from_value(value).unwrap();
-            assert_eq!(reloaded.team.unwrap().unknown_fields[MEMBER_REVIEW_FIELD], expected);
+            assert_eq!(
+                reloaded.team.unwrap().unknown_fields[MEMBER_REVIEW_FIELD],
+                expected
+            );
         }
     }
 }

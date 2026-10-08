@@ -1978,8 +1978,16 @@ async fn team_use_managed(app: tauri::AppHandle, state: State<'_, RegistryState>
 }
 
 #[tauri::command]
-async fn team_review(app: tauri::AppHandle, state: State<'_, RegistryState>, key: String, hash: String, accept: bool) -> Result<Registry, String> {
-    tauri::async_runtime::spawn_blocking(move || teams::review_team_change(&key, &hash, accept)).await.map_err(|e| e.to_string())??;
+async fn team_review(
+    app: tauri::AppHandle,
+    state: State<'_, RegistryState>,
+    key: String,
+    hash: String,
+    accept: bool,
+) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || teams::review_team_change(&key, &hash, accept))
+        .await
+        .map_err(|e| e.to_string())??;
     let fresh = reload_into_state(state.inner())?;
     let _ = app.emit("team-sync-registry", &fresh);
     Ok(fresh)
