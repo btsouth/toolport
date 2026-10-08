@@ -13744,7 +13744,7 @@ fn start_modern_hitl(
             .as_ref()
             .is_some_and(downstream::CancelContext::is_cancelled)
         {
-            return Err(approval::ApprovalDecision::Denied);
+            return Err(approval::ApprovalDecision::Withdrawn);
         }
         if approvals.len() >= MODERN_HITL_MAX_PENDING {
             return Err(approval::ApprovalDecision::Unreachable);
@@ -13798,7 +13798,8 @@ fn poll_modern_hitl(
     input_responses: Option<Value>,
 ) -> ModernHitlPoll {
     let mut approvals = session_tables().hitl();
-    let (poll, remove) = approvals.with(token, |pending| {
+    let (poll, remove) = approvals
+        .with(token, |pending| {
             if pending.name != name
                 || pending.args_hash != args_hash
                 || pending.scope != conversation_scope(client)
