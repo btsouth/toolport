@@ -816,30 +816,18 @@ fn stack_card(
         })
         .cloned()
         .collect();
-    add.connect_clicked(move |button| {
-        button.set_sensitive(false);
+    add.connect_clicked(move |_| {
+        let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else { return; };
         let entries = missing_entries.clone();
-        let name = name.clone();
-        let button = button.clone();
-        let page = page.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::registry_controller::add_catalog_stack(entries)
-            })
-            .await;
-            button.set_sensitive(true);
-            match result {
-                Ok(Ok((_, added))) => {
-                    page.pending_notice.replace(Some(format!(
-                        "Added {added} server{} from {name}. Review and enable them in Servers.",
-                        if added == 1 { "" } else { "s" }
-                    )));
-                    page.refresh();
-                }
-                Ok(Err(error)) => page.show_error(&error),
-                Err(_) => page.show_error("the collection setup stopped unexpectedly"),
-            }
-        });
+        let items = entries.iter().enumerate().map(|(i, e)| crate::registry_controller::SetupItem {
+            key: i.to_string(),name:e.name.clone(),transport:e.transport.clone(),command:e.command.clone(),args:e.args.clone(),url:e.url.clone().or(e.url_hint.clone()),env_keys:e.env_keys.iter().cloned().chain(e.launch.iter().flat_map(|l| l.inputs.iter().map(|i| i.label.clone()))).collect(),is_new:true,
+        }).collect();
+        let refreshed = page.clone();
+        super::setup::review(&parent, &format!("Review {name}"), items, "Review what each server runs. Valid servers turn on. Servers needing credentials or launch values stay off until setup is complete.", "Add selected servers", move |keys| {
+            let selected = entries.iter().enumerate().filter(|(i, _)| keys.contains(&i.to_string())).map(|(_, e)| e.clone()).collect();
+            let (_, added) = crate::registry_controller::add_catalog_stack(selected)?;
+            Ok(format!("Added {added} servers. Check status and complete any missing setup inputs under Servers."))
+        }, move || refreshed.refresh());
     });
     footer.append(&add);
     card.append(&footer);

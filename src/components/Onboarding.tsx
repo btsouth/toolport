@@ -22,13 +22,12 @@ import { toastError } from "@/lib/toast";
 import {
   getAuditLog,
   importServers,
-  installGateway,
   listStacks,
   previewImportServers,
   teamConnect,
   teamJoinPoll,
 } from "@/lib/api";
-import { addCollection } from "@/lib/collections";
+import { CollectionReviewDialog } from "@/components/CollectionReviewDialog";
 import { ClientLogo } from "@/components/ClientLogo";
 import { clientRestartHint } from "@/lib/clientConnect";
 import { HOSTED_TEAMS_URL, TEAMS_MARKETING_URL, teamUrlError } from "@/lib/teamUrl";
@@ -47,6 +46,7 @@ import {
 import { openExternal } from "@/lib/openUrl";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogTitle } from "@/components/ui/dialog";
+import { ConnectReviewDialog } from "@/components/ConnectReviewDialog";
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
 import { Skeleton } from "@/components/ui/skeleton";
 
@@ -530,7 +530,8 @@ function AddServers({
   const [collectionsLoading, setCollectionsLoading] = useState(true);
   const [collectionsError, setCollectionsError] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
-  const [applying, setApplying] = useState(false);
+  const [reviewCollection, setReviewCollection] = useState<Stack | null>(null);
+  const applying = false;
   // True once the user has added a Collection or imported, so "Next" replaces "later".
   const [touched, setTouched] = useState(false);
 
@@ -588,41 +589,23 @@ function AddServers({
   }
 
   /** Add every server in the chosen Collection that isn't already in Toolport. */
-  async function applyCollection(s: Stack) {
-    setApplying(true);
-    const existing = new Set(
-      s.servers
-        .filter((entry) => installed(have, entry))
-        .map((entry) => entry.name.toLowerCase()),
-    );
-    try {
-      const {
-        added,
-        needSetup,
-        registry: next,
-      } = await addCollection(s.servers, existing);
-      onImport(next ?? registry);
-      setTouched(true);
-      toast.success(
-        added > 0
-          ? `Added ${added} server${added === 1 ? "" : "s"} from ${s.name}`
-          : `${s.name}: every server is already in Toolport`,
-        {
-          description:
-            needSetup > 0
-              ? `${needSetup} need setup values. Complete their Launch setup or credentials under Servers, then enable them.`
-              : "Enable them next.",
-        },
-      );
-    } catch (e) {
-      toastError(`Couldn't set up ${s.name}: ${e}`);
-    } finally {
-      setApplying(false);
-    }
+  function applyCollection(s: Stack) {
+    setReviewCollection(s);
   }
 
   return (
     <>
+      {reviewCollection && (
+        <CollectionReviewDialog
+          collection={reviewCollection}
+          registry={registry}
+          onAdded={(next) => {
+            onImport(next);
+            setTouched(true);
+          }}
+          onClose={() => setReviewCollection(null)}
+        />
+      )}
       <StepHeader icon={<Download className="size-5" />} title="Add your first servers">
         Pick what you work on and Toolport sets up a matching Collection. You can also
         import from your other tools or browse the full catalog.
@@ -768,30 +751,22 @@ function ConnectClients({
   onConnected: () => void;
   onNext: () => void;
 }) {
-  const [busyId, setBusyId] = useState<string | null>(null);
   const [done, setDone] = useState<Set<string>>(new Set());
 
-  async function connect(client: DetectedClient) {
-    setBusyId(client.id);
-    try {
-      await installGateway(client.id);
-      setDone((prev) => new Set(prev).add(client.id));
-      onConnected();
-      // Same trap as ClientDetail (SOU-317): config is written now, but the client
-      // usually only loads it on restart. Verify step also says this; put it on the
-      // success toast so it is not delayed until that step.
-      toast.success(`Connected Toolport to ${client.name}`, {
-        description: clientRestartHint(client.name),
-      });
-    } catch (e) {
-      toastError(`Couldn't connect: ${e}`);
-    } finally {
-      setBusyId(null);
-    }
-  }
-
+  const [reviewClient, setReviewClient] = useState<DetectedClient | null>(null);
   return (
     <>
+      {reviewClient && (
+        <ConnectReviewDialog
+          clientId={reviewClient.id}
+          clientName={reviewClient.name}
+          onClose={() => setReviewClient(null)}
+          onConnected={() => {
+            setDone((previous) => new Set(previous).add(reviewClient.id));
+            onConnected();
+          }}
+        />
+      )}
       <StepHeader icon={<Link2 className="size-5" />} title="Connect a client">
         Point a tool at Toolport. It connects once, then sees every server you enable
         here, no per-tool setup.
@@ -822,14 +797,10 @@ function ConnectClients({
                     size="sm"
                     variant="outline"
                     className="h-7 shrink-0 px-2 text-xs"
-                    onClick={() => connect(client)}
-                    disabled={busyId === client.id}
+                    onClick={() => setReviewClient(client)}
+                    disabled={false}
                   >
-                    {busyId === client.id ? (
-                      <Loader2 className="size-3.5 animate-spin" />
-                    ) : (
-                      <Link2 className="size-3.5" />
-                    )}
+                    <Link2 className="size-3.5" />
                     Connect
                   </Button>
                 )}

@@ -15,6 +15,9 @@ interface Props {
   items: ImportItem[];
   busy?: boolean;
   title?: string;
+  description?: string;
+  confirmLabel?: string;
+  allowEmpty?: boolean;
   onOpenChange: (open: boolean) => void;
   onConfirm: (keys: string[]) => void;
 }
@@ -25,6 +28,9 @@ export function ImportReviewDialog({
   items,
   busy = false,
   title = "Review servers to import",
+  description,
+  confirmLabel,
+  allowEmpty = false,
   onOpenChange,
   onConfirm,
 }: Props) {
@@ -36,6 +42,9 @@ export function ImportReviewDialog({
         items={items}
         busy={busy}
         title={title}
+        description={description}
+        confirmLabel={confirmLabel}
+        allowEmpty={allowEmpty}
         onOpenChange={onOpenChange}
         onConfirm={onConfirm}
       />
@@ -47,6 +56,9 @@ function ImportReviewContent({
   items,
   busy = false,
   title = "Review servers to import",
+  description,
+  confirmLabel,
+  allowEmpty = false,
   onOpenChange,
   onConfirm,
 }: Omit<Props, "open">) {
@@ -66,8 +78,8 @@ function ImportReviewContent({
       </DialogHeader>
       <div className="flex flex-col gap-4 py-1">
         <p className="text-xs text-muted-foreground">
-          Review the commands and URLs before adding them. You can leave any server
-          unchecked and import only the ones you want.
+          {description ??
+            "Review the commands and URLs before adding them. Leave any server unchecked to keep it as it is."}
         </p>
         <div className="flex max-h-72 flex-col gap-2 overflow-y-auto">
           {keyedItems.map(({ item, key }) => {
@@ -101,12 +113,13 @@ function ImportReviewContent({
         </Button>
         <Button
           onClick={() => onConfirm(Array.from(selected))}
-          disabled={busy || selectedCount === 0}
+          disabled={busy || (!allowEmpty && selectedCount === 0)}
         >
           <Check className="size-4" />
-          {selectedCount === 0
-            ? "Select a server"
-            : `Import ${selectedCount} server${selectedCount === 1 ? "" : "s"}`}
+          {confirmLabel ??
+            (selectedCount === 0
+              ? "Select a server"
+              : `Import ${selectedCount} server${selectedCount === 1 ? "" : "s"}`)}
         </Button>
       </DialogFooter>
     </DialogContent>
@@ -139,6 +152,11 @@ export function ImportRow({ item, selected }: { item: ImportItem; selected?: boo
       </div>
       {runs && (
         <p className="mt-1 font-mono text-xs break-all text-muted-foreground">{runs}</p>
+      )}
+      {!!item.envKeys?.length && (
+        <p className="mt-1 text-xs text-warning">
+          Credentials: {item.envKeys.join(", ")}. Required before connection can finish.
+        </p>
       )}
       {shell && (
         <p className="mt-1.5 flex items-center gap-1.5 text-xs text-warning">

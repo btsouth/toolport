@@ -9,7 +9,7 @@ import {
   catalogInstalledIdentities,
   installed,
 } from "@/lib/catalogIdentity";
-import { addCollection } from "@/lib/collections";
+import { CollectionReviewDialog } from "@/components/CollectionReviewDialog";
 import type { CatalogEntry, CatalogSearch, Registry, Stack } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -49,7 +49,8 @@ export function CatalogView({ registry, onAdded }: Props) {
   const [collections, setCollections] = useState<Stack[]>([]);
   const [collectionsLoading, setCollectionsLoading] = useState(true);
   const [collectionsError, setCollectionsError] = useState(false);
-  const [collectionBusy, setCollectionBusy] = useState<string | null>(null);
+  const collectionBusy = null;
+  const [reviewCollection, setReviewCollection] = useState<Stack | null>(null);
   const [configEntry, setConfigEntry] = useState<CatalogEntry | null>(null);
 
   const have = new Set((registry?.servers ?? []).flatMap(catalogInstalledIdentities));
@@ -145,7 +146,7 @@ export function CatalogView({ registry, onAdded }: Props) {
     try {
       onAdded(await addCatalogServer(entry));
       toast.success(`Added ${entry.name}`, {
-        description: "Enable it, then authenticate if it needs credentials.",
+        description: "Added and turned on. Check its status under Servers.",
       });
     } catch (e) {
       toastError(`Couldn't add ${entry.name}: ${e}`);
@@ -156,37 +157,8 @@ export function CatalogView({ registry, onAdded }: Props) {
 
   /** Add every server in a Collection that isn't already in Toolport, then point
    * the user at the credential steps for the ones that need them. */
-  async function setupCollection(collection: Stack) {
-    setCollectionBusy(collection.id);
-    const existing = new Set(
-      collection.servers
-        .filter((entry) => installed(have, entry))
-        .map((entry) => entry.name.toLowerCase()),
-    );
-    try {
-      const { added, needSetup } = await addCollection(
-        collection.servers,
-        existing,
-        onAdded,
-      );
-      if (added === 0) {
-        toast.success(`${collection.name}: every server is already in Toolport`);
-      } else {
-        toast.success(
-          `Added ${added} server${added === 1 ? "" : "s"} from ${collection.name}`,
-          {
-            description:
-              needSetup > 0
-                ? `${needSetup} need setup values. Open "Setup steps", then finish setup under Servers.`
-                : "Enable them under Servers.",
-          },
-        );
-      }
-    } catch (e) {
-      toastError(`Couldn't finish setting up ${collection.name}: ${e}`);
-    } finally {
-      setCollectionBusy(null);
-    }
+  function setupCollection(collection: Stack) {
+    setReviewCollection(collection);
   }
 
   const shown = results ?? popular;
@@ -221,6 +193,14 @@ export function CatalogView({ registry, onAdded }: Props) {
 
   return (
     <div className="flex min-w-0 w-full flex-col gap-4">
+      {reviewCollection && (
+        <CollectionReviewDialog
+          collection={reviewCollection}
+          registry={registry}
+          onAdded={onAdded}
+          onClose={() => setReviewCollection(null)}
+        />
+      )}
       <div className="relative">
         <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
         {loading && (

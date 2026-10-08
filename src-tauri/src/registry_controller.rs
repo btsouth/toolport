@@ -380,7 +380,7 @@ pub fn apply_add_server(registry: &mut Registry, fields: ServerFields) -> Result
 
 pub fn apply_add_entry(registry: &mut Registry, mut entry: ServerEntry) -> String {
     entry.enabled = false;
-    registry.add_server(entry)
+    apply_import_entry(registry, entry)
 }
 
 pub(crate) fn server_from_detected(server: &clients::McpServer, client_id: &str) -> ServerEntry {
@@ -563,6 +563,11 @@ pub fn add_server_with_launch(
             .expect("just added");
         launch.validate(&server.args, true)?;
         server.launch = Some(launch);
+        server.enabled = false;
+        let profile = registry.default_access_id();
+        if apply_server_enabled(registry, &profile, &id, true, false).is_ok() {
+            let _ = registry.set_access_server(&profile, &id, true);
+        }
         Ok(id)
     })?;
     Ok(registry)
@@ -830,8 +835,14 @@ fn finish_client_config_mutation(
                 .into(),
         );
         if let Some(file) = &outcome.recovery_path {
-            if let Err(error) = clients::record_config_capture_conflict(file, &receipt.target, outcome.revision.as_deref()) {
-                outcome.warnings.push(format!("could not record unavailable exact rollback: {error}"));
+            if let Err(error) = clients::record_config_capture_conflict(
+                file,
+                &receipt.target,
+                outcome.revision.as_deref(),
+            ) {
+                outcome.warnings.push(format!(
+                    "could not record unavailable exact rollback: {error}"
+                ));
             }
         }
     }
@@ -1229,6 +1240,7 @@ pub struct MigrateOutcome {
     pub imported: usize,
     /// Names of the servers moved out of the client's config.
     pub moved: Vec<String>,
+    pub tools: Vec<serde_json::Value>,
 }
 
 /// Import the servers a client directly manages before its config is replaced
@@ -1256,6 +1268,19 @@ pub(crate) fn import_client_servers_for_migration(
             .servers
             .iter()
             .any(|entry| entry.name.eq_ignore_ascii_case(&server.name));
+        if let Some(existing) = registry
+            .servers
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(&server.name))
+        {
+            if existing.command != server.command
+                || existing.args != server.args
+                || existing.url != server.url
+                || existing.transport != server.transport
+            {
+                return Err(format!("{} already exists with a different definition. Resolve it under Servers before connecting. Client config unchanged.", server.name));
+            }
+        }
         if !exists {
             registry.add_server(server_from_detected(server, &client.id));
             imported += 1;
@@ -1309,7 +1334,12 @@ pub(crate) fn apply_import_entry(registry: &mut Registry, entry: ServerEntry) ->
         .default_access_profile_id
         .clone()
         .unwrap_or_else(|| registry.active_profile_id());
-    if apply_server_enabled(registry, &profile_id, &id, true, false).is_ok() {
+    let ready = registry
+        .servers
+        .iter()
+        .find(|s| s.id == id)
+        .is_some_and(|s| s.env.is_empty() && (s.command.is_some() || s.url.is_some()));
+    if ready && apply_server_enabled(registry, &profile_id, &id, true, false).is_ok() {
         let _ = registry.set_access_server(&profile_id, &id, true);
     }
     id
@@ -1329,33 +1359,141 @@ pub fn migrate_client(
     profile: Option<&str>,
     force: bool,
 ) -> Result<MigrateOutcome, String> {
-    // Guard before import or rewrite so a hand-edited gateway entry is not wiped.
+    let review = preview_client_setup(client_id)?;
+    let names = review
+        .items
+        .iter()
+        .map(|item| item.name.clone())
+        .collect::<Vec<_>>();
+    migrate_client_reviewed(client_id, profile, force, &names, &review.revision)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupItem {
+    pub key: String,
+    pub name: String,
+    pub transport: String,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub url: Option<String>,
+    pub env_keys: Vec<String>,
+    pub is_new: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientSetupReview {
+    pub config_path: String,
+    pub backup_dir: String,
+    pub revision: String,
+    pub items: Vec<SetupItem>,
+}
+
+pub fn preview_client_setup(client_id: &str) -> Result<ClientSetupReview, String> {
+    let revision = clients::setup_revision(client_id)?;
+    let client = clients::detect_clients()
+        .into_iter()
+        .find(|c| c.id == client_id)
+        .ok_or("Unknown client")?;
+    if client.error.is_some() {
+        return Err("Could not read this client config. Fix it before connecting.".into());
+    }
+    let registry = read_registry_exact_or_default()?;
+    let items = client
+        .servers
+        .iter()
+        .filter(|s| !clients::detected_is_gateway(s))
+        .map(|s| SetupItem {
+            key: s.name.clone(),
+            name: s.name.clone(),
+            transport: s.transport.clone(),
+            command: s.command.clone(),
+            args: s.args.clone(),
+            url: s.url.clone(),
+            env_keys: s.env_keys.clone(),
+            is_new: !registry
+                .servers
+                .iter()
+                .any(|e| e.name.eq_ignore_ascii_case(&s.name)),
+        })
+        .collect();
+    if clients::setup_revision(client_id)? != revision {
+        return Err("Client config changed. Review it again.".into());
+    }
+    Ok(ClientSetupReview {
+        config_path: client.config_path,
+        revision,
+        items,
+        backup_dir: clients::backup_dir(client_id)
+            .ok_or("Could not resolve backup directory")?
+            .display()
+            .to_string(),
+    })
+}
+
+pub fn migrate_client_reviewed(
+    client_id: &str,
+    profile: Option<&str>,
+    force: bool,
+    names: &[String],
+    revision: &str,
+) -> Result<MigrateOutcome, String> {
+    migrate_client_reviewed_with(
+        client_id,
+        profile,
+        force,
+        names,
+        revision,
+        verify_setup_gateway,
+    )
+}
+
+fn migrate_client_reviewed_with(
+    client_id: &str,
+    profile: Option<&str>,
+    force: bool,
+    names: &[String],
+    revision: &str,
+    mut verify: impl FnMut(
+        &Registry,
+        &[String],
+        &str,
+        Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String>,
+) -> Result<MigrateOutcome, String> {
     let current = read_registry_exact()?;
     refuse_customized_client(
         client_gateway_state(&current.client_managed_entries, client_id),
         force,
     )?;
-    let client = clients::detect_clients()
+    let mut client = clients::detect_clients()
         .into_iter()
-        .find(|client| client.id == client_id)
-        .ok_or_else(|| format!("Unknown client '{client_id}'"))?;
-
-    let profile = profile.map(str::trim).filter(|profile| !profile.is_empty());
-
-    // Import the client's servers and turn them on where this client looks, under
-    // the lock (a fresh load-modify-save). Any enable failure aborts the save and
-    // returns before the client's config is touched, so a move never drops a
-    // server the client was using (UX-02).
-    let (_, (imported, moved)) = registry::update(|registry| {
-        let (imported, moved) = import_client_servers_for_migration(registry, &client)?;
-        enable_moved_servers(registry, profile, &moved)?;
-        Ok((imported, moved))
+        .find(|c| c.id == client_id)
+        .ok_or("Unknown client")?;
+    if names.iter().any(|name| {
+        !client
+            .servers
+            .iter()
+            .any(|s| &s.name == name && !clients::detected_is_gateway(s))
+    }) {
+        return Err("Reviewed server no longer exists. Review the client config again.".into());
+    }
+    client.servers.retain(|s| names.contains(&s.name));
+    let mut imported = 0;
+    let mut moved = Vec::new();
+    let mut tools = Vec::new();
+    let outcome = clients::migrate_reviewed(client_id, profile, names, revision, || {
+        let (registry, result) = registry::update(|registry| {
+            let (added, moved) = import_client_servers_for_migration(registry, &client)?;
+            enable_moved_servers(registry, profile, &moved)?;
+            Ok((added, moved))
+        })?;
+        imported = result.0;
+        moved = result.1;
+        tools = verify(&registry, &moved, client_id, profile)?;
+        Ok(())
     })?;
-    let outcome = clients::migrate_to_gateway(client_id, profile)?;
-
-    // Record the scope now that the client config was rewritten to the gateway.
-    // "No profile" becomes an explicit-unscoped marker (not a removal) so a live
-    // re-scope to "all servers" applies without restarting the client.
     let result = finish_client_stdio_mutation(client_id, outcome, |managed_entry| {
         registry::update(|registry| {
             Ok(apply_client_stdio_update(
@@ -1370,7 +1508,84 @@ pub fn migrate_client(
         result,
         imported,
         moved,
+        tools,
     })
+}
+
+/// Read the same gateway surface and discovery mode this client will use. Probe
+/// selected entries first so an empty cold catalog cannot masquerade as success.
+fn verify_setup_gateway(
+    registry: &Registry,
+    moved: &[String],
+    client_id: &str,
+    profile: Option<&str>,
+) -> Result<Vec<serde_json::Value>, String> {
+    for name in moved {
+        let server = registry
+            .servers
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
+            .ok_or("Reviewed server missing")?;
+        let probe = crate::server_runtime::probe_one_bounded(server);
+        if !probe.ok {
+            return Err(if probe.auth_required {
+                format!(
+                    "{} needs credentials. Open Credentials and retry. Client config unchanged.",
+                    server.name
+                )
+            } else {
+                format!("{} could not start. Check its command or URL and retry. Client config unchanged.", server.name)
+            });
+        }
+    }
+    let gateway = clients::resolve_gateway_path_readonly()
+        .ok_or("Could not locate the Toolport gateway. Client config unchanged.")?;
+    let mode = clients::discovery_capabilities(client_id)
+        .resolve_mode(registry.client_discovery.get(client_id).map(String::as_str));
+    let env = vec![
+        (
+            "TOOLPORT_DATA_DIR".into(),
+            registry::conduit_dir()
+                .ok_or("Missing data directory")?
+                .display()
+                .to_string(),
+        ),
+        ("TOOLPORT_PROFILE".into(), profile.unwrap_or("").to_string()),
+        ("TOOLPORT_DISCOVERY".into(), mode.to_string()),
+    ];
+    let transport = crate::downstream::StdioTransport::spawn(
+        &gateway.to_string_lossy(),
+        &[],
+        &env,
+        None,
+        false,
+    )
+    .map_err(|_| "Gateway could not start. Client config unchanged.")?;
+    let mut gateway =
+        crate::downstream::DownstreamServer::connect("setup-review".into(), Box::new(transport))
+            .map_err(|_| "Gateway did not answer. Client config unchanged.")?;
+    for name in moved {
+        let server = registry
+            .servers
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
+            .unwrap();
+        let response = gateway
+            .call(
+                "toolport_search_tools",
+                serde_json::json!({"query":"", "server":server.id, "limit":200}),
+            )
+            .map_err(|_| "Gateway discovery failed. Client config unchanged.")?;
+        let text = response["content"][0]["text"].as_str().unwrap_or("");
+        let catalog = text
+            .split_once("\n\n")
+            .and_then(|(_, json)| serde_json::from_str::<Vec<serde_json::Value>>(json).ok())
+            .unwrap_or_default();
+        if catalog.is_empty() || response["isError"].as_bool() == Some(true) {
+            return Err(format!("{} has no verified gateway tools. Retry after it is ready. Client config unchanged.", server.name));
+        }
+    }
+    Ok(gateway.tools.clone())
 }
 
 pub fn connect_client_stdio(
@@ -2078,13 +2293,129 @@ mod tests {
         }
     }
 
+    fn migrate_client(
+        client_id: &str,
+        profile: Option<&str>,
+        force: bool,
+    ) -> Result<MigrateOutcome, String> {
+        let review = preview_client_setup(client_id)?;
+        let names = review
+            .items
+            .iter()
+            .map(|s| s.name.clone())
+            .collect::<Vec<_>>();
+        migrate_client_reviewed_with(
+            client_id,
+            profile,
+            force,
+            &names,
+            &review.revision,
+            |_, _, _, _| Ok(Vec::new()),
+        )
+    }
+
     #[test]
-    fn access_review_renderer_add_starts_disabled() {
+    fn reviewed_setup_moves_only_selected_and_returns_gateway_tools() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(fixture.claude(), r#"{"mcpServers":{"chosen":{"command":"chosen"},"kept":{"command":"kept","custom":true,"env":{"PAT":"native-only"}}}}"#).unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        let outcome = migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["chosen".into()],
+            &review.revision,
+            |_, moved, _, _| {
+                assert_eq!(moved, &["chosen"]);
+                Ok(vec![serde_json::json!({"name":"chosen__read"})])
+            },
+        )
+        .unwrap();
+        let after = json_file(&fixture.claude());
+        assert!(after["mcpServers"].get("chosen").is_none());
+        assert_eq!(after["mcpServers"]["kept"]["env"]["PAT"], "native-only");
+        assert_eq!(after["mcpServers"]["kept"]["custom"], true);
+        assert_eq!(outcome.tools[0]["name"], "chosen__read");
+        assert!(outcome.result.outcome.backup.is_some());
+    }
+
+    #[test]
+    fn reviewed_setup_failed_gateway_leaves_native_bytes_intact() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let original = r#"{ "mcpServers": {"broken":{"command":"missing-command"}} }"#;
+        std::fs::write(fixture.claude(), original).unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        let error = migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["broken".into()],
+            &review.revision,
+            |_, _, _, _| Err("Launch failed".into()),
+        )
+        .unwrap_err();
+        assert_eq!(error, "Launch failed");
+        assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
+        assert!(!fixture.move_record("claude-code").exists());
+    }
+
+    #[test]
+    fn reviewed_setup_refuses_changed_credential_without_importing() {
+        let fixture = MoveFixture::new(&Registry::default());
+        std::fs::write(
+            fixture.claude(),
+            r#"{"mcpServers":{"one":{"command":"one","env":{"PAT":"old"}}}}"#,
+        )
+        .unwrap();
+        let review = preview_client_setup("claude-code").unwrap();
+        let changed = r#"{"mcpServers":{"one":{"command":"one","env":{"PAT":"new"}}}}"#;
+        std::fs::write(fixture.claude(), changed).unwrap();
+        let error = migrate_client_reviewed_with(
+            "claude-code",
+            None,
+            false,
+            &["one".into()],
+            &review.revision,
+            |_, _, _, _| panic!("must refuse before verification"),
+        )
+        .unwrap_err();
+        assert!(error.contains("changed"));
+        assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), changed);
+        assert!(read_registry_exact().unwrap().servers.is_empty());
+    }
+
+    #[test]
+    fn reviewed_setup_launch_and_missing_credentials_are_not_success() {
+        let mut reg = Registry::default();
+        let mut entry = server("broken");
+        entry.command = Some("/does-not-exist-toolport-setup".into());
+        let id = reg.add_server(entry);
+        assert!(
+            verify_setup_gateway(&reg, &["broken".into()], "claude-code", None)
+                .unwrap_err()
+                .contains("could not start")
+        );
+        reg.servers
+            .iter_mut()
+            .find(|s| s.id == id)
+            .unwrap()
+            .env
+            .push(registry::EnvVar {
+                key: "PAT".into(),
+                value: None,
+                secret: true,
+                unknown_fields: Default::default(),
+            });
+        assert!(verify_setup_gateway(&reg, &["broken".into()], "claude-code", None).is_err());
+    }
+
+    #[test]
+    fn reviewed_manual_add_enables_valid_definition() {
         let mut reg = Registry::default();
         let mut entry = server("one");
         entry.enabled = true;
         let id = apply_add_entry(&mut reg, entry);
-        assert!(!reg.server_enabled(&id));
+        assert!(reg.server_enabled(&id));
     }
 
     #[test]
@@ -3147,7 +3478,10 @@ mod tests {
                 .unwrap()
                 .exact_rollback
         );
-        let snapshot: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(result.outcome.recovery_path.as_ref().unwrap()).unwrap()).unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(result.outcome.recovery_path.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(snapshot["exactEligible"], false);
         disconnect_client("claude-code").unwrap();
         assert_eq!(json_file(&fixture.claude())["session"], 2);
@@ -3313,9 +3647,13 @@ mod tests {
         let original = r#"{ "mcpServers": {"native":{"command":"native"}}, "setting": 7 }"#;
         std::fs::write(fixture.claude(), original).unwrap();
         migrate_client("claude-code", None, false).unwrap();
-        disconnect_client_stdio_with("claude-code", false, |_| Err("registry full".into())).unwrap_err();
+        disconnect_client_stdio_with("claude-code", false, |_| Err("registry full".into()))
+            .unwrap_err();
         let result = disconnect_client("claude-code").unwrap();
-        assert_eq!(std::fs::read_to_string(&result.outcome.path).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(&result.outcome.path).unwrap(),
+            original
+        );
     }
 
     /// UX-03 for Codex: the moved TOML tables come back (nested env table too) into

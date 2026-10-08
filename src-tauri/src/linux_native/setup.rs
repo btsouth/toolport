@@ -1,0 +1,125 @@
+//! Shared review window for client cutover, Collections and multi-server paste.
+use crate::registry_controller::SetupItem;
+use adw::prelude::*;
+
+pub(super) fn review(
+    parent: &gtk::Window,
+    title: &str,
+    items: Vec<SetupItem>,
+    disclosure: &str,
+    confirm_label: &str,
+    action: impl Fn(Vec<String>) -> Result<String, String> + Send + Sync + 'static,
+    finished: impl Fn() + 'static,
+) {
+    let dialog = adw::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title(title)
+        .default_width(680)
+        .default_height(600)
+        .build();
+    dialog.add_css_class("toolport-editor");
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    root.add_css_class("toolport-editor-body");
+    let heading = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .css_classes(["title-2"])
+        .build();
+    root.append(&heading);
+    let lede = gtk::Label::builder()
+        .label(disclosure)
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    root.append(&lede);
+    let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let mut selected = Vec::new();
+    for item in items {
+        let command = item
+            .command
+            .as_ref()
+            .map(|c| format!("{c} {}", item.args.join(" ")))
+            .or(item.url.clone())
+            .unwrap_or_else(|| "Needs an endpoint URL".into());
+        let row = gtk::CheckButton::builder().active(true).build();
+        let label = gtk::Label::builder()
+            .label(format!(
+                "{}\n{}\n{}",
+                item.name,
+                command,
+                if item.env_keys.is_empty() {
+                    String::new()
+                } else {
+                    format!("Setup inputs: {}", item.env_keys.join(", "))
+                }
+            ))
+            .xalign(0.0)
+            .wrap(true)
+            .build();
+        row.set_child(Some(&label));
+        rows.append(&row);
+        selected.push((row, item.key));
+    }
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&rows)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    root.append(&scroller);
+    let feedback = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .selectable(true)
+        .visible(false)
+        .build();
+    root.append(&feedback);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let cancel = gtk::Button::with_label("Cancel");
+    let confirm = gtk::Button::with_label(confirm_label);
+    confirm.add_css_class("suggested-action");
+    actions.append(&cancel);
+    actions.append(&confirm);
+    root.append(&actions);
+    dialog.set_content(Some(&root));
+    let closing = dialog.clone();
+    cancel.connect_clicked(move |_| closing.close());
+    let action = std::sync::Arc::new(action);
+    let finished = std::rc::Rc::new(finished);
+    confirm.connect_clicked(move |button| {
+        let keys = selected
+            .iter()
+            .filter(|(row, _)| row.is_active())
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        button.set_sensitive(false);
+        feedback.set_label("Checking setup...");
+        feedback.set_visible(true);
+        let action = action.clone();
+        let finished = finished.clone();
+        let feedback = feedback.clone();
+        let button = button.clone();
+        let cancel = cancel.clone();
+        let scroller = scroller.clone();
+        gtk::glib::spawn_future_local(async move {
+            let result = gtk::gio::spawn_blocking(move || action(keys)).await;
+            match result {
+                Ok(Ok(message)) => {
+                    feedback.set_label(&message);
+                    scroller.set_visible(false);
+                    cancel.set_label("Done");
+                    finished();
+                }
+                Ok(Err(error)) => {
+                    feedback.set_label(&error);
+                    button.set_sensitive(true);
+                }
+                Err(_) => {
+                    feedback.set_label("Setup stopped. Client config unchanged. Retry.");
+                    button.set_sensitive(true);
+                }
+            }
+        });
+    });
+    dialog.present();
+}

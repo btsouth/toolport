@@ -178,6 +178,61 @@ pub(super) fn record(client_id: &str, format: Format, path: &Path) -> Result<(),
     Ok(())
 }
 
+/// Remove only the definitions reviewed for this transaction. Other entries,
+/// including unknown adapter fields and inline credentials, stay in their format.
+pub(super) fn remove_selected(format: Format, path: &Path, names: &[String]) -> Result<(), String> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    match container(format) {
+        Container::Json { key, nested } => {
+            let original = read_config_file(path)?;
+            let mut root = read_existing_json(&original, true)?;
+            let mut servers = root.get_mut(key);
+            if let Some(nested) = nested {
+                servers = servers.and_then(|v| v.get_mut(nested));
+            }
+            let servers = servers
+                .and_then(|v| v.as_object_mut())
+                .ok_or("Could not read the reviewed server list")?;
+            for name in names {
+                servers.remove(name);
+            }
+            atomic_write_json_config(path, Some(&original), &root, key)
+        }
+        Container::Toml => {
+            let mut doc = load_toml_document(path)?;
+            for name in names {
+                toml_mcp_servers_mut(&mut doc).remove(name);
+            }
+            atomic_write(path, &doc.to_string())
+        }
+        Container::YamlMap(key) | Container::YamlList(key) => {
+            let list = matches!(container(format), Container::YamlList(_));
+            let (original, mut root) = read_existing_yaml_with_source(path)?;
+            let servers = root
+                .get_mut(key)
+                .ok_or("Could not read the reviewed server list")?;
+            if list {
+                servers
+                    .as_sequence_mut()
+                    .ok_or("Expected a server list")?
+                    .retain(|v| {
+                        !v.get("name")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|n| names.iter().any(|name| name == n))
+                    });
+            } else {
+                let servers = servers.as_mapping_mut().ok_or("Expected a server map")?;
+                for name in names {
+                    servers.remove(serde_yaml::Value::String(name.clone()));
+                }
+            }
+            atomic_write_yaml_config(path, original.as_deref(), &root, key)
+        }
+    }
+}
+
 pub(super) fn toml_entry(
     client_id: &str,
     path: &Path,

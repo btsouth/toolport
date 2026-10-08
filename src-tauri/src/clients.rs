@@ -24,8 +24,8 @@ pub use discovery::DiscoveryCapabilities;
 mod moved;
 mod mutation;
 mod restore;
-pub(crate) use restore::after_rollback as record_config_rollback;
 pub(crate) use restore::after_capture_conflict as record_config_capture_conflict;
+pub(crate) use restore::after_rollback as record_config_rollback;
 mod zcode;
 
 /// One MCP server, normalized across every client format.
@@ -2261,7 +2261,9 @@ fn parse_json_snippet(
                 .get("command")
                 .is_some_and(|command| command.is_string() || command.is_array())
                 && !servers.get("url").is_some_and(serde_json::Value::is_string)
-                && !servers.get("type").is_some_and(serde_json::Value::is_string)
+                && !servers
+                    .get("type")
+                    .is_some_and(serde_json::Value::is_string)
                 && !servers
                     .get("enabled")
                     .is_some_and(serde_json::Value::is_boolean)
@@ -3127,7 +3129,6 @@ fn parse_client_content(format: Format, content: &str) -> Result<Vec<McpServer>,
         Format::YamlMcpServers => parse_hermes_yaml_servers(content),
         Format::YamlMcpServersList => parse_continue_yaml_servers(content),
     }
-
 }
 
 fn managed_matches_detected(server: &McpServer, rec: &ManagedEntry) -> bool {
@@ -3251,7 +3252,10 @@ pub struct WriteOutcome {
     pub recovery_path: Option<PathBuf>,
 }
 
-fn revision_outcome(client_id: &str, result: Result<WriteOutcome, String>) -> Result<WriteOutcome, String> {
+fn revision_outcome(
+    client_id: &str,
+    result: Result<WriteOutcome, String>,
+) -> Result<WriteOutcome, String> {
     let mut outcome = result?;
     let path = Path::new(&outcome.path);
     outcome.recovery_path = Some(restore::record_path(client_id, path)?);
@@ -3309,7 +3313,7 @@ fn find_def(client_id: &str) -> Option<ClientDef> {
     defs().into_iter().find(|d| d.id == client_id)
 }
 
-fn backup_dir(client_id: &str) -> Option<PathBuf> {
+pub(crate) fn backup_dir(client_id: &str) -> Option<PathBuf> {
     // Anchor to the same home-based dir as the registry (see registry::conduit_dir)
     // so config backups land in one place regardless of whether a packaged or
     // unpackaged process wrote them.
@@ -3770,10 +3774,18 @@ fn rewrite_json_key_preserving(
     }
     let before = parse_json_value(original)?;
     if let Some(prop) = obj.get(key) {
-        if let (Some(child), Some(before), Some(after)) = (prop.object_value(), before.get(key).and_then(serde_json::Value::as_object), new_value.as_object()) {
+        if let (Some(child), Some(before), Some(after)) = (
+            prop.object_value(),
+            before.get(key).and_then(serde_json::Value::as_object),
+            new_value.as_object(),
+        ) {
             patch_json_object(&child, before, after)?;
-        } else { prop.set_value(serde_to_cst_input(new_value)); }
-    } else { obj.append(key, serde_to_cst_input(new_value)); }
+        } else {
+            prop.set_value(serde_to_cst_input(new_value));
+        }
+    } else {
+        obj.append(key, serde_to_cst_input(new_value));
+    }
     Ok(root.to_string())
 }
 
@@ -4741,7 +4753,9 @@ fn atomic_write_yaml_config(
             reject_duplicate_top_level_yaml_key(src, changed_key)?;
             rewrite_yaml_key_preserving(src, changed_key, val)?
         }
-        (Some(src), None) if !src.trim().is_empty() => remove_yaml_key_preserving(src, changed_key)?,
+        (Some(src), None) if !src.trim().is_empty() => {
+            remove_yaml_key_preserving(src, changed_key)?
+        }
         _ => pretty()?,
     };
     parse_existing_yaml_content(&out)?;
@@ -6267,7 +6281,9 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
         let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
-        outcome.warnings.extend(disconnect_warnings(def.format, &path)?);
+        outcome
+            .warnings
+            .extend(disconnect_warnings(def.format, &path)?);
         Ok(outcome)
     })
 }
@@ -6283,7 +6299,11 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             moved::restore(client_id, def.format, &path)?;
         }
         let restored = read_client(&def).servers;
-        restored_names.retain(|name| restored.iter().any(|server| server.name.eq_ignore_ascii_case(name)));
+        restored_names.retain(|name| {
+            restored
+                .iter()
+                .any(|server| server.name.eq_ignore_ascii_case(name))
+        });
         return Ok(WriteOutcome {
             path: path.display().to_string(),
             backup: backup.map(|p| p.display().to_string()),
@@ -6291,12 +6311,16 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             restored: restored_names,
             used_move_record: moved::matches_path(client_id, &path)?,
             revision: None,
-        warnings: Vec::new(),
-        recovery_path: None,
+            warnings: Vec::new(),
+            recovery_path: None,
         });
     }
     let current = crate::registry_controller::registry_for_disconnect()?;
-    restore::check_legacy_gateway(def.format, &path, current.client_managed_entries.get(client_id))?;
+    restore::check_legacy_gateway(
+        def.format,
+        &path,
+        current.client_managed_entries.get(client_id),
+    )?;
     let restored = moved::restore(client_id, def.format, &path)?;
     if restored.is_none() && (!mutation::exists(&path) || !read_client(&def).gateway_installed) {
         return Ok(WriteOutcome {
@@ -6306,8 +6330,8 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             restored: Vec::new(),
             used_move_record: false,
             revision: None,
-        warnings: Vec::new(),
-        recovery_path: None,
+            warnings: Vec::new(),
+            recovery_path: None,
         });
     }
     let mut outcome = install_or_remove(client_id, None)?;
@@ -6328,11 +6352,19 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
 pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) -> Result<(), String> {
     let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
     let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
-    restore::check_finished(client_id, Path::new(&outcome.path), outcome.revision.as_deref())?;
+    restore::check_finished(
+        client_id,
+        Path::new(&outcome.path),
+        outcome.revision.as_deref(),
+    )?;
     if outcome.used_move_record {
         moved::forget(client_id)?;
     }
-    restore::finish(client_id, Path::new(&outcome.path), outcome.revision.as_deref())?;
+    restore::finish(
+        client_id,
+        Path::new(&outcome.path),
+        outcome.revision.as_deref(),
+    )?;
     Ok(())
 }
 
@@ -6346,6 +6378,68 @@ pub fn migrate_to_gateway(client_id: &str, profile: Option<&str>) -> Result<Writ
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
         revision_outcome(client_id, migrate_to_gateway_inner(client_id, profile))
+    })
+}
+
+/// Snapshot token binds review to the whole config, including credential changes.
+/// Only its hash crosses the UI boundary.
+pub fn setup_revision(client_id: &str) -> Result<String, String> {
+    let def = find_def(client_id).ok_or("Unknown client")?;
+    let path = resolved_definition_path(&def)?;
+    let content = if mutation::exists(&path) {
+        read_config_file(&path)?
+    } else {
+        String::new()
+    };
+    Ok(crate::registry::sha256_hex(&format!(
+        "{}:{}:{content}",
+        path.display(),
+        mutation::exists(&path)
+    )))
+}
+
+/// Hold the existing config transaction while the reviewed servers are imported
+/// and verified. No native definition is removed until verification succeeds.
+pub(crate) fn migrate_reviewed(
+    client_id: &str,
+    profile: Option<&str>,
+    names: &[String],
+    revision: &str,
+    mut prepare: impl FnMut() -> Result<(), String>,
+) -> Result<WriteOutcome, String> {
+    let def = find_def(client_id).ok_or("Unknown client")?;
+    let path = resolved_definition_path(&def)?;
+    mutation::run(client_id, &path, def.format, || {
+        if setup_revision(client_id)? != revision {
+            return Err(
+                "Client config changed. Review it again before connecting. Config unchanged."
+                    .into(),
+            );
+        }
+        prepare()?;
+        let backup = backup_file(client_id, &path)?;
+        moved::record(client_id, def.format, &path)?;
+        moved::remove_selected(def.format, &path, names)?;
+        let entry = gateway_entry(profile, client_id)?;
+        edit_format(
+            def.format,
+            &path,
+            Some(&entry),
+            config_is_whole_app_state(client_id),
+        )?;
+        revision_outcome(
+            client_id,
+            Ok(WriteOutcome {
+                path: path.display().to_string(),
+                backup: backup.map(|p| p.display().to_string()),
+                managed: Some(ManagedEntry::from_gateway_entry(&entry)),
+                restored: Vec::new(),
+                used_move_record: false,
+                revision: None,
+                warnings: Vec::new(),
+                recovery_path: None,
+            }),
+        )
     })
 }
 

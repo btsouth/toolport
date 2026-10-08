@@ -13,6 +13,7 @@ mod package_updates;
 mod pairing;
 mod settings;
 mod single_instance;
+mod setup;
 mod state;
 mod teams;
 mod theme;
@@ -119,7 +120,12 @@ pub fn run() {
     let bridge_for_open = bridge.clone();
     let notice_for_open = startup_notice.clone();
     app.connect_open(move |app, files, _hint| {
-        if files.iter().any(|file| crate::teams::parse_pair_link(file.uri().as_str()).is_some()) { let _ = onboarding::mark_complete(); }
+        if files
+            .iter()
+            .any(|file| crate::teams::parse_pair_link(file.uri().as_str()).is_some())
+        {
+            let _ = onboarding::mark_complete();
+        }
         build_window(
             app,
             theme::ThemeController::new(),
@@ -2039,7 +2045,7 @@ impl ClientPage {
         body.add_css_class("toolport-editor-body");
         body.append(
             &gtk::Label::builder()
-                .label("Review the local servers Toolport found. Imported servers start disabled so you can inspect credentials and commands before enabling them.")
+                .label("Review the local servers Toolport found. Valid servers turn on. Servers needing credentials or launch values stay off until setup is complete.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
@@ -2491,33 +2497,6 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.set_halign(gtk::Align::End);
     actions.set_valign(gtk::Align::Center);
-    if !client.uses_connectors
-        && client.movable_server_count > 0
-        && !client.config_error
-        && client.gateway_state != state::ClientGatewayState::Connected
-    {
-        let migrate = gtk::Button::with_label(&format!("Move in {}", client.movable_server_count));
-        migrate.add_css_class("toolport-secondary-action");
-        migrate.set_tooltip_text(Some(&format!(
-            "Import the {} {} this client manages directly, then rewrite its config to use only the Toolport gateway",
-            client.movable_server_count,
-            if client.movable_server_count == 1 {
-                "server"
-            } else {
-                "servers"
-            }
-        )));
-        let client_for_migrate = client.clone();
-        let page_for_migrate = page.clone();
-        migrate.connect_clicked(move |button| {
-            confirm_client_migrate(
-                &client_for_migrate,
-                button.clone(),
-                page_for_migrate.clone(),
-            );
-        });
-        actions.append(&migrate);
-    }
     if client.legacy_bearer_argv {
         let warning = gtk::Label::new(Some("This older HTTP connection exposes a bearer credential in process arguments. Review migration to stdio; it stays unchanged until you confirm."));
         warning.set_wrap(true);
@@ -2538,12 +2517,9 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             let client_for_connect = client.clone();
             let page_for_connect = page.clone();
             connect.connect_clicked(move |button| {
-                run_client_mutation(
+                confirm_client_migrate(
                     &client_for_connect,
-                    true,
-                    false,
-                    None,
-                    button,
+                    button.clone(),
                     page_for_connect.clone(),
                 );
             });
@@ -2590,61 +2566,46 @@ fn confirm_client_migrate(client: &state::ClientView, button: gtk::Button, page:
     let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else {
         return;
     };
-    let count = client.movable_server_count;
-    let mut body = format!(
-        "Toolport imports the {count} {} this client manages directly, turns them on, backs the config up, and rewrites it to contain only the Toolport gateway. Plugin-managed servers are left untouched. Secret values are never read from the client; add them under Credentials after the move.",
-        if count == 1 { "server" } else { "servers" }
-    );
-    let force = client.gateway_state == state::ClientGatewayState::Customized;
-    if force {
-        body.push_str(
-            "\n\nThis client's Toolport entry has a custom configuration; migrating replaces it with the default gateway entry.",
-        );
-    }
-    #[allow(deprecated)]
-    let dialog = adw::MessageDialog::new(
-        Some(&parent),
-        Some(&format!("Move {}'s servers into Toolport?", client.name)),
-        Some(&body),
-    );
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("migrate", "Move into gateway");
-    dialog.set_close_response("cancel");
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_response_appearance("migrate", adw::ResponseAppearance::Suggested);
     let client = client.clone();
-    dialog.connect_response(None, move |dialog, response| {
-        if response == "migrate" {
-            button.set_sensitive(false);
-            page.show_progress("Moving servers into Toolport…");
-            let client_id = client.id.clone();
-            let client_name = client.name.clone();
-            let scope = client.scope_id.clone();
-            let page = page.clone();
-            let button = button.clone();
-            gtk::glib::spawn_future_local(async move {
-                let result = gtk::gio::spawn_blocking(move || {
-                    crate::registry_controller::migrate_client(&client_id, scope.as_deref(), force)
-                })
-                .await;
-                button.set_sensitive(true);
-                match result {
-                    Ok(Ok(outcome)) => {
-                        page.refresh_with_confirmation(migrate_feedback(
-                            &client_name,
-                            outcome.imported,
-                            outcome.moved.len(),
-                            outcome.result.outcome.backup.is_some(),
-                        ));
-                    }
-                    Ok(Err(error)) => page.show_error(&format!("{client_name}: {error}")),
-                    Err(_) => page.show_error(&format!("{client_name}: the migration stopped")),
-                }
-            });
+    button.set_sensitive(false);
+    gtk::glib::spawn_future_local(async move {
+        let client_id = client.id.clone();
+        let preview = gtk::gio::spawn_blocking(move || {
+            crate::registry_controller::preview_client_setup(&client_id)
+        })
+        .await;
+        button.set_sensitive(true);
+        match preview {
+            Ok(Ok(review)) => {
+                let disclosure = format!("Config: {}\nBackup directory: {}\nSelected direct entries move after gateway verification. Unchecked entries and plugin servers stay in place.", review.config_path, review.backup_dir);
+                let revision = review.revision;
+                let id = client.id;
+                let scope = client.scope_id;
+                let force = client.gateway_state == state::ClientGatewayState::Customized;
+                let refresh = page.clone();
+                setup::review(
+                    &parent,
+                    "Review and connect",
+                    review.items,
+                    &disclosure,
+                    "Connect to Toolport",
+                    move |selected| {
+                        let outcome = crate::registry_controller::migrate_client_reviewed(
+                            &id,
+                            scope.as_deref(),
+                            force,
+                            &selected,
+                            &revision,
+                        )?;
+                        Ok(format!("Connected. Restart the client.\nConfig: {}\nBackup: {}\nGateway tools your agent will see:\n{}", outcome.result.outcome.path, outcome.result.outcome.backup.as_deref().unwrap_or("No previous config"), outcome.tools.iter().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>().join("\n")))
+                    },
+                    move || refresh.refresh(),
+                );
+            }
+            Ok(Err(error)) => page.show_error(&error),
+            Err(_) => page.show_error("Could not review client config."),
         }
-        dialog.close();
     });
-    dialog.present();
 }
 
 fn append_client_discovery_actions(
@@ -2934,7 +2895,12 @@ fn run_client_mutation(
                         "Disconnected {client_name} from Toolport. Restart {client_name} to apply it."
                     )
                 };
-                page.refresh_with_confirmation(std::iter::once(message).chain(result.outcome.warnings).collect::<Vec<_>>().join(" "));
+                page.refresh_with_confirmation(
+                    std::iter::once(message)
+                        .chain(result.outcome.warnings)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
             }
             Ok(Err(error)) => page.show_error(&format!("{client_name}: {error}")),
             Err(_) => page.show_error(&format!("{client_name}: the operation stopped")),
@@ -5943,7 +5909,8 @@ fn build_content(
     }
     page.append(&summary);
     let short = adw::Breakpoint::new(
-        adw::BreakpointCondition::parse("max-height: 450px").expect("static short-window condition"),
+        adw::BreakpointCondition::parse("max-height: 450px")
+            .expect("static short-window condition"),
     );
     short.add_setter(&intro, "visible", Some(&false.to_value()));
     short.add_setter(&description, "visible", Some(&false.to_value()));
@@ -6100,26 +6067,47 @@ fn build_content(
 
 fn open_shared_setup(url: &str, page: ServerPage) {
     if let Some((origin, team)) = crate::teams::parse_pair_link(url) {
-        if crate::registry::load().is_ok_and(|reg| crate::teams::pair_target_is_current(&reg, &origin, &team)) {
-            if let Some(action) = page.app.lookup_action("show-teams") { action.activate(None); }
-            if let Some(window) = page.app.active_window() { window.present(); }
+        if crate::registry::load()
+            .is_ok_and(|reg| crate::teams::pair_target_is_current(&reg, &origin, &team))
+        {
+            if let Some(action) = page.app.lookup_action("show-teams") {
+                action.activate(None);
+            }
+            if let Some(window) = page.app.active_window() {
+                window.present();
+            }
             return;
         }
-        for window in page.app.windows() { if window.title().as_deref() == Some("Toolport setup") { window.close(); } }
-        let (parent_app, connected_app, feedback) = (page.app.clone(), page.app.clone(), page.clone());
+        for window in page.app.windows() {
+            if window.title().as_deref() == Some("Toolport setup") {
+                window.close();
+            }
+        }
+        let (parent_app, connected_app, feedback) =
+            (page.app.clone(), page.app.clone(), page.clone());
         let hooks = pairing::PairingHooks {
             parent: Box::new(move || parent_app.active_window()),
             feedback: Box::new(move |message, error| feedback.show_feedback(message, error)),
             connected: Box::new(move || {
-                if let Some(action) = connected_app.lookup_action("show-teams") { action.activate(None); }
-                if let Some(window) = connected_app.active_window() { window.present(); }
+                if let Some(action) = connected_app.lookup_action("show-teams") {
+                    action.activate(None);
+                }
+                if let Some(window) = connected_app.active_window() {
+                    window.present();
+                }
             }),
-            open_url: Box::new(|url| { let _ = crate::oauth::open_web_url(url); }),
+            open_url: Box::new(|url| {
+                let _ = crate::oauth::open_web_url(url);
+            }),
         };
         let pair_origin = origin.clone();
-        pairing::request(hooks, &origin, Box::new(move |cancel, show| {
-            crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
-        }));
+        pairing::request(
+            hooks,
+            &origin,
+            Box::new(move |cancel, show| {
+                crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
+            }),
+        );
         return;
     }
     let Some(id) = crate::sharing_controller::parse_share_url(url) else {
