@@ -452,6 +452,8 @@ export function ServerDialog({
             key: e.key,
             secret: e.secret ?? true,
             present: !!e.value && !/^\$\{[^}]+\}$/.test(e.value),
+            // Snippets have no launch metadata; Import::prepare requires every env key.
+            required: true,
           })),
           isNew: true,
         }))}
