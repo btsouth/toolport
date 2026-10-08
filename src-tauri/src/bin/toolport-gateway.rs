@@ -4578,7 +4578,7 @@ fn execute_call(
     // Scoped to the executing server (SBS-605): a token only resolves for a server
     // that already produced that value. Anything else is refused here rather than
     // dispatched, which is what closes the cross-server exfiltration path.
-    let arguments = match rehydrate_for_downstream(client, srv, name, arguments) {
+    let arguments = match rehydrate_for_downstream(client, server_id, name, arguments) {
         Ok(args) => args,
         Err(msg) => {
             return json!({
@@ -4595,7 +4595,7 @@ fn execute_call(
     // rehydration on the same leg. A host that answers an elicitation from model
     // context puts `⟦EMAIL_1⟧` in `inputResponses`, and the server would receive a
     // pseudonym where an address belongs (SBS-606).
-    let rehydrated_mrtr = match rehydrate_mrtr_for_downstream(client, srv, name, effective_mrtr) {
+    let rehydrated_mrtr = match rehydrate_mrtr_for_downstream(client, server_id, name, effective_mrtr) {
         Ok(m) => m,
         Err(msg) => {
             return json!({
@@ -19674,6 +19674,55 @@ mod tests {
             BTreeSet::from(["⟦EMAIL_1⟧".to_string()]),
             "approving one destination must not release the value to any other"
         );
+    }
+
+    #[test]
+    fn p08b_pii_prompt_keeps_the_canonical_destination_and_client_identity() {
+        let env = pii_test_env("p08b-pii-identity");
+        let asked = stub_broker(&env.dir, approval::ApprovalDecision::Approved);
+        let client = Some("client:real");
+        let _label = ClientLabelGuard::enter(Some("Claude Code 2.1".into()));
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+        let reg = Registry::default();
+        let router = routed_router("team-slack", "read");
+        let _ = execute_call(
+            &reg,
+            &router,
+            &router.aggregated_tools(),
+            client,
+            None,
+            None,
+            None,
+            "team_slack__read",
+            json!({"to":"⟦EMAIL_1⟧"}),
+            None,
+            None,
+            CallOpts {
+                direct: true,
+                shape: true,
+                allow_app_only: false,
+            },
+            None,
+        );
+        let request = asked.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(request.client.as_deref(), client);
+        assert_eq!(request.client_label.as_deref(), Some("Claude Code 2.1"));
+        assert_eq!(request.server, "team-slack");
+        assert_eq!(request.pii_release.unwrap().server, "team-slack");
+        let decisions = audit::read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row["kind"] == "approval")
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0]["serverId"], "team-slack");
+        with_pii_session(client, |map| {
+            assert!(map.rehydrate("team_slack", "⟦EMAIL_1⟧").refused.is_empty());
+            assert!(!map.rehydrate("other", "⟦EMAIL_1⟧").refused.is_empty());
+        });
     }
 
     #[test]
