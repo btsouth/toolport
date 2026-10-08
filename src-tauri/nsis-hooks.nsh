@@ -62,7 +62,7 @@
   ${If} $UpdateMode != 1
     ; The template checks again after this hook, but cancellation must precede
     ; disconnecting clients while the gateway binary still exists.
-    !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+    !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
     nsExec::ExecToLog /TIMEOUT=30000 '"$INSTDIR\toolport-gateway.exe" --disconnect-all'
     Pop $0
     ${If} $0 != 0

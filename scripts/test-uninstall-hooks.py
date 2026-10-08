@@ -177,6 +177,7 @@ exit 1''',
         self.assertLess(recovery.index("Exec '"), recovery.index("IfSilent"))
         self.assertIn("MessageBox MB_OK", recovery)
         uninstall = hooks.split("!macro NSIS_HOOK_PREUNINSTALL", 1)[1].split("!macroend", 1)[0]
+        self.assertIn('!insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"', uninstall)
         self.assertLess(uninstall.index("!insertmacro CheckIfAppIsRunning"), uninstall.index("--disconnect-all"))
 
 
