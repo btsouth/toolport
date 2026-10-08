@@ -70,6 +70,31 @@ impl Fixture {
         self.dir.join("client/.claude.json")
     }
 }
+fn assert_fixture_cleanup(condition: bool, message: &str) {
+    if !std::thread::panicking() {
+        assert!(condition, "{message}");
+    }
+}
+
+#[test]
+fn reviewed_fixture_cleanup_preserves_original_panic() {
+    struct Probe;
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            assert_fixture_cleanup(false, "cleanup failed");
+        }
+    }
+    let panic = std::panic::catch_unwind(|| {
+        let _probe = Probe;
+        panic!("original verification failure");
+    })
+    .unwrap_err();
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"original verification failure")
+    );
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         if let Ok(files) = std::fs::read_dir(self.dir.join("data")) {
@@ -105,9 +130,7 @@ impl Drop for Fixture {
                                 .unwrap()
                                 .join("toolport-gateway");
                             let owned = image.is_ok_and(|image| image == private_image);
-                            if !std::thread::panicking() {
-                                assert!(owned);
-                            }
+                            assert_fixture_cleanup(owned, "fixture daemon image changed");
                             if !owned {
                                 continue;
                             }
@@ -116,9 +139,7 @@ impl Drop for Fixture {
                             // removing the executable or its private data.
                             let killed =
                                 unsafe { libc::kill(descriptor.pid as i32, libc::SIGKILL) };
-                            if !std::thread::panicking() {
-                                assert_eq!(killed, 0);
-                            }
+                            assert_fixture_cleanup(killed == 0, "could not reap fixture daemon");
                             let deadline =
                                 std::time::Instant::now() + std::time::Duration::from_secs(10);
                             while std::fs::read_link(format!("/proc/{}/exe", descriptor.pid))
@@ -136,13 +157,10 @@ impl Drop for Fixture {
                             }
                         }
                         conduit_lib::daemon::clear_descriptor(&file.path());
-                        if !std::thread::panicking() {
-                            assert!(
-                                !running() && !file.path().exists(),
-                                "private fixture daemon {} did not shut down",
-                                descriptor.pid
-                            );
-                        }
+                        assert_fixture_cleanup(
+                            !running() && !file.path().exists(),
+                            "private fixture daemon did not shut down",
+                        );
                     }
                 }
             }
