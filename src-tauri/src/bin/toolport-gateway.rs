@@ -33213,7 +33213,32 @@ mod tests {
     #[test]
     fn watch_tick_publishes_client_discovery_without_catalog_fanout() {
         let _env = DataDirTestEnv::new("client-discovery-tick");
-        let live = Registry::default();
+        let mut live = Registry::default();
+        live.servers = vec![stub_server("one", "One"), stub_server("two", "Two")];
+        for server in &mut live.servers {
+            server.enabled = true;
+        }
+        let mut router = router_with_registry_policy(&live);
+        let mut growing = DownstreamServer::connect(
+            "one".into(),
+            Box::new(MockRoute {
+                tools: vec![json!({"name": "echo"}), json!({"name": "greet"})],
+            }),
+        )
+        .unwrap();
+        // The next real tools/list publishes greet; the current catalog has echo.
+        growing.tools.retain(|tool| tool["name"] == "echo");
+        router.add(growing);
+        router.add(
+            DownstreamServer::connect(
+                "two".into(),
+                Box::new(MockRoute {
+                    tools: vec![json!({"name": "echo"})],
+                }),
+            )
+            .unwrap(),
+        );
+        let cached = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
         let reg_path = registry::resolved_path().unwrap();
         let mut on_disk = live.clone();
         on_disk.set_client_discovery("cursor", Some("lazy"));
@@ -33226,8 +33251,8 @@ mod tests {
         let host = host_from_parts(
             Arc::new(Mutex::new(live.clone())),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(Mutex::new(Arc::new(router_with_registry_policy(&live)))),
-            Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
+            Arc::new(Mutex::new(Arc::new(router))),
+            Arc::new(Mutex::new(cached)),
             Arc::new(AtomicU8::new(0)),
             Arc::new(|_| None),
             Arc::new(Mutex::new(())),
@@ -33235,11 +33260,20 @@ mod tests {
             None,
         );
         host.set_discovery_mode(DiscoveryMode::Full);
-        let unrelated = Arc::new(SessionState::new_http(None));
-        host.mcp_sessions
-            .lock()
-            .unwrap()
-            .insert("unrelated".into(), Arc::clone(&unrelated));
+        let session = |server: &str| {
+            Arc::new(SessionState::new_http(Some(McpSessionOwner {
+                identity: server.into(),
+                profile: None,
+                tool_scope: None,
+                scope: Some(vec![server.into()]),
+            })))
+        };
+        let authorized = session("one");
+        let unrelated = session("two");
+        host.mcp_sessions.lock().unwrap().extend([
+            ("authorized".into(), Arc::clone(&authorized)),
+            ("unrelated".into(), Arc::clone(&unrelated)),
+        ]);
         let before = Arc::clone(&host.router.lock().unwrap());
         watch_tick(
             &reg_path,
@@ -33256,6 +33290,7 @@ mod tests {
         assert_eq!(host.discovery_mode(), DiscoveryMode::Lazy);
         let published = host.registry.lock().unwrap();
         assert_eq!(published.client_discovery_mode("new-client"), Some("full"));
+        drop(published);
         assert!(
             unrelated.outbound.lock().unwrap().is_empty(),
             "one client's discovery choice must not notify unrelated sessions"
@@ -33264,6 +33299,38 @@ mod tests {
             Arc::ptr_eq(&before, &host.router.lock().unwrap()),
             "discovery choices must not rebuild downstream catalogs"
         );
+
+        // A discovery edit can land in the same tick as a downstream change.
+        // It must not consume that change via an unscoped registry rebuild.
+        on_disk.set_client_discovery("new-client", Some("lazy"));
+        registry::save_to(&reg_path, &on_disk).unwrap();
+        watcher.last_mtime = None;
+        host.downstream_dirty
+            .store(downstream::change::TOOLS, Ordering::SeqCst);
+        watch_tick(
+            &reg_path,
+            &test_stdio_session(),
+            &Arc::new(Mutex::new(None)),
+            Some("cursor"),
+            None,
+            false,
+            &Arc::new(Mutex::new(None)),
+            None,
+            &mut watcher,
+            &host,
+        );
+        assert!(unrelated.outbound.lock().unwrap().is_empty());
+        let queue = authorized.outbound.lock().unwrap();
+        assert_eq!(queue.len(), 1, "the authorized session must be notified");
+        let notification: Value = serde_json::from_str(&queue[0].json).unwrap();
+        assert_eq!(notification["method"], "notifications/tools/list_changed");
+        assert!(host
+            .router
+            .lock()
+            .unwrap()
+            .aggregated_tools()
+            .iter()
+            .any(|tool| tool["name"] == "one__greet"));
     }
 
     /// P1.3: the discovery mode belongs to the host, so one host's switch cannot decide what
