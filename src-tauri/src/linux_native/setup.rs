@@ -327,16 +327,14 @@ pub(super) fn review(
                                 .split_once(". ")
                                 .map_or(outcome.message.as_str(), |(title, _)| title),
                         )
-                        .description(
-                            outcome
-                                .message
-                                .split_once(". ")
-                                .map_or("", |(_, description)| description),
-                        )
                         .build();
                     status.add_css_class("compact");
                     status.set_vexpand(false);
                     body.prepend(&status);
+                    if let Some((_, description)) = outcome.message.split_once(". ") {
+                        let next_step = gtk::Label::builder().label(description).wrap(true).build();
+                        body.insert_child_after(&next_step, Some(&status));
+                    }
                     let results = gtk::ListBox::new();
                     results.add_css_class("boxed-list");
                     results.set_selection_mode(gtk::SelectionMode::None);
@@ -586,6 +584,52 @@ mod tests {
             .unwrap();
         button.emit_clicked();
         assert!(!window.is_visible(), "Close must close the error dialog");
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display"]
+    fn successful_review_shows_restart_and_only_done() {
+        adw::init().unwrap();
+        let parent = gtk::Window::new();
+        review(
+            &parent,
+            "Success fixture",
+            Vec::new(),
+            "Fixture",
+            "Connect",
+            |_, _, _| Ok("Claude Code connected. Restart it to load Toolport.".into()),
+            || {},
+            None,
+        );
+        let window = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Window>().ok())
+            .find(|w| w.title().as_deref() == Some("Success fixture"))
+            .unwrap();
+        let widgets = descendants(window.upcast_ref());
+        let connect = widgets
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .find(|b| b.label().as_deref() == Some("Connect"))
+            .unwrap();
+        connect.emit_clicked();
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while connect.label().as_deref() != Some("Done") && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        assert_eq!(connect.label().as_deref(), Some("Done"));
+        let widgets = descendants(window.upcast_ref());
+        assert!(widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .any(|label| label.text() == "Restart it to load Toolport." && label.is_visible()));
+        assert!(!widgets
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Button>())
+            .any(|b| b.label().as_deref() == Some("Connect")));
+        window.close();
     }
 
     #[test]
