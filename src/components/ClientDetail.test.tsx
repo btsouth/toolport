@@ -241,6 +241,7 @@ describe("ClientDetail customized entry (SOU-406)", () => {
       registry: reg,
       moved: ["calendar"],
       tools: [{ name: "calendar__read" }],
+      servers: [{ name: "calendar", toolCount: 2, credentialState: "none" }],
       outcome: { path: "/fixture/client.json", backup: "/fixture/backups/previous.json" },
     });
     render(
@@ -289,6 +290,7 @@ describe("ClientDetail reviewed connection", () => {
       imported: 1,
       moved: ["calendar"],
       tools: [{ name: "calendar__read" }],
+      servers: [{ name: "calendar", toolCount: 2, credentialState: "none" }],
       outcome: { path: "/fixture/client.json", backup: "/fixture/backups/previous.json" },
     });
     render(
@@ -300,12 +302,15 @@ describe("ClientDetail reviewed connection", () => {
       />,
     );
     await userEvent.click(screen.getByRole("button", { name: /connect to toolport/i }));
-    expect(await screen.findByText(/Backup saved to/)).toHaveTextContent(
+    await userEvent.click(await screen.findByText("Details"));
+    expect(await screen.findByText(/Backups will be saved/)).toHaveTextContent(
       "/fixture/backups",
     );
     expect(migrateClient).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole("button", { name: /connect to toolport/i }));
+    await userEvent.click(await screen.findByText("What your agent sees"));
     expect(await screen.findByText("calendar__read")).toBeVisible();
+    await userEvent.click(screen.getByText("Details"));
     expect(screen.getByText("Restart Claude Desktop to load Toolport.")).toBeVisible();
     expect(screen.getByText("Backup: /fixture/backups/previous.json")).toBeVisible();
     expect(installGateway).not.toHaveBeenCalled();

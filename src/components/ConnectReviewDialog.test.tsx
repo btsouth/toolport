@@ -61,7 +61,7 @@ it("keeps the failed selection for retry and collapses raw paths", async () => {
       onConnected={vi.fn()}
     />,
   );
-  await screen.findByText("one");
+  await screen.findByRole("button", { name: /one/ });
   await userEvent.click(screen.getByRole("button", { name: /two/ }));
   expect(screen.queryByText(/Backup saved/)).not.toBeInTheDocument();
   await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
@@ -94,7 +94,7 @@ it("shows downstream tool counts and only Done on success", async () => {
       onConnected={vi.fn()}
     />,
   );
-  await screen.findByText("one");
+  await screen.findByRole("button", { name: /one/ });
   await userEvent.click(screen.getByRole("button", { name: "Connect to Toolport" }));
   expect(await screen.findByText(/7 tools/)).toBeVisible();
   expect(

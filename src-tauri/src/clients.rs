@@ -6381,7 +6381,7 @@ pub(crate) fn migrate_reviewed(
         }
         prepare()?;
         let backup = backup_file(client_id, &path)?;
-        moved::record(client_id, def.format, &path, names)?;
+        moved::record_selected(client_id, def.format, &path, names)?;
         moved::remove_selected(def.format, &path, names)?;
         let entry = gateway_entry(profile, client_id)?;
         edit_format(

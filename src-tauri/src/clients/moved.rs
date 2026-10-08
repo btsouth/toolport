@@ -151,7 +151,16 @@ pub(super) fn recorded_paths() -> Vec<(String, PathBuf, Result<Format, String>)>
 /// Copy every non-gateway entry in `path` into the client's move record before
 /// migration strips them. Entries already recorded by an earlier move are kept;
 /// a name moved again takes its newest definition.
-pub(super) fn record(
+#[cfg(test)]
+pub(super) fn record(client_id: &str, format: Format, path: &Path) -> Result<(), String> {
+    let names = extract(container(format), &read_config_file(path)?)?
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    record_selected(client_id, format, path, &names)
+}
+
+pub(super) fn record_selected(
     client_id: &str,
     format: Format,
     path: &Path,
