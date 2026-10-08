@@ -38323,21 +38323,36 @@ mod tests {
         *host.router.lock().unwrap() = Arc::clone(&router);
         let (view, snapshot) =
             host.router_for_adapter_profile(Arc::clone(&router), &reg, "adapter");
+        let allowed = HashSet::from(["alpha".to_string()]);
         let _profile = ConnectionProfileGuard::enter(Some("adapter".into()));
         for mode in [
             DiscoveryMode::Full,
             DiscoveryMode::Lazy,
             DiscoveryMode::Grouped,
         ] {
-            let surfaces =
-                cached_tool_surfaces(&host, &reg, &view, &snapshot, None, Some("adapter"), mode);
-            let expected = tool_surface(&host, &reg, &view, &snapshot.tools, None, mode);
+            let surfaces = cached_tool_surfaces(
+                &host,
+                &reg,
+                &view,
+                &snapshot,
+                Some(&allowed),
+                Some("adapter"),
+                mode,
+            );
+            let expected = tool_surface(&host, &reg, &view, &snapshot.tools, Some(&allowed), mode);
             assert_eq!(
                 surfaces.1.json.get().as_bytes(),
                 serde_json::to_vec(&expected).unwrap()
             );
-            let warm =
-                cached_tool_surfaces(&host, &reg, &view, &snapshot, None, Some("adapter"), mode);
+            let warm = cached_tool_surfaces(
+                &host,
+                &reg,
+                &view,
+                &snapshot,
+                Some(&allowed),
+                Some("adapter"),
+                mode,
+            );
             assert_eq!(
                 warm.1.json.get().as_bytes(),
                 serde_json::to_vec(&expected).unwrap()
@@ -38404,6 +38419,20 @@ mod tests {
             let cache = host.tool_surfaces.lock().unwrap();
             assert!(cache.bytes <= TOOL_SURFACE_CACHE_BYTES);
             assert!(cache.entries.len() <= TOOL_SURFACE_CACHE_VIEWS);
+        }
+        for mode in [DiscoveryMode::Lazy, DiscoveryMode::Grouped] {
+            let (full, exposed) =
+                cached_tool_surfaces(&host, &reg, &router, &large, None, Some("summary"), mode);
+            let rebuilt =
+                build_tool_surfaces(&reg, &router, &large, None, DiscoveryMode::Full, &full.key).1;
+            assert_eq!(full.hash, rebuilt.hash);
+            assert_eq!(full.bytes, rebuilt.json.get().len() as u64);
+            assert!(full.retained_bytes() + exposed.retained_bytes() < full.bytes as usize / 4);
+            eprintln!(
+                "10k {mode:?}: {} full bytes; {} retained summary/exposed bytes",
+                full.bytes,
+                full.retained_bytes() + exposed.retained_bytes()
+            );
         }
         let cache = host.tool_surfaces.lock().unwrap();
         eprintln!(
