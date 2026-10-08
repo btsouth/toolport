@@ -136,7 +136,7 @@ fn simultaneous_unauthorized_posts_share_one_forced_refresh() {
     });
     let refreshed = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&refreshed);
-    let refresh: RefreshFn = Box::new(move |force| {
+    let refresh: RefreshFn = Box::new(move |force, _| {
         if force {
             counted.fetch_add(1, Ordering::SeqCst);
             Ok(Some("fresh".into()))
@@ -513,7 +513,7 @@ fn failed_forced_refresh_probe(concurrent: bool) {
     const BUSY: &str = "OAuth refresh is busy or its cross-process lock is unavailable; try again.";
     let attempts = Arc::new(AtomicUsize::new(0));
     let forced = Arc::clone(&attempts);
-    let refresh: RefreshFn = Box::new(move |force| {
+    let refresh: RefreshFn = Box::new(move |force, _| {
         if !force {
             return Ok(None);
         }

@@ -5235,8 +5235,10 @@ fn ids_match(got: Option<&Value>, wanted: Option<&Value>) -> bool {
 /// A callback that can proactively mint a fresh token before expiry or force a
 /// refresh after a 401/403. `force = false` returns `Ok(None)` when the current
 /// token is still fresh. A proactive error may fall back to the current token;
-/// a forced error is surfaced as a per-server authentication failure.
-pub type RefreshFn = Box<dyn Fn(bool) -> Result<Option<String>, String> + Send + Sync>;
+/// a forced error is surfaced as a per-server authentication failure. Forced calls
+/// pass the rejected bearer so the callback can adopt or exchange atomically.
+pub type RefreshFn =
+    Box<dyn Fn(bool, Option<&str>) -> Result<Option<String>, String> + Send + Sync>;
 
 /// Interactive OAuth step-up callback. Unlike a refresh-token exchange, this
 /// obtains user consent for the challenged scope and returns a new access token.
@@ -6255,7 +6257,7 @@ impl HttpTransport {
             if failed && self.reuse_stored_auth(&current).unwrap_or(false) {
                 return Ok(());
             }
-            match refresh(false) {
+            match refresh(false, None) {
                 Ok(Some(token)) => {
                     *self
                         .auth
@@ -6356,9 +6358,6 @@ impl HttpTransport {
         if current != rejected {
             return Ok(());
         }
-        if self.reuse_stored_auth(&rejected)? {
-            return Ok(());
-        }
         if let Some(failure) = self
             .refresh_failure
             .lock()
@@ -6375,11 +6374,16 @@ impl HttpTransport {
             )));
         };
         if self.forced_refresh_spent() {
+            // Adoption is still allowed after spending the exchange budget. This
+            // lookup never leads to an exchange, so there is no check-then-act race.
+            if self.reuse_stored_auth(&rejected)? {
+                return Ok(());
+            }
             return Err(TransportError::Fatal(format!(
                 "HTTP {code} (needs authentication): refreshed token rejected"
             )));
         }
-        let result = match refresh(true) {
+        let result = match refresh(true, rejected.as_deref()) {
             Ok(Some(token)) => {
                 self.publish_refreshed_auth(token);
                 return Ok(());
@@ -11037,7 +11041,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/");
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&refresh_calls);
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             assert!(!force);
             if calls.fetch_add(1, Ordering::SeqCst) == 1 {
                 Ok(Some("fresh".to_string()))
@@ -14463,7 +14467,7 @@ mod tests {
 
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&refresh_calls);
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             assert!(
                 !force,
                 "successful proactive refresh should avoid a forced retry"
@@ -14528,7 +14532,7 @@ mod tests {
             let _ = req.respond(tiny_http::Response::from_string(body).with_header(ct));
         });
 
-        let refresh: Option<RefreshFn> = Some(Box::new(|force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(|force, _| {
             assert!(!force);
             Err("temporary OAuth endpoint failure".to_string())
         }));
@@ -14581,9 +14585,12 @@ mod tests {
                 let mut transport = HttpTransport::with_auth_refresh(
                     &url,
                     Some("stale".into()),
-                    Some(Box::new(|force| {
-                        assert!(!force, "a saved winner must avoid another exchange");
-                        Ok(None)
+                    Some(Box::new(move |force, rejected| {
+                        if force {
+                            crate::remote::refresh_token(server_id, rejected).map(Some)
+                        } else {
+                            Ok(None)
+                        }
                     })),
                 );
                 transport.set_server_id(server_id);
@@ -14681,9 +14688,16 @@ mod tests {
                 let mut transport = HttpTransport::with_auth_refresh(
                     &url,
                     Some("old".into()),
-                    Some(Box::new(move |force| {
+                    Some(Box::new(move |force, rejected| {
                         if force || proactive {
                             attempts.fetch_add(1, Ordering::SeqCst);
+                            if force {
+                                assert_eq!(rejected, Some("old"));
+                                if let Some(token) = crate::remote::newer_credential(owner, "old")?
+                                {
+                                    return Ok(Some(token));
+                                }
+                            }
                             Err(failure.into())
                         } else {
                             Ok(None)
@@ -14700,30 +14714,38 @@ mod tests {
                     json!({"ok":true})
                 );
                 wire.join().unwrap();
-                assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    callbacks.load(Ordering::SeqCst),
+                    if proactive { 1 } else { 2 }
+                );
             }
         });
     }
 
     #[test]
     fn proactive_http_refresh_keeps_its_token_when_credential_lookup_fails() {
-        let owner = "__toolport_internal__";
-        assert!(crate::remote::current_credential(owner).is_err());
-        let mut transport = HttpTransport::with_auth_refresh(
-            "http://127.0.0.1:1/",
-            Some("valid-pending-token".into()),
-            Some(Box::new(|force| {
-                assert!(!force);
-                Ok(None)
-            })),
-        );
-        transport.set_server_id(owner);
-        transport.record_refresh_failure(Some("old".into()), "temporary vault failure".into());
-        transport.refresh_before_send().unwrap();
-        assert_eq!(
-            transport.auth.lock().unwrap().as_deref(),
-            Some("valid-pending-token")
-        );
+        crate::secrets::tests::with_isolated_vault(|| {
+            let owner = "http-read-failure";
+            let mut transport = HttpTransport::with_auth_refresh(
+                "http://127.0.0.1:1/",
+                Some("valid-pending-token".into()),
+                Some(Box::new(|force, rejected| {
+                    assert!(!force);
+                    assert_eq!(rejected, None);
+                    Ok(None)
+                })),
+            );
+            transport.set_server_id(owner);
+            transport.record_refresh_failure(Some("old".into()), "temporary vault failure".into());
+            crate::secrets::tests::with_failed_read(crate::secrets::HTTP_AUTH_KEY, || {
+                assert!(crate::remote::current_credential(owner).is_err());
+                transport.refresh_before_send().unwrap();
+                assert_eq!(
+                    transport.auth.lock().unwrap().as_deref(),
+                    Some("valid-pending-token")
+                );
+            });
+        });
     }
 
     #[test]
@@ -14731,7 +14753,7 @@ mod tests {
         let mut transport = HttpTransport::with_auth_refresh(
             "http://127.0.0.1:1/",
             Some("old".into()),
-            Some(Box::new(|_| {
+            Some(Box::new(|_, _| {
                 Err(
                     "OAuth refresh is busy or its cross-process lock is unavailable; try again."
                         .into(),
@@ -14749,7 +14771,7 @@ mod tests {
         let mut transport = HttpTransport::with_auth_refresh(
             "http://127.0.0.1:1/",
             Some("old".into()),
-            Some(Box::new(|force| {
+            Some(Box::new(|force, _| {
                 assert!(force);
                 Ok(Some("fresh".into()))
             })),
@@ -14764,7 +14786,7 @@ mod tests {
         let mut transport = super::HttpTransport::with_auth_refresh(
             "http://127.0.0.1:1/",
             Some("valid".into()),
-            Some(Box::new(|_| {
+            Some(Box::new(|_, _| {
                 panic!("busy gate must skip proactive callback")
             })),
         );
@@ -14985,7 +15007,7 @@ mod tests {
 
         let forced_refreshes = Arc::new(AtomicUsize::new(0));
         let forced = Arc::clone(&forced_refreshes);
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             if force {
                 forced.fetch_add(1, Ordering::SeqCst);
             }
@@ -15068,7 +15090,7 @@ mod tests {
         });
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let refresh_count = Arc::clone(&refresh_calls);
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             if force {
                 refresh_count.fetch_add(1, Ordering::SeqCst);
             }
@@ -15134,7 +15156,7 @@ mod tests {
 
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let refresh_count = Arc::clone(&refresh_calls);
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             if force {
                 refresh_count.fetch_add(1, Ordering::SeqCst);
             }
@@ -15193,7 +15215,7 @@ mod tests {
             }
         });
 
-        let refresh: Option<RefreshFn> = Some(Box::new(|force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(|force, _| {
             if force {
                 Ok(Some("fresh".to_string()))
             } else {
@@ -15260,7 +15282,7 @@ mod tests {
         });
 
         let url = format!("http://127.0.0.1:{port}/");
-        let refresh: Option<RefreshFn> = Some(Box::new(|force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(|force, _| {
             if force {
                 Ok(Some("fresh".to_string()))
             } else {
@@ -15328,7 +15350,7 @@ mod tests {
 
         let forced = Arc::new(AtomicUsize::new(0));
         let fc = Arc::clone(&forced);
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             if force {
                 // Each forced call is a refresh-token exchange with the provider.
                 let n = fc.fetch_add(1, Ordering::SeqCst);
@@ -15422,7 +15444,7 @@ mod tests {
         let fc = Arc::clone(&forced);
         // No proactive deadline: the non-forced arm always declines, exactly like
         // a provider that reported no `expires_in`.
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             if force {
                 let n = fc.fetch_add(1, Ordering::SeqCst);
                 Ok(Some(format!("minted-{n}")))
@@ -15499,7 +15521,7 @@ mod tests {
         let fc = Arc::clone(&forced);
         let proactive = Arc::new(AtomicUsize::new(0));
         let pc = Arc::clone(&proactive);
-        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force, _| {
             if force {
                 let n = fc.fetch_add(1, Ordering::SeqCst);
                 Ok(Some(format!("forced-{n}")))

@@ -1111,7 +1111,7 @@ fn authed_transport(
         let next_refresh_at = Arc::clone(&next_refresh_at);
         let credential_update = Arc::clone(&credential_update);
         let refreshed_during_connect = Arc::clone(&refreshed_during_connect);
-        Some(Box::new(move |force| {
+        Some(Box::new(move |force, rejected| {
             let deadline = *next_refresh_at
                 .lock()
                 .map_err(|_| "OAuth refresh deadline lock poisoned".to_string())?;
@@ -1151,7 +1151,7 @@ fn authed_transport(
                 },
                 &mut update,
                 force,
-                None,
+                rejected,
             ) {
                 Ok(refreshed) => refreshed,
                 Err(e) => {
@@ -2395,16 +2395,20 @@ mod tests {
             endpoint.seed();
             endpoint.release.send(()).unwrap();
             secrets::tests::with_failed_write(STATE_KEY, || {
-                assert_eq!(refresh_token("rotation").unwrap(), "token-1");
+                assert_eq!(refresh_token("rotation", None).unwrap(), "token-1");
             });
             for concurrent in [false, true] {
                 let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
                 let mut transport = HttpTransport::with_auth_refresh(
                     &format!("http://{}/", server.server_addr()),
                     Some("token-0".into()),
-                    Some(Box::new(|force| {
-                        assert!(!force, "the pending token must avoid another exchange");
-                        Ok(None)
+                    Some(Box::new(|force, rejected| {
+                        if force {
+                            assert_eq!(rejected, Some("token-0"));
+                            refresh_token("rotation", rejected).map(Some)
+                        } else {
+                            Ok(None)
+                        }
                     })),
                 );
                 transport.set_server_id("rotation");
@@ -2631,7 +2635,7 @@ mod tests {
         let mut transport = HttpTransport::with_auth_refresh(
             &url,
             Some("old-token".into()),
-            Some(Box::new(|_| Err(OAUTH_REFRESH_LOCK_ERROR.into()))),
+            Some(Box::new(|_, _| Err(OAUTH_REFRESH_LOCK_ERROR.into()))),
         );
         let worker = std::thread::spawn(move || {
             let mut request = server
@@ -2681,7 +2685,7 @@ mod tests {
                 let mut transport = HttpTransport::with_auth_refresh(
                     &url,
                     Some("old-token".into()),
-                    Some(Box::new(move |force| {
+                    Some(Box::new(move |force, _| {
                         if proactive || force {
                             Err(callback_error.clone())
                         } else {
