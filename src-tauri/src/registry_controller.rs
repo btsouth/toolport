@@ -1578,7 +1578,14 @@ fn verify_setup_gateway(
     client_id: &str,
     profile: Option<&str>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    for name in moved {
+    let context = registry.resolve_profile_id(profile.unwrap_or(""));
+    let mut intended = moved.to_vec();
+    for server in &registry.servers {
+        if registry.is_enabled(&context, &server.id) && !intended.contains(&server.name) {
+            intended.push(server.name.clone());
+        }
+    }
+    for name in &intended {
         let server = registry
             .servers
             .iter()
@@ -1622,7 +1629,7 @@ fn verify_setup_gateway(
     let mut gateway =
         crate::downstream::DownstreamServer::connect("setup-review".into(), Box::new(transport))
             .map_err(|_| "Gateway did not answer. Client config unchanged.")?;
-    for name in moved {
+    for name in &intended {
         let server = registry
             .servers
             .iter()

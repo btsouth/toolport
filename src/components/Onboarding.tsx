@@ -19,14 +19,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
-import {
-  getAuditLog,
-  importServers,
-  listStacks,
-  previewImportServers,
-  teamConnect,
-  teamJoinPoll,
-} from "@/lib/api";
+import { getAuditLog, listStacks, teamConnect, teamJoinPoll } from "@/lib/api";
 import { CollectionReviewDialog } from "@/components/CollectionReviewDialog";
 import { ClientLogo } from "@/components/ClientLogo";
 import { clientRestartHint } from "@/lib/clientConnect";
@@ -34,11 +27,9 @@ import { HOSTED_TEAMS_URL, TEAMS_MARKETING_URL, teamUrlError } from "@/lib/teamU
 import { Input } from "@/components/ui/input";
 import {
   importableServers,
-  isEnabled,
   isGatewayServer,
   type AuditEntry,
   type DetectedClient,
-  type ImportItem,
   type ProbeResult,
   type Registry,
   type Stack,
@@ -47,7 +38,6 @@ import { openExternal } from "@/lib/openUrl";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogTitle } from "@/components/ui/dialog";
 import { ConnectReviewDialog } from "@/components/ConnectReviewDialog";
-import { ImportReviewDialog } from "@/components/ImportReviewDialog";
 import { Skeleton } from "@/components/ui/skeleton";
 
 interface Props {
@@ -523,9 +513,6 @@ function AddServers({
   onBrowseCatalog: () => void;
   onNext: () => void;
 }) {
-  const [busy, setBusy] = useState(false);
-  const [importPreview, setImportPreview] = useState<ImportItem[] | null>(null);
-  const [imported, setImported] = useState<{ added: number; on: number } | null>(null);
   const [collections, setCollections] = useState<Stack[]>([]);
   const [collectionsLoading, setCollectionsLoading] = useState(true);
   const [collectionsError, setCollectionsError] = useState(false);
@@ -551,43 +538,6 @@ function AddServers({
   const have = new Set(registry.servers.flatMap(catalogInstalledIdentities));
   const collection = collections.find((s) => s.id === selected) ?? null;
 
-  async function doImport() {
-    setBusy(true);
-    try {
-      const preview = await previewImportServers();
-      if (preview.length === 0) {
-        toast.success("No new servers found in your clients");
-        return;
-      }
-      setImportPreview(preview);
-    } catch (e) {
-      toastError(`Couldn't prepare import: ${e}`);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function confirmImport(selected: string[]) {
-    setBusy(true);
-    try {
-      const next = await importServers(selected);
-      onImport(next);
-      const before = new Set(registry.servers.map((s) => s.id));
-      const added = next.servers.filter((s) => !isGatewayServer(s) && !before.has(s.id));
-      setImported({
-        added: added.length,
-        on: added.filter((s) => isEnabled(next, s.id)).length,
-      });
-      setTouched(true);
-      toast.success("Imported servers from your clients");
-      setImportPreview(null);
-    } catch (e) {
-      toastError(`Import failed: ${e}`);
-    } finally {
-      setBusy(false);
-    }
-  }
-
   /** Add every server in the chosen Collection that isn't already in Toolport. */
   function applyCollection(s: Stack) {
     setReviewCollection(s);
@@ -608,7 +558,7 @@ function AddServers({
       )}
       <StepHeader icon={<Download className="size-5" />} title="Add your first servers">
         Pick what you work on and Toolport sets up a matching Collection. You can also
-        import from your other tools or browse the full catalog.
+        review and connect a client, or browse the full catalog.
       </StepHeader>
 
       <div className="flex flex-col gap-3">
@@ -702,21 +652,11 @@ function AddServers({
           </div>
         )}
 
-        {importable > 0 && imported === null && (
-          <Button variant="outline" onClick={doImport} disabled={busy}>
-            {busy ? (
-              <Loader2 className="size-4 animate-spin" />
-            ) : (
-              <Download className="size-4" />
-            )}
-            Import {importable} from your clients
+        {importable > 0 && (
+          <Button variant="outline" onClick={onNext}>
+            <Download className="size-4" />
+            Review and connect your clients
           </Button>
-        )}
-        {imported !== null && (
-          <div className="flex items-center gap-2 rounded-md bg-success/10 px-3 py-2 text-sm text-success">
-            <Check className="size-4" />
-            {importedSummary(imported.added, imported.on)}
-          </div>
         )}
 
         <Button variant="outline" onClick={onBrowseCatalog}>
@@ -729,15 +669,6 @@ function AddServers({
         {touched ? "Next" : "I'll add servers later"}
         <ArrowRight className="size-4" />
       </Button>
-      <ImportReviewDialog
-        open={importPreview !== null}
-        items={importPreview ?? []}
-        busy={busy}
-        onOpenChange={(open) => {
-          if (!open && !busy) setImportPreview(null);
-        }}
-        onConfirm={confirmImport}
-      />
     </>
   );
 }
@@ -822,12 +753,6 @@ function plural(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
-/** What an import actually turned on, not just what Toolport now lists (UX-01). */
-function importedSummary(added: number, on: number): string {
-  if (on === added) return `Imported ${plural(added, "server")} and turned them on.`;
-  return `Imported ${plural(added, "server")}, ${on} turned on. Turn on the rest from Servers.`;
-}
-
 /** Count servers that answered the health probe, not every server in the registry (UX-01). */
 function servingSummary(health: ProbeResult[], connectedCount: number): string {
   const serving = health.filter((r) => r.ok).length;
@@ -891,7 +816,7 @@ function Done({
   }, [serverCount, onProbe, probeAttempt]);
 
   const nameFor = (id: string) => registry.servers.find((s) => s.id === id)?.name ?? id;
-  const broken = (health ?? []).filter((r) => !r.ok && !r.authRequired);
+  const broken = (health ?? []).filter((r) => !r.ok);
 
   const configured = serverCount > 0 && connectedCount > 0;
   const verifying = serverCount > 0;
@@ -900,7 +825,9 @@ function Done({
   // or the status blocks in "Checking…" / "couldn't verify" language.
   const checkingHealth = configured && verifying && health === null && !probeFailed;
   const verificationFailed = configured && verifying && probeFailed;
-  const ready = configured && (!verifying || (health !== null && !probeFailed));
+  const ready =
+    configured &&
+    (!verifying || (health !== null && !probeFailed && broken.length === 0));
   // The client to verify against: the first one Toolport is actually wired into.
   const verifyClient = clients.find((c) => c.gatewayInstalled) ?? null;
   const missingParts = [
@@ -919,7 +846,9 @@ function Done({
               ? "Checking your setup"
               : configured && probeFailed
                 ? "Setup couldn't be verified"
-                : "Setup started"
+                : broken.length > 0
+                  ? "Some servers need attention"
+                  : "Setup started"
         }
       >
         {ready ? (
@@ -939,6 +868,8 @@ function Done({
             Your servers and client are connected, but Toolport could not verify server
             health. Retry the check below or continue without verification.
           </>
+        ) : broken.length > 0 ? (
+          <>Complete the missing credentials or fix the server command, then retry.</>
         ) : (
           <>
             You haven't {missing} yet. You can{" "}

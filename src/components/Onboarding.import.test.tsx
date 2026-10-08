@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { importServers, listStacks, previewImportServers } from "@/lib/api";
+import { importServers, listStacks } from "@/lib/api";
 import type { DetectedClient, ProbeResult, Registry } from "@/lib/types";
 import { Onboarding } from "./Onboarding";
 
@@ -86,52 +86,25 @@ beforeEach(() => {
 });
 
 describe("Onboarding import copy", () => {
-  async function importBoth(result: Registry) {
-    vi.mocked(previewImportServers).mockResolvedValue(
-      ["memory", "github"].map((name, i) => ({
-        key: String(i),
-        name,
-        transport: "stdio",
-        command: "npx",
-        args: [name],
-        url: null,
-        isNew: true,
-      })),
-    );
-    vi.mocked(importServers).mockResolvedValue(result);
+  it("routes native definitions to client connection without a separate import", async () => {
     const user = userEvent.setup();
     render(
       <Onboarding
         {...props}
+        clients={[{ ...client, gatewayInstalled: false }]}
         initialStep={1}
         registry={empty}
         onProbe={vi.fn().mockResolvedValue([])}
       />,
     );
     await user.click(
-      await screen.findByRole("button", { name: /Import 2 from your clients/ }),
+      await screen.findByRole("button", { name: "Review and connect your clients" }),
     );
-    await user.click(await screen.findByRole("button", { name: "Import 2 servers" }));
-  }
-
-  it("says the imported servers were turned on", async () => {
-    await importBoth(withServers(["memory", "github"]));
-    expect(
-      await screen.findByText("Imported 2 servers and turned them on."),
-    ).toBeInTheDocument();
-    expect(screen.queryByText(/now manages/)).not.toBeInTheDocument();
+    expect(await screen.findByText("Connect your tools")).toBeInTheDocument();
+    expect(importServers).not.toHaveBeenCalled();
   });
 
-  it("does not claim servers it could not turn on", async () => {
-    await importBoth(withServers(["memory"]));
-    expect(
-      await screen.findByText(
-        "Imported 2 servers, 1 turned on. Turn on the rest from Servers.",
-      ),
-    ).toBeInTheDocument();
-  });
-
-  it("counts serving servers on the done step and names the ones needing sign-in", async () => {
+  it("keeps unresolved credentials from claiming setup is ready", async () => {
     const probe: ProbeResult[] = [
       { serverId: "memory", ok: true, toolCount: 9, error: null, authRequired: false },
       { serverId: "github", ok: false, toolCount: 0, error: "401", authRequired: true },
@@ -145,10 +118,11 @@ describe("Onboarding import copy", () => {
       />,
     );
     expect(
-      await screen.findByText(
-        /Toolport is serving 1 server to 1 connected tool, and 1 needs sign-in\./,
-      ),
+      await screen.findByRole("heading", { name: "Some servers need attention" }),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "You're set up" }),
+    ).not.toBeInTheDocument();
     expect(screen.queryByText(/now manages/)).not.toBeInTheDocument();
   });
 });

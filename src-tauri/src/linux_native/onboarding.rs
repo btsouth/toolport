@@ -240,7 +240,7 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
                         show_success(
                             &feedback,
                             &format!(
-                                "Added {count} server{} from {name}. They stay disabled until reviewed.",
+                                "Added {count} server{} from {name}. Valid servers turn on. Missing setup inputs stay off.",
                                 if count == 1 { "" } else { "s" }
                             ),
                         );
@@ -254,7 +254,7 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
         stack_list.append(&row);
     }
     add.append(&stack_list);
-    let import = gtk::Button::with_label("Import servers from clients");
+    let import = gtk::Button::with_label("Review and connect clients");
     import.add_css_class("toolport-secondary-action");
     add.append(&import);
     let add_nav = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -359,15 +359,12 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
             activate_page(&app_for_catalog, "show-catalog");
         }
     });
-    let app_for_import = app.clone();
-    let window_for_import = window.clone();
-    let feedback_for_import = stack_feedback.clone();
-    let client_page_for_import = client_page.clone();
+    let stack_for_import = stack.clone();
+    let list_for_import = connect_list.clone();
+    let feedback_for_import = connect_feedback.clone();
     import.connect_clicked(move |_| {
-        if complete_and_close(&window_for_import, &feedback_for_import) {
-            activate_page(&app_for_import, "show-clients");
-            client_page_for_import.preview_imports();
-        }
+        load_clients(&list_for_import, &feedback_for_import);
+        stack_for_import.set_visible_child_name("connect");
     });
     let list_for_rescan = connect_list.clone();
     let feedback_for_rescan = connect_feedback.clone();
