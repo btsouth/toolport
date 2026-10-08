@@ -41,8 +41,11 @@ pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// one in-flight poll past its deadline, so a blocked contender never gives up
 /// first.
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(20);
-/// Per-probe network budget for the authenticated handshake.
+/// Per-sample network budget for repeated readiness and liveness checks.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// One-shot installer/control requests cannot rely on a later health sample.
+/// Give one response the same total budget used to judge a silent live daemon.
+const CONTROL_TIMEOUT: Duration = SILENT_RETRY_TIMEOUT;
 /// Descriptor publication and cleanup are short filesystem operations. Keep
 /// their lock separate from election, which is deliberately held across spawn
 /// and readiness polling.
@@ -255,9 +258,11 @@ pub fn new_token() -> Result<String, String> {
 
 /// Authenticated `GET /host/identity`. Verifies nothing about compatibility
 /// itself; the caller compares the returned identity against its own
-/// [`CompatKey`]. Any transport error is a failed probe, not a hard error.
+/// [`CompatKey`]. This one-shot control request uses the full silence budget;
+/// repeated readiness and health samples keep their short per-probe budget.
+/// Any transport error is a failed probe, not a hard error.
 pub fn probe_identity(descriptor: &DaemonDescriptor) -> Result<DaemonIdentity, String> {
-    attempt_identity_probe(descriptor).map_err(|failure| match failure {
+    identity_probe_with_timeout(descriptor, CONTROL_TIMEOUT).map_err(|failure| match failure {
         ProbeFailure::Answered(detail) => detail,
         ProbeFailure::Unreachable => "the daemon endpoint is not reachable".to_string(),
         ProbeFailure::Silent => "the daemon did not answer within the probe budget".to_string(),
@@ -322,7 +327,7 @@ pub fn request_shutdown_if_idle(descriptor: &DaemonDescriptor) -> Result<(), Str
         "http://{}{}",
         descriptor.endpoint, SHUTDOWN_IF_IDLE_PATH
     ))
-    .timeout(PROBE_TIMEOUT)
+    .timeout(CONTROL_TIMEOUT)
     .set("Authorization", &format!("Bearer {}", descriptor.token))
     .call()
     .map(|_| ())
@@ -412,10 +417,17 @@ fn is_timeout_io_kind(kind: Option<std::io::ErrorKind>) -> bool {
 pub(crate) fn attempt_identity_probe(
     descriptor: &DaemonDescriptor,
 ) -> Result<DaemonIdentity, ProbeFailure> {
+    identity_probe_with_timeout(descriptor, PROBE_TIMEOUT)
+}
+
+fn identity_probe_with_timeout(
+    descriptor: &DaemonDescriptor,
+    timeout: Duration,
+) -> Result<DaemonIdentity, ProbeFailure> {
     let url = format!("http://{}{}", descriptor.endpoint, IDENTITY_PATH);
     let response = ureq::get(&url)
         .set("Authorization", &format!("Bearer {}", descriptor.token))
-        .timeout(PROBE_TIMEOUT)
+        .timeout(timeout)
         .call()
         .map_err(classify_probe_error)?;
     response
@@ -889,6 +901,71 @@ mod tests {
         let identity = probe_identity(&descriptor).unwrap();
         assert!(identity.is_compatible_with(&compat));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_shot_identity_probe_survives_a_delayed_control_response() {
+        delayed_control_response(false);
+    }
+
+    #[test]
+    fn one_shot_idle_shutdown_survives_a_delayed_control_response() {
+        delayed_control_response(true);
+    }
+
+    fn delayed_control_response(shutdown: bool) {
+        use std::io::{Read as _, Write as _};
+        use std::sync::mpsc;
+        let dir = temp_dir("probe-delayed-control");
+        let key = compat("1.0.0", &dir);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let descriptor =
+            DaemonDescriptor::new(listener.local_addr().unwrap().to_string(), "x", &key);
+        let identity = DaemonIdentity {
+            compat: key.fingerprint(),
+            protocol: PROTOCOL_GENERATION,
+            pid: std::process::id(),
+            gateway_version: "test".into(),
+            telemetry: None,
+        };
+        let expected = (!shutdown).then(|| identity.clone());
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(READY_TIMEOUT)).unwrap();
+            let mut scratch = [0; 4096];
+            stream.read(&mut scratch).unwrap();
+            accepted_tx.send(()).unwrap();
+            // Hold the real response until the caller has outlived a health
+            // sample. Channels control the order; no retry or startup race.
+            release_rx.recv_timeout(READY_TIMEOUT).unwrap();
+            let body = serde_json::to_string(&identity).unwrap();
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        let (result_tx, result_rx) = mpsc::channel();
+        let probe = std::thread::spawn(move || {
+            let result = if shutdown {
+                request_shutdown_if_idle(&descriptor).map(|()| None)
+            } else {
+                probe_identity(&descriptor).map(Some)
+            };
+            result_tx.send(result).unwrap();
+        });
+        accepted_rx.recv_timeout(READY_TIMEOUT).unwrap();
+        let early = result_rx.recv_timeout(PROBE_TIMEOUT + Duration::from_millis(250));
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        probe.join().unwrap();
+        assert!(
+            matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+            "control probe used the health sample budget: {early:?}"
+        );
+        assert_eq!(
+            result_rx.recv_timeout(READY_TIMEOUT).unwrap().unwrap(),
+            expected
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
