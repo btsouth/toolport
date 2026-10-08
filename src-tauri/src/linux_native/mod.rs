@@ -4929,7 +4929,8 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
             .tooltip_text(activity.client_id.as_deref().unwrap_or(""))
             .halign(gtk::Align::Fill)
             .xalign(0.0)
-            .wrap(true)
+            .single_line_mode(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["toolport-muted"])
             .build(),
     );
