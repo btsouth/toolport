@@ -597,7 +597,9 @@ pub fn add_snippet_server(
 ) -> Result<SnippetAddOutcome, String> {
     let (registry, id) = registry::update(|registry| {
         let id = apply_add_server(registry, fields)?;
-        if !env.is_empty() { registry.set_global_server_enabled(&id, false)?; }
+        if !env.is_empty() {
+            registry.set_global_server_enabled(&id, false)?;
+        }
         Ok(id)
     })?;
     let mut outcome = SnippetAddOutcome {
@@ -606,7 +608,13 @@ pub fn add_snippet_server(
         failed: Vec::new(),
     };
     for (key, value) in env {
-        match value.as_deref().filter(|value| !value.trim().is_empty() && !value.starts_with("${") && !value.starts_with("<") && !value.starts_with("YOUR_") && !value.starts_with("REPLACE_")) {
+        match value.as_deref().filter(|value| {
+            !value.trim().is_empty()
+                && !value.starts_with("${")
+                && !value.starts_with("<")
+                && !value.starts_with("YOUR_")
+                && !value.starts_with("REPLACE_")
+        }) {
             Some(value) => match set_server_secret(&id, &key, value) {
                 Ok(registry) => outcome.registry = registry,
                 Err(_) => outcome.failed.push(key),
@@ -629,7 +637,9 @@ pub fn add_snippet_server(
         let (registry, ()) = registry::update(|registry| {
             let profile = registry.default_access_id();
             apply_server_enabled(registry, &profile, &id, true, false)?;
-            if registry.access_profile(&profile).is_some() { registry.set_access_server(&profile, &id, true)?; }
+            if registry.access_profile(&profile).is_some() {
+                registry.set_access_server(&profile, &id, true)?;
+            }
             Ok(())
         })?;
         outcome.registry = registry;
@@ -641,12 +651,39 @@ pub fn add_snippet_server(
 /// values never go through the registry or a log.
 pub fn add_snippet_servers(text: &str, selected: &[String]) -> Result<SnippetAddOutcome, String> {
     let parsed = clients::parse_snippet(text).map_err(|_| "Could not parse the pasted config")?;
-    let mut outcome = SnippetAddOutcome { registry: read_registry_exact_or_default()?, declared_without_value: Vec::new(), failed: Vec::new() };
+    let mut outcome = SnippetAddOutcome {
+        registry: read_registry_exact_or_default()?,
+        declared_without_value: Vec::new(),
+        failed: Vec::new(),
+    };
     for (i, server) in parsed.into_iter().enumerate() {
-        if !selected.contains(&i.to_string()) { continue; }
-        if outcome.registry.servers.iter().any(|s| s.name.eq_ignore_ascii_case(&server.name)) { continue; }
-        let added = add_snippet_server(ServerFields {name:server.name,transport:server.transport,command:server.command,args:server.args,url:server.url,cwd:None}, server.env.into_iter().map(|e| (e.key,e.value)).collect())?;
-        outcome.registry = added.registry; outcome.failed.extend(added.failed); outcome.declared_without_value.extend(added.declared_without_value);
+        if !selected.contains(&i.to_string()) {
+            continue;
+        }
+        if outcome
+            .registry
+            .servers
+            .iter()
+            .any(|s| s.name.eq_ignore_ascii_case(&server.name))
+        {
+            continue;
+        }
+        let added = add_snippet_server(
+            ServerFields {
+                name: server.name,
+                transport: server.transport,
+                command: server.command,
+                args: server.args,
+                url: server.url,
+                cwd: None,
+            },
+            server.env.into_iter().map(|e| (e.key, e.value)).collect(),
+        )?;
+        outcome.registry = added.registry;
+        outcome.failed.extend(added.failed);
+        outcome
+            .declared_without_value
+            .extend(added.declared_without_value);
     }
     Ok(outcome)
 }
@@ -862,14 +899,8 @@ fn finish_client_config_mutation(
                 .into(),
         );
         if let Some(file) = &outcome.recovery_path {
-            if let Err(error) = clients::record_config_capture_conflict(
-                file,
-                &receipt.target,
-                outcome.revision.as_deref(),
-            ) {
-                outcome.warnings.push(format!(
-                    "could not record unavailable exact rollback: {error}"
-                ));
+            if let Err(error) = clients::record_config_capture_conflict(file, &receipt.target, outcome.revision.as_deref()) {
+                outcome.warnings.push(format!("could not record unavailable exact rollback: {error}"));
             }
         }
     }
@@ -2440,12 +2471,32 @@ mod tests {
     #[test]
     fn reviewed_catalog_and_collection_add_enable_valid_definitions() {
         let fixture = MoveFixture::new(&Registry::default());
-        let entry = |name: &str, env: Vec<&str>| serde_json::from_value::<crate::catalog::CatalogEntry>(serde_json::json!({"name":name,"description":"fixture","transport":"stdio","command":"fixture","args":[],"url":null,"envKeys":env,"source":"curated","homepage":null,"category":"Local tools"})).unwrap();
-        assert!(add_catalog_entry(entry("catalog",vec![])).unwrap().servers[0].enabled);
-        let (registry, count) = add_catalog_stack(vec![entry("collection",vec![]),entry("missing",vec!["PAT"])]).unwrap();
-        assert_eq!(count,2);
-        assert!(registry.servers.iter().find(|s| s.name == "collection").unwrap().enabled);
-        assert!(!registry.servers.iter().find(|s| s.name == "missing").unwrap().enabled);
+        let entry = |name: &str, env: Vec<&str>| {
+            serde_json::from_value::<crate::catalog::CatalogEntry>(serde_json::json!({"name":name,"description":"fixture","transport":"stdio","command":"fixture","args":[],"url":null,"envKeys":env,"source":"curated","homepage":null,"category":"Local tools"})).unwrap()
+        };
+        assert!(add_catalog_entry(entry("catalog", vec![])).unwrap().servers[0].enabled);
+        let (registry, count) = add_catalog_stack(vec![
+            entry("collection", vec![]),
+            entry("missing", vec!["PAT"]),
+        ])
+        .unwrap();
+        assert_eq!(count, 2);
+        assert!(
+            registry
+                .servers
+                .iter()
+                .find(|s| s.name == "collection")
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            !registry
+                .servers
+                .iter()
+                .find(|s| s.name == "missing")
+                .unwrap()
+                .enabled
+        );
         drop(fixture);
     }
 
@@ -2454,10 +2505,26 @@ mod tests {
         let _fixture = MoveFixture::new(&Registry::default());
         let outcome = add_snippet_servers(r#"{"mcpServers":{"ready":{"command":"fixture"},"needs":{"command":"fixture","env":{"PAT":"${PAT}"}},"skipped":{"command":"fixture"}}}"#, &["0".into(),"1".into()]).unwrap();
         // JSON maps have sorted keys: needs, ready, skipped.
-        assert_eq!(outcome.registry.servers.len(),2);
-        assert!(!outcome.registry.servers.iter().find(|s| s.name == "needs").unwrap().enabled);
-        assert!(outcome.registry.servers.iter().find(|s| s.name == "ready").unwrap().enabled);
-        assert_eq!(outcome.declared_without_value,["PAT"]);
+        assert_eq!(outcome.registry.servers.len(), 2);
+        assert!(
+            !outcome
+                .registry
+                .servers
+                .iter()
+                .find(|s| s.name == "needs")
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            outcome
+                .registry
+                .servers
+                .iter()
+                .find(|s| s.name == "ready")
+                .unwrap()
+                .enabled
+        );
+        assert_eq!(outcome.declared_without_value, ["PAT"]);
     }
 
     #[test]
@@ -3529,10 +3596,7 @@ mod tests {
                 .unwrap()
                 .exact_rollback
         );
-        let snapshot: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(result.outcome.recovery_path.as_ref().unwrap()).unwrap(),
-        )
-        .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(result.outcome.recovery_path.as_ref().unwrap()).unwrap()).unwrap();
         assert_eq!(snapshot["exactEligible"], false);
         disconnect_client("claude-code").unwrap();
         assert_eq!(json_file(&fixture.claude())["session"], 2);
@@ -3603,7 +3667,10 @@ mod tests {
         let mut existing = server("seq-thinking");
         existing.id = "seq-thinking".into();
         existing.command = Some("npx".into());
-        existing.args = vec!["-y".into(), "@modelcontextprotocol/server-sequential-thinking".into()];
+        existing.args = vec![
+            "-y".into(),
+            "@modelcontextprotocol/server-sequential-thinking".into(),
+        ];
         let mut registry = Registry::default();
         registry.servers.push(existing);
         let fixture = MoveFixture::new(&registry);

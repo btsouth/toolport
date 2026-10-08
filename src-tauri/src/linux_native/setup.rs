@@ -93,6 +93,8 @@ pub(super) fn review(
             .map(|(_, key)| key.clone())
             .collect::<Vec<_>>();
         button.set_sensitive(false);
+        cancel.set_sensitive(false);
+        scroller.set_sensitive(false);
         feedback.set_label("Checking setup...");
         feedback.set_visible(true);
         let action = action.clone();
@@ -103,6 +105,8 @@ pub(super) fn review(
         let scroller = scroller.clone();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || action(keys)).await;
+            cancel.set_sensitive(true);
+            scroller.set_sensitive(true);
             match result {
                 Ok(Ok(message)) => {
                     feedback.set_label(&message);
@@ -124,21 +128,59 @@ pub(super) fn review(
     dialog.present();
 }
 
-pub(super) fn connect(parent: &gtk::Window, client_id: String, profile: Option<String>, force: bool, finished: impl Fn() + 'static) {
+pub(super) fn connect(
+    parent: &gtk::Window,
+    client_id: String,
+    profile: Option<String>,
+    force: bool,
+    finished: impl Fn() + 'static,
+) {
     let parent = parent.clone();
     gtk::glib::spawn_future_local(async move {
         let id = client_id.clone();
-        let preview = gtk::gio::spawn_blocking(move || crate::registry_controller::preview_client_setup(&id)).await;
+        let preview =
+            gtk::gio::spawn_blocking(move || crate::registry_controller::preview_client_setup(&id))
+                .await;
         match preview {
             Ok(Ok(preview)) => {
                 let disclosure = format!("Config: {}\nBackup directory: {}\nSelected entries move after gateway verification. Unchecked entries and plugin servers stay in place.{}", preview.config_path, preview.backup_dir, if force { " This replaces the customized Toolport entry." } else { "" });
-                review(&parent, "Review and connect", preview.items, &disclosure, "Connect to Toolport", move |selected| {
-                    let outcome = crate::registry_controller::migrate_client_reviewed(&client_id, profile.as_deref(), force, &selected, &preview.revision)?;
-                    Ok(format!("Connected. Restart the client.\nConfig: {}\nBackup: {}\nGateway tools your agent will see:\n{}", outcome.result.outcome.path, outcome.result.outcome.backup.as_deref().unwrap_or("No previous config"), outcome.tools.iter().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>().join("\n")))
-                }, finished);
+                review(
+                    &parent,
+                    "Review and connect",
+                    preview.items,
+                    &disclosure,
+                    "Connect to Toolport",
+                    move |selected| {
+                        let outcome = crate::registry_controller::migrate_client_reviewed(
+                            &client_id,
+                            profile.as_deref(),
+                            force,
+                            &selected,
+                            &preview.revision,
+                        )?;
+                        Ok(format!("Connected. Restart the client.\nConfig: {}\nBackup: {}\nGateway tools your agent will see:\n{}", outcome.result.outcome.path, outcome.result.outcome.backup.as_deref().unwrap_or("No previous config"), outcome.tools.iter().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>().join("\n")))
+                    },
+                    finished,
+                );
             }
-            Ok(Err(error)) => review(&parent, "Could not review setup", Vec::new(), &error, "Close", |_| Err("Fix the client config and retry.".into()), || {}),
-            Err(_) => review(&parent, "Could not review setup", Vec::new(), "Client review stopped.", "Close", |_| Err("Retry from Clients.".into()), || {}),
+            Ok(Err(error)) => review(
+                &parent,
+                "Could not review setup",
+                Vec::new(),
+                &error,
+                "Close",
+                |_| Err("Fix the client config and retry.".into()),
+                || {},
+            ),
+            Err(_) => review(
+                &parent,
+                "Could not review setup",
+                Vec::new(),
+                "Client review stopped.",
+                "Close",
+                |_| Err("Retry from Clients.".into()),
+                || {},
+            ),
         }
     });
 }

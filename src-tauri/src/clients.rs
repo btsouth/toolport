@@ -3127,6 +3127,7 @@ fn parse_client_content(format: Format, content: &str) -> Result<Vec<McpServer>,
         Format::YamlMcpServers => parse_hermes_yaml_servers(content),
         Format::YamlMcpServersList => parse_continue_yaml_servers(content),
     }
+
 }
 
 fn managed_matches_detected(server: &McpServer, rec: &ManagedEntry) -> bool {
@@ -3250,10 +3251,7 @@ pub struct WriteOutcome {
     pub recovery_path: Option<PathBuf>,
 }
 
-fn revision_outcome(
-    client_id: &str,
-    result: Result<WriteOutcome, String>,
-) -> Result<WriteOutcome, String> {
+fn revision_outcome(client_id: &str, result: Result<WriteOutcome, String>) -> Result<WriteOutcome, String> {
     let mut outcome = result?;
     let path = Path::new(&outcome.path);
     outcome.recovery_path = Some(restore::record_path(client_id, path)?);
@@ -3772,11 +3770,7 @@ fn rewrite_json_key_preserving(
     }
     let before = parse_json_value(original)?;
     if let Some(prop) = obj.get(key) {
-        if let (Some(child), Some(before), Some(after)) = (
-            prop.object_value(),
-            before.get(key).and_then(serde_json::Value::as_object),
-            new_value.as_object(),
-        ) {
+        if let (Some(child), Some(before), Some(after)) = (prop.object_value(), before.get(key).and_then(serde_json::Value::as_object), new_value.as_object()) {
             patch_json_object(&child, before, after)?;
         } else { prop.set_value(serde_to_cst_input(new_value)); }
     } else { obj.append(key, serde_to_cst_input(new_value)); }
@@ -6308,11 +6302,7 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
         });
     }
     let current = crate::registry_controller::registry_for_disconnect()?;
-    restore::check_legacy_gateway(
-        def.format,
-        &path,
-        current.client_managed_entries.get(client_id),
-    )?;
+    restore::check_legacy_gateway(def.format, &path, current.client_managed_entries.get(client_id))?;
     let restored = moved::restore(client_id, def.format, &path)?;
     if restored.is_none() && (!mutation::exists(&path) || !read_client(&def).gateway_installed) {
         return Ok(WriteOutcome {
@@ -6344,19 +6334,11 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
 pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) -> Result<(), String> {
     let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
     let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
-    restore::check_finished(
-        client_id,
-        Path::new(&outcome.path),
-        outcome.revision.as_deref(),
-    )?;
+    restore::check_finished(client_id, Path::new(&outcome.path), outcome.revision.as_deref())?;
     if outcome.used_move_record {
         moved::forget(client_id)?;
     }
-    restore::finish(
-        client_id,
-        Path::new(&outcome.path),
-        outcome.revision.as_deref(),
-    )?;
+    restore::finish(client_id, Path::new(&outcome.path), outcome.revision.as_deref())?;
     Ok(())
 }
 
@@ -6367,8 +6349,16 @@ pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) -> Result<(), S
 /// Explicit migration writes the stdio adapter entry.
 pub fn migrate_to_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOutcome, String> {
     let revision = setup_revision(client_id)?;
-    let client = detect_clients().into_iter().find(|c| c.id == client_id).ok_or("Unknown client")?;
-    let names = client.servers.iter().filter(|s| !detected_is_gateway(s)).map(|s| s.name.clone()).collect::<Vec<_>>();
+    let client = detect_clients()
+        .into_iter()
+        .find(|c| c.id == client_id)
+        .ok_or("Unknown client")?;
+    let names = client
+        .servers
+        .iter()
+        .filter(|s| !detected_is_gateway(s))
+        .map(|s| s.name.clone())
+        .collect::<Vec<_>>();
     migrate_reviewed(client_id, profile, &names, &revision, || Ok(()))
 }
 

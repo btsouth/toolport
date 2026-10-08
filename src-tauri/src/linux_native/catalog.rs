@@ -90,7 +90,7 @@ impl CatalogPage {
         );
         page.append(
             &gtk::Label::builder()
-                .label("Browse Toolport's curated picks or search the official MCP Registry. Added servers start disabled so you can review and authenticate them first.")
+                .label("Browse Toolport's curated picks or search the official MCP Registry. Valid servers turn on. Missing credentials and setup inputs stay off.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
@@ -795,11 +795,7 @@ fn stack_card(
             .css_classes(["caption", "toolport-muted"])
             .build(),
     );
-    let add = gtk::Button::with_label(if missing == 0 {
-        "Added"
-    } else {
-        "Add Collection"
-    });
+    let add = gtk::Button::with_label(if missing == 0 { "Added" } else { "Add Collection" });
     add.set_sensitive(missing > 0);
     add.add_css_class(if missing == 0 {
         "toolport-secondary-action"

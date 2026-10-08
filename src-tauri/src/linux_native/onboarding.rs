@@ -525,9 +525,14 @@ fn render_clients(list: &gtk::Box, feedback: &gtk::Label, snapshot: ClientSnapsh
             let list = list.clone();
             let feedback = feedback.clone();
             connect.connect_clicked(move |button| {
-                let Some(parent) = button.root().and_downcast::<gtk::Window>() else { return; };
-                let list = list.clone();let feedback = feedback.clone();
-                super::setup::connect(&parent, client_id.clone(), None, false, move || load_clients(&list, &feedback));
+                let Some(parent) = button.root().and_downcast::<gtk::Window>() else {
+                    return;
+                };
+                let list = list.clone();
+                let feedback = feedback.clone();
+                super::setup::connect(&parent, client_id.clone(), None, false, move || {
+                    load_clients(&list, &feedback)
+                });
             });
             row.append(&connect);
         }

@@ -23,6 +23,7 @@ export function ConnectReviewDialog({
   const [review, setReview] = useState<ClientSetupReview | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [attempt, setAttempt] = useState(0);
   const [result, setResult] = useState<MigrateResult | null>(null);
   useEffect(() => {
     let active = true;
@@ -36,7 +37,7 @@ export function ConnectReviewDialog({
     return () => {
       active = false;
     };
-  }, [clientId]);
+  }, [clientId, attempt]);
   async function connect(selected: string[]) {
     if (!review) return;
     setBusy(true);
@@ -76,7 +77,14 @@ export function ConnectReviewDialog({
               <p role="alert" className="text-sm text-warning">
                 {error}
               </p>
-              <Button onClick={() => setError("")}>Back to review</Button>
+              <Button
+                onClick={() => {
+                  setError("");
+                  if (!review) setAttempt(attempt + 1);
+                }}
+              >
+                {review ? "Back to review" : "Retry"}
+              </Button>
             </>
           ) : result ? (
             <div className="flex flex-col gap-3 text-sm">

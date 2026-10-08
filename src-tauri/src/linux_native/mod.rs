@@ -1576,7 +1576,7 @@ impl ServerPage {
                 self.list.append(&state_card(
                     "network-server-symbolic",
                     "Toolport is ready for setup",
-                    "Use Add server for a custom endpoint or open Catalog for a curated starting point. New servers stay disabled until you review them.",
+                    "Use Add server for a custom endpoint or open Catalog for a curated starting point. Valid servers turn on. Missing setup inputs stay off.",
                     false,
                 ));
             }
@@ -2543,8 +2543,16 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
 }
 
 fn confirm_client_migrate(client: &state::ClientView, _button: gtk::Button, page: ClientPage) {
-    let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else { return; };
-    setup::connect(&parent, client.id.clone(), client.scope_id.clone(), client.gateway_state == state::ClientGatewayState::Customized, move || page.refresh());
+    let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else {
+        return;
+    };
+    setup::connect(
+        &parent,
+        client.id.clone(),
+        client.scope_id.clone(),
+        client.gateway_state == state::ClientGatewayState::Customized,
+        move || page.refresh(),
+    );
 }
 
 fn append_client_discovery_actions(
@@ -2834,12 +2842,7 @@ fn run_client_mutation(
                         "Disconnected {client_name} from Toolport. Restart {client_name} to apply it."
                     )
                 };
-                page.refresh_with_confirmation(
-                    std::iter::once(message)
-                        .chain(result.outcome.warnings)
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                );
+                page.refresh_with_confirmation(std::iter::once(message).chain(result.outcome.warnings).collect::<Vec<_>>().join(" "));
             }
             Ok(Err(error)) => page.show_error(&format!("{client_name}: {error}")),
             Err(_) => page.show_error(&format!("{client_name}: the operation stopped")),
@@ -6022,13 +6025,9 @@ fn open_shared_setup(url: &str, page: ServerPage) {
             open_url: Box::new(|url| { let _ = crate::oauth::open_web_url(url); }),
         };
         let pair_origin = origin.clone();
-        pairing::request(
-            hooks,
-            &origin,
-            Box::new(move |cancel, show| {
-                crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
-            }),
-        );
+        pairing::request(hooks, &origin, Box::new(move |cancel, show| {
+            crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
+        }));
         return;
     }
     let Some(id) = crate::sharing_controller::parse_share_url(url) else {
@@ -8592,6 +8591,7 @@ fn open_server_editor_prefilled(
         let url_for_fill = url.clone();
         let cwd_for_fill = cwd.clone();
         let env_for_fill = snippet_env.clone();
+        let page_for_fill = page.clone();
         fill.connect_clicked(move |fill| {
             let buffer = snippet.buffer();
             let text = buffer
@@ -8617,7 +8617,7 @@ fn open_server_editor_prefilled(
                             let outcome = crate::registry_controller::add_snippet_servers(&text, &selected)?;
                             if !outcome.failed.is_empty() { return Err("Could not save credentials. Open Credentials and retry.".into()); }
                             Ok("Added selected servers. Check their status under Servers.".into())
-                        }, || {});
+                        }, { let page = page_for_fill.clone(); move || page.refresh() });
                         return;
                     }
                     let Some(first) = servers.first() else {
