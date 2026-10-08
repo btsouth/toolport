@@ -250,7 +250,10 @@ try {
       page.getByRole("heading", { name: "Review and connect Codex" }),
     ).toBeVisible();
     await expect(page.getByText(/Backup saved to/)).toBeVisible();
-    await page.screenshot({ path: path.join(output, "setup-client-review.png") });
+    await page.screenshot({
+      animations: "disabled",
+      path: path.join(output, "setup-client-review.png"),
+    });
     await page.getByRole("button", { name: "Connect to Toolport", exact: true }).click();
     if (failure) {
       await expect(
@@ -264,6 +267,7 @@ try {
       await expect(page.getByText("Gateway tools your agent will see:")).toBeVisible();
     }
     await page.screenshot({
+      animations: "disabled",
       path: path.join(output, `setup-${failure || "gateway-result"}.png`),
     });
     expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
@@ -279,7 +283,10 @@ try {
   await expect(
     page.getByRole("switch", { name: "Toggle Manual notes", exact: true }),
   ).toBeChecked();
-  await page.screenshot({ path: path.join(output, "setup-manual-add.png") });
+  await page.screenshot({
+    animations: "disabled",
+    path: path.join(output, "setup-manual-add.png"),
+  });
   await page.getByRole("button", { name: "Add server", exact: true }).click();
   await page.getByRole("button", { name: "Paste from client config" }).click();
   await page.locator("textarea").fill(
@@ -295,7 +302,10 @@ try {
     page.getByRole("heading", { name: "Review pasted servers" }),
   ).toBeVisible();
   await expect(page.getByText("synthetic-secret", { exact: true })).toHaveCount(0);
-  await page.screenshot({ path: path.join(output, "setup-multi-paste-review.png") });
+  await page.screenshot({
+    animations: "disabled",
+    path: path.join(output, "setup-multi-paste-review.png"),
+  });
   await page.getByRole("button", { name: "Add selected servers" }).click();
   await expect(page.getByText("Alpha", { exact: true })).toBeVisible();
   await expect(page.getByText("Beta", { exact: true })).toBeVisible();
@@ -304,7 +314,10 @@ try {
   await page.getByRole("button", { name: "Add 2", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Review Local notes" })).toBeVisible();
   await expect(page.getByText(/Credentials: PAT/)).toBeVisible();
-  await page.screenshot({ path: path.join(output, "setup-collection-review.png") });
+  await page.screenshot({
+    animations: "disabled",
+    path: path.join(output, "setup-collection-review.png"),
+  });
   await page.getByRole("button", { name: "Add selected servers" }).click();
   await page.getByRole("button", { name: "Servers", exact: true }).click();
   await expect(
@@ -313,7 +326,10 @@ try {
   await expect(
     page.getByRole("switch", { name: "Toggle Calendar", exact: true }),
   ).not.toBeChecked();
-  await page.screenshot({ path: path.join(output, "setup-collection-added.png") });
+  await page.screenshot({
+    animations: "disabled",
+    path: path.join(output, "setup-collection-added.png"),
+  });
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   await page.goto(`${baseURL}/fixtures/?setup=1`);
   await page.getByRole("button", { name: "Browse catalog", exact: true }).click();
@@ -322,7 +338,10 @@ try {
   await expect(
     page.getByRole("switch", { name: "Toggle NoteKit", exact: true }),
   ).toBeChecked();
-  await page.screenshot({ path: path.join(output, "setup-catalog-add.png") });
+  await page.screenshot({
+    animations: "disabled",
+    path: path.join(output, "setup-catalog-add.png"),
+  });
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   await page.goto(`${baseURL}/fixtures/?logos`);
   await expect(page.getByText("Dark logo fixture")).toBeVisible();
