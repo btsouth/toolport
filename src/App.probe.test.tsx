@@ -4,6 +4,12 @@ import userEvent from "@testing-library/user-event";
 import App from "./App";
 import type { ProbeResult, Registry } from "@/lib/types";
 
+const warningToast = vi.hoisted(() => vi.fn());
+vi.mock("sonner", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("sonner")>();
+  return { ...actual, toast: { ...actual.toast, warning: warningToast } };
+});
+
 const probeServers = vi.fn();
 const getRegistry = vi.fn();
 const detectClients = vi.fn();
@@ -118,6 +124,23 @@ beforeEach(() => {
 });
 
 describe("App onboarding probe wiring", () => {
+  it("shows the preservation failure when a backup keeps startup available", async () => {
+    const reason = "corrupt registry could not be preserved: evidence path is blocked";
+    takeRegistryRecoveryNotice.mockResolvedValue({
+      recoveredAtMs: 1,
+      reason,
+      quarantinePath: null,
+    });
+    probeServers.mockResolvedValue([]);
+    render(<App />);
+    await waitFor(() =>
+      expect(warningToast).toHaveBeenCalledWith(
+        "Registry recovered from backup",
+        expect.objectContaining({ description: expect.stringContaining(reason) }),
+      ),
+    );
+  });
+
   // SBS-720 / CodeRev: after Connect, load() already kicked off a probe. The Done
   // step's verification must JOIN that in-flight probe (reprobe), not queue a second
   // full probeServers pass behind it (reprobeAfterMutation) — each pass is bounded

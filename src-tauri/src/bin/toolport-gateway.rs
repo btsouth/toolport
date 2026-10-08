@@ -1666,30 +1666,6 @@ fn discovery_mode_for(reg: &Registry, client_id: Option<&str>) -> DiscoveryMode 
     mode
 }
 
-/// Resolve from disk for the gateway bootstrap (before the watcher takes over the live
-/// updates), keyed by this client's `TOOLPORT_CLIENT_ID` (legacy: `CONDUIT_CLIENT_ID`).
-fn resolve_discovery_mode() -> DiscoveryMode {
-    let client_id = conduit_lib::brand::env_var(
-        conduit_lib::brand::CLIENT_ID,
-        conduit_lib::brand::CLIENT_ID_LEGACY,
-    );
-    match registry::load_resolved().ok() {
-        Some(reg) => discovery_mode_for(&reg, client_id.as_deref()),
-        None => {
-            let (mode, warning) = resolve_mode_from(
-                conduit_lib::brand::env_var("TOOLPORT_DISCOVERY", "CONDUIT_DISCOVERY").as_deref(),
-                None,
-                None,
-                true,
-            );
-            if let Some(msg) = warning {
-                eprintln!("{msg}");
-            }
-            mode
-        }
-    }
-}
-
 /// Pure precedence: an explicit `CONDUIT_DISCOVERY` env var (hand-set in a client's config)
 /// wins, then the per-client override (`registry.client_discovery[client_id]`), then the
 /// registry's global `discovery_mode`, then its `lazy_discovery` bool. A SET env value that
@@ -17904,14 +17880,6 @@ fn main() {
         conduit_lib::telemetry::exit_with(0);
     }
 
-    // Discovery mode resolves from an explicit env override first (per-client), then
-    // the registry (its `discovery_mode` override, else the `lazy_discovery` bool), so
-    // it applies to EVERY client, including ones that don't forward env vars to the
-    // gateway (e.g. Antigravity). Resolved once and cached; grouped mode reads the
-    // same cached value.
-    let mode = resolve_discovery_mode();
-    // The host's discovery mode starts from this bootstrap value; the watcher refreshes it.
-    let discovery_seed = mode.as_u8();
     // Per-client scoping: this gateway exposes only the named profile's servers.
     // This is only the bootstrap value - once the registry loads below, the live
     // value (kept in sync with registry.client_scopes on every watcher tick) wins.
@@ -17943,12 +17911,11 @@ fn main() {
     let http_mode = http_port_opt.is_some() || daemon_mode;
     glog("=== gateway start ===");
     glog(&format!(
-        "cwd={:?} TOOLPORT_REGISTRY={:?} registry_path={:?} dir_resolution={:?} mode={} profile={env_profile:?} client_id={client_id:?}",
+        "cwd={:?} TOOLPORT_REGISTRY={:?} registry_path={:?} dir_resolution={:?} profile={env_profile:?} client_id={client_id:?}",
         std::env::current_dir().ok(),
         conduit_lib::brand::env_var("TOOLPORT_REGISTRY", "CONDUIT_REGISTRY"),
         registry::resolved_path(),
         registry::conduit_dir_resolution(),
-        mode.as_str(),
     ));
     if registry::conduit_dir_resolution() == registry::DirResolution::VirtualizedFallback {
         // Loud, not fatal: inside an MSIX container with no UNC escape, the data
@@ -17962,17 +17929,10 @@ fn main() {
         );
         glog("WARNING: MSIX container detected but devirtualization failed (UNC view unreachable)");
     }
-    // SBS-900: keep the load *outcome* next to the in-memory registry. An empty
-    // `http_clients` list satisfies the `--insecure-loopback` open branch, and it
-    // is empty for three unrelated reasons: nothing configured (fine), an Err
-    // fallback to `Registry::default()`, and an Ok whose contents came from a
-    // backup or stood in for a file that could not be read. Only a load that
-    // actually saw the configured state may be read as "no clients".
+    // Only a load that saw the configured state may be read as "no clients".
+    // Backup recovery can return an incomplete HTTP client list (SBS-900).
     let load_outcome = registry::load_resolved_with_source();
-    // The host's code-mode flag starts from this load *outcome*, not from the registry value
-    // it falls back to: `Registry::default()` has `code_mode: true`, so seeding from the
-    // error fallback would silently re-enable code mode after a corrupt registry (WS2-5).
-    // The watcher already fails safe by not touching the flag when a reload fails.
+    // The watcher also keeps the last good code-mode flag when a reload fails.
     let code_mode_seed =
         seed_code_mode_after_registry_load(load_outcome.as_ref().map(|(r, _)| r).map_err(|_| ()));
     let (loaded, registry_loaded) = match load_outcome {
@@ -17992,29 +17952,20 @@ fn main() {
             }
             (r, source.is_authoritative())
         }
-        Err(e) if registry::is_newer_version_error(&e) => {
-            // Version skew: this build cannot represent the on-disk schema, and
-            // serving from a partial view risks acting on a newer registry it
-            // does not fully understand. Refuse to start serving tools rather
-            // than fall back to defaults; the app shows the same message.
+        Err(e) => {
             eprintln!("toolport-gateway: {e} Refusing to start serving tools from this registry.");
-            glog(&format!("load_resolved ERR (newer schema): {e}"));
+            if registry::is_newer_version_error(&e) {
+                glog(&format!("load_resolved ERR (newer schema): {e}"));
+            } else {
+                glog(&format!("load_resolved ERR: {e}"));
+            }
             conduit_lib::telemetry::exit_with(1);
         }
-        Err(e) => {
-            // Always surface this (not only under CONDUIT_DEBUG). A corrupt or
-            // unreadable registry would otherwise silently serve an empty catalog,
-            // making every tool appear to vanish in the client with no explanation.
-            // We keep running on a default so the gateway stays up, and the on-disk
-            // tool cache still answers tools/list from the last good build.
-            eprintln!(
-                "toolport-gateway: could not load registry ({e}); serving cached tools only. \
-                 Fix or recreate the registry to restore full functionality."
-            );
-            glog(&format!("load_resolved ERR: {e}"));
-            (registry::Registry::default(), false)
-        }
     };
+    // Resolve discovery from the same registry snapshot used for authority and
+    // routing. A second bootstrap load could recover or fail differently.
+    let mode = discovery_mode_for(&loaded, client_id.as_deref());
+    let discovery_seed = mode.as_u8();
     inspect::clear();
     // Resolve the live profile immediately from what's already on disk, rather than
     // waiting for the watcher's first tick: a scoped client re-launched after being

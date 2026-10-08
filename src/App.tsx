@@ -285,7 +285,9 @@ function App() {
           const detail =
             recovery.reason === "corrupt"
               ? `The registry file was damaged. Restored from backup (${when}).`
-              : `The registry file was missing. Restored from backup (${when}).`;
+              : recovery.reason === "missing"
+                ? `The registry file was missing. Restored from backup (${when}).`
+                : `${recovery.reason}. Loaded from backup (${when}).`;
           toast.warning("Registry recovered from backup", {
             description: recovery.quarantinePath
               ? `${detail} A copy of the bad file was saved for inspection.`
