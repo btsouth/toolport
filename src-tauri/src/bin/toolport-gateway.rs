@@ -25046,7 +25046,11 @@ mod tests {
         assert_eq!(entry["clientName"], "Cursor");
 
         drop(_data_dir);
-        std::fs::remove_dir_all(dir).ok();
+        assert!(conduit_lib::telemetry::retire_dir_for_test(
+            &dir,
+            std::time::Duration::from_secs(5)
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -31572,7 +31576,12 @@ mod tests {
             .expect("savings entry for this search");
         assert_eq!(discovery["kind"], "discovery_response");
         assert_eq!(discovery["responseContentBytes"], text.len());
-        let _ = std::fs::remove_dir_all(dir);
+        drop(_data);
+        assert!(conduit_lib::telemetry::retire_dir_for_test(
+            &dir,
+            std::time::Duration::from_secs(5)
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A tool definition whose forged Toolport voice sits everywhere BUT the
@@ -32921,7 +32930,12 @@ mod tests {
         assert!(std::fs::read_to_string(dir.join("gateway.log"))
             .unwrap()
             .contains("SECURITY: integrity recording failed:"));
-        let _ = std::fs::remove_dir_all(dir);
+        drop(_data_dir);
+        assert!(conduit_lib::telemetry::retire_dir_for_test(
+            &dir,
+            std::time::Duration::from_secs(5)
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

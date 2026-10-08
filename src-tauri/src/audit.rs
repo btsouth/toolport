@@ -1082,7 +1082,11 @@ mod tests {
         assert_eq!(content.lines().count(), 1);
         let entry: Value = serde_json::from_str(content.trim()).expect("valid JSON");
         assert_eq!(entry["server"], "fixture");
-        std::fs::remove_dir_all(root).ok();
+        assert!(crate::telemetry::retire_dir_for_test(
+            &root,
+            std::time::Duration::from_secs(5)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

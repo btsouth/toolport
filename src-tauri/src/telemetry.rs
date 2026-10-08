@@ -124,6 +124,12 @@ struct Writer {
 
 static WRITER: OnceLock<Writer> = OnceLock::new();
 
+// A FIFO flush cannot stop concurrent tests from queuing more records into a
+// process-global data-dir override. Retired fixture paths never accept new IO.
+#[cfg(any(test, feature = "test-support"))]
+static RETIRED_TEST_DIRS: std::sync::RwLock<Vec<std::path::PathBuf>> =
+    std::sync::RwLock::new(Vec::new());
+
 fn writer() -> &'static Writer {
     WRITER.get_or_init(|| Writer::spawn(QUEUE_CAPACITY, append_batch))
 }
@@ -208,6 +214,16 @@ impl Writer {
 }
 
 pub(crate) fn record(path: &Path, line: &str, rotation: Rotation) {
+    #[cfg(any(test, feature = "test-support"))]
+    let retired = RETIRED_TEST_DIRS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(any(test, feature = "test-support"))]
+    if retired.iter().any(|dir| path.starts_with(dir)) {
+        return;
+    }
+    // Hold the admission guard through enqueue so retirement's barrier covers
+    // every accepted record, including callers that captured the path earlier.
     writer().record(Record {
         path: path.to_path_buf(),
         line: line.to_string(),
@@ -224,6 +240,19 @@ pub fn flush() -> bool {
 #[cfg(any(test, feature = "test-support"))]
 pub fn flush_for_test(budget: Duration) -> bool {
     WRITER.get().is_none_or(|writer| writer.flush(budget))
+}
+
+/// Stop telemetry admission to a unique scratch directory, then drain accepted
+/// records before its removal. Release its DataDirOverride first and keep the
+/// data-dir test lock until cleanup finishes. Late records from concurrent tests
+/// are intentionally discarded; the path cannot be reused in this process.
+#[cfg(any(test, feature = "test-support"))]
+pub fn retire_dir_for_test(dir: &Path, budget: Duration) -> bool {
+    RETIRED_TEST_DIRS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(dir.to_path_buf());
+    flush_for_test(budget)
 }
 
 /// Drain on orderly gateway exit for at most two seconds. Never joins a writer
@@ -429,6 +458,15 @@ impl GapState {
     ) {
         let dropped = counters.queue_dropped.load(Ordering::Relaxed);
         let Some(dir) = &self.dir else { return };
+        #[cfg(any(test, feature = "test-support"))]
+        if RETIRED_TEST_DIRS
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|retired| dir.starts_with(retired))
+        {
+            return;
+        }
         let since = counters.dropped_since.load(Ordering::Relaxed);
         for (name, reported, rotation) in [
             (
@@ -489,6 +527,51 @@ fn append_batch(path: &Path, lines: &[String], rotation: Rotation) -> Result<(),
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retired_directory_rejects_a_record_with_a_previously_captured_path() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = scratch("retired");
+        let data = crate::registry::DataDirOverride::set(&dir);
+        crate::gatewaylog::append("before teardown");
+        let (captured_tx, captured_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let producer = std::thread::spawn(move || {
+            let path = crate::registry::gateway_log_path().unwrap();
+            captured_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            record(&path, "after teardown", Rotation::Gateway);
+        });
+        captured_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(data);
+        assert!(retire_dir_for_test(&dir, Duration::from_secs(5)));
+        assert!(std::fs::read_to_string(dir.join("gateway.log"))
+            .unwrap()
+            .contains("before teardown"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        release_tx.send(()).unwrap();
+        producer.join().unwrap();
+        assert!(flush_for_test(Duration::from_secs(5)));
+        assert!(
+            !dir.exists(),
+            "late telemetry recreated the retired directory"
+        );
+    }
+
+    #[test]
+    fn retired_directory_does_not_receive_gap_markers_on_later_flushes() {
+        let dir = scratch("retired-gap");
+        assert!(retire_dir_for_test(&dir, Duration::from_secs(5)));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let counters = Counters::default();
+        counters.queue_dropped.store(1, Ordering::Relaxed);
+        let mut gaps = GapState {
+            dir: Some(dir.clone()),
+            ..GapState::default()
+        };
+        gaps.deliver(&counters, &mut append_batch);
+        assert!(!dir.exists(), "gap marker recreated the retired directory");
+    }
+
     #[test]
     fn gateway_and_adapter_explicit_exits_use_bounded_flush() {
         for source in [
@@ -634,6 +717,7 @@ mod tests {
                 .contains("tokensSaved"));
         }
         assert!(flush_for_test(Duration::from_secs(5)));
+        assert!(retire_dir_for_test(&dir, Duration::from_secs(5)));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -845,6 +929,8 @@ mod tests {
         assert!(flush_for_test(Duration::from_secs(5)));
         assert!(dir.join("gateway.log").exists());
         assert!(!dir.join("current/gateway.log").exists());
+        drop(_data);
+        assert!(retire_dir_for_test(&dir, Duration::from_secs(5)));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -883,7 +969,8 @@ mod tests {
         for line in &lines {
             serde_json::from_str::<serde_json::Value>(line).expect("each line is whole JSON");
         }
-        let _ = std::fs::remove_dir_all(dir);
+        assert!(retire_dir_for_test(&dir, Duration::from_secs(5)));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Crossing the cap rotates on the writer thread and keeps the newest lines,
@@ -898,7 +985,8 @@ mod tests {
         assert!(flush_for_test(Duration::from_secs(5)));
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content, "{\"i\":7}\n{\"i\":8}\n{\"i\":9}\n");
-        let _ = std::fs::remove_dir_all(dir);
+        assert!(retire_dir_for_test(&dir, Duration::from_secs(5)));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A record call never waits on a cross-process lock held elsewhere: it queues
@@ -926,6 +1014,7 @@ mod tests {
             content.contains("{\"held\":true}"),
             "line landed: {content}"
         );
-        let _ = std::fs::remove_dir_all(dir);
+        assert!(retire_dir_for_test(&dir, Duration::from_secs(5)));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
