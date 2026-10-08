@@ -33210,6 +33210,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn watch_tick_publishes_client_discovery_without_catalog_fanout() {
+        let _env = DataDirTestEnv::new("client-discovery-tick");
+        let live = Registry::default();
+        let reg_path = registry::resolved_path().unwrap();
+        let mut on_disk = live.clone();
+        on_disk.set_client_discovery("cursor", Some("lazy"));
+        on_disk.set_client_discovery("new-client", Some("full"));
+        registry::save_to(&reg_path, &on_disk).unwrap();
+        let mut watcher = WatchLoopState {
+            last_mtime: None,
+            last_relevant: router_relevant(&live),
+        };
+        let host = host_from_parts(
+            Arc::new(Mutex::new(live.clone())),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(Mutex::new(Arc::new(router_with_registry_policy(&live)))),
+            Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(|_| None),
+            Arc::new(Mutex::new(())),
+            None,
+            None,
+        );
+        host.set_discovery_mode(DiscoveryMode::Full);
+        let unrelated = Arc::new(SessionState::new_http(None));
+        host.mcp_sessions
+            .lock()
+            .unwrap()
+            .insert("unrelated".into(), Arc::clone(&unrelated));
+        let before = Arc::clone(&host.router.lock().unwrap());
+        watch_tick(
+            &reg_path,
+            &test_stdio_session(),
+            &Arc::new(Mutex::new(None)),
+            Some("cursor"),
+            None,
+            false,
+            &Arc::new(Mutex::new(None)),
+            None,
+            &mut watcher,
+            &host,
+        );
+        assert_eq!(host.discovery_mode(), DiscoveryMode::Lazy);
+        let published = host.registry.lock().unwrap();
+        assert_eq!(published.client_discovery_mode("new-client"), Some("full"));
+        assert!(
+            unrelated.outbound.lock().unwrap().is_empty(),
+            "one client's discovery choice must not notify unrelated sessions"
+        );
+        assert!(
+            Arc::ptr_eq(&before, &host.router.lock().unwrap()),
+            "discovery choices must not rebuild downstream catalogs"
+        );
+    }
+
     /// P1.3: the discovery mode belongs to the host, so one host's switch cannot decide what
     /// another host advertises.
     ///
