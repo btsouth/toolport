@@ -6250,7 +6250,9 @@ impl HttpTransport {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_some();
-            if failed && self.reuse_stored_auth(&current)? {
+            // A read failure cannot revoke the token already in hand. The refresh
+            // callback can still return a valid pending rotation on this path.
+            if failed && self.reuse_stored_auth(&current).unwrap_or(false) {
                 return Ok(());
             }
             match refresh(false) {
@@ -14701,6 +14703,27 @@ mod tests {
                 assert_eq!(callbacks.load(Ordering::SeqCst), 1);
             }
         });
+    }
+
+    #[test]
+    fn proactive_http_refresh_keeps_its_token_when_credential_lookup_fails() {
+        let owner = "__toolport_internal__";
+        assert!(crate::remote::current_credential(owner).is_err());
+        let mut transport = HttpTransport::with_auth_refresh(
+            "http://127.0.0.1:1/",
+            Some("valid-pending-token".into()),
+            Some(Box::new(|force| {
+                assert!(!force);
+                Ok(None)
+            })),
+        );
+        transport.set_server_id(owner);
+        transport.record_refresh_failure(Some("old".into()), "temporary vault failure".into());
+        transport.refresh_before_send().unwrap();
+        assert_eq!(
+            transport.auth.lock().unwrap().as_deref(),
+            Some("valid-pending-token")
+        );
     }
 
     #[test]
