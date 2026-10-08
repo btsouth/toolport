@@ -13080,7 +13080,7 @@ for line in sys.stdin:
             "between".into(),
             super::CancelEntry {
                 stdin: recorder.stdin.clone(),
-                forwarder: super::StdioForwarder::new(Weak::new()),
+                forwarder: super::StdioForwarder::new(std::sync::Weak::new()),
                 downstream_id: json!(41),
                 waiter: None,
                 forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13154,16 +13154,20 @@ for line in sys.stdin:
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         forwarder.enqueue(Box::new(move || {
             started_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
         }));
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         for _ in 0..super::MAX_STDIO_FORWARDS {
             forwarder.enqueue(Box::new(|| {}));
         }
-        assert!(!forwarder.retired.load(Ordering::Acquire));
+        assert!(!forwarder.retired.load(std::sync::atomic::Ordering::Acquire));
         forwarder.enqueue(Box::new(|| {}));
         assert!(
-            forwarder.retired.load(Ordering::Acquire),
+            forwarder.retired.load(std::sync::atomic::Ordering::Acquire),
             "overflow must retire instead of accumulating work"
         );
         release_tx.send(()).unwrap();
@@ -13203,7 +13207,7 @@ for line in sys.stdin:
             "c-2".to_string(),
             CancelEntry {
                 stdin: Arc::clone(&recorder.stdin),
-                forwarder: super::StdioForwarder::new(Weak::new()),
+                forwarder: super::StdioForwarder::new(std::sync::Weak::new()),
                 downstream_id: json!(41),
                 waiter: None,
                 forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13246,7 +13250,7 @@ for line in sys.stdin:
             "c-3".to_string(),
             CancelEntry {
                 stdin: Arc::clone(&first_recorder.stdin),
-                forwarder: super::StdioForwarder::new(Weak::new()),
+                forwarder: super::StdioForwarder::new(std::sync::Weak::new()),
                 downstream_id: json!(41),
                 waiter: None,
                 forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13262,7 +13266,7 @@ for line in sys.stdin:
             "c-3".to_string(),
             CancelEntry {
                 stdin: Arc::clone(&second_recorder.stdin),
-                forwarder: super::StdioForwarder::new(Weak::new()),
+                forwarder: super::StdioForwarder::new(std::sync::Weak::new()),
                 downstream_id: json!(42),
                 waiter: None,
                 forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
