@@ -1451,6 +1451,36 @@ mod tests {
     use crate::teams::{HandoffOutcome, LocalHandoff, PushPreview, ShareSelectionPreview};
     use adw::prelude::*;
 
+    #[test]
+    fn member_review_native_shows_diff_labels_and_both_decisions() {
+        adw::init().unwrap();
+        let mut registry = crate::registry::Registry::default();
+        registry.team = Some(serde_json::from_value(serde_json::json!({"teamId":"native-review", "serverUrl":"https://teams.toolport.app", "role":"member"})).unwrap());
+        crate::teams::stage_team_config(&mut registry, "native-review", &serde_json::json!({"servers":[], "instructions":{"content":"Recognized team instructions"}}), 12, &[serde_json::json!({"author":{"name":"Alice"},"at":1791417600000_i64,"via":"dashboard","approvedBy":{"name":"Bob"},"summary":{"instructions":true}})]).unwrap();
+        let review = crate::teams::member_review(&registry).unwrap();
+        let parent = adw::ApplicationWindow::builder().title("P14 member review").default_width(700).default_height(800).build();
+        let dialog = super::member_review_dialog(&parent, &review);
+        let mut text = String::new();
+        collect(&dialog.clone().upcast(), &mut text);
+        assert!(text.contains("Team instructions"));
+        assert!(text.contains("Before: None"));
+        assert!(text.contains("After: Recognized team instructions"));
+        assert!(text.contains("Alice") && text.contains("via dashboard") && text.contains("approved by Bob"));
+        assert!(text.contains("Accept") && text.contains("Reject"));
+        // Optional visual evidence from this exact widget, always in an isolated desktop.
+        if let Ok(path) = std::env::var("TOOLPORT_MEMBER_REVIEW_SCREENSHOT") {
+            parent.present();
+            dialog.present();
+            let context = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < deadline && !dialog.is_mapped() { context.iteration(true); }
+            while context.pending() { context.iteration(false); }
+            std::process::Command::new("grim").arg(path).status().unwrap();
+        }
+        dialog.close();
+        parent.close();
+    }
+
     fn selection(name: &str, change: &str, outcome: HandoffOutcome, message: &str) -> ShareSelectionPreview {
         ShareSelectionPreview {
             id: name.to_lowercase(),

@@ -506,6 +506,11 @@ export function TeamsView({
               and the exact change shown.
             </DialogDescription>
           </DialogHeader>
+          {error && (
+            <p role="alert" className="text-sm text-destructive">
+              {error}
+            </p>
+          )}
           <div className="max-h-[65vh] overflow-y-auto space-y-4">
             {changes.length === 0 && <p>No changes waiting for review.</p>}
             {changes.map((change) => (

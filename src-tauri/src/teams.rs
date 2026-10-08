@@ -7715,3 +7715,246 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod member_review_tests {
+    use super::*;
+
+    fn registry() -> Registry {
+        let mut reg = Registry::default();
+        reg.team = Some(serde_json::from_value(json!({"teamId":"review-team", "serverUrl":"https://teams.toolport.app", "role":"member"})).unwrap());
+        reg
+    }
+
+    fn config(command: &str) -> Value {
+        json!({"servers":[
+            {"id":"stdio", "name":"Local tool", "transport":"stdio", "command":command, "args":[], "env":[]},
+            {"id":"remote", "name":"Public tool", "transport":"http", "url":"https://1.2.3.4/mcp", "env":[]}
+        ], "instructions":{"content":"Reviewed instructions"}, "screeningPolicy":{"minSafetyLevel":"ask"},
+            "rateLimits":[{"serverId":"stdio", "callsPerMinute":10}], "callAuditExport":true})
+    }
+
+    fn decide(reg: &mut Registry, key: &str, accept: bool) {
+        let hash = member_review(reg).unwrap().pending[key].hash.clone();
+        decide_member_change(reg, key, &hash, accept).unwrap();
+    }
+
+    #[test]
+    fn member_review_sync_holds_all_control_plane_changes() {
+        let mut reg = registry();
+        stage_team_config(&mut reg, "review-team", &config("fixture-only"), 1, &[]).unwrap();
+        assert_eq!(member_review(&reg).unwrap().pending.len(), 5);
+        assert_eq!(reg.servers.len(), 2);
+        for server in &reg.servers {
+            assert!(!server.enabled);
+            assert!(!reg.is_enabled(&reg.active_profile_id(), &server.id));
+            assert!(server.needs_team_enable_review());
+            assert!(server.check_enable_allowed(false).is_err());
+        }
+        assert!(reg.team.as_ref().unwrap().team_instructions_content.is_none());
+        assert!(!reg.team.as_ref().unwrap().call_audit_export);
+        assert!(reg.team.as_ref().unwrap().rate_limits.is_empty());
+        // The required safety floor still takes effect before consent.
+        assert_eq!(reg.team_min_safety_level, crate::registry::SafetyLevel::Ask);
+        let id = reg.servers[0].id.clone();
+        let profile = reg.active_profile_id();
+        assert!(crate::registry_controller::apply_server_enabled(&mut reg, &profile, &id, true, true).is_err());
+        reg.set_all_enabled(&profile, true).unwrap();
+        assert!(reg.servers.iter().all(|s| !reg.is_enabled(&profile, &s.id)));
+    }
+
+    #[test]
+    fn member_review_rejection_survives_save_sync_and_content_return() {
+        let mut reg = registry();
+        let first = config("first");
+        stage_team_config(&mut reg, "review-team", &first, 1, &[]).unwrap();
+        decide(&mut reg, "server:stdio", false);
+        decide(&mut reg, "instructions", false);
+        decide(&mut reg, "policy", false);
+        decide(&mut reg, "callAuditExport", false);
+        reg = serde_json::from_value(serde_json::to_value(&reg).unwrap()).unwrap();
+        stage_team_config(&mut reg, "review-team", &first, 2, &[]).unwrap();
+        assert_eq!(member_review(&reg).unwrap().pending.len(), 1);
+        let mut next = config("next");
+        next["instructions"]["content"] = json!("Different instructions");
+        next["screeningPolicy"]["forceBlockOnInjection"] = json!(true);
+        stage_team_config(&mut reg, "review-team", &next, 3, &[]).unwrap();
+        let pending = member_review(&reg).unwrap().pending;
+        assert!(pending.contains_key("server:stdio"));
+        assert!(pending.contains_key("instructions"));
+        assert!(pending.contains_key("policy"));
+        assert!(!pending.contains_key("callAuditExport"));
+        stage_team_config(&mut reg, "review-team", &first, 4, &[]).unwrap();
+        assert!(!member_review(&reg).unwrap().pending.contains_key("server:stdio"));
+        assert!(reg.servers.iter().all(|s| !s.enabled));
+        assert!(!reg.team.as_ref().unwrap().call_audit_export);
+    }
+
+    #[test]
+    fn member_review_stale_accept_cannot_accept_a_later_definition() {
+        let mut reg = registry();
+        stage_team_config(&mut reg, "review-team", &config("first"), 1, &[]).unwrap();
+        let hash = member_review(&reg).unwrap().pending["server:stdio"].hash.clone();
+        stage_team_config(&mut reg, "review-team", &config("changed"), 2, &[]).unwrap();
+        let before = serde_json::to_value(&reg).unwrap();
+        assert!(decide_member_change(&mut reg, "server:stdio", &hash, true).unwrap_err().contains("updated"));
+        assert_eq!(serde_json::to_value(&reg).unwrap(), before);
+        decide(&mut reg, "server:stdio", true);
+        let server = reg.servers.iter().find(|s| saved_team_original_id(s) == Some("stdio")).unwrap();
+        assert_eq!(server.command.as_deref(), Some("changed"));
+        assert!(server.enabled);
+        assert!(reg.is_enabled(&reg.active_profile_id(), &server.id));
+        assert!(!server_change_held(&reg, &server.id));
+        stage_team_config(&mut reg, "review-team", &config("changed"), 3, &[]).unwrap();
+        assert!(!member_review(&reg).unwrap().pending.contains_key("server:stdio"));
+    }
+
+    #[test]
+    fn member_review_changed_remote_and_removal_are_held() {
+        let mut reg = registry();
+        let mut cfg = config("first");
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "server:remote", true);
+        cfg["servers"][1]["url"] = json!("https://1.2.3.5/mcp");
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert!(member_review(&reg).unwrap().pending["server:remote"].fields.iter().any(|f| f.before.contains("1.2.3.4") && f.after.contains("1.2.3.5")));
+        assert!(reg.servers.iter().all(|s| !s.enabled));
+        cfg["servers"] = json!([]);
+        stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
+        assert!(member_review(&reg).unwrap().pending.contains_key("server:remote"));
+        assert!(reg.servers.iter().any(|s| saved_team_original_id(s) == Some("remote")));
+        decide(&mut reg, "server:remote", true);
+        assert!(!reg.servers.iter().any(|s| saved_team_original_id(s) == Some("remote")));
+    }
+
+    #[test]
+    fn member_review_floor_tightens_immediately_and_loosening_waits() {
+        use crate::registry::SafetyLevel::{Off, Strict};
+        let mut reg = registry();
+        let strict = json!({"servers":[], "screeningPolicy":{"minSafetyLevel":"strict", "forceQuarantineOnDrift":true,"forceBlockOnInjection":true}});
+        stage_team_config(&mut reg, "review-team", &strict, 1, &[]).unwrap();
+        assert_eq!(reg.team_min_safety_level, Strict);
+        assert!(reg.team_forced_quarantine_on_drift && reg.team_forced_block_on_injection);
+        decide(&mut reg, "policy", true);
+        let loose = json!({"servers":[], "screeningPolicy":{"minSafetyLevel":"off", "forceQuarantineOnDrift":false,"forceBlockOnInjection":false}});
+        stage_team_config(&mut reg, "review-team", &loose, 2, &[]).unwrap();
+        assert_eq!(reg.team_min_safety_level, Strict);
+        assert!(reg.team_forced_quarantine_on_drift && reg.team_forced_block_on_injection);
+        decide(&mut reg, "policy", false);
+        stage_team_config(&mut reg, "review-team", &loose, 3, &[]).unwrap();
+        assert_eq!(reg.team_min_safety_level, Strict);
+        assert!(member_review(&reg).unwrap().pending.is_empty());
+        let mut different = loose.clone();
+        different["screeningPolicy"]["forcePiiRedaction"] = json!(true);
+        stage_team_config(&mut reg, "review-team", &different, 4, &[]).unwrap();
+        decide(&mut reg, "policy", true);
+        assert_eq!(reg.team_min_safety_level, Off);
+        assert!(!reg.team_forced_quarantine_on_drift && !reg.team_forced_block_on_injection);
+    }
+
+    #[test]
+    fn member_review_export_turn_off_revokes_prior_consent() {
+        let mut reg = registry();
+        let mut cfg = config("first");
+        stage_team_config(&mut reg, "review-team", &cfg, 1, &[]).unwrap();
+        decide(&mut reg, "callAuditExport", true);
+        assert!(reg.team.as_ref().unwrap().call_audit_export);
+        cfg["callAuditExport"] = json!(false);
+        stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
+        assert!(!reg.team.as_ref().unwrap().call_audit_export);
+        cfg["callAuditExport"] = json!(true);
+        stage_team_config(&mut reg, "review-team", &cfg, 3, &[]).unwrap();
+        assert!(!reg.team.as_ref().unwrap().call_audit_export);
+        assert!(member_review(&reg).unwrap().pending.contains_key("callAuditExport"));
+    }
+
+    #[test]
+    fn member_review_hash_is_full_content_and_stable_for_object_key_order() {
+        assert_eq!(item_hash("server:s", &json!({"a":1,"b":2})), item_hash("server:s", &json!({"b":2,"a":1})));
+        assert_ne!(item_hash("server:s", &json!({"a":1})), item_hash("server:s", &json!({"a":2})));
+        assert_ne!(item_hash("server:s", &json!({"args":["a","b"]})), item_hash("server:s", &json!({"args":["b","a"]})));
+        assert_ne!(item_hash("server:s", &json!({})), item_hash("server:t", &json!({})));
+    }
+
+    #[test]
+    fn member_review_labels_require_a_complete_version_chain() {
+        let changes = json!({"changes":[
+            {"version":12,"baseVersion":11,"author":{"name":"Alice"},"at":1,"via":"dashboard","approvedBy":{"name":"Bob"},"summary":{"serversChanged":["stdio"]}},
+            {"version":11,"baseVersion":9,"summary":{"instructions":true}}
+        ]});
+        assert_eq!(covered_changes(changes.clone(), 9, 12).len(), 2);
+        assert!(covered_changes(changes.clone(), 8, 12).is_empty());
+        let mut missing = changes.clone();
+        missing["changes"][0].as_object_mut().unwrap().remove("baseVersion");
+        assert!(covered_changes(missing, 9, 12).is_empty());
+        let labels = change_labels("server:stdio", &covered_changes(changes, 9, 12));
+        assert_eq!(labels[0]["author"]["name"], "Alice");
+        assert_eq!(labels[0]["approvedBy"]["name"], "Bob");
+        assert_eq!(labels[0]["via"], "dashboard");
+    }
+
+    fn serve(status: u16, body: Value) -> (String, std::thread::JoinHandle<(String, Value)>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", server.server_addr());
+        let handle = std::thread::spawn(move || {
+            let mut request = server.recv_timeout(std::time::Duration::from_secs(5)).unwrap().expect("Teams request");
+            let path = request.url().to_string();
+            let mut payload = String::new();
+            request.as_reader().read_to_string(&mut payload).unwrap();
+            request.respond(tiny_http::Response::from_string(body.to_string()).with_status_code(status)).unwrap();
+            (path, serde_json::from_str(&payload).unwrap_or(Value::Null))
+        });
+        (address, handle)
+    }
+
+    #[test]
+    fn member_review_http_404_is_unlabelled_and_403_explains_dashboard() {
+        let (url, server) = serve(404, json!({}));
+        let mut conn = registry().team.unwrap();
+        conn.server_url = url;
+        assert!(fetch_change_labels(&conn, "fixture-token", 4, 5).unwrap().is_empty());
+        assert_eq!(server.join().unwrap().0, "/teams/review-team/config/changes?since=4");
+        let (url, server) = serve(403, json!({"error":"device token is not an admin session"}));
+        assert_eq!(push_config(&url, "review-team", "fixture-token", &json!({"servers":[]}), 4).unwrap_err(), "Finish this in the Teams dashboard");
+        server.join().unwrap();
+        assert_eq!(push_status_message(403), Some("Finish this in the Teams dashboard"));
+    }
+
+    #[test]
+    fn member_review_202_and_safe_confirmation_url() {
+        let proposal = json!({"proposal":{"id":"p1","baseVersion":7,"confirmUrl":"https://teams.toolport.app/#changes=team/p1"}});
+        let outcome = parse_push_response(HOSTED_TEAMS_URL, 202, proposal).unwrap();
+        let result = PublishResult::whole_set(outcome);
+        assert_eq!(result.summary, "Sent for confirmation");
+        assert!(!result.published);
+        assert!(result.handoffs.is_empty());
+        assert_eq!(result.proposal.unwrap().base_version, 7);
+        for url in ["http://teams.toolport.app/#changes=p1", "https://evil.example/", "https://teams.toolport.app.evil.example/", "https://user@teams.toolport.app/", "file:///tmp/config", "https://teams.toolport.app:444/"] {
+            assert!(validate_confirmation_url(HOSTED_TEAMS_URL, url).is_err(), "{url}");
+        }
+        assert!(matches!(parse_push_response(HOSTED_TEAMS_URL, 200, json!({"version":8})).unwrap(), PushOutcome::Published(8)));
+    }
+
+    #[test]
+    fn member_review_pairing_device_fields_are_optional_and_bounded() {
+        let body = pairing_body("t", "challenge", Some(&"界".repeat(150)), &"o".repeat(140), &"v".repeat(140));
+        assert_eq!(body["teamId"], "t");
+        assert_eq!(body["challenge"], "challenge");
+        for key in ["deviceName", "os", "appVersion"] { assert_eq!(body[key].as_str().unwrap().chars().count(), 128); }
+        assert!(pairing_body("t", "c", None, "linux", "2.0").get("deviceName").is_none());
+    }
+
+    #[test]
+    fn member_review_survives_v1_v2_v3_round_trip() {
+        let mut reg = registry();
+        stage_team_config(&mut reg, "review-team", &config("fixture-only"), 1, &[]).unwrap();
+        decide(&mut reg, "instructions", false);
+        let expected = reg.team.as_ref().unwrap().unknown_fields[MEMBER_REVIEW_FIELD].clone();
+        for version in [1, 2, 3] {
+            let mut value = serde_json::to_value(&reg).unwrap();
+            value["version"] = json!(version);
+            let reloaded: Registry = serde_json::from_value(value).unwrap();
+            assert_eq!(reloaded.team.unwrap().unknown_fields[MEMBER_REVIEW_FIELD], expected);
+        }
+    }
+}
