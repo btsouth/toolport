@@ -5,9 +5,10 @@ import App from "./App";
 import type { ProbeResult, Registry } from "@/lib/types";
 
 const warningToast = vi.hoisted(() => vi.fn());
-vi.mock("sonner", () => ({
-  toast: { warning: warningToast, error: vi.fn(), success: vi.fn(), info: vi.fn() },
-}));
+vi.mock("sonner", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("sonner")>();
+  return { ...actual, toast: { ...actual.toast, warning: warningToast } };
+});
 
 const probeServers = vi.fn();
 const getRegistry = vi.fn();
