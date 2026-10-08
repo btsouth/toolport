@@ -17879,10 +17879,10 @@ fn main() {
         }
         ArgAction::InstallerPreflight(path) => {
             match conduit_lib::gateway_publish::installer_preflight(&path) {
-                Ok(()) => std::process::exit(0),
+                Ok(()) => conduit_lib::telemetry::exit_with(0),
                 Err(clients) => {
                     println!("Toolport installation deferred:\n{}", clients.join("\n"));
-                    std::process::exit(1);
+                    conduit_lib::telemetry::exit_with(1);
                 }
             }
         }
