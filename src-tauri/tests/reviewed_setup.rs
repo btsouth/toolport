@@ -99,6 +99,13 @@ fn migrate_fixture(
     if let Err(error) = &attempt {
         assert!(error.contains("no verified gateway tools"), "{error}");
         assert_eq!(std::fs::read_to_string(fixture.config()).unwrap(), original);
+        let keys = controller::preview_client_imports()
+            .unwrap()
+            .into_iter()
+            .filter(|candidate| names.contains(&candidate.name))
+            .map(|candidate| candidate.key)
+            .collect();
+        controller::import_client_servers(keys).unwrap();
         // Synchronize with real lazy discovery through a harmless fixture tool.
         // No timed sleeps or arbitrary retry loop is needed for the cold catalog.
         registry::update(|reg| {

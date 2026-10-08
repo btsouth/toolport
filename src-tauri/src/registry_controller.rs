@@ -1541,17 +1541,40 @@ fn migrate_client_reviewed_with(
     let mut imported = 0;
     let mut moved = Vec::new();
     let mut tools = Vec::new();
+    let mut staged = None;
     let outcome = clients::migrate_reviewed(client_id, profile, names, revision, || {
         let (registry, result) = registry::update(|registry| {
+            let previous = registry.clone();
             let (added, moved) = import_client_servers_for_migration(registry, &client)?;
             enable_moved_servers(registry, profile, &moved)?;
-            Ok((added, moved))
+            Ok((added, moved, previous))
         })?;
         imported = result.0;
         moved = result.1;
+        staged = Some((result.2, registry.clone()));
         tools = verify(&registry, &moved, client_id, profile)?;
         Ok(())
-    })?;
+    });
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if let Some((previous, prepared)) = staged {
+                let (_, restored) = registry::update(|latest| {
+                    // Never overwrite an edit made while the gateway was checking.
+                    let unchanged = serde_json::to_value(&*latest).map_err(|e| e.to_string())?
+                        == serde_json::to_value(&prepared).map_err(|e| e.to_string())?;
+                    if unchanged {
+                        *latest = previous;
+                    }
+                    Ok(unchanged)
+                })?;
+                if !restored {
+                    return Err(format!("{error} Registry changed during setup. Review Servers before retrying."));
+                }
+            }
+            return Err(error);
+        }
+    };
     let result = finish_client_stdio_mutation(client_id, outcome, |managed_entry| {
         registry::update(|registry| {
             Ok(apply_client_stdio_update(
@@ -2420,6 +2443,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "Launch failed");
+        assert!(read_registry_exact().unwrap().servers.is_empty());
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
         assert!(!fixture.move_record("claude-code").exists());
     }
