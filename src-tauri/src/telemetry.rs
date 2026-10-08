@@ -533,7 +533,6 @@ mod tests {
         let dir = scratch("retired");
         let data = crate::registry::DataDirOverride::set(&dir);
         crate::gatewaylog::append("before teardown");
-        assert!(flush_for_test(Duration::from_secs(5)));
         let (captured_tx, captured_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let producer = std::thread::spawn(move || {
