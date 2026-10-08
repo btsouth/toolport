@@ -637,7 +637,7 @@ fn suggestion_row(
                     Ok(Ok(registry)) => {
                         open_added_setup(&registry, &page);
                         page.pending_notice.replace(Some(format!(
-                            "Added {name}. Review credentials and enable it from Servers."
+                            "Added {name}. Check its status under Servers."
                         )));
                         page.search.set_text("");
                         page.refresh();
@@ -795,7 +795,11 @@ fn stack_card(
             .css_classes(["caption", "toolport-muted"])
             .build(),
     );
-    let add = gtk::Button::with_label(if missing == 0 { "Added" } else { "Add Collection" });
+    let add = gtk::Button::with_label(if missing == 0 {
+        "Added"
+    } else {
+        "Add Collection"
+    });
     add.set_sensitive(missing > 0);
     add.add_css_class(if missing == 0 {
         "toolport-secondary-action"
@@ -813,7 +817,9 @@ fn stack_card(
         .cloned()
         .collect();
     add.connect_clicked(move |_| {
-        let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else { return; };
+        let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else {
+            return;
+        };
         let entries = missing_entries.clone();
         let refreshed = page.clone();
         super::setup::collection(&parent, &name, entries, move || refreshed.refresh());
@@ -946,7 +952,7 @@ fn catalog_card(
                     Ok(Ok(registry)) => {
                         open_added_setup(&registry, &page);
                         page.pending_notice.replace(Some(format!(
-                            "Added {name}. Review credentials and enable it from Servers."
+                            "Added {name}. Check its status under Servers."
                         )));
                         page.refresh();
                     }
