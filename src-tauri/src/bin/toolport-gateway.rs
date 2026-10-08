@@ -6761,9 +6761,9 @@ fn handle_request_with_cancel(
                 // reuse one client's answer for another.
                 "cacheScope": "private"
             });
-            if let Some(text) = server_instructions(reg, profile, || {
-                DISCOVER_INSTRUCTIONS_PREAMBLE.to_string()
-            }) {
+            if let Some(text) =
+                server_instructions(reg, profile, || DISCOVER_INSTRUCTIONS_PREAMBLE.to_string())
+            {
                 result["instructions"] = Value::String(text);
             }
             Some(success(id, result))
