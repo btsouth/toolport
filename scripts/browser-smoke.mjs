@@ -275,6 +275,7 @@ try {
       await expect(
         page.getByText("toolport_search_tools", { exact: true }),
       ).toBeVisible();
+      await page.getByText("What your agent sees", { exact: true }).click();
     }
     await page.screenshot({
       animations: "disabled",
