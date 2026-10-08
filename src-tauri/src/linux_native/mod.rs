@@ -6835,7 +6835,9 @@ fn posture_line(ready: usize, auth: usize, errors: usize, pending: usize, total:
     parts.join(" · ")
 }
 
-fn server_groups(servers: &[state::ServerView]) -> (Vec<&state::ServerView>, Vec<&state::ServerView>) {
+fn server_groups(
+    servers: &[state::ServerView],
+) -> (Vec<&state::ServerView>, Vec<&state::ServerView>) {
     let mut servers = servers.iter().collect::<Vec<_>>();
     servers.sort_by_key(|server| server_order_key(server));
     servers.into_iter().partition(|server| server.enabled)
@@ -9974,8 +9976,14 @@ mod tests {
         aardvark.enabled = false;
         let servers = [zulu, beta, alpha, aardvark];
         let (on, off) = server_groups(&servers);
-        let on_names = on.iter().map(|server| server.name.as_str()).collect::<Vec<_>>();
-        let off_names = off.iter().map(|server| server.name.as_str()).collect::<Vec<_>>();
+        let on_names = on
+            .iter()
+            .map(|server| server.name.as_str())
+            .collect::<Vec<_>>();
+        let off_names = off
+            .iter()
+            .map(|server| server.name.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(on_names, ["Alpha", "Zulu"]);
         assert_eq!(off_names, ["Aardvark", "beta"]);
     }
