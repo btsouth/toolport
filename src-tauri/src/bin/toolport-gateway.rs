@@ -6423,7 +6423,6 @@ fn cached_tool_surfaces(
     (full, exposed)
 }
 
-
 /// Check coldness without cloning a potentially multi-megabyte tool catalog.
 fn has_scoped_tools(
     tools: &[Value],
@@ -37769,6 +37768,7 @@ mod tests {
         struct ReconnectingApps {
             inner: McpAppsServer,
             html: bool,
+            reset: Arc<AtomicBool>,
         }
         impl Transport for ReconnectingApps {
             fn request(
@@ -37776,11 +37776,6 @@ mod tests {
                 method: &str,
                 params: Value,
             ) -> Result<Value, downstream::TransportError> {
-                if method == "tools/call" && self.html {
-                    return Err(downstream::TransportError::Unavailable(
-                        "fixture disconnect".into(),
-                    ));
-                }
                 let mut result = self.inner.request(method, params)?;
                 if method == "server/discover" && !self.html {
                     result["capabilities"]["extensions"]
@@ -37797,16 +37792,23 @@ mod tests {
             ) -> Result<(), downstream::TransportError> {
                 self.inner.notify(method, params)
             }
+            fn connection_reset_reason(&self) -> Option<String> {
+                (self.html && self.reset.load(Ordering::SeqCst))
+                    .then(|| "fixture retired connection".into())
+            }
             fn set_protocol_meta(&mut self, meta: Option<Value>) {
                 self.inner.set_protocol_meta(meta);
             }
         }
-        let connect = |html| {
+        let reset = Arc::new(AtomicBool::new(false));
+        let transport_reset = Arc::clone(&reset);
+        let connect = move |html| {
             DownstreamServer::connect(
                 "apps".into(),
                 Box::new(ReconnectingApps {
                     inner: McpAppsServer::default(),
                     html,
+                    reset: Arc::clone(&transport_reset),
                 }),
             )
             .unwrap()
@@ -37834,7 +37836,8 @@ mod tests {
         let before = get();
         assert!(before.1.json.get().contains("apps__app_only"));
         // A call swaps the shared connection without reindexing this Arc.
-        let _ = router.route_call("apps__plain", json!({}));
+        reset.store(true, Ordering::SeqCst);
+        router.route_call("apps__plain", json!({})).unwrap();
         assert!(!router.mcp_app_html_visibility(|_| true).0);
         let after = get();
         assert!(!Arc::ptr_eq(&before.1, &after.1));
