@@ -12,27 +12,43 @@ pub(crate) const CHANGED: &str = "Client config revision changed before rename";
 struct Identity {
     size: u64,
     modified: Option<std::time::SystemTime>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     device: u64,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     inode: u64,
     #[cfg(unix)]
     mtime: (i64, i64),
 }
 impl Identity {
-    fn of(meta: &Metadata) -> Self {
+    fn of(meta: &Metadata, _file: &File) -> Result<Self, String> {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
-        Self {
+        #[cfg(windows)]
+        let info = {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            };
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe { GetFileInformationByHandle(_file.as_raw_handle(), &mut info) } == 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            info
+        };
+        Ok(Self {
             size: meta.len(),
             modified: meta.modified().ok(),
             #[cfg(unix)]
             device: meta.dev(),
             #[cfg(unix)]
             inode: meta.ino(),
+            #[cfg(windows)]
+            device: u64::from(info.dwVolumeSerialNumber),
+            #[cfg(windows)]
+            inode: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
             #[cfg(unix)]
             mtime: (meta.mtime(), meta.mtime_nsec()),
-        }
+        })
     }
 }
 
@@ -75,6 +91,7 @@ pub(crate) fn read(path: &Path) -> Result<Revision, String> {
     }
     #[cfg(test)]
     hook("read", path);
+    let file_identity = Identity::of(&meta, &file)?;
     let mut text = String::new();
     file.take(crate::clients::MAX_CONFIG_BYTES + 1)
         .read_to_string(&mut text)
@@ -84,7 +101,7 @@ pub(crate) fn read(path: &Path) -> Result<Revision, String> {
     }
     Ok(Revision {
         text: Some(text),
-        identity: Some(Identity::of(&meta)),
+        identity: Some(file_identity),
         permissions: Some(meta.permissions()),
     })
 }
@@ -99,8 +116,18 @@ fn sibling(dest: &Path) -> PathBuf {
 }
 
 fn identity(path: &Path) -> Result<Option<Identity>, String> {
-    match fs::metadata(path) {
-        Ok(meta) => Ok(Some(Identity::of(&meta))),
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    match options.open(path) {
+        Ok(file) => Ok(Some(Identity::of(
+            &file.metadata().map_err(|e| e.to_string())?,
+            &file,
+        )?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.to_string()),
     }
