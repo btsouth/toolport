@@ -15045,7 +15045,10 @@ fn process_request_wire(
         let cold = !has_scoped_tools(&cache_snapshot.tools, allowed, &router, &reg)
             || (discovery == DiscoveryMode::Full || search_server.is_some())
                 && router.any_missing_catalog(visible);
-        if cold {
+        // Scoped search verifies the live published catalog even when another
+        // server makes the cache warm. Publication swaps the router before the
+        // cached search index is refreshed.
+        if cold || search_server.is_some() {
             #[cfg(test)]
             COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
                 if let Some(hook) = hook.take() {
@@ -22152,6 +22155,31 @@ mod tests {
             .unwrap()
             .iter()
             .any(|tool| tool["name"] == "other__cached"));
+    }
+
+    #[test]
+    fn reviewed_scoped_search_reads_published_catalog_before_cache_refresh() {
+        let _env = DataDirTestEnv::new("reviewed-search-cache-publication");
+        let state = http_state(false);
+        let mut live = Router::new();
+        live.add(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap());
+        *state.router.lock().unwrap() = Arc::new(live);
+        // Publication swaps the indexed router before persistence refreshes the
+        // cached catalog. A different server can already make that cache warm.
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
+        let reply = process_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"","server":"late"}}}),
+            &SearchGuard::default(), None, None, None, None, Some("claude-code"), None, DiscoveryMode::Lazy,
+        ).unwrap();
+        assert!(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("late__cached"),
+            "scoped search used the stale cache: {reply}"
+        );
     }
 
     #[test]
