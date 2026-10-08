@@ -26,6 +26,8 @@ pub(crate) struct ArgumentMap {
     tuple: Vec<ArgumentMap>,
     branches: Vec<ArgumentMap>,
     extra: Option<Box<ArgumentMap>>,
+    patterns: Vec<(regex::Regex, ArgumentMap)>,
+    contains: Option<Box<ArgumentMap>>,
     known: BTreeSet<String>,
 }
 
@@ -36,6 +38,8 @@ impl ArgumentMap {
             && self.tuple.is_empty()
             && self.branches.is_empty()
             && self.extra.is_none()
+            && self.patterns.is_empty()
+            && self.contains.is_none()
     }
 
     pub(crate) fn restore(&self, value: &mut Value) -> Result<(), String> {
@@ -56,9 +60,21 @@ impl ArgumentMap {
                     child.restore(value)?;
                 }
             }
+            for (pattern, child) in &self.patterns {
+                for (key, value) in object.iter_mut() {
+                    if pattern.is_match(key) {
+                        child.restore(value)?;
+                    }
+                }
+            }
             if let Some(extra) = &self.extra {
                 for (key, value) in object.iter_mut() {
-                    if !self.known.contains(key) {
+                    if !self.known.contains(key)
+                        && !self
+                            .patterns
+                            .iter()
+                            .any(|(pattern, _)| pattern.is_match(key))
+                    {
                         extra.restore(value)?;
                     }
                 }
@@ -67,6 +83,9 @@ impl ArgumentMap {
         if let Some(array) = value.as_array_mut() {
             for (index, value) in array.iter_mut().enumerate() {
                 if let Some(child) = self.tuple.get(index).or(self.items.as_deref()) {
+                    child.restore(value)?;
+                }
+                if let Some(child) = &self.contains {
                     child.restore(value)?;
                 }
             }
@@ -294,7 +313,7 @@ fn normalize_node(schema: &mut Value, aliases: &BTreeMap<String, String>) -> Arg
             }
         }
     }
-    for keyword in ["then", "else"] {
+    for keyword in ["if", "then", "else", "not"] {
         if let Some(child) = object.get_mut(keyword) {
             let branch = normalize_node(child, aliases);
             if !branch.is_empty() {
@@ -337,14 +356,35 @@ fn normalize_node(schema: &mut Value, aliases: &BTreeMap<String, String>) -> Arg
     }
     // These schemas do not describe a fixed argument position, but still need
     // valid numeric keywords and property declarations on the published side.
-    for keyword in ["$defs", "definitions", "patternProperties"] {
+    if let Some(map) = object
+        .get_mut("patternProperties")
+        .and_then(Value::as_object_mut)
+    {
+        for (pattern, child) in map {
+            let child = normalize_node(child, aliases);
+            // JSON Schema already requires valid regexes. Keep invalid regexes
+            // unchanged; they cannot define a safe argument mapping.
+            if !child.is_empty() {
+                if let Ok(pattern) = regex::Regex::new(pattern) {
+                    plan.patterns.push((pattern, child));
+                }
+            }
+        }
+    }
+    if let Some(child) = object.get_mut("contains") {
+        let child = normalize_node(child, aliases);
+        if !child.is_empty() {
+            plan.contains = Some(Box::new(child));
+        }
+    }
+    for keyword in ["$defs", "definitions"] {
         if let Some(map) = object.get_mut(keyword).and_then(Value::as_object_mut) {
             for child in map.values_mut() {
                 normalize_node(child, aliases);
             }
         }
     }
-    for keyword in ["contains", "propertyNames", "not", "if"] {
+    for keyword in ["propertyNames"] {
         if let Some(child) = object.get_mut(keyword) {
             normalize_node(child, aliases);
         }

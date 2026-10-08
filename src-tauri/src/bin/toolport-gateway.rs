@@ -37137,9 +37137,9 @@ mod tests {
             "{result}"
         );
         // MRTR/task continuation dispatches the tool through this same boundary.
-        let retry = MrtrRequest::from_params(
+        let retry = MrtrRequest::from_params(Some(
             &json!({"requestState": "resume-fixture", "inputResponses": []}),
-        );
+        ));
         router
             .route_call_with_cancel_and_mrtr(
                 "s__write",
