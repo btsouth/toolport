@@ -1126,6 +1126,7 @@ mod tests {
             window.present();
             let main_loop = gtk::glib::MainLoop::new(None, false);
             let frames = Rc::new(Cell::new(0));
+            let observed_frames = frames.clone();
             let finished = main_loop.clone();
             window.add_tick_callback(move |_, _| {
                 frames.set(frames.get() + 1);
@@ -1142,6 +1143,10 @@ mod tests {
                     deadline.quit()
                 });
             main_loop.run();
+            assert!(
+                observed_frames.get() >= 2,
+                "GTK did not produce the fixture frames within five seconds"
+            );
             timer.remove();
             assert!(page.root.width() > 0);
             if let Ok(output) = std::env::var("P22_SCREENSHOT_DIR") {
