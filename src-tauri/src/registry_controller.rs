@@ -621,7 +621,16 @@ pub fn add_reviewed_entry(entry: ServerEntry) -> Result<(Registry, String), Stri
         })
         .collect::<serde_json::Map<_, _>>();
     let definition = serde_json::json!({"env":env});
-    let import = crate::import_credentials::Import::prepare(entry, Some(&definition))?;
+    let choices = entry
+        .env
+        .iter()
+        .map(|env| (env.key.clone(), env.secret))
+        .collect();
+    let import = crate::import_credentials::Import::prepare_with_choices(
+        entry,
+        Some(&definition),
+        Some(&choices),
+    )?;
     crate::import_credentials::transaction(|writes| {
         let current = read_registry_exact_or_default()?;
         let mut registry = current.clone();

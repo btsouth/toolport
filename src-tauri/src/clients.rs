@@ -1911,11 +1911,16 @@ pub struct ParsedSnippetServer {
     pub env: Vec<SnippetEnvVar>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct SnippetEnvVar {
     pub key: String,
     pub value: Option<String>,
+}
+
+impl Serialize for SnippetEnvVar {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok,S::Error> {
+        serde_json::json!({"key":self.key,"value":self.value,"secret":crate::import_credentials::secret_env(&self.key,self.value.as_deref())}).serialize(serializer)
+    }
 }
 
 /// Like `json_server`, but also captures env-var values from the JSON def.

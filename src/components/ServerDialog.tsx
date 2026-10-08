@@ -105,8 +105,14 @@ export function ServerDialog({
   });
   // Env vars (API keys etc.). Values are vaulted in the OS keychain, never stored
   // in the registry, so existing secrets show as declared keys with empty values.
-  const [envRows, setEnvRows] = useState<{ key: string; value: string }[]>(
-    initial?.env.map((e) => ({ key: e.key, value: "" })) ?? [],
+  const [envRows, setEnvRows] = useState<
+    { key: string; value: string; secret?: boolean }[]
+  >(
+    initial?.env.map((e) => ({
+      key: e.key,
+      value: e.secret ? "" : (e.value ?? ""),
+      secret: e.secret,
+    })) ?? [],
   );
   const [launch, setLaunch] = useState<LaunchConfig | null>(initial?.launch ?? null);
   const [launchValues, setLaunchValues] = useState<Record<string, string>>(
@@ -172,7 +178,13 @@ export function ServerDialog({
             ? ""
             : String(initial.initializeTimeoutMs / 1000),
       });
-      setEnvRows(initial?.env.map((e) => ({ key: e.key, value: "" })) ?? []);
+      setEnvRows(
+        initial?.env.map((e) => ({
+          key: e.key,
+          value: e.secret ? "" : (e.value ?? ""),
+          secret: e.secret,
+        })) ?? [],
+      );
       setLaunch(initial?.launch ?? null);
       setLaunchValues(
         Object.fromEntries(
@@ -241,6 +253,7 @@ export function ServerDialog({
         s.env.map((e) => ({
           key: e.key,
           value: e.value ?? "",
+          secret: e.secret ?? true,
         })),
       );
       setLaunch(null);
@@ -285,8 +298,8 @@ export function ServerDialog({
           : null,
       env: declared.map((r) => ({
         key: r.key.trim(),
-        value: withSecretValues && r.value ? r.value : null,
-        secret: true,
+        value: (withSecretValues || r.secret === false) && r.value ? r.value : null,
+        secret: r.secret !== false,
       })),
       url: isStdio ? null : form.url.trim() || null,
       source: bindingCleared ? "manual" : (initial?.source ?? "manual"),
@@ -386,7 +399,7 @@ export function ServerDialog({
       const failedKeys: string[] = [];
       if (id) {
         for (const r of declared) {
-          if (!r.value) continue;
+          if (!r.value || r.secret === false) continue;
           const key = r.key.trim();
           try {
             result = await setSecret(id, key, r.value);
@@ -435,6 +448,11 @@ export function ServerDialog({
           ...s,
           key: String(i),
           envKeys: s.env.map((e) => e.key),
+          credentials: s.env.map((e) => ({
+            key: e.key,
+            secret: e.secret ?? true,
+            present: !!e.value && !/^\$\{[^}]+\}$/.test(e.value),
+          })),
           isNew: true,
         }))}
         busy={busy}
@@ -692,13 +710,28 @@ export function ServerDialog({
                   onChange={(e) => setEnvRow(i, "key", e.target.value)}
                 />
                 <Input
-                  type="password"
+                  type={row.secret === false ? "text" : "password"}
                   placeholder={
                     initial?.env.some((e) => e.key === row.key) ? "•••• (saved)" : "value"
                   }
                   value={row.value}
                   onChange={(e) => setEnvRow(i, "value", e.target.value)}
                 />
+                <label className="flex shrink-0 items-center gap-1 text-xs">
+                  <input
+                    type="checkbox"
+                    aria-label={`Keep ${row.key || "variable"} in keychain`}
+                    checked={row.secret !== false}
+                    onChange={(e) =>
+                      setEnvRows((rows) =>
+                        rows.map((r, j) =>
+                          j === i ? { ...r, secret: e.target.checked } : r,
+                        ),
+                      )
+                    }
+                  />
+                  Keychain
+                </label>
                 <Button
                   size="icon"
                   variant="ghost"

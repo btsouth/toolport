@@ -8613,11 +8613,11 @@ fn open_server_editor_prefilled(
                 Ok(servers) => {
                     if servers.len() > 1 {
                         let Some(parent) = fill.root().and_downcast::<gtk::Window>() else { return; };
-                        let items = servers.iter().enumerate().map(|(i, s)| crate::registry_controller::SetupItem {key:i.to_string(),name:s.name.clone(),transport:s.transport.clone(),command:s.command.clone(),args:s.args.clone(),url:s.url.clone(),env_keys:s.env.iter().map(|e| e.key.clone()).collect(),is_new:true,credentials:Vec::new(),unsupported:None}).collect();
-                        setup::review(&parent, "Review pasted servers", items, "Review each command and URL. Credentials go to the keychain. Missing inputs stay off.", "Add selected servers", move |selected,_choices| {
-                            let outcome = crate::registry_controller::add_snippet_servers(&text, &selected)?;
+                        let items = servers.iter().enumerate().map(|(i, s)| crate::registry_controller::SetupItem {key:i.to_string(),name:s.name.clone(),transport:s.transport.clone(),command:s.command.clone(),args:s.args.clone(),url:s.url.clone(),env_keys:s.env.iter().map(|e| e.key.clone()).collect(),is_new:true,credentials:s.env.iter().map(|e|crate::registry_controller::CredentialReview{key:e.key.clone(),secret:crate::import_credentials::secret_env(&e.key,e.value.as_deref()),present:e.value.as_deref().is_some_and(crate::import_credentials::provided)}).collect(),unsupported:None}).collect();
+                        setup::review(&parent, "Review pasted servers", items, "Review each command and URL. Credentials go to the keychain. Missing inputs stay off.", "Add selected servers", move |selected,choices| {
+                            let outcome = crate::registry_controller::add_snippet_servers_choices(&text, &selected, &choices)?;
                             if !outcome.failed.is_empty() { return Err("Could not save credentials. Open Credentials and retry.".into()); }
-                            Ok("Added selected servers. Check their status under Servers.".into())
+                            Ok(outcome.servers.iter().map(|s|format!("{}: {}",s.name,s.status)).collect::<Vec<_>>().join("\n").into())
                         }, { let page = page_for_fill.clone(); move || run_profile_mutation(page.clone(), "Added selected servers", crate::registry_controller::registry_for_disconnect) }, None);
                         return;
                     }

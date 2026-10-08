@@ -20,7 +20,7 @@ export interface ParsedSnippetServer {
   command: string | null;
   args: string[];
   url: string | null;
-  env: { key: string; value: string | null }[];
+  env: { key: string; value: string | null; secret?: boolean }[];
 }
 
 /** Ownership of the gateway entry under our name in a client config (SOU-406). */
