@@ -256,8 +256,9 @@ mod tests {
 
     #[test]
     fn deleted_image_remains_identifiable() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("shell");
+        let temp = std::env::temp_dir().join(format!("toolport-shell-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&temp).unwrap();
+        let path = temp.join("shell");
         std::fs::write(&path, b"old").unwrap();
         let old = std::fs::File::open(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -269,5 +270,6 @@ mod tests {
             })
             .unwrap()
         );
+        std::fs::remove_dir_all(temp).unwrap();
     }
 }
