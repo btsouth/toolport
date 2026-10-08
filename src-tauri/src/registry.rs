@@ -2890,15 +2890,56 @@ static DATA_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Serialize tests that resolve [`conduit_dir`] with tests that override it.
 ///
-/// The override is process-global, so this lock is required even for tests that only
-/// read the normal data directory; otherwise they can observe another test's scratch
-/// directory while that test holds a [`DataDirOverride`].
+/// Every test that resolves a data-dir-derived path must hold this lock and its
+/// own [`DataDirOverride`]. Acquire this before process environment locks. Prefer
+/// [`DataDirTestEnv`] for scratch directory setup and cleanup.
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn data_dir_test_lock() -> std::sync::MutexGuard<'static, ()> {
     DATA_DIR_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Owns a serialized scratch data directory, including telemetry cleanup.
+/// Acquire this before any process environment lock.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct DataDirTestEnv {
+    pub dir: PathBuf,
+    data_dir: Option<DataDirOverride>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl DataDirTestEnv {
+    pub fn new(label: &str) -> Self {
+        let lock = data_dir_test_lock();
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("a writable scratch data directory");
+        Self {
+            data_dir: Some(DataDirOverride::set(&dir)),
+            dir,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for DataDirTestEnv {
+    fn drop(&mut self) {
+        drop(self.data_dir.take());
+        assert!(crate::telemetry::retire_dir_for_test(
+            &self.dir,
+            std::time::Duration::from_secs(5)
+        ));
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 /// Points [`conduit_dir`] at a scratch directory until the guard drops. **Tests only.**
@@ -2916,8 +2957,8 @@ pub fn data_dir_test_lock() -> std::sync::MutexGuard<'static, ()> {
 /// `--features test-support`.
 ///
 /// The override is process-global. Every test in the same test binary that resolves
-/// [`conduit_dir`] directly or indirectly must hold `data_dir_test_lock`, whether
-/// or not that test installs an override itself.
+/// [`conduit_dir`] directly or indirectly must hold `data_dir_test_lock` and install
+/// its own override. Workers must finish before the override is dropped.
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 #[doc(hidden)]
 #[must_use = "the override is reverted when the guard drops, so it must be bound"]
@@ -2970,33 +3011,28 @@ fn resolve_conduit_dir() -> (Option<PathBuf>, DirResolution) {
     }
     // Unit tests must never fall through to the developer's data directory. Binary
     // fixtures compiled with test-support may supply an explicit directory instead.
-    #[cfg(test)]
-    panic!("data directory resolved without DataDirOverride; hold data_dir_test_lock and install a scratch override");
-    #[cfg(all(feature = "test-support", not(test)))]
+    #[cfg(any(test, feature = "test-support"))]
     assert!(
-        crate::brand::env_var("TOOLPORT_DATA_DIR", "CONDUIT_DATA_DIR").is_some(),
-        "data directory resolved without DataDirOverride or an explicit fixture directory"
+        !cfg!(test) && crate::brand::env_var("TOOLPORT_DATA_DIR", "CONDUIT_DATA_DIR").is_some(),
+        "data directory resolved without DataDirOverride; hold data_dir_test_lock and install a scratch override"
     );
-    #[cfg(not(test))]
     {
-        {
-            let cached = DATA_DIR_RESOLVED
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((path, resolution)) = cached.as_ref() {
-                // Re-resolve when the cached path was removed (e.g. legacy leaf renamed).
-                let still_valid = path.as_ref().map(|p| p.exists()).unwrap_or(true);
-                if still_valid {
-                    return (path.clone(), *resolution);
-                }
+        let cached = DATA_DIR_RESOLVED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((path, resolution)) = cached.as_ref() {
+            // Re-resolve when the cached path was removed (e.g. legacy leaf renamed).
+            let still_valid = path.as_ref().map(|p| p.exists()).unwrap_or(true);
+            if still_valid {
+                return (path.clone(), *resolution);
             }
         }
-        let fresh = compute_conduit_dir();
-        *DATA_DIR_RESOLVED
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fresh.clone());
-        fresh
     }
+    let fresh = compute_conduit_dir();
+    *DATA_DIR_RESOLVED
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fresh.clone());
+    fresh
 }
 
 static DATA_DIR_RESOLVED: std::sync::RwLock<Option<(Option<PathBuf>, DirResolution)>> =
@@ -4923,6 +4959,27 @@ pub(crate) mod tests {
     static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn data_dir_resolution_requires_a_scratch_override() {
+        let _lock = data_dir_test_lock();
+        for resolve in [conduit_dir, resolved_path, gateway_log_path] {
+            let panic = std::panic::catch_unwind(resolve).expect_err("unisolated lookup must fail");
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap();
+            assert!(message.contains("without DataDirOverride"));
+        }
+        let dir = std::env::temp_dir().join(format!("toolport-resolver-{}", std::process::id()));
+        let data = DataDirOverride::set(&dir);
+        assert_eq!(conduit_dir(), Some(dir.clone()));
+        assert_eq!(resolved_path(), Some(dir.join("registry.json")));
+        assert_eq!(gateway_log_path(), Some(dir.join("gateway.log")));
+        drop(data);
+        assert!(std::panic::catch_unwind(conduit_dir).is_err());
+    }
+
+    #[test]
     fn access_review_global_switch_never_follows_membership() {
         let mut reg = Registry::default();
         let server: ServerEntry = serde_json::from_value(serde_json::json!({
@@ -6125,13 +6182,10 @@ pub(crate) mod tests {
 
     #[test]
     fn load_and_save_resolved_honor_registry_override() {
+        let _data = DataDirTestEnv::new("registry-override");
         let _guard = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Resolves the data dir indirectly through save/load/update, so it owes
-        // the same lock every other resolver takes. Without it this ran beside a
-        // test holding a DataDirOverride and each saw the other's path.
-        let _data_dir = data_dir_test_lock();
 
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -6240,28 +6294,25 @@ pub(crate) mod tests {
         assert!(super::msix::unc_twin(Path::new("C:")).is_none());
     }
 
-    /// `cargo test` never runs with package identity, so resolution must be
-    /// Direct and the dir the natural home-derived path (not a UNC one).
     #[cfg(windows)]
     #[test]
     fn conduit_dir_is_direct_outside_a_container() {
-        let _data_dir = data_dir_test_lock();
-        assert_eq!(conduit_dir_resolution(), DirResolution::Direct);
-        let dir = conduit_dir().expect("home dir resolves");
-        let s = dir.to_string_lossy();
-        // Prefer Toolport; existing installs may still resolve under the legacy leaf
-        // until desktop launch migrates it.
-        assert!(
-            s.ends_with(&format!(
-                "AppData\\Roaming\\{}",
-                crate::brand::data_dir_leaf_name()
-            )) || s.ends_with(&format!(
-                "AppData\\Roaming\\{}",
-                crate::brand::legacy_data_dir_leaf_name()
-            )),
-            "unexpected data dir: {s}"
+        let env = DataDirTestEnv::new("windows-direct");
+        assert!(!msix::has_package_identity());
+        // Exercise the natural Windows anchor under a synthetic home, never the
+        // developer's actual profile or an installed legacy data directory.
+        let natural =
+            crate::brand::resolve_data_dir_under(&crate::brand::windows_roaming_base(&env.dir));
+        assert_eq!(
+            natural,
+            env.dir
+                .join("AppData")
+                .join("Roaming")
+                .join(crate::brand::data_dir_leaf_name())
         );
-        assert!(!s.starts_with(r"\\"));
+        let _data = DataDirOverride::set(&natural);
+        assert_eq!(conduit_dir_resolution(), DirResolution::Direct);
+        assert_eq!(conduit_dir(), Some(natural));
     }
 
     #[test]
@@ -8202,10 +8253,10 @@ mod registry_version_tests {
 
     #[test]
     fn missing_version_loads_as_v1() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("missing-version");
         let _override = DataDirOverride::set(&dir);
         let path = resolved_path().unwrap();
@@ -8231,10 +8282,10 @@ mod registry_version_tests {
 
     #[test]
     fn current_version_loads_unchanged() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("current-version");
         let _override = DataDirOverride::set(&dir);
         let path = resolved_path().unwrap();
@@ -8258,10 +8309,10 @@ mod registry_version_tests {
 
     #[test]
     fn future_version_is_refused_and_the_file_is_untouched() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("future-version");
         let _override = DataDirOverride::set(&dir);
         let path = resolved_path().unwrap();
@@ -8299,10 +8350,10 @@ mod registry_version_tests {
 
     #[test]
     fn save_over_a_newer_on_disk_version_is_refused() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("save-over-newer");
         let _override = DataDirOverride::set(&dir);
         let path = resolved_path().unwrap();
@@ -8328,10 +8379,10 @@ mod registry_version_tests {
 
     #[test]
     fn test_only_migration_runs_writes_a_backup_and_saves_the_new_version() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("test-migration");
         let _override = DataDirOverride::set(&dir);
         let path = resolved_path().unwrap();
@@ -8370,10 +8421,10 @@ mod registry_version_tests {
 
     #[test]
     fn failing_migration_leaves_the_original_and_no_partial_file() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("failing-migration");
         let _override = DataDirOverride::set(&dir);
         let path = resolved_path().unwrap();
@@ -8433,10 +8484,10 @@ mod registry_version_tests {
 
     #[test]
     fn historical_registry_shapes_still_load() {
+        let _data = data_dir_test_lock();
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = data_dir_test_lock();
         let dir = scratch_dir("historical-shapes");
         let _override = DataDirOverride::set(&dir);
         let path = resolved_path().unwrap();

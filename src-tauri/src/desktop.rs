@@ -1865,15 +1865,24 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
             let connected = registry::load().map(|r| r.team.is_some());
             let delay = match connected {
-                Ok(false) => { failures = 0; 3 }
+                Ok(false) => {
+                    failures = 0;
+                    3
+                }
                 Ok(true) => match teams::sync_wait(25) {
                     Ok(result) => {
                         failures = 0;
-                        if stop.load(std::sync::atomic::Ordering::Acquire) { break; }
+                        if stop.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
                         let state = handle.state::<RegistryState>();
                         match finish_sync(&handle, state.inner(), result) {
-                            Ok(fresh) => { let _ = handle.emit("team-sync-registry", &fresh); }
-                            Err(error) => eprintln!("Toolport: Teams registry refresh failed: {error}"),
+                            Ok(fresh) => {
+                                let _ = handle.emit("team-sync-registry", &fresh);
+                            }
+                            Err(error) => {
+                                eprintln!("Toolport: Teams registry refresh failed: {error}")
+                            }
                         }
                         teams::retry_delay_seconds(0)
                     }
@@ -1890,7 +1899,9 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
                 }
             };
             for _ in 0..delay {
-                if stop.load(std::sync::atomic::Ordering::Acquire) { break; }
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
@@ -1957,7 +1968,9 @@ async fn team_instructions_status() -> Option<teams::InstructionsStatusView> {
 /// Leave the team: remove its merged servers, clear the connection and the token.
 #[tauri::command]
 async fn team_account_link() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(teams::account_link).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(teams::account_link)
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1970,8 +1983,14 @@ fn team_disconnect(state: State<RegistryState>) -> Result<Registry, String> {
 }
 
 #[tauri::command]
-async fn team_use_managed(app: tauri::AppHandle, state: State<'_, RegistryState>, server_id: String) -> Result<Registry, String> {
-    tauri::async_runtime::spawn_blocking(move || teams::use_managed_server(&server_id)).await.map_err(|e| e.to_string())??;
+async fn team_use_managed(
+    app: tauri::AppHandle,
+    state: State<'_, RegistryState>,
+    server_id: String,
+) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || teams::use_managed_server(&server_id))
+        .await
+        .map_err(|e| e.to_string())??;
     let fresh = reload_into_state(state.inner())?;
     let _ = app.emit("team-sync-registry", &fresh);
     Ok(fresh)
@@ -1981,11 +2000,17 @@ async fn team_use_managed(app: tauri::AppHandle, state: State<'_, RegistryState>
 /// only, secret values never sent). Remote instructions and policy fields are preserved, and
 /// an optimistic-concurrency conflict is returned rather than overwriting another admin.
 #[tauri::command]
-async fn team_push_preview(state: State<'_, RegistryState>, selected_ids: Option<Vec<String>>) -> Result<teams::PushPreview, String> {
+async fn team_push_preview(
+    state: State<'_, RegistryState>,
+    selected_ids: Option<Vec<String>>,
+) -> Result<teams::PushPreview, String> {
     refresh_from_disk(state.inner())?;
-    tauri::async_runtime::spawn_blocking(move || match selected_ids { Some(ids) => teams::preview_push_selected(&ids), None => teams::preview_push_current() })
-        .await
-        .map_err(|e| format!("push preview task join failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || match selected_ids {
+        Some(ids) => teams::preview_push_selected(&ids),
+        None => teams::preview_push_current(),
+    })
+    .await
+    .map_err(|e| format!("push preview task join failed: {e}"))?
 }
 
 #[tauri::command]
@@ -1997,8 +2022,10 @@ async fn team_push(
 ) -> Result<teams::PublishResult, String> {
     refresh_from_disk(state.inner())?;
     // push_current does a blocking GET + PUT to the team server; keep it off the main thread.
-    tauri::async_runtime::spawn_blocking(move || {
-        match selected_ids { Some(ids) => teams::push_selected(&ids, base_version, &local_fingerprint), None => teams::push_current(base_version, &local_fingerprint).map(teams::PublishResult::whole_set) }
+    tauri::async_runtime::spawn_blocking(move || match selected_ids {
+        Some(ids) => teams::push_selected(&ids, base_version, &local_fingerprint),
+        None => teams::push_current(base_version, &local_fingerprint)
+            .map(teams::PublishResult::whole_set),
     })
     .await
     .map_err(|e| format!("push task join failed: {e}"))?
@@ -3421,7 +3448,11 @@ struct TeamPairEvent {
 
 impl TeamPairEvent {
     fn new(state: &'static str) -> Self {
-        Self { state, check: None, message: None }
+        Self {
+            state,
+            check: None,
+            message: None,
+        }
     }
 }
 
@@ -3436,16 +3467,25 @@ fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
         if let Some(current) = pairing.as_ref() {
             // A repeated link brings the waiting prompt back instead of pairing twice.
             if let Some(check) = &current.check {
-                let _ = app.emit("team-pair", TeamPairEvent { check: Some(check.clone()), ..TeamPairEvent::new("pending") });
+                let _ = app.emit(
+                    "team-pair",
+                    TeamPairEvent {
+                        check: Some(check.clone()),
+                        ..TeamPairEvent::new("pending")
+                    },
+                );
             }
             return;
         }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        *pairing = Some(TeamPairing { cancel: std::sync::Arc::clone(&cancel), check: None });
+        *pairing = Some(TeamPairing {
+            cancel: std::sync::Arc::clone(&cancel),
+            check: None,
+        });
         cancel
     };
     let pending = TeamPairGuard(std::sync::Arc::clone(&cancel));
-    let handle=app.clone();
+    let handle = app.clone();
     app.dialog().message(format!("Control plane: {origin}\nOnly continue if you trust this origin. Your browser will show the named team and account before approval. Connecting replaces this installation's current team connection."))
         .title("Connect Toolport to Teams?").buttons(MessageDialogButtons::OkCancel).show(move |approved| {
             if !approved { drop(pending); return; }
@@ -3471,7 +3511,10 @@ fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
 #[tauri::command]
 fn team_pair_state() -> Option<TeamPairEvent> {
     team_pairing().as_ref().and_then(|current| {
-        current.check.clone().map(|check| TeamPairEvent { check: Some(check), ..TeamPairEvent::new("pending") })
+        current.check.clone().map(|check| TeamPairEvent {
+            check: Some(check),
+            ..TeamPairEvent::new("pending")
+        })
     })
 }
 
@@ -3479,7 +3522,9 @@ fn team_pair_state() -> Option<TeamPairEvent> {
 #[tauri::command]
 fn team_pair_cancel() {
     if let Some(current) = team_pairing().as_ref() {
-        current.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        current
+            .cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -3521,11 +3566,8 @@ fn tray_host_present() -> bool {
     let class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
     // Windows owns this class for Explorer's notification area.
     unsafe {
-        !windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(
-            class.as_ptr(),
-            std::ptr::null(),
-        )
-        .is_null()
+        !windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(class.as_ptr(), std::ptr::null())
+            .is_null()
     }
 }
 
@@ -6007,10 +6049,10 @@ mod tests {
         let _serial = GEN_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _data = registry::data_dir_test_lock();
         let _env = registry::REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = registry::data_dir_test_lock();
         let dir = unique_update_test_dir("clear-auth-reload-fail");
         std::fs::create_dir_all(&dir).unwrap();
         let _override = registry::DataDirOverride::set(&dir);

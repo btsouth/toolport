@@ -8415,6 +8415,9 @@ mod tests {
 
     #[test]
     fn a_catalog_that_collapses_is_held_until_confirmed() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "a_catalog_that_collapses_is_held_until_confirmed",
+        );
         // The Atlassian case: a *successful* tools/list that returns 3 of a
         // server's 40 tools. Nothing about the response is malformed, so only the
         // size of the drop can catch it.
@@ -8508,6 +8511,9 @@ mod tests {
 
     #[test]
     fn connect_refuses_a_catalog_truncated_by_a_failed_page() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "connect_refuses_a_catalog_truncated_by_a_failed_page",
+        );
         // The regression this exists for: a server whose first page holds 1 of its
         // tools and whose second page fails must NOT connect advertising that one
         // tool as its catalog. That prefix would be published to clients and
@@ -8536,6 +8542,9 @@ mod tests {
 
     #[test]
     fn connect_keeps_a_catalog_truncated_by_a_safety_cap() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "connect_keeps_a_catalog_truncated_by_a_safety_cap",
+        );
         // Bounded truncation is deterministic - retrying returns the same prefix -
         // so refusing it would make an oversized or cursor-looping server
         // permanently unusable rather than partially usable.
@@ -8582,6 +8591,9 @@ mod tests {
 
     #[test]
     fn incomplete_refresh_keeps_the_previous_complete_catalog() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "incomplete_refresh_keeps_the_previous_complete_catalog",
+        );
         let transport = PaginationTransport::new(vec![
             Ok(json!({"tools":[{"name":"partial"}],"nextCursor":"two"})),
             Err(TransportError::Unavailable(
@@ -8623,6 +8635,9 @@ mod tests {
     /// Mutation check: remove the empty-success guard and this fails.
     #[test]
     fn empty_successful_tool_refresh_keeps_previous_catalog() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "empty_successful_tool_refresh_keeps_previous_catalog",
+        );
         let transport = PaginationTransport::new(vec![Ok(json!({ "tools": [] }))]);
         let mut server = DownstreamServer {
             id: "fixture".to_string(),
@@ -8664,6 +8679,9 @@ mod tests {
     /// so legitimate full revocation is not stuck forever behind the guard.
     #[test]
     fn two_consecutive_empty_tool_refreshes_accept_wipe() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "two_consecutive_empty_tool_refreshes_accept_wipe",
+        );
         let transport =
             PaginationTransport::new(vec![Ok(json!({ "tools": [] })), Ok(json!({ "tools": [] }))]);
         let mut server = DownstreamServer {
@@ -8742,6 +8760,9 @@ mod tests {
     /// SOU-338: resources and prompts share the empty-success guard.
     #[test]
     fn empty_successful_resource_and_prompt_refresh_keeps_previous() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "empty_successful_resource_and_prompt_refresh_keeps_previous",
+        );
         let transport = PaginationTransport::new(vec![
             Ok(json!({ "resources": [] })),
             Ok(json!({ "resourceTemplates": [] })),
@@ -10940,6 +10961,9 @@ mod tests {
 
     #[test]
     fn stdio_server_request_across_clients_is_refused_and_serializes_the_server() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "stdio_server_request_across_clients_is_refused_and_serializes_the_server",
+        );
         let fixture = CoreFixture::new("mixed", "");
         let handled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&handled);
@@ -10991,6 +11015,9 @@ mod tests {
 
     #[test]
     fn stdio_server_request_is_not_given_to_another_client_while_one_is_suspended() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "stdio_server_request_is_not_given_to_another_client_while_one_is_suspended",
+        );
         let fixture = CoreFixture::new("suspended-owner", "");
         let roots_asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&roots_asked);

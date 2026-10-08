@@ -830,8 +830,14 @@ fn finish_client_config_mutation(
                 .into(),
         );
         if let Some(file) = &outcome.recovery_path {
-            if let Err(error) = clients::record_config_capture_conflict(file, &receipt.target, outcome.revision.as_deref()) {
-                outcome.warnings.push(format!("could not record unavailable exact rollback: {error}"));
+            if let Err(error) = clients::record_config_capture_conflict(
+                file,
+                &receipt.target,
+                outcome.revision.as_deref(),
+            ) {
+                outcome.warnings.push(format!(
+                    "could not record unavailable exact rollback: {error}"
+                ));
             }
         }
     }
@@ -1923,7 +1929,9 @@ pub fn apply_server_enabled(
     enabled: bool,
     reviewed: bool,
 ) -> Result<(), String> {
-    if reviewed { crate::local_auth::detach_changed(registry, server_id)?; }
+    if reviewed {
+        crate::local_auth::detach_changed(registry, server_id)?;
+    }
     if enabled {
         if let Some(server) = registry
             .servers
@@ -2893,10 +2901,10 @@ mod tests {
 
     #[test]
     fn persisted_secret_round_trip_keeps_the_value_out_of_the_registry() {
+        let _data = registry::data_dir_test_lock();
         let _env = registry::REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _data = registry::data_dir_test_lock();
         let dir = std::env::temp_dir().join(format!(
             "toolport-controller-secret-roundtrip-{}-{}",
             std::process::id(),
@@ -2968,11 +2976,11 @@ mod tests {
 
     impl MoveFixture {
         fn new(registry: &Registry) -> Self {
+            let data_lock = registry::data_dir_test_lock();
             let registry_lock = registry::REGISTRY_ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let env_lock = clients::env_test_lock();
-            let data_lock = registry::data_dir_test_lock();
             let root = std::env::temp_dir().join(format!(
                 "toolport-controller-move-{}-{}",
                 std::process::id(),
@@ -3139,7 +3147,10 @@ mod tests {
                 .unwrap()
                 .exact_rollback
         );
-        let snapshot: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(result.outcome.recovery_path.as_ref().unwrap()).unwrap()).unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(result.outcome.recovery_path.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(snapshot["exactEligible"], false);
         disconnect_client("claude-code").unwrap();
         assert_eq!(json_file(&fixture.claude())["session"], 2);
@@ -3305,9 +3316,13 @@ mod tests {
         let original = r#"{ "mcpServers": {"native":{"command":"native"}}, "setting": 7 }"#;
         std::fs::write(fixture.claude(), original).unwrap();
         migrate_client("claude-code", None, false).unwrap();
-        disconnect_client_stdio_with("claude-code", false, |_| Err("registry full".into())).unwrap_err();
+        disconnect_client_stdio_with("claude-code", false, |_| Err("registry full".into()))
+            .unwrap_err();
         let result = disconnect_client("claude-code").unwrap();
-        assert_eq!(std::fs::read_to_string(&result.outcome.path).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(&result.outcome.path).unwrap(),
+            original
+        );
     }
 
     /// UX-03 for Codex: the moved TOML tables come back (nested env table too) into

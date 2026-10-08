@@ -283,6 +283,9 @@ mod tests {
 
     #[test]
     fn probe_passes_composed_launch_argument_to_real_stdio_child() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "probe_passes_composed_launch_argument_to_real_stdio_child",
+        );
         let mut server = server();
         server.command = Some("node".into());
         server.args = vec![

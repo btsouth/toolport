@@ -24,8 +24,8 @@ pub use discovery::DiscoveryCapabilities;
 mod moved;
 mod mutation;
 mod restore;
-pub(crate) use restore::after_rollback as record_config_rollback;
 pub(crate) use restore::after_capture_conflict as record_config_capture_conflict;
+pub(crate) use restore::after_rollback as record_config_rollback;
 mod zcode;
 
 /// One MCP server, normalized across every client format.
@@ -2240,7 +2240,9 @@ fn parse_json_snippet(
                 .get("command")
                 .is_some_and(|command| command.is_string() || command.is_array())
                 && !servers.get("url").is_some_and(serde_json::Value::is_string)
-                && !servers.get("type").is_some_and(serde_json::Value::is_string)
+                && !servers
+                    .get("type")
+                    .is_some_and(serde_json::Value::is_string)
                 && !servers
                     .get("enabled")
                     .is_some_and(serde_json::Value::is_boolean)
@@ -3106,7 +3108,6 @@ fn parse_client_content(format: Format, content: &str) -> Result<Vec<McpServer>,
         Format::YamlMcpServers => parse_hermes_yaml_servers(content),
         Format::YamlMcpServersList => parse_continue_yaml_servers(content),
     }
-
 }
 
 fn managed_matches_detected(server: &McpServer, rec: &ManagedEntry) -> bool {
@@ -3230,7 +3231,10 @@ pub struct WriteOutcome {
     pub recovery_path: Option<PathBuf>,
 }
 
-fn revision_outcome(client_id: &str, result: Result<WriteOutcome, String>) -> Result<WriteOutcome, String> {
+fn revision_outcome(
+    client_id: &str,
+    result: Result<WriteOutcome, String>,
+) -> Result<WriteOutcome, String> {
     let mut outcome = result?;
     let path = Path::new(&outcome.path);
     outcome.recovery_path = Some(restore::record_path(client_id, path)?);
@@ -3749,10 +3753,18 @@ fn rewrite_json_key_preserving(
     }
     let before = parse_json_value(original)?;
     if let Some(prop) = obj.get(key) {
-        if let (Some(child), Some(before), Some(after)) = (prop.object_value(), before.get(key).and_then(serde_json::Value::as_object), new_value.as_object()) {
+        if let (Some(child), Some(before), Some(after)) = (
+            prop.object_value(),
+            before.get(key).and_then(serde_json::Value::as_object),
+            new_value.as_object(),
+        ) {
             patch_json_object(&child, before, after)?;
-        } else { prop.set_value(serde_to_cst_input(new_value)); }
-    } else { obj.append(key, serde_to_cst_input(new_value)); }
+        } else {
+            prop.set_value(serde_to_cst_input(new_value));
+        }
+    } else {
+        obj.append(key, serde_to_cst_input(new_value));
+    }
     Ok(root.to_string())
 }
 
@@ -4720,7 +4732,9 @@ fn atomic_write_yaml_config(
             reject_duplicate_top_level_yaml_key(src, changed_key)?;
             rewrite_yaml_key_preserving(src, changed_key, val)?
         }
-        (Some(src), None) if !src.trim().is_empty() => remove_yaml_key_preserving(src, changed_key)?,
+        (Some(src), None) if !src.trim().is_empty() => {
+            remove_yaml_key_preserving(src, changed_key)?
+        }
         _ => pretty()?,
     };
     parse_existing_yaml_content(&out)?;
@@ -6246,7 +6260,9 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
         let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
-        outcome.warnings.extend(disconnect_warnings(def.format, &path)?);
+        outcome
+            .warnings
+            .extend(disconnect_warnings(def.format, &path)?);
         Ok(outcome)
     })
 }
@@ -6262,7 +6278,11 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             moved::restore(client_id, def.format, &path)?;
         }
         let restored = read_client(&def).servers;
-        restored_names.retain(|name| restored.iter().any(|server| server.name.eq_ignore_ascii_case(name)));
+        restored_names.retain(|name| {
+            restored
+                .iter()
+                .any(|server| server.name.eq_ignore_ascii_case(name))
+        });
         return Ok(WriteOutcome {
             path: path.display().to_string(),
             backup: backup.map(|p| p.display().to_string()),
@@ -6270,12 +6290,16 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             restored: restored_names,
             used_move_record: moved::matches_path(client_id, &path)?,
             revision: None,
-        warnings: Vec::new(),
-        recovery_path: None,
+            warnings: Vec::new(),
+            recovery_path: None,
         });
     }
     let current = crate::registry_controller::registry_for_disconnect()?;
-    restore::check_legacy_gateway(def.format, &path, current.client_managed_entries.get(client_id))?;
+    restore::check_legacy_gateway(
+        def.format,
+        &path,
+        current.client_managed_entries.get(client_id),
+    )?;
     let restored = moved::restore(client_id, def.format, &path)?;
     if restored.is_none() && (!mutation::exists(&path) || !read_client(&def).gateway_installed) {
         return Ok(WriteOutcome {
@@ -6285,8 +6309,8 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             restored: Vec::new(),
             used_move_record: false,
             revision: None,
-        warnings: Vec::new(),
-        recovery_path: None,
+            warnings: Vec::new(),
+            recovery_path: None,
         });
     }
     let mut outcome = install_or_remove(client_id, None)?;
@@ -6307,11 +6331,19 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
 pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) -> Result<(), String> {
     let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
     let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
-    restore::check_finished(client_id, Path::new(&outcome.path), outcome.revision.as_deref())?;
+    restore::check_finished(
+        client_id,
+        Path::new(&outcome.path),
+        outcome.revision.as_deref(),
+    )?;
     if outcome.used_move_record {
         moved::forget(client_id)?;
     }
-    restore::finish(client_id, Path::new(&outcome.path), outcome.revision.as_deref())?;
+    restore::finish(
+        client_id,
+        Path::new(&outcome.path),
+        outcome.revision.as_deref(),
+    )?;
     Ok(())
 }
 
@@ -7944,6 +7976,8 @@ mod tests {
     /// ENOTDIR on unix but ERROR_PATH_NOT_FOUND (NotFound) on Windows.
     #[test]
     fn write_servers_aborts_when_backup_stat_fails() {
+        let _data =
+            crate::registry::DataDirTestEnv::new("write_servers_aborts_when_backup_stat_fails");
         // Serialize against other tests that mutate the process-global
         // CLAUDE_CONFIG_DIR (e.g. client_config_paths_match_current_platform):
         // without the lock, that test could resolve the default home config

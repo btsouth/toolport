@@ -1564,7 +1564,6 @@ fn removed_meta_tool_error(name: &str) -> String {
     )
 }
 
-
 // --- Grouped discovery mode (CONDUIT_DISCOVERY=grouped) ---
 //
 // Between `lazy` (a constant handful of meta-tools; best for a capable model that
@@ -4158,7 +4157,18 @@ fn execute_call(
                     conduit_lib::rate_limits::check_and_count(&team.rate_limits, server_id, tool)
                 {
                     // Count as a failed call with a clear reason so Activity / export show the block.
-                    audit::record_routed_call(reg, server_id, tool, false, None, Some("rate_limit"), client, client_name, None, None);
+                    audit::record_routed_call(
+                        reg,
+                        server_id,
+                        tool,
+                        false,
+                        None,
+                        Some("rate_limit"),
+                        client,
+                        client_name,
+                        None,
+                        None,
+                    );
                     return json!({
                         "content": [{ "type": "text", "text": msg }],
                         "isError": true
@@ -5890,8 +5900,8 @@ fn execute_script_dispatch(
     // (SBS-881). Run the defense here, before the script's own result is returned,
     // so nothing unscanned reaches the model. The failure envelope was defended
     // part by part above and is all Toolport text now.
-    let untrusted = result["isError"] != true
-        && !defend_script_aggregate(reg, client, &owner, &mut result);
+    let untrusted =
+        result["isError"] != true && !defend_script_aggregate(reg, client, &owner, &mut result);
 
     // Intermediate calls were not shaped (full bodies stayed in the sandbox). The
     // script's aggregate can still blow the transport/context budget, so shape only
@@ -6187,9 +6197,9 @@ fn handle_request_with_cancel(
                 // reuse one client's answer for another.
                 "cacheScope": "private"
             });
-            if let Some(text) = server_instructions(reg, profile, || {
-                DISCOVER_INSTRUCTIONS_PREAMBLE.to_string()
-            }) {
+            if let Some(text) =
+                server_instructions(reg, profile, || DISCOVER_INSTRUCTIONS_PREAMBLE.to_string())
+            {
                 result["instructions"] = Value::String(text);
             }
             Some(success(id, result))
@@ -9011,8 +9021,9 @@ type IntegrityCheckFailure = (String, BTreeSet<String>);
 /// prove the drifted definition is never published in the first place. Registered and
 /// consumed on one thread, so a parallel test's gate cannot trigger it.
 #[cfg(test)]
-static INTEGRITY_GATE_OBSERVER: Mutex<Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>> =
-    Mutex::new(None);
+static INTEGRITY_GATE_OBSERVER: Mutex<
+    Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>,
+> = Mutex::new(None);
 
 #[cfg(test)]
 fn observe_integrity_gate() {
@@ -16814,7 +16825,12 @@ fn proxy_public_http_connection(
     };
     drop(pending_read);
     let Some(_active) = try_acquire_inflight(active, http_max_connections()) else {
-        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway busy; retry later");
+        write_ingress_response(
+            &mut client,
+            503,
+            "Service Unavailable",
+            "gateway busy; retry later",
+        );
         return;
     };
     // Authenticate the cached daemon before every new public request. A failed
@@ -16824,23 +16840,43 @@ fn proxy_public_http_connection(
         Ok(descriptor) => descriptor,
         Err(error) => {
             glog(&format!("HTTP proxy: {error}"));
-            write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+            write_ingress_response(
+                &mut client,
+                503,
+                "Service Unavailable",
+                "gateway unavailable",
+            );
             return;
         }
     };
     let Ok(endpoint) = descriptor.endpoint.parse::<SocketAddr>() else {
-        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+        write_ingress_response(
+            &mut client,
+            503,
+            "Service Unavailable",
+            "gateway unavailable",
+        );
         return;
     };
     let mut upstream = match TcpStream::connect_timeout(&endpoint, Duration::from_secs(2)) {
         Ok(stream) => stream,
         Err(_) => {
-            write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+            write_ingress_response(
+                &mut client,
+                503,
+                "Service Unavailable",
+                "gateway unavailable",
+            );
             return;
         }
     };
     if upstream.write_all(&request).is_err() {
-        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+        write_ingress_response(
+            &mut client,
+            503,
+            "Service Unavailable",
+            "gateway unavailable",
+        );
         return;
     }
     let _ = upstream.shutdown(Shutdown::Write);
@@ -16913,13 +16949,23 @@ fn serve_http_proxy(port: u16) -> Result<(), String> {
             match listener.accept() {
                 Ok((mut client, _)) => {
                     if client.set_nonblocking(false).is_err() {
-                        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+                        write_ingress_response(
+                            &mut client,
+                            503,
+                            "Service Unavailable",
+                            "gateway unavailable",
+                        );
                         continue;
                     }
                     let Some(pending) =
                         try_acquire_inflight(&pending_reads, http_max_connections())
                     else {
-                        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway busy; retry later");
+                        write_ingress_response(
+                            &mut client,
+                            503,
+                            "Service Unavailable",
+                            "gateway busy; retry later",
+                        );
                         continue;
                     };
                     let state = Arc::clone(&state);
@@ -17031,7 +17077,11 @@ fn respond_mcp_sse_listen(request: tiny_http::Request, mut out: HttpOut, allow_h
         .unwrap(),
         tiny_http::Header::from_bytes(b"Access-Control-Allow-Headers", allow_headers.as_bytes())
             .unwrap(),
-        tiny_http::Header::from_bytes(b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()).unwrap(),
+        tiny_http::Header::from_bytes(
+            b"Access-Control-Expose-Headers",
+            EXPOSED_HTTP_HEADERS.as_bytes(),
+        )
+        .unwrap(),
     ];
     for (name, value) in out.extra {
         let safe = sanitize_header_value(&value);
@@ -17588,7 +17638,10 @@ fn handle_connection(
         ),
         (b"Access-Control-Allow-Headers", allow_headers.as_bytes()),
         // Browser clients need session identity and untrusted-data provenance.
-        (b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()),
+        (
+            b"Access-Control-Expose-Headers",
+            EXPOSED_HTTP_HEADERS.as_bytes(),
+        ),
     ];
     for (name, value) in cors {
         // Skip a header that won't encode rather than panicking the thread.
@@ -17853,11 +17906,13 @@ fn main() {
                         "{}",
                         serde_json::to_string(&results).expect("serializable disconnect results")
                     );
-                    conduit_lib::telemetry::exit_with(if results.iter().any(|result| result.error.is_some()) {
-                        1
-                    } else {
-                        0
-                    });
+                    conduit_lib::telemetry::exit_with(
+                        if results.iter().any(|result| result.error.is_some()) {
+                            1
+                        } else {
+                            0
+                        },
+                    );
                 }
                 Err(error) => {
                     eprintln!("toolport-gateway --disconnect-all: {error}");
@@ -18461,10 +18516,22 @@ mod tests {
     /// judging it whole lets the prefix decide for every tool on that server.
     #[test]
     fn disconnect_all_is_a_standalone_role_and_dry_run_cannot_start_gateway() {
-        assert_eq!(parse_args(&["--disconnect-all".into()]), ArgAction::DisconnectAll { dry_run: false });
-        assert_eq!(parse_args(&["--disconnect-all".into(), "--dry-run".into()]), ArgAction::DisconnectAll { dry_run: true });
-        assert!(matches!(parse_args(&["--dry-run".into()]), ArgAction::Unknown(_)));
-        assert!(matches!(parse_args(&["--disconnect-all".into(), "--daemon".into()]), ArgAction::Unknown(_)));
+        assert_eq!(
+            parse_args(&["--disconnect-all".into()]),
+            ArgAction::DisconnectAll { dry_run: false }
+        );
+        assert_eq!(
+            parse_args(&["--disconnect-all".into(), "--dry-run".into()]),
+            ArgAction::DisconnectAll { dry_run: true }
+        );
+        assert!(matches!(
+            parse_args(&["--dry-run".into()]),
+            ArgAction::Unknown(_)
+        ));
+        assert!(matches!(
+            parse_args(&["--disconnect-all".into(), "--daemon".into()]),
+            ArgAction::Unknown(_)
+        ));
     }
 
     #[test]
@@ -18611,69 +18678,29 @@ mod tests {
     /// Holding it also means a developer with the real desktop app running cannot have
     /// these tests block on a live human prompt: the scratch dir has no descriptor unless
     /// the test puts one there.
-    struct PiiTestEnv {
-        dir: std::path::PathBuf,
-        // Declaration order IS drop order: release the override before the lock, so the
-        // next test never observes this scratch dir.
-        _data_dir: conduit_lib::registry::DataDirOverride,
-        _env: std::sync::MutexGuard<'static, ()>,
-    }
-
-    fn pii_test_env(name: &str) -> PiiTestEnv {
-        let env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("toolport-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a writable scratch dir");
-        let data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
-        PiiTestEnv {
-            dir,
-            _data_dir: data_dir,
-            _env: env,
-        }
-    }
-
-    /// A serialized environment with its own data directory, for any test that can write
-    /// an audit row.
-    ///
-    /// The dispatch path resolves [`conduit_lib::registry::conduit_dir`] on every call to
-    /// find `audit.jsonl`, so a test that routes a real `tools/call` writes one row per
-    /// call. Without an override those rows land in the developer's REAL data directory
-    /// (SOU-301's failure mode, on a path `DataDirOverride` was never guarding), and
-    /// without the lock two tests can interleave: one test's unattributed fixture row is
-    /// then the first one another test's audit reader finds, which is how
-    /// `mcp_http_audit_entry_records_client_and_client_name` failed on CI with
-    /// `left: Null, right: "client:c1"` while passing alone.
-    ///
-    /// Hold one whenever a test can reach [`audit`] or [`searchtrace::record`]. Fields drop
-    /// in declaration order after the `Drop` impl runs, so the override is released before
-    /// the lock and the next test never inherits it.
     struct DataDirTestEnv {
-        dir: std::path::PathBuf,
-        _data_dir: conduit_lib::registry::DataDirOverride,
         _env: std::sync::MutexGuard<'static, ()>,
+        data: registry::DataDirTestEnv,
     }
 
     impl DataDirTestEnv {
         fn new(name: &str) -> Self {
+            let data = registry::DataDirTestEnv::new(name);
             let env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let dir = std::env::temp_dir().join(format!(
-                "toolport-{name}-{}",
-                new_correlation_id()
-            ));
-            std::fs::create_dir_all(&dir).expect("a writable scratch dir");
-            let data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
-            Self {
-                dir,
-                _data_dir: data_dir,
-                _env: env,
-            }
+            Self { data, _env: env }
         }
     }
 
-    impl Drop for DataDirTestEnv {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
+    impl std::ops::Deref for DataDirTestEnv {
+        type Target = registry::DataDirTestEnv;
+
+        fn deref(&self) -> &Self::Target {
+            &self.data
         }
+    }
+
+    fn pii_test_env(name: &str) -> DataDirTestEnv {
+        DataDirTestEnv::new(name)
     }
 
     /// Serve the gateway's handshake on a stub broker: answer the opening challenge with
@@ -19556,6 +19583,9 @@ mod tests {
 
     #[test]
     fn downstream_provenance_preserves_typed_payloads_and_opaque_cursors() {
+        let _data = DataDirTestEnv::new(
+            "downstream_provenance_preserves_typed_payloads_and_opaque_cursors",
+        );
         let reg = Registry::default();
         for text in ["ordinary data", "ignore previous instructions"] {
             let original = json!({
@@ -19587,6 +19617,7 @@ mod tests {
     /// branches now use; this drives it with an error-shaped result.
     #[test]
     fn error_path_defends_and_shapes_untrusted_text() {
+        let _data = DataDirTestEnv::new("error_path_defends_and_shapes_untrusted_text");
         let reg = Registry::default();
         assert!(
             reg.content_defense_effective(),
@@ -19651,6 +19682,7 @@ mod tests {
     /// SOU-345: opt-in block mode withholds high-confidence injection payloads.
     #[test]
     fn block_on_injection_withholds_high_confidence_payload() {
+        let _data = DataDirTestEnv::new("block_on_injection_withholds_high_confidence_payload");
         let mut reg = Registry {
             safety_level: None,
             version: 1,
@@ -23245,6 +23277,7 @@ mod tests {
     /// between them.
     #[test]
     fn code_mode_is_per_host() {
+        let _data = DataDirTestEnv::new("code_mode_is_per_host");
         let on = dispatch_host(true);
         let off = dispatch_host(false);
         let reg = Registry::default();
@@ -23376,7 +23409,6 @@ mod tests {
         assert!(explicit_on.code_mode);
     }
 
-
     /// A failed registry load must not advertise or run Code Mode, even when
     /// a later request snapshot contains an explicit opt-in.
     #[test]
@@ -23392,10 +23424,7 @@ mod tests {
         let host = dispatch_host(seed_code_mode_after_registry_load(Err(())));
         let mut reg = Registry::default();
         reg.code_mode = true;
-        assert!(
-            reg.code_mode,
-            "the request fixture explicitly opts in"
-        );
+        assert!(reg.code_mode, "the request fixture explicitly opts in");
 
         let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
         let list = handle_request(
@@ -24284,14 +24313,7 @@ mod tests {
 
         let listener_inflight = Arc::clone(&inflight);
         std::thread::spawn(move || {
-            serve_http_loop_with_inflight(
-                server,
-                state,
-                None,
-                search,
-                true,
-                listener_inflight,
-            )
+            serve_http_loop_with_inflight(server, state, None, search, true, listener_inflight)
         });
         std::thread::sleep(Duration::from_millis(50));
 
@@ -24323,6 +24345,7 @@ mod tests {
 
     #[test]
     fn a_saturated_daemon_still_answers_its_identity_probe() {
+        let _data = DataDirTestEnv::new("a_saturated_daemon_still_answers_its_identity_probe");
         use std::io::{Read, Write};
         let state = http_state(false);
         state.daemon_mode.store(true, Ordering::SeqCst);
@@ -24623,6 +24646,7 @@ mod tests {
     /// reload instead of silently reverting to unauthenticated.
     #[test]
     fn a_reload_that_loses_trust_closes_the_open_listener() {
+        let _data = DataDirTestEnv::new("a_reload_that_loses_trust_closes_the_open_listener");
         let state = http_state(true);
         // Same flag the watcher publishes with every registry swap.
         let trusted = Arc::clone(&state.registry_trusted);
@@ -24673,6 +24697,8 @@ mod tests {
 
     #[test]
     fn a_rebuild_keeps_the_previous_catalog_for_a_collapsed_server() {
+        let _data =
+            DataDirTestEnv::new("a_rebuild_keeps_the_previous_catalog_for_a_collapsed_server");
         // A router rebuild replaces catalogs from fresh connects, so the in-place
         // refresh guard never sees it. Without this, a degraded Atlassian answer
         // lands in tool-cache.json and every gateway started afterwards inherits it.
@@ -24727,6 +24753,8 @@ mod tests {
 
     #[test]
     fn a_confirmed_rebuild_collapse_is_accepted_on_the_second_pass() {
+        let _data =
+            DataDirTestEnv::new("a_confirmed_rebuild_collapse_is_accepted_on_the_second_pass");
         // The refresh path accepts a collapse after EMPTY_CATALOG_CONFIRMATIONS
         // agreeing refreshes. The rebuild path must not disagree: holding forever
         // pins a genuinely downsized server (revoked scopes, an admin pruning
@@ -24751,6 +24779,7 @@ mod tests {
 
     #[test]
     fn a_recovered_rebuild_clears_the_collapse_streak() {
+        let _data = DataDirTestEnv::new("a_recovered_rebuild_clears_the_collapse_streak");
         // A held collapse followed by a healthy rebuild must not leave the server one
         // step from acceptance. Otherwise two unrelated blips, months apart, would
         // combine into a "confirmation" and drop 37 tools on the strength of one.
@@ -24952,6 +24981,7 @@ mod tests {
 
     #[test]
     fn mcp_http_audit_entry_records_client_and_client_name() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
 
         let dir = std::env::temp_dir().join(format!(
@@ -25147,8 +25177,8 @@ mod tests {
 
     #[test]
     fn status_summary_scopes_to_allowed_servers() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _data_lock = registry::data_dir_test_lock();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir =
             std::env::temp_dir().join(format!("toolport-status-scope-{}", std::process::id()));
         let _override = registry::DataDirOverride::set(&dir);
@@ -25233,6 +25263,7 @@ mod tests {
 
     #[test]
     fn status_flags_enabled_servers_that_expose_no_tools() {
+        let _data = DataDirTestEnv::new("status_flags_enabled_servers_that_expose_no_tools");
         let host = dispatch_host(false);
         let mut reg = Registry::default();
         for id in ["github", "atlassian"] {
@@ -25278,6 +25309,7 @@ mod tests {
     /// dropped its counts, then reported it as exposing 0 tools.
     #[test]
     fn status_counts_tools_for_a_hyphenated_server_id() {
+        let _data = DataDirTestEnv::new("status_counts_tools_for_a_hyphenated_server_id");
         let host = dispatch_host(false);
         let mut reg = Registry::default();
         reg.servers.push(stub_server("file-system", "File System"));
@@ -25317,6 +25349,7 @@ mod tests {
 
     #[test]
     fn status_omits_zero_tool_hint_before_catalog_populates() {
+        let _data = DataDirTestEnv::new("status_omits_zero_tool_hint_before_catalog_populates");
         let host = dispatch_host(false);
         // Before any server has produced tools (empty catalog = still connecting),
         // the hint must stay silent - otherwise every server reads as "0 tools".
@@ -25513,19 +25546,20 @@ mod tests {
         let state = http_state(true);
         swap_router(&state, router);
         let search = SearchGuard::default();
-        let post = |path: &str| {
-            handle_http(
-                &state, &search, "POST", path, "{}", None, None, None, None,
-            )
-        };
+        let post =
+            |path: &str| handle_http(&state, &search, "POST", path, "{}", None, None, None, None);
 
         let ok = post("/s__work");
         assert_eq!(ok.status, 200, "body={}", ok.body);
         assert_eq!(ok.body, "\"called\"");
-        assert!(ok.extra.contains(&("X-Toolport-Content-Trust".into(), "untrusted".into())));
+        assert!(ok
+            .extra
+            .contains(&("X-Toolport-Content-Trust".into(), "untrusted".into())));
         for (name, _) in &ok.extra {
             assert!(
-                EXPOSED_HTTP_HEADERS.split(", ").any(|exposed| exposed.eq_ignore_ascii_case(name)),
+                EXPOSED_HTTP_HEADERS
+                    .split(", ")
+                    .any(|exposed| exposed.eq_ignore_ascii_case(name)),
                 "browser cannot read provenance header {name}"
             );
         }
@@ -25612,6 +25646,7 @@ mod tests {
 
     #[test]
     fn mcp_http_initialize_list_call_round_trip() {
+        let _data = DataDirTestEnv::new("mcp_http_initialize_list_call_round_trip");
         // Streamable-HTTP MCP: initialize → session id → tools/list → tools/call.
         let state = http_state(true);
         let search = SearchGuard::default();
@@ -25852,6 +25887,9 @@ mod tests {
 
     #[test]
     fn modern_http_request_is_sessionless_and_ignores_legacy_session_header() {
+        let _data = DataDirTestEnv::new(
+            "modern_http_request_is_sessionless_and_ignores_legacy_session_header",
+        );
         let state = http_state(true);
         let caller = test_caller("client:cursor", None);
         let out = handle_http_with_headers(
@@ -25997,6 +26035,8 @@ mod tests {
 
     #[test]
     fn modern_http_headers_are_plumbed_through_the_real_listener() {
+        let _data =
+            DataDirTestEnv::new("modern_http_headers_are_plumbed_through_the_real_listener");
         let state = http_state(true);
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
@@ -26334,6 +26374,7 @@ mod tests {
 
     #[test]
     fn mcp_http_session_is_bound_to_client_identity_and_scope() {
+        let _data = DataDirTestEnv::new("mcp_http_session_is_bound_to_client_identity_and_scope");
         let state = http_state(true);
         let search = SearchGuard::default();
         let caller = |identity: &str, scope: &[&str]| test_caller(identity, Some(scope));
@@ -26873,8 +26914,10 @@ mod tests {
         reg.servers.push(stub_server("team-slack", "Team Slack"));
         reg.servers.push(stub_server("team_slack", "slack"));
         let personal = reg.add_profile("Personal");
-        reg.set_access_server(&personal, "team-slack", true).unwrap();
-        reg.set_access_server("default", "team_slack", true).unwrap();
+        reg.set_access_server(&personal, "team-slack", true)
+            .unwrap();
+        reg.set_access_server("default", "team_slack", true)
+            .unwrap();
         reg.set_server_enabled(&personal, "team-slack", true)
             .unwrap();
         reg.set_server_enabled("default", "team_slack", true)
@@ -28157,6 +28200,7 @@ mod tests {
 
     #[test]
     fn mcp_http_sse_when_accept_prefers_event_stream() {
+        let _data = DataDirTestEnv::new("mcp_http_sse_when_accept_prefers_event_stream");
         let state = http_state(true);
         let search = SearchGuard::default();
         let init = handle_http(
@@ -29016,6 +29060,7 @@ mod tests {
 
     #[test]
     fn a_modern_declaration_is_still_served_and_decorated() {
+        let _data = DataDirTestEnv::new("a_modern_declaration_is_still_served_and_decorated");
         // The other side of the refusal above: the one revision the `_meta` key
         // belongs to is served, and served as modern.
         let resp = dispatch(&modern_req(1, "tools/list", json!({})));
@@ -29375,7 +29420,10 @@ mod tests {
                 .get("instructions")
                 .cloned()
         };
-        assert_eq!(handshake(&state), Some(json!(DISCOVER_INSTRUCTIONS_PREAMBLE)));
+        assert_eq!(
+            handshake(&state),
+            Some(json!(DISCOVER_INSTRUCTIONS_PREAMBLE))
+        );
         *state.profile.lock().unwrap() = Some("media".into());
         assert_eq!(handshake(&state), Some(json!("Media only.")));
         *state.profile.lock().unwrap() = Some("postgres".into());
@@ -29384,6 +29432,12 @@ mod tests {
 
     #[test]
     fn toolport_extension_reports_active_features_without_gating_core_tools() {
+        let _data = DataDirTestEnv::new(
+            "toolport_extension_reports_active_features_without_gating_core_tools",
+        );
+        let _data = DataDirTestEnv::new(
+            "toolport_extension_reports_active_features_without_gating_core_tools",
+        );
         let host = dispatch_host(false);
         host.set_code_mode(true);
         let reg = Registry {
@@ -29675,12 +29729,10 @@ mod tests {
 
     #[test]
     fn lazy_discovery_keeps_ui_linked_tools_only_for_apps_hosts() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _lock = registry::data_dir_test_lock();
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-apps-measure-{}",
-            new_correlation_id()
-        ));
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("toolport-apps-measure-{}", new_correlation_id()));
         let _data = registry::DataDirOverride::set(&dir);
         let host = dispatch_host(false);
         let reg = Registry::default();
@@ -29946,6 +29998,9 @@ mod tests {
 
     #[test]
     fn negotiated_mcp_app_html_passes_through_without_content_defense_rewrite() {
+        let _data = DataDirTestEnv::new(
+            "negotiated_mcp_app_html_passes_through_without_content_defense_rewrite",
+        );
         let host = dispatch_host(false);
         let reg = Registry::default();
         assert!(
@@ -30129,6 +30184,7 @@ mod tests {
 
     #[test]
     fn modern_client_is_served_without_any_handshake() {
+        let _data = DataDirTestEnv::new("modern_client_is_served_without_any_handshake");
         // The whole point of the stateless revision: no initialize, no session,
         // just a request that declares its own version.
         let resp = dispatch(&modern_req(2, "tools/list", json!({})));
@@ -30220,6 +30276,7 @@ mod tests {
 
     #[test]
     fn legacy_clients_see_no_modern_fields() {
+        let _data = DataDirTestEnv::new("legacy_clients_see_no_modern_fields");
         // The no-regression guarantee for every client in the wild today: a
         // request without `_meta` gets a byte-identical response to before.
         let req = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {} });
@@ -30284,6 +30341,8 @@ mod tests {
 
     #[test]
     fn upstream_era_does_not_leak_between_requests() {
+        let _data = DataDirTestEnv::new("upstream_era_does_not_leak_between_requests");
+        let _data = DataDirTestEnv::new("upstream_era_does_not_leak_between_requests");
         // Sequential case. Weak on its own: `UpstreamEraGuard::enter` replaces the
         // thread-local unconditionally, so the second dispatch sets it correctly
         // whether or not Drop ever restores anything. Kept for the plain
@@ -30302,6 +30361,9 @@ mod tests {
 
     #[test]
     fn nested_modern_dispatch_does_not_decorate_the_outer_legacy_response() {
+        let _data = DataDirTestEnv::new(
+            "nested_modern_dispatch_does_not_decorate_the_outer_legacy_response",
+        );
         // THE test for the RAII guard, and the one that was missing: gutting
         // `impl Drop for UpstreamEraGuard` left all 190 gateway tests green,
         // because nothing exercised nesting.
@@ -31036,6 +31098,7 @@ mod tests {
 
     #[test]
     fn status_tool_reports_enabled_servers() {
+        let _data = DataDirTestEnv::new("status_tool_reports_enabled_servers");
         let host = dispatch_host(false);
         let mut reg = Registry::default();
         let id = reg.add_server(registry::ServerEntry {
@@ -31115,6 +31178,7 @@ mod tests {
 
     #[test]
     fn lazy_tools_list_returns_only_meta_tools() {
+        let _data = DataDirTestEnv::new("lazy_tools_list_returns_only_meta_tools");
         let host = dispatch_host(false);
         // The exact tool count of 4 assumes run_script is not advertised, and the flag on
         // the host this test dispatches with is the only thing that decides that.
@@ -31164,7 +31228,11 @@ mod tests {
         let host = dispatch_host(false);
         host.set_code_mode(false);
         let tools = floor_tool_defs(&host);
-        assert_eq!(tools.len(), 4, "Code Mode off means the floor is the core four");
+        assert_eq!(
+            tools.len(),
+            4,
+            "Code Mode off means the floor is the core four"
+        );
         let tools_json = serde_json::to_string(&tools).expect("floor tools serialize");
         let bytes = tools_json.len() + DISCOVER_INSTRUCTIONS_PREAMBLE.len();
         assert!(
@@ -31197,8 +31265,8 @@ mod tests {
 
     #[test]
     fn tools_tab_targets_share_gateway_scope_and_policy() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _lock = registry::data_dir_test_lock();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("tools-tab-{}", new_correlation_id()));
         let _data = registry::DataDirOverride::set(&dir);
         struct ToolsTabRoute(MockRoute);
@@ -31366,12 +31434,10 @@ mod tests {
 
     #[test]
     fn catalog_measurement_uses_actual_surfaces_for_modes_scope_and_dynamic_defs() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _lock = registry::data_dir_test_lock();
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-catalog-measure-{}",
-            new_correlation_id()
-        ));
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("toolport-catalog-measure-{}", new_correlation_id()));
         let _data = registry::DataDirOverride::set(&dir);
         let mut router = Router::new();
         for server in ["alpha", "beta"] {
@@ -31522,12 +31588,10 @@ mod tests {
 
     #[test]
     fn search_measurement_includes_lead_and_guidance_text() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _lock = registry::data_dir_test_lock();
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-search-measure-{}",
-            new_correlation_id()
-        ));
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("toolport-search-measure-{}", new_correlation_id()));
         let _data = registry::DataDirOverride::set(&dir);
         let response = handle_request(
             &dispatch_host(false),
@@ -32029,6 +32093,7 @@ mod tests {
 
     #[test]
     fn reconcile_to_clears_a_re_approved_tool() {
+        let _data = DataDirTestEnv::new("reconcile_to_clears_a_re_approved_tool");
         // Regression for SOU-292. Re-approving a tool rewrote quarantine.json, but nothing
         // told the running gateway: the refresh path only fired when a NEW drift was
         // quarantined, so it could ADD to the set and never REMOVE from it. The registry
@@ -32065,6 +32130,7 @@ mod tests {
 
     #[test]
     fn reconcile_to_detects_a_partial_release() {
+        let _data = DataDirTestEnv::new("reconcile_to_detects_a_partial_release");
         // Releasing one of several must still re-filter. A cheaper "is it empty vs
         // non-empty" check would miss this and leave the released tool blocked.
         let (router, stdio) = reconcile_harness();
@@ -32183,6 +32249,8 @@ mod tests {
     /// empty), so a running gateway stayed dark until it restarted.
     #[test]
     fn sbs871_reconcile_to_lifts_fail_closed_on_a_successful_empty_read() {
+        let _data =
+            DataDirTestEnv::new("sbs871_reconcile_to_lifts_fail_closed_on_a_successful_empty_read");
         let (router, stdio) = fail_closed_harness();
         assert!(router.lock().unwrap().catalog_fail_closed());
 
@@ -32204,6 +32272,9 @@ mod tests {
     /// the store was still unreadable.
     #[test]
     fn sbs871_integrity_change_with_an_unreadable_store_keeps_fail_closed() {
+        let _data = DataDirTestEnv::new(
+            "sbs871_integrity_change_with_an_unreadable_store_keeps_fail_closed",
+        );
         let (router, _stdio) = fail_closed_harness();
         let mut live = {
             let guard = router.lock().unwrap();
@@ -32247,6 +32318,7 @@ mod tests {
     /// prefers that cache, so the hide reached route_call and nothing else.
     #[test]
     fn sbs871_fail_closed_publish_clears_the_tool_cache() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "toolport-sbs871-fail-closed-cache-{}",
@@ -32287,6 +32359,7 @@ mod tests {
 
     #[test]
     fn integrity_failure_unions_pending_and_live_blocks_instead_of_installing_stale_state() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "toolport-integrity-fail-closed-{}",
@@ -32305,7 +32378,11 @@ mod tests {
             (**guard).clone()
         };
 
-        fail_closed_integrity_catalog(&mut live, Some("sbs714-gateway"), set_of(&["srv__new_drift"]));
+        fail_closed_integrity_catalog(
+            &mut live,
+            Some("sbs714-gateway"),
+            set_of(&["srv__new_drift"]),
+        );
 
         assert_eq!(
             live.quarantined(),
@@ -32317,6 +32394,9 @@ mod tests {
 
     #[test]
     fn post_write_quarantine_read_failure_still_blocks_the_new_candidate() {
+        let _data = DataDirTestEnv::new(
+            "post_write_quarantine_read_failure_still_blocks_the_new_candidate",
+        );
         let (router, _stdio) = reconcile_harness();
         {
             let mut guard = router.lock().unwrap();
@@ -32342,8 +32422,12 @@ mod tests {
 
     #[test]
     fn team_quarantine_at_member_off_enforces_drift_and_survives_watcher_reconciliation() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("toolport-team-quarantine-off-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-team-quarantine-off-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
@@ -32390,6 +32474,7 @@ mod tests {
     /// `tools/list` rather than on the watcher's first tick.
     #[test]
     fn startup_build_quarantines_readonly_description_drift_before_ready() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir =
             std::env::temp_dir().join(format!("toolport-startup-integrity-{}", std::process::id()));
@@ -32453,6 +32538,7 @@ mod tests {
     /// the live router was empty cannot be served by the self-heal publish.
     #[test]
     fn self_heal_rebuild_quarantines_readonly_description_drift() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "toolport-selfheal-integrity-{}",
@@ -32501,6 +32587,7 @@ mod tests {
     /// recorded, at `warn`, and the tool stays callable (the setting is the only gate).
     #[test]
     fn startup_build_records_readonly_description_drift_at_warn_without_quarantine() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "toolport-startup-integrity-off-{}",
@@ -32570,6 +32657,7 @@ mod tests {
     /// records what the LIVE slot advertises at that instant.
     #[test]
     fn published_router_never_exposes_a_drifted_tool_during_the_integrity_gate() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "toolport-publish-gate-order-{}",
@@ -32605,14 +32693,17 @@ mod tests {
                 let live = live_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let advertises = live.aggregated_tools().iter().any(|t| t["name"] == "srv__read");
-                *seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(advertises);
+                let advertises = live
+                    .aggregated_tools()
+                    .iter()
+                    .any(|t| t["name"] == "srv__read");
+                *seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(advertises);
             }),
         ));
 
-        let published =
-            publish_built_router(&state.registry, &state.router, drifted, profile);
+        let published = publish_built_router(&state.registry, &state.router, drifted, profile);
 
         *INTEGRITY_GATE_OBSERVER
             .lock()
@@ -32635,7 +32726,10 @@ mod tests {
             "the quarantine must be on the router the moment it becomes live"
         );
         assert!(
-            !live.aggregated_tools().iter().any(|t| t["name"] == "srv__read"),
+            !live
+                .aggregated_tools()
+                .iter()
+                .any(|t| t["name"] == "srv__read"),
             "the published router must not advertise the drifted tool"
         );
     }
@@ -32661,6 +32755,7 @@ mod tests {
 
     #[test]
     fn effective_quarantine_is_empty_without_mandatory_entries_while_feature_is_off() {
+        let _data_lock = registry::data_dir_test_lock();
         // Ordinary drift entries stay dormant while quarantine-on-drift is off. With no
         // baseline-tamper entries persisted, the effective set is still known-empty.
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -32685,6 +32780,7 @@ mod tests {
 
     #[test]
     fn integrity_ask_corrupt_pin_root_keeps_live_fail_closed_set() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "toolport-corrupt-pins-live-q-{}",
@@ -32753,6 +32849,7 @@ mod tests {
 
     #[test]
     fn integrity_ask_baseline_tamper_quarantines() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("toolport-mandatory-q-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -32812,6 +32909,7 @@ mod tests {
 
     #[test]
     fn integrity_off_baseline_tamper_records_without_blocking() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir =
             std::env::temp_dir().join(format!("toolport-off-mandatory-q-{}", std::process::id()));
@@ -32854,6 +32952,7 @@ mod tests {
 
     #[test]
     fn integrity_store_error_fails_closed_at_ask_and_logs_at_off() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "toolport-safety-store-error-{}",
@@ -32940,6 +33039,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_quarantine_store_keeps_the_current_set_instead_of_un_blocking() {
+        let _data_lock = registry::data_dir_test_lock();
         // A corrupt store is Err (SOU-320: never rename aside to look like empty).
         // Reconciling a LIVE set against Err is fail-CLOSED: empty would be
         // indistinguishable from "the user re-approved everything".
@@ -33022,6 +33122,7 @@ mod tests {
 
     #[test]
     fn watch_tick_http_mode_keeps_profile_none_after_registry_reload() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir =
             std::env::temp_dir().join(format!("toolport-http-profile-none-{}", std::process::id()));
@@ -33090,6 +33191,7 @@ mod tests {
     /// re-globalized the flag, or wrote it to a different host, fails an assertion here.
     #[test]
     fn watch_tick_refreshes_code_mode_on_the_host_it_was_given() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir =
             std::env::temp_dir().join(format!("toolport-code-mode-tick-{}", std::process::id()));
@@ -33172,6 +33274,7 @@ mod tests {
     /// rebuild that would respawn every downstream server.
     #[test]
     fn watch_tick_publishes_an_instructions_edit_without_rebuilding() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir =
             std::env::temp_dir().join(format!("toolport-instructions-tick-{}", std::process::id()));
@@ -33360,6 +33463,7 @@ mod tests {
     /// handed rather than a value resolved somewhere else.
     #[test]
     fn discovery_mode_is_per_host() {
+        let _data = DataDirTestEnv::new("discovery_mode_is_per_host");
         let grouped = dispatch_host(false);
         grouped.set_discovery_mode(DiscoveryMode::Grouped);
         let full = dispatch_host(false);
@@ -33419,6 +33523,7 @@ mod tests {
     /// one of the two assertions.
     #[test]
     fn watch_tick_refreshes_discovery_mode_on_the_host_it_was_given() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir =
             std::env::temp_dir().join(format!("toolport-discovery-tick-{}", std::process::id()));
@@ -33511,6 +33616,7 @@ mod tests {
     /// publish how much it can be trusted along with the registry it swaps in.
     #[test]
     fn watch_tick_marks_a_recovered_registry_untrusted() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("toolport-sbs900-tick-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -33596,6 +33702,7 @@ mod tests {
 
     #[test]
     fn watch_tick_reconciles_a_release_without_registry_or_downstream_change() {
+        let _data_lock = registry::data_dir_test_lock();
         // SOU-304: the infinite watch_registry loop used to be untestable, so moving
         // reconcile_quarantine below the early-continue would reintroduce SOU-292 with
         // every existing test still green. Drive a single tick and assert a release is
@@ -33732,6 +33839,7 @@ mod tests {
 
     #[test]
     fn reconcile_quarantine_reads_the_persisted_set_and_clears_a_release() {
+        let _data_lock = registry::data_dir_test_lock();
         // Covers `reconcile_quarantine` itself, the function the watcher actually calls.
         // The other tests exercise `reconcile_to`, its pure half, which leaves the
         // composition with `effective_quarantine` (and that function's ON branch, the one
@@ -33808,12 +33916,13 @@ mod tests {
 
     #[test]
     fn data_dir_override_redirects_and_reverts() {
+        let _data_lock = registry::data_dir_test_lock();
         // The revert half matters as much as the redirect: the override is
         // process-global, so one that outlived its test would silently point the app
         // (and every other test) at a scratch directory.
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        let before = conduit_lib::registry::conduit_dir();
+        assert!(std::panic::catch_unwind(registry::conduit_dir).is_err());
         let scratch = std::env::temp_dir().join(format!("toolport-ddo-{}", std::process::id()));
         {
             let _guard = conduit_lib::registry::DataDirOverride::set(&scratch);
@@ -33823,15 +33932,15 @@ mod tests {
                 "conduit_dir must follow the override even though it memoizes"
             );
         }
-        assert_eq!(
-            conduit_lib::registry::conduit_dir(),
-            before,
-            "the override must revert when the guard drops"
+        assert!(
+            std::panic::catch_unwind(registry::conduit_dir).is_err(),
+            "dropping the override must restore the isolation guard"
         );
     }
 
     #[test]
     fn end_to_end_lexical_semantic_blend() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let cat = vec![
@@ -34191,6 +34300,7 @@ mod tests {
 
     #[test]
     fn search_query_bounds_are_enforced_before_ranking() {
+        let _data = DataDirTestEnv::new("search_query_bounds_are_enforced_before_ranking");
         let host = dispatch_host(false);
         assert!(validate_search_query(&"x".repeat(MAX_SEARCH_QUERY_CHARS)).is_ok());
         let char_limit_error =
@@ -34709,6 +34819,7 @@ mod tests {
 
     #[test]
     fn daemon_identity_matches_the_compat_key() {
+        let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "toolport-daemon-identity-{}-{}",
@@ -35837,6 +35948,8 @@ mod tests {
     /// must never serve it, with or without a bearer.
     #[test]
     fn the_daemon_identity_route_follows_the_hosts_daemon_flag() {
+        let _data = DataDirTestEnv::new("the_daemon_identity_route_follows_the_hosts_daemon_flag");
+        let _data = DataDirTestEnv::new("the_daemon_identity_route_follows_the_hosts_daemon_flag");
         let state = http_state(true);
         let caller = test_caller("daemon-probe", None);
         let probe = |state: &GatewayState, caller: Option<&HttpCaller>, private_bearer: bool| {
@@ -35881,7 +35994,11 @@ mod tests {
         let anonymous = probe(&state, None, false);
         assert_eq!(anonymous.status, 401, "body={}", anonymous.body);
         let registered_client = probe(&state, Some(&caller), false);
-        assert_eq!(registered_client.status, 401, "body={}", registered_client.body);
+        assert_eq!(
+            registered_client.status, 401,
+            "body={}",
+            registered_client.body
+        );
         let registered_topology = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
@@ -35926,6 +36043,13 @@ mod tests {
     /// state. Both are per-host now.
     #[test]
     fn rebuild_streaks_and_quarantine_read_state_belong_to_the_host() {
+        let _data_lock = registry::data_dir_test_lock();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("toolport-host-qflag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
         let first = http_state(false);
         let second = http_state(false);
 
@@ -35968,11 +36092,6 @@ mod tests {
         // which is exactly what a re-globalized flag would not be. The failure is forced
         // with a directory where the store's JSON file must be (SOU-320: an unreadable
         // store is reported as unknown, never as empty).
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("toolport-host-qflag-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
         let profile = Some("host-qflag");
         std::fs::create_dir_all(dir.join(format!(
             "quarantine-v2-{}.json",

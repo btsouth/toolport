@@ -2697,6 +2697,9 @@ mod tests {
     /// The shipped call sites must actually seed the guard, not just support it.
     #[test]
     fn production_reap_contexts_protect_the_current_process() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "production_reap_contexts_protect_the_current_process",
+        );
         for ctx in [
             ReapContext {
                 current_version: "1.9.6".into(),
