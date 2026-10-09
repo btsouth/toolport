@@ -1653,7 +1653,15 @@ impl Router {
     }
 
     fn reserved_policy_name(&self, server: &str, original: &str) -> Option<String> {
-        self.overrides
+        Self::legacy_tool_policy_name(&self.overrides, server, original)
+    }
+
+    pub(crate) fn legacy_tool_policy_name(
+        overrides: &HashMap<String, HashMap<String, ToolOverride>>,
+        server: &str,
+        original: &str,
+    ) -> Option<String> {
+        overrides
             .get(server)?
             .get(original)?
             .name
@@ -1663,21 +1671,21 @@ impl Router {
     }
 
     fn bind_policy_name(&mut self, exposed: &str, server: &str, original: &str) {
+        // Only tools in this view can claim a persisted policy record.
+        if !self.policy.allows_server(server)
+            || self
+                .policy
+                .allow
+                .get(server)
+                .is_some_and(|tools| !tools.contains(original))
+        {
+            return;
+        }
         let legacy = self.reserved_policy_name(server, original);
         let name = legacy.as_deref().unwrap_or(exposed);
         if !name.starts_with("toolport_") {
             return;
         }
-        let duplicate_override = legacy.is_some()
-            && self
-                .overrides
-                .iter()
-                .flat_map(|(server, tools)| tools.keys().map(move |tool| (server, tool)))
-                .filter(|(server, tool)| {
-                    self.reserved_policy_name(server, tool).as_deref() == Some(name)
-                })
-                .count()
-                > 1;
         let collisions: Vec<_> = self
             .policy_names
             .iter()
@@ -1685,11 +1693,12 @@ impl Router {
             .map(|(alias, _)| alias.clone())
             .collect();
         self.policy_names.insert(exposed.into(), name.into());
-        if duplicate_override || !collisions.is_empty() {
+        if !collisions.is_empty() {
             // An old alias cannot identify which baseline or quarantine belongs
             // to which tool. Refuse every claimant, including an earlier route.
             for alias in collisions.into_iter().chain([exposed.to_string()]) {
                 self.routes.remove(&alias);
+                self.schema_arguments.remove(&alias);
                 self.tools.0.retain(|tool| tool["name"] != alias);
                 self.blocked
                     .insert(alias, "ambiguous persisted tool policy binding".into());
@@ -6758,6 +6767,95 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn reserved_alias_ambiguity_ignores_stale_and_out_of_scope_claimants() {
+        let override_for = || ToolOverride {
+            name: Some("toolport_custom_echo".into()),
+            description: None,
+            unknown_fields: Default::default(),
+        };
+        let mut router = Router::new();
+        router.set_overrides(HashMap::from([
+            (
+                "s".into(),
+                HashMap::from([
+                    ("echo".into(), override_for()),
+                    ("gone".into(), override_for()),
+                ]),
+            ),
+            (
+                "absent".into(),
+                HashMap::from([("echo".into(), override_for())]),
+            ),
+        ]));
+        router.add(mock_server("s"));
+        for view in [router.clone(), router.reindexed()] {
+            assert!(view.route_call("s__echo", json!({})).is_ok());
+            assert!(view.route_call("s__add", json!({})).is_ok());
+        }
+        for native in [false, true] {
+            let mut router = Router::new();
+            let legacy = if native {
+                "toolport__echo"
+            } else {
+                "toolport_custom_echo"
+            };
+            router.set_overrides(HashMap::from([
+                (
+                    "s".into(),
+                    HashMap::from([(
+                        "echo".into(),
+                        ToolOverride {
+                            name: Some(legacy.into()),
+                            ..override_for()
+                        },
+                    )]),
+                ),
+                (
+                    "toolport".into(),
+                    HashMap::from([("echo".into(), override_for())]),
+                ),
+            ]));
+            router.add(mock_server("s"));
+            router.add(mock_server("toolport"));
+            let scoped =
+                router.with_tool_allow(HashMap::from([("toolport".into(), HashSet::new())]));
+            assert!(scoped.route_call("s__echo", json!({})).is_ok());
+            assert!(scoped.route_call("toolport__echo", json!({})).is_err());
+        }
+    }
+
+    #[test]
+    fn reserved_alias_ambiguity_removes_cached_argument_schema() {
+        let mut router = Router::new();
+        let rename = ToolOverride {
+            name: Some("toolport_custom_echo".into()),
+            description: None,
+            unknown_fields: Default::default(),
+        };
+        router.set_overrides(HashMap::from([
+            ("s".into(), HashMap::from([("echo".into(), rename.clone())])),
+            ("other".into(), HashMap::from([("echo".into(), rename)])),
+        ]));
+        let mut server = mock_server("s");
+        server.tools = vec![json!({"name":"echo", "inputSchema": {
+            "type":"object", "properties":{"a b":{"type":"string"}}
+        }})]
+        .into();
+        router.add(server);
+        assert!(router.schema_arguments.contains_key("s__echo"));
+        router.add(mock_server("other"));
+        for view in [router.clone(), router.reindexed()] {
+            assert!(!view.schema_arguments.contains_key("s__echo"));
+            for alias in ["s__echo", "other__echo"] {
+                assert!(view
+                    .route_call(alias, json!({}))
+                    .unwrap_err()
+                    .contains("ambiguous"));
+            }
+        }
+    }
+
+    #[test]
     fn gateway_owned_aliases_keep_the_original_route_after_reindexing() {
         for reserved in [
             "toolport_search_tools",
@@ -7419,7 +7517,10 @@ for line in sys.stdin:
         let mut guarded = router_with_catalogs(&[("atlassian", 3)]);
         let catalog = previous.aggregated_tools();
         guarded.adopt_restored_routes(&previous, &catalog);
-        assert_eq!(guarded.route_of("atlassian__t39"), Some(("atlassian", "t39")));
+        assert_eq!(
+            guarded.route_of("atlassian__t39"),
+            Some(("atlassian", "t39"))
+        );
         // Refresh path: next = live clone, rebuilt, published, then adopted again
         // with previous_router = the guarded live router.
         let prior_live = guarded.clone();
@@ -9156,7 +9257,10 @@ for line in sys.stdin:
         let inner = router.servers[0].inner.lock().unwrap();
         assert!(router.raw_catalogs().is_none());
         drop(inner);
-        assert_eq!(router.raw_catalogs().unwrap()["s"].materialize(0)["name"], "echo");
+        assert_eq!(
+            router.raw_catalogs().unwrap()["s"].materialize(0)["name"],
+            "echo"
+        );
     }
 
     #[test]
@@ -9171,7 +9275,12 @@ for line in sys.stdin:
             .unavailable()
             .contains("has not connected yet"));
         let (last_attempt, retry_at) = {
-            let state = router.servers[0].supervisor.as_ref().unwrap().lock().unwrap();
+            let state = router.servers[0]
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap();
             (state.last_attempt, state.next_attempt)
         };
         assert!(!router.servers[0].start_at(true, last_attempt));

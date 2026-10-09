@@ -65,7 +65,19 @@ fn annotate_quarantine(server_id: &str, tools: &mut [serde_json::Value]) -> Resu
         });
         tool["toolportQuarantine"] = serde_json::json!(match (&quarantined, alias) {
             (Ok(names), Some(alias)) if !ambiguous_prefix && !ambiguous_alias =>
-                if names.contains(alias) {
+                if names.contains(alias)
+                    || tool
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|original| {
+                            crate::router::Router::legacy_tool_policy_name(
+                                &registry.tool_overrides,
+                                server_id,
+                                original,
+                            )
+                            .is_some_and(|legacy| names.contains(&legacy))
+                        })
+                {
                     "quarantined"
                 } else {
                     "clear"
@@ -163,4 +175,44 @@ pub fn get_prompt(
     downstream
         .get_prompt(name, arguments)
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reserved_alias_quarantine_annotation_uses_legacy_binding() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.path());
+        let mut registry = crate::registry::Registry::default();
+        registry.tool_overrides.insert(
+            "s".into(),
+            std::collections::HashMap::from([(
+                "echo".into(),
+                crate::registry::ToolOverride {
+                    name: Some("toolport_custom_echo".into()),
+                    description: None,
+                    unknown_fields: Default::default(),
+                },
+            )]),
+        );
+        crate::registry::save_to(&dir.path().join("registry.json"), &registry).unwrap();
+        let profile = registry.default_access_id();
+        crate::integrity::apply_quarantine(
+            Some(&profile),
+            &[json!({"name":"toolport_custom_echo", "annotations":{"destructiveHint":true}})],
+            &[
+                json!({"type":"tool_drift", "tool":"toolport_custom_echo", "server":"s",
+                "change":"changed", "severity":"high"}),
+            ],
+        )
+        .unwrap();
+        let mut tools = vec![json!({"name":"echo"}), json!({"name":"add"})];
+        annotate_quarantine("s", &mut tools).unwrap();
+        assert_eq!(tools[0]["toolportQuarantine"], "quarantined");
+        assert_eq!(tools[1]["toolportQuarantine"], "clear");
+    }
 }
