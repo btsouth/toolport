@@ -2536,6 +2536,11 @@ pub fn apply_secret_declaration(
         .iter_mut()
         .find(|server| server.id == server_id)
         .ok_or_else(|| format!("No server with id '{server_id}'"))?;
+    if let Some(header) = server.unknown_fields.get_mut("headerKeys").and_then(serde_json::Value::as_array_mut).and_then(|hs| hs.iter_mut().find(|h| h["key"] == key)) {
+        if let Some(object) = header.as_object_mut() { object.remove("source"); }
+        registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
+        return Ok(());
+    }
     match server.env.iter_mut().find(|entry| entry.key == key) {
         Some(entry) => {
             entry.secret = true;
@@ -2787,7 +2792,7 @@ pub fn apply_launch_secret_generation(
 ) -> Result<(), String> {
     let server = registry
         .servers
-        .iter()
+        .iter_mut()
         .find(|server| server.id == server_id)
         .ok_or_else(|| format!("No server with id '{server_id}'"))?;
     if !server.launch.as_ref().is_some_and(|launch| {
@@ -2798,6 +2803,7 @@ pub fn apply_launch_secret_generation(
     }) {
         return Err("not a declared secret launch input".into());
     }
+    if let Some(input) = server.launch.as_mut().and_then(|l| l.inputs.iter_mut().find(|i| i.key == key)) { input.unknown_fields.remove("source"); }
     registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
     Ok(())
 }

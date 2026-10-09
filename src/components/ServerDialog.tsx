@@ -291,7 +291,7 @@ export function ServerDialog({
               ...launch,
               inputs: launch.inputs.map((input) => ({
                 ...input,
-                value: input.secret
+                value: input.source ? null : input.secret
                   ? withSecretValues
                     ? launchValues[input.key] || null
                     : null
@@ -417,7 +417,7 @@ export function ServerDialog({
           }
         }
         for (const input of launch?.inputs ?? []) {
-          if (!input.secret || !launchValues[input.key]) continue;
+          if (input.source || !input.secret || !launchValues[input.key]) continue;
           try {
             result = await setLaunchSecret(id, input.key, launchValues[input.key]);
           } catch {
@@ -623,7 +623,8 @@ export function ServerDialog({
                         {input.label}
                         {input.required ? " *" : ""}
                       </Label>
-                      <Input
+                      {input.secret && <select aria-label={`Key source for ${input.label}`} className="self-start rounded border bg-background p-1 text-xs" value={input.source ? "reference" : "paste"} onChange={(e) => { setLaunch((l) => l ? { ...l, inputs: l.inputs.map((i) => i.key === input.key ? { ...i, source: e.target.value === "reference" ? {ref: "op://Engineering/Docs/key"} : undefined } : i) } : l); clearTest(); }}><option value="paste">Paste a key</option><option value="reference">From a password manager</option></select>}
+                      {input.source ? <SecretReferenceField serverId={currentEditId ?? ""} value={input.source.ref} onChange={(ref) => { setLaunch((l) => l ? { ...l, inputs: l.inputs.map((i) => i.key === input.key ? { ...i, source: { ref } } : i) } : l); clearTest(); }} /> : <Input
                         id={`launch-${input.key}`}
                         type={input.secret ? "password" : "text"}
                         value={launchValues[input.key] ?? ""}
@@ -639,7 +640,7 @@ export function ServerDialog({
                           }));
                           clearTest();
                         }}
-                      />
+                      />}
                     </div>
                   ))}
                   <p className="text-xs text-muted-foreground">

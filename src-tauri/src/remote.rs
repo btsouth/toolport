@@ -1725,6 +1725,7 @@ fn connect_remote_inner(
     //
     // Handled here because this is the only place that sees both the current entry
     // and the vault; the reacquire seam takes just a server id by design.
+    if !crate::secret_refs::has_references(server) && header_values.is_empty() {
     let stale_cc = client_credentials_state_is_stale(server, server_id, url).or_else(|error| {
         let update = credential_update(server_id);
         let update = update
@@ -1748,6 +1749,7 @@ fn connect_remote_inner(
             .as_ref()
             .expect("uses_client_credentials checked it");
         acquire_client_credentials(server_id, url, config)?;
+    }
     }
     // A vault read failure is not "no token" (SBS-789): connecting anonymous on a
     // locked keychain would surface as a bogus 401/"needs sign-in" and can hand an
@@ -1791,8 +1793,8 @@ fn connect_remote_inner(
     if let Some(ref handler) = server_handler {
         transport.set_server_request_handler(handler.clone());
     }
-    transport.set_resource_updated_sink(resource_updated.clone());
-    transport.set_progress_sink(progress.clone());
+    transport.set_resource_updated_sink(protect_resource_updates(server, resource_updated.clone()));
+    transport.set_progress_sink(protect_progress(server, progress.clone()));
     transport.set_change_sink(change_dirty.clone());
     match DownstreamServer::connect(server_id.to_string(), reviewed_transport(server, transport))
         .map_err(|e| safe_imported_error(server, e))
@@ -4101,4 +4103,16 @@ mod reference_redaction_tests {
         let payload=redaction.value(serde_json::json!({"content":[{"text":"synthetic-ref-value"}],"synthetic-ref-value":"synthetic-ref-value"}));
         assert!(!payload.to_string().contains("synthetic-ref-value"));
     }
+}
+
+/// Prevent unsolicited progress and resource notifications from echoing injected keys.
+pub fn protect_progress(server: &ServerEntry, sink: Option<ProgressSink>) -> Option<ProgressSink> {
+    if !crate::secret_refs::has_references(server) { return sink; }
+    let redact = Redaction::for_server(server);
+    sink.map(|sink| Arc::new(move |value| sink(redact.value(value))) as ProgressSink)
+}
+pub fn protect_resource_updates(server: &ServerEntry, sink: Option<ResourceUpdatedSink>) -> Option<ResourceUpdatedSink> {
+    if !crate::secret_refs::has_references(server) { return sink; }
+    let redact = Redaction::for_server(server);
+    sink.map(|sink| Arc::new(move |uri| sink(redact.text(uri))) as ResourceUpdatedSink)
 }

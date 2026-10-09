@@ -8914,14 +8914,14 @@ fn connect_one_result(
             resolved_cwd.as_deref(),
             server.inherit_env,
             Arc::clone(dirty),
-            resource_updated,
+            remote::protect_resource_updates(server, resource_updated),
         ) {
             Ok(mut t) => {
                 if let Some(timeout) = initialize_timeout.expect("validated above") {
                     t.set_connect_timeout(timeout);
                 }
                 t.set_server_request_handler(Arc::clone(&server_handler));
-                t.set_progress_sink(progress);
+                t.set_progress_sink(remote::protect_progress(server, progress));
                 DownstreamServer::connect(
                     server.id.clone(),
                     remote::protect_transport(server, Box::new(t)),

@@ -29,7 +29,7 @@ pub const PROVIDERS: &[Provider] = &[
     Provider { scheme: "vault://", name: "HashiCorp Vault", binary: "vault", example: "vault://secret/docs#token", docs: "https://developer.hashicorp.com/vault/docs/commands/kv/get", sign_in: "Run vault login and configure VAULT_ADDR locally." },
     Provider { scheme: "bws://", name: "Bitwarden Secrets Manager", binary: "bws", example: "bws://be8e0ad8-d545-4017-a55a-b02f014d4158", docs: "https://bitwarden.com/help/secrets-manager-cli/", sign_in: "Configure BWS_ACCESS_TOKEN in the local Toolport process environment." },
     Provider { scheme: "bw://", name: "Bitwarden Password Manager", binary: "bw", example: "bw://be8e0ad8-d545-4017-a55a-b02f014d4158/password", docs: "https://bitwarden.com/help/cli/", sign_in: "Run bw login and bw unlock, then start Toolport with BW_SESSION in its environment." },
-    Provider { scheme: "keeper://", name: "Keeper Secrets Manager", binary: "ksm", example: "keeper://8f8I-OqPV58o2r91wVgZ_A/field/password", docs: "https://docs.keeper.io/keeperpam/secrets-manager/secrets-manager-command-line-interface/secret-command", sign_in: "Initialize a local Keeper Secrets Manager CLI profile with ksm profile init." },
+    Provider { scheme: "keeper://", name: "Keeper Secrets Manager", binary: "ksm", example: "keeper://8f8I-OqPV58o2r91wVgZ_A/field/password", docs: "https://docs.keeper.io/keeperpam/secrets-manager/secrets-manager-command-line-interface/secret-command", sign_in: "Initialize a local Keeper Secrets Manager CLI profile before testing the reference." },
     Provider { scheme: "dl://", name: "Dashlane", binary: "dcli", example: "dl://QD145B53-B987-4CFE-9408-F25803DC47A4/password", docs: "https://cli.dashlane.com/personal/secrets/read", sign_in: "Sign in locally with dcli and unlock your Dashlane vault." },
     Provider { scheme: "lpass://", name: "LastPass", binary: "lpass", example: "lpass://123456789/password", docs: "https://lastpass.github.io/lastpass-cli/lpass.1.html", sign_in: "Run lpass login on this machine and unlock its agent." },
     Provider { scheme: "env:", name: "Environment variable", binary: "", example: "env:API_TOKEN", docs: "https://doc.rust-lang.org/std/env/fn.var.html", sign_in: "Set the named environment variable before starting Toolport." },
@@ -574,7 +574,7 @@ pub fn resolve_headers(server: &ServerEntry) -> Result<Vec<(String, String)>, Re
                 check_policy(server, &r.r#ref)?;
                 resolve(&r.r#ref)?
             } else {
-                crate::secrets::get_secret_result(&server.id, h.env.as_deref().unwrap_or(&h.key))
+                crate::secrets::get_secret_result(&server.id, &h.key)
                     .map_err(|_| error(None, ErrorState::Locked))?
                     .ok_or_else(|| error(None, ErrorState::NotFound))?
             };

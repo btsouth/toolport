@@ -348,6 +348,13 @@ mockIPC(
         return setupCatalog;
       case "add_server":
         return fixtureAdd(args.entry as ServerEntry);
+      case "test_secret_reference":
+        return null;
+      case "set_secret_reference": {
+        const server = registry.servers.find((s) => s.id === args.serverId);
+        if (server) { let entry = server.env.find((e) => e.key === args.key); if (!entry) { entry = {key: String(args.key), value: null, secret: true}; server.env.push(entry); } entry.source = {ref: String(args.reference)}; entry.value = null; }
+        return structuredClone(registry);
+      }
       case "set_secret":
       case "set_launch_secret":
         return structuredClone(registry);
