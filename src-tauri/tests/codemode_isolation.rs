@@ -175,7 +175,10 @@ impl Gateway {
             "tools/call",
             json!({ "name": "toolport_run_script", "arguments": arguments }),
         );
-        assert!(response["result"].is_object(), "code mode RPC failed: {response}");
+        assert!(
+            response["result"].is_object(),
+            "code mode RPC failed: {response}"
+        );
         response["result"].clone()
     }
 
@@ -245,12 +248,10 @@ impl Drop for Gateway {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
         // The default stdio path is an adapter. Killing it does not kill its
         // detached host daemon, so stop that fixture daemon before removing the
-        // descriptor that identifies it.
+        // descriptor that identifies it. On Windows the daemon can retain an
+        // inherited pipe handle, so joining the reader first waits for idle exit.
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
@@ -280,8 +281,58 @@ impl Drop for Gateway {
                 }
             }
         }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+#[test]
+fn fixture_stops_its_daemon_before_joining_the_pipe_reader() {
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    let mut gateway = Gateway::start();
+    let dir = gateway.dir.clone();
+    let descriptor = std::fs::read_dir(&gateway.dir)
+        .unwrap()
+        .flatten()
+        .find_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            (name.starts_with("daemon-") && name.ends_with(".json"))
+                .then(|| conduit_lib::daemon::read_descriptor(&entry.path()))
+                .flatten()
+        })
+        .expect("stdio adapter published its fixture daemon");
+    let pid = descriptor.pid;
+    let reader = gateway.reader.take().unwrap();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let reader_stopped = Arc::clone(&stopped);
+    // Model a reader whose pipe stays open while the detached daemon lives.
+    // This also exercises the Windows teardown order on Unix, without relying
+    // on a race during OS pipe-handle inheritance to reproduce the delay.
+    gateway.reader = Some(std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while conduit_lib::gateway_publish::pid_is_running(descriptor.pid) {
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        reader_stopped.store(true, Ordering::Release);
+    }));
+    drop(gateway);
+    reader.join().unwrap();
+    assert!(
+        stopped.load(Ordering::Acquire),
+        "fixture must stop its daemon before waiting for pipe EOF"
+    );
+    assert!(!dir.exists(), "fixture data must be removed");
+    assert!(
+        !conduit_lib::gateway_publish::pid_is_running(pid),
+        "fixture daemon must exit before cleanup finishes"
+    );
 }
 
 #[test]

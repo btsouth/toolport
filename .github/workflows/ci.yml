@@ -358,7 +358,7 @@ jobs:
           workspaces: src-tauri
           key: ci-headless
           cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next/2.0') }}
       - name: Compile Rust tests and record build timings
         if: matrix.os != 'windows-latest'
         run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support --lib --bins --tests --no-run --timings
