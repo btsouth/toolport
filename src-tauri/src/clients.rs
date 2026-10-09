@@ -181,6 +181,9 @@ pub fn client_discovery_mode(registry: &crate::registry::Registry, id: &str) -> 
 }
 
 pub fn discovery_capabilities(id: &str) -> DiscoveryCapabilities {
+    // Adapter routing wraps legacy client IDs too. Only the capability lookup
+    // uses this spelling; authorization and result ownership keep the wire ID.
+    let id = id.strip_prefix("adapter:").unwrap_or(id);
     discovery::capabilities(id.strip_prefix("client:").unwrap_or(id))
 }
 

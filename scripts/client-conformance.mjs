@@ -83,11 +83,12 @@ async function changedCatalog(
 async function baseline(profile) {
   await withFixture(profile, false, async (_fixture, client) => {
     await client.initialize();
-    const native = ["claude-code", "codex", "cursor"].includes(profile.id);
+    const native = ["codex", "cursor"].includes(profile.id);
     const tools = await catalog(client, native ? "mock__echo" : "toolport_search_tools");
     assert.equal(
       tools.some((t) => t.name === "toolport_call_tool"),
-      !native,
+      true,
+      "Auto clients retain scoped call helpers, including non-refreshing Full clients",
     );
     if (!native) {
       const search = await client.call("toolport_search_tools", {
@@ -139,6 +140,25 @@ async function replay(profile) {
       pass(`${profile.id}: notification then source/documented re-list profile`);
     } else {
       await client.notification("notifications/tools/list_changed");
+      if (["codex", "cursor"].includes(profile.id)) {
+        // Startup and grow can both notify. Search after each event under the
+        // same deadline, without asking this non-refreshing client to re-list.
+        const deadline = performance.now() + deadlineMs;
+        while (true) {
+          const search = await client.call("toolport_search_tools", {
+            query: "mock__greet",
+          });
+          success(search);
+          if (textOf(search).includes("mock__greet")) break;
+          await client.notification(
+            "notifications/tools/list_changed",
+            Math.max(1, deadline - performance.now()),
+          );
+          assert(performance.now() < deadline, "changed tool missing from Full search");
+        }
+        success(await client.call("mock__greet", { name: "fixture" }, true));
+        pass(`${profile.id}: Full helpers recover a changed catalog without re-listing`);
+      }
       pass(
         `${profile.id}: notification delivered; client re-list ${profile.listChanged.supported === false ? "unsupported" : "unknown"}`,
       );
@@ -261,10 +281,16 @@ try {
   await withFixture(codex, true, async (fixture, first) => {
     const second = fixture.client(claude);
     await Promise.all([first.initialize(), second.initialize()]);
-    await Promise.all([catalog(first, "mock__echo"), catalog(second, "mock__echo")]);
+    await Promise.all([
+      catalog(first, "mock__echo"),
+      catalog(second, "toolport_search_tools"),
+    ]);
+    const search = await second.call("toolport_search_tools", { query: "mock__echo" });
+    success(search);
+    assert(textOf(search).includes("mock__echo"));
     const replies = await Promise.all([
       first.call("mock__echo", { text: "codex owned" }, false, "same-id"),
-      second.call("mock__echo", { text: "claude owned" }, false, "same-id"),
+      second.call("mock__echo", { text: "claude owned" }, true, "same-id"),
     ]);
     replies.forEach(success);
     assert(textOf(replies[0]).includes("codex owned"));

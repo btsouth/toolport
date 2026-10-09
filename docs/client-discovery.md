@@ -1,15 +1,26 @@
 # Client discovery defaults
 
-Auto is the default in Clients. It advertises the full tool list when the client
-has documented native search or deferred loading. Otherwise it exposes search
-and call tools. The capability table in `src-tauri/src/clients/discovery.rs`
-travels with each detected client to both shells. Evidence was checked on
-2026-10-07; unknown means unverified, not an assertion that a vendor lacks support.
+Auto is the default in Clients. Each client's measured default comes from
+`src-tauri/src/clients/discovery.rs` and travels with the detected client to both
+shells. Claude Code and opencode use Lazy; Codex and Cursor use Full. The
+2026-10-09 live CLI benchmark found Claude Code Lazy matched Full's 27/30 strict
+fixture successes with 78.7% less mean input. These are fixture results for those
+builds and models, not production-service acceptance. Other defaults retain the
+capability-based choice below. Unknown means unverified.
+
+Auto is resolved at request time. Existing installs receive updated defaults
+without a migration or config rewrite; explicit Full, Lazy and Grouped choices
+remain unchanged.
 
 A cold Full `tools/list` waits for the first catalogs within the client's budget
 below, including startup and rooted servers in one deadline. It then answers
 with whatever has loaded and still sends `notifications/tools/list_changed`
-for later arrivals. Clients with verified refresh retain the two-second bound
+for later arrivals. Codex and Cursor do not re-list on the measured builds, so
+Full also exposes the compact scoped search and call helpers. Use search when a
+tool is not in the client list or the catalog changed; dispatch keeps the same
+authorization, scope and result isolation as Lazy. Clients not marked as ignoring
+refresh do not get these extra Full helpers. No new setting is added.
+Clients with verified refresh retain the two-second bound
 from #1052. Warm lists with cached tools for the client's view answer immediately.
 The longer budget applies only to Full mode; Lazy, Grouped, prompts and resources
 retain the two-second catalog bound. This adds no setting or registry version.
@@ -25,7 +36,7 @@ not new file-based adapters.
 | Client ID            | Native search / deferral | Tool-list refresh   | Auto | Cold Full budget | Evidence                                                                                                                                                                                                                                                                                 |
 | -------------------- | ------------------------ | ------------------- | ---- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `claude-desktop`     | Unknown                  | Unknown             | Lazy | 5 s              | [Client adapter notes](clients.md); search and notification behavior unverified                                                                                                                                                                                                          |
-| `cursor`             | Yes                      | Unknown             | Full | 5 s              | [Cursor dynamic discovery](https://cursor.com/blog/dynamic-context-discovery); [MCP docs](https://cursor.com/docs/mcp) and [current changelog](https://cursor.com/changelog) do not document list-changed refresh                                                                        |
+| `cursor`             | Yes                      | No (live CLI)       | Full | 5 s              | [Cursor dynamic discovery](https://cursor.com/blog/dynamic-context-discovery); [MCP docs](https://cursor.com/docs/mcp) and [current changelog](https://cursor.com/changelog) do not document list-changed refresh                                                                        |
 | `droid`              | Unknown                  | Unknown             | Lazy | 5 s              | [Client adapter notes](clients.md); search and notification behavior unverified                                                                                                                                                                                                          |
 | `crush`              | Unknown                  | Unknown             | Lazy | 5 s              | [Client adapter notes](clients.md); search and notification behavior unverified                                                                                                                                                                                                          |
 | `anythingllm`        | Unknown                  | Unknown             | Lazy | 5 s              | [Client adapter notes](clients.md); search and notification behavior unverified                                                                                                                                                                                                          |
@@ -39,7 +50,7 @@ not new file-based adapters.
 | `codex`              | Yes                      | No (source checked) | Full | 8 s              | [Codex config reference](https://developers.openai.com/codex/config-reference); [notification handler at 2351d9e1](https://github.com/openai/codex/blob/2351d9e1b608e6f9d9a3699b71d7eb39ee41cfa4/codex-rs/rmcp-client/src/logging_client_handler.rs#L78-L80) only logs tool-list changes |
 | `github-copilot-cli` | Unknown                  | Unknown             | Lazy | 5 s              | [Client adapter notes](clients.md); search and notification behavior unverified                                                                                                                                                                                                          |
 | `antigravity`        | Unknown                  | Unknown             | Lazy | 5 s              | [Client adapter notes](clients.md); search and notification behavior unverified                                                                                                                                                                                                          |
-| `claude-code`        | Yes                      | Yes                 | Full | 2 s              | [Claude Code: tool search and dynamic updates](https://code.claude.com/docs/en/mcp)                                                                                                                                                                                                      |
+| `claude-code`        | Yes                      | Yes                 | Lazy | 2 s              | [Claude Code: tool search and dynamic updates](https://code.claude.com/docs/en/mcp)                                                                                                                                                                                                      |
 | `gemini-cli`         | Unknown                  | Yes                 | Lazy | 5 s              | [Client conformance source evidence](client-conformance.md#verified-notification-evidence), checked 2026-10-09                                                                                                                                                                           |
 | `qwen-code`          | Unknown                  | Unknown             | Lazy | 5 s              | [Client adapter notes](clients.md); search and notification behavior unverified                                                                                                                                                                                                          |
 | `junie`              | Unknown                  | Unknown             | Lazy | 5 s              | [Client adapter notes](clients.md); search and notification behavior unverified                                                                                                                                                                                                          |
@@ -69,8 +80,9 @@ At revision `2351d9e1b608e6f9d9a3699b71d7eb39ee41cfa4`, that callback logs only;
 the elicitation service delegates notifications to it. This verifies receipt,
 but not automatic catalog refresh. Cursor's MCP docs and current changelog were
 searched for list-changed support without finding a documented refresh contract;
-its refresh capability remains unknown. These are source/documentation checks,
-not live vendor-client acceptance tests.
+the 2026-10-09 live CLI probe then delivered a notification without a re-list.
+Claude Code and opencode re-listed; Codex and Cursor did not on the tested builds.
+These observations do not establish refresh behavior for every client version.
 
 Choose Full, Lazy or Grouped in the existing per-client control to override Auto.
 Existing `clientDiscovery` entries are preserved, including Grouped. Clearing an
@@ -97,3 +109,10 @@ for the exact serialized tool arrays with Code Mode off and a fixed 14-tool
 fixture. It also checks that the lazy floor is independent of catalog size.
 These are MCP catalog costs, not vendor prompt usage or billed savings after
 native deferral and caching. Small catalogs can cost less than the lazy floor.
+
+Stdio downstream initialize retains its 10-second bound (with the existing launcher
+exception). The first tool catalog has a separate 30-second deadline shared by
+all pages. This covers the observed legitimate 15-second catalogs plus catalog
+work, matches the existing live-call/traversal cap, and still fails hung servers
+cleanly. Existing supervisor retry backoff is unchanged. Adapter prefixes are
+normalized only for capability lookup, never for session ownership or scope.

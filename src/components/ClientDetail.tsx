@@ -119,8 +119,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     });
   }
 
-  // Absence is Auto; native search or deferred loading selects Full.
-  const autoMode = client.discovery?.nativeToolSearch === true ? "full" : "lazy";
+  // Absence is Auto; use the backend default rather than infer it from native search.
+  const autoMode = client.discovery?.autoMode ?? "lazy";
   const storedMode = registry?.clientDiscovery?.[client.id]?.trim().toLowerCase();
   const clientMode = storedMode && DISCOVERY_HINT[storedMode] ? storedMode : "";
   const effectiveMode = clientMode || autoMode;

@@ -252,7 +252,7 @@ fn a_cached_server_stays_lazy_then_stops_when_idle_and_restarts_on_use() {
 // Startup persists a spec before first-use discovery has populated its tools.
 // A matching spec alone cannot prove that a restart will stay lazy.
 fn has_cached_echo(cache: &serde_json::Value) -> bool {
-    cache["version"] == 2
+    cache["version"] == 3
         && cache["servers"]["lazy"]["spec"].is_string()
         && cache["servers"]["lazy"]["tools"]
             .as_array()
@@ -261,10 +261,10 @@ fn has_cached_echo(cache: &serde_json::Value) -> bool {
 
 #[test]
 fn an_empty_persisted_catalog_is_not_a_warm_cache() {
-    let mut cache = json!({"version":2,"servers":{"lazy":{"spec":"current","tools":[]}}});
+    let mut cache = json!({"version":3,"servers":{"lazy":{"spec":"current","tools":[]}}});
     assert!(!has_cached_echo(&cache));
     cache["servers"]["lazy"]["tools"] = json!([{"name":"echo"}]);
     assert!(has_cached_echo(&cache));
-    cache["version"] = json!(1);
+    cache["version"] = json!(2);
     assert!(!has_cached_echo(&cache));
 }

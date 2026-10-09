@@ -2441,7 +2441,7 @@ fn append_client_discovery_actions(
         (
             "Auto",
             None,
-            "Choose from this client's native search or deferred loading capabilities",
+            "Use this client's measured backend default discovery mode",
         ),
         (
             "Full catalog",

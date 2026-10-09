@@ -10,6 +10,30 @@ use conduit_lib::{registry, remote, secrets};
 use serde_json::{json, Value};
 
 #[test]
+fn reserved_alias_upgrade_policy_replay() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let output = Command::new("node")
+        .arg(root.join("scripts/reserved-alias-policy.mjs"))
+        .env(
+            "TOOLPORT_GATEWAY_BIN",
+            env!("CARGO_BIN_EXE_toolport-gateway"),
+        )
+        .env("TOOLPORT_MOCK_BIN", env!("CARGO_BIN_EXE_mock-mcp-server"))
+        .current_dir(root)
+        .output()
+        .expect("Node is required for the policy replay");
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "policy replay failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn client_profiles_replay_against_the_real_adapter_and_daemon() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

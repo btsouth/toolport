@@ -450,6 +450,7 @@ mockIPC(
             gatewayInstalled: !setupFixture || setupConnected,
             entryState: !setupFixture || setupConnected ? "managed" : "absent",
             discovery: {
+              autoMode: "full",
               nativeToolSearch: true,
               toolsListChanged: null,
               evidence: "fixture",
