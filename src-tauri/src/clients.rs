@@ -7018,19 +7018,21 @@ fn repair_secondary_claude_config(path: &Path, current: &str) -> Result<(), Stri
         // Selection happened before the mutation lock. Respect a subsequent edit.
         let fresh = claude_configs_needing_repair(&[path.to_path_buf()], current).pop()
             .ok_or("Secondary gateway changed before repair; leaving it untouched")?;
+        let (entry_name, _) = claude_gateway_entry_in(&read_config_file(path)?)
+            .ok_or("Secondary gateway disappeared before repair")?;
         backup_secondary_claude_file(path)?;
-        if !gateway_entry_needs_rewrite(GATEWAY_ENTRY_NAME, &fresh.stored, current, None) {
+        if !gateway_entry_needs_rewrite(&entry_name, &fresh.stored, current, None) {
             return moved::backfill_identity(
                 Format::JsonMcpServers,
                 path,
-                GATEWAY_ENTRY_NAME,
+                &entry_name,
                 "claude-code-secondary",
             );
         }
         let entry = repair_gateway_entry(
             Format::JsonMcpServers,
             path,
-            GATEWAY_ENTRY_NAME,
+            &entry_name,
             "claude-code-secondary",
         )?;
         edit_json_gateway(path, "mcpServers", Some(&entry), true)
@@ -9675,6 +9677,24 @@ command = "npx"
         std::fs::write(&path, custom).unwrap();
         assert!(repair_secondary_claude_config(&path, current).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
+    }
+
+    #[test]
+    fn secondary_legacy_name_repair_preserves_scope_identity() {
+        let data = crate::registry::DataDirTestEnv::new("f3-secondary-legacy-scope");
+        let current = data.dir.join("toolport-gateway");
+        std::fs::write(&current, "fixture").unwrap();
+        let path = data.dir.join("secondary.json");
+        for command in [current.clone(), data.dir.join("conduit-gateway")] {
+            let raw = serde_json::json!({"mcpServers":{"conduit":{"command":command,"env":{"TOOLPORT_PROFILE":"narrow","CONDUIT_CLIENT_ID":"existing"}}}});
+            std::fs::write(&path, raw.to_string()).unwrap();
+            repair_secondary_claude_config(&path, current.to_str().unwrap()).unwrap();
+            let after: serde_json::Value = serde_json::from_str(&read_config_file(&path).unwrap()).unwrap();
+            let env = &after["mcpServers"][GATEWAY_ENTRY_NAME]["env"];
+            assert_eq!(env[crate::brand::PROFILE], "narrow");
+            assert_eq!(env[crate::brand::CLIENT_ID], "existing");
+            assert_eq!(env[crate::brand::ATTRIBUTION_ID], "claude-code-secondary");
+        }
     }
 
     #[test]
