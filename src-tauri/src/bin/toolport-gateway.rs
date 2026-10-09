@@ -3281,7 +3281,7 @@ fn project_search_results(tools: &[&Value], include_top_schema: bool) -> Vec<Val
         .as_ref()
         .is_some_and(|schema| worker::json_size(schema, 4096).is_none())
     {
-        24
+        16
     } else {
         100
     };

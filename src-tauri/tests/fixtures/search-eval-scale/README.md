@@ -96,7 +96,7 @@ a short description and every required parameter name. Row 1 also carries the
 complete input schema. Repeated schema fragments use local definitions without
 losing constraints or documentation; exact-name lookups preserve the original
 complete definition and existing lossless paging. Description lines allow 100
-characters with small schemas and 24 with large schemas to meet the token budget.
+characters with small schemas and 16 with large schemas to meet the token budget.
 The informational low_confidence flag never changes menu size or schema hydration.
 
 The `search-static` Cargo feature is default on for ordinary desktop builds.
