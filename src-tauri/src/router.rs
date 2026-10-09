@@ -6525,6 +6525,9 @@ for line in sys.stdin:
         rebuilt.rebuild_aggregation();
         rebuilt.adopt_restored_routes(&previous, &previous.aggregated_tools());
 
+        let prior_live = rebuilt.clone();
+        rebuilt.rebuild_preserving_restored();
+        rebuilt.adopt_restored_routes(&prior_live, &prior_live.shared_tools());
         let profile = rebuilt.with_tool_allow(HashMap::from([(
             "atlassian".to_string(),
             HashSet::from(["t39".to_string()]),
@@ -6570,10 +6573,26 @@ for line in sys.stdin:
         next.adopt_restored_routes(&prior_live, &catalog);
         assert_eq!(next.route_of("atlassian__t39"), Some(("atlassian", "t39")));
         let profile = next.with_tool_allow(HashMap::new());
-        assert_eq!(profile.route_of("atlassian__t39"), Some(("atlassian", "t39")), "profile view lost restored route");
+        assert_eq!(
+            profile.route_of("atlassian__t39"),
+            Some(("atlassian", "t39")),
+            "profile view lost restored route"
+        );
         let mut policy = next.clone();
         policy.requarantine(BTreeSet::new());
-        assert_eq!(policy.route_of("atlassian__t39"), Some(("atlassian", "t39")), "policy rebuild lost restored route");
+        assert_eq!(
+            policy.route_of("atlassian__t39"),
+            Some(("atlassian", "t39")),
+            "policy rebuild lost restored route"
+        );
+        let mut registry = next.registry_policy();
+        registry.deny_destructive = true;
+        assert!(next.apply_registry_policy(registry));
+        assert_eq!(next.route_of("atlassian__t39"), Some(("atlassian", "t39")));
+        assert!(next.route_call("atlassian__t39", json!({})).is_ok());
+        next.requarantine(BTreeSet::from(["atlassian__t39".to_string()]));
+        assert!(next.route_of("atlassian__t39").is_none());
+        assert!(next.is_blocked("atlassian__t39"));
     }
 
     #[test]
@@ -7906,7 +7925,7 @@ for line in sys.stdin:
         let inner = router.servers[0].inner.lock().unwrap();
         assert!(router.raw_catalogs().is_none());
         drop(inner);
-        assert_eq!(router.raw_catalogs().unwrap()["s"].get(0)["name"], "echo");
+        assert_eq!(router.raw_catalogs().unwrap()["s"].materialize(0)["name"], "echo");
     }
 
     #[test]

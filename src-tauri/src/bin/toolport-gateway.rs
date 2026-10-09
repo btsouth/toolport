@@ -30331,6 +30331,145 @@ mod tests {
     }
 
     #[test]
+    fn catalog_publication_notifies_only_profiles_with_digest_changes() {
+        let _env = DataDirTestEnv::new("profile-catalog-digest-publication");
+        let state = http_state(false);
+        let mut reg = Registry::default();
+        reg.servers = vec![stub_server("one", "One"), stub_server("two", "Two")];
+        for server in &mut reg.servers {
+            server.enabled = true;
+        }
+        reg.profiles = [
+            ("one", vec!["one"], HashMap::new()),
+            ("two", vec!["two"], HashMap::new()),
+            ("both", vec!["one", "two"], HashMap::new()),
+            (
+                "echo",
+                vec!["one"],
+                HashMap::from([("one".into(), vec!["echo".into()])]),
+            ),
+        ]
+        .into_iter()
+        .map(|(id, servers, tool_scope)| registry::Profile {
+            id: id.into(),
+            name: id.into(),
+            enabled_server_ids: servers.into_iter().map(str::to_string).collect(),
+            tool_scope,
+            instructions: None,
+            unknown_fields: Default::default(),
+        })
+        .collect();
+        *state.registry.lock().unwrap() = reg.clone();
+        let build = |tools: Vec<Value>| {
+            let mut router = Router::new();
+            router.add(
+                DownstreamServer::connect("one".into(), Box::new(MockRoute { tools })).unwrap(),
+            );
+            router.add(
+                DownstreamServer::connect(
+                    "two".into(),
+                    Box::new(MockRoute {
+                        tools: vec![json!({"name":"echo"})],
+                    }),
+                )
+                .unwrap(),
+            );
+            router
+        };
+        let mut tools = vec![
+            json!({"name":"echo", "description":"Echo", "inputSchema":{"type":"object"}}),
+            json!({"name":"greet", "description":"Greet", "inputSchema":{"type":"object"}}),
+        ];
+        let initial = build(tools.clone());
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(initial.shared_tools()));
+        swap_router(&state, initial);
+        let clients: Vec<_> = ["one", "two", "both", "echo"]
+            .into_iter()
+            .map(|profile| {
+                let (allowed, caller) = resolve_adapter_caller(&reg, profile, Some(profile), None);
+                let sid = mint_mcp_session(&state, Some(&caller.session_owner))
+                    .unwrap_or_else(|_| panic!("mint fixture session"));
+                (profile, allowed, caller, sid)
+            })
+            .collect();
+        for (phase, expected) in [
+            ("schema", vec!["one", "both", "echo"]),
+            ("description", vec!["one", "both"]),
+            ("addition", vec!["one", "both"]),
+            ("reorder", vec![]),
+            ("unchanged", vec![]),
+        ] {
+            let previous = state.router.lock().unwrap().clone();
+            let frozen = state.host.adapter_tools_before_refresh(&previous);
+            match phase {
+                "schema" => {
+                    tools[0]["inputSchema"]["properties"] = json!({"text":{"type":"string"}})
+                }
+                "description" => tools[1]["description"] = json!("Updated greeting"),
+                "addition" => tools.push(json!({"name":"wave"})),
+                "reorder" => tools.reverse(),
+                _ => {}
+            }
+            let next = build(tools.clone());
+            let next_tools = next.shared_tools();
+            swap_router(&state, next);
+            state.host.persist_and_emit_with_sessions(
+                &next_tools,
+                &state.cached_tools,
+                &state.router,
+                Some(&previous),
+                &state.stdio_upstream,
+                Some(&state.mcp_sessions),
+                None,
+                true,
+                Some(&frozen),
+            );
+            for (profile, allowed, caller, sid) in &clients {
+                let notes = drain_session(&state, sid);
+                assert_eq!(
+                    notes.len(),
+                    usize::from(expected.contains(profile)),
+                    "{phase}: profile {profile}: {notes:?}"
+                );
+                if let Some(note) = notes.first() {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(note).unwrap()["method"],
+                        "notifications/tools/list_changed"
+                    );
+                }
+                let out = handle_http(
+                    &state,
+                    &SearchGuard::default(),
+                    "POST",
+                    "/mcp",
+                    &json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}).to_string(),
+                    Some(sid),
+                    None,
+                    Some(allowed),
+                    Some(caller),
+                );
+                assert_eq!(out.status, 200, "{phase}: {}", out.body);
+                let response: Value = serde_json::from_str(&out.body).unwrap();
+                let listed = response["result"]["tools"]
+                    .as_array()
+                    .expect("profile tools/list");
+                assert!(listed.iter().any(|tool| tool["name"]
+                    == if *profile == "two" {
+                        "two__echo"
+                    } else {
+                        "one__echo"
+                    }));
+                if *profile == "echo" {
+                    assert!(!listed
+                        .iter()
+                        .any(|tool| tool["name"] == "one__greet" || tool["name"] == "one__wave"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn mcp_upstream_timeout_drops_undelivered_request() {
         let session = SessionState::new_http(None);
         let err = session

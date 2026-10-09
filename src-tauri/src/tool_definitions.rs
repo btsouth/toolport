@@ -485,6 +485,41 @@ mod tests {
     }
 
     #[test]
+    fn serialized_metadata_index_tracks_duplicates_and_copy_on_write() {
+        let values = vec![
+            json!({"name":"read", "inputSchema":{"properties":{"header":{"type":"string","x-mcp-header":"Tenant"}}}}),
+            json!({"name":"read", "inputSchema":{"properties":{"header":{"type":"boolean","x-mcp-header":"Other"}}}}),
+            json!({"name":"invalid", "inputSchema":{"x-mcp-header":7}}),
+        ];
+        let mut catalog = SerializedTools::from(values.clone());
+        let prior = catalog.clone();
+        assert!(catalog.contains_name("read"));
+        assert!(!catalog.contains_name("missing"));
+        assert_eq!(
+            catalog.header_specs("read").unwrap(),
+            crate::downstream::header_param_specs(&values[0]).unwrap()
+        );
+        assert_eq!(
+            catalog.header_specs("invalid").unwrap_err(),
+            crate::downstream::header_param_specs(&values[2]).unwrap_err()
+        );
+        assert!(catalog.header_specs("missing").unwrap().is_empty());
+        catalog.retain_names(|name| name == Some("invalid"));
+        assert!(!catalog.contains_name("read"));
+        assert!(prior.contains_name("read"));
+        catalog.push(values[1].clone());
+        assert_eq!(
+            catalog.header_specs("read").unwrap(),
+            crate::downstream::header_param_specs(&values[1]).unwrap()
+        );
+        assert_eq!(
+            catalog.materialize_all(),
+            vec![values[2].clone(), values[1].clone()]
+        );
+        assert!(Arc::ptr_eq(&catalog.0.tools[0], &prior.0.tools[2]));
+    }
+
+    #[test]
     fn shared_catalog_digests_cover_schema_description_and_order_changes() {
         let values = vec![
             json!({"name":"read", "description":"first", "inputSchema":{"type":"object"}}),
