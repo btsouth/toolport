@@ -7235,8 +7235,7 @@ impl HttpTransport {
                 }
             }
         }
-        Err(TransportError::Classified(
-            crate::call_failure::CallFailureKind::Unavailable { after_send: true },
+        Err(TransportError::Fatal(
             "no matching message in SSE stream".to_string(),
         ))
     }
