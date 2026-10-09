@@ -88,7 +88,7 @@ export function RegistryServerRow({
       : (server.url ?? "");
   const providers = [
     ...new Set(
-      [...server.env, ...(server.headerKeys ?? [])]
+      [...server.env, ...(server.headerKeys ?? []), ...(server.launch?.inputs ?? [])]
         .map((e) => referenceProvider(e.source?.ref)?.name)
         .filter(Boolean),
     ),

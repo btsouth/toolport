@@ -6,6 +6,8 @@ import type { Registry, ServerEntry } from "@/lib/types";
 const api = vi.hoisted(() => ({
   setLaunchInputValue: vi.fn(),
   setLaunchSecret: vi.fn(),
+  setSecretReference: vi.fn(),
+  testSecretReference: vi.fn(),
 }));
 vi.mock("@/lib/api", () => api);
 vi.mock("sonner", () => ({ toast: { success: vi.fn() } }));
@@ -66,6 +68,32 @@ describe("LaunchSetupDialog", () => {
     expect(api.setLaunchInputValue).toHaveBeenCalledWith("team_twilio", "SID", "ACnew");
     expect(api.setLaunchSecret).not.toHaveBeenCalled();
     expect(onSaved).toHaveBeenCalledWith(saved);
+  });
+
+  it("saves only the selected reference even after a key was pasted", async () => {
+    api.setSecretReference.mockResolvedValue(saved);
+    const user = userEvent.setup();
+    render(
+      <LaunchSetupDialog
+        server={server}
+        trigger={<button>Launch setup</button>}
+        onSaved={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Launch setup" }));
+    await user.type(screen.getByLabelText("API Secret *"), "synthetic-pasted-value");
+    await user.selectOptions(
+      screen.getByLabelText("Key source for API Secret"),
+      "reference",
+    );
+    await user.selectOptions(screen.getByLabelText("Password manager provider"), "env:");
+    await user.click(screen.getByRole("button", { name: "Save setup" }));
+    expect(api.setSecretReference).toHaveBeenCalledWith(
+      "team_twilio",
+      "SECRET",
+      "env:API_TOKEN",
+    );
+    expect(api.setLaunchSecret).not.toHaveBeenCalled();
   });
 
   it("vaults a new secret under the existing team server id", async () => {

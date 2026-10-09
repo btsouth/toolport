@@ -133,8 +133,8 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
             </div>
           ))}
           <p className="text-xs text-muted-foreground">
-            Secret values stay in Toolport's vault. This server can be enabled after its
-            required setup and credentials are present.
+            Pasted keys stay in Toolport's vault. Password manager references sync to your
+            other machines. Sign in to the provider on each machine.
           </p>
         </div>
         <DialogFooter>

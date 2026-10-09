@@ -100,6 +100,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [newKey, setNewKey] = useState("");
   const [newValue, setNewValue] = useState("");
+  const [newReference, setNewReference] = useState<string | undefined>();
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [authSet, setAuthSet] = useState(false);
   const [authProbeError, setAuthProbeError] = useState(false);
@@ -533,17 +534,22 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
 
   async function addNew() {
     const k = newKey.trim();
-    if (!k || !newValue) return;
+    if (!k || !(newReference ?? newValue)) return;
     retireInFlightVaultProbes();
     setBusyKey("add");
     try {
-      onSaved(await setSecret(server.id, k, newValue));
-      setVaulted((v) => ({ ...v, [k]: true }));
+      onSaved(
+        newReference !== undefined
+          ? await setSecretReference(server.id, k, newReference)
+          : await setSecret(server.id, k, newValue),
+      );
+      if (newReference === undefined) setVaulted((v) => ({ ...v, [k]: true }));
       setInputs((i) => ({ ...i, [k]: "" }));
       toast.success(`Saved ${k}`);
       onChanged?.();
       setNewKey("");
       setNewValue("");
+      setNewReference(undefined);
     } catch (e) {
       toastError(secretErrorMessage(e));
     } finally {
@@ -1023,24 +1029,49 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
             <summary className="cursor-pointer text-xs text-muted-foreground select-none">
               Add another environment secret
             </summary>
-            <div className="mt-2 flex items-center gap-2">
+            <div className="mt-2 flex flex-col gap-2">
               <Input
                 placeholder="ENV_NAME"
                 className="font-mono"
                 value={newKey}
                 onChange={(e) => setNewKey(e.target.value)}
               />
-              <Input
-                type="password"
-                placeholder="value"
-                value={newValue}
-                onChange={(e) => setNewValue(e.target.value)}
-              />
+              <select
+                aria-label="Key source for new variable"
+                className="self-start rounded border bg-background p-1 text-xs"
+                value={newReference === undefined ? "paste" : "reference"}
+                onChange={(e) =>
+                  setNewReference(
+                    e.target.value === "reference"
+                      ? "op://Engineering/Docs/key"
+                      : undefined,
+                  )
+                }
+              >
+                <option value="paste">Paste a key</option>
+                <option value="reference">From a password manager</option>
+              </select>
+              {newReference !== undefined ? (
+                <SecretReferenceField
+                  serverId={server.id}
+                  value={newReference}
+                  onChange={setNewReference}
+                />
+              ) : (
+                <Input
+                  type="password"
+                  placeholder="value"
+                  value={newValue}
+                  onChange={(e) => setNewValue(e.target.value)}
+                />
+              )}
               <Button
                 size="icon"
                 className="size-8 shrink-0"
                 aria-label="Add secret"
-                disabled={busyKey !== null || !newKey.trim() || !newValue}
+                disabled={
+                  busyKey !== null || !newKey.trim() || !(newReference ?? newValue)
+                }
                 onClick={addNew}
               >
                 {busyKey === "add" ? (
