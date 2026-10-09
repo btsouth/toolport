@@ -1836,9 +1836,10 @@ fn connect_remote_inner(
         require_secure_for_auth(url)?;
     }
     transport.set_credential_headers(header_values.clone())?;
+    transport.set_reference_credentials(crate::secret_refs::has_references(server));
     transport.set_connect_timeout(initialize_timeout);
     if let Some(ref handler) = server_handler {
-        transport.set_server_request_handler(handler.clone());
+        transport.set_server_request_handler(protect_server_requests(server, handler.clone()));
     }
     transport.set_resource_updated_sink(protect_resource_updates(server, resource_updated.clone()));
     transport.set_progress_sink(protect_progress(server, progress.clone()));
@@ -4141,6 +4142,25 @@ mod tests {
 mod reference_redaction_tests {
     use super::*;
     #[test]
+    fn handshake_requests_do_not_expose_resolved_credentials() {
+        let server: ServerEntry = serde_json::from_value(serde_json::json!({"id":"refs", "name":"Refs", "transport":"stdio", "command":"mock", "env":[{"key":"KEY", "secret":true, "value":"synthetic-ref-value", "source":{"ref":"env:SYNTHETIC"}}]})).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let handler = protect_server_requests(
+            &server,
+            Arc::new(move |frame| {
+                assert!(!frame.to_string().contains("synthetic-ref-value"));
+                observed.fetch_add(1, Ordering::Relaxed);
+                None
+            }),
+        );
+        handler(
+            &serde_json::json!({"method":"elicitation/create", "params":{"message":"synthetic-ref-value"}}),
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn reference_errors_are_opaque_and_auth_triggers_reconnection() {
         let redaction = Redaction(vec!["synthetic-ref-value".into()]);
         let e = redaction.connection_error(
@@ -4182,4 +4202,16 @@ pub fn protect_resource_updates(
     }
     let redact = Redaction::for_server(server);
     sink.map(|sink| Arc::new(move |uri| sink(redact.text(uri))) as ResourceUpdatedSink)
+}
+
+/// Redact handshake-time requests before the protected transport is installed.
+pub fn protect_server_requests(
+    server: &ServerEntry,
+    handler: ServerRequestHandler,
+) -> ServerRequestHandler {
+    if !crate::secret_refs::has_references(server) {
+        return handler;
+    }
+    let redact = Redaction::for_server(server);
+    Arc::new(move |frame| handler(&redact.value(frame.clone())))
 }

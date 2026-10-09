@@ -8920,7 +8920,7 @@ fn connect_one_result(
                 if let Some(timeout) = initialize_timeout.expect("validated above") {
                     t.set_connect_timeout(timeout);
                 }
-                t.set_server_request_handler(Arc::clone(&server_handler));
+                t.set_server_request_handler(remote::protect_server_requests(server, Arc::clone(&server_handler)));
                 t.set_progress_sink(remote::protect_progress(server, progress));
                 DownstreamServer::connect(
                     server.id.clone(),

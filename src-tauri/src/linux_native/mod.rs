@@ -9484,6 +9484,52 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn reference_controls_test_reports_status_without_showing_value() {
+        use adw::prelude::*;
+        adw::init().unwrap();
+        let key = "TOOLPORT_NATIVE_REFERENCE_TEST_483762";
+        std::env::set_var(key, "synthetic-native-key-value");
+        let feedback = gtk::Label::new(None);
+        let (choice, controls, reference) =
+            super::secret_reference_fields("", Some(&format!("env:{key}")), &feedback);
+        assert_eq!(choice.selected(), 1);
+        assert!(controls.is_visible());
+        let provider = controls
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::DropDown>()
+            .unwrap();
+        assert_eq!(
+            provider.selected(),
+            (crate::secret_refs::PROVIDERS.len() - 1) as u32
+        );
+        let test = controls
+            .last_child()
+            .unwrap()
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        test.emit_clicked();
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !test.is_sensitive() && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::env::remove_var(key);
+        assert!(test.is_sensitive(), "reference test must finish");
+        assert_eq!(feedback.text(), "Success. This machine can read the key.");
+        assert_eq!(reference.text(), format!("env:{key}"));
+        assert!(!feedback.text().contains("synthetic-native-key-value"));
+        provider.set_selected(0);
+        assert_eq!(reference.text(), crate::secret_refs::PROVIDERS[0].example);
+        choice.set_selected(0);
+        assert!(!controls.is_visible());
+    }
+
+    #[test]
     fn launch_reference_edit_discards_pasted_value_and_switches_back_to_vault() {
         let input = crate::registry::LaunchInput {
             key: "TOKEN".into(),
