@@ -9994,17 +9994,33 @@ mod tests {
         );
         assert_eq!(
             probe_status_line(&probe(false, 0, true)),
-            (match probe.auth_target {
-            Some(crate::call_failure::AuthTarget::ServiceCredential) => "Service credential required",
-            Some(crate::call_failure::AuthTarget::Scope) => "Service permission required",
-            Some(crate::call_failure::AuthTarget::OAuthRefresh) => "MCP OAuth refresh failed",
-            _ => "MCP endpoint auth required",
-        }.to_string(), "review")
+            ("MCP endpoint auth required".to_string(), "review")
         );
         assert_eq!(
             probe_status_line(&probe(false, 0, false)),
             ("Error".to_string(), "error")
         );
+    }
+
+    #[test]
+    fn probe_auth_ownership_is_visible() {
+        use crate::call_failure::AuthTarget;
+        for (target, text) in [
+            (AuthTarget::Endpoint, "MCP endpoint auth required"),
+            (AuthTarget::ServiceCredential, "Service credential required"),
+            (AuthTarget::Scope, "Service permission required"),
+            (AuthTarget::OAuthRefresh, "MCP OAuth refresh failed"),
+        ] {
+            let probe = crate::server_runtime::ProbeResult {
+                server_id: "fixture".into(),
+                ok: false,
+                tool_count: 0,
+                error: None,
+                auth_required: true,
+                auth_target: Some(target),
+            };
+            assert_eq!(probe_status_line(&probe), (text.into(), "review"));
+        }
     }
 
     #[test]

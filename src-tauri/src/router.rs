@@ -3383,10 +3383,16 @@ impl Router {
                         .record_success();
                     return Ok(v);
                 }
-                Err(TransportError::Retry {
-                    retry_after,
-                    message,
-                }) if attempt < HTTP_MAX_RETRIES => {
+                Err(
+                    TransportError::Retry {
+                        retry_after,
+                        message,
+                    }
+                    | TransportError::RateLimited {
+                        retry_after,
+                        message,
+                    },
+                ) if attempt < HTTP_MAX_RETRIES => {
                     let wait = retry_wait(retry_after, attempt);
                     eprintln!("toolport: retrying downstream call after {wait:?}: {message}");
                     wait_for_retry_or_cancel(wait, cancel).map_err(|error| error.call_failure())?;
@@ -4109,6 +4115,155 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    fn http_timeout_with_successful_sibling(body_stage: bool) {
+        use crate::downstream::HttpTransport;
+        use std::io::{Read, Write};
+        let _lock = crate::registry::data_dir_test_lock();
+        let scratch = tempfile::tempdir().unwrap();
+        let _data = crate::registry::DataDirOverride::set(scratch.path());
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", server.server_addr());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let writes = Arc::new(AtomicU32::new(0));
+        let counted = writes.clone();
+        let wire = std::thread::spawn(move || {
+            let mut stalled = None;
+            while !stopped.load(Ordering::Acquire) {
+                let Some(mut request) = server.recv_timeout(Duration::from_millis(50)).unwrap()
+                else {
+                    continue;
+                };
+                let mut text = String::new();
+                request.as_reader().read_to_string(&mut text).unwrap();
+                let body: Value = serde_json::from_str(&text).unwrap();
+                if body["params"]["name"] == "write" {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let mut output = request.into_writer();
+                    if body_stage {
+                        output.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"jsonrpc\":").unwrap();
+                        output.flush().unwrap();
+                    }
+                    // Channel barriers, not sleeps, keep the write in flight while
+                    // the sibling succeeds. Dropping this writer ends the fixture.
+                    started_tx.send(()).unwrap();
+                    stalled = Some(output);
+                    continue;
+                }
+                if body.get("id").is_none() {
+                    request.respond(tiny_http::Response::empty(202)).unwrap();
+                    continue;
+                }
+                let result = match body["method"].as_str().unwrap_or_default() {
+                    "initialize" => {
+                        json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"timeout-fixture","version":"1"}})
+                    }
+                    "tools/list" => {
+                        json!({"tools":[{"name":"write","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":false}},{"name":"read","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]})
+                    }
+                    "tools/call" => json!({"content":[{"type":"text","text":"sibling succeeded"}]}),
+                    _ => json!({}),
+                };
+                let response = if body["method"] == "server/discover" {
+                    json!({"jsonrpc":"2.0","id":body["id"],"error":{"code":-32601,"message":"legacy fixture"}})
+                } else {
+                    json!({"jsonrpc":"2.0","id":body["id"],"result":result})
+                };
+                request
+                    .respond(
+                        tiny_http::Response::from_string(response.to_string()).with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        ),
+                    )
+                    .unwrap();
+            }
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(stalled);
+        });
+        let transport =
+            HttpTransport::guarded_with_timeout(&url, None, None, false, Duration::from_secs(2));
+        let downstream = DownstreamServer::connect("fixture".into(), Box::new(transport)).unwrap();
+        let spawns = Arc::new(AtomicU32::new(0));
+        let reconnects = spawns.clone();
+        let mut router = Router::new();
+        router.add_with_reconnect(
+            downstream,
+            Some(Box::new(move || {
+                reconnects.fetch_add(1, Ordering::SeqCst);
+                None
+            })),
+        );
+        let router = Arc::new(router);
+        let caller = router.clone();
+        let slow = std::thread::spawn(move || {
+            caller.route_call_typed("fixture__write", json!({}), None, None, None)
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let sibling = router
+            .route_call_typed("fixture__read", json!({}), None, None, None)
+            .unwrap();
+        assert_eq!(sibling["content"][0]["text"], "sibling succeeded");
+        let failure = slow.join().unwrap().unwrap_err();
+        assert_eq!(
+            failure.kind,
+            CallFailureKind::Timeout { after_send: true },
+            "{failure}"
+        );
+        assert_eq!(
+            router.servers[0]
+                .breaker
+                .lock()
+                .unwrap()
+                .consecutive_failures,
+            1
+        );
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            0,
+            "a timeout must not reconnect/replay an uncertain write"
+        );
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "the write must reach the wire once"
+        );
+        assert!(
+            router.route_call("fixture__read", json!({})).is_ok(),
+            "sibling connection survives the failed call"
+        );
+        stop.store(true, Ordering::Release);
+        release_tx.send(()).unwrap();
+        wire.join().unwrap();
+    }
+
+    #[test]
+    fn header_timeout_counts_health_without_replaying_or_interrupting_sibling() {
+        http_timeout_with_successful_sibling(false);
+    }
+
+    #[test]
+    fn body_timeout_counts_health_without_replaying_or_interrupting_sibling() {
+        http_timeout_with_successful_sibling(true);
+    }
+
+    #[test]
+    fn post_send_io_failures_are_non_replayable_even_for_read_probes() {
+        for kind in [
+            CallFailureKind::Timeout { after_send: true },
+            CallFailureKind::Unavailable { after_send: true },
+        ] {
+            let error = TransportError::Classified(kind, "opaque detail".into());
+            assert!(error.is_health_failure());
+            assert!(ReplayPolicy::ReadOnly.uncertain_failure(&error).is_some());
+            assert!(ReplayPolicy::NoAmbiguousReplay
+                .uncertain_failure(&error)
+                .is_some());
+        }
+    }
 
     #[test]
     fn unrouted_client_prefixed_alias_error_names_the_real_tool() {
@@ -5591,7 +5746,7 @@ for line in sys.stdin:
         // Factory still can't reach the server (returns None): no recovery, and the
         // caller must fall through to record the failure.
         let slot = dead_slot(Some(Box::new(|| None)));
-        let out: Option<Result<Value, String>> =
+        let out: Option<Result<Value, CallFailure>> =
             router.reconnect_and_retry(&slot, None, None, 0, 0, SlotAccess::Shared, &mut |ds| {
                 ds.call_with_cancel_and_mrtr("echo", json!({}), None, None, None)
             });
@@ -5631,7 +5786,10 @@ for line in sys.stdin:
             .expect("reconnect was attempted")
             .unwrap_err();
 
-        assert!(result.contains("cancelled"), "unexpected error: {result}");
+        assert!(
+            result.detail.contains("cancelled"),
+            "unexpected error: {result}"
+        );
         assert_eq!(
             retried_calls.load(Ordering::SeqCst),
             0,
@@ -5649,7 +5807,7 @@ for line in sys.stdin:
         let cancel_from_retry = cancellations.clone();
         let slot = dead_slot(Some(Box::new(|| Some(mock_server("s")))));
 
-        let result: Result<Value, String> = router
+        let result: Result<Value, CallFailure> = router
             .reconnect_and_retry(
                 &slot,
                 Some(&cancel),
@@ -5666,7 +5824,7 @@ for line in sys.stdin:
             )
             .expect("reconnect was attempted");
 
-        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(result.unwrap_err().detail.contains("cancelled"));
         let mut breaker = slot
             .breaker
             .lock()
@@ -5683,7 +5841,7 @@ for line in sys.stdin:
         // A slot with no reconnect factory (e.g. a test fixture) behaves as before:
         // reconnect is skipped and the breaker path handles the failure.
         let slot = dead_slot(None);
-        let out: Option<Result<Value, String>> =
+        let out: Option<Result<Value, CallFailure>> =
             router.reconnect_and_retry(&slot, None, None, 0, 0, SlotAccess::Shared, &mut |ds| {
                 ds.call_with_cancel_and_mrtr("echo", json!({}), None, None, None)
             });

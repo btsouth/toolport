@@ -44,6 +44,16 @@ function renderRow(enabled: boolean, result?: ProbeResult, rowServer = server) {
 
 describe("RegistryServerRow status accessibility", () => {
   it.each([
+    ["endpoint", "MCP endpoint auth required"],
+    ["service_credential", "Service credential required"],
+    ["scope", "Service permission required"],
+    ["oauth_refresh", "MCP OAuth refresh failed"],
+  ] as const)("shows %s auth ownership", (authTarget, text) => {
+    renderRow(true, health({ authRequired: true, authTarget }));
+    expect(screen.getByText(text)).toBeInTheDocument();
+  });
+
+  it.each([
     ["Server disabled", false, undefined],
     ["Checking connection", true, undefined],
     ["Ready, 2 tools", true, health({ ok: true, toolCount: 2 })],

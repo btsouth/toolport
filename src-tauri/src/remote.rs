@@ -1480,6 +1480,13 @@ impl Redaction {
             E::Fatal(message) => E::Fatal(self.text(message)),
             E::FrameRejected(message) => E::FrameRejected(self.text(message)),
             E::Unavailable(message) => E::Unavailable(self.text(message)),
+            E::RateLimited {
+                retry_after,
+                message,
+            } => E::RateLimited {
+                retry_after,
+                message: self.text(message),
+            },
             E::Retry {
                 retry_after,
                 message,

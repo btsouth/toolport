@@ -1047,6 +1047,11 @@ pub enum TransportError {
         retry_after: Option<Duration>,
         message: String,
     },
+    /// The endpoint explicitly rejected the request with HTTP 429.
+    RateLimited {
+        retry_after: Option<Duration>,
+        message: String,
+    },
     /// The upstream caller abandoned this operation. It is deliberately not a
     /// health failure: pressing Stop says nothing about the downstream server.
     Cancelled(String),
@@ -1415,6 +1420,7 @@ impl TransportError {
                 )
                 | TransportError::FrameRejected(_)
                 | TransportError::Retry { .. }
+                | TransportError::RateLimited { .. }
         )
     }
 
@@ -1424,10 +1430,7 @@ impl TransportError {
             Self::Classified(kind, _) => kind.clone(),
             Self::Rpc(error) => K::rpc(error),
             Self::Unavailable(_) | Self::FrameRejected(_) => K::Unavailable { after_send: true },
-            Self::Retry {
-                retry_after: Some(_),
-                ..
-            } => K::Quota,
+            Self::RateLimited { .. } => K::Quota,
             Self::Retry { .. } => K::Unavailable { after_send: false },
             Self::Cancelled(_) => K::Cancelled,
             Self::Busy(_) => K::Unavailable { after_send: false },
@@ -1526,7 +1529,9 @@ impl std::fmt::Display for TransportError {
             // changes now that the error is carried structurally.
             TransportError::Rpc(err) => write!(f, "{err}"),
             TransportError::Unavailable(msg) => write!(f, "{msg}"),
-            TransportError::Retry { message, .. } => write!(f, "{message}"),
+            TransportError::Retry { message, .. } | TransportError::RateLimited { message, .. } => {
+                write!(f, "{message}")
+            }
             TransportError::Cancelled(message) | TransportError::Busy(message) => {
                 write!(f, "{message}")
             }
@@ -7013,7 +7018,13 @@ impl HttpTransport {
                 .is_some_and(|deadline| Instant::now() >= deadline)
                 || (self.deadline.is_some() && self.concurrency.closed.load(Ordering::SeqCst))
             {
-                return Err(TransportError::Fatal(
+                return Err(TransportError::Classified(
+                    crate::call_failure::CallFailureKind::Timeout {
+                        after_send: self
+                            .send_started
+                            .as_ref()
+                            .is_some_and(|s| s.load(Ordering::Acquire)),
+                    },
                     "HTTP request deadline ended before POST".into(),
                 ));
             }
@@ -7090,7 +7101,7 @@ impl HttpTransport {
                     // and surface a Retry signal so the Router backs off.
                     let retry_after = record_shared_rate_limit(&self.url, &r);
                     let _ = read_capped(r, 8 * 1024);
-                    return Err(TransportError::Retry {
+                    return Err(TransportError::RateLimited {
                         retry_after,
                         message: "HTTP 429: rate limited".to_string(),
                     });
@@ -7229,7 +7240,7 @@ impl HttpTransport {
     /// session-start handshake, which never reaches the Router's retry loop.
     fn shared_backoff_gate(&self) -> Result<(), TransportError> {
         match crate::downstream_backoff::remaining_for_url(&self.url) {
-            Some(remaining) => Err(TransportError::Retry {
+            Some(remaining) => Err(TransportError::RateLimited {
                 retry_after: Some(remaining),
                 message: format!(
                     "HTTP 429: rate limited (shared backoff: {}s)",
@@ -7288,7 +7299,13 @@ impl HttpTransport {
                 .is_some_and(|deadline| Instant::now() >= deadline)
                 || (self.deadline.is_some() && self.concurrency.closed.load(Ordering::SeqCst))
             {
-                return Err(TransportError::Fatal(
+                return Err(TransportError::Classified(
+                    crate::call_failure::CallFailureKind::Timeout {
+                        after_send: self
+                            .send_started
+                            .as_ref()
+                            .is_some_and(|s| s.load(Ordering::Acquire)),
+                    },
                     "HTTP request deadline ended before POST".into(),
                 ));
             }
@@ -7360,7 +7377,7 @@ impl HttpTransport {
                     // re-hitting the same provider limit at their next start.
                     let retry_after = record_shared_rate_limit(&self.url, &r);
                     let _ = read_capped(r, 8 * 1024);
-                    return Err(TransportError::Retry {
+                    return Err(TransportError::RateLimited {
                         retry_after,
                         message: "HTTP 429: rate limited".to_string(),
                     });
@@ -14395,6 +14412,40 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn http_read_errors_preserve_timeout_io_and_protocol_categories() {
+        use super::*;
+        use crate::call_failure::CallFailureKind as K;
+        for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+            let error = http_read_error(std::io::Error::new(kind, "opaque"));
+            assert_eq!(error.call_failure().kind, K::Timeout { after_send: true });
+            assert!(error.is_health_failure());
+        }
+        let error = http_read_error(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "opaque",
+        ));
+        assert_eq!(
+            error.call_failure().kind,
+            K::Unavailable { after_send: true }
+        );
+        assert!(error.is_health_failure());
+        assert!(!http_read_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad frame"
+        ))
+        .is_health_failure());
+        assert_eq!(
+            TransportError::RateLimited {
+                retry_after: None,
+                message: "opaque".into()
+            }
+            .call_failure()
+            .kind,
+            K::Quota
+        );
+    }
+
+    #[test]
     fn an_rpc_error_is_not_a_health_failure() {
         // Only unreachability trips the per-server circuit breaker. A server that
         // answers with a JSON-RPC error is alive and well-behaved, and counting it
@@ -16674,10 +16725,10 @@ for line in sys.stdin:
             true,
         );
         match &result {
-            Err(TransportError::Retry { retry_after, .. }) => {
+            Err(TransportError::RateLimited { retry_after, .. }) => {
                 assert_eq!(*retry_after, Some(Duration::from_secs(2)));
             }
-            other => panic!("expected TransportError::Retry, got {other:?}"),
+            other => panic!("expected TransportError::RateLimited, got {other:?}"),
         }
 
         // The 429 above recorded a shared 2s backoff window for this origin;
@@ -17122,7 +17173,7 @@ for line in sys.stdin:
             true,
         );
         match &result {
-            Err(TransportError::Retry {
+            Err(TransportError::RateLimited {
                 retry_after,
                 message,
             }) => {
@@ -17162,7 +17213,7 @@ for line in sys.stdin:
             "jsonrpc": "2.0", "id": 2, "result": {}
         }));
         match &result {
-            Err(TransportError::Retry { message, .. }) => {
+            Err(TransportError::RateLimited { message, .. }) => {
                 assert!(message.contains("shared backoff"), "{message}");
             }
             other => panic!("expected fast-fail Retry, got {other:?}"),
@@ -17188,7 +17239,7 @@ for line in sys.stdin:
             "jsonrpc": "2.0", "id": 3, "result": {}
         }));
         match &result {
-            Err(TransportError::Retry { retry_after, .. }) => {
+            Err(TransportError::RateLimited { retry_after, .. }) => {
                 assert_eq!(*retry_after, Some(Duration::from_secs(1)));
             }
             other => panic!("expected Retry from live 429, got {other:?}"),

@@ -3373,6 +3373,27 @@ fn recovery_hint(
     let tool = catalog
         .iter()
         .find(|tool| tool["name"].as_str() == Some(name));
+    let kind = if kind == CallFailureKind::Internal {
+        // A known unconditional schema omission establishes an input failure even
+        // when an adapter supplied only an opaque error string.
+        let input = tool.and_then(|tool| tool.get("inputSchema")).map(|schema| {
+            CallFailureKind::InvalidInput {
+                missing: vec![],
+                invalid: vec![],
+            }
+            .with_schema(schema, arguments)
+        });
+        match input {
+            Some(CallFailureKind::InvalidInput { missing, invalid })
+                if !missing.is_empty() || !invalid.is_empty() =>
+            {
+                CallFailureKind::InvalidInput { missing, invalid }
+            }
+            _ => kind,
+        }
+    } else {
+        kind
+    };
     let kind = tool.and_then(|tool| tool.get("inputSchema")).map_or_else(
         || kind.clone(),
         |schema| kind.clone().with_schema(schema, arguments),
@@ -20135,6 +20156,50 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_guidance_is_short_scoped_and_schema_grounded() {
+        let catalog = vec![
+            json!({"name":"s__write","inputSchema":{"properties":{"deploymentId":{"type":"string"}},"required":["deploymentId"]}}),
+            json!({"name":"s__list_deployments"}),
+            json!({"name":"other__list_secrets"}),
+        ];
+        assert_eq!(
+            recovery_hint(
+                &catalog,
+                "s",
+                "s__write",
+                &json!({}),
+                CallFailureKind::Quota
+            ),
+            " Quota or rate limit reached. Check limits before retrying."
+        );
+        let input = recovery_hint(
+            &catalog,
+            "s",
+            "s__write",
+            &json!({}),
+            CallFailureKind::Internal,
+        );
+        assert_eq!(
+            input,
+            " Check tool input. Missing: deploymentId. Find IDs: s__list_deployments."
+        );
+        assert_eq!(input.len(), 70);
+        let timeout = recovery_hint(
+            &catalog,
+            "s",
+            "s__write",
+            &json!({}),
+            CallFailureKind::Timeout { after_send: true },
+        );
+        assert_eq!(
+            timeout,
+            " Timed out after send; may have completed, check before retrying."
+        );
+        assert_eq!(timeout.len(), 63);
+        assert!(!timeout.contains("Find IDs"));
+    }
+
     #[test]
     fn gateway_modes_have_distinct_diagnostic_roles() {
         use conduit_lib::gatewaylog::Role;
