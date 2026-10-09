@@ -37576,8 +37576,8 @@ mod tests {
         // instead of re-searching. Regression guard for the search-thrash fix.
         assert!(text.contains("Top match:"), "should name the top match");
         assert!(
-            text.contains("call it now") || text.contains("call it"),
-            "should tell the model to call now"
+            text.contains("call toolport_call_tool with name \"stripe__list_charges\""),
+            "should tell the model to call the exact top tool name"
         );
         assert!(
             text.to_lowercase().contains("only search again"),
