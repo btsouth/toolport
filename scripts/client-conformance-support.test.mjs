@@ -13,6 +13,26 @@ import {
   wireMetadata,
 } from "./client-conformance-support.mjs";
 
+function firstOutput(child) {
+  return new Promise((resolve, reject) => {
+    const done = (error, data) => {
+      clearTimeout(timer);
+      child.stdout.off("data", output);
+      child.off("error", fail);
+      child.off("exit", exited);
+      if (error) reject(error);
+      else resolve(data.toString().trim());
+    };
+    const output = (data) => done(null, data);
+    const fail = (error) => done(error);
+    const exited = () => done(new Error("fixture exited before readiness"));
+    const timer = setTimeout(() => done(new Error("fixture readiness deadline")), 5_000);
+    child.stdout.once("data", output);
+    child.once("error", fail);
+    child.once("exit", exited);
+  });
+}
+
 async function sleeper(cwd) {
   const child = spawn(
     process.execPath,
@@ -22,10 +42,12 @@ async function sleeper(cwd) {
       stdio: ["ignore", "pipe", "ignore"],
     },
   );
-  await new Promise((resolve, reject) => {
-    child.stdout.once("data", resolve);
-    child.once("error", reject);
-  });
+  try {
+    await firstOutput(child);
+  } catch (error) {
+    await stop(child);
+    throw error;
+  }
   return child;
 }
 
@@ -34,13 +56,17 @@ test("cleanup waits for daemon and mock exit before removing their working direc
   const children = [];
   try {
     const daemon = await sleeper(fixture.home);
+    children.push(daemon);
     const mock = await sleeper(fixture.data);
-    children.push(daemon, mock);
+    children.push(mock);
+    const wiretap = await sleeper(fixture.home);
+    children.push(wiretap);
     await writeFile(
       path.join(fixture.data, "daemon-test.json"),
       JSON.stringify({ pid: daemon.pid }),
     );
     await writeFile(path.join(fixture.data, "mock.pid"), `${mock.pid}\n`);
+    await writeFile(path.join(fixture.data, "wiretap.pid"), `${wiretap.pid}\n`);
     await fixture.close();
     await Promise.all(children.map((child) => waitExit(child)));
     await assert.rejects(access(fixture.home), { code: "ENOENT" });
@@ -91,51 +117,47 @@ test("wire metadata tolerates non-JSON output without retaining it", () => {
   );
 });
 
-test(
-  "live cleanup kills the CLI process group including its grandchild",
-  {
-    skip:
-      process.platform === "win32"
-        ? "Windows uses taskkill and published wiretap PIDs"
-        : false,
-  },
-  async () => {
-    const child = spawn(
-      process.execPath,
-      [
-        "-e",
-        `
+test("live cleanup kills the CLI and its grandchild", async () => {
+  const child = spawn(
+    process.execPath,
+    [
+      "-e",
+      `
     const { spawn } = require('node:child_process');
     const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
     grandchild.once('spawn', () => console.log(grandchild.pid));
     grandchild.once('exit', () => process.exit(0));
     process.on('SIGTERM', () => {});
   `,
-      ],
-      { detached: true, stdio: ["ignore", "pipe", "ignore"] },
-    );
-    const pid = await new Promise((resolve, reject) => {
-      child.stdout.once("data", (data) => resolve(Number(data.toString().trim())));
-      child.once("error", reject);
-    });
-    const kill = process.kill;
-    const signals = [];
-    process.kill = (target, signal) => {
-      signals.push([target, signal]);
-      return kill(target, signal);
-    };
-    try {
-      await stopTree(child);
+    ],
+    { detached: process.platform !== "win32", stdio: ["ignore", "pipe", "ignore"] },
+  );
+  let pid;
+  try {
+    pid = Number(await firstOutput(child));
+  } catch (error) {
+    await stopTree(child);
+    throw error;
+  }
+  const kill = process.kill;
+  const signals = [];
+  process.kill = (target, signal) => {
+    signals.push([target, signal]);
+    return kill(target, signal);
+  };
+  try {
+    await stopTree(child);
+    if (process.platform !== "win32")
       assert(
         signals.some(([target, signal]) => target === -child.pid && signal === "SIGKILL"),
       );
-      // No second signal can target a later process group reusing the leader PID.
-      await stopTree(child);
-      assert.equal(signals.length, 1);
-      await waitPidExit(pid);
-    } finally {
-      process.kill = kill;
-      await stopTree(child);
-    }
-  },
-);
+    // No second signal can target a later process group reusing the leader PID.
+    const count = signals.length;
+    await stopTree(child);
+    assert.equal(signals.length, count);
+    await waitPidExit(pid);
+  } finally {
+    process.kill = kill;
+    await stopTree(child);
+  }
+});

@@ -307,7 +307,13 @@ fn spawn_daemon() -> Result<(), String> {
     }
     command
         .spawn()
-        .map(|_child| ())
+        .map(|mut child| {
+            // Reap exited daemons while this adapter stays connected. Dropping
+            // Child alone leaves a zombie after a crash or version handover.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        })
         .map_err(|error| format!("could not start the host daemon: {error}"))
 }
 
