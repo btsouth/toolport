@@ -105,7 +105,7 @@ mod tests {
             assert_eq!(caps.cold_full_list_wait_ms, 5_000, "{id}");
         }
         assert_eq!(capabilities("codex").tools_list_changed, Some(false));
-        assert_eq!(capabilities("cursor").tools_list_changed, None);
+        assert_eq!(capabilities("cursor").tools_list_changed, Some(false));
     }
     #[test]
     fn every_definition_carries_capability_evidence_and_preserves_overrides() {
