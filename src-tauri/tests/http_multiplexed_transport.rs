@@ -560,11 +560,11 @@ fn failed_forced_refresh_recovers_on_the_next_concurrent_call() {
 }
 
 #[test]
-fn http_null_id_errors_preserve_detail_and_classify_endpoint_status() {
+fn http_null_id_errors_preserve_detail_without_session_health_failures() {
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let url = format!("http://{}/", server.server_addr());
     let wire = std::thread::spawn(move || {
-        for status in [200, 400] {
+        for status in [200, 400, 404] {
             let request = server
                 .recv_timeout(Duration::from_secs(3))
                 .unwrap()
@@ -576,7 +576,7 @@ fn http_null_id_errors_preserve_detail_and_classify_endpoint_status() {
     transport.set_protocol_meta(Some(
         json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28"}),
     ));
-    for status in [200, 400] {
+    for status in [200, 400, 404] {
         let error = transport.request("echo", json!({})).unwrap_err();
         if status == 200 {
             assert!(
@@ -586,10 +586,19 @@ fn http_null_id_errors_preserve_detail_and_classify_endpoint_status() {
         } else {
             assert_eq!(
                 error.call_failure().kind,
-                conduit_lib::call_failure::CallFailureKind::Unavailable { after_send: true }
+                if status == 400 {
+                    conduit_lib::call_failure::CallFailureKind::InvalidInput {
+                        missing: vec![],
+                        invalid: vec![],
+                    }
+                } else {
+                    conduit_lib::call_failure::CallFailureKind::ServerError { after_send: true }
+                }
             );
         }
         assert!(error.to_string().contains("invalid request from server"));
+        assert!(!error.is_health_failure());
+        assert!(transport.connection_reset_reason().is_none());
     }
     wire.join().unwrap();
 }
