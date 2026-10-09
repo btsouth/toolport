@@ -15383,6 +15383,10 @@ fn process_request_wire(
             response.as_ref().is_some_and(|r| r.envelope.get("error").is_none() && r.envelope.pointer("/result/isError").and_then(Value::as_bool) != Some(true)),
         );
     }
+    // One-way HTTP messages finish here rather than at a JSON-RPC reply write.
+    if observed.is_request() && req.get("id").is_none() {
+        observed.close(observation::CloseReason::RequestComplete);
+    }
     if let Some(response) = &mut response {
         response.observation = Some(observed.clone());
         response.tools_list = method == "tools/list";
