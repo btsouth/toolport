@@ -602,6 +602,18 @@ impl RegistrySnapshot {
                                 .map(|r| (e.key.clone(), r.to_string()))
                         })
                         .chain(
+                            server
+                                .launch
+                                .iter()
+                                .flat_map(|l| &l.inputs)
+                                .filter_map(|i| {
+                                    crate::secret_refs::source(&i.unknown_fields)
+                                        .ok()
+                                        .flatten()
+                                        .map(|r| (i.key.clone(), r.to_string()))
+                                }),
+                        )
+                        .chain(
                             crate::secret_refs::headers(server)
                                 .unwrap_or_default()
                                 .into_iter()

@@ -633,6 +633,7 @@ fn configure_self_hosted(entry: &crate::catalog::CatalogEntry, hint: &str, page:
         launch: entry.launch.clone(),
         url: None,
         cwd: None,
+        secret_references: Default::default(),
         secret_keys: entry.env_keys.clone(),
         client_credentials: None,
         enabled: false,

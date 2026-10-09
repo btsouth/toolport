@@ -7998,11 +7998,10 @@ impl Transport for HttpTransport {
                     .header("content-type")
                     .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
                 if !is_sse {
-                    let detail: String =
-                        read_capped(response, 64 * 1024).chars().take(200).collect();
-                    downstream_trace(&format!(
-                        "subscriptions/listen returned a non-SSE response: {detail}"
-                    ));
+                    // Provider bodies can echo API keys, including fragments. Drain
+                    // within the bound, but never copy the response into diagnostics.
+                    let _ = read_capped(response, 64 * 1024);
+                    downstream_trace("subscriptions/listen returned a non-SSE response");
                     std::thread::sleep(retry_delay);
                     retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
                     continue;
@@ -16795,9 +16794,12 @@ for line in sys.stdin:
         handle.join().unwrap();
 
         assert!(error.to_string().contains("HTTP 401"));
-        assert_eq!(error.call_failure().kind, crate::call_failure::CallFailureKind::Auth {
-            target: crate::call_failure::AuthTarget::Scope,
-        });
+        assert_eq!(
+            error.call_failure().kind,
+            crate::call_failure::CallFailureKind::Auth {
+                target: crate::call_failure::AuthTarget::Scope,
+            }
+        );
         assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
     }
 

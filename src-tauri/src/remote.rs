@@ -1283,10 +1283,10 @@ fn guard_connect_target(server: &ServerEntry) -> Result<(), String> {
 fn first_vaulted_secret(server: &ServerEntry) -> Result<Option<String>, String> {
     for e in &server.env {
         if e.secret && e.key != secrets::IMPORTED_URL_KEY {
-            if let Some(v) = (match &e.value {
+            if let Some(v) = match &e.value {
                 Some(v) => Some(v.clone()),
                 None => secrets::get_secret_result(&server.id, &e.key)?,
-            }) {
+            } {
                 return Ok(Some(v));
             }
         }
@@ -1372,7 +1372,11 @@ pub fn connect_remote_with_handler(
 
 /// Keep provider errors from echoing a credential-bearing endpoint after connect.
 struct ImportedTransport(Box<dyn Transport>, Redaction, bool);
-struct ImportedConcurrent(Arc<dyn crate::downstream::ConcurrentTransport>, Redaction, bool);
+struct ImportedConcurrent(
+    Arc<dyn crate::downstream::ConcurrentTransport>,
+    Redaction,
+    bool,
+);
 #[derive(Clone)]
 struct Redaction(Vec<String>);
 impl Redaction {
@@ -1478,23 +1482,49 @@ impl Redaction {
             value => value,
         }
     }
-    fn connection_error(&self, error: crate::downstream::TransportError, reference: bool) -> crate::downstream::TransportError {
-        if !reference { return self.error(error); }
-        use crate::downstream::TransportError as E;
+    fn connection_error(
+        &self,
+        error: crate::downstream::TransportError,
+        reference: bool,
+    ) -> crate::downstream::TransportError {
+        if !reference {
+            return self.error(error);
+        }
         use crate::call_failure::CallFailureKind as K;
+        use crate::downstream::TransportError as E;
         let kind = error.call_failure().kind;
         // An auth rejection invalidates this connection, so its supervisor reads the
         // reference again. Never replay a possibly completed write automatically.
         if matches!(kind, K::Auth { .. }) {
-            return E::Classified(K::Unavailable { after_send: true }, "Password manager credential rejected. Reconnecting will read the key again.".into());
+            return E::Classified(
+                K::Unavailable { after_send: true },
+                "Password manager credential rejected. Reconnecting will read the key again."
+                    .into(),
+            );
         }
         // Child tails can contain a fragment or an escaped credential. Use fixed
         // text for reference-backed errors while retaining their retry classification.
         let message = match error {
-            E::Retry { retry_after, .. } => return E::Retry { retry_after, message: "Reference-backed server asked to retry.".into() },
-            E::RateLimited { retry_after, .. } => return E::RateLimited { retry_after, message: "Reference-backed server rate limited the request.".into() },
-            E::Fatal(_) => return E::Unavailable("Reference-backed server connection closed.".into()),
-            E::Rpc(ref value) => return E::Rpc(serde_json::json!({"code": value.get("code").and_then(serde_json::Value::as_i64).unwrap_or(-32603), "message": "Reference-backed server rejected the request."})),
+            E::Retry { retry_after, .. } => {
+                return E::Retry {
+                    retry_after,
+                    message: "Reference-backed server asked to retry.".into(),
+                }
+            }
+            E::RateLimited { retry_after, .. } => {
+                return E::RateLimited {
+                    retry_after,
+                    message: "Reference-backed server rate limited the request.".into(),
+                }
+            }
+            E::Fatal(_) => {
+                return E::Unavailable("Reference-backed server connection closed.".into())
+            }
+            E::Rpc(ref value) => {
+                return E::Rpc(
+                    serde_json::json!({"code": value.get("code").and_then(serde_json::Value::as_i64).unwrap_or(-32603), "message": "Reference-backed server rejected the request."}),
+                )
+            }
             _ => "Reference-backed server request failed.",
         };
         E::Classified(kind, message.into())
@@ -1551,9 +1581,13 @@ impl Transport for ImportedTransport {
         self.0.response_count()
     }
     fn connection_reset_reason(&self) -> Option<String> {
-        self.0
-            .connection_reset_reason()
-            .map(|error| if self.2 { "Reference-backed connection closed. Restart to read its key again.".into() } else { self.1.text(error) })
+        self.0.connection_reset_reason().map(|error| {
+            if self.2 {
+                "Reference-backed connection closed. Restart to read its key again.".into()
+            } else {
+                self.1.text(error)
+            }
+        })
     }
 
     fn request(
@@ -1636,8 +1670,12 @@ impl Transport for ImportedTransport {
     fn set_server_request_handler(&mut self, handler: ServerRequestHandler) {
         if self.2 {
             let redact = self.1.clone();
-            self.0.set_server_request_handler(Arc::new(move |frame| handler(&redact.value(frame.clone()))));
-        } else { self.0.set_server_request_handler(handler) }
+            self.0.set_server_request_handler(Arc::new(move |frame| {
+                handler(&redact.value(frame.clone()))
+            }));
+        } else {
+            self.0.set_server_request_handler(handler)
+        }
     }
     fn set_server_id(&mut self, id: &str) {
         self.0.set_server_id(id)
@@ -1665,7 +1703,11 @@ pub fn protect_transport(
     transport: Box<dyn Transport>,
 ) -> Box<dyn Transport> {
     if has_imported_credentials(server) || crate::secret_refs::has_references(server) {
-        Box::new(ImportedTransport(transport, Redaction::for_server(server), crate::secret_refs::has_references(server)))
+        Box::new(ImportedTransport(
+            transport,
+            Redaction::for_server(server),
+            crate::secret_refs::has_references(server),
+        ))
     } else {
         transport
     }
@@ -1726,30 +1768,31 @@ fn connect_remote_inner(
     // Handled here because this is the only place that sees both the current entry
     // and the vault; the reacquire seam takes just a server id by design.
     if !crate::secret_refs::has_references(server) && header_values.is_empty() {
-    let stale_cc = client_credentials_state_is_stale(server, server_id, url).or_else(|error| {
-        let update = credential_update(server_id);
-        let update = update
-            .lock()
-            .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
-        if !uses_client_credentials(server) && update.valid_pending_token().is_some() {
-            Ok(false)
-        } else {
-            Err(error)
+        let stale_cc =
+            client_credentials_state_is_stale(server, server_id, url).or_else(|error| {
+                let update = credential_update(server_id);
+                let update = update
+                    .lock()
+                    .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
+                if !uses_client_credentials(server) && update.valid_pending_token().is_some() {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            })?;
+        if stale_cc {
+            // Not ignored: leaving stale state would silently keep using the wrong
+            // flow, or the wrong resource binding, for the rest of the session.
+            reset_client_credentials(server_id)?;
         }
-    })?;
-    if stale_cc {
-        // Not ignored: leaving stale state would silently keep using the wrong
-        // flow, or the wrong resource binding, for the rest of the session.
-        reset_client_credentials(server_id)?;
-    }
-    // A failed CC-state read is not "no state" (SBS-840): do not mint a second grant.
-    if uses_client_credentials(server) && load_cc_state(server_id)?.is_none() {
-        let config = server
-            .client_credentials
-            .as_ref()
-            .expect("uses_client_credentials checked it");
-        acquire_client_credentials(server_id, url, config)?;
-    }
+        // A failed CC-state read is not "no state" (SBS-840): do not mint a second grant.
+        if uses_client_credentials(server) && load_cc_state(server_id)?.is_none() {
+            let config = server
+                .client_credentials
+                .as_ref()
+                .expect("uses_client_credentials checked it");
+            acquire_client_credentials(server_id, url, config)?;
+        }
     }
     // A vault read failure is not "no token" (SBS-789): connecting anonymous on a
     // locked keychain would surface as a bogus 401/"needs sign-in" and can hand an
@@ -1759,7 +1802,9 @@ fn connect_remote_inner(
         .iter()
         .find(|e| e.unknown_fields.contains_key("source") && e.secret)
         .and_then(|e| e.value.clone());
-    let auth = if !header_values.is_empty() { None } else if reference_auth.is_some() {
+    let auth = if !header_values.is_empty() {
+        None
+    } else if reference_auth.is_some() {
         reference_auth.clone()
     } else {
         match refresh_token_if_needed(server_id)? {
@@ -1776,7 +1821,9 @@ fn connect_remote_inner(
         // connect (SOU-474).
     };
     let sent_auth = auth.clone();
-    let (mut transport, refreshed_during_connect) = if reference_auth.is_some() || !header_values.is_empty() {
+    let (mut transport, refreshed_during_connect) = if reference_auth.is_some()
+        || !header_values.is_empty()
+    {
         require_secure_for_auth(url)?;
         (
             HttpTransport::guarded_with_timeout(url, auth, None, block_private, request_timeout),
@@ -4096,10 +4143,23 @@ mod reference_redaction_tests {
     #[test]
     fn reference_errors_are_opaque_and_auth_triggers_reconnection() {
         let redaction = Redaction(vec!["synthetic-ref-value".into()]);
-        let e = redaction.connection_error(crate::downstream::TransportError::Fatal("tail ends in ref-value".into()), true);
-        assert!(!e.to_string().contains("ref-value")); assert!(e.is_health_failure());
-        let e = redaction.connection_error(crate::downstream::TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::Endpoint }, "HTTP 401 synthetic-ref-value".into()), true);
-        assert!(e.is_health_failure()); assert!(!e.to_string().contains("synthetic-ref-value"));
+        let e = redaction.connection_error(
+            crate::downstream::TransportError::Fatal("tail ends in ref-value".into()),
+            true,
+        );
+        assert!(!e.to_string().contains("ref-value"));
+        assert!(e.is_health_failure());
+        let e = redaction.connection_error(
+            crate::downstream::TransportError::Classified(
+                crate::call_failure::CallFailureKind::Auth {
+                    target: crate::call_failure::AuthTarget::Endpoint,
+                },
+                "HTTP 401 synthetic-ref-value".into(),
+            ),
+            true,
+        );
+        assert!(e.is_health_failure());
+        assert!(!e.to_string().contains("synthetic-ref-value"));
         let payload=redaction.value(serde_json::json!({"content":[{"text":"synthetic-ref-value"}],"synthetic-ref-value":"synthetic-ref-value"}));
         assert!(!payload.to_string().contains("synthetic-ref-value"));
     }
@@ -4107,12 +4167,19 @@ mod reference_redaction_tests {
 
 /// Prevent unsolicited progress and resource notifications from echoing injected keys.
 pub fn protect_progress(server: &ServerEntry, sink: Option<ProgressSink>) -> Option<ProgressSink> {
-    if !crate::secret_refs::has_references(server) { return sink; }
+    if !crate::secret_refs::has_references(server) {
+        return sink;
+    }
     let redact = Redaction::for_server(server);
     sink.map(|sink| Arc::new(move |value| sink(redact.value(value))) as ProgressSink)
 }
-pub fn protect_resource_updates(server: &ServerEntry, sink: Option<ResourceUpdatedSink>) -> Option<ResourceUpdatedSink> {
-    if !crate::secret_refs::has_references(server) { return sink; }
+pub fn protect_resource_updates(
+    server: &ServerEntry,
+    sink: Option<ResourceUpdatedSink>,
+) -> Option<ResourceUpdatedSink> {
+    if !crate::secret_refs::has_references(server) {
+        return sink;
+    }
     let redact = Redaction::for_server(server);
     sink.map(|sink| Arc::new(move |uri| sink(redact.text(uri))) as ResourceUpdatedSink)
 }

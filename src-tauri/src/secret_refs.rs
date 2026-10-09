@@ -490,7 +490,18 @@ fn read_cli(
     let value = if p.scheme == "bws://" {
         let data: Value =
             serde_json::from_str(&output).map_err(|_| error(Some(p), ErrorState::InvalidOutput))?;
-        if data.get("id").and_then(Value::as_str) != Some(&reference[p.scheme.len()..]) {
+        // Some CLI versions wrap get results in a singleton array. Never pick
+        // an arbitrary record from a list or accept a mismatched identifier.
+        let data = match &data {
+            Value::Array(items) if items.len() == 1 => &items[0],
+            Value::Object(_) => &data,
+            _ => return Err(error(Some(p), ErrorState::InvalidOutput)),
+        };
+        if !data
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.eq_ignore_ascii_case(&reference[p.scheme.len()..]))
+        {
             return Err(error(Some(p), ErrorState::InvalidOutput));
         }
         data.get("value")
@@ -883,6 +894,18 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn bws_singleton_output_matches_uuid_without_echoing_other_records() {
+        let tmp = Scratch::new();
+        let p = &PROVIDERS[4];
+        let binary = tmp.fake(p.binary, "printf '%s' '[{\"id\":\"BE8E0AD8-D545-4017-A55A-B02F014D4158\",\"value\":\"synthetic-ref-value\"}]'");
+        assert_eq!(
+            read_cli(p, p.example, &binary, Duration::from_secs(1)).unwrap(),
+            "synthetic-ref-value"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn fake_output_rejects_multiple_values_invalid_json_missing_and_oversize() {
         let tmp = Scratch::new();
         let p = parse(PROVIDERS[0].example).unwrap();
@@ -911,6 +934,8 @@ mod tests {
         for body in [
             "printf '{broken'",
             "printf '{}'",
+            "printf '[]'",
+            "printf '[{},{}]'",
             "printf '{\"value\":\"bad\",\"id\":\"wrong\"}'",
         ] {
             let binary = tmp.fake(p.binary, body);
@@ -927,9 +952,20 @@ mod tests {
 /// Only messages constructed by this module may bypass downstream prose redaction.
 pub fn safe_status(message: &str) -> Option<String> {
     for p in PROVIDERS {
-        for state in [ErrorState::InvalidReference,ErrorState::PolicyDenied,ErrorState::NotInstalled,ErrorState::Locked,ErrorState::NotFound,ErrorState::Timeout,ErrorState::InvalidOutput,ErrorState::Failed] {
-            let known=error(Some(p),state).message;
-            if message == known { return Some(known); }
+        for state in [
+            ErrorState::InvalidReference,
+            ErrorState::PolicyDenied,
+            ErrorState::NotInstalled,
+            ErrorState::Locked,
+            ErrorState::NotFound,
+            ErrorState::Timeout,
+            ErrorState::InvalidOutput,
+            ErrorState::Failed,
+        ] {
+            let known = error(Some(p), state).message;
+            if message == known {
+                return Some(known);
+            }
         }
     }
     None
