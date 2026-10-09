@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, act } from "@testing-library/react";
+import { render, screen, act, fireEvent } from "@testing-library/react";
 import { PendingApprovals } from "./PendingApprovals";
 import type { PendingApproval } from "@/lib/types";
 
@@ -92,6 +92,65 @@ describe("PendingApprovals PII release", () => {
 });
 
 describe("PendingApprovals refresh ordering", () => {
+  it("applies the decision refresh while a newer poll is still pending", async () => {
+    vi.useFakeTimers();
+    try {
+      let settleDecision!: (value: PendingApproval[]) => void;
+      const decision = new Promise<PendingApproval[]>(
+        (resolve) => (settleDecision = resolve),
+      );
+      const poll = new Promise<PendingApproval[]>(() => {});
+      listPendingApprovals
+        .mockResolvedValueOnce([approval()])
+        .mockReturnValueOnce(decision)
+        .mockReturnValueOnce(poll);
+      decideApproval.mockResolvedValue(null);
+      render(<PendingApprovals />);
+      await act(async () => {});
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: /^Deny$/ }));
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(listPendingApprovals).toHaveBeenCalledTimes(3);
+      await act(async () => settleDecision([]));
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refreshes after Deny without waiting for an event or poll", async () => {
+    vi.useFakeTimers();
+    try {
+      listPendingApprovals.mockResolvedValueOnce([approval()]).mockResolvedValue([]);
+      decideApproval.mockResolvedValue(null);
+      render(<PendingApprovals />);
+      await act(async () => {});
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: /^Deny$/ }));
+      });
+      expect(decideApproval).toHaveBeenCalledWith("req-1", false, "once");
+      expect(listPendingApprovals).toHaveBeenCalledTimes(2);
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a decided row until the authoritative queue removes it", async () => {
+    listPendingApprovals.mockResolvedValue([approval()]);
+    decideApproval.mockResolvedValue(null);
+    render(<PendingApprovals />);
+    await act(async () => {});
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^Deny$/ }));
+    });
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Deny$/ })).toBeDisabled();
+  });
+
   it("discards a stale list that lands after a newer one", async () => {
     // The mount refresh is still in flight when the 2s poll starts a newer one, so the
     // older response can land last. Writing it would resurrect a row the newer list had

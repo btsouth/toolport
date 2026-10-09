@@ -14649,8 +14649,8 @@ fn handle_client_notification(
 }
 
 /// The live view of a daemon adapter's request. Registry churn only invalidates
-/// dispatches that lose their server/tool scope; a root change still invalidates
-/// the request because its downstream may have been launched in a different cwd.
+/// dispatches that lose their server/tool scope. Root changes invalidate requests
+/// when a launch or folder binding depends on the root.
 fn adapter_live_view(
     host: &Arc<HostState>,
     reg: &Registry,
@@ -14659,17 +14659,28 @@ fn adapter_live_view(
     client: Option<&str>,
 ) -> LiveRouterResolver {
     let folder_profile = root.as_deref().and_then(|root| reg.profile_for_root(root));
+    let rooted = reg
+        .enabled_servers_for(profile)
+        .iter()
+        .any(|server| server_uses_project_root(server));
     let client_binding = client.map(|id| (id.to_string(), reg.client_scopes.get(id).cloned()));
     let expected = Arc::new((reg.resolve_profile_id(profile), root));
     let context_stale = {
         let expected = Arc::clone(&expected);
         Arc::new(move |current: &Registry, current_root: Option<String>| {
             let (_, root) = &*expected;
+            // A roots reply can establish the adapter's project after a
+            // restart. That changes no ordinary launch or folder binding.
             current_root != *root
+                && (rooted
+                    || current
+                        .enabled_servers_for(&expected.0)
+                        .iter()
+                        .any(|server| server_uses_project_root(server)))
                 || client_binding.as_ref().is_some_and(|(client, binding)| {
                     current.client_scopes.get(client) != binding.as_ref()
                 })
-                || root
+                || current_root
                     .as_deref()
                     .and_then(|root| current.profile_for_root(root))
                     != folder_profile
@@ -21474,6 +21485,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cwd_publication_preserves_ordinary_routes_but_retires_rooted_views() {
+        let _env = DataDirTestEnv::new("adapter-cwd-publication");
+        for (rooted, folder_binding) in [(false, false), (true, false), (false, true)] {
+            let state = http_state(false);
+            state.daemon_mode.store(true, Ordering::SeqCst);
+            let mut reg = Registry::default();
+            let mut server = stub_server("cache", "Cache");
+            server.enabled = true;
+            if rooted {
+                server.cwd = Some("${ROOT}".into());
+            }
+            reg.servers.push(server);
+            reg.profiles = vec![registry::Profile {
+                id: "p".into(),
+                name: "P".into(),
+                enabled_server_ids: vec!["cache".into()],
+                tool_scope: HashMap::new(),
+                instructions: None,
+                unknown_fields: Default::default(),
+            }];
+            if folder_binding {
+                reg.folder_profiles.push(registry::FolderProfile {
+                    path: "/work/project".into(),
+                    profile: "p".into(),
+                    unknown_fields: Default::default(),
+                });
+            }
+            *state.registry.lock().unwrap() = reg.clone();
+            *state.router.lock().unwrap() = Arc::new(cache_router());
+            let snapshot = state.router.lock().unwrap().clone();
+            let _root = AdapterRootGuard::enter(None);
+            let view = adapter_live_view(&state.host, &reg, "p", None, None);
+            let target = DispatchTarget::Tool("cache__cached");
+            assert!(!(view.stale)(&snapshot, target));
+            // The roots response lands between the pre-call check and resolve,
+            // exactly as an adapter's reinitialized session can do after restart.
+            let _cwd = AdapterRootGuard::enter(Some("/work/project".into()));
+            let resolved = (view.resolve)();
+            let stale = rooted || folder_binding;
+            assert_eq!(resolved.route_of("cache__cached").is_some(), !stale);
+            assert_eq!((view.stale)(&snapshot, target), stale);
+        }
+    }
+
+    fn gated_cache_start(id: &str, release: std::sync::mpsc::Receiver<()>) -> Connect {
+        // Prepare the fake transport before measuring the client's wait. The
+        // gate models catalog availability, not fixture construction latency.
+        let server = Mutex::new(Some(
+            DownstreamServer::connect(id.into(), Box::new(CacheRoute)).unwrap(),
+        ));
+        let release = Mutex::new(release);
+        Arc::new(move || {
+            release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            Ok(server.lock().unwrap().take().unwrap())
+        })
+    }
+
+    fn publish_fixture_catalog(state: &GatewayState, live: &Router) {
+        // These budget tests need publication, including the old snapshot's
+        // shared supervisor state, but not unrelated disk or integrity I/O.
+        let mut published = live.clone();
+        assert_eq!(published.adopt_ready_reconnects(), vec!["late"]);
+        let published = Arc::new(published);
+        *state.router.lock().unwrap() = Arc::clone(&published);
+        published.activate_supervisors();
+    }
+
     fn cached_supervisor() -> Router {
         let mut router = Router::new();
         router.add_supervised(
@@ -22273,19 +22356,11 @@ mod tests {
         *state.cached_tools.lock().unwrap() =
             Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let release_rx = Arc::new(Mutex::new(release_rx));
         let mut live = Router::new();
         live.add_supervised(
             "late".into(),
             Vec::new(),
-            Arc::new(move || {
-                release_rx
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(10))
-                    .unwrap();
-                Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
-            }),
+            gated_cache_start("late", release_rx),
             ReconnectBackoff::default(),
             json!({"revision":1}),
         );
@@ -22305,11 +22380,7 @@ mod tests {
                     seen = wait_for_started_supervisor(seen, deadline);
                 }
                 assert!(live.has_ready_reconnects(), "fixture did not connect");
-                adopt_reconnected_servers(
-                    &publisher.host,
-                    &publisher.stdio_upstream,
-                    &publisher.profile,
-                );
+                publish_fixture_catalog(&publisher, &live);
                 assert!(!snapshot.any_discovering(|_| true));
                 assert!(!snapshot.any_publishing_first_catalog(|_| true));
                 assert!(snapshot.aggregated_tools().is_empty());
@@ -22708,19 +22779,11 @@ mod tests {
             *state.cached_tools.lock().unwrap() =
                 Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
             let (release_tx, release_rx) = std::sync::mpsc::channel();
-            let release_rx = Arc::new(Mutex::new(release_rx));
             let mut live = Router::new();
             live.add_supervised(
                 "late".into(),
                 Vec::new(),
-                Arc::new(move || {
-                    release_rx
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(Duration::from_secs(10))
-                        .unwrap();
-                    Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
-                }),
+                gated_cache_start("late", release_rx),
                 ReconnectBackoff::default(),
                 json!({"revision":1}),
             );
@@ -22740,11 +22803,7 @@ mod tests {
                         seen = wait_for_started_supervisor(seen, deadline);
                     }
                     assert!(live.has_ready_reconnects(), "fixture did not connect");
-                    adopt_reconnected_servers(
-                        &publisher.host,
-                        &publisher.stdio_upstream,
-                        &publisher.profile,
-                    );
+                    publish_fixture_catalog(&publisher, &live);
                     assert!(!snapshot.any_discovering(|_| true));
                     assert!(!snapshot.any_publishing_first_catalog(|_| true));
                     assert!(snapshot.aggregated_tools().is_empty());
@@ -22788,19 +22847,11 @@ mod tests {
         *state.cached_tools.lock().unwrap() =
             Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let release_rx = Arc::new(Mutex::new(release_rx));
         let mut live = Router::new();
         live.add_supervised(
             "late".into(),
             Vec::new(),
-            Arc::new(move || {
-                release_rx
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(10))
-                    .unwrap();
-                Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
-            }),
+            gated_cache_start("late", release_rx),
             ReconnectBackoff::default(),
             json!({"revision":1}),
         );
@@ -22836,7 +22887,7 @@ mod tests {
             seen = wait_for_started_supervisor(seen, deadline);
         }
         assert!(live.has_ready_reconnects(), "fixture did not connect");
-        adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
+        publish_fixture_catalog(&state, &live);
         let reply = match &early_reply {
             Ok(reply) => reply.clone(),
             Err(_) => reply_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -30004,11 +30055,14 @@ mod tests {
         let denied = call("x__work");
         assert_eq!(denied["isError"], true, "got {denied}");
         host.registry.lock().unwrap().folder_profiles.clear();
+        // A root change invalidates a launch that actually depends on it.
+        host.registry.lock().unwrap().servers[1].cwd = Some("${ROOT}".into());
         {
             let _changed_root = AdapterRootGuard::enter(Some("/work/elsewhere".into()));
             let denied = call("x__work");
             assert_eq!(denied["isError"], true, "got {denied}");
         }
+        host.registry.lock().unwrap().servers[1].cwd = None;
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
         host.registry.lock().unwrap().profiles[0].enabled_server_ids = vec!["a".to_string()];

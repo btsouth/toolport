@@ -199,6 +199,14 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
         .map(str::to_string)
         .unwrap_or_else(|| format!("matrix-{index}"));
     discovery_support::select_full(dir, &client_id);
+    spawn_configured_adapter(dir, options, &client_id)
+}
+
+fn spawn_configured_adapter(
+    dir: &Path,
+    options: &AdapterOptions,
+    client_id: &str,
+) -> AdapterClient {
     let mut command = Command::new(env!("CARGO_BIN_EXE_toolport-gateway"));
     if !options.default_role {
         command.arg("--stdio-adapter");
@@ -374,10 +382,17 @@ impl AdapterClient {
     }
 
     fn send(&mut self, message: Value) {
-        let mut guard = self.stdin.lock().unwrap();
-        let stdin = guard.as_mut().expect("adapter stdin still open");
-        writeln!(stdin, "{message}").expect("write to the adapter");
-        stdin.flush().expect("flush the adapter");
+        let result = {
+            let mut guard = self.stdin.lock().unwrap();
+            let stdin = guard.as_mut().expect("adapter stdin still open");
+            writeln!(stdin, "{message}").and_then(|()| stdin.flush())
+        };
+        result.unwrap_or_else(|error| {
+            panic!(
+                "could not write to the adapter ({error})\n{}",
+                self.diagnostics()
+            )
+        });
     }
 
     fn next_message(&self) -> Value {
@@ -592,7 +607,10 @@ impl AdapterClient {
 
 impl Drop for AdapterClient {
     fn drop(&mut self) {
-        self.stdin.lock().unwrap().take();
+        self.stdin
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -1578,8 +1596,16 @@ fn matrix_pooling_sessions_share_one_downstream_child() {
     );
     let before = mock_child_process_count(&dir);
 
-    let mut clients: Vec<AdapterClient> = (0..3)
-        .map(|_| spawn_adapter(&dir, &AdapterOptions::default()))
+    // Complete fixture writes before the first adapter starts its daemon.
+    // Rewriting discovery choices while it boots can hold the registry lock
+    // across fsync and charge fixture setup against the daemon's load budget.
+    let ids = ["pool-one", "pool-two", "pool-three"];
+    for id in ids {
+        discovery_support::select_full(&dir, id);
+    }
+    let mut clients: Vec<AdapterClient> = ids
+        .iter()
+        .map(|id| spawn_configured_adapter(&dir, &AdapterOptions::default(), id))
         .collect();
     let mut echo_tools = Vec::new();
     for client in clients.iter_mut() {
