@@ -3424,8 +3424,13 @@ impl Router {
                     .wrapping_add(server.response_count())
             };
             let (result, started) = Self::attempt(slot, access, cancel, &mut f);
-            if result.is_ok() || result.as_ref().is_err_and(|error| matches!(error, TransportError::Rpc(_))
-                || matches!(error, TransportError::Classified(kind, _) if !kind.is_health_failure())) {
+            // Local classified failures (for example OAuth refresh before send)
+            // are not response activity. Wire transports count completed replies.
+            if result.is_ok()
+                || result
+                    .as_ref()
+                    .is_err_and(|error| matches!(error, TransportError::Rpc(_)))
+            {
                 slot.responses.fetch_add(1, Ordering::AcqRel);
             }
             match result {
@@ -8394,6 +8399,41 @@ for line in sys.stdin:
         assert!(wait_until(|| router.has_ready_reconnects()));
         router.adopt_ready_reconnects();
         router.activate_supervisors();
+    }
+
+    #[test]
+    fn local_auth_failure_does_not_mask_a_dead_connection_timeout() {
+        let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
+        router.servers[0].start(true);
+        ready_supervisor(&mut router);
+        let slot = &router.servers[0];
+        let generation = slot.generation.load(Ordering::Acquire);
+        let responses = slot.responses.load(Ordering::Acquire);
+        let result: Result<Value, CallFailure> = router.call_with_retry_typed(
+            slot,
+            None,
+            false,
+            ReplayPolicy::NoAmbiguousReplay,
+            SlotAccess::Shared,
+            |_| {
+                Err(TransportError::Classified(
+                    CallFailureKind::Auth {
+                        target: AuthTarget::OAuthRefresh,
+                    },
+                    "local refresh failed before send".into(),
+                ))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(slot.responses.load(Ordering::Acquire), responses);
+        assert!(slot.timeout_health(
+            &TransportError::Classified(
+                CallFailureKind::Timeout { after_send: true },
+                "no wire response".into(),
+            ),
+            generation,
+            responses,
+        ));
     }
 
     #[test]
