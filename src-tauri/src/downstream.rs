@@ -9872,13 +9872,14 @@ mod tests {
     #[test]
     fn first_catalog_deadline_bounds_all_pages() {
         let mut transport = PaginationTransport::new(vec![Ok(json!({"tools":[]}))]);
-        let error = super::fetch_paginated_list_with_deadline(
+        let Err(error) = super::fetch_paginated_list_with_deadline(
             &mut transport,
             "tools/list",
             "tools",
             Some(std::time::Instant::now()),
-        )
-        .unwrap_err();
+        ) else {
+            panic!("an expired first-catalog deadline must fail");
+        };
         assert!(error.to_string().contains("catalog deadline exceeded"));
         assert!(
             transport.params.is_empty(),
