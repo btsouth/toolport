@@ -118,9 +118,9 @@ pub fn probe_one(server: &ServerEntry) -> ProbeResult {
                 ok: false,
                 tool_count: 0,
                 auth_required: auth_rejected || missing_credential,
-                auth_target: if missing_credential || (auth_rejected && server.url.is_none()) {
+                auth_target: if missing_credential {
                     Some(crate::call_failure::AuthTarget::ServiceCredential)
-                } else if auth_rejected {
+                } else if auth_rejected && server.url.is_some() {
                     Some(crate::call_failure::AuthTarget::Endpoint)
                 } else {
                     None

@@ -1040,7 +1040,7 @@ pub enum TransportError {
     /// died). Distinct from `Fatal` so the circuit breaker can trip on a genuinely
     /// dead/hung server without counting ordinary error responses against it.
     Unavailable(String),
-    /// Retryable: a 429 rate-limit or a connection that never reached the server.
+    /// Retryable connection failure that never reached the server.
     /// `retry_after` carries the server-advertised delay (Retry-After) if present;
     /// the caller falls back to its own exponential backoff when `None`.
     Retry {
@@ -6763,7 +6763,7 @@ impl HttpTransport {
             Some(rejected) => crate::remote::newer_credential(owner, rejected),
             None => crate::remote::current_credential(owner),
         }
-        .map_err(TransportError::Fatal)?;
+        .map_err(|detail| TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::OAuthRefresh }, detail))?;
         if let Some(token) = stored {
             self.publish_refreshed_auth(token);
             *self
