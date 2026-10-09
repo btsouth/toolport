@@ -9130,6 +9130,7 @@ mod tests {
             "clientName":"Unknown app (via Cursor)", "clientLabel":"kt 1", "phase":"close",
             "toolsListCount":3, "listChangedCount":1, "firstCatalogSize":4, "contentChanged":true,
         })] });
+        clients.list.parent().unwrap().downcast::<gtk::Box>().unwrap().remove(&clients.list);
         let root = gtk::Box::new(gtk::Orientation::Vertical, 18);
         root.set_margin_top(24); root.set_margin_bottom(24); root.set_margin_start(24); root.set_margin_end(24);
         for (title, widget) in [("Approval required", card.upcast::<gtk::Widget>()), ("Activity", activity_card(&activity).upcast()), ("Clients", clients.list.clone().upcast())] {
