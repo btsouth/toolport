@@ -24,6 +24,8 @@ representative public subset, not a current complete hosted catalog. Sources:
 - [Filesystem reference](https://github.com/modelcontextprotocol/servers/blob/5abed86c5317b833dd59907492d56c65981642aa/src/filesystem/index.ts)
 - [GitHub issue tools](https://github.com/github/github-mcp-server/blob/eb47a99ddb866ca2b8a162920e6bda9521f33ebb/pkg/github/issues.go)
 
+The upstream license notices are in `licenses/`.
+
 Claude counts are explicitly `ceil(Unicode characters / 4)` approximations.
 They are uncalibrated, especially for JSON and newer Claude tokenizers. No
 Anthropic counting key was configured for this audit. Native-search name/header

@@ -132,9 +132,10 @@ fn extract_body(result: &Value) -> (String, usize) {
             .and_then(Value::as_array)
             .is_some_and(|blocks| blocks.len() == 1 && blocks[0]["type"] == "text");
         let duplicate = single_text
-            && serde_json::from_str::<Value>(&out)
-                .ok()
-                .is_some_and(|text| text == *sc);
+            && (out == structured_text
+                || serde_json::from_str::<Value>(&out)
+                    .ok()
+                    .is_some_and(|text| text == *sc));
         if !duplicate {
             if !out.is_empty() {
                 out.push('\n');
