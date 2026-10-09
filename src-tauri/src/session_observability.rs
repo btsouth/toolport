@@ -35,29 +35,16 @@ impl Drop for ContextGuard {
 
 /// Persist only bounded printable name/version tokens, never locations or secrets.
 pub fn display_label(label: &str) -> Option<String> {
-    static URL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let label = crate::approval::sanitize_client_label(label)?;
     let label = crate::registry::redact_secret_text(&label);
-    let pattern = URL.get_or_init(|| {
-        regex::Regex::new(r"(?i)[a-z][a-z0-9+.-]*://[^\s]+|www\.[^\s]+")
-            .expect("metadata URL pattern")
-    });
-    let label = pattern.replace_all(&label, "[link]");
-    let safe = label
-        .split_whitespace()
-        .map(|token| {
-            if token == "<redacted>" {
-                "[redacted]"
-            } else if token.chars().all(|c| {
-                c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '(' | ')' | '[' | ']')
-            }) {
-                token
-            } else {
-                "[private]"
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+    let safe = label.replace("<redacted>", "[redacted]");
+    if !safe.chars().all(|c| {
+        c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '+' | '(' | ')' | '[' | ']')
+    }) {
+        // Reject the entire label: a path containing spaces must not retain
+        // its trailing directory or filename as an apparently valid name token.
+        return Some("[private]".into());
+    }
     crate::approval::sanitize_client_label(&safe)
 }
 
@@ -378,7 +365,7 @@ mod tests {
     #[test]
     fn private_paths_never_reach_session_or_correlated_audit_rows() {
         let data = crate::registry::DataDirTestEnv::new("f3-label-paths");
-        for path in ["/home/private/customer.env", "C:\\private\\customer.env", "~/private/customer.env", "\\\\server\\private\\customer.env", "file:///home/private/customer.env", "../private/customer.env", "private/customer.env"] {
+        for path in ["/home/private/customer.env", "C:\\private\\customer.env", "~/private/customer.env", "\\\\server\\private\\customer.env", "file:///home/private/customer.env", "file:///home/private/my customer.env", "../private/customer.env", "private/customer.env", "/home/private/my customer.env", "C:\\private\\my customer.env", "\\\\server\\private folder\\customer.env"] {
             let label = format!("review {path} sk-live-abcdefghijk123456789");
             let session = Session::start(None, None, Some(&label), "stdio", "initialize");
             let _context = ContextGuard::enter(Context {run_id:Some("opaque".into()), ..session.context()});
@@ -420,7 +407,7 @@ mod tests {
         let rows = crate::audit::read_recent(1).unwrap();
         let row = &rows[0];
         assert_eq!(row["clientName"], "Unknown app (via Cursor)");
-        assert_eq!(row["clientLabel"], "kt 1 [link]");
+        assert_eq!(row["clientLabel"], "[private]");
         assert_eq!(row["sessionId"], "opaque-session");
         assert_eq!(row["runId"], "opaque-run");
         assert_eq!(row["decision"], "withdrawn");
@@ -472,7 +459,7 @@ mod tests {
         assert_eq!(close["contentChanged"], true);
         assert_eq!(close["clientType"], "unknown");
         assert!(close.get("client").is_none());
-        assert_eq!(close["clientLabel"], "kt 1 [link]");
+        assert_eq!(close["clientLabel"], "[private]");
         assert_eq!(close["sessionId"].as_str().unwrap().len(), 32);
         assert_eq!(crate::audit::stats().unwrap()["total"], 0);
         let text = serde_json::to_string(&rows).unwrap();
