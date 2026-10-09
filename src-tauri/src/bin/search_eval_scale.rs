@@ -725,14 +725,20 @@ fn search_dev_v2_quality_gate() {
     let report = evaluate("dev-v2 self-check", &dev_v2_self_check(), &tools, &index, 0);
     // Recall floors are set below the measured baseline with room for general
     // retrieval tradeoffs. Confidence is informational, never an accuracy claim.
-    assert!(report["top3_rate"].as_f64().unwrap() >= 0.55, "{report}");
+    assert!(
+        report["top3_rate"].as_f64().unwrap() >= 0.55,
+        "recall@3 {}",
+        report["top3_rate"]
+    );
     assert!(
         report["recall_at"]["10"]["rate"].as_f64().unwrap() >= 0.75,
-        "{report}"
+        "{}",
+        report["recall_at"]["10"]
     );
     assert!(
         report["no_match_honesty"].as_f64().unwrap() >= 0.95,
-        "{report}"
+        "{}",
+        report["no_match_honesty"]
     );
     if let Some(precision) = report["no_match_precision"].as_f64() {
         assert!(precision >= 0.90);

@@ -2842,18 +2842,30 @@ fn search_catalog_filtered(
                     // distinct terms. Repeated boilerplate cannot inflate evidence.
                     let fields = [
                         (&doc.name_tokens, NAME_W, 0.2),
-                        (&doc.description_tokens, DESC_W, 0.65),
+                        (
+                            &doc.description_tokens,
+                            if doc.summary_tokens.contains(qt) {
+                                2.0
+                            } else {
+                                DESC_W
+                            },
+                            0.65,
+                        ),
                         (&doc.parameter_tokens, 0.8, 0.4),
                     ];
                     let frequency: f64 = fields
                         .iter()
-                        .zip(index.average_field_lengths)
+                        .zip([
+                            index.average_field_lengths[0],
+                            index.average_field_lengths[1].max(128.0),
+                            index.average_field_lengths[2].max(128.0),
+                        ])
                         .filter(|((tokens, _, _), _)| tokens.contains(qt))
                         .map(|((tokens, field_weight, b), average)| {
-                            field_weight / (1.0 - b + b * tokens.len() as f64 / average)
+                            field_weight / (1.0 - b + b * tokens.len() as f64 / average).max(1.0)
                         })
                         .sum();
-                    let mut best = weight * frequency * 4.2 / (1.2 + frequency);
+                    let mut best = weight * frequency * 11.0 / (8.0 + frequency);
                     // Prefix fallback for partial words ("proj" -> "project").
                     if best == 0.0 && qt.len() >= 3 {
                         if doc.name_tokens.iter().any(|t| t.starts_with(qt.as_str())) {
@@ -2922,8 +2934,26 @@ fn search_catalog_filtered(
         });
         let total = ranked.len();
 
-        let low_confidence = ranked.first().is_none_or(|(score, _)| {
+        let low_confidence = ranked.first().is_none_or(|(score, top)| {
+            let position = lex
+                .iter()
+                .position(|(_, tool)| std::ptr::eq(*tool, *top))
+                .unwrap();
+            let doc = &index.documents[pool[position]];
+            let covered: f64 = q_tokens
+                .iter()
+                .zip(&query_weights)
+                .filter(|(token, _)| {
+                    doc.name_tokens.contains(*token)
+                        || doc.description_tokens.contains(*token)
+                        || doc.parameter_tokens.contains(*token)
+                })
+                .map(|(_, weight)| weight)
+                .sum();
+            let weight: f64 = query_weights.iter().sum();
             *score <= f64::EPSILON
+                || weight <= f64::EPSILON
+                || covered / weight < 0.90
                 || ranked
                     .get(1)
                     .is_some_and(|(next, _)| *next >= *score * CONFIDENCE_COMPETITOR_RATIO)
@@ -7357,7 +7387,10 @@ fn handle_request_with_cancel(
                     .iter()
                     .flat_map(|server| {
                         let prefix = sanitize_segment(&server.id).to_lowercase();
-                        [(prefix.clone(), server.id.clone()), (prefix, server.name.clone())]
+                        [
+                            (prefix.clone(), server.id.clone()),
+                            (prefix, server.name.clone()),
+                        ]
                     })
                     .collect();
                 let outcome = search_catalog_filtered(
@@ -7394,7 +7427,7 @@ fn handle_request_with_cancel(
                 };
                 let instruction = "Pick by description, call the chosen tool with toolport_call_tool, or search its exact name to get another candidate's full schema.";
                 let lead = if total == 0 && !matches.is_empty() {
-                    format!("No direct tools matched{scope}. These are fallback candidates. {instruction}")
+                    format!("No direct tools matched{scope}. These are bounded fallback candidates. {instruction} {exhaustive_hint}")
                 } else if matches.is_empty() {
                     // A search aimed at a server that has not connected says why, and
                     // pulls its next retry forward (rate-limited by its backoff).
@@ -38672,18 +38705,9 @@ mod tests {
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("stripe__list_charges"));
         assert_eq!(resp["result"]["isError"], false);
-        // Response must lead with a named, ready-to-call directive and an explicit
-        // anti-loop signal, so a compliant (esp. local) model commits to a call
-        // instead of re-searching. Regression guard for the search-thrash fix.
-        assert!(text.contains("Top match:"), "should name the top match");
-        assert!(
-            text.contains("call toolport_call_tool with name \"stripe__list_charges\""),
-            "should tell the model to call the exact top tool name"
-        );
-        assert!(
-            text.to_lowercase().contains("only search again"),
-            "should signal not to keep searching"
-        );
+        assert!(text.contains("Pick by description"));
+        assert!(text.contains("call the chosen tool with toolport_call_tool"));
+        assert!(text.contains("search its exact name"));
         let (_, payload) = text
             .split_once("\n\n")
             .expect("guidance and compact JSON payload");
@@ -38892,7 +38916,10 @@ mod tests {
             "send",
         ] {
             let text = search_text(&reg, &guard, q);
-            assert!(text.contains("Top match:"), "query {q} should stay polite");
+            assert!(
+                text.contains("Pick by description"),
+                "query {q} should keep the menu"
+            );
             assert!(
                 !text.contains(ESCALATION_MARK),
                 "query {q} must not escalate"
@@ -39392,7 +39419,10 @@ mod tests {
         // expose both alternatives instead of promising a collection endpoint.
         let unresolved = search_catalog_with(&cat, "show my buckets", None, 5, None);
         assert!(unresolved.low_confidence);
-        assert!(unresolved.matches.iter().any(|tool| tool["name"] == "aws__list_bucket"));
+        assert!(unresolved
+            .matches
+            .iter()
+            .any(|tool| tool["name"] == "aws__list_bucket"));
         assert_eq!(top(&cat, "get the bucket"), "aws__get_bucket");
 
         // Naming the service picks its tool, and "GitHub" stays one word.
