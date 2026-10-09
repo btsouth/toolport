@@ -42,3 +42,24 @@ known name when its full definition is needed. Full passthrough calls
 can be direct; native deferral adds its own search round before direct dispatch.
 The large-result whole-fetch measurement bypasses normal page size only to total
 the stored body. Actual clients use bounded pages; projection measures one row.
+
+Review fixes preserve exact routing case and restore explicit call names in guidance.
+The same fixtures and `o200k_base` tokenizer measure these response costs:
+
+| Payload                                  | Before review fixes | After |
+| ---------------------------------------- | ------------------: | ----: |
+| Synthetic exact-name definition          |                 181 |   207 |
+| Public exact-name definition             |                 148 |   166 |
+| Public fuzzy search                      |                 484 |   493 |
+| One grouped help definition              |                  86 |    95 |
+| Synthetic grouped session, Code Mode off |               1,094 | 1,157 |
+
+The exact-name increases retain full definitions; grouped and search guidance
+explicitly name the call argument. Lazy and Full session costs remain 499 and
+1,436,974 tokens. These are serialized payloads, not billed or native client context.
+Regression limits allow about 10% headroom: floor 550, grouped help 105, public
+search 545 and public exact lookup 185. If a limit needs raising, do it deliberately
+and record the before/after token counts. The exact-definition tests also cover
+long descriptions and output schemas, which are absent from the selected audit
+hits. Full definitions and pinned prerequisites can exceed these small-fixture
+budgets; they must stay complete.

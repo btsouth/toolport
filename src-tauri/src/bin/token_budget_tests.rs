@@ -269,15 +269,15 @@ fn token_budget_regression() {
     let floor_tokens = tokens;
     let help = help_tool_def("synthetic00", 618).to_string();
     let help_tokens = bpe.encode_ordinary(&help).len();
-    check("grouped help", help_tokens, 110);
+    check("grouped help", help_tokens, 105);
     let catalog = token_audit_public_tools();
     let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"list channels"}}});
     let response = token_audit_dispatch(&catalog, DiscoveryMode::Lazy, &req);
     let tokens = bpe.encode_ordinary(&response.to_string()).len();
-    check("public search", tokens, 550);
+    check("public search", tokens, 545);
     let exact = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"slack__slack_list_channels"}}});
     let exact_response = token_audit_dispatch(&catalog, DiscoveryMode::Lazy, &exact);
     let exact_tokens = bpe.encode_ordinary(&exact_response.to_string()).len();
-    check("exact-name lookup", exact_tokens, 200);
+    check("exact-name lookup", exact_tokens, 185);
     println!("TOKEN_BUDGET floor={floor_tokens} search={tokens} exact={exact_tokens} grouped_help={help_tokens}");
 }

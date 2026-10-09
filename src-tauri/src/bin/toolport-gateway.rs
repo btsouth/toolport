@@ -37400,8 +37400,7 @@ mod tests {
                 assert!(!outcome.low_confidence);
             }
             let query = format!("{}__getItem", first.split_once("__").unwrap().0.to_uppercase());
-            let ambiguous =
-                search_catalog_indexed(&cat, &query, None, 25, None, Some(&index));
+            let ambiguous = search_catalog_indexed(&cat, &query, None, 25, None, Some(&index));
             assert_eq!(
                 ambiguous.total, 2,
                 "ambiguous folded names must keep the menu"
