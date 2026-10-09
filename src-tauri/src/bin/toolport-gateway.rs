@@ -6705,6 +6705,7 @@ struct GatewayResponse {
     envelope: Value,
     surface: Option<Arc<savings::SerializedSurface>>,
     observation: Option<Arc<observation::Session>>,
+    tools_list: bool,
 }
 
 impl From<Value> for GatewayResponse {
@@ -6713,12 +6714,14 @@ impl From<Value> for GatewayResponse {
             envelope,
             surface: None,
             observation: None,
+            tools_list: false,
         }
     }
 }
 
 impl GatewayResponse {
     fn catalog_delivery(&self) -> Option<observation::CatalogDelivery> {
+        if !self.tools_list { return None; }
         if let Some(surface) = &self.surface {
             return Some(observation::CatalogDelivery {
                 count: surface.tool_count(),
@@ -15382,6 +15385,7 @@ fn process_request_wire(
     }
     if let Some(response) = &mut response {
         response.observation = Some(observed.clone());
+        response.tools_list = method == "tools/list";
     }
     response
 }
@@ -15959,6 +15963,7 @@ fn process_request_wire_inner(
             envelope,
             surface: Some(exposed),
             observation: None,
+            tools_list: true,
         });
     }
     handle_request_with_cancel(
@@ -19970,14 +19975,15 @@ fn handle_connection(
             response = response.with_header(h);
         }
     }
-    if respond_http(request, response) {
+    let delivered = respond_http(request, response);
+    if delivered {
         if let Some((session, catalog)) = out.catalog_delivery {
             session.list_delivered(catalog);
         }
     }
     if let Some(session) = out.observation {
         if session.is_request() {
-            session.close(observation::CloseReason::RequestComplete);
+            session.close(if delivered { observation::CloseReason::RequestComplete } else { observation::CloseReason::ClientDisconnect });
         }
     }
 }
@@ -29256,6 +29262,14 @@ mod tests {
         assert_eq!(audit::recent_sessions(1).unwrap()[0]["listChangedCount"], 1);
         session.close();
         assert_eq!(audit::recent_sessions(1).unwrap()[0]["reason"], "client_disconnect");
+    }
+
+    #[test]
+    fn session_catalog_fields_on_other_methods_are_not_tool_list_deliveries() {
+        let mut response = GatewayResponse::from(json!({"result":{"tools":[{"name":"fixture"}]}}));
+        assert!(response.catalog_delivery().is_none());
+        response.tools_list = true;
+        assert_eq!(response.catalog_delivery().unwrap().count, 1);
     }
 
     #[test]
