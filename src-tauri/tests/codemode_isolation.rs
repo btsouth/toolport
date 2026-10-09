@@ -293,11 +293,19 @@ fn fixture_stops_its_daemon_before_joining_the_pipe_reader() {
     use std::sync::{atomic::AtomicBool, Arc};
 
     let mut gateway = Gateway::start();
+    let dir = gateway.dir.clone();
     let descriptor = std::fs::read_dir(&gateway.dir)
         .unwrap()
         .flatten()
-        .find_map(|entry| conduit_lib::daemon::read_descriptor(&entry.path()))
+        .find_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            (name.starts_with("daemon-") && name.ends_with(".json"))
+                .then(|| conduit_lib::daemon::read_descriptor(&entry.path()))
+                .flatten()
+        })
         .expect("stdio adapter published its fixture daemon");
+    let pid = descriptor.pid;
     let reader = gateway.reader.take().unwrap();
     let stopped = Arc::new(AtomicBool::new(false));
     let reader_stopped = Arc::clone(&stopped);
@@ -319,6 +327,11 @@ fn fixture_stops_its_daemon_before_joining_the_pipe_reader() {
     assert!(
         stopped.load(Ordering::Acquire),
         "fixture must stop its daemon before waiting for pipe EOF"
+    );
+    assert!(!dir.exists(), "fixture data must be removed");
+    assert!(
+        !conduit_lib::gateway_publish::pid_is_running(pid),
+        "fixture daemon must exit before cleanup finishes"
     );
 }
 
