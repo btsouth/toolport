@@ -39,23 +39,10 @@ jobs:
         run: gh release download v1.24.0 -R btsouth/toolport -p '*.deb' -D .verify/native-packages/old
         env:
           GH_TOKEN: ${{ github.token }}
-      - name: Use the public Docker Hub image cache
-        run: |
-          sudo mkdir -p /etc/docker
-          sudo python3 - <<'PY'
-          import json
-          from pathlib import Path
-          path = Path("/etc/docker/daemon.json")
-          config = json.loads(path.read_text()) if path.exists() else {}
-          mirrors = config.get("registry-mirrors", [])
-          config["registry-mirrors"] = ["https://mirror.gcr.io"] + [
-              mirror for mirror in mirrors if mirror != "https://mirror.gcr.io"
-          ]
-          path.write_text(json.dumps(config) + "\n")
-          PY
-          sudo systemctl restart docker
       - name: Ubuntu upgrade, Debian and Fedora fresh installs
         run: scripts/test-linux-packages.sh .verify/native-packages/*.deb .verify/native-packages/*.rpm .verify/native-packages/old/*.deb
+        env:
+          TOOLPORT_PACKAGE_TEST_IMAGE_PREFIX: mirror.gcr.io/library/
       - name: Keep tested packages
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
