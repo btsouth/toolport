@@ -82,6 +82,8 @@ export async function waitExit(child, ms = 5_000) {
   });
 }
 export async function stop(child) {
+  // A failed spawn has no PID and will never emit a later exit event.
+  if (!child.pid) return;
   if (child.exitCode !== null || child.signalCode !== null) return;
   child.kill();
   try {

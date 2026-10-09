@@ -185,11 +185,13 @@ if (process.argv[2] === "--wiretap") {
         }) + "\n",
       );
     } else child.stdin.end();
-    let timedOut = false;
+    let timedOut = false,
+      cliError;
     try {
       await waitExit(child, 30_000);
-    } catch {
-      timedOut = true;
+    } catch (error) {
+      timedOut = error.message === "child exit deadline";
+      cliError = error.message;
       await stop(child);
     }
     let records = [];
@@ -209,6 +211,7 @@ if (process.argv[2] === "--wiretap") {
       client: id,
       exitCode: child.exitCode,
       timedOut,
+      cliError,
       handshakeCaptured: Boolean(initialize),
       initialize: initialize?.message,
       methods: records

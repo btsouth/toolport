@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -9,6 +10,8 @@ import {
   failed,
   textOf,
   deadlineMs,
+  stop,
+  waitExit,
 } from "./client-conformance-support.mjs";
 
 const source = await readFile(path.join(repo, "src-tauri/src/clients.rs"), "utf8");
@@ -303,6 +306,17 @@ try {
     assert.equal(reply.result.cacheScope, "private");
   });
   pass("modern sessionless discovery (synthetic)");
+  const missingFixture = await Fixture.create("missing-executable");
+  try {
+    const missing = spawn(path.join(missingFixture.home, "unavailable-client"), [], {
+      stdio: "ignore",
+    });
+    await assert.rejects(waitExit(missing), { code: "ENOENT" });
+    await stop(missing);
+  } finally {
+    await missingFixture.close();
+  }
+  pass("failed executable spawn cleans up without waiting for an impossible exit");
   console.log(
     `Client conformance: ${checks} scenario groups passed; ${profiles.length} adapter baselines, ${captures.length} captured health variants across ${profiles.filter((p) => p.initialize).length} clients. Authenticated model/GUI acceptance not implied.`,
   );
