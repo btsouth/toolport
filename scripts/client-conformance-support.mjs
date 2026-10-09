@@ -52,6 +52,7 @@ export function cleanEnvironment(home) {
     TEMP: home,
     TMP: home,
     TERM: "dumb",
+    DBUS_SESSION_BUS_ADDRESS: `unix:path=${path.join(home, "unavailable-session-bus")}`,
     NO_COLOR: "1",
     DO_NOT_TRACK: "1",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
@@ -188,7 +189,8 @@ export class Fixture {
         finished = true;
         clearTimeout(timer);
         watcher.close();
-        error ? reject(error) : resolve();
+        if (error) reject(error);
+        else resolve();
       };
       const check = async () => {
         if (checking) {
@@ -336,13 +338,13 @@ export class RpcClient {
       assert(this.notifications.length <= 128, "notification queue exceeded");
     }
   }
-  request(method, params = {}, id = this.id++) {
+  request(method, params = {}, id = this.id++, timeoutMs = deadlineMs) {
     assert(!this.pending.has(id), `duplicate request ID ${id}`);
     const promise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`${this.profile.id} ${method} deadline: ${this.stderr}`));
-      }, deadlineMs);
+      }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       try {
         this.send({ jsonrpc: "2.0", id, method, params });
@@ -374,7 +376,7 @@ export class RpcClient {
     this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
     return reply;
   }
-  notification(method) {
+  notification(method, timeoutMs = deadlineMs) {
     const index = this.notifications.findIndex((n) => n.method === method);
     if (index >= 0) return Promise.resolve(this.notifications.splice(index, 1)[0]);
     return new Promise((resolve, reject) => {
@@ -382,12 +384,12 @@ export class RpcClient {
       entry.timer = setTimeout(() => {
         this.waiters = this.waiters.filter((w) => w !== entry);
         reject(new Error(`${method} notification deadline`));
-      }, deadlineMs);
+      }, timeoutMs);
       this.waiters.push(entry);
     });
   }
-  async list() {
-    const reply = await this.request("tools/list");
+  async list(timeoutMs = deadlineMs) {
+    const reply = await this.request("tools/list", {}, undefined, timeoutMs);
     assert(!failed(reply), JSON.stringify(reply));
     assert(Array.isArray(reply.result.tools));
     return reply.result.tools;

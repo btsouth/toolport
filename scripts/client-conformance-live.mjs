@@ -84,6 +84,7 @@ if (process.argv[2] === "--wiretap") {
     "qwen-code": ["mcp", "list"],
     "github-copilot-cli": ["mcp", "list"],
     codex: ["app-server"],
+    hermes: ["mcp", "test", "toolport"],
   };
   assert(
     commands[id] && executable && output,
@@ -108,7 +109,9 @@ if (process.argv[2] === "--wiretap") {
         typeof value === "string" ? value : JSON.stringify(value),
       );
     };
-    if (id === "codex")
+    if (id === "hermes")
+      await config(".hermes/config.yaml", { mcp_servers: { toolport: mcp } });
+    else if (id === "codex")
       await config(
         ".codex/config.toml",
         `[mcp_servers.toolport]\ncommand = ${JSON.stringify(command)}\nargs = ${JSON.stringify(shim)}\n`,

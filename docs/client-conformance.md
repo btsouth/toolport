@@ -20,7 +20,7 @@ Gemini and Qwen's health commands use `mcp-test-client`; their advertised
 capabilities do not establish the model-session client's capabilities.
 
 The captured profiles cover Claude Code, Codex, Cursor, OpenCode, Gemini CLI,
-Qwen Code and Kilo Code. Health commands may only initialize or ping, so their
+Qwen Code, Kilo Code and Hermes. Health commands may only initialize or ping, so their
 actual follow-up method sequence is replayed separately from synthetic calls.
 Cursor's health command opened two sessions; the profile represents one session.
 
@@ -50,7 +50,7 @@ npm run test:client-conformance:live -- opencode /usr/local/bin/opencode /tmp/to
 npm run test:client-conformance:live -- codex /usr/bin/codex /tmp/toolport-codex-evidence
 ```
 
-The driver supports the seven captured clients and Copilot CLI. Each run creates a
+The driver supports the eight captured clients and Copilot CLI. Each run creates a
 fresh HOME, XDG dirs, working directory and Toolport data/registry. It passes only
 OS/executable locators, writes only its disposable client config, and never copies
 auth from a real home. Gemini's disposable config disables folder trust so its

@@ -8,6 +8,7 @@ import {
   repo,
   failed,
   textOf,
+  deadlineMs,
 } from "./client-conformance-support.mjs";
 
 const source = await readFile(path.join(repo, "src-tauri/src/clients.rs"), "utf8");
@@ -52,15 +53,28 @@ async function withFixture(profile, full, run) {
 }
 
 async function catalog(client, expected) {
+  const deadline = performance.now() + deadlineMs;
   const tools = await client.list();
   if (tools.some((t) => t.name === expected)) return tools;
-  await client.notification("notifications/tools/list_changed");
-  const refreshed = await client.list();
-  assert(
-    refreshed.some((t) => t.name === expected),
-    `${client.profile.id}: missing ${expected}`,
-  );
-  return refreshed;
+  return changedCatalog(client, expected, deadline);
+}
+
+async function changedCatalog(
+  client,
+  expected,
+  deadline = performance.now() + deadlineMs,
+) {
+  // Startup and grow can each emit a valid event. Re-list for every event
+  // under one deadline until the changed entry arrives.
+  while (performance.now() < deadline) {
+    await client.notification(
+      "notifications/tools/list_changed",
+      deadline - performance.now(),
+    );
+    const refreshed = await client.list(Math.max(1, deadline - performance.now()));
+    if (refreshed.some((t) => t.name === expected)) return refreshed;
+  }
+  assert.fail(`${client.profile.id}: missing ${expected} after notifications`);
 }
 
 async function baseline(profile) {
@@ -116,15 +130,16 @@ async function replay(profile) {
     // an unknown client is not credited with a handler it has not demonstrated.
     client.notifications = [];
     success(await client.call("mock__grow"));
-    await client.notification("notifications/tools/list_changed");
     if (profile.listChanged.supported === true) {
-      assert((await client.list()).some((t) => t.name === "mock__greet"));
+      await changedCatalog(client, "mock__greet");
       success(await client.call("mock__greet", { name: "fixture" }));
       pass(`${profile.id}: notification then source/documented re-list profile`);
-    } else
+    } else {
+      await client.notification("notifications/tools/list_changed");
       pass(
         `${profile.id}: notification delivered; client re-list ${profile.listChanged.supported === false ? "unsupported" : "unknown"}`,
       );
+    }
 
     const resources = await client.request("resources/list");
     success(resources);

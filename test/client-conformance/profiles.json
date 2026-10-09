@@ -269,7 +269,8 @@
             "name": "claude-code",
             "title": "Claude Code",
             "version": "2.1.286",
-            "description": "Anthropic's agentic coding tool"
+            "description": "Anthropic's agentic coding tool",
+            "websiteUrl": "https://claude.com/claude-code"
           }
         },
         "jsonrpc": "2.0",
@@ -519,15 +520,36 @@
     },
     {
       "id": "hermes",
-      "evidence": "documentation only",
-      "initialize": null,
-      "initialMethods": [],
+      "evidence": "captured health command",
+      "initialize": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-11-25",
+          "capabilities": {
+            "sampling": {
+              "tools": {}
+            },
+            "elicitation": {
+              "form": {},
+              "url": {}
+            }
+          },
+          "clientInfo": {
+            "name": "mcp",
+            "version": "0.1.0"
+          },
+          "_meta": {}
+        }
+      },
+      "initialMethods": ["initialize", "notifications/initialized", "tools/list"],
       "listChanged": {
         "supported": null,
         "detail": "unverified"
       },
       "source": "https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp",
-      "observedSessionKind": null
+      "observedSessionKind": "CLI health command, not model session"
     },
     {
       "id": "continue",
