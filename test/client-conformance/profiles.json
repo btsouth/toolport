@@ -154,7 +154,7 @@
         "supported": true,
         "detail": "Yes, source handler directly re-lists; latency unmeasured"
       },
-      "source": "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/opencode/src/mcp/index.ts",
+      "source": "https://raw.githubusercontent.com/anomalyco/opencode/388406238bd5ca15564a762840a2362c3a45bd9c/packages/opencode/src/mcp/index.ts",
       "observedSessionKind": "CLI health command, not model session"
     },
     {

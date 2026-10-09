@@ -6,6 +6,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promis
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { pathToFileURL } from "node:url";
 
@@ -93,6 +94,69 @@ export async function stop(child) {
     await waitExit(child);
   }
 }
+export async function waitPidExit(pid, ms = 5_000) {
+  assert(Number.isSafeInteger(pid) && pid > 0, "invalid fixture PID");
+  const deadline = performance.now() + ms;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error.code === "ESRCH") return;
+      throw error;
+    }
+    if (performance.now() >= deadline) throw new Error(`PID ${pid} exit deadline`);
+    await delay(25);
+  }
+}
+export async function killPid(pid) {
+  assert(Number.isSafeInteger(pid) && pid > 0, "invalid fixture PID");
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (error) {
+    if (error.code !== "ESRCH") throw error;
+  }
+  await waitPidExit(pid);
+}
+const stoppedTrees = new WeakSet();
+export async function stopTree(child) {
+  if (!child.pid || stoppedTrees.has(child)) return;
+  if (process.platform === "win32") {
+    if (child.exitCode === null && child.signalCode === null) {
+      const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+        stdio: "ignore",
+      });
+      await waitExit(killer);
+    }
+  } else {
+    // The live CLI has its own process group. Its wiretap may outlive the CLI.
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+    }
+  }
+  await stop(child);
+  stoppedTrees.add(child);
+}
+export function wireMetadata(line) {
+  let message;
+  try {
+    message = JSON.parse(line);
+    if (!message || typeof message !== "object") return { nonJson: true };
+  } catch {
+    return { nonJson: true };
+  }
+  const safe = { jsonrpc: message.jsonrpc, id: message.id, method: message.method };
+  if (message.method === "initialize") safe.params = message.params;
+  if (message.result?.protocolVersion)
+    safe.result = {
+      protocolVersion: message.result.protocolVersion,
+      capabilities: message.result.capabilities,
+    };
+  if (message.result?.tools) safe.toolCount = message.result.tools.length;
+  return safe;
+}
+
 export function failed(reply) {
   return Boolean(reply.error || reply.result?.isError);
 }
@@ -146,6 +210,7 @@ export class Fixture {
     this.data = path.join(home, "data");
     this.transcript = path.join(this.data, "downstream.jsonl");
     this.clients = [];
+    this.killedPids = new Set();
   }
   async save() {
     await writeFile(path.join(this.data, "registry.json"), JSON.stringify(this.registry));
@@ -225,7 +290,13 @@ export class Fixture {
     });
   }
   async descriptors() {
-    const names = (await readdir(this.data)).filter((n) => /^daemon-.*\.json$/.test(n));
+    let names;
+    try {
+      names = (await readdir(this.data)).filter((n) => /^daemon-.*\.json$/.test(n));
+    } catch (error) {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    }
     const result = [];
     for (const name of names) {
       try {
@@ -236,29 +307,41 @@ export class Fixture {
     }
     return result;
   }
+  async killOwnedPid(pid) {
+    // A descriptor can survive SIGKILL. Never signal its PID again after exit.
+    if (this.killedPids.has(pid)) return;
+    await killPid(pid);
+    this.killedPids.add(pid);
+  }
   async killDaemon() {
     const descriptors = await this.descriptors();
     assert.equal(descriptors.length, 1);
     const pid = descriptors[0].pid;
-    assert(Number.isSafeInteger(pid) && pid > 0);
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch (e) {
-      if (e.code !== "ESRCH") throw e;
-    }
+    await this.killOwnedPid(pid);
     return pid;
   }
   async close() {
     await Promise.all(this.clients.map((c) => stop(c.child)));
-    // Only PIDs published in this fresh, private fixture directory.
-    for (const descriptor of await this.descriptors()) {
+    // Stop the producers first, then consume every published mock/wiretap PID.
+    for (const descriptor of await this.descriptors())
+      await this.killOwnedPid(descriptor.pid);
+    for (const name of ["wiretap.pid", "mock.pid"]) {
+      let pids;
       try {
-        process.kill(descriptor.pid, "SIGKILL");
-      } catch (e) {
-        if (e.code !== "ESRCH") throw e;
+        pids = await readFile(path.join(this.data, name), "utf8");
+      } catch (error) {
+        if (error.code === "ENOENT") continue;
+        throw error;
       }
+      for (const pid of new Set(pids.trim().split(/\s+/).filter(Boolean).map(Number)))
+        await this.killOwnedPid(pid);
     }
-    await rm(this.home, { recursive: true, force: true });
+    await rm(this.home, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100,
+    });
   }
 }
 
@@ -273,7 +356,7 @@ export class RpcClient {
     this.stderr = "";
     this.closed = false;
     this.child = spawn(gateway, ["--stdio-adapter"], {
-      cwd: fixture.home,
+      cwd: repo,
       env: { ...fixture.env(profile.id), ...overrides },
       stdio: ["pipe", "pipe", "pipe"],
     });

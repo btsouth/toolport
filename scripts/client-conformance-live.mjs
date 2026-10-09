@@ -10,7 +10,10 @@ import {
   Fixture,
   profiles,
   gateway,
+  repo,
   stop,
+  stopTree,
+  wireMetadata,
   waitExit,
 } from "./client-conformance-support.mjs";
 
@@ -19,24 +22,16 @@ if (process.argv[2] === "--wiretap") {
   const [trace, data, id, home] = process.argv.slice(3);
   const fixture = new Fixture(home, id);
   assert.equal(data, fixture.data, "wiretap fixture data mismatch");
+  await appendFile(path.join(fixture.data, "wiretap.pid"), `${process.pid}\n`);
   const child = spawn(gateway, ["--stdio-adapter"], {
-    cwd: home,
+    cwd: repo,
     env: fixture.env(),
     stdio: ["pipe", "pipe", "pipe"],
   });
   let writes = Promise.resolve();
   function record(direction, line) {
-    const message = JSON.parse(line);
-    // Capture the offered handshake verbatim; other messages carry method/ID
-    // and catalog size only. Never log auth/env or large tool arguments/results.
-    const safe = { jsonrpc: message.jsonrpc, id: message.id, method: message.method };
-    if (message.method === "initialize") safe.params = message.params;
-    if (message.result?.protocolVersion)
-      safe.result = {
-        protocolVersion: message.result.protocolVersion,
-        capabilities: message.result.capabilities,
-      };
-    if (message.result?.tools) safe.toolCount = message.result.tools.length;
+    // Retain metadata only; non-JSON chatter must not crash tracing or leak text.
+    const safe = wireMetadata(line);
     writes = writes.then(() =>
       appendFile(
         trace,
@@ -140,6 +135,7 @@ if (process.argv[2] === "--wiretap") {
     }
     child = spawn(executable, commands[id], {
       cwd: fixture.home,
+      detached: process.platform !== "win32",
       env: fixture.env(),
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -192,8 +188,10 @@ if (process.argv[2] === "--wiretap") {
     } catch (error) {
       timedOut = error.message === "child exit deadline";
       cliError = error.message;
-      await stop(child);
+      await stopTree(child);
     }
+    // Close surviving wiretaps before reading their final trace.
+    await stopTree(child);
     let records = [];
     try {
       records = (await readFile(trace, "utf8"))
@@ -230,7 +228,7 @@ if (process.argv[2] === "--wiretap") {
     console.log(JSON.stringify(summary));
     if (!initialize || timedOut || child.exitCode !== 0) process.exitCode = 1;
   } finally {
-    if (child) await stop(child);
+    if (child) await stopTree(child);
     await fixture.close();
   }
 }

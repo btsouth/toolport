@@ -7147,6 +7147,14 @@ fn handle_request_with_cancel(
                             status.id,
                             status.describe()
                         ),
+                        None if router.any_discovering(|id| {
+                            allowed.is_none_or(|set| server_in_allowed_scope(id, set))
+                        }) || router.any_publishing_first_catalog(|id| {
+                            allowed.is_none_or(|set| server_in_allowed_scope(id, set))
+                        }) =>
+                        {
+                            "Servers are still connecting. Retry or check toolport_status.".into()
+                        }
                         None => format!("No tools matched{scope}. {exhaustive_hint}"),
                     }
                 } else if low_confidence {
@@ -15056,7 +15064,9 @@ fn process_request_wire(
                 && allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
         };
         if tool_search {
-            router.demand_servers(visible);
+            if search_server.is_some() {
+                router.demand_servers(visible);
+            }
             router.discover_uncached(visible);
         }
         let cold = !has_scoped_tools(&cache_snapshot.tools, allowed, &router, &reg)
@@ -22345,6 +22355,86 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("late__cached"));
+    }
+
+    #[test]
+    fn reviewed_warm_unscoped_search_keeps_saved_catalog_stopped() {
+        let _env = DataDirTestEnv::new("reviewed-warm-unscoped-search");
+        let state = http_state(false);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let mut live = Router::new();
+        live.add_supervised(
+            "saved".into(),
+            vec![json!({"name":"cached", "inputSchema":{"type":"object"}})],
+            Arc::new(move || {
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+                Ok(DownstreamServer::connect("saved".into(), Box::new(CacheRoute)).unwrap())
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        let live = Arc::new(live);
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(live.aggregated_tools()));
+        *state.router.lock().unwrap() = Arc::clone(&live);
+        let reply = process_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":""}}}),
+            &SearchGuard::default(), None, None, None, None, Some("cursor"), None, DiscoveryMode::Lazy,
+        ).unwrap();
+        let starting = live.any_starting(|_| true);
+        let _ = release_tx.send(());
+        assert!(reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("saved__cached"));
+        assert!(
+            !starting,
+            "saved catalog discovery started a stopped server"
+        );
+    }
+
+    #[test]
+    fn reviewed_unscoped_search_reports_catalog_still_connecting() {
+        let _env = DataDirTestEnv::new("reviewed-search-still-connecting");
+        let state = http_state(false);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let mut live = Router::new();
+        live.add_supervised(
+            "late".into(),
+            Vec::new(),
+            Arc::new(move || {
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(15));
+                Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        let live = Arc::new(live);
+        *state.router.lock().unwrap() = Arc::clone(&live);
+        let reply = process_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":""}}}),
+            &SearchGuard::default(), None, None, None, None, Some("cursor"), None, DiscoveryMode::Lazy,
+        ).unwrap();
+        let still_connecting = live.any_discovering(|_| true);
+        release_tx.send(()).unwrap();
+        let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            still_connecting,
+            "fixture published before the client budget expired"
+        );
+        assert!(text.contains("still connecting"), "{text}");
+        assert!(text.contains("toolport_status"), "{text}");
+        assert!(!text.contains("No tools matched"), "{text}");
     }
 
     #[test]

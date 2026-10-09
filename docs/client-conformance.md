@@ -1,6 +1,6 @@
 # Client conformance
 
-Run the fixture suite on devbox or CI:
+Run the fixture suite on a Linux build host or CI:
 
 ```sh
 npm run test:client-conformance
@@ -58,21 +58,25 @@ npm run test:client-conformance:live -- codex /usr/bin/codex /tmp/toolport-codex
 The driver supports the eight captured clients and Copilot CLI. Each run creates a
 fresh HOME, XDG dirs, working directory and Toolport data/registry. It passes only
 OS/executable locators, writes only its disposable client config, and never copies
-auth from a real home. Gemini's disposable config disables folder trust so its
+auth from a real home. On macOS, Claude Code reads the login Keychain regardless
+of HOME, so a disposable HOME alone does not isolate its authentication. Use an
+isolated OS account/session with no saved Claude credentials for that probe.
+Gemini's disposable config disables folder trust so its
 health command can connect. Other approval/auth requirements are reported as
 uncaptured, not bypassed. Codex uses app-server MCP status, without a model turn.
 Copilot's `mcp list` may inspect config without opening a connection; that produces
 no handshake and a failing live result.
 
-Run workstation CLIs that touch session services inside omabox. Use a devbox
+Run CLIs that touch session services in an isolated desktop session. Use an
 absolute executable that does not depend on a user GUI launcher. Builds and client
-installs belong on devbox, in a task-local prefix. No global installation or real
+installs belong on a Linux build host, in a task-local prefix. No global installation or real
 client config mutation is needed. The live driver never installs a client.
 
 `traffic.jsonl` contains the offered handshake and message method/ID metadata,
 not environment values, auth headers or tool argument/result bodies.
 `summary.json` reports whether a handshake actually occurred. `status.txt` is
-bounded CLI health output from the unauthenticated disposable environment.
+bounded CLI health output from the disposable environment; the macOS Keychain
+caveat above applies.
 Cleanup targets only spawned children and daemons published in that fresh data
 folder. All requests and live commands have deadlines.
 
@@ -84,8 +88,8 @@ establish a supported behavior, not a latency guarantee for every release.
 | Client      | Evidence                                                                                                                                                  | Refresh                                                         |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
 | Claude Code | [Vendor MCP docs](https://code.claude.com/docs/en/mcp)                                                                                                    | Tools-list notifications supported                              |
-| OpenCode    | [Client handler](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/mcp/index.ts)                                                       | Direct tools re-list handler; onclose drops the catalog         |
-| Gemini CLI  | [Client handlers](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/tools/mcp-client.ts)                                            | Tools, resources and prompts refresh                            |
+| OpenCode    | [Client handler](https://github.com/anomalyco/opencode/blob/388406238bd5ca15564a762840a2362c3a45bd9c/packages/opencode/src/mcp/index.ts)                                                       | Direct tools re-list handler; onclose drops the catalog         |
+| Gemini CLI  | [Client handlers](https://github.com/google-gemini/gemini-cli/blob/2ce1a6963e9e53a04afaf76111e4527cfa7c5dd7/packages/core/src/tools/mcp-client.ts)                                            | Tools, resources and prompts refresh                            |
 | Cline       | [Pinned client](https://github.com/cline/cline/blob/75111f347f275022abea2b2d784901920d8618be/apps/vscode/src/services/mcp/McpHub.ts)                      | 300 ms debounce, 2 s max deferral, bounded refresh retry        |
 | Zed         | [Vendor MCP docs](https://zed.dev/docs/ai/mcp)                                                                                                            | Automatically reloads tools                                     |
 | Codex       | [Pinned catalog](https://github.com/openai/codex/blob/2351d9e1b608e6f9d9a3699b71d7eb39ee41cfa4/codex-rs/codex-mcp/src/connection_manager/tool_catalog.rs) | Generic notification refresh not established; cached tools      |

@@ -33,6 +33,26 @@ fn client_profiles_replay_against_the_real_adapter_and_daemon() {
     );
 }
 
+#[test]
+fn client_fixture_cleanup_and_wire_metadata_regressions() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let output = Command::new("node")
+        .arg("--test")
+        .arg(root.join("scripts/client-conformance-support.test.mjs"))
+        .current_dir(root)
+        .output()
+        .expect("Node is required for the client conformance harness");
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "fixture regression failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 struct AuthFixture {
     dir: std::path::PathBuf,
     _data: registry::DataDirOverride,
