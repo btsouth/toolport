@@ -8996,6 +8996,7 @@ for line in sys.stdin:
 
     #[test]
     fn local_auth_failure_does_not_mask_a_dead_connection_timeout() {
+        let _data = crate::registry::DataDirTestEnv::new("f3-local-auth-dead-connection-timeout");
         let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
         router.servers[0].start(true);
         ready_supervisor(&mut router);
@@ -9031,6 +9032,7 @@ for line in sys.stdin:
 
     #[test]
     fn read_only_timeout_degrade_keeps_read_wording_and_does_not_replay() {
+        let _data = crate::registry::DataDirTestEnv::new("f3-read-only-timeout-degrade");
         let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
         router.servers[0].start(true);
         ready_supervisor(&mut router);
