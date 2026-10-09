@@ -4132,16 +4132,10 @@ fn resolve_adapter_caller(
     (
         Some(allowed),
         HttpCaller {
-            audit_label: Some(if clients::known_adapter_name(client_id).is_none() {
-                client_id
-                    .strip_prefix("adapter-pid-")
-                    .and_then(|pid| pid.parse().ok())
-                    .and_then(conduit_lib::client_process::parent_app)
-                    .map(|name| format!("Unknown app (via {name})"))
-                    .unwrap_or_else(|| "An AI client".into())
-            } else {
-                clients::trusted_client_name(Some(&format!("adapter:{client_id}")), None)
-            }),
+            audit_label: Some(clients::trusted_client_name(
+                Some(&format!("adapter:{client_id}")),
+                None,
+            )),
             session_owner: McpSessionOwner {
                 identity: format!("adapter:{client_id}"),
                 profile: Some(profile.clone()),
@@ -12877,6 +12871,7 @@ struct GatewayState {
     /// root-change handler can recompute the effective (folder-scoped) profile off the
     /// request thread without re-reading env. Process constants; unused in HTTP mode.
     client_id: Option<String>,
+    attribution_id: Option<String>,
     env_profile: Option<String>,
 }
 
@@ -13334,6 +13329,7 @@ struct SessionState {
     client_upstream: Mutex<ClientUpstreamCaps>,
     client_label: Mutex<Option<String>>,
     observation: Mutex<Option<Arc<observation::Session>>>,
+    parent_app: conduit_lib::client_process::ParentApp,
     observation_shared: AtomicBool,
     upstream_pending: Mutex<HashMap<String, std::sync::mpsc::Sender<Value>>>,
     next_upstream_id: AtomicI64,
@@ -13429,6 +13425,7 @@ impl SessionState {
             client_upstream: Mutex::new(ClientUpstreamCaps::default()),
             client_label: Mutex::new(None),
             observation: Mutex::new(None),
+            parent_app: conduit_lib::client_process::ParentApp::default(),
             observation_shared: AtomicBool::new(false),
             upstream_pending: Mutex::new(HashMap::new()),
             next_upstream_id: AtomicI64::new(1),
@@ -15258,6 +15255,30 @@ fn catalog_wait_budget(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn observed_client_name(
+    state: &GatewayState,
+    holder: Option<&SessionState>,
+    client: Option<&str>,
+    name: Option<&str>,
+) -> String {
+    if client
+        .and_then(|c| c.strip_prefix("adapter:"))
+        .is_some_and(|id| clients::known_adapter_name(id).is_some())
+    {
+        return clients::trusted_client_name(client, None);
+    }
+    let pid = if state.http {
+        HTTP_ADAPTER_ATTRIBUTION.with(|current| current.borrow().1)
+    } else {
+        Some(std::process::id())
+    };
+    holder
+        .zip(pid)
+        .and_then(|(session, pid)| session.parent_app.resolve(pid))
+        .map(|name| format!("Unknown app (via {name})"))
+        .unwrap_or_else(|| clients::trusted_client_name(client, name))
+}
+
 fn process_request_wire(
     state: &GatewayState,
     req: &Value,
@@ -15274,8 +15295,8 @@ fn process_request_wire(
     let holder = if !state.http {
         Some(state.stdio_upstream.clone())
     } else {
-        active_mcp_session()
-            .or_else(adapter_lifetime_key)
+        adapter_lifetime_key()
+            .or_else(active_mcp_session)
             .and_then(|id| {
                 state
                     .mcp_sessions
@@ -15293,17 +15314,17 @@ fn process_request_wire(
     } else {
         "legacy_first_request"
     };
-    let name = if !state.http
-        && client
-            .and_then(|c| c.strip_prefix("adapter:"))
-            .is_none_or(|id| clients::known_adapter_name(id).is_none())
-    {
-        conduit_lib::client_process::parent_app(std::process::id())
-            .map(|name| format!("Unknown app (via {name})"))
-            .unwrap_or_else(|| clients::trusted_client_name(client, client_name))
+    let display_client = if state.http {
+        HTTP_ADAPTER_ATTRIBUTION.with(|current| current.borrow().0.clone())
     } else {
-        clients::trusted_client_name(client, client_name)
-    };
+        state
+            .attribution_id
+            .clone()
+            .or_else(|| state.client_id.clone())
+    }
+    .map(|id| format!("adapter:{id}"));
+    let display_client = display_client.as_deref().or(client);
+    let name = observed_client_name(state, holder.as_deref(), display_client, client_name);
     let observed = if let Some(holder) = &holder {
         let mut current = holder
             .observation
@@ -15316,8 +15337,9 @@ fn process_request_wire(
         }
         current
             .get_or_insert_with(|| {
-                observation::Session::start(
+                observation::Session::start_attributed(
                     client,
+                    display_client,
                     Some(&name),
                     label.as_deref(),
                     if state.http { "http" } else { "stdio" },
@@ -15328,8 +15350,9 @@ fn process_request_wire(
     } else {
         // Modern remote HTTP has no protocol session. A request is the only
         // observable lifetime; never merge two windows merely by bearer identity.
-        observation::Session::start(
+        observation::Session::start_attributed(
             client,
+            display_client,
             Some(&name),
             label.as_deref(),
             "http_request",
@@ -16965,9 +16988,22 @@ fn handle_mcp_http(
                 ) {
                     Ok((key, session)) => {
                         let lifetime = adapter_lifetime(state, session_owner);
-                        let start = || observation::Session::start(
-                            client, client_name, None, "http_subscription", "modern_subscription",
-                        );
+                        let display = HTTP_ADAPTER_ATTRIBUTION
+                            .with(|current| current.borrow().0.clone())
+                            .map(|id| format!("adapter:{id}"));
+                        let display = display.as_deref().or(client);
+                        let name =
+                            observed_client_name(state, lifetime.as_deref(), display, client_name);
+                        let start = || {
+                            observation::Session::start_attributed(
+                                client,
+                                display,
+                                Some(&name),
+                                None,
+                                "http_subscription",
+                                "modern_subscription",
+                            )
+                        };
                         let observed = if let Some(lifetime) = &lifetime {
                             let mut current = lifetime.observation.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             current.get_or_insert_with(start).clone()
@@ -18013,6 +18049,7 @@ fn http_connection_cancellations() -> &'static Mutex<HashMap<SocketAddr, downstr
     CONNECTIONS.get_or_init(Mutex::default)
 }
 thread_local! {
+    static HTTP_ADAPTER_ATTRIBUTION: std::cell::RefCell<(Option<String>, Option<u32>)> = const { std::cell::RefCell::new((None, None)) };
     static HTTP_ADAPTER_INSTANCE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static HTTP_CONNECTION_CANCEL: std::cell::RefCell<Option<downstream::CancelRegistry>> = const { std::cell::RefCell::new(None) };
 }
@@ -18021,6 +18058,12 @@ impl Drop for HttpConnectionScope {
     fn drop(&mut self) {
         HTTP_CONNECTION_CANCEL.with(|current| current.replace(self.0.take()));
         HTTP_ADAPTER_INSTANCE.with(|current| current.replace(self.1.take()));
+    }
+}
+struct AdapterAttributionScope((Option<String>, Option<u32>));
+impl Drop for AdapterAttributionScope {
+    fn drop(&mut self) {
+        HTTP_ADAPTER_ATTRIBUTION.with(|current| current.replace(std::mem::take(&mut self.0)));
     }
 }
 struct HttpRequestEnd {
@@ -19835,23 +19878,7 @@ fn handle_connection(
             )
         };
         match resolved {
-            Some((allowed, mut resolved_caller)) => {
-                if private_daemon_bearer
-                    && adapter_client_id
-                        .as_deref()
-                        .is_some_and(|id| clients::known_adapter_name(id).is_none())
-                {
-                    if let Some(pid) = request
-                        .headers()
-                        .iter()
-                        .find(|h| h.field.equiv("Toolport-Adapter-Pid"))
-                        .and_then(|h| h.value.as_str().parse::<u32>().ok())
-                    {
-                        if let Some(name) = conduit_lib::client_process::parent_app(pid) {
-                            resolved_caller.audit_label = Some(format!("Unknown app (via {name})"));
-                        }
-                    }
-                }
+            Some((allowed, resolved_caller)) => {
                 caller = Some(resolved_caller);
                 Some(allowed)
             }
@@ -19897,6 +19924,29 @@ fn handle_connection(
                 let previous_instance =
                     HTTP_ADAPTER_INSTANCE.with(|current| current.replace(instance));
                 let _connection_scope = HttpConnectionScope(previous, previous_instance);
+                let attribution = if private_daemon_bearer && valid_adapter_claim {
+                    let id = request
+                        .headers()
+                        .iter()
+                        .find(|h| {
+                            h.field
+                                .equiv(conduit_lib::stdio_adapter::ADAPTER_ATTRIBUTION_HEADER)
+                        })
+                        .map(|h| h.value.as_str())
+                        .filter(|id| clients::known_adapter_name(id).is_some())
+                        .map(str::to_string);
+                    let pid = request
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.equiv("Toolport-Adapter-Pid"))
+                        .and_then(|h| h.value.as_str().parse().ok());
+                    (id, pid)
+                } else {
+                    (None, None)
+                };
+                let _attribution = AdapterAttributionScope(
+                    HTTP_ADAPTER_ATTRIBUTION.with(|current| current.replace(attribution)),
+                );
                 // A panic in a handler must return 500, not kill the listener.
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     handle_http_with_headers(
@@ -20721,6 +20771,9 @@ fn main() {
         profile: Arc::clone(&profile),
         stdio_upstream,
         client_id: client_id.clone(),
+        attribution_id: std::env::var(conduit_lib::brand::ATTRIBUTION_ID)
+            .ok()
+            .filter(|id| clients::known_adapter_name(id).is_some()),
         env_profile: env_profile.clone(),
     };
 
@@ -27341,6 +27394,7 @@ mod tests {
             profile: Arc::new(Mutex::new(None)),
             stdio_upstream,
             client_id: None,
+            attribution_id: None,
             env_profile: None,
         }
     }

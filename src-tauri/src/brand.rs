@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 /// Env key written into client MCP configs for the client identity.
 pub const CLIENT_ID: &str = "TOOLPORT_CLIENT_ID";
+/// Display-only adapter identity. Never consulted for profile or scope selection.
+pub const ATTRIBUTION_ID: &str = "TOOLPORT_ATTRIBUTION_ID";
 /// Pre-rename client identity env key still accepted by the gateway.
 pub const CLIENT_ID_LEGACY: &str = "CONDUIT_CLIENT_ID";
 

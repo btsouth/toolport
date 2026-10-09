@@ -295,7 +295,7 @@ pub(super) fn backfill_identity(
     name: &str,
     id: &str,
 ) -> Result<(), String> {
-    let key = crate::brand::CLIENT_ID;
+    let key = crate::brand::ATTRIBUTION_ID;
     match container(format) {
         Container::Json {
             key: container_key,

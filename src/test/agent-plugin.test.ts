@@ -163,7 +163,7 @@ describe("plugin client identity", () => {
         stdio: "ignore",
         args: [
           "-e",
-          "process.exit(process.env.TOOLPORT_CLIENT_ID === 'claude-code' ? 0 : 1)",
+          "process.exit(process.env.TOOLPORT_ATTRIBUTION_ID === 'claude-code' ? 0 : 1)",
         ],
       }),
     ).resolves.toBe(0);

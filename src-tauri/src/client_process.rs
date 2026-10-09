@@ -13,8 +13,7 @@ impl ParentApp {
         self.resolve_with(|| parent_app(pid))
     }
     fn resolve_with(&self, read: impl FnOnce() -> Option<String>) -> Option<String> {
-        let _ = &self.0;
-        read()
+        self.0.get_or_init(read).clone()
     }
 }
 
@@ -29,7 +28,8 @@ fn stable_process(
     name: impl FnOnce() -> Option<String>,
 ) -> Option<(u32, String)> {
     let before = generation()?;
-    Some((before.parent, name()?))
+    let name = name()?;
+    (generation()? == before).then_some((before.parent, name))
 }
 
 pub fn parent_app(pid: u32) -> Option<String> {
@@ -43,9 +43,7 @@ fn walk(mut pid: u32, mut read: impl FnMut(u32) -> Option<(u32, String)>) -> Opt
         if pid <= 1 || !seen.insert(pid) {
             break;
         }
-        let Some((parent, name)) = read(pid) else {
-            break;
-        };
+        let (parent, name) = read(pid)?;
         // Skip the adapter itself; examine its parents, including generic launchers.
         if seen.len() > 1 {
             let name = Path::new(&name).file_name()?.to_str()?;
@@ -83,26 +81,58 @@ fn walk(mut pid: u32, mut read: impl FnMut(u32) -> Option<(u32, String)>) -> Opt
 
 #[cfg(target_os = "linux")]
 fn process(pid: u32) -> Option<(u32, String)> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    let parent = status
-        .lines()
-        .find_map(|line| line.strip_prefix("PPid:"))?
-        .trim()
-        .parse()
-        .ok()?;
-    let name = std::fs::read_link(format!("/proc/{pid}/exe"))
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .or_else(|| {
-            std::fs::read_to_string(format!("/proc/{pid}/comm"))
+    stable_process(
+        || linux_generation(pid),
+        || {
+            std::fs::read_link(format!("/proc/{pid}/exe"))
                 .ok()
-                .map(|n| n.trim().to_string())
-        })?;
-    Some((parent, name))
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .or_else(|| {
+                    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                        .ok()
+                        .map(|n| n.trim().to_string())
+                })
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_generation(pid: u32) -> Option<Generation> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm can contain spaces and parentheses. Fields after its last ')' start at state.
+    let fields: Vec<_> = stat
+        .get(stat.rfind(')')? + 1..)?
+        .split_whitespace()
+        .collect();
+    Some(Generation {
+        parent: fields.get(1)?.parse().ok()?,
+        started: fields.get(19)?.parse().ok()?,
+    })
 }
 
 #[cfg(target_os = "macos")]
 fn process(pid: u32) -> Option<(u32, String)> {
+    stable_process(
+        || macos_generation(pid),
+        || {
+            let mut buf = [0u8; 4096];
+            let n = unsafe {
+                libc::proc_pidpath(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32)
+            };
+            if n <= 0 {
+                return None;
+            }
+            let path = std::ffi::CStr::from_bytes_until_nul(&buf)
+                .ok()?
+                .to_str()
+                .ok()?;
+            Some(Path::new(path).file_name()?.to_str()?.to_string())
+        },
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_generation(pid: u32) -> Option<Generation> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of_val(&info) as i32;
     let n = unsafe {
@@ -114,22 +144,13 @@ fn process(pid: u32) -> Option<(u32, String)> {
             size,
         )
     };
-    if n != size {
-        return None;
-    }
-    let mut buf = [0u8; 4096];
-    let n = unsafe { libc::proc_pidpath(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
-    if n <= 0 {
-        return None;
-    }
-    let path = std::ffi::CStr::from_bytes_until_nul(&buf)
-        .ok()?
-        .to_str()
-        .ok()?;
-    Some((
-        info.pbi_ppid,
-        Path::new(path).file_name()?.to_str()?.to_string(),
-    ))
+    (n == size).then_some(Generation {
+        parent: info.pbi_ppid,
+        started: info
+            .pbi_start_tvsec
+            .checked_mul(1_000_000)?
+            .checked_add(info.pbi_start_tvusec)?,
+    })
 }
 
 #[cfg(windows)]
@@ -139,7 +160,8 @@ fn process(pid: u32) -> Option<(u32, String)> {
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
-    unsafe {
+    let before = windows_generation(pid)?;
+    let found = unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
             return None;
@@ -168,6 +190,29 @@ fn process(pid: u32) -> Option<(u32, String)> {
         }
         CloseHandle(snapshot);
         found
+    }?;
+    let after = windows_generation(pid)?;
+    (before == after).then_some(found)
+}
+
+#[cfg(windows)]
+fn windows_generation(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut created: FILETIME = std::mem::zeroed();
+        let mut exited: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        let ok = GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(process);
+        (ok != 0).then_some(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
     }
 }
 
@@ -199,6 +244,18 @@ mod tests {
             Some(Generation {parent: 9, started: reads})
         }, || Some("Cursor".into())), None);
         assert_eq!(reads, 2);
+    }
+
+    #[test]
+    fn missing_or_reused_parent_discards_launcher_fallback() {
+        assert_eq!(
+            walk(10, |pid| match pid {
+                10 => Some((9, "toolport-gateway".into())),
+                9 => Some((8, "node".into())),
+                _ => None,
+            }),
+            None
+        );
     }
 
     #[test]

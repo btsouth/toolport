@@ -51,6 +51,7 @@ pub const STDIO_ADAPTER_FLAG: &str = "--stdio-adapter";
 /// Internal daemon headers. The daemon accepts these only with its private
 /// rendezvous bearer; the public HTTP bridge never trusts them.
 pub const ADAPTER_CLIENT_ID_HEADER: &str = "Toolport-Adapter-Client-Id";
+pub const ADAPTER_ATTRIBUTION_HEADER: &str = "Toolport-Adapter-Attribution";
 pub const ADAPTER_PROFILE_HEADER: &str = "Toolport-Adapter-Profile";
 /// Path values are URL-safe base64 so Unicode and platform separators survive
 /// HTTP header transport. The daemon's cwd belongs to the first adapter only.
@@ -452,6 +453,7 @@ struct Session {
     stdout: Mutex<Box<dyn Write + Send>>,
     request_timeout: Duration,
     client_id: String,
+    attribution_id: Option<String>,
     env_profile: Option<String>,
     cwd: Option<String>,
     root_override: Option<String>,
@@ -528,6 +530,9 @@ impl Session {
             stdout: Mutex::new(Box::new(std::io::stdout())),
             request_timeout: REQUEST_TIMEOUT,
             client_id,
+            attribution_id: std::env::var(crate::brand::ATTRIBUTION_ID)
+                .ok()
+                .filter(|id| crate::clients::known_adapter_name(id).is_some()),
             env_profile,
             cwd,
             root_override,
@@ -545,6 +550,10 @@ impl Session {
             .set(ADAPTER_CLIENT_ID_HEADER, &self.client_id)
             .set("Toolport-Adapter-Pid", &std::process::id().to_string())
             .set("Toolport-Adapter-Instance", &self.instance);
+        let request = match &self.attribution_id {
+            Some(id) => request.set(ADAPTER_ATTRIBUTION_HEADER, id),
+            None => request,
+        };
         let request = match &self.env_profile {
             Some(profile) => request.set(ADAPTER_PROFILE_HEADER, profile),
             None => request,

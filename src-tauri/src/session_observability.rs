@@ -33,7 +33,7 @@ impl Drop for ContextGuard {
     }
 }
 
-/// Bounded display metadata, with URL and registered-secret redaction.
+/// Persist only bounded printable name/version tokens, never locations or secrets.
 pub fn display_label(label: &str) -> Option<String> {
     static URL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let label = crate::approval::sanitize_client_label(label)?;
@@ -42,7 +42,23 @@ pub fn display_label(label: &str) -> Option<String> {
         regex::Regex::new(r"(?i)[a-z][a-z0-9+.-]*://[^\s]+|www\.[^\s]+")
             .expect("metadata URL pattern")
     });
-    crate::approval::sanitize_client_label(&pattern.replace_all(&label, "[link]"))
+    let label = pattern.replace_all(&label, "[link]");
+    let safe = label
+        .split_whitespace()
+        .map(|token| {
+            if token == "<redacted>" {
+                "[redacted]"
+            } else if token.chars().all(|c| {
+                c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '(' | ')' | '[' | ']')
+            }) {
+                token
+            } else {
+                "[private]"
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    crate::approval::sanitize_client_label(&safe)
 }
 
 pub struct DispatchTimer {
@@ -204,7 +220,17 @@ impl Session {
         transport: &'static str,
         reason: &'static str,
     ) -> Arc<Self> {
-        let client_type = client
+        Self::start_attributed(client, client, name, label, transport, reason)
+    }
+    pub fn start_attributed(
+        client: Option<&str>,
+        display_client: Option<&str>,
+        name: Option<&str>,
+        label: Option<&str>,
+        transport: &'static str,
+        reason: &'static str,
+    ) -> Arc<Self> {
+        let client_type = display_client
             .and_then(|c| c.strip_prefix("adapter:"))
             .filter(|id| crate::clients::known_adapter_name(id).is_some())
             .unwrap_or(if client.is_some_and(|c| c.starts_with("client:")) {
@@ -224,7 +250,7 @@ impl Session {
                             .is_some_and(|id| crate::clients::known_adapter_name(id).is_some())
                 })
                 .map(str::to_string),
-            name: display_label(&crate::clients::trusted_client_name(client, name))
+            name: display_label(&crate::clients::trusted_client_name(display_client, name))
                 .unwrap_or_else(|| "An AI client".into()),
             client_type,
             label: label.and_then(display_label),
@@ -329,6 +355,27 @@ impl Drop for Session {
 mod tests {
     use super::*;
     #[test]
+    fn display_identity_never_replaces_the_recorded_principal() {
+        let _data = crate::registry::DataDirTestEnv::new("f3-display-identity");
+        let session = Session::start_attributed(
+            Some("adapter:adapter-pid-123"),
+            Some("adapter:claude-code"),
+            None,
+            None,
+            "stdio",
+            "initialize",
+        );
+        session.close(CloseReason::ClientDisconnect);
+        let rows = crate::audit::read_recent(2).unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row["clientType"], "claude-code");
+            assert_eq!(row["clientName"], "Claude Code");
+            assert!(row.get("client").is_none());
+        }
+    }
+
+    #[test]
     fn private_paths_never_reach_session_or_correlated_audit_rows() {
         let data = crate::registry::DataDirTestEnv::new("f3-label-paths");
         for path in ["/home/private/customer.env", "C:\\private\\customer.env", "~/private/customer.env", "\\\\server\\private\\customer.env", "file:///home/private/customer.env", "../private/customer.env", "private/customer.env"] {
@@ -340,7 +387,9 @@ mod tests {
             assert!(!row.to_string().contains("customer.env"), "{row}");
             session.close(CloseReason::ClientDisconnect);
         }
-        crate::telemetry::flush();
+        assert!(crate::telemetry::flush_for_test(
+            std::time::Duration::from_secs(5)
+        ));
         let audit = std::fs::read_to_string(data.dir.join("audit.jsonl")).unwrap();
         assert!(!audit.contains("customer.env"), "{audit}");
         assert!(!audit.contains("sk-live-abcdefghijk123456789"));
