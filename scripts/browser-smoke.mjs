@@ -247,7 +247,9 @@ try {
   ]) {
     await expect(page.getByText(label, { exact: true })).toBeVisible();
   }
-  await expect(page.getByText("Claude Code 2.1 · 2m ago · waited 1m 30s")).toBeVisible();
+  await expect(
+    page.getByText('Claude Code (reports "Claude Code 2.1") · 2m ago · waited 1m 30s'),
+  ).toBeVisible();
   await page.screenshot({ path: path.join(output, "approval-activity.png") });
   await page.setViewportSize({ width: 1240, height: 900 });
   for (const failure of ["", "launch", "credential", "optional", "vault", "verifying"]) {
@@ -376,6 +378,34 @@ try {
     path: path.join(output, "setup-catalog-add.png"),
   });
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
+  await page.goto(`${baseURL}/fixtures/?sessions&approvals`);
+  const unknownApproval = page.getByRole("alertdialog");
+  await expect(
+    unknownApproval.getByText(
+      "Unknown app (via Cursor) wants to run this · destructive tool",
+    ),
+  ).toBeVisible();
+  await expect(unknownApproval.getByText("Reports itself as: kt 1")).toBeVisible();
+  await page.screenshot({ path: path.join(output, "session-approval.png") });
+  await unknownApproval.getByRole("button", { name: "Deny", exact: true }).click();
+  await expect(unknownApproval).toHaveCount(0);
+  await page.getByRole("button", { name: "Activity", exact: true }).click();
+  const calls = page.getByRole("button", { name: /Recent calls and approvals/ });
+  await expect(calls).toBeVisible();
+  if ((await calls.getAttribute("aria-expanded")) === "false") await calls.click();
+  await expect(page.getByText(/Unknown app \(via Cursor\).*reports.*kt 1/)).toBeVisible();
+  await expect(page.getByText(/dispatch 3 ms/)).toBeVisible();
+  await page.screenshot({ path: path.join(output, "session-activity.png") });
+  await page.getByRole("button", { name: "Clients", exact: true }).click();
+  const sessions = page.getByRole("region", { name: "Recent client sessions" });
+  await expect(sessions.getByText("Unknown app (via Cursor)")).toBeVisible();
+  await expect(sessions.getByText("Reports itself as: kt 1")).toBeVisible();
+  await expect(
+    sessions.getByText(/3 tool lists.*1 list changes delivered/),
+  ).toBeVisible();
+  await expect(sessions.getByRole("button")).toHaveCount(0);
+  expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
+  await page.screenshot({ path: path.join(output, "session-clients.png") });
   await page.goto(`${baseURL}/fixtures/?logos`);
   await expect(page.getByText("Dark logo fixture")).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
