@@ -9099,8 +9099,16 @@ mod tests {
             let name = copy.first_child().unwrap();
             assert!(name.tooltip_text().unwrap().contains("Client id: cursor"));
             let detail = name.next_sibling().unwrap();
-            assert!(detail.clone().downcast::<gtk::Label>().unwrap().text().starts_with("2 local MCP servers"));
-            assert_eq!(detail.next_sibling().is_some(), state == state::ClientGatewayState::Connected);
+            assert!(detail
+                .clone()
+                .downcast::<gtk::Label>()
+                .unwrap()
+                .text()
+                .starts_with("2 local MCP servers"));
+            assert_eq!(
+                detail.next_sibling().is_some(),
+                state == state::ClientGatewayState::Connected
+            );
             let after_copy = copy.next_sibling().unwrap();
             if state == state::ClientGatewayState::Customized {
                 let badge = after_copy.clone().downcast::<gtk::Label>().unwrap();
@@ -9112,12 +9120,19 @@ mod tests {
             }
             if state == state::ClientGatewayState::Disconnected {
                 assert_eq!(after_copy.valign(), gtk::Align::Center);
-                let button = after_copy.first_child().unwrap().downcast::<gtk::Button>().unwrap();
+                let button = after_copy
+                    .first_child()
+                    .unwrap()
+                    .downcast::<gtk::Button>()
+                    .unwrap();
                 assert_eq!(button.label().as_deref(), Some("Connect"));
             }
             heights.push(row.measure(gtk::Orientation::Vertical, 880).1);
         }
-        assert!(heights[0] < heights[2], "Disconnected rows should be shorter: {heights:?}");
+        assert!(
+            heights[0] < heights[2],
+            "Disconnected rows should be shorter: {heights:?}"
+        );
     }
 
     #[test]
