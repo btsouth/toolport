@@ -281,10 +281,16 @@ try {
   await withFixture(codex, true, async (fixture, first) => {
     const second = fixture.client(claude);
     await Promise.all([first.initialize(), second.initialize()]);
-    await Promise.all([catalog(first, "mock__echo"), catalog(second, "mock__echo")]);
+    await Promise.all([
+      catalog(first, "mock__echo"),
+      catalog(second, "toolport_search_tools"),
+    ]);
+    const search = await second.call("toolport_search_tools", { query: "mock__echo" });
+    success(search);
+    assert(textOf(search).includes("mock__echo"));
     const replies = await Promise.all([
       first.call("mock__echo", { text: "codex owned" }, false, "same-id"),
-      second.call("mock__echo", { text: "claude owned" }, false, "same-id"),
+      second.call("mock__echo", { text: "claude owned" }, true, "same-id"),
     ]);
     replies.forEach(success);
     assert(textOf(replies[0]).includes("codex owned"));
