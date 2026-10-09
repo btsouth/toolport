@@ -15368,6 +15368,11 @@ fn process_request_wire(
     let internal = match (method, req["params"]["name"].as_str()) {
         ("server/discover", _) => Some("describe"),
         ("tools/call", Some("toolport_search_tools")) => Some("search"),
+        ("tools/call", Some(name))
+            if discovery == DiscoveryMode::Grouped && grouped_help_target(name).is_some() =>
+        {
+            Some("search")
+        }
         _ => None,
     };
     let cold = internal.is_some() && {
@@ -40700,6 +40705,85 @@ mod tests {
             denied["result"]["isError"] == true || denied.get("error").is_some(),
             "{denied}"
         );
+    }
+
+    #[test]
+    fn discovery_helpers_record_private_scoped_timings_in_every_mode() {
+        let _data = DataDirTestEnv::new("discovery-helper-timings");
+        for (client, mode) in [
+            ("adapter:claude-code", DiscoveryMode::Lazy),
+            ("adapter:codex", DiscoveryMode::Full),
+            ("adapter:cursor", DiscoveryMode::Full),
+            ("adapter:codex", DiscoveryMode::Grouped),
+            ("adapter:/home/private/customer.env", DiscoveryMode::Full),
+        ] {
+            let state = http_state(false);
+            let (router, calls, _) = counting_router(false);
+            let mut reg = Registry::default();
+            reg.servers.push(stub_server("s", "Server"));
+            *state.registry.lock().unwrap() = reg;
+            *state.cached_tools.lock().unwrap() =
+                Arc::new(CatalogSnapshot::new(router.shared_tools()));
+            swap_router(&state, router);
+            let allowed = HashSet::from(["s".to_string()]);
+            let search_name = if mode == DiscoveryMode::Grouped {
+                "help_s"
+            } else {
+                "toolport_search_tools"
+            };
+            let run = |name: &str, arguments: Value| {
+                process_request_wire(
+                    &state,
+                    &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":name,"arguments":arguments}}),
+                    &SearchGuard::default(), Some(&allowed), None, None, None, Some(client), None, mode,
+                ).unwrap()
+            };
+            for query in ["work", "s__work"] {
+                let response = run(search_name, json!({"query":query}));
+                let text = response.envelope["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap();
+                assert!(text.contains("s__work"), "{text}");
+                assert_eq!(response.envelope["result"]["isError"], false);
+            }
+            let response = if observation::telemetry_principal(client).is_some() {
+                let response = run("toolport_call_tool", json!({"name":"s__work", "arguments":{}}));
+                assert_eq!(response.envelope["result"]["isError"], false);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                response
+            } else {
+                run(search_name, json!({"query":"work"}))
+            };
+            let session_id = response
+                .observation
+                .as_ref()
+                .unwrap()
+                .context()
+                .session_id
+                .unwrap();
+            let rows: Vec<_> = audit::read_all()
+                .unwrap()
+                .into_iter()
+                .filter(|row| {
+                    row["sessionId"] == session_id
+                        && (row["kind"] == "internal" || row["tool"] == "work")
+                })
+                .collect();
+            assert_eq!(rows.len(), 3, "{rows:?}");
+            for row in rows {
+                assert_eq!(
+                    row["client"].as_str(),
+                    observation::telemetry_principal(client)
+                );
+                assert!(row["durationMs"].is_u64(), "{row}");
+                assert!(row["cold"].is_boolean(), "{row}");
+                if row["kind"] == "internal" {
+                    assert_eq!(row["tool"], "search");
+                } else {
+                    assert!(row["dispatchMs"].is_u64(), "{row}");
+                }
+            }
+        }
     }
 
     #[test]
