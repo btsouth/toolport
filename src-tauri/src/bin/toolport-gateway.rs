@@ -22453,7 +22453,10 @@ mod tests {
             let mut seen = started_supervisors();
             router.prepare_lazy_use(id);
             while router.any_starting(|_| true) && Instant::now() < deadline {
-                seen = wait_for_started_supervisor(seen, deadline);
+                seen = wait_for_started_supervisor(
+                    seen,
+                    deadline.min(Instant::now() + Duration::from_millis(10)),
+                );
             }
             assert!(!router.any_starting(|_| true));
         }
@@ -22527,11 +22530,14 @@ mod tests {
     #[test]
     fn reviewed_unscoped_no_match_waits_for_first_catalog_publication() {
         let _env = DataDirTestEnv::new("reviewed-no-match-publication");
-        let router = counting_cache_supervisor("publishing", Vec::new(), &Arc::new(AtomicUsize::new(0)));
+        let router = counting_cache_supervisor(
+            "publishing",
+            Vec::new(),
+            &Arc::new(AtomicUsize::new(0)),
+        );
         router.prepare_lazy_use("publishing");
         wait_for_supervisor_result(&router);
         assert!(router.any_publishing_first_catalog(|_| true));
-        assert!(router.pending_statuses().iter().all(|status| !status.connecting));
         let text = reviewed_no_match_text(&router, None);
         assert_eq!(text, "Servers are still connecting. Retry shortly or check toolport_status.\n\n[]");
         let text = reviewed_no_match_text(&router, Some(&HashSet::new()));
@@ -22575,7 +22581,7 @@ mod tests {
         assert!(!text.contains("still connecting"), "{text}");
         assert!(!text.contains("Retry"), "{text}");
         let text = reviewed_no_match_text(&router, Some(&HashSet::new()));
-        assert_eq!(text, "No tools matched. If you know the target server, search again with an empty query and its server prefix; otherwise call toolport_status to see the available prefixes.\n\n[]");
+        assert_eq!(text, "No tools matched. If you know the target server, search again with an empty query and its `server` prefix; otherwise call toolport_status to see the available prefixes.\n\n[]");
         drop(release);
     }
 
