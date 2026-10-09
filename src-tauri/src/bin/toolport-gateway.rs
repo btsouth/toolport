@@ -6341,6 +6341,7 @@ fn handle_request(
 
 /// A tools response serializes its immutable array directly into the envelope.
 /// IDs, protocol decoration and downstream TTL remain request-local.
+#[derive(Clone)]
 struct GatewayResponse {
     envelope: Value,
     surface: Option<Arc<savings::SerializedSurface>>,
@@ -6390,6 +6391,21 @@ impl serde::Serialize for GatewayResponse {
 }
 
 impl GatewayResponse {
+    fn to_json(&self) -> Result<String, serde_json::Error> {
+        let Some(surface) = &self.surface else {
+            return serde_json::to_string(self);
+        };
+        // The envelope contains an empty tools array. Reserve its replacement
+        // before writing so the final delimiters cannot double a large buffer.
+        let capacity = serde_json::to_vec(&self.envelope)?
+            .len()
+            .saturating_add(surface.json.get().len().saturating_sub(2));
+        let mut bytes = Vec::with_capacity(capacity);
+        serde_json::to_writer(&mut bytes, self)?;
+        // SAFETY: serde_json only writes valid UTF-8 into this vector.
+        Ok(unsafe { String::from_utf8_unchecked(bytes) })
+    }
+
     fn into_value(self) -> Value {
         // Parsed callers (tests and OpenAPI calls) retain their existing API.
         // MCP stdio and HTTP never take this compatibility path.
@@ -16112,7 +16128,11 @@ fn mcp_accepts_sse(accept: Option<&str>) -> bool {
 
 /// Wrap a single JSON-RPC message as one SSE `message` event (stream closes after).
 fn mcp_sse_body(json: &str) -> String {
-    format!("event: message\ndata: {json}\n\n")
+    let mut body = String::with_capacity(json.len().saturating_add(23));
+    body.push_str("event: message\ndata: ");
+    body.push_str(json);
+    body.push_str("\n\n");
+    body
 }
 
 /// `session_id` is `None` for a modern (2026-07-28) client: the response must
@@ -16124,11 +16144,24 @@ fn mcp_rpc_response(
     session_id: Option<&str>,
     prefer_sse: bool,
 ) -> HttpOut {
-    let out = if prefer_sse {
-        HttpOut::new(status, "text/event-stream", mcp_sse_body(&json_body))
-            .with_header("Cache-Control", "no-cache")
+    let body = if prefer_sse {
+        mcp_sse_body(&json_body)
     } else {
-        HttpOut::new(status, "application/json", json_body)
+        json_body
+    };
+    mcp_rpc_response_ready(status, body, session_id, prefer_sse)
+}
+
+fn mcp_rpc_response_ready(
+    status: u16,
+    body: String,
+    session_id: Option<&str>,
+    prefer_sse: bool,
+) -> HttpOut {
+    let out = if prefer_sse {
+        HttpOut::new(status, "text/event-stream", body).with_header("Cache-Control", "no-cache")
+    } else {
+        HttpOut::new(status, "application/json", body)
     };
     match session_id {
         Some(sid) => out.with_header("Mcp-Session-Id", sid),
@@ -16610,15 +16643,31 @@ fn handle_mcp_http(
                     } else {
                         200
                     };
-                    let body = serde_json::to_string(&resp).unwrap_or_else(|_| {
-                        json!({
+                    if resp.surface.is_none() {
+                        let body = serde_json::to_string(&resp.envelope).unwrap_or_else(|_| {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": req.get("id").cloned().unwrap_or(Value::Null),
+                                "error": { "code": -32603, "message": "serialize failed" }
+                            })
+                            .to_string()
+                        });
+                        return mcp_rpc_response(status, body, session_id.as_deref(), prefer_sse);
+                    }
+                    let body = gateway_memory::serialize(&resp, prefer_sse).unwrap_or_else(|_| {
+                        let body = json!({
                             "jsonrpc": "2.0",
                             "id": req.get("id").cloned().unwrap_or(Value::Null),
                             "error": { "code": -32603, "message": "serialize failed" }
                         })
-                        .to_string()
+                        .to_string();
+                        if prefer_sse {
+                            mcp_sse_body(&body)
+                        } else {
+                            body
+                        }
                     });
-                    mcp_rpc_response(status, body, session_id.as_deref(), prefer_sse)
+                    mcp_rpc_response_ready(status, body, session_id.as_deref(), prefer_sse)
                 }
                 None => {
                     let body = json!({
@@ -19604,6 +19653,9 @@ fn main() {
             }
         }
         ArgAction::Run => {}
+    }
+    if daemon_requested(&cli_args) {
+        gateway_memory::configure_daemon();
     }
     {
         use std::io::IsTerminal;
@@ -39410,11 +39462,11 @@ mod tests {
                                 )
                                 .unwrap();
                                 assert_eq!(
-                                    serde_json::to_vec(&cold).unwrap(),
+                                    cold.to_json().unwrap().as_bytes(),
                                     serde_json::to_vec(&expected).unwrap()
                                 );
                                 assert_eq!(
-                                    serde_json::to_vec(&warm).unwrap(),
+                                    warm.to_json().unwrap().as_bytes(),
                                     serde_json::to_vec(&expected).unwrap()
                                 );
                             }
@@ -39423,6 +39475,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tool_surface_wire_buffer_does_not_double_after_the_cached_array() {
+        let surface = Arc::new(savings::SerializedSurface::new(&[json!({
+            "name": "read",
+            "description": "é\n\"🦀".repeat(128 * 1024),
+            "inputSchema": {"type": "object"}
+        })]));
+        for id in [json!(7), json!("é\n\"🦀"), Value::Null] {
+            let response = GatewayResponse {
+                envelope: success(id, json!({"tools": [], "cacheTTL": 123})),
+                surface: Some(Arc::clone(&surface)),
+            };
+            let expected = serde_json::to_string(&response).unwrap();
+            let body = response.to_json().unwrap();
+            assert_eq!(body, expected);
+            assert_eq!(body.capacity(), body.len(), "cached reply must not grow");
+            assert_eq!(
+                mcp_sse_body(&body),
+                format!("event: message\ndata: {expected}\n\n")
+            );
+            for sse in [false, true] {
+                for session in [None, Some("legacy-session")] {
+                    let framed = gateway_memory::serialize(&response, sse).unwrap();
+                    let out = mcp_rpc_response_ready(429, framed, session, sse);
+                    let expected = mcp_rpc_response(429, body.clone(), session, sse);
+                    assert_eq!(out.status, expected.status);
+                    assert_eq!(out.ctype, expected.ctype);
+                    assert_eq!(out.body, expected.body);
+                    assert_eq!(out.extra, expected.extra);
+                }
+            }
+        }
+        let response = GatewayResponse::from(error(json!(1), -32603, "é\n\"🦀"));
+        assert_eq!(
+            response.to_json().unwrap(),
+            serde_json::to_string(&response).unwrap()
+        );
     }
 
     #[test]
