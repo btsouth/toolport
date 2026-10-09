@@ -1,3 +1,4 @@
+import { SecretReferenceField } from "@/components/SecretReferenceField";
 import { useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
@@ -106,12 +107,13 @@ export function ServerDialog({
   // Env vars (API keys etc.). Values are vaulted in the OS keychain, never stored
   // in the registry, so existing secrets show as declared keys with empty values.
   const [envRows, setEnvRows] = useState<
-    { key: string; value: string; secret?: boolean }[]
+    { key: string; value: string; secret?: boolean; source?: { ref: string } }[]
   >(
     initial?.env.map((e) => ({
       key: e.key,
       value: e.secret ? "" : (e.value ?? ""),
       secret: e.secret,
+      source: e.source,
     })) ?? [],
   );
   const [launch, setLaunch] = useState<LaunchConfig | null>(initial?.launch ?? null);
@@ -183,6 +185,7 @@ export function ServerDialog({
           key: e.key,
           value: e.secret ? "" : (e.value ?? ""),
           secret: e.secret,
+          source: e.source,
         })) ?? [],
       );
       setLaunch(initial?.launch ?? null);
@@ -296,10 +299,13 @@ export function ServerDialog({
               })),
             }
           : null,
+      headerKeys: initial?.headerKeys,
+      secretSources: initial?.secretSources,
       env: declared.map((r) => ({
         key: r.key.trim(),
-        value: (withSecretValues || r.secret === false) && r.value ? r.value : null,
-        secret: r.secret !== false,
+        value: !r.source && (withSecretValues || r.secret === false) && r.value ? r.value : null,
+        secret: r.source ? true : r.secret !== false,
+        ...(r.source ? { source: r.source } : {}),
       })),
       url: isStdio ? null : form.url.trim() || null,
       source: bindingCleared ? "manual" : (initial?.source ?? "manual"),
@@ -399,7 +405,7 @@ export function ServerDialog({
       const failedKeys: string[] = [];
       if (id) {
         for (const r of declared) {
-          if (!r.value || r.secret === false) continue;
+          if (r.source || !r.value || r.secret === false) continue;
           const key = r.key.trim();
           try {
             result = await setSecret(id, key, r.value);
@@ -709,21 +715,24 @@ export function ServerDialog({
               your OS keychain, never in the config.
             </p>
             {envRows.map((row, i) => (
-              <div key={i} className="flex items-center gap-2">
+              <div key={i} className="flex flex-wrap items-center gap-2">
                 <Input
                   placeholder="ENV_NAME"
                   className="font-mono"
                   value={row.key}
                   onChange={(e) => setEnvRow(i, "key", e.target.value)}
                 />
-                <Input
+                {row.secret !== false && <select aria-label={`Key source for ${row.key || "variable"}`} className="rounded border bg-background p-1 text-xs" value={row.source ? "reference" : "paste"} onChange={(e) => setEnvRows((rows) => rows.map((r,j) => j === i ? { ...r, value: "", source: e.target.value === "reference" ? { ref: "op://Engineering/Docs/key" } : undefined } : r))}>
+                  <option value="paste">Paste a key</option><option value="reference">From a password manager</option>
+                </select>}
+                {row.source ? <SecretReferenceField serverId={currentEditId ?? ""} value={row.source.ref} onChange={(ref) => setEnvRows((rows) => rows.map((r,j) => j === i ? { ...r, source: { ref } } : r))} /> : <Input
                   type={row.secret === false ? "text" : "password"}
                   placeholder={
                     initial?.env.some((e) => e.key === row.key) ? "•••• (saved)" : "value"
                   }
                   value={row.value}
                   onChange={(e) => setEnvRow(i, "value", e.target.value)}
-                />
+                />}
                 <label className="flex shrink-0 items-center gap-1 text-xs">
                   <input
                     type="checkbox"
@@ -732,7 +741,7 @@ export function ServerDialog({
                     onChange={(e) =>
                       setEnvRows((rows) =>
                         rows.map((r, j) =>
-                          j === i ? { ...r, secret: e.target.checked } : r,
+                          j === i ? { ...r, secret: e.target.checked, source: e.target.checked ? r.source : undefined } : r,
                         ),
                       )
                     }

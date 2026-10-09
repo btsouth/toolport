@@ -2925,7 +2925,8 @@ fn team_server_export(reg: &Registry) -> Value {
                 "launch": s.launch.as_ref().map(|launch| launch.without_values()),
                 "cwd": s.cwd,
                 "url": url,
-                "env": s.env.iter().map(|e| serde_json::json!({ "key": e.key, "secret": e.secret })).collect::<Vec<_>>(),
+                "env": s.env.iter().map(|e| { let mut value = serde_json::json!({ "key": e.key, "secret": e.secret }); if let Some(source) = e.unknown_fields.get("source") { value["source"] = source.clone(); } value }).collect::<Vec<_>>(),
+                "headerKeys": s.unknown_fields.get("headerKeys"),
                 "disabledTools": s.disabled_tools,
                 "requestTimeoutMs": s.request_timeout_ms,
                 "initializeTimeoutMs": s.initialize_timeout_ms,
@@ -3038,6 +3039,7 @@ fn review_items(config: &Value) -> BTreeMap<String, Value> {
             "denyDestructive": config["denyDestructive"].as_bool().unwrap_or(false),
             "screeningPolicy": screening,
             "rateLimits": config.get("rateLimits").cloned().unwrap_or(json!([])),
+            "secretSources": config.get("secretSources").cloned().unwrap_or(Value::Null),
         }),
     );
     items.insert(
@@ -3102,6 +3104,7 @@ fn current_policy(reg: &Registry) -> Value {
             "forcePiiRedaction": reg.team_forced_pii_redaction,
         },
         "rateLimits": reg.team.as_ref().map(|t| &t.rate_limits),
+        "secretSources": reg.servers.iter().find_map(|s| s.unknown_fields.get("secretSources")).cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -3614,6 +3617,13 @@ fn apply_review_state(
         immediate_rate_limits(&mut policy, latest);
     }
     policy["screeningPolicy"]["minSafetyLevel"] = json!(floor(&policy));
+    // Secret-source restrictions apply immediately, including while policy review is pending.
+    policy["secretSources"] = review
+        .latest
+        .get("policy")
+        .and_then(|v| v.get("secretSources"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let mut effective = policy;
     effective["callAuditExport"] = review
         .accepted
@@ -4108,7 +4118,34 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
             }
             let shared_id = team_entry_original_id(s).unwrap_or_default().to_string();
             let allowed = parse_allowed_tools(s);
-            match classify_team_server(s, &tag) {
+            let classified = match classify_team_server(s, &tag) {
+                TeamClass::Ready(mut entry) => {
+                    if let Some(policy) = team_cfg.get("secretSources").filter(|v| !v.is_null()) {
+                        entry
+                            .unknown_fields
+                            .insert("secretSources".into(), policy.clone());
+                    }
+                    if crate::secret_refs::validate_server(&entry).is_err() {
+                        TeamClass::Blocked
+                    } else {
+                        TeamClass::Ready(entry)
+                    }
+                }
+                TeamClass::Review(mut entry) => {
+                    if let Some(policy) = team_cfg.get("secretSources").filter(|v| !v.is_null()) {
+                        entry
+                            .unknown_fields
+                            .insert("secretSources".into(), policy.clone());
+                    }
+                    if crate::secret_refs::validate_server(&entry).is_err() {
+                        TeamClass::Blocked
+                    } else {
+                        TeamClass::Review(entry)
+                    }
+                }
+                other => other,
+            };
+            match classified {
                 TeamClass::Ready(mut entry) => {
                     let collides = slug_counts.get(&entry.id).copied().unwrap_or(0) > 1;
                     entry.id = local_team_server_id(&entry, &tag, &previous, &used_ids, collides);
@@ -4429,6 +4466,14 @@ pub(crate) fn consent_fingerprint(entry: &ServerEntry) -> String {
     for key in env_keys {
         field("env", key);
     }
+    for e in &entry.env {
+        if let Some(r) = crate::secret_refs::reference_for(e) {
+            field("secretRef", &format!("{}:{r}", e.key));
+        }
+    }
+    if let Some(h) = entry.unknown_fields.get("headerKeys") {
+        field("headerKeys", &h.to_string());
+    }
     field("cwd", entry.cwd.as_deref().unwrap_or(""));
     field("url", entry.url.as_deref().unwrap_or(""));
     if let Some(credentials) = &entry.client_credentials {
@@ -4507,6 +4552,9 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         TEAM_ORIGINAL_ID_FIELD.into(),
         Value::String(orig_id.unwrap_or(name).to_string()),
     );
+    if let Some(headers) = s.get("headerKeys").filter(|v| !v.is_null()) {
+        unknown_fields.insert("headerKeys".into(), headers.clone());
+    }
     let str_array = |k: &str| {
         s.get(k)
             .and_then(Value::as_array)
@@ -4528,7 +4576,10 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
                         key,
                         value: None,
                         secret: e.get("secret").and_then(Value::as_bool).unwrap_or(true),
-                        unknown_fields: Default::default(),
+                        unknown_fields: e
+                            .get("source")
+                            .map(|s| [("source".into(), s.clone())].into_iter().collect())
+                            .unwrap_or_default(),
                     })
                 })
                 .collect()
@@ -4626,6 +4677,9 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
     // A server that runs a local command (stdio, or any command-bearing entry) is the RCE
     // case: carry the command so the member CAN run it, but only after they enable it.
     // Nothing here runs at sync time; the gateway only starts servers enabled in a profile.
+    if crate::secret_refs::validate_server(&entry).is_err() {
+        return TeamClass::Blocked;
+    }
     if entry.transport == "stdio" || command.is_some() {
         match command {
             Some(c) => entry.command = Some(c),

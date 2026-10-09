@@ -1,3 +1,5 @@
+import { SecretReferenceField } from "@/components/SecretReferenceField";
+import { referenceProvider } from "@/lib/secretRefs";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Check, ExternalLink, KeyRound, Loader2, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
@@ -17,6 +19,7 @@ import {
   secretStatus,
   setAuthToken,
   setSecret,
+  setSecretReference,
 } from "@/lib/api";
 import type { AuthInfo, Registry, ServerEntry } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -134,7 +137,17 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   const [authInfo, setAuthInfo] = useState<AuthInfo | null>(null);
   const [probing, setProbing] = useState(false);
 
-  const secretKeys = server.env.filter((e) => e.secret).map((e) => e.key);
+  const secretKeys = [...new Set([...server.env.filter((e) => e.secret).map((e) => e.key), ...(server.headerKeys ?? []).map((h) => h.key)])];
+  const [references, setReferences] = useState<Record<string, string | undefined>>({});
+  useEffect(() => {
+    setReferences(Object.fromEntries([...server.env, ...(server.headerKeys ?? [])].filter((e) => e.source).map((e) => [e.key, e.source!.ref])));
+  }, [server]);
+  async function saveReference(key: string) {
+    setBusyKey(key);
+    try { const registry = await setSecretReference(server.id, key, references[key]!); onSaved(registry); onChanged?.(); toast.success("Reference saved"); }
+    catch (error) { toastError("Could not save reference", error); }
+    finally { setBusyKey(null); }
+  }
   // A server with a command is stdio (matches how the backend connects); only a
   // command-less, URL-based server is remote. Guards against a stray empty-string
   // url making a stdio server show the remote token/OAuth UI.
@@ -227,7 +240,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
    * is one answer for the whole list and one warning to show. */
   async function probeVaultedKeys(vaultRunId: number) {
     try {
-      const pairs = await secretStatus(server.id, secretKeys);
+      const pairs = await secretStatus(server.id, secretKeys.filter((key) => ![...server.env, ...(server.headerKeys ?? [])].find((e) => e.key === key)?.source));
       if (vaultRunId !== vaultRunIdRef.current) return;
       setVaulted(Object.fromEntries(pairs));
       setSecretProbeError(false);
@@ -869,7 +882,14 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                       </span>
                     )}
                   </div>
-                  <div className="flex items-center gap-2">
+                  <select aria-label={`Key source for ${key}`} className="self-start rounded border bg-background p-1 text-xs" value={references[key] !== undefined ? "reference" : "paste"} onChange={(e) => setReferences((refs) => ({ ...refs, [key]: e.target.value === "reference" ? "op://Engineering/Docs/key" : undefined }))}>
+                    <option value="paste">Paste a key</option><option value="reference">From a password manager</option>
+                  </select>
+                  {references[key] !== undefined ? <>
+                    <p className="text-xs">{referenceProvider(references[key])?.name ?? "Password manager"}</p>
+                    <SecretReferenceField serverId={server.id} value={references[key]!} onChange={(ref) => setReferences((refs) => ({ ...refs, [key]: ref }))} />
+                    <Button size="sm" className="self-start" disabled={busyKey !== null || !references[key]} onClick={() => void saveReference(key)}>Save reference</Button>
+                  </> : <div className="flex items-center gap-2">
                     <Input
                       type="password"
                       placeholder={
@@ -923,7 +943,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                         }
                       />
                     )}
-                  </div>
+                  </div>}
                 </div>
               ))}
             </div>

@@ -8678,7 +8678,9 @@ fn server_credential_revision(server: &ServerEntry, generation: u64) -> String {
     let mut keys: BTreeSet<(String, bool)> = server
         .env
         .iter()
-        .filter(|entry| entry.secret && entry.value.is_none())
+        .filter(|entry| {
+            entry.secret && entry.value.is_none() && !entry.unknown_fields.contains_key("source")
+        })
         .map(|entry| (entry.key.clone(), false))
         .collect();
     if let Some(launch) = &server.launch {
@@ -8686,7 +8688,11 @@ fn server_credential_revision(server: &ServerEntry, generation: u64) -> String {
             launch
                 .inputs
                 .iter()
-                .filter(|input| input.secret && input.value.is_none())
+                .filter(|input| {
+                    input.secret
+                        && input.value.is_none()
+                        && !input.unknown_fields.contains_key("source")
+                })
                 .map(|input| (input.key.clone(), true)),
         );
     }
@@ -8740,7 +8746,7 @@ fn effective_server_spec(
         .map(|entry| {
             (
                 entry.key.clone(),
-                json!({"value": entry.value, "secret": entry.secret}),
+                json!({"value": entry.value, "secret": entry.secret, "source": entry.unknown_fields.get("source")}),
             )
         })
         .collect();
@@ -8751,7 +8757,7 @@ fn effective_server_spec(
             .map(|input| {
                 (
                     &input.key,
-                    json!({"secret":input.secret,"required":input.required,"value":input.value}),
+                    json!({"secret":input.secret,"required":input.required,"value":input.value,"source":input.unknown_fields.get("source")}),
                 )
             })
             .collect();
@@ -8759,7 +8765,7 @@ fn effective_server_spec(
     });
     json!({
         "command": server.command, "args": server.args, "launch": launch, "url": server.url,
-        "source": server.source,
+        "source": server.source, "headerKeys": server.unknown_fields.get("headerKeys"), "secretSources": server.unknown_fields.get("secretSources"),
         "cwdConfigured": server.cwd,
         "cwd": server.cwd.as_deref().and_then(|cwd| downstream::resolve_root_token(cwd, root)),
         "inheritEnv": server.inherit_env, "env": env,
@@ -8824,6 +8830,19 @@ fn connect_one_result(
     // connect, and `DownstreamServer::set_server_request_handler` wraps again afterwards
     // (idempotent) (SBS-891).
     let server_handler = downstream::stamping_server_request_handler(&server.id, server_handler);
+    // Each new stdio connection resolves once. The supervisor calls us again on restart.
+    let resolved_server;
+    let server = if server.command.is_some() {
+        resolved_server =
+            conduit_lib::secret_refs::resolve_server(server).map_err(|error| ConnectFailure {
+                message: error.to_string(),
+                needs_auth: false,
+                auth_target: None,
+            })?;
+        &resolved_server
+    } else {
+        server
+    };
     let initialize_timeout = server.initialize_timeout();
     let result = if let Err(error) = &initialize_timeout {
         Err(error.clone())
@@ -8903,8 +8922,11 @@ fn connect_one_result(
                 }
                 t.set_server_request_handler(Arc::clone(&server_handler));
                 t.set_progress_sink(progress);
-                DownstreamServer::connect(server.id.clone(), Box::new(t))
-                    .map_err(|error| resolved.redact(error))
+                DownstreamServer::connect(
+                    server.id.clone(),
+                    remote::protect_transport(server, Box::new(t)),
+                )
+                .map_err(|error| resolved.redact(error))
             }
             Err(e) => Err(resolved.redact(e)),
         }

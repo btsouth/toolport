@@ -184,8 +184,12 @@ fn selected_servers_to_import(
 async fn import_servers(
     state: State<'_, RegistryState>,
     selected: Option<Vec<String>>,
-    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
-    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
+    secret_choices: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    >,
+    credential_inputs: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    >,
 ) -> Result<Registry, String> {
     let selected = match selected {
         Some(selected) => selected,
@@ -207,11 +211,20 @@ async fn add_snippet_servers(
     state: State<'_, RegistryState>,
     text: String,
     selected: Vec<String>,
-    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
-    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
+    secret_choices: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    >,
+    credential_inputs: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    >,
 ) -> Result<serde_json::Value, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::add_snippet_servers_inputs(&text,&selected,&secret_choices.unwrap_or_default(),&credential_inputs.unwrap_or_default())
+        crate::registry_controller::add_snippet_servers_inputs(
+            &text,
+            &selected,
+            &secret_choices.unwrap_or_default(),
+            &credential_inputs.unwrap_or_default(),
+        )
     })
     .await
     .map_err(|_| "Paste import stopped".to_string())??;
@@ -652,8 +665,12 @@ async fn migrate_client(
     force: Option<bool>,
     selected: Vec<String>,
     revision: String,
-    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
-    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
+    secret_choices: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    >,
+    credential_inputs: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    >,
 ) -> Result<MigrateResult, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         crate::registry_controller::migrate_client_reviewed_inputs(
@@ -670,7 +687,20 @@ async fn migrate_client(
     .map_err(|e| e.to_string())??;
 
     let registry = reload_into_state(state.inner())?;
-    let backup_date = outcome.result.outcome.backup.as_ref().and_then(|path|std::fs::metadata(path).ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()).map(|duration|duration.as_secs());
+    let backup_date = outcome
+        .result
+        .outcome
+        .backup
+        .as_ref()
+        .and_then(|path| {
+            std::fs::metadata(path)
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+        })
+        .map(|duration| duration.as_secs());
     Ok(MigrateResult {
         registry,
         imported: outcome.imported,
@@ -680,6 +710,42 @@ async fn migrate_client(
         backup_date,
         outcome: outcome.result.outcome,
     })
+}
+
+#[tauri::command]
+async fn set_secret_reference(
+    app: AppHandle,
+    server_id: String,
+    key: String,
+    reference: String,
+) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        let (reg, ()) = write_registry(state.inner(), |reg| {
+            crate::registry_controller::apply_secret_reference(reg, &server_id, &key, &reference)
+        })?;
+        Ok(reg)
+    })
+    .await
+    .map_err(|_| "Reference task stopped".to_string())?
+}
+#[tauri::command]
+async fn test_secret_reference(
+    server_id: String,
+    reference: String,
+) -> Result<(), crate::secret_refs::ResolveError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::registry_controller::test_secret_reference(&server_id, &reference)
+    })
+    .await
+    .map_err(|_| crate::secret_refs::ResolveError {
+        state: crate::secret_refs::ErrorState::Failed,
+        message: "Reference test stopped".into(),
+    })?
+}
+#[tauri::command]
+fn secret_reference_providers() -> Vec<crate::secret_refs::Provider> {
+    crate::secret_refs::PROVIDERS.to_vec()
 }
 
 /// Store a secret env value in the OS keychain and mark it on the server entry
@@ -3960,6 +4026,9 @@ pub fn run() {
             migrate_client,
             preview_client_setup,
             set_secret,
+            set_secret_reference,
+            test_secret_reference,
+            secret_reference_providers,
             set_launch_secret,
             set_launch_input_value,
             delete_secret,

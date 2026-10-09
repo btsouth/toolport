@@ -5790,6 +5790,7 @@ pub(crate) fn guarded_agent_with_timeout(
 /// the JSON-RPC message. A session id from `initialize` is echoed on later calls.
 pub struct HttpTransport {
     url: String,
+    credential_headers: Vec<(String, String)>,
     agent: ureq::Agent,
     /// Separate pool so inline replies can POST while an SSE body is still open.
     inline_agent: ureq::Agent,
@@ -6411,6 +6412,7 @@ impl HttpTransport {
     ) -> Self {
         HttpTransport {
             url: url.to_string(),
+            credential_headers: Vec::new(),
             agent: guarded_agent_with_timeout(block_private, request_timeout),
             inline_agent: guarded_agent_with_timeout(block_private, request_timeout),
             connect_timeout: request_timeout,
@@ -6442,6 +6444,32 @@ impl HttpTransport {
             owns_listener_generation: true,
             draining: None,
         }
+    }
+
+    pub fn set_credential_headers(&mut self, headers: Vec<(String, String)>) -> Result<(), String> {
+        for (name, value) in &headers {
+            if name.is_empty()
+                || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                || value.chars().any(char::is_control)
+                || [
+                    "host",
+                    "content-length",
+                    "transfer-encoding",
+                    "connection",
+                    "content-type",
+                    "accept",
+                ]
+                .contains(&name.to_ascii_lowercase().as_str())
+                || name.to_ascii_lowercase().starts_with("mcp-")
+            {
+                return Err(
+                    "Invalid credential header. Use an API key header without control characters."
+                        .into(),
+                );
+            }
+        }
+        self.credential_headers = headers;
+        Ok(())
     }
 
     pub fn set_scope_reauthorize(&mut self, callback: Option<ScopeReauthorizeFn>) {
@@ -6524,6 +6552,7 @@ impl HttpTransport {
     fn draining_shell(&self, receiver: Receiver<HttpAttemptOutcome>) -> Self {
         Self {
             url: self.url.clone(),
+            credential_headers: self.credential_headers.clone(),
             agent: self.agent.clone(),
             inline_agent: self.inline_agent.clone(),
             connect_timeout: self.connect_timeout,
@@ -6600,6 +6629,7 @@ impl HttpTransport {
         let agent = guarded_agent_with_timeout(self.block_private, HTTP_CANCEL_FORWARD_TIMEOUT);
         let url = self.url.clone();
         let auth = Arc::clone(&self.auth);
+        let credential_headers = self.credential_headers.clone();
         let session_id = self
             .session_id
             .lock()
@@ -6641,6 +6671,9 @@ impl HttpTransport {
                 .clone();
             if let Some(token) = token.as_deref() {
                 request = request.set("Authorization", &bearer_header(token));
+            }
+            for (name, value) in &credential_headers {
+                request = request.set(name, value);
             }
             if let Err(error) = request.send_string(&body.to_string()) {
                 downstream_trace(&format!("HTTP cancellation forward failed: {error}"));
@@ -7154,6 +7187,9 @@ impl HttpTransport {
             if let Some(token) = auth.as_deref() {
                 req = req.set("Authorization", &bearer_header(token));
             }
+            for (name, value) in &self.credential_headers {
+                req = req.set(name, value);
+            }
             if cancel.is_some_and(|signal| !signal.mark_sending()) {
                 return Err(TransportError::Cancelled(
                     "HTTP request cancelled by upstream client".to_string(),
@@ -7472,6 +7508,9 @@ impl HttpTransport {
                 req = req.set("Authorization", &bearer_header(token));
             }
 
+            for (name, value) in &self.credential_headers {
+                req = req.set(name, value);
+            }
             if cancel.is_some_and(|signal| !signal.mark_sending()) {
                 return Err(TransportError::Cancelled(
                     "request cancelled before it reached the HTTP server".to_string(),
@@ -7845,6 +7884,7 @@ impl Transport for HttpTransport {
         let agent = self.agent.clone();
         let url = self.url.clone();
         let auth = Arc::clone(&self.auth);
+        let credential_headers = self.credential_headers.clone();
         let mut auth_shell = self.request_shell();
         let wire_version = self.wire_protocol_version();
         let dirty = self.change_dirty.clone();
@@ -7884,6 +7924,9 @@ impl Transport for HttpTransport {
                         .clone();
                     if let Some(token) = token.as_deref() {
                         request = request.set("Authorization", &bearer_header(token));
+                    }
+                    for (name, value) in &credential_headers {
+                        request = request.set(name, value);
                     }
                     match request.send_string(&payload) {
                         Ok(response) => {

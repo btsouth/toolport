@@ -12,8 +12,8 @@ mod onboarding;
 mod package_updates;
 mod pairing;
 mod settings;
-mod single_instance;
 mod setup;
+mod single_instance;
 mod state;
 mod teams;
 mod theme;
@@ -6894,6 +6894,23 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
                 .build(),
         );
     }
+    if !server.secret_references.is_empty() {
+        let providers: std::collections::BTreeSet<_> = server
+            .secret_references
+            .values()
+            .filter_map(|r| crate::secret_refs::parse(r).ok().map(|p| p.name))
+            .collect();
+        text.append(
+            &gtk::Label::builder()
+                .label(format!(
+                    "Keys from {}",
+                    providers.into_iter().collect::<Vec<_>>().join(", ")
+                ))
+                .halign(gtk::Align::Start)
+                .css_classes(["toolport-muted"])
+                .build(),
+        );
+    }
     card.append(&text);
 
     let authenticate = gtk::Button::with_label("Sign in");
@@ -7924,7 +7941,21 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
         let replace = gtk::Button::with_label("Replace");
         replace.add_css_class("toolport-secondary-action");
         replace_row.append(&replace);
+        let (source_choice, reference_box) = secret_reference_controls(
+            &server.id,
+            key,
+            server.secret_references.get(key).map(String::as_str),
+            &page,
+            &editor,
+            &feedback,
+        );
+        replace_row.set_visible(source_choice.selected() == 0);
+        let paste_row = replace_row.clone();
+        source_choice
+            .connect_selected_notify(move |choice| paste_row.set_visible(choice.selected() == 0));
+        row.append(&source_choice);
         row.append(&replace_row);
+        row.append(&reference_box);
         stored.append(&row);
 
         let server_id = server.id.clone();
@@ -8002,7 +8033,23 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
     let add = gtk::Button::with_label("Store");
     add.add_css_class("suggested-action");
     add_row.append(&new_key);
+    let (source_choice, reference_box) = secret_reference_controls_dynamic(
+        &server.id,
+        new_key.clone(),
+        None,
+        &page,
+        &editor,
+        &feedback,
+    );
+    add_row.append(&source_choice);
+    let value_for_source = new_value.clone();
+    let add_for_source = add.clone();
+    source_choice.connect_selected_notify(move |choice| {
+        value_for_source.set_visible(choice.selected() == 0);
+        add_for_source.set_visible(choice.selected() == 0);
+    });
     add_row.append(&new_value);
+    add_row.append(&reference_box);
     let add_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     add_actions.set_halign(gtk::Align::End);
     add_actions.append(&add);
@@ -10303,6 +10350,7 @@ mod tests {
             url: None,
             cwd: None,
             secret_keys: Vec::new(),
+            secret_references: Default::default(),
             client_credentials: None,
             enabled: true,
             requires_review: false,
@@ -10367,4 +10415,113 @@ mod p10c_r1_presentation_tests {
         assert_eq!(approval_outcome("denied").2, "approval-denied");
         assert_eq!(approval_outcome("withdrawn").2, "disabled");
     }
+}
+
+fn secret_reference_controls(
+    server_id: &str,
+    key: &str,
+    existing: Option<&str>,
+    page: &ServerPage,
+    editor: &adw::Window,
+    feedback: &gtk::Label,
+) -> (gtk::DropDown, gtk::Box) {
+    let key = gtk::Entry::builder().text(key).build();
+    secret_reference_controls_dynamic(server_id, key, existing, page, editor, feedback)
+}
+fn secret_reference_controls_dynamic(
+    server_id: &str,
+    key: gtk::Entry,
+    existing: Option<&str>,
+    page: &ServerPage,
+    editor: &adw::Window,
+    feedback: &gtk::Label,
+) -> (gtk::DropDown, gtk::Box) {
+    let choice = gtk::DropDown::from_strings(&["Paste a key", "From a password manager"]);
+    choice.set_selected(u32::from(existing.is_some()));
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    container.set_visible(existing.is_some());
+    let providers = crate::secret_refs::PROVIDERS;
+    let names: Vec<_> = providers.iter().map(|p| p.name).collect();
+    let provider = gtk::DropDown::from_strings(&names);
+    provider.set_selected(
+        existing
+            .and_then(|r| providers.iter().position(|p| r.starts_with(p.scheme)))
+            .unwrap_or(0) as u32,
+    );
+    let reference = gtk::Entry::builder()
+        .text(existing.unwrap_or(providers[0].example))
+        .placeholder_text("Secret reference")
+        .build();
+    reference.set_tooltip_text(Some(
+        "Only the reference syncs. Sign in to this provider on each machine.",
+    ));
+    let reference_for_provider = reference.clone();
+    provider.connect_selected_notify(move |provider| {
+        reference_for_provider.set_text(providers[provider.selected() as usize].example)
+    });
+    container.append(&provider);
+    container.append(&reference);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let test = gtk::Button::with_label("Test");
+    let save = gtk::Button::with_label("Save reference");
+    actions.append(&test);
+    actions.append(&save);
+    container.append(&actions);
+    let box_for_choice = container.clone();
+    choice
+        .connect_selected_notify(move |choice| box_for_choice.set_visible(choice.selected() == 1));
+    let test_id = server_id.to_string();
+    let test_reference = reference.clone();
+    let test_feedback = feedback.clone();
+    test.connect_clicked(move |button| {
+        button.set_sensitive(false);
+        let id = test_id.clone();
+        let reference = test_reference.text().to_string();
+        let button = button.clone();
+        let feedback = test_feedback.clone();
+        gtk::glib::spawn_future_local(async move {
+            let result = gtk::gio::spawn_blocking(move || {
+                crate::registry_controller::test_secret_reference(&id, &reference)
+            })
+            .await;
+            button.set_sensitive(true);
+            feedback.set_visible(true);
+            feedback.set_label(&match result {
+                Ok(Ok(())) => "Success. This machine can read the key.".into(),
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => "Reference test stopped".into(),
+            });
+        });
+    });
+    let id = server_id.to_string();
+    let page = page.clone();
+    let editor = editor.clone();
+    let feedback = feedback.clone();
+    save.connect_clicked(move |button| {
+        button.set_sensitive(false);
+        let id = id.clone();
+        let reprobe_id = id.clone();
+        let key = key.text().to_string();
+        let reference = reference.text().to_string();
+        let page = page.clone();
+        let editor = editor.clone();
+        let feedback = feedback.clone();
+        let button = button.clone();
+        gtk::glib::spawn_future_local(async move {
+            let result = gtk::gio::spawn_blocking(move || {
+                crate::registry_controller::set_secret_reference(&id, &key, &reference)
+            })
+            .await;
+            finish_credential_update(
+                result,
+                &reprobe_id,
+                &page,
+                &editor,
+                &feedback,
+                &button,
+                "Reference saved",
+            );
+        });
+    });
+    (choice, container)
 }

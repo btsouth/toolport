@@ -32,6 +32,7 @@ fn missing_secret(server: &ServerEntry) -> bool {
         entry.secret
             && env_key_required(server, &entry.key)
             && entry.value.is_none()
+            && !entry.unknown_fields.contains_key("source")
             && matches!(secrets::get_secret_result(&server.id, &entry.key), Ok(None))
     })
 }
@@ -74,6 +75,9 @@ fn environment_for_probe_with(
 
 pub fn connect_server(server: &ServerEntry) -> Result<DownstreamServer, String> {
     if let Some(command) = &server.command {
+        let resolved_server =
+            crate::secret_refs::resolve_server(server).map_err(|e| e.to_string())?;
+        let server = &resolved_server;
         let env = environment_for_probe_with(server, secrets::get_secret_result)?;
         let cwd = server
             .cwd
@@ -91,8 +95,11 @@ pub fn connect_server(server: &ServerEntry) -> Result<DownstreamServer, String> 
         if let Some(timeout) = server.initialize_timeout()? {
             transport.set_connect_timeout(timeout);
         }
-        DownstreamServer::connect(server.id.clone(), Box::new(transport))
-            .map_err(|error| resolved.redact(error))
+        DownstreamServer::connect(
+            server.id.clone(),
+            remote::protect_transport(server, Box::new(transport)),
+        )
+        .map_err(|error| resolved.redact(error))
     } else if server.url.is_some() {
         remote::connect_remote(server)
     } else {

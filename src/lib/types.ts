@@ -409,13 +409,17 @@ export interface CatalogEntry {
 
 // --- Toolport registry (source of truth) ---
 
+export interface SecretReference { ref: string }
+export interface HeaderKey { key: string; env?: string; source?: SecretReference }
 export interface EnvVar {
+  source?: SecretReference;
   key: string;
   value: string | null;
   secret: boolean;
 }
 
 export interface LaunchInput {
+  source?: SecretReference;
   key: string;
   label: string;
   secret: boolean;
@@ -446,6 +450,8 @@ export interface ServerEntry {
   args: string[];
   launch?: LaunchConfig | null;
   env: EnvVar[];
+  headerKeys?: HeaderKey[];
+  secretSources?: { allowedPrefixes?: string[] };
   url: string | null;
   source: string | null;
   /** A remote removal or disable kept this saved personal original off. */

@@ -364,7 +364,13 @@ impl Import {
         }
         let mut values = Vec::new();
         let mut plain = Vec::new();
+        let mut references = Vec::new();
+        crate::secret_refs::validate_server(&entry).map_err(|e| e.to_string())?;
         for env in &entry.env {
+            if crate::secret_refs::reference_for(env).is_some() {
+                references.push(env.clone());
+                continue;
+            }
             let value = definition
                 .and_then(|d| {
                     ["env", "environment", "envs", "headers", "http_headers"]
@@ -498,6 +504,7 @@ impl Import {
             })
             .collect();
         entry.env.extend(plain);
+        entry.env.extend(references);
         if !had_launch {
             launch.required_env = entry.env.iter().map(|e| e.key.clone()).collect();
         }

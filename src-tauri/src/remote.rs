@@ -1282,8 +1282,11 @@ fn guard_connect_target(server: &ServerEntry) -> Result<(), String> {
 /// anonymous exactly like the `HTTP_AUTH_KEY` path used to.
 fn first_vaulted_secret(server: &ServerEntry) -> Result<Option<String>, String> {
     for e in &server.env {
-        if e.secret && e.value.is_none() && e.key != secrets::IMPORTED_URL_KEY {
-            if let Some(v) = secrets::get_secret_result(&server.id, &e.key)? {
+        if e.secret && e.key != secrets::IMPORTED_URL_KEY {
+            if let Some(v) = (match &e.value {
+                Some(v) => Some(v.clone()),
+                None => secrets::get_secret_result(&server.id, &e.key)?,
+            }) {
                 return Ok(Some(v));
             }
         }
@@ -1336,6 +1339,8 @@ pub fn connect_remote_with_handler(
     progress: Option<ProgressSink>,
     change_dirty: Option<Arc<AtomicU8>>,
 ) -> Result<DownstreamServer, String> {
+    let resolved = crate::secret_refs::resolve_server(server).map_err(|e| e.to_string())?;
+    let server = &resolved;
     let imported = crate::import_credentials::has_imported_url(server);
     if !imported {
         return connect_remote_inner(
@@ -1623,18 +1628,23 @@ impl Transport for ImportedTransport {
     }
 }
 fn reviewed_transport(server: &ServerEntry, transport: HttpTransport) -> Box<dyn Transport> {
-    if has_imported_credentials(server) {
-        Box::new(ImportedTransport(
-            Box::new(transport),
-            Redaction::for_server(server),
-        ))
+    protect_transport(server, Box::new(transport))
+}
+
+/// Share the existing credential redaction with stdio reference-backed connections.
+pub fn protect_transport(
+    server: &ServerEntry,
+    transport: Box<dyn Transport>,
+) -> Box<dyn Transport> {
+    if has_imported_credentials(server) || crate::secret_refs::has_references(server) {
+        Box::new(ImportedTransport(transport, Redaction::for_server(server)))
     } else {
-        Box::new(transport)
+        transport
     }
 }
 
 fn safe_imported_error(server: &ServerEntry, error: String) -> String {
-    if !has_imported_credentials(server) {
+    if !has_imported_credentials(server) && !crate::secret_refs::has_references(server) {
         return error;
     }
     Redaction::for_server(server).text(error)
@@ -1652,6 +1662,17 @@ fn connect_remote_inner(
     change_dirty: Option<Arc<AtomicU8>>,
 ) -> Result<DownstreamServer, String> {
     guard_connect_target(server)?;
+    let header_values = crate::secret_refs::resolve_headers(server).map_err(|e| e.to_string())?;
+    let mut server_with_headers = server.clone();
+    for (key, value) in &header_values {
+        server_with_headers.env.push(crate::registry::EnvVar {
+            key: key.clone(),
+            value: Some(value.clone()),
+            secret: true,
+            unknown_fields: Default::default(),
+        });
+    }
+    let server = &server_with_headers;
     let url = server.url.as_deref().unwrap_or("");
     let server_id = &server.id;
     // Untrusted-provenance servers also get private/loopback refused at the resolver,
@@ -1703,21 +1724,41 @@ fn connect_remote_inner(
     // A vault read failure is not "no token" (SBS-789): connecting anonymous on a
     // locked keychain would surface as a bogus 401/"needs sign-in" and can hand an
     // unauthenticated session to a server the user believes is authenticated.
-    let auth = match refresh_token_if_needed(server_id)? {
-        Some(fresh) => Some(fresh),
-        None => match current_credential(server_id)? {
-            Some(token) => Some(token),
-            None => first_vaulted_secret(server)
-                .map_err(|e| format!("could not read the vaulted auth token: {e}"))?,
-        },
+    let reference_auth = server
+        .env
+        .iter()
+        .find(|e| e.unknown_fields.contains_key("source") && e.secret)
+        .and_then(|e| e.value.clone());
+    let auth = if reference_auth.is_some() {
+        reference_auth.clone()
+    } else {
+        match refresh_token_if_needed(server_id)? {
+            Some(fresh) => Some(fresh),
+            None => match current_credential(server_id)? {
+                Some(token) => Some(token),
+                None => first_vaulted_secret(server)
+                    .map_err(|e| format!("could not read the vaulted auth token: {e}"))?,
+            },
+        };
+        // Remember exactly what we hand the transport. The transport force-refreshes
+        // internally on a 401/403 and vaults the result, so if the vaulted token
+        // differs from this afterwards, an exchange already happened during this
+        // connect (SOU-474).
     };
-    // Remember exactly what we hand the transport. The transport force-refreshes
-    // internally on a 401/403 and vaults the result, so if the vaulted token
-    // differs from this afterwards, an exchange already happened during this
-    // connect (SOU-474).
     let sent_auth = auth.clone();
-    let (mut transport, refreshed_during_connect) =
-        authed_transport(url, auth, server_id, block_private, request_timeout)?;
+    let (mut transport, refreshed_during_connect) = if reference_auth.is_some() {
+        require_secure_for_auth(url)?;
+        (
+            HttpTransport::guarded_with_timeout(url, auth, None, block_private, request_timeout),
+            Arc::new(AtomicBool::new(false)),
+        )
+    } else {
+        authed_transport(url, auth, server_id, block_private, request_timeout)?
+    };
+    if !header_values.is_empty() {
+        require_secure_for_auth(url)?;
+    }
+    transport.set_credential_headers(header_values.clone())?;
     transport.set_connect_timeout(initialize_timeout);
     if let Some(ref handler) = server_handler {
         transport.set_server_request_handler(handler.clone());
@@ -1732,7 +1773,7 @@ fn connect_remote_inner(
             ds.set_call_timeout(request_timeout);
             Ok(ds)
         }
-        Err(e) if is_auth_error(&e) => {
+        Err(e) if is_auth_error(&e) && reference_auth.is_none() => {
             // The transport already gets one forced refresh per token on a 401/403.
             // If it spent one during this connect, the vault now holds a token that
             // has ALREADY been rejected, so minting yet another cannot help - and
