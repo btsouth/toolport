@@ -10733,9 +10733,16 @@ fn secret_reference_fields(
         .connect_selected_notify(move |choice| box_for_choice.set_visible(choice.selected() == 1));
     let test_id = server_id.to_string();
     let test_reference = reference.clone();
+    let test_provider = provider.clone();
+    let feedback_for_changes = feedback.clone();
+    reference.connect_changed(move |_| feedback_for_changes.set_visible(false));
     let test_feedback = feedback.clone();
     test.connect_clicked(move |button| {
         button.set_sensitive(false);
+        test_reference.set_sensitive(false);
+        test_provider.set_sensitive(false);
+        let reference_field = test_reference.clone();
+        let provider_field = test_provider.clone();
         let id = test_id.clone();
         let reference = test_reference.text().to_string();
         let button = button.clone();
@@ -10746,6 +10753,8 @@ fn secret_reference_fields(
             })
             .await;
             button.set_sensitive(true);
+            reference_field.set_sensitive(true);
+            provider_field.set_sensitive(true);
             feedback.set_visible(true);
             feedback.set_label(&match result {
                 Ok(Ok(())) => "Success. This machine can read the key.".into(),
