@@ -135,6 +135,10 @@ describe("agent plugin MCP config (mcp.json)", () => {
 describe("plugin client identity", () => {
   it("names supported hosts and preserves explicit identity", () => {
     expect(pluginIdentity({}, "claude-code")).toBe("claude-code");
+    expect(pluginIdentity({}, "cursor")).toBe("cursor");
+    expect(pluginIdentity({ CLAUDE_PLUGIN_ROOT: "/fixture/inherited" }, "codex")).toBe(
+      "codex",
+    );
     expect(pluginIdentity({ CURSOR_PLUGIN_ROOT: "/fixture/plugin" })).toBe("cursor");
     expect(pluginIdentity({ CODEX_PLUGIN_ROOT: "/fixture/plugin" })).toBe("codex");
     expect(pluginIdentity({ TOOLPORT_CLIENT_ID: "custom" }, "claude-code")).toBe(

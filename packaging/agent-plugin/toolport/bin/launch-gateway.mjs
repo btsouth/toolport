@@ -227,7 +227,8 @@ function failNotInstalled(detail) {
 export function pluginIdentity(env = process.env, host) {
   if (env.TOOLPORT_CLIENT_ID?.trim()) return env.TOOLPORT_CLIENT_ID;
   if (env.CONDUIT_CLIENT_ID?.trim()) return env.CONDUIT_CLIENT_ID;
-  if (host === "claude-code" || "CLAUDE_PLUGIN_ROOT" in env) return "claude-code";
+  if (["claude-code", "cursor", "codex"].includes(host)) return host;
+  if ("CLAUDE_PLUGIN_ROOT" in env) return "claude-code";
   if ("CURSOR_PLUGIN_ROOT" in env) return "cursor";
   if ("CODEX_PLUGIN_ROOT" in env) return "codex";
   return "toolport-plugin";
