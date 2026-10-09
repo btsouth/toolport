@@ -363,6 +363,35 @@ mod tests {
     }
 
     #[test]
+    fn oversized_paths_are_rejected_before_client_info_cropping() {
+        let data = crate::registry::DataDirTestEnv::new("f3-uncropped-label-paths");
+        let path = format!("{}/customer.env", "customer-private-".repeat(14));
+        let info = json!({"clientInfo":{"name":path,"version":"1"}});
+        let combined = json!({"clientInfo":{
+            "name":"demo ".repeat(20),
+            "version":format!("{}/customer.env", "customer-private".repeat(3))
+        }});
+        for label in [
+            path,
+            crate::approval::client_info_label(Some(&info)).unwrap(),
+            crate::approval::client_info_label(Some(&combined)).unwrap(),
+        ] {
+            let session = Session::start(None, None, Some(&label), "stdio", "initialize");
+            let _context = ContextGuard::enter(Context {
+                run_id: Some("opaque".into()),
+                ..session.context()
+            });
+            let mut row = json!({"tool":"run_script", "ok":false});
+            enrich(&mut row);
+            assert_eq!(row["clientLabel"], "[private]", "{row}");
+            session.close(CloseReason::ClientDisconnect);
+        }
+        assert!(crate::telemetry::flush_for_test(std::time::Duration::from_secs(5)));
+        let audit = std::fs::read_to_string(data.dir.join("audit.jsonl")).unwrap();
+        assert!(!audit.contains("customer-private"), "{audit}");
+    }
+
+    #[test]
     fn private_paths_never_reach_session_or_correlated_audit_rows() {
         let data = crate::registry::DataDirTestEnv::new("f3-label-paths");
         for path in ["/home/private/customer.env", "C:\\private\\customer.env", "~/private/customer.env", "\\\\server\\private\\customer.env", "file:///home/private/customer.env", "file:///home/private/my customer.env", "../private/customer.env", "private/customer.env", "/home/private/my customer.env", "C:\\private\\my customer.env", "\\\\server\\private folder\\customer.env"] {
