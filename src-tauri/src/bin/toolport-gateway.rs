@@ -30388,7 +30388,8 @@ mod tests {
         let clients: Vec<_> = ["one", "two", "both", "echo"]
             .into_iter()
             .map(|profile| {
-                let (allowed, mut caller) = resolve_adapter_caller(&reg, profile, Some(profile), None);
+                let (allowed, mut caller) =
+                    resolve_adapter_caller(&reg, profile, Some(profile), None);
                 caller.discovery = Some(DiscoveryMode::Full);
                 let sid = mint_mcp_session(&state, Some(&caller.session_owner))
                     .unwrap_or_else(|_| panic!("mint fixture session"));
@@ -30466,6 +30467,40 @@ mod tests {
                     assert!(!listed
                         .iter()
                         .any(|tool| tool["name"] == "one__greet" || tool["name"] == "one__wave"));
+                }
+                if *profile == "two" {
+                    assert!(!listed.iter().any(|tool| tool["name"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with("one__"))));
+                } else {
+                    let echo = listed
+                        .iter()
+                        .find(|tool| tool["name"] == "one__echo")
+                        .unwrap();
+                    assert_eq!(
+                        echo["inputSchema"]["properties"]["text"],
+                        json!({"type":"string"}),
+                        "{phase}: profile {profile} must read the published schema"
+                    );
+                    if *profile != "echo" {
+                        let greet = listed
+                            .iter()
+                            .find(|tool| tool["name"] == "one__greet")
+                            .unwrap();
+                        assert_eq!(
+                            greet["description"],
+                            if phase == "schema" {
+                                "Greet"
+                            } else {
+                                "Updated greeting"
+                            },
+                            "{phase}: profile {profile} must read the published description"
+                        );
+                        assert_eq!(
+                            listed.iter().any(|tool| tool["name"] == "one__wave"),
+                            matches!(phase, "addition" | "reorder" | "unchanged")
+                        );
+                    }
                 }
             }
         }
