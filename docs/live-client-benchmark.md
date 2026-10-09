@@ -1,65 +1,38 @@
 # Live client discovery benchmark
 
-This opt-in driver measures real model turns against an isolated Toolport gateway
-and a deterministic public catalog mock. It never uses the installed gateway,
-changes discovery defaults, or copies credentials. Outputs belong outside the repo.
+This opt-in driver runs authenticated CLI clients against a disposable gateway and a deterministic local mock. It uses the public 1,707-tool catalog and only the search evaluation development split. Results measure real client discovery and dispatch against fictional data, not production services.
 
-Build the baseline gateway with `test-support` and no default features. Supply the
-1,707-tool public `catalog.json` and only `dev.json` from `feat/search-eval-scale`.
-The 30 requests use development intents, fictional arguments, three multi-step
-flows, and three no-match requests. No other evaluation split is read.
+Supply an existing gateway build and authenticated client executable:
 
 ```sh
 node scripts/live-client-bench.mjs \
-  --catalog /absolute/fixture/catalog.json --dev /absolute/fixture/dev.json \
-  --gateway /absolute/bin/toolport-gateway \
-  --executable /absolute/bin/claude --client claude-code --mode lazy \
-  --out /absolute/private-evidence/matrix
+  --catalog /path/to/catalog.json --dev /path/to/dev.json \
+  --gateway /path/to/toolport-gateway --executable /path/to/client \
+  --client codex --mode lazy --out /path/outside/the/repo
 ```
 
-Use `claude-code`, `codex`, or `opencode`, and `full`, `lazy`, or `grouped`.
-Each run needs a new output subdirectory. `--tasks r4-196` selects one request;
-`--limit 2` bounds pilots; `--model` overrides the CLI model. Claude defaults to
-Haiku, keeps native ToolSearch, and caps each task at $0.50. Other clients use
-their default models. `--timeout` sets a per-task millisecond deadline, default
-90 seconds. Two consecutive failures without model usage stop that invocation.
+Clients: `claude-code`, `codex`, `cursor`, `opencode`. Modes: `full`, `lazy`, `grouped`. Use `--model` to pin the CLI model and `--timeout` for the per-task deadline in milliseconds. The default deadline is 90 seconds. Every model invocation has its own registry, data directory and MCP configuration. Credentials are read by the existing CLI login and are never copied by the driver. Codex and Cursor use a read-only filesystem with disposable runtime writes. Cursor loads a workspace MCP file while its real global MCP file is hidden.
 
-Normal runs warm and verify the complete 1,707-tool catalog before starting the
-CLI. `--delay 3000`, `8000`, or `15000` skips warming and delays each downstream's
-first tools/list response for cold-catalog acceptance. `--start` runs one trivial
-turn for reported session input. `--notification` triggers tools/list_changed
-after a Slack call and asks the model to find the new capability in the same turn.
-The notification probe is separate from development-task scoring.
+- `--resume` skips completed summaries and preserves cancelled artifacts before rerunning an incomplete task.
+- `--tasks r4-001,r4-002` selects development cases; `--limit 2` bounds the selection.
+- `--start` measures a trivial first turn with no requested tool call.
+- `--notification` adds a capability after the first Slack call. A bounded response barrier keeps the change inside the active turn.
+- `--delay 8000 --single-server` delays the first downstream catalog without prewarming. The single server is named `catalog`, so its exposed tool names have that extra prefix.
+- Cold Codex runs use a loopback bridge that launches the gateway only when the client connects. This preserves a cold start under filesystem containment.
+- `--adapter-id codex` tests the installed adapter identity. The historical benchmark identity is `client:codex`.
+- `--recovery` asks the model to inspect status and retry scoped discovery twice. `--bootstrap` explicitly directs code mode to inspect gateway helpers first. Keep these diagnostic runs separate from the ordinary matrix.
+- `--debug` saves detailed CLI diagnostics. Codex retains its transcript only in the disposable runtime overlay.
+- `--fixture-approvals` disables Codex's inner approval sandbox for this public fixture. Its outer filesystem containment remains active. Do not use it for real servers.
 
-Claude uses strict per-run MCP configuration. OpenCode uses a temporary config
-directory with its own normal CLI auth mechanism. Codex ignores user config and
-uses inline MCP overrides. On Linux, bubblewrap gives its normal home a disposable
-writable overlay, with the original auth and config files mounted read-only.
-The CLI reads its existing login directly; no auth file is copied or refreshed.
-Runtime state and logs use temporary paths. Metadata snapshots record concurrent
-host changes, which do not imply a write through the isolated mount. Codex needs
-unprivileged overlayfs and bubblewrap; missing support is a failure, never a
-fallback to writable real-home operation. Cursor is excluded until an isolated
-per-run MCP mechanism is verified.
+Evidence includes full JSON-RPC exchanges, downstream calls, CLI output, config metadata before and after, and summaries. Keep all evidence outside the repository. Config metadata from concurrent clients can change independently; use the recorded paths and containment evidence to distinguish those changes.
 
-Codex marks this disposable MCP server required so an optional startup grace
-cannot silently omit it. The default invocation retains Codex's approval policy.
-`--fixture-approvals` opts into the CLI's approval bypass for this canned server;
-the entire host filesystem stays read-only except the run's temporary directory,
-evidence output, and disposable Codex overlay. This distinguishes task performance
-from noninteractive approval-policy failures. It is not production acceptance of
-the CLI's normal approval settings.
+Score requires a completed turn, correct ordered downstream calls, schema validity and the requested argument values. It accepts the development split's file-read alternatives and refund shapes, and permits surrounding text when posting a returned URL. An extra unrelated call fails the task. Invalid public schemas fail validation without being rewritten. No-match cases require explicit abstention.
 
-The private output records model usage, time, gateway discovery requests, actual
-downstream calls, JSON Schema validity, requested argument values, wrong calls,
-notification delivery, and re-list counts. Invalid public schemas fail strict
-validity without changing the served catalog. Dev-approved refund alternatives
-retain their distinct input shapes. Successful multi-step tasks need the intended
-order and successful no-match tasks need a completed turn without downstream
-calls and an explicit unavailable response. Wire payload bytes are not model tokens. Aggregate usage is not peak
-context, and cache categories differ across providers; retain each raw usage
-object when comparing results.
+```sh
+node --test scripts/live-client-bench.test.mjs
+node scripts/live-client-bench-report.mjs \
+  --catalog /path/to/catalog.json --dev /path/to/dev.json \
+  --runs /path/to/evidence/matrix --out /path/to/evidence/analysis.json
+```
 
-Run `node --test scripts/live-client-bench.test.mjs` for scorer regressions.
-Raw CLI outputs, gateway data, private reports, and auth artifacts must never be
-committed. The deterministic fixture cannot establish live-service or GUI success.
+The report sums and compares CLI-reported usage. Codex input includes cached tokens. The other CLI input fields exclude separate cache reads, and Claude also reports cache writes. Missing usage stays unknown. Latency includes process startup and model time. Do not treat concurrent samples as controlled performance or billing estimates. Discovery defaults are not selected by this driver.
