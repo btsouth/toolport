@@ -35,13 +35,15 @@ Top-1, top-3 and MRR use 338 resolvable requests with labelled alternatives.
 Ambiguity honesty requires low confidence and at least two labelled returned
 candidates. No-match precision and recall use `total == 0`; no-match honesty also
 accepts a low-confidence menu. Undefined precision is null, never a perfect score.
-The default adaptive menu starts at three and widens to 25 for uncertain queries.
-Explicit limits are honored. This evaluates retrieval, not native tool execution,
+The production menu always contains ten candidates, or all visible candidates
+when fewer exist. Exact-name lookups return one complete definition. Confidence
+never changes the payload. This evaluates retrieval, not native tool execution,
 model choice, owner decisions or current provider behavior.
 
 Run the ignored `search_scale_measure` test with `SEARCH_SCALE_SPLIT=both` and
 `SEARCH_SCALE_OUTPUT=/external/report.json`. Optional `SEARCH_SCALE_LIMIT` selects
-a fixed limit; zero or absence measures the adaptive policy. The output includes
+a legacy request limit for compatibility checks; production still returns ten.
+The output includes
 raw response text, exact `o200k_base` token counts, warm ranker/projection latency,
 first-dispatch latency and cold index build time. `held_out` selects only the old
 held-out dev subset; it never opens a new blind file.
