@@ -2617,9 +2617,8 @@ type SharedCatalog = Arc<Mutex<Arc<CatalogSnapshot>>>;
 /// specific tool wins over generic ones. An empty query lists tools (all of a
 /// server's when `server` is set).
 /// Returns (results, total_matched) so the caller can tell the agent when results
-/// were truncated - otherwise a buried tool reads as "doesn't exist". When NOT
-/// scoped to a server, results are diversified so one chatty server can't flood
-/// the window (the bug where a "create product" query returned only RevenueCat).
+/// were truncated. A compact menu preserves the top ten ranked candidates;
+/// confidence and provider identity never change its size.
 /// Lexical-only entry point used by the unit tests (the live handler calls
 /// `search_catalog_with` so it can pass the semantic config).
 #[cfg(test)]
@@ -2865,22 +2864,6 @@ fn search_catalog_filtered(
                     let exact_form = doc.surface_name_tokens.intersection(&surface_query).count();
                     score *=
                         1.0 + 0.1 * exact_form as f64 / doc.surface_name_tokens.len().max(1) as f64;
-                    // Favor coherent evidence across the requested words over
-                    // a single rare name hit. This uses only indexed tool text.
-                    let covered: f64 = q_tokens
-                        .iter()
-                        .zip(&query_weights)
-                        .filter(|(token, _)| {
-                            doc.name_tokens.contains(*token)
-                                || doc.description_tokens.contains(*token)
-                                || doc.parameter_tokens.contains(*token)
-                        })
-                        .map(|(_, weight)| weight)
-                        .sum();
-                    let requested: f64 = query_weights.iter().sum();
-                    if requested > 0.0 {
-                        score *= 1.0 + covered / requested;
-                    }
                     if *named {
                         score *= 1.0 + SERVER_NAMED_BOOST;
                     }
@@ -7634,7 +7617,7 @@ fn handle_request_with_cancel(
                         matched_schema_bytes,
                     );
                 }
-                // Record exact UTF-8 returned text and schema-array bytes. Legacy
+                // Record exact UTF-8 returned text and serialized menu bytes. Legacy
                 // token fields remain reference estimates for existing readers.
                 let returned_names: Vec<String> = matches
                     .iter()
