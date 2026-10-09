@@ -1466,7 +1466,7 @@ fn status_tool_def() -> Value {
 /// `toolport_call_tool`.
 ///
 /// The search description stays capability-agnostic and short: it points at the
-/// search-first path and names the schemaOmitted recovery, but deliberately does NOT
+/// search-first path and names exact-name schema recovery, but deliberately does NOT
 /// list the user's connected servers (that would scale with server count, go stale,
 /// and leak the user's stack into a possibly remote model's context on every request)
 /// and does not claim every result is already callable. `toolport_status` names the
@@ -1474,10 +1474,10 @@ fn status_tool_def() -> Value {
 fn search_tool_def() -> Value {
     json!({
         "name": "toolport_search_tools",
-        "description": "Search the live MCP inventory when a tool is not in your list or the catalog changed. \
-            Call this before declaring a capability absent; local keyword filters do not search it. \
-            Matches include exact names and schemas when they fit. Use toolport_call_tool; \
-            for schemaOmitted, search the exact tool name.",
+        "description": "Your gateway to every connected MCP server's tools; use it first for any \
+            external action or data. Returns a ten-candidate menu with the first candidate's full \
+            schema. Pick by description and call with toolport_call_tool. Search another \
+            candidate's exact name for its full schema.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3242,7 +3242,12 @@ fn compact_search_schema(mut schema: Value) -> Value {
         if !root && node.is_object() {
             let text = serde_json::to_string(node).unwrap_or_default();
             if let Some(name) = names.get(&text) {
-                definitions.entry(name.clone()).or_insert_with(|| node.clone());
+                if !definitions.contains_key(name) {
+                    let mut definition = node.clone();
+                    definitions.insert(name.clone(), Value::Null);
+                    replace(&mut definition, names, definitions, true);
+                    definitions.insert(name.clone(), definition);
+                }
                 *node = json!({"$ref":format!("#/$defs/{name}")});
                 return;
             }
@@ -7514,7 +7519,7 @@ fn handle_request_with_cancel(
                              `server` prefix; otherwise call toolport_status to see the available prefixes."
                         .to_string(),
                 };
-                let instruction = "Rows: name, description, required parameters; #1 also has its full schema. Pick by description, call the chosen tool with toolport_call_tool, or search its exact name to get another candidate's full schema.";
+                let instruction = "Rows: name, description, required parameters, #1 schema. Pick by description, call with toolport_call_tool, or search an exact name for its full schema.";
                 let lead = if total == 0 && !matches.is_empty() {
                     format!("No direct tools matched{scope}. These are bounded fallback candidates. {instruction} {exhaustive_hint}")
                 } else if matches.is_empty() {
@@ -7578,10 +7583,10 @@ fn handle_request_with_cancel(
                     format!("Found {total} matching tool(s){scope}. {instruction}")
                 };
                 let exact = total == 1 && top.eq_ignore_ascii_case(query.trim());
-                let menu: Vec<Value> = matches.iter().map(|tool| {
-                    let mut row = vec![tool["name"].clone(), tool["description"].clone(), tool["requiredParams"].clone()];
-                    if let Some(schema) = tool.get("inputSchema") { row.push(schema.clone()); }
-                    Value::Array(row)
+                let menu: Vec<Vec<&Value>> = matches.iter().map(|tool| {
+                    let mut row = vec![&tool["name"], &tool["description"], &tool["requiredParams"]];
+                    if let Some(schema) = tool.get("inputSchema") { row.push(schema); }
+                    row
                 }).collect();
                 let text = format!(
                     "{lead}\n\n{}",
@@ -34778,8 +34783,8 @@ mod tests {
             "search description still overclaims: {description}"
         );
         assert!(
-            description.contains("schemaOmitted"),
-            "search description must name the schemaOmitted recovery: {description}"
+            description.contains("exact name"),
+            "search description must name exact-name recovery: {description}"
         );
     }
 
