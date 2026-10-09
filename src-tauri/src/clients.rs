@@ -1935,7 +1935,7 @@ pub struct SnippetEnvVar {
 }
 
 impl Serialize for SnippetEnvVar {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok,S::Error> {
         serde_json::json!({"key":self.key,"value":self.value,"secret":crate::import_credentials::secret_env(&self.key,self.value.as_deref())}).serialize(serializer)
     }
 }
@@ -2297,9 +2297,7 @@ fn parse_json_snippet(
                 .get("command")
                 .is_some_and(|command| command.is_string() || command.is_array())
                 && !servers.get("url").is_some_and(serde_json::Value::is_string)
-                && !servers
-                    .get("type")
-                    .is_some_and(serde_json::Value::is_string)
+                && !servers.get("type").is_some_and(serde_json::Value::is_string)
                 && !servers
                     .get("enabled")
                     .is_some_and(serde_json::Value::is_boolean)
@@ -3174,6 +3172,7 @@ fn parse_client_content(format: Format, content: &str) -> Result<Vec<McpServer>,
         Format::YamlMcpServers => parse_hermes_yaml_servers(content),
         Format::YamlMcpServersList => parse_continue_yaml_servers(content),
     }
+
 }
 
 fn managed_matches_detected(server: &McpServer, rec: &ManagedEntry) -> bool {
@@ -3297,10 +3296,7 @@ pub struct WriteOutcome {
     pub recovery_path: Option<PathBuf>,
 }
 
-fn revision_outcome(
-    client_id: &str,
-    result: Result<WriteOutcome, String>,
-) -> Result<WriteOutcome, String> {
+fn revision_outcome(client_id: &str, result: Result<WriteOutcome, String>) -> Result<WriteOutcome, String> {
     let mut outcome = result?;
     let path = Path::new(&outcome.path);
     outcome.recovery_path = Some(restore::record_path(client_id, path)?);
@@ -3819,18 +3815,10 @@ fn rewrite_json_key_preserving(
     }
     let before = parse_json_value(original)?;
     if let Some(prop) = obj.get(key) {
-        if let (Some(child), Some(before), Some(after)) = (
-            prop.object_value(),
-            before.get(key).and_then(serde_json::Value::as_object),
-            new_value.as_object(),
-        ) {
+        if let (Some(child), Some(before), Some(after)) = (prop.object_value(), before.get(key).and_then(serde_json::Value::as_object), new_value.as_object()) {
             patch_json_object(&child, before, after)?;
-        } else {
-            prop.set_value(serde_to_cst_input(new_value));
-        }
-    } else {
-        obj.append(key, serde_to_cst_input(new_value));
-    }
+        } else { prop.set_value(serde_to_cst_input(new_value)); }
+    } else { obj.append(key, serde_to_cst_input(new_value)); }
     Ok(root.to_string())
 }
 
@@ -6334,9 +6322,7 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
         let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
-        outcome
-            .warnings
-            .extend(disconnect_warnings(def.format, &path)?);
+        outcome.warnings.extend(disconnect_warnings(def.format, &path)?);
         Ok(outcome)
     })
 }
@@ -6364,16 +6350,12 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             restored: restored_names,
             used_move_record: moved::matches_path(client_id, &path)?,
             revision: None,
-            warnings: Vec::new(),
-            recovery_path: None,
+        warnings: Vec::new(),
+        recovery_path: None,
         });
     }
     let current = crate::registry_controller::registry_for_disconnect()?;
-    restore::check_legacy_gateway(
-        def.format,
-        &path,
-        current.client_managed_entries.get(client_id),
-    )?;
+    restore::check_legacy_gateway(def.format, &path, current.client_managed_entries.get(client_id))?;
     let restored = moved::restore(client_id, def.format, &path)?;
     if restored.is_none() && (!mutation::exists(&path) || !read_client(&def).gateway_installed) {
         return Ok(WriteOutcome {
@@ -6383,8 +6365,8 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             restored: Vec::new(),
             used_move_record: false,
             revision: None,
-            warnings: Vec::new(),
-            recovery_path: None,
+        warnings: Vec::new(),
+        recovery_path: None,
         });
     }
     let mut outcome = install_or_remove(client_id, None)?;
@@ -6405,19 +6387,11 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
 pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) -> Result<(), String> {
     let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
     let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
-    restore::check_finished(
-        client_id,
-        Path::new(&outcome.path),
-        outcome.revision.as_deref(),
-    )?;
+    restore::check_finished(client_id, Path::new(&outcome.path), outcome.revision.as_deref())?;
     if outcome.used_move_record {
         moved::forget(client_id)?;
     }
-    restore::finish(
-        client_id,
-        Path::new(&outcome.path),
-        outcome.revision.as_deref(),
-    )?;
+    restore::finish(client_id, Path::new(&outcome.path), outcome.revision.as_deref())?;
     Ok(())
 }
 
@@ -6442,18 +6416,10 @@ pub fn setup_revision(client_id: &str) -> Result<String, String> {
 
 /// Stage registry changes against the reviewed server container, then release
 /// the config lock before any vault read, unlock prompt or transport verification.
-pub(crate) fn stage_reviewed<T>(
-    client_id: &str,
-    revision: &str,
-    stage: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
+pub(crate) fn stage_reviewed<T>(client_id: &str, revision: &str, stage: impl FnOnce() -> Result<T,String>) -> Result<T,String> {
     let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
     let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
-    if setup_revision(client_id)? != revision {
-        return Err(
-            "Client config changed. Review it again before connecting. Config unchanged.".into(),
-        );
-    }
+    if setup_revision(client_id)? != revision { return Err("Client config changed. Review it again before connecting. Config unchanged.".into()); }
     stage()
 }
 

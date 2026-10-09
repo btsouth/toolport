@@ -121,8 +121,19 @@ export function ClientsView({
   const [sessionError, setSessionError] = useState(false);
   useEffect(() => {
     let current = true;
-    getClientSessions().then((rows) => { if (current) { setSessions(rows); setSessionError(false); } }).catch(() => { if (current) setSessionError(true); });
-    return () => { current = false; };
+    getClientSessions()
+      .then((rows) => {
+        if (current) {
+          setSessions(rows);
+          setSessionError(false);
+        }
+      })
+      .catch(() => {
+        if (current) setSessionError(true);
+      });
+    return () => {
+      current = false;
+    };
   }, [clients]);
   const sorted = sortClients(clients);
   const present = sorted.filter((client) => statusOf(client) !== "missing");
@@ -152,17 +163,42 @@ export function ClientsView({
 
   return (
     <div className="flex flex-col gap-5">
-      {sessionError && <p role="status" className="text-xs text-muted-foreground">Client session history could not be read.</p>}
-      {sessions.length > 0 && <section aria-label="Recent client sessions">
-        <SectionHeader count={sessions.length}>Recent client sessions</SectionHeader>
-        <div className="overflow-hidden rounded-xl border border-border/60 bg-card/40">
-          {sessions.map((session) => <div key={session.sessionId} className="border-b border-border/60 px-3.5 py-2.5 last:border-b-0">
-            <p className="truncate text-sm font-medium" title={session.sessionId}>{session.clientName}</p>
-            {session.clientLabel && <p className="truncate text-xs text-muted-foreground" dir="auto">Reports itself as: {session.clientLabel}</p>}
-            <p className="text-xs text-muted-foreground">{session.phase === "close" ? "Closed" : "Last observed"} · {session.toolsListCount} tool lists · {session.listChangedCount} list changes delivered · {session.firstCatalogSize == null ? "No catalog delivered" : `${session.firstCatalogSize} tools at first list`} · {session.contentChanged ? "Catalog changed" : "Catalog unchanged"}</p>
-          </div>)}
-        </div>
-      </section>}
+      {sessionError && (
+        <p role="status" className="text-xs text-muted-foreground">
+          Client session history could not be read.
+        </p>
+      )}
+      {sessions.length > 0 && (
+        <section aria-label="Recent client sessions">
+          <SectionHeader count={sessions.length}>Recent client sessions</SectionHeader>
+          <div className="overflow-hidden rounded-xl border border-border/60 bg-card/40">
+            {sessions.map((session) => (
+              <div
+                key={session.sessionId}
+                className="border-b border-border/60 px-3.5 py-2.5 last:border-b-0"
+              >
+                <p className="truncate text-sm font-medium" title={session.sessionId}>
+                  {session.clientName}
+                </p>
+                {session.clientLabel && (
+                  <p className="truncate text-xs text-muted-foreground" dir="auto">
+                    Reports itself as: {session.clientLabel}
+                  </p>
+                )}
+                <p className="text-xs text-muted-foreground">
+                  {session.phase === "close" ? "Closed" : "Last observed"} ·{" "}
+                  {session.toolsListCount} tool lists · {session.listChangedCount} list
+                  changes delivered ·{" "}
+                  {session.firstCatalogSize == null
+                    ? "No catalog delivered"
+                    : `${session.firstCatalogSize} tools at first list`}{" "}
+                  · {session.contentChanged ? "Catalog changed" : "Catalog unchanged"}
+                </p>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
       {present.length === 0 && (
         <EmptyState
           icon={<MonitorCog />}

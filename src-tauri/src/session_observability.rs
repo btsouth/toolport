@@ -112,6 +112,17 @@ pub fn enrich(entry: &mut Value) {
             entry["clientLabel"] = json!(label);
         }
     }
+    // Broker decisions are recorded outside the gateway request context too.
+    for field in ["clientName", "clientLabel"] {
+        if let Some(label) = entry[field].as_str() {
+            let safe = display_label(label);
+            if let Some(safe) = safe {
+                entry[field] = json!(safe);
+            } else if let Some(object) = entry.as_object_mut() {
+                object.remove(field);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

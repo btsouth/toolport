@@ -9291,12 +9291,7 @@ for line in sys.stdin:
             .unavailable()
             .contains("has not connected yet"));
         let (last_attempt, retry_at) = {
-            let state = router.servers[0]
-                .supervisor
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap();
+            let state = router.servers[0].supervisor.as_ref().unwrap().lock().unwrap();
             (state.last_attempt, state.next_attempt)
         };
         assert!(!router.servers[0].start_at(true, last_attempt));

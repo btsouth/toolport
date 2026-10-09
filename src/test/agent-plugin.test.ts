@@ -137,12 +137,24 @@ describe("plugin client identity", () => {
     expect(pluginIdentity({}, "claude-code")).toBe("claude-code");
     expect(pluginIdentity({ CURSOR_PLUGIN_ROOT: "/fixture/plugin" })).toBe("cursor");
     expect(pluginIdentity({ CODEX_PLUGIN_ROOT: "/fixture/plugin" })).toBe("codex");
-    expect(pluginIdentity({ TOOLPORT_CLIENT_ID: "custom" }, "claude-code")).toBe("custom");
+    expect(pluginIdentity({ TOOLPORT_CLIENT_ID: "custom" }, "claude-code")).toBe(
+      "custom",
+    );
     expect(pluginIdentity({ CONDUIT_CLIENT_ID: "legacy" })).toBe("legacy");
     expect(pluginIdentity({})).toBe("toolport-plugin");
   });
   it("passes identity to the spawned gateway without recording environment values", async () => {
-    await expect(spawnFirst([process.execPath], { env: {}, host: "claude-code", stdio: "ignore", args: ["-e", "process.exit(process.env.TOOLPORT_CLIENT_ID === 'claude-code' ? 0 : 1)"] })).resolves.toBe(0);
+    await expect(
+      spawnFirst([process.execPath], {
+        env: {},
+        host: "claude-code",
+        stdio: "ignore",
+        args: [
+          "-e",
+          "process.exit(process.env.TOOLPORT_CLIENT_ID === 'claude-code' ? 0 : 1)",
+        ],
+      }),
+    ).resolves.toBe(0);
   });
 });
 

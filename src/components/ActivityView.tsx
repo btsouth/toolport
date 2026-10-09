@@ -760,7 +760,14 @@ function CallRow({ e }: { e: AuditEntry }) {
       ? (APPROVAL_OUTCOME[e.decision ?? ""] ?? UNKNOWN_APPROVAL)
       : null;
   const RowIcon =
-    approvalOutcome?.Icon ?? (e.kind === "internal" ? Clock : e.held ? ShieldAlert : e.ok ? CheckCircle2 : XCircle);
+    approvalOutcome?.Icon ??
+    (e.kind === "internal"
+      ? Clock
+      : e.held
+        ? ShieldAlert
+        : e.ok
+          ? CheckCircle2
+          : XCircle);
   const duration = approvalOutcome ? e.heldMs : e.durationMs;
   const meta = [
     activityClientName(e),
@@ -816,7 +823,14 @@ function CallRow({ e }: { e: AuditEntry }) {
           </div>
           <div
             className="mt-1 truncate text-xs text-muted-foreground"
-            title={[meta, e.client && `Client: ${e.client}`, e.sessionId && `Session: ${e.sessionId}`, e.runId && `Run: ${e.runId}`].filter(Boolean).join(" · ")}
+            title={[
+              meta,
+              e.client && `Client: ${e.client}`,
+              e.sessionId && `Session: ${e.sessionId}`,
+              e.runId && `Run: ${e.runId}`,
+            ]
+              .filter(Boolean)
+              .join(" · ")}
             dir="auto"
           >
             {meta}

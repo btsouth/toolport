@@ -17,6 +17,7 @@ pub(super) struct ActivityView {
     pub(super) client_label: Option<String>,
     pub(super) approval_decision: Option<String>,
     pub(super) cold: Option<bool>,
+    pub(super) dispatch_ms: Option<u64>,
     pub(super) failure_kind: Option<String>,
     pub(super) run_id: Option<String>,
     pub(super) ok: bool,
@@ -122,6 +123,7 @@ impl ActivitySnapshot {
                         .and_then(serde_json::Value::as_str)
                         .and_then(crate::approval::sanitize_client_label),
                     cold: entry["cold"].as_bool(),
+                    dispatch_ms: entry["dispatchMs"].as_u64(),
                     failure_kind: entry["failureKind"].as_str().map(str::to_string),
                     run_id: entry["runId"].as_str().map(str::to_string),
                     approval_decision: is_approval

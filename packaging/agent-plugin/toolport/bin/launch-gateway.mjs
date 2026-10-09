@@ -251,7 +251,11 @@ export function spawnFirst(
         reject(lastError ?? new Error("no gateway candidates"));
         return;
       }
-      const child = spawnImpl(binaries[index], args, { stdio, windowsHide, env: { ...env, TOOLPORT_CLIENT_ID: pluginIdentity(env, host) } });
+      const child = spawnImpl(binaries[index], args, {
+        stdio,
+        windowsHide,
+        env: { ...env, TOOLPORT_CLIENT_ID: pluginIdentity(env, host) },
+      });
       let started = false;
       child.once("spawn", () => {
         started = true;
