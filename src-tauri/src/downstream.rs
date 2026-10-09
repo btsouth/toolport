@@ -14546,6 +14546,9 @@ for line in sys.stdin:
             result.is_err(),
             "the delayed response must exceed the configured timeout"
         );
+        let error = result.unwrap_err();
+        assert_eq!(error.call_failure().kind, crate::call_failure::CallFailureKind::Timeout { after_send: true });
+        assert!(error.is_health_failure());
         assert!(
             started.elapsed() < Duration::from_millis(800),
             "the custom timeout was not applied: {:?}",
