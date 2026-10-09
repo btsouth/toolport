@@ -379,7 +379,7 @@ jobs:
 
       - name: Build headless gateway for cross-platform smoke
         if: matrix.os != 'ubuntu-22.04'
-        run: cargo build --manifest-path src-tauri/Cargo.toml --bin toolport-gateway --bin mock-mcp-server --no-default-features --features test-support
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin toolport-gateway --bin mock-mcp-server --no-default-features --features test-support,search-static
 
       - name: Headless gateway security smoke (macOS)
         if: matrix.os == 'macos-latest'

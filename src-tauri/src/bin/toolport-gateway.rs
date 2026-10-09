@@ -66,6 +66,32 @@ use conduit_lib::topology::LaunchKey;
 static CODE_MODE_ALLOCATOR: worker::WorkerAllocator = worker::WorkerAllocator;
 
 mod gateway_memory;
+#[cfg(feature = "search-static")]
+mod search_cache;
+#[cfg(feature = "search-static")]
+mod search_static;
+#[cfg(not(feature = "search-static"))]
+mod search_cache {
+    #[derive(Debug, Default)]
+    pub struct Vectors(pub std::sync::Arc<std::sync::OnceLock<Vec<Vec<f32>>>>);
+    impl Vectors {
+        pub fn build(_: &dyn conduit_lib::tool_definitions::ToolCatalog) -> Self {
+            Self::default()
+        }
+    }
+}
+#[cfg(not(feature = "search-static"))]
+mod search_static {
+    pub fn enabled() -> bool {
+        false
+    }
+    pub fn query_vector(_: &str) -> Vec<f32> {
+        Vec::new()
+    }
+    pub fn cosine(_: &[f32], _: &[f32]) -> f64 {
+        0.0
+    }
+}
 
 thread_local! {
     static APPROVAL_CANCEL: std::cell::RefCell<Option<downstream::CancelContext>> = const { std::cell::RefCell::new(None) };
@@ -1457,7 +1483,7 @@ fn search_tool_def() -> Value {
             "properties": {
                 "query": { "type": "string", "maxLength": MAX_SEARCH_QUERY_CHARS, "description": "Keywords for the capability you need, e.g. \"list emails\". An empty value with `server` lists that server's tools." },
                 "server": { "type": "string", "description": "Optional: limit to this server by name/prefix." },
-                "limit": { "type": "integer", "description": "Max results (default 25, up to 200).", "default": 25 }
+                "limit": { "type": "integer", "description": "Max results, up to 200. Omit for 3 candidates, widening to 25 when uncertain." }
             },
             "required": ["query"],
             "additionalProperties": false
@@ -1930,7 +1956,7 @@ fn tool_prefix(t: &Value) -> String {
         .to_lowercase()
 }
 
-// --- Lexical search ranking (tokens + light stemming + synonyms + IDF) ---
+// --- Lexical search ranking (tokens + light stemming + IDF) ---
 // This is the relevance core; it's deliberately self-contained so an optional
 // embedding-based scorer can blend in or replace it later without touching the
 // search plumbing (server filter, diversification, projection) around it.
@@ -1941,28 +1967,36 @@ const DESC_W: f64 = 1.0;
 /// How much a fully-on-the-nose tool name (query explains all its tokens) is boosted
 /// over a longer sibling that merely contains the same words. Small: it only tips
 /// near-ties toward the more specific tool, never overrides a stronger keyword signal.
-const NAME_SPECIFICITY_W: f64 = 0.35;
-/// A synonym ("show" for "list") is weaker evidence than the word itself, so when
-/// `list_projects` and `get_project` both match "list projects", the exact verb wins.
-const SYNONYM_W: f64 = 0.6;
-/// A query that names the service ("in Linear", "on GitHub") means that server's
-/// tools, so they outrank another server's tool that shares the other words.
+const NAME_SPECIFICITY_W: f64 = 0.65;
+/// A complete configured provider identity is a soft preference, never a scope.
 const SERVER_NAMED_BOOST: f64 = 0.5;
-/// A plural object ("list my buckets") asks for a collection: tips a `list_bucket`
-/// versus `get_bucket` near-tie toward the list tool.
-const PLURAL_LIST_BOOST: f64 = 0.1;
 /// Tools whose description says they are deprecated rank below their replacement.
 const DEPRECATED_PENALTY: f64 = 0.5;
 /// Below these normalized scores the ranker has too little evidence to hide the
 /// rest of the scoped catalog. Hybrid scores are already normalized to 0..=1;
 /// lexical scores are normalized against an ideal all-name-hit score below.
+// Full-name evidence without vectors must be nearly complete. With vectors,
+// confidence additionally needs independent separation in both retrieval paths.
+// Tuning targeted >= 88.89% precision; report actual precision and coverage.
 const LOW_CONFIDENCE_LEXICAL_RATIO: f64 = 0.55;
+const LOW_CONFIDENCE_SEMANTIC_LEXICAL_RATIO: f64 = 0.65;
+const CONFIDENCE_COMPETITOR_RATIO: f64 = 0.75;
 const LOW_CONFIDENCE_HYBRID_SCORE: f64 = 0.45;
 /// A weak search should give the calling model enough descriptions to recover,
 /// while staying far below the normal 25-result/default context budget.
 const LOW_CONFIDENCE_MIN_RESULTS: usize = 12;
 
 struct SearchOutcome {
+    #[cfg(test)]
+    confidence_strength: f64,
+    #[cfg(test)]
+    query_coverage: f64,
+    #[cfg(test)]
+    competitor_ratio: f64,
+    #[cfg(test)]
+    semantic_strength: f64,
+    #[cfg(test)]
+    semantic_competitor_ratio: f64,
     matches: Vec<Value>,
     /// Number of candidates with a positive lexical or hybrid score.
     total: usize,
@@ -2005,6 +2039,44 @@ fn stem_token(token: &str) -> String {
     } else {
         t
     }
+}
+
+/// Negative instructions are constraints, not additional requested operations.
+/// Stop at the constraint within each sentence; keep later positive sentences.
+fn positive_query(query: &str) -> String {
+    let mut positive = Vec::new();
+    for sentence in query.split([',', ';', '.', '!', '?']) {
+        // ASCII folding preserves byte offsets and the original Unicode/camelCase.
+        let lower = sentence.to_ascii_lowercase();
+        let mut separators: Vec<_> = lower
+            .match_indices(" and ")
+            .chain(lower.match_indices(" but "))
+            .collect();
+        separators.sort_by_key(|(position, _)| *position);
+        let mut start = 0;
+        for (end, separator) in separators
+            .into_iter()
+            .chain(std::iter::once((sentence.len(), "")))
+        {
+            if end < start {
+                continue;
+            }
+            let clause = &sentence[start..end];
+            let folded = &lower[start..end];
+            let end = ["do not ", "don't ", "dont ", "without ", "not "]
+                .iter()
+                .filter_map(|marker| {
+                    folded.find(marker).filter(|position| {
+                        *position == 0 || folded.as_bytes()[position - 1].is_ascii_whitespace()
+                    })
+                })
+                .min()
+                .unwrap_or(clause.len());
+            positive.push(&clause[..end]);
+            start += clause.len() + separator.len();
+        }
+    }
+    positive.join(" ")
 }
 
 /// Tokenize tool text or a query into normalized search tokens (break on
@@ -2156,7 +2228,14 @@ fn index_tokens(text: &str) -> Vec<String> {
 /// splitting into "git" + "hub" and matching the `git` server.
 fn query_tokens(query: &str, known: impl Fn(&str) -> bool) -> Vec<String> {
     let mut out = Vec::new();
-    for word in query.split(|c: char| !c.is_alphanumeric()) {
+    let words: Vec<&str> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let mut position = 0;
+    while position < words.len() {
+        let word = words[position];
+        position += 1;
         let parts = split_camel(word);
         if parts.len() > 1 {
             let whole = stem_token(word);
@@ -2172,17 +2251,66 @@ fn query_tokens(query: &str, known: impl Fn(&str) -> bool) -> Vec<String> {
                 .map(|t| stem_token(&t)),
         );
     }
+    out.dedup();
     out
 }
 
-/// Stemmed query words written in the plural ("buckets"), which ask for a list.
-fn plural_query_tokens(query: &str) -> HashSet<String> {
-    query
-        .split(|c: char| !c.is_alphanumeric())
-        .flat_map(split_camel)
-        .filter(|t| t.len() > 3 && t.ends_with('s') && !t.ends_with("ss") && !is_stopword(t))
-        .map(|t| stem_token(&t))
-        .collect()
+/// Correct only a unique nearby catalog word. Bound the work and preserve
+/// identifiers, Unicode and ambiguous spellings instead of guessing a provider.
+fn corrected_query_token(token: &str, frequencies: &HashMap<String, usize>) -> Option<String> {
+    if frequencies.contains_key(token)
+        || token.len() < 6
+        || token.len() > 32
+        || !token.bytes().all(|c| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    let maximum = 1;
+    let distance = |candidate: &str| {
+        let left = token.as_bytes();
+        let right = candidate.as_bytes();
+        let mut previous: Vec<usize> = (0..=right.len()).collect();
+        let mut before_previous = previous.clone();
+        for (i, a) in left.iter().enumerate() {
+            let mut current = vec![i + 1; right.len() + 1];
+            for (j, b) in right.iter().enumerate() {
+                current[j + 1] = (previous[j + 1] + 1)
+                    .min(current[j] + 1)
+                    .min(previous[j] + usize::from(a != b));
+                if i > 0 && j > 0 && left[i] == right[j - 1] && left[i - 1] == right[j] {
+                    current[j + 1] = current[j + 1].min(before_previous[j - 1] + 1);
+                }
+            }
+            if *current.iter().min().unwrap() > maximum {
+                return maximum + 1;
+            }
+            before_previous = previous;
+            previous = current;
+        }
+        previous[right.len()]
+    };
+    let mut best = maximum + 1;
+    let mut winner = None;
+    let mut tied = false;
+    for (candidate, count) in frequencies {
+        if *count < 2
+            || candidate.as_bytes().first() != token.as_bytes().first()
+            || candidate.len().abs_diff(token.len()) > maximum
+            || candidate.len() > 32
+            || !candidate.bytes().all(|c| c.is_ascii_alphabetic())
+        {
+            continue;
+        }
+        let score = distance(candidate);
+        if score < best {
+            best = score;
+            winner = Some(candidate);
+            tied = false;
+        } else if score == best {
+            tied = true;
+        }
+    }
+    (!tied).then_some(winner).flatten().cloned()
 }
 
 /// Initialisms of two or three consecutive query words ("direct message" -> "dm"),
@@ -2200,38 +2328,76 @@ fn query_initialisms(q_tokens: &[String]) -> Vec<String> {
     out
 }
 
-/// Synonym group for a (stemmed) token, bridging common MCP vocabulary so e.g.
-/// "mail" finds an "email" tool and "get" finds a "list" tool. Empty if none.
-fn synonym_group(token: &str) -> &'static [&'static str] {
-    const GROUPS: &[&[&str]] = &[
-        &[
-            "list", "get", "fetch", "show", "read", "find", "search", "view",
-        ],
-        &["create", "add", "new", "make", "insert", "save", "store"],
-        &["delete", "remove", "destroy", "drop"],
-        &["update", "edit", "modify", "change", "set"],
-        &["email", "mail", "message"],
-        &["project", "repo", "repository"],
-        &["user", "account", "member", "customer"],
-        &["team", "org", "organization", "workspace"],
-        &["schedule", "calendar", "meeting", "appointment"],
-        &["dispute", "chargeback"],
-        &["token", "tokenize"],
-        &["send", "post"],
-        &["filesystem", "disk", "fs"],
-    ];
-    GROUPS
-        .iter()
-        .find(|g| g.contains(&token))
-        .copied()
-        .unwrap_or(&[])
+/// Match the complete configured identity on word boundaries, preserving underscores.
+/// A provider mention is only a preference: capability evidence can outweigh it.
+fn query_names_server(query: &str, identity: &str) -> bool {
+    let query = query.to_lowercase();
+    let identity = identity.to_lowercase();
+    !identity.is_empty()
+        && query.match_indices(&identity).any(|(start, matched)| {
+            let boundary = |c: char| !c.is_alphanumeric() && c != '_' && c != '-';
+            (start == 0 || query[..start].chars().next_back().is_some_and(boundary))
+                && (start + matched.len() == query.len()
+                    || query[start + matched.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(boundary))
+        })
+}
+
+fn schema_search_tokens(schema: Option<&Value>) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    let mut pending: Vec<(&Value, usize)> = schema.into_iter().map(|value| (value, 0)).collect();
+    let mut visited = 0;
+    while let Some((value, depth)) = pending.pop() {
+        visited += 1;
+        if visited > 256 || tokens.len() >= 256 {
+            break;
+        }
+        if depth > 6 {
+            continue;
+        }
+        if let Some(object) = value.as_object() {
+            for field in ["description", "title"] {
+                if let Some(text) = object.get(field).and_then(Value::as_str) {
+                    tokens.extend(index_tokens(&text.chars().take(512).collect::<String>()));
+                }
+            }
+            if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                for (name, child) in properties.iter().take(64) {
+                    tokens.extend(index_tokens(name));
+                    if pending.len() < 256 {
+                        pending.push((child, depth + 1));
+                    }
+                }
+            }
+            for field in ["items", "anyOf", "oneOf", "allOf"] {
+                if let Some(child) = object.get(field) {
+                    if let Some(array) = child.as_array() {
+                        pending.extend(array.iter().take(8).map(|child| (child, depth + 1)));
+                    } else {
+                        pending.push((child, depth + 1));
+                    }
+                }
+            }
+        }
+    }
+    // A single description can cross the limit. Keep deterministic bounded data.
+    let mut ordered: Vec<String> = tokens.into_iter().collect();
+    ordered.sort();
+    ordered.truncate(256);
+    ordered.into_iter().collect()
 }
 
 #[derive(Debug)]
 struct SearchDocument {
     name_tokens: HashSet<String>,
+    surface_name_tokens: HashSet<String>,
     description_tokens: HashSet<String>,
+    summary_tokens: HashSet<String>,
     server_prefix: String,
+    parameter_tokens: HashSet<String>,
+    schema_bytes: u64,
 }
 
 /// Immutable lexical index paired with one immutable catalog snapshot.
@@ -2245,12 +2411,23 @@ struct SearchDocument {
 struct CatalogSearchIndex {
     documents: Vec<SearchDocument>,
     document_frequency: HashMap<String, usize>,
+    spelling_frequency: HashMap<String, usize>,
+    provider_tokens: HashSet<String>,
     catalog_address: usize,
     surface_bytes: u64,
+    semantic_vectors: search_cache::Vectors,
 }
 
 impl CatalogSearchIndex {
     fn build(tools: &dyn ToolCatalog) -> Self {
+        let mut index = Self::build_lexical(tools);
+        index.semantic_vectors = search_cache::Vectors::build(tools);
+        index
+    }
+
+    fn build_lexical(tools: &dyn ToolCatalog) -> Self {
+        #[cfg(test)]
+        SEARCH_INDEX_BUILDS.with(|count| count.set(count.get() + 1));
         let mut documents = Vec::with_capacity(tools.len());
         let mut document_frequency = HashMap::new();
 
@@ -2260,29 +2437,78 @@ impl CatalogSearchIndex {
                 .get("description")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let name_tokens: HashSet<String> = search_tokens(name).into_iter().collect();
+            let server_prefix = tool_prefix(tool);
+            let operation = name
+                .split_once("__")
+                .map_or(name, |(_, operation)| operation);
+            let mut operation_tokens = search_tokens(operation);
+            // Some servers repeat their namespace inside every operation name.
+            // It is provider identity, not an unexplained capability word.
+            if operation_tokens.len() > 1
+                && operation_tokens
+                    .first()
+                    .is_some_and(|token| token == &server_prefix)
+            {
+                operation_tokens.remove(0);
+            }
+            let name_tokens: HashSet<String> = operation_tokens.into_iter().collect();
+            // Parameters provide lower-weight evidence; bound traversal by nodes,
+            // depth and tokens so very large API schemas cannot grow the index unboundedly.
+            let parameter_tokens = schema_search_tokens(tool.get("inputSchema"));
             let description_tokens: HashSet<String> =
                 index_tokens(description).into_iter().collect();
 
             let mut seen = HashSet::with_capacity(name_tokens.len() + description_tokens.len());
             seen.extend(name_tokens.iter().map(String::as_str));
             seen.extend(description_tokens.iter().map(String::as_str));
+            seen.extend(parameter_tokens.iter().map(String::as_str));
             for token in seen {
                 *document_frequency.entry(token.to_string()).or_insert(0) += 1;
             }
 
             documents.push(SearchDocument {
                 name_tokens,
+                surface_name_tokens: operation
+                    .split(|c: char| !c.is_alphanumeric())
+                    .flat_map(split_camel)
+                    .collect(),
                 description_tokens,
-                server_prefix: tool_prefix(tool),
+                // Public tool descriptions normally state the job first. Weight
+                // this bounded summary between a terse name and incidental prose.
+                summary_tokens: index_tokens(
+                    &description
+                        .split(['.', '!', '?'])
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(256)
+                        .collect::<String>(),
+                )
+                .into_iter()
+                .collect(),
+                server_prefix,
+                parameter_tokens,
+                schema_bytes: savings::surface_bytes(std::slice::from_ref(tool)) - 2,
             });
         }
 
+        let providers: HashSet<String> = documents
+            .iter()
+            .flat_map(|doc| search_tokens(&doc.server_prefix))
+            .collect();
+        let spelling_frequency = document_frequency
+            .iter()
+            .filter(|(word, _)| !providers.contains(*word))
+            .map(|(word, count)| (word.clone(), *count))
+            .collect();
         Self {
             documents,
             document_frequency,
+            spelling_frequency,
+            provider_tokens: providers,
             catalog_address: tools.address(),
             surface_bytes: savings::surface_bytes(tools.iter()),
+            semantic_vectors: search_cache::Vectors::default(),
         }
     }
 
@@ -2298,12 +2524,19 @@ impl CatalogSearchIndex {
                 .name_tokens
                 .iter()
                 .chain(&doc.description_tokens)
+                .chain(&doc.summary_tokens)
+                .chain(&doc.parameter_tokens)
+                .chain(&doc.surface_name_tokens)
                 .map(|token| token.capacity())
                 .sum();
             std::mem::size_of::<SearchDocument>()
                 + doc.server_prefix.capacity()
                 + token_bytes
-                + (doc.name_tokens.capacity() + doc.description_tokens.capacity())
+                + (doc.name_tokens.capacity()
+                    + doc.description_tokens.capacity()
+                    + doc.summary_tokens.capacity()
+                    + doc.parameter_tokens.capacity()
+                    + doc.surface_name_tokens.capacity())
                     * std::mem::size_of::<String>()
                     * 2
         });
@@ -2313,12 +2546,29 @@ impl CatalogSearchIndex {
                 + std::mem::size_of::<usize>()
                 + 2 * std::mem::size_of::<usize>()
         });
-        document_bytes.sum::<usize>() + df_bytes.sum::<usize>()
+        document_bytes.sum::<usize>()
+            + df_bytes.sum::<usize>()
+            + self
+                .spelling_frequency
+                .keys()
+                .map(|word| {
+                    word.capacity()
+                        + std::mem::size_of::<String>()
+                        + 3 * std::mem::size_of::<usize>()
+                })
+                .sum::<usize>()
+            + self.semantic_vectors.0.get().map_or(0, |vectors| {
+                vectors
+                    .iter()
+                    .map(|v| v.capacity() * std::mem::size_of::<f32>())
+                    .sum::<usize>()
+            })
     }
 }
 
 #[cfg(test)]
 thread_local! {
+    static SEARCH_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static CATALOG_SNAPSHOT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -2367,7 +2617,7 @@ type SharedCatalog = Arc<Mutex<Arc<CatalogSnapshot>>>;
 
 /// Rank the cached catalog against a query, optionally scoped to one server.
 /// Ranking is lexical with IDF weighting: query and tools are tokenized (camelCase
-/// split, light stemming, small synonym map), a name hit outweighs a description hit,
+/// split, light stemming), a name hit outweighs a description hit,
 /// and a rare token (e.g. "products") outweighs a common one (e.g. "list") so the
 /// specific tool wins over generic ones. An empty query lists tools (all of a
 /// server's when `server` is set).
@@ -2390,7 +2640,7 @@ fn search_catalog(
 
 /// As `search_catalog`, with optional semantic re-ranking. When `sem` is None or
 /// inactive, or embeddings are unavailable, ranking is pure lexical and byte-for-byte
-/// identical to before, semantic only ever adds, never degrades.
+/// based on catalog text. Semantic fusion can change order and must be measured.
 #[cfg(test)]
 fn search_catalog_with(
     cached: &dyn ToolCatalog,
@@ -2399,12 +2649,17 @@ fn search_catalog_with(
     limit: usize,
     sem: Option<&semantic::SemanticConfig>,
 ) -> SearchOutcome {
-    search_catalog_indexed(cached, query, server, limit, sem, None)
+    let index = CatalogSearchIndex::build(cached);
+    search_catalog_indexed(cached, query, server, limit, sem, Some(&index))
 }
 
 /// Indexed search entry point used by the live gateway. Tests and cold/live
 /// fallbacks may omit `index`; in that case a temporary index is built so behavior
 /// remains identical and there is only one ranking implementation.
+const DEFAULT_SEARCH_RESULTS: usize = 3;
+const UNCERTAIN_SEARCH_RESULTS: usize = 25;
+
+#[cfg(test)]
 fn search_catalog_indexed(
     cached: &dyn ToolCatalog,
     query: &str,
@@ -2413,14 +2668,36 @@ fn search_catalog_indexed(
     sem: Option<&semantic::SemanticConfig>,
     index: Option<&CatalogSearchIndex>,
 ) -> SearchOutcome {
+    search_catalog_filtered(cached, query, server, limit, sem, index, |_| true, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_catalog_filtered(
+    cached: &dyn ToolCatalog,
+    query: &str,
+    server: Option<&str>,
+    limit: usize,
+    sem: Option<&semantic::SemanticConfig>,
+    index: Option<&CatalogSearchIndex>,
+    visible: impl Fn(&Value) -> bool,
+    identities: &[(String, String)],
+) -> SearchOutcome {
+    let adaptive = limit == 0;
+    let limit = if adaptive {
+        DEFAULT_SEARCH_RESULTS
+    } else {
+        limit
+    };
     let fallback_index;
     let index = match index.filter(|candidate| candidate.matches_catalog(cached)) {
         Some(index) => index,
         None => {
-            fallback_index = CatalogSearchIndex::build(cached);
+            fallback_index = CatalogSearchIndex::build_lexical(cached);
             &fallback_index
         }
     };
+    let vectors = index.semantic_vectors.0.get();
+    let use_local_semantic = search_static::enabled() && vectors.is_some();
     let q = query.to_lowercase();
     let terms: Vec<&str> = q.split_whitespace().filter(|t| !t.is_empty()).collect();
     let server_filter = server
@@ -2432,6 +2709,7 @@ fn search_catalog_indexed(
         .documents
         .iter()
         .enumerate()
+        .filter(|(position, _)| visible(cached.get(*position).unwrap()))
         .filter(|(_, doc)| match &server_filter {
             Some(sf) => doc.server_prefix.contains(sf.as_str()),
             None => true,
@@ -2467,10 +2745,26 @@ fn search_catalog_indexed(
                 low_confidence: false,
                 broadened: 0,
                 direct_returned: 1,
+                #[cfg(test)]
+                confidence_strength: 1.0,
+                #[cfg(test)]
+                query_coverage: 1.0,
+                #[cfg(test)]
+                competitor_ratio: 0.0,
+                #[cfg(test)]
+                semantic_strength: 1.0,
+                #[cfg(test)]
+                semantic_competitor_ratio: 0.0,
             };
         }
     }
 
+    #[cfg(test)]
+    let mut query_coverage = 0.0;
+    #[cfg(test)]
+    let (mut confidence_strength, mut competitor_ratio) = (0.0, 1.0);
+    #[cfg(test)]
+    let (mut semantic_strength, mut semantic_competitor_ratio) = (0.0, 1.0);
     // Select an ordered set of tool refs (ranking happens here; projection below).
     let (selected, total, low_confidence, broadened, direct_returned) = if terms.is_empty() {
         // Empty query: list the pool. With `server` set this enumerates that server.
@@ -2483,33 +2777,39 @@ fn search_catalog_indexed(
         let direct_returned = selected.len();
         (selected, total, false, 0, direct_returned)
     } else {
-        // The normal local path reuses the precomputed global document frequencies.
-        // A substring server filter can select more than one server, so preserve its
-        // historical ranking by deriving DF over that already-tokenized subset.
-        let scoped_df;
-        let df = if server_filter.is_none() {
-            &index.document_frequency
-        } else {
-            let mut frequencies = HashMap::new();
-            for position in &pool {
-                let doc = &index.documents[*position];
-                for token in doc.name_tokens.union(&doc.description_tokens) {
-                    *frequencies.entry(token.clone()).or_insert(0) += 1;
-                }
-            }
-            scoped_df = frequencies;
-            &scoped_df
-        };
-        let n = pool.len().max(1) as f64;
+        let df = &index.document_frequency;
+        let n = index.documents.len().max(1) as f64;
         let idf = |tok: &str| ((n + 1.0) / (*df.get(tok).unwrap_or(&0) as f64 + 1.0)).ln() + 1.0;
 
-        let q_tokens = query_tokens(query, |token| df.contains_key(token));
-        let q_set: HashSet<&str> = q_tokens.iter().map(String::as_str).collect();
-        let plurals = plural_query_tokens(query);
+        let positive = positive_query(query);
+        let mut q_tokens = query_tokens(&positive, |token| {
+            df.contains_key(token) || index.provider_tokens.contains(token)
+        });
+        let mut corrected_spelling = false;
+        for token in &mut q_tokens {
+            if let Some(corrected) = corrected_query_token(token, &index.spelling_frequency) {
+                if identities
+                    .iter()
+                    .any(|(_, name)| search_tokens(name).contains(&corrected))
+                {
+                    continue;
+                }
+                *token = corrected;
+                corrected_spelling = true;
+            }
+        }
+        let surface_query: HashSet<String> = positive
+            .split(|c: char| !c.is_alphanumeric())
+            .flat_map(split_camel)
+            .collect();
         let initialisms: Vec<String> = query_initialisms(&q_tokens)
             .into_iter()
             .filter(|initials| df.contains_key(initials))
             .collect();
+        // The catalog weights are constant for this query. Compute logarithms
+        // once per token, rather than once per matching document.
+        let query_weights: Vec<f64> = q_tokens.iter().map(|token| idf(token)).collect();
+        let initialism_weights: Vec<f64> = initialisms.iter().map(|token| idf(token)).collect();
         // Per server: its prefix tokens, and whether the query names it.
         let mut servers: HashMap<&str, (Vec<String>, bool)> = HashMap::new();
         // Lexical score for EVERY doc (0 if no hit), kept so optional semantic
@@ -2523,39 +2823,37 @@ fn search_catalog_indexed(
                     .entry(doc.server_prefix.as_str())
                     .or_insert_with(|| {
                         let tokens = search_tokens(&doc.server_prefix);
-                        let named = tokens.iter().any(|t| q_set.contains(t.as_str()));
+                        let named = query_names_server(&positive, &doc.server_prefix)
+                            || identities.iter().any(|(id, name)| {
+                                id == &doc.server_prefix && query_names_server(&positive, name)
+                            });
                         (tokens, named)
                     });
                 let mut score = 0.0_f64;
-                for initials in &initialisms {
+                for (initials, weight) in initialisms.iter().zip(&initialism_weights) {
                     if doc.name_tokens.contains(initials) && !server_tokens.contains(initials) {
-                        score += NAME_W * idf(initials);
+                        score += NAME_W * weight;
                     }
                 }
-                for qt in &q_tokens {
-                    // Best field hit across the query token and its synonyms; name
-                    // beats description, the matched token's IDF sets the weight, and
-                    // a synonym counts for less than the word itself.
+                for (qt, weight) in q_tokens.iter().zip(&query_weights) {
+                    // Prefer terse names and summaries over long descriptions.
+                    // Catalog document frequency sets each token's weight.
                     let mut best = 0.0_f64;
-                    let cands = std::iter::once((qt.as_str(), 1.0)).chain(
-                        synonym_group(qt)
-                            .iter()
-                            .filter(|c| **c != qt.as_str())
-                            .map(|c| (*c, SYNONYM_W)),
-                    );
-                    for (c, weight) in cands {
-                        if doc.name_tokens.contains(c) {
-                            best = best.max(weight * NAME_W * idf(c));
-                        } else if doc.description_tokens.contains(c) {
-                            best = best.max(weight * DESC_W * idf(c));
-                        }
+                    if doc.name_tokens.contains(qt) {
+                        best = NAME_W * weight;
+                    } else if doc.summary_tokens.contains(qt) {
+                        best = 2.0 * weight;
+                    } else if doc.description_tokens.contains(qt) {
+                        let length_weight =
+                            (128.0 / doc.description_tokens.len().max(128) as f64).sqrt();
+                        best = DESC_W * weight * length_weight;
+                    } else if doc.parameter_tokens.contains(qt) {
+                        best = 0.8 * weight;
                     }
                     // Prefix fallback for partial words ("proj" -> "project").
                     if best == 0.0 && qt.len() >= 3 {
-                        if let Some(tok) =
-                            doc.name_tokens.iter().find(|t| t.starts_with(qt.as_str()))
-                        {
-                            best = 0.6 * NAME_W * idf(tok);
+                        if doc.name_tokens.iter().any(|t| t.starts_with(qt.as_str())) {
+                            best = 0.6 * NAME_W * weight;
                         }
                     }
                     score += best;
@@ -2571,102 +2869,176 @@ fn search_catalog_indexed(
                     let explained = doc
                         .name_tokens
                         .iter()
-                        .filter(|nt| {
-                            q_tokens
-                                .iter()
-                                .any(|qt| qt == *nt || synonym_group(qt).contains(&nt.as_str()))
-                        })
+                        .filter(|nt| q_tokens.iter().any(|qt| qt == *nt))
                         .count();
                     let coverage = explained as f64 / doc.name_tokens.len() as f64;
                     score *= 1.0 + NAME_SPECIFICITY_W * coverage;
+                    let exact_form = doc.surface_name_tokens.intersection(&surface_query).count();
+                    score *=
+                        1.0 + 0.1 * exact_form as f64 / doc.surface_name_tokens.len().max(1) as f64;
                     if *named {
                         score *= 1.0 + SERVER_NAMED_BOOST;
                     }
                     if doc.description_tokens.contains("deprecated") {
                         score *= DEPRECATED_PENALTY;
                     }
-                    if doc.name_tokens.contains("list")
-                        && plurals
-                            .iter()
-                            .any(|plural| doc.name_tokens.contains(plural))
-                    {
-                        let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-                        let action = name.split_once("__").map_or(name, |(_, rest)| rest);
-                        let mut words = search_tokens(action)
-                            .into_iter()
-                            .filter(|t| !server_tokens.contains(t));
-                        if words.next().as_deref() == Some("list")
-                            && words.any(|t| plurals.contains(&t))
-                        {
-                            score *= 1.0 + PLURAL_LIST_BOOST;
-                        }
-                    }
                 }
                 Some((score, tool))
             })
             .collect();
 
-        // Blended (semantic) ranking when configured and embeddings succeed; else
-        // pure lexical (positive scores only, highest first), identical to before.
-        let semantic_ranked = semantic_rerank(sem, query, &lex);
-        let used_semantic = semantic_ranked.is_some();
-        let ranked: Vec<(f64, &Value)> = semantic_ranked.unwrap_or_else(|| {
-            let mut s: Vec<(f64, &Value)> =
-                lex.iter().filter(|(sc, _)| *sc > 0.0).cloned().collect();
-            s.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            s
+        // Keep user-configured endpoint search; the default signal is fully local.
+        let remote_ranked = semantic_rerank(sem, &positive, &lex);
+        let used_semantic = remote_ranked.is_some();
+        let query_vector = if use_local_semantic {
+            search_static::query_vector(&positive)
+        } else {
+            Vec::new()
+        };
+        let similarities: Vec<f64> = pool
+            .iter()
+            .map(|position| {
+                vectors
+                    .and_then(|vectors| vectors.get(*position))
+                    .map_or(0.0, |vector| search_static::cosine(&query_vector, vector))
+            })
+            .collect();
+        let ranked = remote_ranked.unwrap_or_else(|| {
+            if use_local_semantic {
+                local_search_fusion(&lex, &similarities)
+            } else {
+                let mut rows: Vec<_> = lex
+                    .iter()
+                    .copied()
+                    .filter(|(score, _)| *score > 0.0)
+                    .collect();
+                rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+                rows
+            }
         });
         let total = ranked.len();
 
+        let ideal = NAME_W * query_weights.iter().sum::<f64>() * (1.0 + NAME_SPECIFICITY_W);
         let low_confidence = match ranked.first() {
             None => true,
-            Some((top_score, _)) if used_semantic => *top_score < LOW_CONFIDENCE_HYBRID_SCORE,
-            Some((top_score, _)) => {
-                // Normalize the raw lexical score against an ideal result where
-                // every meaningful query token hits a tool name. Missing query
-                // terms still contribute to the denominator, which is exactly the
-                // weak-evidence case that should broaden.
-                let ideal_idf: f64 = q_tokens
+            Some((score, _)) if used_semantic => {
+                *score < LOW_CONFIDENCE_HYBRID_SCORE
+                    || ranked
+                        .get(1)
+                        .is_some_and(|(next, _)| *next >= *score * 0.85)
+            }
+            Some((_, top)) => {
+                let evidence = lex
                     .iter()
-                    .map(|qt| {
-                        let matched_idf = std::iter::once(qt.as_str())
-                            .chain(synonym_group(qt).iter().copied())
-                            .filter(|candidate| df.contains_key(*candidate))
-                            .map(idf)
-                            .fold(0.0_f64, f64::max);
-                        if matched_idf > 0.0 {
-                            matched_idf
-                        } else {
-                            idf(qt)
-                        }
+                    .find(|(_, tool)| std::ptr::eq(*tool, *top))
+                    .map_or(0.0, |(score, _)| *score);
+                let offered = &index.documents[pool[lex
+                    .iter()
+                    .position(|(_, tool)| std::ptr::eq(*tool, *top))
+                    .unwrap()]];
+                let covered: f64 = q_tokens
+                    .iter()
+                    .filter(|token| {
+                        offered.name_tokens.contains(*token)
+                            || offered.description_tokens.contains(*token)
+                            || offered.parameter_tokens.contains(*token)
                     })
+                    .map(|token| idf(token))
                     .sum();
-                let ideal = NAME_W * ideal_idf * (1.0 + NAME_SPECIFICITY_W);
-                ideal <= f64::EPSILON || *top_score / ideal < LOW_CONFIDENCE_LEXICAL_RATIO
+                let query_weight: f64 = q_tokens.iter().map(|token| idf(token)).sum();
+                #[cfg(test)]
+                {
+                    query_coverage = if query_weight > 0.0 {
+                        covered / query_weight
+                    } else {
+                        0.0
+                    };
+                }
+                let missing_evidence =
+                    query_weight <= f64::EPSILON || covered / query_weight < 0.90;
+                let runner_up = lex
+                    .iter()
+                    .filter(|(_, tool)| !std::ptr::eq(*tool, *top))
+                    .map(|(score, _)| *score)
+                    .fold(0.0_f64, f64::max);
+                let ratio = if evidence > 0.0 {
+                    runner_up / evidence
+                } else {
+                    1.0
+                };
+                #[cfg(test)]
+                {
+                    confidence_strength = if ideal > 0.0 { evidence / ideal } else { 0.0 };
+                    competitor_ratio = ratio;
+                }
+                let top_position = lex
+                    .iter()
+                    .position(|(_, tool)| std::ptr::eq(*tool, *top))
+                    .unwrap();
+                let similarity = similarities[top_position];
+                let other = similarities
+                    .iter()
+                    .enumerate()
+                    .filter(|(position, _)| *position != top_position)
+                    .map(|(_, score)| *score)
+                    .fold(0.0_f64, f64::max);
+                let semantic_ratio = if similarity > 0.0 {
+                    other / similarity
+                } else {
+                    1.0
+                };
+                #[cfg(test)]
+                {
+                    semantic_strength = similarity;
+                    semantic_competitor_ratio = semantic_ratio;
+                }
+                let minimum = if use_local_semantic {
+                    LOW_CONFIDENCE_SEMANTIC_LEXICAL_RATIO
+                } else {
+                    LOW_CONFIDENCE_LEXICAL_RATIO
+                };
+                corrected_spelling
+                    || missing_evidence
+                    || ideal <= f64::EPSILON
+                    || evidence / ideal < minimum
+                    || ratio
+                        >= if use_local_semantic {
+                            0.65
+                        } else {
+                            CONFIDENCE_COMPETITOR_RATIO
+                        }
+                    || (use_local_semantic && (similarity < 0.35 || semantic_ratio >= 0.95))
             }
         };
 
+        let limit = if adaptive && low_confidence {
+            UNCERTAIN_SEARCH_RESULTS
+        } else {
+            limit
+        };
+        // A named provider is an intentional scope, so its tools can fill the menu.
         // Scoped to a server: take the top `limit`. Unscoped: cap per server so one
         // server with many matching tools can't crowd the others out of the window.
-        let mut selected: Vec<&Value> = if server_filter.is_some() {
-            ranked.iter().take(limit).map(|(_, t)| *t).collect()
-        } else {
-            let cap = (limit / 3).max(4);
-            let mut per: HashMap<String, usize> = HashMap::new();
-            let mut out = Vec::new();
-            for (_, t) in &ranked {
-                if out.len() >= limit {
-                    break;
+        let mut selected: Vec<&Value> =
+            if server_filter.is_some() || servers.values().any(|(_, named)| *named) {
+                ranked.iter().take(limit).map(|(_, t)| *t).collect()
+            } else {
+                let cap = (limit / 3).max(4);
+                let mut per: HashMap<String, usize> = HashMap::new();
+                let mut out = Vec::new();
+                for (_, t) in &ranked {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    let c = per.entry(tool_prefix(t)).or_insert(0);
+                    if *c >= cap {
+                        continue;
+                    }
+                    *c += 1;
+                    out.push(*t);
                 }
-                let c = per.entry(tool_prefix(t)).or_insert(0);
-                if *c >= cap {
-                    continue;
-                }
-                *c += 1;
-                out.push(*t);
-            }
-            out
-        };
+                out
+            };
         let direct_returned = selected.len();
 
         // A weak score should not make every zero-score candidate invisible. Add
@@ -2715,12 +3087,77 @@ fn search_catalog_indexed(
     };
 
     SearchOutcome {
-        matches: project_budgeted(&selected),
+        #[cfg(test)]
+        confidence_strength,
+        #[cfg(test)]
+        query_coverage,
+        #[cfg(test)]
+        competitor_ratio,
+        #[cfg(test)]
+        semantic_strength,
+        #[cfg(test)]
+        semantic_competitor_ratio,
+        matches: project_search_results(&selected, true),
         total,
         low_confidence,
         broadened,
         direct_returned,
     }
+}
+
+/// Weighted reciprocal rank fusion needs no shared scale between IDF and cosine.
+/// Weak semantic similarities do not invent direct matches for an unknown request.
+fn local_search_fusion<'a>(
+    lex: &[(f64, &'a Value)],
+    similarities: &[f64],
+) -> Vec<(f64, &'a Value)> {
+    #[cfg(test)]
+    let weight = std::env::var("SEARCH_SENTENCE_WEIGHT")
+        .ok()
+        .map(|v| v.parse::<f64>().unwrap())
+        .unwrap_or(0.5);
+    #[cfg(not(test))]
+    let weight = 0.5;
+    #[cfg(test)]
+    let floor = std::env::var("SEARCH_SENTENCE_FLOOR")
+        .ok()
+        .map(|v| v.parse::<f64>().unwrap())
+        .unwrap_or(0.60);
+    #[cfg(not(test))]
+    let floor = 0.60_f64;
+    #[cfg(test)]
+    let minimum_similarity = std::env::var("SEARCH_SENTENCE_MIN_SIM")
+        .ok()
+        .map(|v| v.parse::<f64>().unwrap())
+        .unwrap_or(0.35);
+    #[cfg(not(test))]
+    let minimum_similarity = 0.35;
+    let semantic_floor = floor.max(similarities.iter().copied().fold(0.0_f64, f64::max) * 0.85);
+    let mut lexical_order: Vec<usize> = (0..lex.len()).collect();
+    lexical_order.sort_by(|a, b| lex[*b].0.total_cmp(&lex[*a].0));
+    let mut semantic_order: Vec<usize> = (0..lex.len()).collect();
+    semantic_order.sort_by(|a, b| similarities[*b].total_cmp(&similarities[*a]));
+    let mut scores = vec![0.0; lex.len()];
+    for (rank, position) in lexical_order.into_iter().enumerate() {
+        if lex[position].0 > 0.0 {
+            scores[position] += 1.0 / (10.0 + (rank + 1) as f64);
+        }
+    }
+    for (rank, position) in semantic_order.into_iter().enumerate() {
+        if similarities[position] >= minimum_similarity
+            && (lex[position].0 > 0.0 || similarities[position] >= semantic_floor)
+        {
+            scores[position] += weight / (10.0 + (rank + 1) as f64);
+        }
+    }
+    let mut ranked: Vec<_> = lex
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| scores[*i] > 0.0)
+        .map(|(i, (_, tool))| (scores[i], *tool))
+        .collect();
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    ranked
 }
 
 /// Blend embedding similarity into the lexical scores. Returns None when semantic
@@ -2762,7 +3199,7 @@ fn semantic_rerank<'a>(
 }
 
 /// Human-readable "why this tool" for the search trace: which query terms hit the
-/// tool's name vs its description. Reuses the same tokenizer and synonyms the ranker
+/// tool's name vs its description. Reuses the same tokenizer and catalog vocabulary the ranker
 /// scores with, so the explanation reflects the real match (minus IDF weighting).
 /// Bounded so a long query can't bloat a trace line; an empty result means the tool
 /// surfaced without a keyword hit (a semantic match, or a pinned prerequisite).
@@ -2778,7 +3215,7 @@ fn explain_match(query: &str, tool: &Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for qt in index_tokens(query) {
-        let cands = std::iter::once(qt.as_str()).chain(synonym_group(qt.as_str()).iter().copied());
+        let cands = std::iter::once(qt.as_str());
         for c in cands {
             let field = if name_set.contains(c) {
                 Some("name")
@@ -2826,71 +3263,41 @@ fn neutralize_listed_tools(tools: &mut [Value]) {
     }
 }
 
-/// Project selected tools to search results, bounding the total size of their
-/// (sometimes enormous) input schemas. Lazy discovery exists to keep the agent's
-/// context small, so one server's giant schemas must not blow it up: the top
-/// result always carries its full schema and the runner-up carries a small one;
-/// the rest return the name and a short description only, flagged `schemaOmitted`
-/// so the agent can fetch a tool's full schema by searching its exact name (or
-/// scoping with `server`).
-fn project_budgeted(tools: &[&Value]) -> Vec<Value> {
-    // Only the top result carries a full schema and a longer description - it's the
-    // one we tell the model to call. The runner-up keeps its schema when that is
-    // small, so a close second choice is callable without another search. Every
-    // other result is a compact menu entry: name plus a one-line description, no
-    // schema. A 25-result response then stays a few KB instead of tens, which
-    // matters because a (slow, local) model re-reads the whole thing on every turn.
-    // Full schema/text for any other tool comes from a scoped or exact-name search,
-    // as the response text explains.
-    const TOP_DESC_MAX: usize = 500;
-    const MENU_DESC_MAX: usize = 140;
-    const SECOND_SCHEMA_MAX_BYTES: usize = 1_536;
-    let truncate = |d: Option<&Value>, max: usize| match d.and_then(|v| v.as_str()) {
-        Some(s) => {
-            // Search is a delivery path for tool descriptions (SBS-896).
-            let s = integrity::neutralize_gateway_voice(s);
-            if s.chars().count() > max {
-                let head: String = s.chars().take(max).collect();
-                Value::String(format!("{head}…"))
-            } else {
-                Value::String(s)
-            }
+/// Menus carry one bounded complete schema. Exact-name retrieval can restore an
+/// oversized schema, which the handler pages losslessly through fetch_result.
+const SEARCH_TOP_SCHEMA_BYTES: usize = 4096;
+const SEARCH_DESCRIBE_BUDGET_BYTES: usize = 8192;
+
+fn project_search_results(tools: &[&Value], include_top_schema: bool) -> Vec<Value> {
+    tools.iter().enumerate().map(|(i, tool)| {
+        let mut entry = json!({"name":tool.get("name"),
+            "description": tool.get("description").and_then(Value::as_str).map(|text| {
+                let text = integrity::neutralize_gateway_voice(text);
+                let max = if i == 0 { 320 } else { 100 };
+                let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                if one_line.chars().count() > max { format!("{}…", one_line.chars().take(max).collect::<String>()) }
+                else { one_line }
+            })});
+        let schema = tool.get("inputSchema").unwrap_or(&Value::Null);
+        if include_top_schema && i == 0 && worker::json_size(schema, SEARCH_TOP_SCHEMA_BYTES).is_some() {
+            let mut schema = schema.clone();
+            integrity::neutralize_value_strings(&mut schema);
+            entry["inputSchema"] = schema;
+        } else {
+            entry["schemaOmitted"] = json!(true);
+            // This is a summary, never a partial schema presented as complete.
+            let required = schema.get("required").and_then(Value::as_array);
+            let params: Vec<_> = required.into_iter().flatten().take(6).filter_map(|name| {
+                let name = name.as_str()?;
+                let parameter = schema.get("properties")?.get(name)?;
+                let kind = parameter.get("type").and_then(Value::as_str).filter(|kind| kind.len() <= 20).unwrap_or("value");
+                Some(json!({"name":integrity::neutralize_gateway_voice(&name.chars().take(80).collect::<String>()),"type":kind}))
+            }).collect();
+            if !params.is_empty() { entry["requiredParams"] = json!(params); }
+            if required.is_some_and(|items| items.len() > 6) { entry["moreRequiredParams"] = json!(true); }
         }
-        _ => d.cloned().unwrap_or(Value::Null),
-    };
-    tools
-        .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            let name = t.get("name").cloned().unwrap_or(Value::Null);
-            if i == 0 {
-                let mut schema = t.get("inputSchema").cloned().unwrap_or(Value::Null);
-                integrity::neutralize_value_strings(&mut schema);
-                json!({
-                    "name": name,
-                    "description": truncate(t.get("description"), TOP_DESC_MAX),
-                    "inputSchema": schema,
-                })
-            } else if let Some(schema) = t
-                .get("inputSchema")
-                .filter(|schema| i == 1 && schema.to_string().len() <= SECOND_SCHEMA_MAX_BYTES)
-            {
-                let mut schema = schema.clone();
-                integrity::neutralize_value_strings(&mut schema);
-                json!({
-                    "name": name,
-                    "description": truncate(t.get("description"), MENU_DESC_MAX),
-                    "inputSchema": schema,
-                })
-            } else {
-                json!({
-                    "name": name,
-                    "description": truncate(t.get("description"), MENU_DESC_MAX),
-                    "schemaOmitted": true,
-                })
-            }
-        })
-        .collect()
+        entry
+    }).collect()
 }
 
 /// Append this process's health notes, such as a client moved to a private
@@ -3601,22 +4008,6 @@ fn scope_tools(
             .cloned()
             .collect(),
     }
-}
-
-fn scope_shared_tools(
-    tools: &dyn ToolCatalog,
-    allowed: Option<&HashSet<String>>,
-    route_of: impl Fn(&str) -> Option<String>,
-) -> SharedTools {
-    let mut tools = tools.shared();
-    if let Some(set) = allowed {
-        tools.retain(|tool| {
-            tool.get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|name| tool_in_scope(name, set, &route_of))
-        });
-    }
-    tools
 }
 
 fn scoped_catalog_digests(
@@ -6840,9 +7231,8 @@ fn handle_request_with_cancel(
     // requests can't cross-contaminate and dispatch needn't hold the router lock.
     client: Option<&str>,
     client_name: Option<&str>,
-    // Immutable index built from the same catalog snapshot as `cached`. Scoped
-    // HTTP clients and cold live-router fallbacks rebuild from their filtered
-    // source rather than risk indexing a tool they cannot see.
+    // Immutable index for `cached`. Visibility is filtered before every scoring
+    // path; a scoped request never builds or queues an embedding index.
     search_index: Option<&CatalogSearchIndex>,
     // The live router as a shareable Arc, used ONLY to build the `'static` call closure a
     // code-mode script needs (its downstream calls re-enter execute_call). `None` disables
@@ -7069,8 +7459,8 @@ fn handle_request_with_cancel(
                 let limit = arguments
                     .get("limit")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(25)
-                    .clamp(1, 200) as usize;
+                    .map(|limit| limit.clamp(1, 200) as usize)
+                    .unwrap_or(0);
                 // Prefer the cached catalog (instant); on a cold cache fall back to
                 // the live router so a first-time search doesn't return 0 results.
                 let live;
@@ -7083,34 +7473,21 @@ fn handle_request_with_cancel(
                 // This meta-tool feeds the model directly, so app-only tools
                 // must never appear in its results even for an Apps-capable
                 // host. Such tools are exposed separately for the host/view.
-                let model_visible;
-                let base = if base.iter().any(|tool| !mcp_app_tool_is_model_visible(tool)) {
-                    model_visible = {
-                        let mut visible = base.shared();
-                        visible.retain(mcp_app_tool_is_model_visible);
-                        visible
-                    };
-                    &model_visible
-                } else {
-                    base
+                let owners = unique_prefix_owners(reg);
+                let visible = |tool: &Value| {
+                    mcp_app_tool_is_model_visible(tool)
+                        && tool
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| {
+                                allowed.is_none_or(|allowed| {
+                                    tool_in_scope(name, allowed, &|name| {
+                                        owner_of_exposed_tool(Some(router), &owners, name)
+                                    })
+                                })
+                            })
                 };
-                // Avoid cloning the entire catalog for the normal local/unscoped path.
-                // Scoped HTTP callers still get a fail-closed filtered copy and a
-                // temporary index built only from that visible subset.
-                let scoped;
-                let (source, source_index): (&dyn ToolCatalog, Option<&CatalogSearchIndex>) =
-                    if allowed.is_none() {
-                        (
-                            base,
-                            search_index.filter(|index| index.matches_catalog(base)),
-                        )
-                    } else {
-                        let owners = unique_prefix_owners(reg);
-                        scoped = scope_shared_tools(base, allowed, |n| {
-                            owner_of_exposed_tool(Some(router), &owners, n)
-                        });
-                        (&scoped, None)
-                    };
+                let source: Vec<&Value> = base.iter().filter(|tool| visible(tool)).collect();
                 // Semantic re-ranking if the user has configured it (off by default;
                 // falls back to lexical on any failure).
                 let s = &reg.semantic_search;
@@ -7120,13 +7497,23 @@ fn handle_request_with_cancel(
                     s.model.clone(),
                     s.blend,
                 );
-                let outcome = search_catalog_indexed(
-                    source,
+                let identities: Vec<_> = reg
+                    .servers
+                    .iter()
+                    .flat_map(|server| {
+                        let prefix = sanitize_segment(&server.id).to_lowercase();
+                        [(prefix.clone(), server.id.clone()), (prefix, server.name.clone())]
+                    })
+                    .collect();
+                let outcome = search_catalog_filtered(
+                    base,
                     query,
                     server,
                     limit,
                     Some(&sem_cfg),
-                    source_index,
+                    search_index,
+                    visible,
+                    &identities,
                 );
                 let mut matches = outcome.matches;
                 let total = outcome.total;
@@ -7165,19 +7552,17 @@ fn handle_request_with_cancel(
                 if escalate {
                     matches.truncate(1); // only the best match, no distractions
                 }
-                // Always surface pinned prerequisite tools (with their full schema),
-                // even if the query didn't rank them, so a load-bearing tool (auth /
-                // list-before-act, or one whose description doesn't match the keywords)
-                // is never hidden behind lazy discovery. Scoped (source is already the
-                // client's catalog) and capped so a big pin set can't itself bloat.
+                // Pinned prerequisites keep their complete definitions, including schemas.
+                // Source is already scoped to the client; cap the number of pins.
                 let mut pins_added = 0usize;
                 if !reg.pinned_tools.is_empty() {
                     let have: std::collections::HashSet<&str> = matches
                         .iter()
                         .filter_map(|m| m.get("name").and_then(Value::as_str))
                         .collect();
-                    let mut pinned: Vec<Value> = source
+                    let pinned: Vec<&Value> = source
                         .iter()
+                        .copied()
                         .filter(|t| {
                             t.get("name")
                                 .and_then(Value::as_str)
@@ -7190,13 +7575,13 @@ fn handle_request_with_cancel(
                                     .unwrap_or(false)
                         })
                         .take(10)
-                        .map(|t| {
-                            // Pins are cloned straight from the raw catalog, so
-                            // they skip project_budgeted. Neutralize them on the
-                            // same terms as the ranked hits (SBS-896).
-                            let mut t = t.clone();
-                            neutralize_listed_tool(&mut t);
-                            t
+                        .collect();
+                    let mut pinned: Vec<Value> = pinned
+                        .into_iter()
+                        .map(|tool| {
+                            let mut tool = tool.clone();
+                            neutralize_listed_tool(&mut tool);
+                            tool
                         })
                         .collect();
                     if !pinned.is_empty() {
@@ -7225,10 +7610,9 @@ fn handle_request_with_cancel(
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false)
                 });
-                // Note only clarifies the OMITTED results need a follow-up; the first
-                // result always carries its schema, so it never does.
+                // Omitted schemas are explicitly deferred, including an oversized top schema.
                 let schema_note = if omitted {
-                    " For schemaOmitted, search the exact tool name for its schema."
+                    " For schemaOmitted, search the exact tool name to describe it. Large definitions are paged with toolport_fetch_result."
                 } else {
                     ""
                 };
@@ -7249,6 +7633,14 @@ fn handle_request_with_cancel(
                     None => "If you know the target server, search again with an empty query and its \
                              `server` prefix; otherwise call toolport_status to see the available prefixes."
                         .to_string(),
+                };
+                let schema_status = if matches
+                    .iter()
+                    .any(|tool| tool["name"] == top && tool.get("inputSchema").is_some())
+                {
+                    "with schema below"
+                } else {
+                    "with schema deferred"
                 };
                 let lead = if low_confidence && total == 0 && !matches.is_empty() {
                     format!(
@@ -7334,9 +7726,8 @@ fn handle_request_with_cancel(
                     // so a model exploring different needs is never cut off.)
                     format!(
                         "You have searched {} times and keep getting the same top tool, `{top}`. It \
-                         is the best match and its full input schema is below - call toolport_call_tool \
-                         now with name \"{top}\". Searching again will keep returning this. Only if \
-                         `{top}` genuinely cannot do the task, call toolport_status to see other servers.{pin_note}",
+                         is the best match {schema_status}. Describe it if schemaOmitted, otherwise call toolport_call_tool. \
+                         Only if `{top}` cannot do the task, call toolport_status to see other servers.{pin_note}{schema_note}",
                         repeats
                     )
                 } else {
@@ -7344,8 +7735,8 @@ fn handle_request_with_cancel(
                     // commits instead of re-searching (the v0.3.6 keep-searching nudges
                     // overcorrected and made compliant models thrash).
                     format!(
-                        "Found {total} matching tool(s){scope}. Top match: `{top}` with complete schema. \
-                         If it fits, call toolport_call_tool with name \"{top}\". Only search again if none match.{pin_note}{more}{schema_note}"
+                        "Found {total} matching tool(s){scope}. Top match: `{top}` {schema_status}. \
+                         If it fits, call toolport_call_tool with name \"{top}\" after reading its schema. Only search again if none match.{pin_note}{more}{schema_note}"
                     )
                 };
                 let text = format!(
@@ -7355,16 +7746,47 @@ fn handle_request_with_cancel(
                     // spending tokens on indentation and line breaks on every search.
                     serde_json::to_string(&matches).unwrap_or_default()
                 );
-                let response_content_bytes = text.len() as u64;
+                let mut search_result =
+                    json!({ "content": [{ "type": "text", "text": text }], "isError": false });
+                // A menu must keep every selected candidate visible. Only explicit
+                // describe requests page a large complete definition.
+                if total == 1 && top.eq_ignore_ascii_case(query.trim()) {
+                    shaping::shape_result(&mut search_result, SEARCH_DESCRIBE_BUDGET_BYTES, client);
+                }
+                let response_content_bytes = search_result["content"][0]["text"]
+                    .as_str()
+                    .map_or(0, str::len) as u64;
                 let matched_schema_bytes = savings::surface_bytes(&matches);
-                let catalog_schema_bytes = source_index
-                    .filter(|index| index.matches_catalog(source))
-                    .map_or_else(
-                        || savings::surface_bytes(source.iter()),
-                        |index| index.surface_bytes,
-                    );
+                let catalog_schema_bytes = 2
+                    + source.len().saturating_sub(1) as u64
+                    + search_index
+                        .filter(|index| index.matches_catalog(base))
+                        .map_or_else(
+                            || {
+                                source
+                                    .iter()
+                                    .map(|tool| {
+                                        savings::surface_bytes(std::slice::from_ref(*tool)) - 2
+                                    })
+                                    .sum()
+                            },
+                            |index| {
+                                if source.len() == base.len() {
+                                    index.surface_bytes - 2 - source.len().saturating_sub(1) as u64
+                                } else {
+                                    base.iter()
+                                        .zip(&index.documents)
+                                        .filter(|(tool, _)| visible(tool))
+                                        .map(|(_, doc)| doc.schema_bytes)
+                                        .sum::<u64>()
+                                }
+                            },
+                        );
                 if mode != DiscoveryMode::Full {
-                    savings::record_discovery(&text, matched_schema_bytes);
+                    savings::record_discovery(
+                        search_result["content"][0]["text"].as_str().unwrap_or(""),
+                        matched_schema_bytes,
+                    );
                 }
                 // Record exact UTF-8 returned text and schema-array bytes. Legacy
                 // token fields remain reference estimates for existing readers.
@@ -7392,7 +7814,7 @@ fn handle_request_with_cancel(
                 // Reflects the configured ranker (semantic re-rank falls back to lexical
                 // on any embedding failure, so this is the intended mode, not a per-call
                 // guarantee it succeeded).
-                let mode = if sem_cfg.is_active() {
+                let mode = if sem_cfg.is_active() || search_static::enabled() {
                     "semantic"
                 } else {
                     "lexical"
@@ -7415,10 +7837,7 @@ fn handle_request_with_cancel(
                     &ranking,
                     mode,
                 );
-                return Some(success(
-                    id,
-                    json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
-                ));
+                return Some(success(id, search_result));
             }
 
             // toolport_run_script: server-side "code mode". Run one agent script that calls
@@ -20248,6 +20667,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    mod search_scale {
+        include!("search_eval_scale.rs");
+    }
+
     #[test]
     fn recovery_guidance_is_short_scoped_and_schema_grounded() {
         let catalog = vec![
@@ -38270,9 +38693,9 @@ mod tests {
         // Top: keeps schema and the longer description.
         assert!(hits[0].get("inputSchema").is_some());
         assert!(hits[0]["description"].as_str().unwrap().chars().count() <= 501);
-        // Runner-up: keeps its small schema, short description.
-        assert_eq!(hits[1]["inputSchema"], json!({ "type": "object" }));
-        assert!(hits[1].get("schemaOmitted").is_none());
+        // Runner-up: compact, with its schema explicitly deferred.
+        assert!(hits[1].get("inputSchema").is_none());
+        assert_eq!(hits[1]["schemaOmitted"], json!(true));
         assert!(hits[1]["description"].as_str().unwrap().chars().count() <= 141);
         // Menu: no schema, short description.
         assert!(hits[2].get("inputSchema").is_none());
@@ -38436,7 +38859,8 @@ mod tests {
         ];
         let (hits, _) = search_catalog(&cat, "alpha", Some("a"), 10);
         assert_eq!(hits.len(), 2);
-        assert!(hits[0].get("inputSchema").is_some());
+        assert!(hits[0].get("inputSchema").is_none());
+        assert_eq!(hits[0]["schemaOmitted"], json!(true));
         assert!(hits[1].get("inputSchema").is_none());
         assert_eq!(
             hits[1].get("schemaOmitted").and_then(|v| v.as_bool()),
@@ -39241,14 +39665,14 @@ mod tests {
     #[test]
     fn search_bridges_synonyms_and_stems_and_camelcase() {
         let cat = vec![
-            json!({ "name": "resend__send_email", "description": "Send an email", "inputSchema": {} }),
+            json!({ "name": "resend__send_email", "description": "Send an email or mail message", "inputSchema": {} }),
             json!({ "name": "stripe__list_charges", "description": "List charges", "inputSchema": {} }),
             json!({ "name": "gh__listPullRequests", "description": "List PRs", "inputSchema": {} }),
-            json!({ "name": "stripe__list_disputes", "description": "List disputes", "inputSchema": {} }),
-            json!({ "name": "stripe__create_token", "description": "Create a token", "inputSchema": {} }),
-            json!({ "name": "calendar__create_event", "description": "Create a calendar event", "inputSchema": {} }),
+            json!({ "name": "stripe__list_disputes", "description": "List disputes and chargebacks", "inputSchema": {} }),
+            json!({ "name": "stripe__create_token", "description": "Create a token to tokenize a value", "inputSchema": {} }),
+            json!({ "name": "calendar__create_event", "description": "Create a calendar event to schedule a meeting", "inputSchema": {} }),
         ];
-        // Synonym: "mail" finds the email tool even though it never says "mail".
+        // Descriptions provide vocabulary missing from terse operation names.
         let (hits, _) = search_catalog(&cat, "mail", None, 10);
         assert_eq!(hits[0]["name"], "resend__send_email");
 
@@ -39260,8 +39684,7 @@ mod tests {
         let (hits, _) = search_catalog(&cat, "pull requests", None, 10);
         assert_eq!(hits[0]["name"], "gh__listPullRequests");
 
-        // Domain synonyms surfaced by the recall benchmark: "chargeback" == dispute,
-        // and "tokenize" bridges to a "token" tool.
+        // Alternative vocabulary comes from catalog descriptions, never a hand list.
         let (hits, _) = search_catalog(&cat, "chargeback", None, 10);
         assert_eq!(hits[0]["name"], "stripe__list_disputes");
         let (hits, _) = search_catalog(&cat, "tokenize", None, 10);
@@ -39279,12 +39702,16 @@ mod tests {
             search_catalog(cat, query, None, 5).0[0]["name"].clone()
         };
 
-        // The exact verb beats a synonym, and a plural object reads as a list.
+        // Exact operation text is stronger evidence than an unspecified inspection verb.
         let cat = vec![
-            tool("aws__get_bucket", "Get bucket."),
-            tool("aws__list_bucket", "List bucket."),
+            tool("aws__get_bucket", "Get one bucket."),
+            tool("aws__list_bucket", "List buckets."),
         ];
-        assert_eq!(top(&cat, "show my buckets"), "aws__list_bucket");
+        // With no catalog evidence distinguishing the inspection operation,
+        // expose both alternatives instead of promising a collection endpoint.
+        let unresolved = search_catalog_with(&cat, "show my buckets", None, 5, None);
+        assert!(unresolved.low_confidence);
+        assert!(unresolved.matches.iter().any(|tool| tool["name"] == "aws__list_bucket"));
         assert_eq!(top(&cat, "get the bucket"), "aws__get_bucket");
 
         // Naming the service picks its tool, and "GitHub" stays one word.

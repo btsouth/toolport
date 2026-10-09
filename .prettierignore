@@ -11,3 +11,5 @@ package-lock.json
 
 # Generated/external
 src-tauri/gen/
+# Pinned upstream static-model tokenizer, preserved byte for byte
+src-tauri/assets/search/tokenizer.json

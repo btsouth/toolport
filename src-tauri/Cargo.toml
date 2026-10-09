@@ -30,7 +30,9 @@ required-features = ["test-support"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["desktop"]
+default = ["desktop", "search-static"]
+# Offline bundled model; headless callers opt in explicitly with --no-default-features.
+search-static = ["dep:tokenizers"]
 desktop = [
     "dep:tauri",
     "dep:gio",
@@ -102,6 +104,8 @@ boa_gc = "0.21"
 base64 = "0.22"
 regex = "1"
 unicode-normalization = "0.1"
+# Pure Rust tokenizer for bundled static search embeddings, without native regex or HTTP.
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["fancy-regex"] }
 getrandom = "0.2"
 # OS advisory file locking (flock / LockFileEx) for the cross-process registry write
 # lock, so the app, the gateway binary, and the team-sync worker can't revert each

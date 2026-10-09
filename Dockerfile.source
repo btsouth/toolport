@@ -19,11 +19,12 @@ RUN mkdir -p src/bin && \
     printf 'fn main() {}\n' > src/main.rs && \
     printf 'fn main() {}\n' > src/bin/toolport-gateway.rs && \
     printf 'fn main() {}\n' > src/bin/mock-mcp-server.rs && \
-    cargo build --release --bin toolport-gateway --no-default-features
+    cargo build --release --bin toolport-gateway --no-default-features --features search-static
 
+COPY src-tauri/assets/search ./assets/search
 COPY src-tauri/src ./src
 RUN touch src/lib.rs src/main.rs src/bin/toolport-gateway.rs src/bin/mock-mcp-server.rs && \
-    cargo build --release --bin toolport-gateway --no-default-features
+    cargo build --release --bin toolport-gateway --no-default-features --features search-static
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \

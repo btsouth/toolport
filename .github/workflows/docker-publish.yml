@@ -64,10 +64,10 @@ jobs:
       # release-profile tests need the test-support hooks. Rebuild without the
       # feature afterwards so the uploaded artifact is a production binary.
       - name: Test toolport-gateway
-        run: cargo test --release --bin toolport-gateway --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support
+        run: cargo test --release --bin toolport-gateway --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static
 
       - name: Rebuild production gateway binary
-        run: cargo build --release --bin toolport-gateway --manifest-path src-tauri/Cargo.toml --no-default-features
+        run: cargo build --release --bin toolport-gateway --manifest-path src-tauri/Cargo.toml --no-default-features --features search-static
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
