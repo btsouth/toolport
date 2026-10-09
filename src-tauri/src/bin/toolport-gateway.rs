@@ -2867,11 +2867,16 @@ fn search_catalog_filtered(
                         1.0 + 0.1 * exact_form as f64 / doc.surface_name_tokens.len().max(1) as f64;
                     // Favor coherent evidence across the requested words over
                     // a single rare name hit. This uses only indexed tool text.
-                    let covered: f64 = q_tokens.iter().zip(&query_weights)
-                        .filter(|(token, _)| doc.name_tokens.contains(*token)
-                            || doc.description_tokens.contains(*token)
-                            || doc.parameter_tokens.contains(*token))
-                        .map(|(_, weight)| weight).sum();
+                    let covered: f64 = q_tokens
+                        .iter()
+                        .zip(&query_weights)
+                        .filter(|(token, _)| {
+                            doc.name_tokens.contains(*token)
+                                || doc.description_tokens.contains(*token)
+                                || doc.parameter_tokens.contains(*token)
+                        })
+                        .map(|(_, weight)| weight)
+                        .sum();
                     let requested: f64 = query_weights.iter().sum();
                     if requested > 0.0 {
                         score *= 1.0 + covered / requested;
