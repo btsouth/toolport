@@ -22603,6 +22603,8 @@ mod tests {
                     Err(ConnectFailure {
                         message: "HTTP 401 secret-token private-stderr".into(),
                         needs_auth,
+                        auth_target: needs_auth
+                            .then_some(conduit_lib::call_failure::AuthTarget::Endpoint),
                     })
                 }),
                 ReconnectBackoff {
