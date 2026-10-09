@@ -709,6 +709,8 @@ async function benchmark(options) {
       const work = path.join(home, "codex-overlay-work");
       for (const dir of [original, upper, work]) mkdirSync(dir, { mode: 0o700 });
       const readonlyArgs = [
+        "--unshare-pid",
+        "--die-with-parent",
         "--ro-bind",
         "/",
         "/",
@@ -790,6 +792,8 @@ async function benchmark(options) {
         work = path.join(home, "cursor-overlay-work");
       for (const dir of [original, upper, work]) mkdirSync(dir, { mode: 0o700 });
       const readonly = [
+        "--unshare-pid",
+        "--die-with-parent",
         "--ro-bind",
         "/",
         "/",
