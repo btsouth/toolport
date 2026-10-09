@@ -628,7 +628,16 @@ mod tests {
         fn fake(&self, name: &str, body: &str) -> PathBuf {
             use std::os::unix::fs::PermissionsExt;
             let path = self.0.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            // A concurrent process fork can inherit another test's writable
+            // script descriptor and make exec fail with ETXTBSY. Write in a
+            // separate, awaited fixture process so the test runner never owns it.
+            assert!(Command::new("/bin/sh")
+                .args(["-c", "printf '%s' \"$2\" > \"$1\"", "toolport-ref-fixture"])
+                .arg(&path)
+                .arg(format!("#!/bin/sh\n{body}\n"))
+                .status()
+                .unwrap()
+                .success());
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
             path
         }
