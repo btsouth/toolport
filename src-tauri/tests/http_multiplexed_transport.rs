@@ -560,7 +560,7 @@ fn failed_forced_refresh_recovers_on_the_next_concurrent_call() {
 }
 
 #[test]
-fn http_null_id_errors_preserve_the_server_message() {
+fn http_null_id_errors_preserve_detail_and_classify_endpoint_status() {
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let url = format!("http://{}/", server.server_addr());
     let wire = std::thread::spawn(move || {
@@ -576,12 +576,19 @@ fn http_null_id_errors_preserve_the_server_message() {
     transport.set_protocol_meta(Some(
         json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28"}),
     ));
-    for _ in 0..2 {
+    for status in [200, 400] {
         let error = transport.request("echo", json!({})).unwrap_err();
-        assert!(
-            matches!(error, conduit_lib::downstream::TransportError::Rpc(_)),
-            "{error}"
-        );
+        if status == 200 {
+            assert!(
+                matches!(error, conduit_lib::downstream::TransportError::Rpc(_)),
+                "{error}"
+            );
+        } else {
+            assert_eq!(
+                error.call_failure().kind,
+                conduit_lib::call_failure::CallFailureKind::Unavailable { after_send: true }
+            );
+        }
         assert!(error.to_string().contains("invalid request from server"));
     }
     wire.join().unwrap();
