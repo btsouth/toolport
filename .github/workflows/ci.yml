@@ -356,7 +356,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: src-tauri
-          shared-key: ci-headless
+          key: ci-headless
           cache-bin: "false"
           save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next/2.0') }}
       - name: Compile Rust tests and record build timings
