@@ -141,11 +141,21 @@ async function replay(profile) {
     } else {
       await client.notification("notifications/tools/list_changed");
       if (["codex", "cursor"].includes(profile.id)) {
-        const search = await client.call("toolport_search_tools", {
-          query: "mock__greet",
-        });
-        success(search);
-        assert(textOf(search).includes("mock__greet"));
+        // Startup and grow can both notify. Search after each event under the
+        // same deadline, without asking this non-refreshing client to re-list.
+        const deadline = performance.now() + deadlineMs;
+        while (true) {
+          const search = await client.call("toolport_search_tools", {
+            query: "mock__greet",
+          });
+          success(search);
+          if (textOf(search).includes("mock__greet")) break;
+          await client.notification(
+            "notifications/tools/list_changed",
+            Math.max(1, deadline - performance.now()),
+          );
+          assert(performance.now() < deadline, "changed tool missing from Full search");
+        }
         success(await client.call("mock__greet", { name: "fixture" }, true));
         pass(`${profile.id}: Full helpers recover a changed catalog without re-listing`);
       }

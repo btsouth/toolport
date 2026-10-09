@@ -110,7 +110,7 @@ fixture. It also checks that the lazy floor is independent of catalog size.
 These are MCP catalog costs, not vendor prompt usage or billed savings after
 native deferral and caching. Small catalogs can cost less than the lazy floor.
 
-Downstream initialize retains its 10-second bound (with the existing launcher
+Stdio downstream initialize retains its 10-second bound (with the existing launcher
 exception). The first tool catalog has a separate 30-second deadline shared by
 all pages. This covers the observed legitimate 15-second catalogs plus catalog
 work, matches the existing live-call/traversal cap, and still fails hung servers
