@@ -773,7 +773,7 @@ function CallRow({ e }: { e: AuditEntry }) {
     activityClientName(e),
     fmtAgo(e.ts),
     ...(e.cold == null ? [] : [e.cold ? "cold catalog" : "warm catalog"]),
-    ...(e.failureKind ? [e.failureKind.replaceAll("_", " ")] : []),
+    ...(e.failureKind ? [e.failureKind.replace(/_/g, " ")] : []),
     ...(e.dispatchMs == null ? [] : [`dispatch ${fmtMs(e.dispatchMs)}`]),
     ...(duration == null
       ? []
@@ -848,7 +848,7 @@ function CallRow({ e }: { e: AuditEntry }) {
       {open && e.error && (
         <div className="border-t border-border/50 bg-destructive/5 px-3 py-2 pl-9">
           <p className="font-mono text-xs whitespace-pre-wrap break-words text-destructive">
-            {e.error ?? e.failureKind?.replaceAll("_", " ")}
+            {e.error ?? e.failureKind?.replace(/_/g, " ")}
           </p>
           {e.runId && <p className="mt-1 font-mono text-xs">Run: {e.runId}</p>}
         </div>
