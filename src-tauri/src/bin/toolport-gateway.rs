@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 use conduit_lib::approval;
 use conduit_lib::approval::new_correlation_id;
 use conduit_lib::audit;
+use conduit_lib::call_failure::{CallFailure, CallFailureKind};
 use conduit_lib::clients;
 use conduit_lib::codemode;
 use conduit_lib::codemode_worker as worker;
@@ -3361,18 +3362,56 @@ fn source_tool_hints(
     hits.into_iter().map(|(_, n)| n).take(max).collect()
 }
 
-/// A one-line recovery hint naming sibling list/get tools, appended when a call
-/// fails so the model can source a missing/invalid identifier and retry.
-fn recovery_hint(catalog: &dyn ToolCatalog, server: &str) -> String {
-    let hints = source_tool_hints(catalog, server, None, 3);
-    if hints.is_empty() {
-        String::new()
+/// Trusted, bounded guidance appended only after defending downstream content.
+fn recovery_hint(
+    catalog: &dyn ToolCatalog,
+    server: &str,
+    name: &str,
+    arguments: &Value,
+    kind: CallFailureKind,
+) -> String {
+    let tool = catalog
+        .iter()
+        .find(|tool| tool["name"].as_str() == Some(name));
+    let kind = if kind == CallFailureKind::Internal {
+        // A known unconditional schema omission establishes an input failure even
+        // when an adapter supplied only an opaque error string.
+        let input = tool.and_then(|tool| tool.get("inputSchema")).map(|schema| {
+            CallFailureKind::InvalidInput {
+                missing: vec![],
+                invalid: vec![],
+            }
+            .with_schema(schema, arguments)
+        });
+        match input {
+            Some(CallFailureKind::InvalidInput { missing, invalid })
+                if !missing.is_empty() || !invalid.is_empty() =>
+            {
+                CallFailureKind::InvalidInput { missing, invalid }
+            }
+            _ => kind,
+        }
     } else {
-        format!(
-            " If a required identifier was missing or wrong, get valid values from one of these on '{server}', then retry: {}.",
-            hints.join(", ")
-        )
+        kind
+    };
+    let kind = tool.and_then(|tool| tool.get("inputSchema")).map_or_else(
+        || kind.clone().with_schema(&Value::Null, arguments),
+        |schema| kind.clone().with_schema(schema, arguments),
+    );
+    let read_only = tool
+        .and_then(|tool| tool.pointer("/annotations/readOnlyHint"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let mut text = format!(" {}", kind.guidance(read_only));
+    if kind.identifier_failure() {
+        let hints = source_tool_hints(catalog, server, None, 2);
+        // Long tool names must not expand every failure's context budget.
+        let hints: Vec<_> = hints.into_iter().filter(|hint| hint.len() <= 64).collect();
+        if !hints.is_empty() {
+            text.push_str(&format!(" Find IDs: {}.", hints.join(", ")));
+        }
     }
+    text
 }
 
 /// The server prefix of a namespaced tool name (`server__tool`). This is the
@@ -4759,14 +4798,9 @@ fn execute_call(
         cancel.as_ref(),
         effective_mrtr.is_some_and(|request| !request.is_empty()),
     );
-    match live_policy.and_then(|()| {
-        exec_router.route_call_with_cancel_and_mrtr(
-            name,
-            arguments,
-            cancel.clone(),
-            client_meta,
-            effective_mrtr,
-        )
+    let guidance_arguments = arguments.clone();
+    match live_policy.map_err(CallFailure::from).and_then(|()| {
+        exec_router.route_call_typed(name, arguments, cancel.clone(), client_meta, effective_mrtr)
     }) {
         Ok(mut result) => {
             if let Some(profiler) = &mut call_profiler {
@@ -4801,7 +4835,13 @@ fn execute_call(
             let trailer = if raw_ok {
                 String::new()
             } else {
-                recovery_hint(cached, srv)
+                recovery_hint(
+                    cached,
+                    srv,
+                    name,
+                    &guidance_arguments,
+                    CallFailureKind::tool_result(&result),
+                )
             };
             let Defended { result: out, pii } =
                 defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
@@ -4833,7 +4873,9 @@ fn execute_call(
             }
             out
         }
-        Err(e) => {
+        Err(failure) => {
+            let trailer = recovery_hint(cached, srv, name, &guidance_arguments, failure.kind);
+            let e = failure.detail;
             finish_modern_hitl(active_modern_hitl.as_deref());
             let ms = started.elapsed().as_millis() as u64;
             // Live inspection: capture the failed call too, with the error
@@ -4854,15 +4896,8 @@ fn execute_call(
             // Defend first, then audit: the error text runs through the same PII pass as
             // a successful result, and the audit row has to carry that pass's count like
             // the success path does (SBS-607).
-            let Defended { result: out, pii } = defend_and_shape(
-                reg,
-                srv,
-                tool,
-                client,
-                result,
-                &recovery_hint(cached, srv),
-                shape,
-            );
+            let Defended { result: out, pii } =
+                defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
             let defended_err = audited_error_text(&e, &out);
             audit::record_routed_call(
                 reg,
@@ -8496,6 +8531,7 @@ fn connect_one_result(
             return Err(ConnectFailure {
                 message: err,
                 needs_auth: false,
+                auth_target: None,
             });
         }
         // Resolve the ${ROOT} token against the client's project root (issue #239)
@@ -8514,6 +8550,7 @@ fn connect_one_result(
                 return Err(ConnectFailure {
                     message: error,
                     needs_auth: false,
+                    auth_target: None,
                 });
             }
         };
@@ -8575,6 +8612,8 @@ fn connect_one_result(
             glog(&msg);
             Err(ConnectFailure {
                 needs_auth: server.url.is_some() && remote::is_auth_error(&e),
+                auth_target: (server.url.is_some() && remote::is_auth_error(&e))
+                    .then_some(conduit_lib::call_failure::AuthTarget::Endpoint),
                 message: e,
             })
         }
@@ -12168,6 +12207,7 @@ impl HostState {
                     return Err(ConnectFailure {
                         message: "launch retired".to_string(),
                         needs_auth: false,
+                        auth_target: None,
                     });
                 }
                 let mut ds = connect_one_result(
@@ -12181,6 +12221,7 @@ impl HostState {
                     return Err(ConnectFailure {
                         message: "launch retired".to_string(),
                         needs_auth: false,
+                        auth_target: None,
                     });
                 }
                 resubscribe_server_resources(&mut ds, &server_id, &subs);
@@ -20122,6 +20163,50 @@ fn main() {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn recovery_guidance_is_short_scoped_and_schema_grounded() {
+        let catalog = vec![
+            json!({"name":"s__write","inputSchema":{"properties":{"deploymentId":{"type":"string"}},"required":["deploymentId"]}}),
+            json!({"name":"s__list_deployments"}),
+            json!({"name":"other__list_secrets"}),
+        ];
+        assert_eq!(
+            recovery_hint(
+                &catalog,
+                "s",
+                "s__write",
+                &json!({}),
+                CallFailureKind::Quota
+            ),
+            " Quota or rate limit reached. Check limits before retrying."
+        );
+        let input = recovery_hint(
+            &catalog,
+            "s",
+            "s__write",
+            &json!({}),
+            CallFailureKind::Internal,
+        );
+        assert_eq!(
+            input,
+            " Check tool input. Missing: deploymentId. Find IDs: s__list_deployments."
+        );
+        assert_eq!(input.len(), 72);
+        let timeout = recovery_hint(
+            &catalog,
+            "s",
+            "s__write",
+            &json!({}),
+            CallFailureKind::Timeout { after_send: true },
+        );
+        assert_eq!(
+            timeout,
+            " Timed out after send; may have completed, check before retrying."
+        );
+        assert_eq!(timeout.len(), 65);
+        assert!(!timeout.contains("Find IDs"));
+    }
+
+    #[test]
     fn gateway_modes_have_distinct_diagnostic_roles() {
         use conduit_lib::gatewaylog::Role;
         for (arg, tty, expected) in [
@@ -21950,6 +22035,7 @@ mod tests {
                 Err(ConnectFailure {
                     message: "initialize timed out".into(),
                     needs_auth: false,
+                    auth_target: None,
                 })
             }),
             ReconnectBackoff::default(),
@@ -22159,6 +22245,7 @@ mod tests {
                 Err(ConnectFailure {
                     message: "needs authentication".into(),
                     needs_auth: true,
+                    auth_target: Some(conduit_lib::call_failure::AuthTarget::Endpoint),
                 })
             }),
             ReconnectBackoff::default(),
@@ -22516,6 +22603,8 @@ mod tests {
                     Err(ConnectFailure {
                         message: "HTTP 401 secret-token private-stderr".into(),
                         needs_auth,
+                        auth_target: needs_auth
+                            .then_some(conduit_lib::call_failure::AuthTarget::Endpoint),
                     })
                 }),
                 ReconnectBackoff {
@@ -23002,6 +23091,7 @@ mod tests {
                     return Err(ConnectFailure {
                         message: "Temporary failure in name resolution".into(),
                         needs_auth: false,
+                        auth_target: None,
                     });
                 }
                 // The demand retry hangs rather than answering.
@@ -23009,6 +23099,7 @@ mod tests {
                 Err(ConnectFailure {
                     message: "initialize timed out".into(),
                     needs_auth: false,
+                    auth_target: None,
                 })
             }),
             ReconnectBackoff {

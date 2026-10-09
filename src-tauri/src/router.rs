@@ -22,6 +22,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde_json::{json, Value};
 
+use crate::call_failure::{AuthTarget, CallFailure, CallFailureKind};
 use crate::downstream::{
     backoff_delay, is_implausible_shrink, CacheHint, CancelContext, DownstreamServer, MrtrRequest,
     ServerDispatch, TransportError, HTTP_MAX_RETRIES, HTTP_RETRY_CAP,
@@ -604,6 +605,8 @@ struct ServerSlot {
     /// Calls that succeeded. A failed probe re-spawns a live multiplexed
     /// connection only if no other call succeeded while it was in flight.
     successes: AtomicU64,
+    /// Completed protocol responses, including ordinary error responses.
+    responses: AtomicU64,
     /// Calls running on a call handle. Counted while the slot lock is held to
     /// fetch the handle, so a re-spawn that checks it under the lock sees every
     /// call that could still be using the connection it replaces.
@@ -627,6 +630,7 @@ impl ServerSlot {
             in_flight: InFlightLimit::default(),
             generation: AtomicU64::new(0),
             successes: AtomicU64::new(0),
+            responses: AtomicU64::new(0),
             handle_calls: AtomicUsize::new(0),
             reconnect_gate: Mutex::new(()),
             supervisor: None,
@@ -643,6 +647,19 @@ impl ServerSlot {
         self.successes.load(Ordering::Acquire) == successes
             && self.handle_calls.load(Ordering::Acquire) == 0
             && server.suspended_calls() == 0
+    }
+
+    fn timeout_health(&self, error: &TransportError, generation: u64, responses: u64) -> bool {
+        !matches!(error.call_failure().kind, CallFailureKind::Timeout { .. })
+            || self.inner.try_lock().is_ok_and(|server| {
+                self.generation.load(Ordering::Acquire) == generation
+                    && self
+                        .responses
+                        .load(Ordering::Acquire)
+                        .wrapping_add(server.response_count())
+                        == responses
+                    && server.suspended_calls() == 0
+            })
     }
 }
 
@@ -693,6 +710,7 @@ pub enum SupervisorState {
 }
 
 struct Supervisor {
+    auth_target: Option<AuthTarget>,
     state: SupervisorState,
     connect: Connect,
     backoff: ReconnectBackoff,
@@ -716,6 +734,7 @@ impl ServerSlot {
     ) -> Self {
         let mut slot = Self::new(id.clone(), DownstreamServer::stopped(id, tools), None);
         slot.supervisor = Some(Mutex::new(Supervisor {
+            auth_target: None,
             state: SupervisorState::Stopped,
             connect,
             backoff,
@@ -758,6 +777,7 @@ impl ServerSlot {
         Some(PendingStatus {
             id: self.id.clone(),
             needs_auth: state.state == SupervisorState::NeedsAuth,
+            auth_target: state.auth_target,
             connecting: state.state == SupervisorState::Starting,
             failures: state.failures,
             last_error: state.last_error.clone(),
@@ -782,7 +802,10 @@ impl ServerSlot {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.publishing
                 || !(demand && state.state == SupervisorState::Stopped
-                    || state.state == SupervisorState::Backoff
+                    || (state.state == SupervisorState::Backoff
+                        || state.state == SupervisorState::NeedsAuth
+                            && state.auth_target == Some(AuthTarget::Endpoint)
+                            && !state.ever_ready)
                         && (now >= state.next_attempt
                             || demand
                                 && now.saturating_duration_since(state.last_attempt)
@@ -805,6 +828,7 @@ impl ServerSlot {
                         Err(ConnectFailure {
                             message: "connection startup panicked".to_string(),
                             needs_auth: false,
+                            auth_target: None,
                         })
                     });
                 if let Some(slot) = weak.upgrade() {
@@ -833,6 +857,7 @@ impl ServerSlot {
                         }
                         Err(failure) => {
                             state.failures = state.failures.saturating_add(1);
+                            state.auth_target = failure.auth_target;
                             state.last_error = failure.message;
                             state.next_attempt = Instant::now()
                                 + state
@@ -882,7 +907,9 @@ impl ServerSlot {
             let mut state = supervisor
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.state == SupervisorState::Ready {
+            if state.state == SupervisorState::Ready
+                || state.state == SupervisorState::NeedsAuth && state.ever_ready
+            {
                 state.last_use = Instant::now();
                 return Ok(());
             }
@@ -941,8 +968,10 @@ impl ServerSlot {
         let mut state = supervisor
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.state != SupervisorState::Ready
-            || self.generation.load(Ordering::Acquire) != generation
+        if !matches!(
+            state.state,
+            SupervisorState::Ready | SupervisorState::NeedsAuth
+        ) || self.generation.load(Ordering::Acquire) != generation
         {
             return state.state != SupervisorState::Ready;
         }
@@ -1149,6 +1178,7 @@ impl ReplayPolicy {
     fn uncertain_failure<'a>(self, error: &'a TransportError) -> Option<&'a TransportError> {
         match (self, error) {
             (Self::NoAmbiguousReplay, TransportError::Unavailable(_)) => Some(error),
+            (_, TransportError::Classified(kind, _)) if kind.uncertain() => Some(error),
             _ => None,
         }
     }
@@ -1217,9 +1247,8 @@ impl Breaker {
 #[derive(Debug, Clone)]
 pub struct ConnectFailure {
     pub message: String,
-    /// The server refused our credentials (or has none). Retrying cannot help until
-    /// they change, and a change rewrites the registry, which rebuilds the router.
     pub needs_auth: bool,
+    pub auth_target: Option<AuthTarget>,
 }
 
 /// Connect (or re-connect) one server from scratch. Supplied by the gateway, like
@@ -1269,6 +1298,7 @@ fn reconnect_jitter() -> f64 {
 /// Retry bookkeeping for one pending server. `now` and the jitter are passed in so
 /// the transitions are unit-testable without sleeping.
 struct PendingState {
+    auth_target: Option<AuthTarget>,
     failures: u32,
     last_error: String,
     needs_auth: bool,
@@ -1282,6 +1312,7 @@ struct PendingState {
 impl PendingState {
     fn new(failure: ConnectFailure, backoff: &ReconnectBackoff, now: Instant, jitter: f64) -> Self {
         let mut state = PendingState {
+            auth_target: None,
             failures: 0,
             last_error: String::new(),
             needs_auth: false,
@@ -1323,6 +1354,7 @@ impl PendingState {
         self.failures = self.failures.saturating_add(1);
         self.last_error = failure.message;
         self.needs_auth = failure.needs_auth;
+        self.auth_target = failure.auth_target;
         // Cap after jitter, so the slowest retry is the cap itself.
         let delay = backoff
             .delay(self.failures)
@@ -1361,6 +1393,7 @@ impl PendingServer {
         PendingStatus {
             id: self.id.clone(),
             needs_auth: state.needs_auth,
+            auth_target: state.auth_target,
             connecting: state.in_flight || state.ready.is_some(),
             failures: state.failures,
             last_error: state.last_error.clone(),
@@ -1423,6 +1456,7 @@ impl PendingServer {
 pub struct PendingStatus {
     pub id: String,
     pub needs_auth: bool,
+    pub auth_target: Option<AuthTarget>,
     /// An attempt is running, or one just connected and is joining the catalog.
     pub connecting: bool,
     pub failures: u32,
@@ -1435,7 +1469,12 @@ impl PendingStatus {
     pub fn describe(&self) -> String {
         let error = client_safe_error(&self.last_error);
         if self.needs_auth {
-            format!("needs sign-in in Toolport (last error: {error})")
+            let guidance = match self.auth_target {
+                Some(AuthTarget::Endpoint) => "MCP endpoint needs sign-in in Toolport",
+                Some(AuthTarget::ServiceCredential) => "service API credential required",
+                _ => "needs sign-in in Toolport",
+            };
+            format!("{guidance} (last error: {error})")
         } else if self.connecting {
             format!("connecting (last error: {error})")
         } else {
@@ -2216,6 +2255,11 @@ impl Router {
                     state.ever_ready = true;
                     state.failures = 0;
                     state.last_error.clear();
+                    state.auth_target = None;
+                    slot.breaker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record_success();
                 }
             }
         }
@@ -3253,15 +3297,59 @@ impl Router {
         dispatch_cancelled_continuation: bool,
         replay_policy: ReplayPolicy,
         access: SlotAccess,
-        mut f: F,
+        f: F,
     ) -> Result<T, String>
     where
         F: FnMut(&mut dyn ServerDispatch) -> Result<T, TransportError>,
     {
+        self.call_with_retry_typed(
+            slot,
+            cancel,
+            dispatch_cancelled_continuation,
+            replay_policy,
+            access,
+            f,
+        )
+        .map_err(|failure| failure.to_string())
+    }
+
+    fn call_with_retry_typed<T, F>(
+        &self,
+        slot: &Arc<ServerSlot>,
+        cancel: Option<&CancelContext>,
+        dispatch_cancelled_continuation: bool,
+        replay_policy: ReplayPolicy,
+        access: SlotAccess,
+        mut f: F,
+    ) -> Result<T, CallFailure>
+    where
+        F: FnMut(&mut dyn ServerDispatch) -> Result<T, TransportError>,
+    {
         if !dispatch_cancelled_continuation && cancel.is_some_and(CancelContext::is_cancelled) {
-            return Err("request cancelled before downstream attempt".to_string());
+            return Err(CallFailure::new(
+                CallFailureKind::Cancelled,
+                "request cancelled before downstream attempt",
+            ));
         }
-        slot.wait_for_start(cancel, dispatch_cancelled_continuation)?;
+        slot.wait_for_start(cancel, dispatch_cancelled_continuation)
+            .map_err(|detail| {
+                CallFailure::new(
+                    if !dispatch_cancelled_continuation
+                        && cancel.is_some_and(CancelContext::is_cancelled)
+                    {
+                        CallFailureKind::Cancelled
+                    } else if let Some(status) = slot.status().filter(|status| status.needs_auth) {
+                        status
+                            .auth_target
+                            .map_or(CallFailureKind::Internal, |target| CallFailureKind::Auth {
+                                target,
+                            })
+                    } else {
+                        CallFailureKind::Unavailable { after_send: false }
+                    },
+                    detail,
+                )
+            })?;
         // Circuit breaker: a server that just failed repeatedly is fast-failed here,
         // BEFORE taking its `inner` lock, so a dead/hung server neither pays its full
         // read timeout again nor queues callers behind an in-flight timing-out call.
@@ -3274,11 +3362,11 @@ impl Router {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(remaining) = breaker.open_remaining(Instant::now()) {
-                return Err(format!(
+                return Err(CallFailure::new(CallFailureKind::Unavailable { after_send: false }, format!(
                     "server '{}' is temporarily unavailable (too many recent failures; retrying in {}s)",
                     slot.id,
                     remaining.as_secs() + 1
-                ));
+                )));
             }
             // Cooldown elapsed but the failure streak is still at/over threshold: this
             // call is the half-open probe of a tripped breaker.
@@ -3309,24 +3397,55 @@ impl Router {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .record_failure(Instant::now());
-            return Err(format!("{reason}; downstream reconnect required"));
+            return Err(CallFailure::new(
+                CallFailureKind::Unavailable { after_send: false },
+                format!("{reason}; downstream reconnect required"),
+            ));
         }
         let mut attempt = 0u32;
         loop {
             if !dispatch_cancelled_continuation && cancel.is_some_and(CancelContext::is_cancelled) {
-                return Err("request cancelled before downstream attempt".to_string());
+                return Err(CallFailure::new(
+                    CallFailureKind::Cancelled,
+                    "request cancelled before downstream attempt",
+                ));
             }
             let generation = slot.generation.load(Ordering::Acquire);
             let successes = slot.successes.load(Ordering::Acquire);
+            let responses = {
+                let server = slot
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                slot.responses
+                    .load(Ordering::Acquire)
+                    .wrapping_add(server.response_count())
+            };
             let (result, started) = Self::attempt(slot, access, cancel, &mut f);
+            // Local classified failures (for example OAuth refresh before send)
+            // are not response activity. Wire transports count completed replies.
+            if result.is_ok()
+                || result
+                    .as_ref()
+                    .is_err_and(|error| matches!(error, TransportError::Rpc(_)))
+            {
+                slot.responses.fetch_add(1, Ordering::AcqRel);
+            }
             match result {
                 Ok(v) => {
                     slot.successes.fetch_add(1, Ordering::AcqRel);
                     if let Some(supervisor) = &slot.supervisor {
-                        supervisor
+                        let mut state = supervisor
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .failures = 0;
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.failures = 0;
+                        if state.state == SupervisorState::NeedsAuth
+                            && slot.generation.load(Ordering::Acquire) == generation
+                        {
+                            state.state = SupervisorState::Ready;
+                            state.auth_target = None;
+                            state.last_error.clear();
+                        }
                     }
                     slot.breaker
                         .lock()
@@ -3334,16 +3453,46 @@ impl Router {
                         .record_success();
                     return Ok(v);
                 }
-                Err(TransportError::Retry {
-                    retry_after,
-                    message,
-                }) if attempt < HTTP_MAX_RETRIES => {
+                Err(
+                    TransportError::Retry {
+                        retry_after,
+                        message,
+                    }
+                    | TransportError::RateLimited {
+                        retry_after,
+                        message,
+                    },
+                ) if attempt < HTTP_MAX_RETRIES => {
                     let wait = retry_wait(retry_after, attempt);
                     eprintln!("toolport: retrying downstream call after {wait:?}: {message}");
-                    wait_for_retry_or_cancel(wait, cancel).map_err(|error| error.to_string())?;
+                    wait_for_retry_or_cancel(wait, cancel).map_err(|error| error.call_failure())?;
                     attempt += 1;
                 }
                 Err(e) => {
+                    if matches!(
+                        e.call_failure().kind,
+                        CallFailureKind::Auth {
+                            target: crate::call_failure::AuthTarget::Endpoint
+                        }
+                    ) {
+                        if let Some(supervisor) = &slot.supervisor {
+                            let mut state = supervisor
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if matches!(
+                                state.state,
+                                SupervisorState::Ready | SupervisorState::NeedsAuth
+                            ) && slot.generation.load(Ordering::Acquire) == generation
+                                && slot.successes.load(Ordering::Acquire) == successes
+                            {
+                                state.state = SupervisorState::NeedsAuth;
+                                if let CallFailureKind::Auth { target } = e.call_failure().kind {
+                                    state.auth_target = Some(target);
+                                }
+                                state.last_error = e.to_string();
+                            }
+                        }
+                    }
                     if matches!(e, TransportError::FrameRejected(_)) {
                         // Retire every owned call without replay, including read-only
                         // calls. Concurrent failures of one stream count once.
@@ -3351,12 +3500,12 @@ impl Router {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .record_concurrent_failure(started, Instant::now());
-                        return Err(e.to_string());
+                        return Err(e.call_failure());
                     }
                     // Only a health failure (timeout / dead connection / exhausted
                     // retries) counts toward the breaker; a normal error response does
                     // not disable the server.
-                    if e.is_health_failure() {
+                    if e.is_health_failure() && slot.timeout_health(&e, generation, responses) {
                         if slot.degrade(generation, successes, &e.to_string(), is_probe) {
                             slot.breaker
                                 .lock()
@@ -3364,9 +3513,12 @@ impl Router {
                                 .record_concurrent_failure(started, Instant::now());
                             let mut message = slot.unavailable();
                             if replay_policy.uncertain_failure(&e).is_some() {
-                                message.push_str(". The previous operation may have completed; check before retrying it.");
+                                message.push_str(match replay_policy {
+                                    ReplayPolicy::ReadOnly => ". Retry the read after the endpoint recovers.",
+                                    ReplayPolicy::NoAmbiguousReplay => ". The previous operation may have completed; check before retrying it.",
+                                });
                             }
-                            return Err(message);
+                            return Err(CallFailure::new(e.call_failure().kind, message));
                         }
                         // The server has now failed for a full cooldown and the probe
                         // confirms it's still down. Re-spawn the connection once and
@@ -3381,9 +3533,10 @@ impl Router {
                         // ends every call in flight. The last of them to fail does it.
                         if is_probe && Self::respawn_after_failure(slot, successes) {
                             if cancel.is_some_and(CancelContext::is_cancelled) {
-                                return Err(
-                                    "request cancelled before downstream reconnect".to_string()
-                                );
+                                return Err(CallFailure::new(
+                                    CallFailureKind::Cancelled,
+                                    "request cancelled before downstream reconnect",
+                                ));
                             }
                             if let Some(v) = self.reconnect_and_retry(
                                 slot,
@@ -3402,7 +3555,7 @@ impl Router {
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .record_concurrent_failure(started, Instant::now());
                     }
-                    return Err(e.to_string());
+                    return Err(e.call_failure());
                 }
             }
         }
@@ -3440,10 +3593,10 @@ impl Router {
             .supervisor
             .as_ref()
             .map(|s| s.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
-        if lifecycle
-            .as_ref()
-            .is_some_and(|s| s.state != SupervisorState::Ready)
-        {
+        if lifecycle.as_ref().is_some_and(|s| {
+            s.state != SupervisorState::Ready
+                && !(s.state == SupervisorState::NeedsAuth && s.ever_ready)
+        }) {
             drop(lifecycle);
             return (Err(TransportError::Busy(slot.unavailable())), None);
         }
@@ -3508,7 +3661,7 @@ impl Router {
         successes: u64,
         access: SlotAccess,
         f: &mut F,
-    ) -> Option<Result<T, String>>
+    ) -> Option<Result<T, CallFailure>>
     where
         F: FnMut(&mut dyn ServerDispatch) -> Result<T, TransportError>,
     {
@@ -3526,11 +3679,11 @@ impl Router {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .open_remaining(Instant::now())
             {
-                return Some(Err(format!(
+                return Some(Err(CallFailure::new(CallFailureKind::Unavailable { after_send: false }, format!(
                     "server '{}' is temporarily unavailable (too many recent failures; retrying in {}s)",
                     slot.id,
                     remaining.as_secs() + 1
-                )));
+                ))));
             }
             if slot.generation.load(Ordering::Acquire) == generation {
                 eprintln!("toolport: server '{}' is down; re-spawning it", slot.id);
@@ -3542,9 +3695,10 @@ impl Router {
                     return None; // still unreachable: fall through to record_failure
                 };
                 if cancel.is_some_and(CancelContext::is_cancelled) {
-                    return Some(Err(
-                        "request cancelled before retrying the reconnected downstream".to_string(),
-                    ));
+                    return Some(Err(CallFailure::new(
+                        CallFailureKind::Cancelled,
+                        "request cancelled before retrying the reconnected downstream",
+                    )));
                 }
                 // Swap the live child/connection for the fresh one.
                 let mut server = slot
@@ -3575,13 +3729,24 @@ impl Router {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .record_success();
-            return Some(Err(error.to_string()));
+            return Some(Err(error.call_failure()));
         }
         if cancel.is_some_and(CancelContext::is_cancelled) {
-            return Some(Err(
-                "request cancelled before retrying the reconnected downstream".to_string(),
-            ));
+            return Some(Err(CallFailure::new(
+                CallFailureKind::Cancelled,
+                "request cancelled before retrying the reconnected downstream",
+            )));
         }
+        let generation = slot.generation.load(Ordering::Acquire);
+        let responses = {
+            let server = slot
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.responses
+                .load(Ordering::Acquire)
+                .wrapping_add(server.response_count())
+        };
         let (retry, started) = Self::attempt(slot, access, cancel, f);
         if retry.is_ok() {
             slot.successes.fetch_add(1, Ordering::AcqRel);
@@ -3597,10 +3762,10 @@ impl Router {
                 Ok(v)
             }
             Err(e) => {
-                if e.is_health_failure() {
+                if e.is_health_failure() && slot.timeout_health(&e, generation, responses) {
                     breaker.record_concurrent_failure(started, Instant::now());
                 }
-                Err(e.to_string())
+                Err(e.call_failure())
             }
         })
     }
@@ -3634,17 +3799,39 @@ impl Router {
         meta: Option<&Value>,
         mrtr: Option<&MrtrRequest>,
     ) -> Result<Value, String> {
+        self.route_call_typed(exposed_name, arguments, cancel, meta, mrtr)
+            .map_err(|failure| failure.to_string())
+    }
+
+    pub fn route_call_typed(
+        &self,
+        exposed_name: &str,
+        arguments: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, CallFailure> {
         self.authorize(DispatchTarget::Tool(exposed_name))?;
-        let (server_id, tool) = self
-            .routes
-            .get(exposed_name)
-            .ok_or_else(|| self.no_route_message(exposed_name))?;
+        let (server_id, tool) = self.routes.get(exposed_name).ok_or_else(|| {
+            CallFailure::new(
+                CallFailureKind::NotFound,
+                self.no_route_message(exposed_name),
+            )
+        })?;
         let mut arguments = arguments;
         if let Some(plan) = self.schema_arguments.get(exposed_name) {
-            plan.restore(&mut arguments)?;
+            plan.restore(&mut arguments).map_err(|detail| {
+                CallFailure::new(
+                    CallFailureKind::InvalidInput {
+                        missing: vec![],
+                        invalid: vec![],
+                    },
+                    detail,
+                )
+            })?;
         }
         let slot = self.authorized_slot(server_id)?;
-        let (result, downstream_supports_tasks) = self.call_with_retry(
+        let (result, downstream_supports_tasks) = self.call_with_retry_typed(
             &slot,
             cancel.as_ref(),
             mrtr.is_some_and(|request| !request.is_empty()),
@@ -3662,16 +3849,19 @@ impl Router {
         if result.get("resultType").and_then(Value::as_str) == Some("task") {
             if !client_supports_tasks(meta) {
                 return Err(
-                    "downstream returned a task without the required client capability".to_string(),
+                    "downstream returned a task without the required client capability"
+                        .to_string()
+                        .into(),
                 );
             }
             if !downstream_supports_tasks {
                 return Err(
                     "downstream returned a task without advertising the Tasks extension"
-                        .to_string(),
+                        .to_string()
+                        .into(),
                 );
             }
-            expose_task_result(result, server_id)
+            expose_task_result(result, server_id).map_err(Into::into)
         } else {
             Ok(result)
         }
@@ -4032,6 +4222,179 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    fn http_timeout_health(body_stage: bool, live_sibling: bool) {
+        use crate::downstream::HttpTransport;
+        use std::io::Write;
+        let _lock = crate::registry::data_dir_test_lock();
+        let scratch = std::env::temp_dir().join(format!(
+            "toolport-f1-timeout-{}",
+            crate::approval::new_correlation_id()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&scratch);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", server.server_addr());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let writes = Arc::new(AtomicU32::new(0));
+        let counted = writes.clone();
+        let wire = std::thread::spawn(move || {
+            let mut stalled = Vec::new();
+            while !stopped.load(Ordering::Acquire) {
+                let Some(mut request) = server.recv_timeout(Duration::from_millis(50)).unwrap()
+                else {
+                    continue;
+                };
+                let mut text = String::new();
+                request.as_reader().read_to_string(&mut text).unwrap();
+                let body: Value = serde_json::from_str(&text).unwrap();
+                if body["params"]["name"] == "write" {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let mut output = request.into_writer();
+                    if body_stage {
+                        output.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"jsonrpc\":").unwrap();
+                        output.flush().unwrap();
+                    }
+                    // Channel barriers, not sleeps, keep the write in flight while
+                    // the sibling succeeds. Dropping this writer ends the fixture.
+                    started_tx.send(()).unwrap();
+                    stalled.push(output);
+                    continue;
+                }
+                if body.get("id").is_none() {
+                    request.respond(tiny_http::Response::empty(202)).unwrap();
+                    continue;
+                }
+                let result = match body["method"].as_str().unwrap_or_default() {
+                    "initialize" => {
+                        json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"timeout-fixture","version":"1"}})
+                    }
+                    "tools/list" => {
+                        json!({"tools":[{"name":"write","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":false}},{"name":"read","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]})
+                    }
+                    "tools/call" => json!({"content":[{"type":"text","text":"sibling succeeded"}]}),
+                    _ => json!({}),
+                };
+                let response = if body["method"] == "server/discover" {
+                    json!({"jsonrpc":"2.0","id":body["id"],"error":{"code":-32601,"message":"legacy fixture"}})
+                } else {
+                    json!({"jsonrpc":"2.0","id":body["id"],"result":result})
+                };
+                request
+                    .respond(
+                        tiny_http::Response::from_string(response.to_string()).with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        ),
+                    )
+                    .unwrap();
+            }
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(stalled);
+        });
+        let transport =
+            HttpTransport::guarded_with_timeout(&url, None, None, false, Duration::from_secs(2));
+        let downstream = DownstreamServer::connect("fixture".into(), Box::new(transport)).unwrap();
+        let spawns = Arc::new(AtomicU32::new(0));
+        let reconnects = spawns.clone();
+        let mut router = Router::new();
+        router.add_with_reconnect(
+            downstream,
+            Some(Box::new(move || {
+                reconnects.fetch_add(1, Ordering::SeqCst);
+                None
+            })),
+        );
+        let router = Arc::new(router);
+        for _ in 0..3 {
+            let caller = router.clone();
+            let slow = std::thread::spawn(move || {
+                caller.route_call_typed("fixture__write", json!({}), None, None, None)
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if live_sibling {
+                let sibling = router.route_call("fixture__read", json!({})).unwrap();
+                assert_eq!(sibling["content"][0]["text"], "sibling succeeded");
+            }
+            let failure = slow.join().unwrap().unwrap_err();
+            assert_eq!(
+                failure.kind,
+                CallFailureKind::Timeout { after_send: true },
+                "{failure}"
+            );
+        }
+        assert_eq!(
+            router.servers[0]
+                .breaker
+                .lock()
+                .unwrap()
+                .consecutive_failures,
+            if live_sibling { 0 } else { 3 }
+        );
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            0,
+            "timeouts must not reconnect/replay"
+        );
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            3,
+            "each write reaches the wire once"
+        );
+        if live_sibling {
+            assert!(router.route_call("fixture__read", json!({})).is_ok());
+        } else {
+            assert!(router.servers[0]
+                .breaker
+                .lock()
+                .unwrap()
+                .open_until
+                .is_some());
+        }
+        stop.store(true, Ordering::Release);
+        release_tx.send(()).unwrap();
+        wire.join().unwrap();
+        drop(_data);
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn header_timeouts_with_live_siblings_leave_breaker_closed() {
+        http_timeout_health(false, true);
+    }
+
+    #[test]
+    fn body_timeouts_with_live_siblings_leave_breaker_closed() {
+        http_timeout_health(true, true);
+    }
+
+    #[test]
+    fn dead_http_timeouts_open_breaker_without_replay() {
+        http_timeout_health(false, false);
+    }
+
+    #[test]
+    fn stalled_http_bodies_open_breaker_without_replay() {
+        http_timeout_health(true, false);
+    }
+
+    #[test]
+    fn post_send_io_failures_are_non_replayable_even_for_read_probes() {
+        for kind in [
+            CallFailureKind::Timeout { after_send: true },
+            CallFailureKind::Unavailable { after_send: true },
+        ] {
+            let error = TransportError::Classified(kind, "opaque detail".into());
+            assert!(error.is_health_failure());
+            assert!(ReplayPolicy::ReadOnly.uncertain_failure(&error).is_some());
+            assert!(ReplayPolicy::NoAmbiguousReplay
+                .uncertain_failure(&error)
+                .is_some());
+        }
+    }
 
     #[test]
     fn unrouted_client_prefixed_alias_error_names_the_real_tool() {
@@ -5145,6 +5508,69 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_timeout_with_sibling_response_does_not_count_health() {
+        let mut router = Router::new();
+        router.add_with_reconnect(
+            mock_server("s"),
+            Some(Box::new(|| {
+                Some(
+                    DownstreamServer::connect(
+                        "s".into(),
+                        Box::new(GatedTransport {
+                            gate: closed_gate(),
+                            slow_fails: false,
+                            late: closed_gate(),
+                        }),
+                    )
+                    .unwrap(),
+                )
+            })),
+        );
+        let router = Arc::new(router);
+        let slot = Arc::clone(&router.servers[0]);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let caller = Arc::clone(&router);
+        let call_slot = Arc::clone(&slot);
+        let call = std::thread::spawn(move || {
+            caller
+                .reconnect_and_retry(
+                    &call_slot,
+                    None,
+                    None,
+                    0,
+                    0,
+                    SlotAccess::Shared,
+                    &mut |_| {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Err::<Value, _>(TransportError::Classified(
+                            CallFailureKind::Timeout { after_send: true },
+                            "deadline".into(),
+                        ))
+                    },
+                )
+                .unwrap()
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let sibling: Result<Value, CallFailure> = router.call_with_retry_typed(
+            &slot,
+            None,
+            false,
+            ReplayPolicy::NoAmbiguousReplay,
+            SlotAccess::Shared,
+            |_| Ok(json!({"sibling":true})),
+        );
+        assert!(sibling.is_ok());
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            call.join().unwrap().unwrap_err().kind,
+            CallFailureKind::Timeout { after_send: true }
+        );
+        assert_eq!(slot.breaker.lock().unwrap().consecutive_failures, 0);
+    }
+
+    #[test]
     fn a_slow_concurrent_call_does_not_hold_the_slot_lock() {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let mut router = Router::new();
@@ -5514,7 +5940,7 @@ for line in sys.stdin:
         // Factory still can't reach the server (returns None): no recovery, and the
         // caller must fall through to record the failure.
         let slot = dead_slot(Some(Box::new(|| None)));
-        let out: Option<Result<Value, String>> =
+        let out: Option<Result<Value, CallFailure>> =
             router.reconnect_and_retry(&slot, None, None, 0, 0, SlotAccess::Shared, &mut |ds| {
                 ds.call_with_cancel_and_mrtr("echo", json!({}), None, None, None)
             });
@@ -5554,7 +5980,10 @@ for line in sys.stdin:
             .expect("reconnect was attempted")
             .unwrap_err();
 
-        assert!(result.contains("cancelled"), "unexpected error: {result}");
+        assert!(
+            result.detail.contains("cancelled"),
+            "unexpected error: {result}"
+        );
         assert_eq!(
             retried_calls.load(Ordering::SeqCst),
             0,
@@ -5572,7 +6001,7 @@ for line in sys.stdin:
         let cancel_from_retry = cancellations.clone();
         let slot = dead_slot(Some(Box::new(|| Some(mock_server("s")))));
 
-        let result: Result<Value, String> = router
+        let result: Result<Value, CallFailure> = router
             .reconnect_and_retry(
                 &slot,
                 Some(&cancel),
@@ -5589,7 +6018,7 @@ for line in sys.stdin:
             )
             .expect("reconnect was attempted");
 
-        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(result.unwrap_err().detail.contains("cancelled"));
         let mut breaker = slot
             .breaker
             .lock()
@@ -5606,7 +6035,7 @@ for line in sys.stdin:
         // A slot with no reconnect factory (e.g. a test fixture) behaves as before:
         // reconnect is skipped and the breaker path handles the failure.
         let slot = dead_slot(None);
-        let out: Option<Result<Value, String>> =
+        let out: Option<Result<Value, CallFailure>> =
             router.reconnect_and_retry(&slot, None, None, 0, 0, SlotAccess::Shared, &mut |ds| {
                 ds.call_with_cancel_and_mrtr("echo", json!({}), None, None, None)
             });
@@ -7755,6 +8184,7 @@ for line in sys.stdin:
         ConnectFailure {
             message: message.to_string(),
             needs_auth,
+            auth_target: needs_auth.then_some(AuthTarget::Endpoint),
         }
     }
 
@@ -7796,10 +8226,385 @@ for line in sys.stdin:
         router
     }
 
+    #[test]
+    fn endpoint_http_failures_keep_siblings_and_recover_auth_and_sessions() {
+        use crate::downstream::{HttpTransport, ScopeReauthorizeFn};
+        let _lock = crate::registry::data_dir_test_lock();
+        let scratch = std::env::temp_dir().join(crate::approval::new_correlation_id());
+        std::fs::create_dir_all(&scratch).unwrap();
+        let data = crate::registry::DataDirOverride::set(&scratch);
+        for has_session in [true, false] {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/mcp", server.server_addr());
+            let code = Arc::new(AtomicU32::new(200));
+            let status = Arc::clone(&code);
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = Arc::clone(&stop);
+            let initializes = Arc::new(AtomicU32::new(0));
+            let inits = Arc::clone(&initializes);
+            let calls = Arc::new(AtomicU32::new(0));
+            let counted = Arc::clone(&calls);
+            let wire = std::thread::spawn(move || {
+                while !stopped.load(Ordering::Acquire) {
+                    let Some(mut request) = server.recv_timeout(Duration::from_millis(50)).unwrap()
+                    else {
+                        continue;
+                    };
+                    let mut text = String::new();
+                    request.as_reader().read_to_string(&mut text).unwrap();
+                    let body: Value = serde_json::from_str(&text).unwrap();
+                    let status =
+                        if body["method"] == "tools/call" && body["params"]["name"] == "echo" {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            status.load(Ordering::Acquire)
+                        } else {
+                            200
+                        };
+                    let result = match body["method"].as_str().unwrap_or_default() {
+                        "initialize" => {
+                            inits.fetch_add(1, Ordering::SeqCst);
+                            json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}}})
+                        }
+                        "tools/list" => {
+                            json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}},{"name":"sibling","inputSchema":{"type":"object"}}]})
+                        }
+                        _ => json!({"content":[{"type":"text","text":"ok"}]}),
+                    };
+                    if matches!(status, 201 | 202) {
+                        let wrong = json!({"jsonrpc":"2.0","id":999,"result":result});
+                        let (text, content_type) = if status == 202 {
+                            (format!("data: {wrong}\n\n"), "text/event-stream")
+                        } else {
+                            (wrong.to_string(), "application/json")
+                        };
+                        request
+                            .respond(
+                                tiny_http::Response::from_string(text).with_header(
+                                    tiny_http::Header::from_bytes("Content-Type", content_type)
+                                        .unwrap(),
+                                ),
+                            )
+                            .unwrap();
+                        continue;
+                    }
+                    let response = if status == 400 {
+                        json!({"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"session missing"}})
+                    } else if status == 422 {
+                        json!({"jsonrpc":"2.0","id":body["id"],"error":{"code":-32602,"message":"invalid args"}})
+                    } else {
+                        json!({"jsonrpc":"2.0","id":body["id"],"result":result})
+                    };
+                    let mut response = tiny_http::Response::from_string(response.to_string())
+                        .with_status_code(if status == 422 { 400 } else { status as u16 })
+                        .with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        );
+                    if has_session && body["method"] == "initialize" {
+                        response = response.with_header(
+                            tiny_http::Header::from_bytes("Mcp-Session-Id", "fixture-session")
+                                .unwrap(),
+                        );
+                    }
+                    if status == 403 {
+                        response = response.with_header(
+                            tiny_http::Header::from_bytes(
+                                "WWW-Authenticate",
+                                "Bearer error=\"insufficient_scope\", scope=\"write\"",
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    request.respond(response).unwrap();
+                }
+            });
+            let connect: Connect = Arc::new(move || {
+                let mut transport = HttpTransport::new(&url);
+                let reauthorize: ScopeReauthorizeFn = Box::new(|_| Err("declined".into()));
+                transport.set_scope_reauthorize(Some(reauthorize));
+                DownstreamServer::connect("s".into(), Box::new(transport))
+                    .map_err(|message| failure(&message, false))
+            });
+            let mut router = supervised_fixture(connect);
+            router.servers[0].start(true);
+            ready_supervisor(&mut router);
+            for status in [403, 403, 500, 500, 500, 501, 505, 422] {
+                code.store(status, Ordering::Release);
+                let error = router
+                    .route_call_typed("s__echo", json!({}), None, None, None)
+                    .unwrap_err();
+                let expected = if status == 403 {
+                    CallFailureKind::Auth {
+                        target: AuthTarget::Scope,
+                    }
+                } else if status == 422 {
+                    CallFailureKind::InvalidInput {
+                        missing: vec![],
+                        invalid: vec![],
+                    }
+                } else {
+                    CallFailureKind::ServerError { after_send: true }
+                };
+                assert_eq!(error.kind, expected);
+                assert!(!router.servers[0].status().unwrap().needs_auth);
+                if status != 500 {
+                    assert!(router.route_call("s__sibling", json!({})).is_ok());
+                }
+                assert_eq!(
+                    router.servers[0]
+                        .breaker
+                        .lock()
+                        .unwrap()
+                        .consecutive_failures,
+                    0
+                );
+            }
+            for status in [201, 202] {
+                code.store(status, Ordering::Release);
+                let before = calls.load(Ordering::SeqCst);
+                let error = router
+                    .route_call_typed("s__echo", json!({}), None, None, None)
+                    .unwrap_err();
+                assert_eq!(
+                    error.kind,
+                    CallFailureKind::ServerError { after_send: true }
+                );
+                assert!(error.kind.guidance(false).contains("may have completed"));
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    before + 1,
+                    "mismatched replies never replay"
+                );
+                assert!(router.route_call("s__sibling", json!({})).is_ok());
+            }
+            code.store(401, Ordering::Release);
+            // Repeated rejects must still reach the wire, without accumulating a
+            // server-wide delay. A working sibling immediately clears the display.
+            for _ in 0..10 {
+                for _ in 0..6 {
+                    assert_eq!(
+                        router
+                            .route_call_typed("s__echo", json!({}), None, None, None)
+                            .unwrap_err()
+                            .kind,
+                        CallFailureKind::Auth {
+                            target: AuthTarget::Endpoint
+                        }
+                    );
+                    assert!(router.servers[0].status().unwrap().needs_auth);
+                }
+                assert!(router.route_call("s__sibling", json!({})).is_ok());
+                assert!(!router.servers[0].status().unwrap().needs_auth);
+            }
+            code.store(200, Ordering::Release);
+            assert!(router.route_call("s__echo", json!({})).is_ok());
+            assert!(!router.servers[0].status().unwrap().needs_auth);
+            assert_eq!(
+                initializes.load(Ordering::SeqCst),
+                1,
+                "auth recovery uses the existing connection"
+            );
+            for status in [400, 404] {
+                code.store(status, Ordering::Release);
+                for _ in 0..if has_session { 1 } else { 4 } {
+                    assert_eq!(
+                        router
+                            .route_call_typed("s__echo", json!({}), None, None, None)
+                            .unwrap_err()
+                            .kind,
+                        if !has_session && status == 404 {
+                            CallFailureKind::ServerError { after_send: true }
+                        } else {
+                            CallFailureKind::http_status(status as u16, has_session)
+                        }
+                    );
+                }
+                code.store(200, Ordering::Release);
+                if has_session {
+                    router.servers[0]
+                        .supervisor
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .next_attempt = Instant::now();
+                    assert!(router.servers[0].start(true));
+                    ready_supervisor(&mut router);
+                }
+                assert!(router.route_call("s__sibling", json!({})).is_ok());
+            }
+            assert_eq!(
+                initializes.load(Ordering::SeqCst),
+                if has_session { 3 } else { 1 },
+                "only invalid sessions initialize again"
+            );
+            stop.store(true, Ordering::Release);
+            wire.join().unwrap();
+        }
+        drop(data);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
     fn ready_supervisor(router: &mut Router) {
         assert!(wait_until(|| router.has_ready_reconnects()));
         router.adopt_ready_reconnects();
         router.activate_supervisors();
+    }
+
+    #[test]
+    fn local_auth_failure_does_not_mask_a_dead_connection_timeout() {
+        let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
+        router.servers[0].start(true);
+        ready_supervisor(&mut router);
+        let slot = &router.servers[0];
+        let generation = slot.generation.load(Ordering::Acquire);
+        let responses = slot.responses.load(Ordering::Acquire);
+        let result: Result<Value, CallFailure> = router.call_with_retry_typed(
+            slot,
+            None,
+            false,
+            ReplayPolicy::NoAmbiguousReplay,
+            SlotAccess::Shared,
+            |_| {
+                Err(TransportError::Classified(
+                    CallFailureKind::Auth {
+                        target: AuthTarget::OAuthRefresh,
+                    },
+                    "local refresh failed before send".into(),
+                ))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(slot.responses.load(Ordering::Acquire), responses);
+        assert!(slot.timeout_health(
+            &TransportError::Classified(
+                CallFailureKind::Timeout { after_send: true },
+                "no wire response".into(),
+            ),
+            generation,
+            responses,
+        ));
+    }
+
+    #[test]
+    fn read_only_timeout_degrade_keeps_read_wording_and_does_not_replay() {
+        let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
+        router.servers[0].start(true);
+        ready_supervisor(&mut router);
+        router.servers[0]
+            .breaker
+            .lock()
+            .unwrap()
+            .consecutive_failures = BREAKER_FAILURE_THRESHOLD;
+        let attempts = AtomicU32::new(0);
+        let result: Result<Value, CallFailure> = router.call_with_retry_typed(
+            &router.servers[0],
+            None,
+            false,
+            ReplayPolicy::ReadOnly,
+            SlotAccess::Shared,
+            |_| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(TransportError::Classified(
+                    CallFailureKind::Timeout { after_send: true },
+                    "deadline".into(),
+                ))
+            },
+        );
+        let failure = result.unwrap_err();
+        assert_eq!(failure.kind, CallFailureKind::Timeout { after_send: true });
+        assert!(failure
+            .detail
+            .contains("Retry the read after the endpoint recovers"));
+        assert!(!failure.detail.contains("may have completed"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn call_auth_keeps_demands_open_and_recovers_on_success() {
+        use crate::call_failure::AuthTarget;
+        for target in [
+            AuthTarget::Endpoint,
+            AuthTarget::OAuthRefresh,
+            AuthTarget::ServiceCredential,
+            AuthTarget::Scope,
+        ] {
+            let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
+            router.servers[0].start(true);
+            ready_supervisor(&mut router);
+            let kind = CallFailureKind::Auth { target };
+            let result: Result<Value, CallFailure> = router.call_with_retry_typed(
+                &router.servers[0],
+                None,
+                false,
+                ReplayPolicy::NoAmbiguousReplay,
+                SlotAccess::Shared,
+                |_| Err(TransportError::Classified(kind.clone(), "opaque".into())),
+            );
+            assert_eq!(result.unwrap_err().kind, kind);
+            let endpoint_auth = target == AuthTarget::Endpoint;
+            assert_eq!(
+                router.servers[0].status().unwrap().needs_auth,
+                endpoint_auth
+            );
+            assert_eq!(router.pending_statuses().len(), usize::from(endpoint_auth));
+            if endpoint_auth {
+                assert_eq!(
+                    router.servers[0].status().unwrap().auth_target,
+                    Some(target)
+                );
+            }
+            if endpoint_auth {
+                for _ in 0..10 {
+                    let rejected: Result<Value, CallFailure> = router.call_with_retry_typed(
+                        &router.servers[0],
+                        None,
+                        false,
+                        ReplayPolicy::NoAmbiguousReplay,
+                        SlotAccess::Shared,
+                        |_| Err(TransportError::Classified(kind.clone(), "opaque".into())),
+                    );
+                    assert_eq!(rejected.unwrap_err().kind, kind);
+                    assert!(router.servers[0].status().unwrap().needs_auth);
+                    assert_eq!(
+                        router.servers[0]
+                            .supervisor
+                            .as_ref()
+                            .unwrap()
+                            .lock()
+                            .unwrap()
+                            .failures,
+                        0
+                    );
+                }
+            }
+            if matches!(
+                target,
+                AuthTarget::Endpoint | AuthTarget::OAuthRefresh | AuthTarget::Scope
+            ) {
+                // A transient vault/lock failure must leave the next demand free
+                // to reread a saved winner, rather than terminally blocking it.
+                let recovered: Result<Value, CallFailure> = router.call_with_retry_typed(
+                    &router.servers[0],
+                    None,
+                    false,
+                    ReplayPolicy::NoAmbiguousReplay,
+                    SlotAccess::Shared,
+                    |_| Ok(json!({"savedWinner":true})),
+                );
+                assert_eq!(recovered.unwrap(), json!({"savedWinner":true}));
+                assert!(!router.servers[0].status().unwrap().needs_auth);
+            }
+
+            assert_eq!(
+                router.servers[0]
+                    .breaker
+                    .lock()
+                    .unwrap()
+                    .consecutive_failures,
+                0
+            );
+        }
     }
 
     #[test]
@@ -7969,7 +8774,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn supervisor_background_retry_waits_for_backoff_and_auth_waits_for_replacement() {
+    fn supervisor_background_and_connect_auth_retry_after_backoff() {
         let calls = Arc::new(AtomicU64::new(0));
         let mut router = supervised_fixture(flaky_connect("s", 1, Arc::clone(&calls)));
         router.servers[0].start(true);
@@ -7990,21 +8795,64 @@ for line in sys.stdin:
         let auth_calls = Arc::new(AtomicU64::new(0));
         let count = Arc::clone(&auth_calls);
         let auth: Connect = Arc::new(move || {
-            count.fetch_add(1, Ordering::SeqCst);
-            Err(failure("HTTP 401", true))
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(failure("HTTP 401", true))
+            } else {
+                Ok(mock_server("s"))
+            }
         });
-        let router = supervised_fixture(auth);
+        let mut router = supervised_fixture(auth);
         router.servers[0].start(true);
         assert!(wait_until(|| router.servers[0]
             .status()
             .unwrap()
             .needs_auth));
-        for _ in 0..10 {
-            router.maintain_supervisors();
-            router.servers[0].start(true);
-        }
-        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
-        assert!(router.servers[0].unavailable().contains("needs sign-in"));
+        let status = router.servers[0].status().unwrap();
+        assert_eq!(status.auth_target, Some(AuthTarget::Endpoint));
+        assert!(status.describe().contains("MCP endpoint"));
+        let (last, due) = {
+            let state = router.servers[0]
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap();
+            (state.last_attempt, state.next_attempt)
+        };
+        assert!(!router.servers[0].start_at(true, last));
+        assert!(router.servers[0].start_at(true, due));
+        ready_supervisor(&mut router);
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 2);
+        assert!(!router.servers[0].status().unwrap().needs_auth);
+        assert!(router.route_call("s__echo", json!({})).is_ok());
+    }
+
+    #[test]
+    fn supervisor_service_credentials_wait_for_configuration_changes() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&calls);
+        let connect: Connect = Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Err(ConnectFailure {
+                message: "missing service credential".to_string(),
+                needs_auth: true,
+                auth_target: Some(AuthTarget::ServiceCredential),
+            })
+        });
+        let router = supervised_fixture(connect);
+        let slot = &router.servers[0];
+        assert!(slot.start(true));
+        assert!(wait_until(|| slot.status().unwrap().needs_auth));
+        let due = slot
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .next_attempt;
+        assert!(!slot.start_at(false, due));
+        assert!(!slot.start_at(true, due + Duration::from_secs(60)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

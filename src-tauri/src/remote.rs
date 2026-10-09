@@ -1476,9 +1476,17 @@ impl Redaction {
     fn error(&self, error: crate::downstream::TransportError) -> crate::downstream::TransportError {
         use crate::downstream::TransportError as E;
         match error {
+            E::Classified(kind, message) => E::Classified(kind, self.text(message)),
             E::Fatal(message) => E::Fatal(self.text(message)),
             E::FrameRejected(message) => E::FrameRejected(self.text(message)),
             E::Unavailable(message) => E::Unavailable(self.text(message)),
+            E::RateLimited {
+                retry_after,
+                message,
+            } => E::RateLimited {
+                retry_after,
+                message: self.text(message),
+            },
             E::Retry {
                 retry_after,
                 message,
@@ -1512,6 +1520,15 @@ impl crate::downstream::ConcurrentTransport for ImportedConcurrent {
     }
 }
 impl Transport for ImportedTransport {
+    fn response_count(&self) -> u64 {
+        self.0.response_count()
+    }
+    fn connection_reset_reason(&self) -> Option<String> {
+        self.0
+            .connection_reset_reason()
+            .map(|error| self.1.text(error))
+    }
+
     fn request(
         &mut self,
         method: &str,

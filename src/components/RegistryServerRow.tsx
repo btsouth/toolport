@@ -110,21 +110,27 @@ export function RegistryServerRow({
   const isTeam = server.source?.startsWith("team:") ?? false;
 
   const label =
-    status === "connected"
-      ? `Ready · ${health?.toolCount ?? 0} tool${health?.toolCount === 1 ? "" : "s"}`
-      : status === "error"
-        ? "Error"
-        : status === "checking"
-          ? initializing
-            ? launcher
-              ? "Installing…"
-              : "Initializing…"
-            : "Checking…"
-          : requiredLaunch.length
-            ? missingPlainLaunch.length
-              ? `Setup required: ${missingPlainLaunch.map((input) => input.label).join(", ")}`
-              : "Disabled · check launch setup"
-            : "Disabled";
+    status === "needs-auth"
+      ? health?.authTarget === "service_credential"
+        ? "Service credential required"
+        : health?.authTarget === "endpoint"
+          ? "MCP endpoint auth required"
+          : "Authentication required"
+      : status === "connected"
+        ? `Ready · ${health?.toolCount ?? 0} tool${health?.toolCount === 1 ? "" : "s"}`
+        : status === "error"
+          ? "Error"
+          : status === "checking"
+            ? initializing
+              ? launcher
+                ? "Installing…"
+                : "Initializing…"
+              : "Checking…"
+            : requiredLaunch.length
+              ? missingPlainLaunch.length
+                ? `Setup required: ${missingPlainLaunch.map((input) => input.label).join(", ")}`
+                : "Disabled · check launch setup"
+              : "Disabled";
 
   // Next free "Name (N)" for the duplicate-for-another-account action.
   const existingNames = new Set(registry?.servers.map((s) => s.name.toLowerCase()) ?? []);
@@ -186,27 +192,34 @@ export function RegistryServerRow({
                 ? launcher
                   ? "Installing the server package"
                   : "Server initializing"
-                : status === "connected"
-                  ? label.replace(" · ", ", ")
-                  : STATUS_ARIA_LABEL[status]
+                : status === "needs-auth"
+                  ? label
+                  : status === "connected"
+                    ? label.replace(" · ", ", ")
+                    : STATUS_ARIA_LABEL[status]
             }
             className="sr-only"
           />
           {status === "needs-auth" ? (
-            <SecretsDialog
-              server={server}
-              onSaved={onRegistryChange}
-              onChanged={onReprobe}
-              trigger={
-                <button
-                  onClick={stop}
-                  className="inline-flex items-center gap-1.5 rounded-md border border-warning/40 px-2.5 py-1 text-xs text-warning transition-colors hover:bg-warning/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-warning"
-                >
-                  <LogIn className="size-3.5" />
-                  Authenticate
-                </button>
-              }
-            />
+            <>
+              <StatusLabel status={status} label={label} error={health?.error ?? null} />
+              <SecretsDialog
+                server={server}
+                onSaved={onRegistryChange}
+                onChanged={onReprobe}
+                trigger={
+                  <button
+                    onClick={stop}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-warning/40 px-2.5 py-1 text-xs text-warning transition-colors hover:bg-warning/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-warning"
+                  >
+                    <LogIn className="size-3.5" />
+                    {health?.authTarget === "service_credential"
+                      ? "Edit service key"
+                      : "Sign in"}
+                  </button>
+                }
+              />
+            </>
           ) : (
             <StatusLabel status={status} label={label} error={health?.error ?? null} />
           )}

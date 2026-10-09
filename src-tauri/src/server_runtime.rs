@@ -17,6 +17,7 @@ pub struct ProbeResult {
     pub tool_count: usize,
     pub error: Option<String>,
     pub auth_required: bool,
+    pub auth_target: Option<crate::call_failure::AuthTarget>,
 }
 
 fn env_key_required(server: &ServerEntry, key: &str) -> bool {
@@ -107,14 +108,26 @@ pub fn probe_one(server: &ServerEntry) -> ProbeResult {
             tool_count: connection.tools.len(),
             error: None,
             auth_required: false,
+            auth_target: None,
         },
-        Err(error) => ProbeResult {
-            server_id: server.id.clone(),
-            ok: false,
-            tool_count: 0,
-            auth_required: remote::is_auth_error(&error) || missing_secret(server),
-            error: Some(error),
-        },
+        Err(error) => {
+            let missing_credential = missing_secret(server);
+            let auth_rejected = remote::is_auth_error(&error);
+            ProbeResult {
+                server_id: server.id.clone(),
+                ok: false,
+                tool_count: 0,
+                auth_required: auth_rejected || missing_credential,
+                auth_target: if missing_credential {
+                    Some(crate::call_failure::AuthTarget::ServiceCredential)
+                } else if auth_rejected && server.url.is_some() {
+                    Some(crate::call_failure::AuthTarget::Endpoint)
+                } else {
+                    None
+                },
+                error: Some(error),
+            }
+        }
     }
 }
 
@@ -151,6 +164,7 @@ pub fn probe_one_bounded(server: &ServerEntry) -> ProbeResult {
             tool_count: 0,
             error: Some(format!("timed out after {}s", timeout.as_secs())),
             auth_required: false,
+            auth_target: None,
         })
 }
 

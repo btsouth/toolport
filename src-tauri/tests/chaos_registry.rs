@@ -43,17 +43,18 @@ fn a_corrupt_registry_does_not_take_down_a_running_gateway() {
     let corrupt = "{ \"version\": 1, \"servers\": [ { \"id\": \"x\", TRUNCATED";
     std::fs::write(scratch.path().join("registry.json"), corrupt).expect("corrupt the registry");
 
-    // The unreadable bytes are preserved for inspection before anything heals.
+    // A matching temporary filename is not evidence that quarantine finished.
+    // Wait for the exact final copy, including every byte of the failed write.
+    let quarantined = format!(
+        "registry.json.unreadable-sha256-{}",
+        conduit_lib::registry::sha256_hex(corrupt)
+    );
     wait_for("the corrupt copy to be quarantined", Duration::from_secs(30), || {
-        !scratch.matching("registry.json.unreadable-").is_empty()
+        scratch.read(&quarantined) == corrupt
     });
-    let quarantined = scratch
-        .matching("registry.json.unreadable-")
-        .into_iter()
-        .map(|name| scratch.read(&name))
-        .find(|content| content.contains("TRUNCATED"));
-    assert!(
-        quarantined.is_some(),
+    assert_eq!(
+        scratch.read(&quarantined),
+        corrupt,
         "the corrupt bytes must survive in the quarantine copy"
     );
 
