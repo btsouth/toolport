@@ -7038,7 +7038,11 @@ impl HttpTransport {
                     .store(true, Ordering::Release);
                 self.concurrency.closed.store(true, Ordering::Release);
             }
-            return crate::call_failure::CallFailureKind::http_status(code, has_session);
+            return if !has_session && code == 404 {
+                crate::call_failure::CallFailureKind::ServerError { after_send: true }
+            } else {
+                crate::call_failure::CallFailureKind::http_status(code, has_session)
+            };
         }
         crate::call_failure::CallFailureKind::http_status(code, true)
     }
@@ -14674,7 +14678,7 @@ for line in sys.stdin:
                         invalid: vec![],
                     },
                 ),
-                (404, CallFailureKind::NotFound),
+                (404, CallFailureKind::ServerError { after_send: true }),
                 (200, CallFailureKind::ServerError { after_send: true }),
             ] {
                 let server = tiny_http::Server::http("127.0.0.1:0").unwrap();

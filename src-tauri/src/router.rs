@@ -8412,7 +8412,11 @@ for line in sys.stdin:
                             .route_call_typed("s__echo", json!({}), None, None, None)
                             .unwrap_err()
                             .kind,
-                        CallFailureKind::http_status(status as u16, has_session)
+                        if !has_session && status == 404 {
+                            CallFailureKind::ServerError { after_send: true }
+                        } else {
+                            CallFailureKind::http_status(status as u16, has_session)
+                        }
                     );
                 }
                 code.store(200, Ordering::Release);
