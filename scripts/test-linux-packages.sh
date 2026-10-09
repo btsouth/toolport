@@ -137,6 +137,7 @@ for mode in ubuntu debian fedora; do
     debian) image=debian:13 ;;
     fedora) image=fedora:latest ;;
   esac
+  image="${TOOLPORT_PACKAGE_TEST_IMAGE_PREFIX:-}$image"
   # Tag only task-owned aliases. Keep shared upstream caches and containers.
   timeout 300 docker pull "$image"
   alias_image="$prefix-$mode:latest"
