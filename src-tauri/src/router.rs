@@ -9152,6 +9152,7 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_lazy_start_is_single_flight_and_cached_discovery_stays_stopped() {
+        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-lazy-start");
         let calls = Arc::new(AtomicU64::new(0));
         let mut router = supervised_fixture(flaky_connect("s", 0, Arc::clone(&calls)));
         router.maintain_supervisors();
@@ -9313,6 +9314,7 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_catalog_save_skips_busy_server_without_losing_its_cache() {
+        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-catalog-save");
         let router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
         let inner = router.servers[0].inner.lock().unwrap();
         assert!(router.raw_catalogs().is_none());
@@ -9433,6 +9435,7 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_idle_stop_keeps_prompts_and_resources_without_rediscovery() {
+        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-idle-catalog");
         let calls = Arc::new(AtomicU64::new(0));
         let mut router = supervised_fixture(flaky_connect("s", 0, Arc::clone(&calls)));
         router.servers[0].start(true);
@@ -9462,6 +9465,7 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_startup_result_wakes_a_waiting_publisher() {
+        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-startup-result");
         let router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
         let mut seen = started_supervisors();
         let started = Instant::now();
@@ -9496,6 +9500,7 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_unsubscribe_never_starts_a_stopped_server() {
+        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-unsubscribe");
         let calls = Arc::new(AtomicU64::new(0));
         let router = supervised_fixture(flaky_connect("s", 0, Arc::clone(&calls)));
         let started = Instant::now();
@@ -9550,6 +9555,7 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_unavailable_message_matches_the_demand_retry() {
+        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-unavailable");
         let calls = Arc::new(AtomicU64::new(0));
         let router = supervised_fixture(flaky_connect("s", 1, Arc::clone(&calls)));
         let slot = Arc::clone(&router.servers[0]);
@@ -9655,6 +9661,7 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_start_panic_enters_backoff_instead_of_staying_starting() {
+        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-start-panic");
         let router = supervised_fixture(Arc::new(|| panic!("fixture startup panic")));
         router.servers[0].start(true);
         assert!(wait_until(
@@ -9674,6 +9681,7 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_reuses_only_matching_launch_specs() {
+        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-launch-specs");
         let previous = supervised_fixture(flaky_connect("s", 0, Arc::new(AtomicU64::new(0))));
         let mut same = Router::new();
         assert!(same.reuse_supervisor(&previous, "s", &json!({"revision":1})));
