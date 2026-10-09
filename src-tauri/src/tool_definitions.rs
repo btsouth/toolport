@@ -390,7 +390,6 @@ impl SerializedTools {
         }
         catalog.tools.push(tool);
     }
-    #[cfg(test)]
     pub fn retain_names(&mut self, mut keep: impl FnMut(Option<&str>) -> bool) {
         let catalog = Arc::make_mut(&mut self.0);
         catalog.tools.retain(|tool| keep(tool.name.as_deref()));

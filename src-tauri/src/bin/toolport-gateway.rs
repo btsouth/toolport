@@ -30446,7 +30446,7 @@ mod tests {
                     &json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}).to_string(),
                     Some(sid),
                     None,
-                    Some(allowed),
+                    allowed.as_ref(),
                     Some(caller),
                 );
                 assert_eq!(out.status, 200, "{phase}: {}", out.body);
