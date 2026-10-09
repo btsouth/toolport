@@ -40761,6 +40761,7 @@ mod tests {
                 .context()
                 .session_id
                 .unwrap();
+            assert!(conduit_lib::telemetry::flush_for_test(Duration::from_secs(5)));
             let rows: Vec<_> = audit::read_all()
                 .unwrap()
                 .into_iter()
@@ -40897,6 +40898,8 @@ mod tests {
             let response = GatewayResponse {
                 envelope: success(id, json!({"tools": [], "cacheTTL": 123})),
                 surface: Some(Arc::clone(&surface)),
+                observation: None,
+                tools_list: true,
             };
             let expected = serde_json::to_string(&response).unwrap();
             let body = response.to_json().unwrap();
