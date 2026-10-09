@@ -6022,23 +6022,11 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
     })
 }
 
-/// A secondary Claude config gets display identity without changing its scope.
-fn secondary_claude_gateway_entry(profile: Option<&str>) -> Result<ServerEntry, String> {
-    let mut entry = gateway_entry(profile, "claude-code-secondary")?;
-    for env in &mut entry.env {
-        if env.key == crate::brand::CLIENT_ID {
-            env.key = crate::brand::ATTRIBUTION_ID.into();
-        }
-    }
-    Ok(entry)
-}
-
 /// Preserve the launch's scope identity when replacing a stale command.
 fn repair_gateway_entry(
     format: Format,
     path: &Path,
     name: &str,
-    profile: Option<&str>,
     id: &str,
 ) -> Result<ServerEntry, String> {
     let text = read_config_file(path)?;
@@ -6057,12 +6045,27 @@ fn repair_gateway_entry(
         Format::YamlExtensions => "envs",
         _ => "env",
     };
-    let mut entry = gateway_entry(profile, id)?;
+    let mut entry = gateway_entry(None, id)?;
     entry.env.retain(|env| env.key != crate::brand::CLIENT_ID);
-    for key in [crate::brand::CLIENT_ID, crate::brand::CLIENT_ID_LEGACY] {
-        if let Some(value) = prior[env_key].get(key) {
-            let value = value.as_str().ok_or("Invalid gateway scope identity")?;
-            entry.env.push(EnvVar {
+    for (key, legacy) in [
+        (crate::brand::CLIENT_ID, crate::brand::CLIENT_ID_LEGACY),
+        (crate::brand::PROFILE, crate::brand::PROFILE_LEGACY),
+    ] {
+        for candidate in [key, legacy] {
+            if prior[env_key]
+                .get(candidate)
+                .is_some_and(|value| !value.is_string())
+            {
+                return Err("Invalid gateway scope environment".into());
+            }
+        }
+        if let Some(value) = [key, legacy].into_iter().find_map(|candidate| {
+            prior[env_key]
+                .get(candidate)
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+        }) {
+            entry.env.push(crate::registry::EnvVar {
                 key: key.into(),
                 value: Some(value.into()),
                 secret: false,
@@ -6070,7 +6073,7 @@ fn repair_gateway_entry(
             });
         }
     }
-    entry.env.push(EnvVar {
+    entry.env.push(crate::registry::EnvVar {
         key: crate::brand::ATTRIBUTION_ID.into(),
         value: Some(id.into()),
         secret: false,
@@ -6875,10 +6878,6 @@ fn repoint_stale_gateways_in(
         {
             continue;
         }
-        let profile = config_text
-            .as_deref()
-            .and_then(profile_from_config_text)
-            .or_else(|| read_gateway_profile(&client.id));
         let rewrite = find_def(&client.id)
             .ok_or("Unknown client".to_string())
             .and_then(|def| {
@@ -6892,11 +6891,6 @@ fn repoint_stale_gateways_in(
                             "Client gateway changed during repoint; leaving it untouched".into(),
                         );
                     }
-                    let fresh_profile = read_config_file(&path)
-                        .ok()
-                        .as_deref()
-                        .and_then(profile_from_config_text)
-                        .or_else(|| profile.clone());
                     if !gateway_entry_needs_rewrite(
                         entry_name,
                         stored,
@@ -6904,7 +6898,8 @@ fn repoint_stale_gateways_in(
                         config_text.as_deref(),
                     ) {
                         backfill_gateway_identity(&def, &path, entry_name, &client.id)?;
-                        let mut updated = gateway_entry(fresh_profile.as_deref(), &client.id)?;
+                        let mut updated =
+                            repair_gateway_entry(def.format, &path, entry_name, &client.id)?;
                         updated.command = Some(current.to_string());
                         let detected = read_client(&def);
                         let server = detected
@@ -6933,13 +6928,8 @@ fn repoint_stale_gateways_in(
                             recovery_path: None,
                         })
                     } else {
-                        let entry = repair_gateway_entry(
-                            def.format,
-                            &path,
-                            entry_name,
-                            fresh_profile.as_deref(),
-                            &client.id,
-                        )?;
+                        let entry =
+                            repair_gateway_entry(def.format, &path, entry_name, &client.id)?;
                         install_or_remove(&client.id, Some(&entry))
                     }
                 })
@@ -7041,7 +7031,6 @@ fn repair_secondary_claude_config(path: &Path, current: &str) -> Result<(), Stri
             Format::JsonMcpServers,
             path,
             GATEWAY_ENTRY_NAME,
-            fresh.profile.as_deref(),
             "claude-code-secondary",
         )?;
         edit_json_gateway(path, "mcpServers", Some(&entry), true)
@@ -9656,24 +9645,6 @@ command = "npx"
     }
 
     #[test]
-    fn secondary_claude_repair_keeps_profile_with_distinct_client_id() {
-        let entry = secondary_claude_gateway_entry(Some("work")).unwrap();
-        let env: std::collections::HashMap<_, _> = entry
-            .env
-            .iter()
-            .map(|e| (e.key.clone(), e.value.clone()))
-            .collect();
-        assert_eq!(
-            env.get(crate::brand::PROFILE).unwrap().as_deref(),
-            Some("work")
-        );
-        assert_eq!(
-            env.get(crate::brand::ATTRIBUTION_ID).unwrap().as_deref(),
-            Some("claude-code-secondary")
-        );
-    }
-
-    #[test]
     fn secondary_identity_repair_preserves_fields_and_rechecks_ownership() {
         let data = crate::registry::DataDirTestEnv::new("f3-secondary-ownership");
         let current = data.dir.join(if cfg!(windows) { "toolport-gateway.exe" } else { "toolport-gateway" });
@@ -9682,7 +9653,10 @@ command = "npx"
         let path = data.dir.join("secondary.json");
         let raw = serde_json::json!({"mcpServers":{"toolport":{"command":current,"args":["--private"],"env":{"TOOLPORT_PROFILE":"work","KEEP":"fixture"},"unknown":42}}});
         std::fs::write(&path, raw.to_string()).unwrap();
-        assert_eq!(claude_configs_needing_repair(&[path.clone()], current).len(), 1);
+        assert_eq!(
+            claude_configs_needing_repair(&[path.clone()], current).len(),
+            1
+        );
         repair_secondary_claude_config(&path, current).unwrap();
         let mut after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -9758,8 +9732,7 @@ command = "npx"
                     assert_eq!(before.get(key), after.get(key), "{} {key} changed", def.id);
                 }
                 let repaired =
-                    repair_gateway_entry(def.format, &path, GATEWAY_ENTRY_NAME, profile, def.id)
-                        .unwrap();
+                    repair_gateway_entry(def.format, &path, GATEWAY_ENTRY_NAME, def.id).unwrap();
                 edit_format(def.format, &path, Some(&repaired), true).unwrap();
                 assert_eq!(
                     effective_tools(&before),

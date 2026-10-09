@@ -148,11 +148,21 @@ describe("plugin client identity", () => {
     expect(pluginIdentity({})).toBe("toolport-plugin");
   });
   it("host attribution preserves scope identity and profile", async () => {
-    for (const env of [{ TOOLPORT_PROFILE: "narrow" }, { TOOLPORT_PROFILE: "narrow", CONDUIT_CLIENT_ID: "legacy" }]) {
-      await expect(spawnFirst([process.execPath], {
-        env, host: "claude-code", stdio: "ignore",
-        args: ["-e", "process.exit(!process.env.TOOLPORT_CLIENT_ID && process.env.TOOLPORT_PROFILE === 'narrow' ? 0 : 1)"],
-      })).resolves.toBe(0);
+    for (const env of [
+      { TOOLPORT_PROFILE: "narrow" },
+      { TOOLPORT_PROFILE: "narrow", CONDUIT_CLIENT_ID: "legacy" },
+    ]) {
+      await expect(
+        spawnFirst([process.execPath], {
+          env,
+          host: "claude-code",
+          stdio: "ignore",
+          args: [
+            "-e",
+            "process.exit(!process.env.TOOLPORT_CLIENT_ID && process.env.TOOLPORT_PROFILE === 'narrow' ? 0 : 1)",
+          ],
+        }),
+      ).resolves.toBe(0);
     }
   });
   it("passes identity to the spawned gateway without recording environment values", async () => {

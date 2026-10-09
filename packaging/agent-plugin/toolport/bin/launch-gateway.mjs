@@ -255,7 +255,11 @@ export function spawnFirst(
       const child = spawnImpl(binaries[index], args, {
         stdio,
         windowsHide,
-        env: { ...env, TOOLPORT_ATTRIBUTION_ID: env.TOOLPORT_ATTRIBUTION_ID || pluginIdentity(env, host) },
+        env: {
+          ...env,
+          TOOLPORT_ATTRIBUTION_ID:
+            env.TOOLPORT_ATTRIBUTION_ID || pluginIdentity(env, host),
+        },
       });
       let started = false;
       child.once("spawn", () => {

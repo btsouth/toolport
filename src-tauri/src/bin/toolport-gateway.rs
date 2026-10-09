@@ -15254,7 +15254,6 @@ fn catalog_wait_budget(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn observed_client_name(
     state: &GatewayState,
     holder: Option<&SessionState>,
@@ -15279,6 +15278,7 @@ fn observed_client_name(
         .unwrap_or_else(|| clients::trusted_client_name(client, name))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_request_wire(
     state: &GatewayState,
     req: &Value,
@@ -17005,7 +17005,10 @@ fn handle_mcp_http(
                             )
                         };
                         let observed = if let Some(lifetime) = &lifetime {
-                            let mut current = lifetime.observation.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut current = lifetime
+                                .observation
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             current.get_or_insert_with(start).clone()
                         } else {
                             start()

@@ -17,12 +17,14 @@ impl ParentApp {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Generation {
     parent: u32,
     started: u64,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn stable_process(
     mut generation: impl FnMut() -> Option<Generation>,
     name: impl FnOnce() -> Option<String>,
