@@ -7147,6 +7147,47 @@ fn handle_request_with_cancel(
                             status.id,
                             status.describe()
                         ),
+                        None if server.is_none() => {
+                            let visible = |id: &str| {
+                                allowed.is_none_or(|set| server_in_allowed_scope(id, set))
+                            };
+                            let pending: Vec<_> = router
+                                .pending_statuses()
+                                .into_iter()
+                                .filter(|status| visible(&status.id))
+                                .collect();
+                            let connecting = pending.iter().any(|status| status.connecting)
+                                || router.any_publishing_first_catalog(visible);
+                            let mut text = if connecting {
+                                "Servers are still connecting. Retry shortly or check toolport_status."
+                                    .to_string()
+                            } else {
+                                format!("No tools matched{scope}. {exhaustive_hint}")
+                            };
+                            let unavailable: Vec<_> =
+                                pending.iter().filter(|status| !status.connecting).collect();
+                            if !unavailable.is_empty() {
+                                let mut states = unavailable
+                                    .iter()
+                                    .take(3)
+                                    .map(|status| {
+                                        let state = if status.needs_auth {
+                                            "needs sign-in"
+                                        } else {
+                                            "retrying"
+                                        };
+                                        format!("{} ({state})", status.id)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                if unavailable.len() > 3 {
+                                    states
+                                        .push_str(&format!(" and {} more", unavailable.len() - 3));
+                                }
+                                text.push_str(&format!(" Unavailable: {states}."));
+                            }
+                            text
+                        }
                         None => format!("No tools matched{scope}. {exhaustive_hint}"),
                     }
                 } else if low_confidence {
@@ -14666,13 +14707,13 @@ fn process_request(
 
 fn catalog_wait_budget(
     discovery: DiscoveryMode,
-    scoped_search: bool,
+    tool_search: bool,
     client: Option<&str>,
     setup: bool,
 ) -> Duration {
     if setup {
         downstream::SETUP_CATALOG_WAIT_BUDGET
-    } else if discovery == DiscoveryMode::Full || scoped_search {
+    } else if discovery == DiscoveryMode::Full || tool_search {
         Duration::from_millis(
             clients::discovery_capabilities(client.unwrap_or("")).cold_full_list_wait_ms,
         )
@@ -14705,13 +14746,13 @@ fn process_request_wire(
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     // One deadline includes startup and rooted composition, rather than granting
     // each phase another budget. Warm tools lists never enter the catalog wait.
-    let search_server = (method == "tools/call"
-        && req["params"]["name"] == "toolport_search_tools")
+    let tool_search = method == "tools/call" && req["params"]["name"] == "toolport_search_tools";
+    let search_server = tool_search
         .then(|| req["params"]["arguments"]["server"].as_str())
         .flatten();
     let tools_list_budget = catalog_wait_budget(
         discovery,
-        search_server.is_some(),
+        tool_search,
         client,
         std::env::args().any(|arg| arg == "--setup-review"),
     );
@@ -14819,7 +14860,7 @@ fn process_request_wire(
         _ => false,
     };
     if wait {
-        let deadline = if method == "tools/list" || search_server.is_some() {
+        let deadline = if method == "tools/list" || tool_search {
             tools_list_deadline
         } else {
             Instant::now() + Duration::from_secs(30)
@@ -15050,13 +15091,15 @@ fn process_request_wire(
         (rooted, cached)
     };
     let (mut router, mut cache_snapshot) = catalog_for_view(rooted_router);
-    if method == "tools/list" || search_server.is_some() {
+    if method == "tools/list" || tool_search {
         let visible = |id: &str| {
             search_server.is_none_or(|server| server == id)
                 && allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
         };
-        if search_server.is_some() {
-            router.demand_servers(visible);
+        if tool_search {
+            if search_server.is_some() {
+                router.demand_servers(visible);
+            }
             router.discover_uncached(visible);
         }
         let cold = !has_scoped_tools(&cache_snapshot.tools, allowed, &router, &reg)
@@ -15119,7 +15162,9 @@ fn process_request_wire(
                         .is_some_and(|name| name.starts_with(&prefix))
                 })
             });
-            if !daemon_adapter && (cold && method == "tools/list" || search_cache_lag) {
+            if !daemon_adapter
+                && (cold && (method == "tools/list" || tool_search) || search_cache_lag)
+            {
                 cache_snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
             }
             // Do not wait on rebuild_lock after the deadline: a slow publisher
@@ -22346,12 +22391,204 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_scoped_search_waits_for_first_catalog() {
-        let _env = DataDirTestEnv::new("reviewed-scoped-search");
+    fn reviewed_warm_unscoped_search_keeps_saved_catalog_stopped() {
+        let _env = DataDirTestEnv::new("reviewed-warm-unscoped-search");
         let state = http_state(false);
-        // Another client's warm catalog must not shorten this view's cold wait.
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let mut live = Router::new();
+        live.add_supervised(
+            "saved".into(),
+            vec![json!({"name":"cached", "inputSchema":{"type":"object"}})],
+            Arc::new(move || {
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+                Ok(DownstreamServer::connect("saved".into(), Box::new(CacheRoute)).unwrap())
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        let live = Arc::new(live);
         *state.cached_tools.lock().unwrap() =
-            Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
+            Arc::new(CatalogSnapshot::new(live.aggregated_tools()));
+        *state.router.lock().unwrap() = Arc::clone(&live);
+        let reply = process_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":""}}}),
+            &SearchGuard::default(), None, None, None, None, Some("cursor"), None, DiscoveryMode::Lazy,
+        ).unwrap();
+        let starting = live.any_starting(|_| true);
+        let _ = release_tx.send(());
+        assert!(reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("saved__cached"));
+        assert!(
+            !starting,
+            "saved catalog discovery started a stopped server"
+        );
+    }
+
+    fn reviewed_no_match_router(failures: &[(&str, bool)]) -> Router {
+        let mut router = Router::new();
+        for &(id, needs_auth) in failures {
+            router.add_supervised(
+                id.into(),
+                Vec::new(),
+                Arc::new(move || {
+                    Err(ConnectFailure {
+                        message: "HTTP 401 secret-token private-stderr".into(),
+                        needs_auth,
+                    })
+                }),
+                ReconnectBackoff {
+                    base: Duration::from_secs(60),
+                    cap: Duration::from_secs(60),
+                },
+                json!({"revision":1}),
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut seen = started_supervisors();
+            router.prepare_lazy_use(id);
+            while router.any_starting(|_| true) && Instant::now() < deadline {
+                seen = wait_for_started_supervisor(
+                    seen,
+                    deadline.min(Instant::now() + Duration::from_millis(10)),
+                );
+            }
+            assert!(!router.any_starting(|_| true));
+        }
+        router
+    }
+
+    fn reviewed_no_match_text(router: &Router, allowed: Option<&HashSet<String>>) -> String {
+        let reply = handle_request(
+            &dispatch_host(false),
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"absent"}}}),
+            &Registry::default(),
+            router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            allowed,
+            None,
+        ).unwrap();
+        let text = reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!text.contains("secret-token"), "{text}");
+        assert!(!text.contains("private-stderr"), "{text}");
+        text
+    }
+
+    #[test]
+    fn reviewed_unscoped_no_match_needs_auth_does_not_request_retry() {
+        let _env = DataDirTestEnv::new("reviewed-no-match-auth");
+        let router = reviewed_no_match_router(&[("auth", true)]);
+        let text = reviewed_no_match_text(&router, None);
+        assert!(text.contains("No tools matched."), "{text}");
+        assert!(text.contains("auth (needs sign-in)"), "{text}");
+        assert!(text.contains("empty query"), "{text}");
+        assert!(!text.contains("still connecting"), "{text}");
+        assert!(!text.contains("Retry"), "{text}");
+    }
+
+    #[test]
+    fn reviewed_unscoped_no_match_backoff_does_not_request_retry() {
+        let _env = DataDirTestEnv::new("reviewed-no-match-backoff");
+        let router = reviewed_no_match_router(&[("flaky", false)]);
+        let text = reviewed_no_match_text(&router, None);
+        assert!(text.contains("No tools matched."), "{text}");
+        assert!(text.contains("flaky (retrying)"), "{text}");
+        assert!(text.contains("empty query"), "{text}");
+        assert!(!text.contains("still connecting"), "{text}");
+        assert!(!text.contains("Retry"), "{text}");
+    }
+
+    #[test]
+    fn reviewed_unscoped_no_match_caps_mixed_unavailable_servers() {
+        let _env = DataDirTestEnv::new("reviewed-no-match-cap");
+        let router = reviewed_no_match_router(&[
+            ("auth", true),
+            ("flaky", false),
+            ("third", true),
+            ("fourth", false),
+            ("fifth", true),
+        ]);
+        let text = reviewed_no_match_text(&router, None);
+        assert!(text.ends_with("Unavailable: auth (needs sign-in), flaky (retrying), third (needs sign-in) and 2 more.\n\n[]"), "{text}");
+        assert!(!text.contains("fourth"), "{text}");
+        assert!(!text.contains("fifth"), "{text}");
+        assert!(!text.contains("still connecting"), "{text}");
+        assert!(!text.contains("Retry"), "{text}");
+    }
+
+    #[test]
+    fn reviewed_unscoped_no_match_waits_for_first_catalog_publication() {
+        let _env = DataDirTestEnv::new("reviewed-no-match-publication");
+        let router = counting_cache_supervisor(
+            "publishing",
+            Vec::new(),
+            &Arc::new(AtomicUsize::new(0)),
+        );
+        router.prepare_lazy_use("publishing");
+        wait_for_supervisor_result(&router);
+        assert!(router.any_publishing_first_catalog(|_| true));
+        let text = reviewed_no_match_text(&router, None);
+        assert_eq!(text, "Servers are still connecting. Retry shortly or check toolport_status.\n\n[]");
+        let text = reviewed_no_match_text(&router, Some(&HashSet::new()));
+        assert!(text.starts_with("No tools matched."), "{text}");
+        assert!(!text.contains("still connecting"), "{text}");
+        assert!(!text.contains("publishing"), "{text}");
+    }
+
+    #[test]
+    fn reviewed_unscoped_no_match_mixed_connecting_and_unavailable() {
+        let _env = DataDirTestEnv::new("reviewed-no-match-mixed");
+        let mut router = reviewed_no_match_router(&[("auth", true), ("flaky", false)]);
+        let release = hanging_supervisor(&mut router, "late");
+        router.prepare_lazy_use("late");
+        let text = reviewed_no_match_text(&router, None);
+        assert!(
+            text.starts_with("Servers are still connecting. Retry shortly"),
+            "{text}"
+        );
+        assert!(
+            text.contains("auth (needs sign-in), flaky (retrying)"),
+            "{text}"
+        );
+        drop(release);
+    }
+
+    #[test]
+    fn reviewed_unscoped_no_match_filters_unavailable_and_connecting_scope() {
+        let _env = DataDirTestEnv::new("reviewed-no-match-scope");
+        let mut router = reviewed_no_match_router(&[
+            ("auth", true),
+            ("private-auth", true),
+            ("private-flaky", false),
+        ]);
+        let release = hanging_supervisor(&mut router, "private-late");
+        router.prepare_lazy_use("private-late");
+        let allowed = HashSet::from(["auth".to_string()]);
+        let text = reviewed_no_match_text(&router, Some(&allowed));
+        assert!(text.contains("auth (needs sign-in)"), "{text}");
+        assert!(!text.contains("private"), "{text}");
+        assert!(!text.contains("still connecting"), "{text}");
+        assert!(!text.contains("Retry"), "{text}");
+        let text = reviewed_no_match_text(&router, Some(&HashSet::new()));
+        assert_eq!(text, "No tools matched. If you know the target server, search again with an empty query and its `server` prefix; otherwise call toolport_status to see the available prefixes.\n\n[]");
+        drop(release);
+    }
+
+    #[test]
+    fn reviewed_unscoped_search_reports_catalog_still_connecting() {
+        let _env = DataDirTestEnv::new("reviewed-search-still-connecting");
+        let state = http_state(false);
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Arc::new(Mutex::new(release_rx));
         let mut live = Router::new();
@@ -22359,11 +22596,10 @@ mod tests {
             "late".into(),
             Vec::new(),
             Arc::new(move || {
-                release_rx
+                let _ = release_rx
                     .lock()
                     .unwrap()
-                    .recv_timeout(Duration::from_secs(10))
-                    .unwrap();
+                    .recv_timeout(Duration::from_secs(15));
                 Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
             }),
             ReconnectBackoff::default(),
@@ -22371,58 +22607,103 @@ mod tests {
         );
         let live = Arc::new(live);
         *state.router.lock().unwrap() = Arc::clone(&live);
-        let publisher = state.clone();
-        COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
-            hook.replace(Some(Box::new(move |snapshot| {
-                assert!(snapshot.aggregated_tools().is_empty());
-                assert!(snapshot.any_discovering(|id| id == "late"));
-                // Force the request to retain the old router across publication.
-                // Wait for the actual supervisor result, not a scheduler delay.
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let mut seen = started_supervisors();
-                release_tx.send(()).unwrap();
-                while !live.has_ready_reconnects() && Instant::now() < deadline {
-                    seen = wait_for_started_supervisor(seen, deadline);
-                }
-                assert!(live.has_ready_reconnects(), "fixture did not connect");
-                adopt_reconnected_servers(
-                    &publisher.host,
-                    &publisher.stdio_upstream,
-                    &publisher.profile,
-                );
-                assert!(!snapshot.any_discovering(|_| true));
-                assert!(!snapshot.any_publishing_first_catalog(|_| true));
-                assert!(snapshot.aggregated_tools().is_empty());
-                assert!(publisher
-                    .router
-                    .lock()
-                    .unwrap()
-                    .aggregated_tools()
-                    .iter()
-                    .any(|tool| tool["name"] == "late__cached"));
-            })));
-        });
-        let allowed = HashSet::from(["late".to_string()]);
-        let started = Instant::now();
         let reply = process_request(
             &state,
-            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"","server":"late"}}}),
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":""}}}),
+            &SearchGuard::default(), None, None, None, None, Some("cursor"), None, DiscoveryMode::Lazy,
+        ).unwrap();
+        let still_connecting = live.any_discovering(|_| true);
+        release_tx.send(()).unwrap();
+        let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            still_connecting,
+            "fixture published before the client budget expired"
+        );
+        assert!(text.contains("still connecting"), "{text}");
+        assert!(text.contains("toolport_status"), "{text}");
+        assert!(!text.contains("No tools matched"), "{text}");
+    }
+
+    #[test]
+    fn reviewed_search_waits_for_first_catalog() {
+        for server in [None, Some("late")] {
+            let _env = DataDirTestEnv::new("reviewed-cold-search");
+            let state = http_state(false);
+            // Another client's warm catalog must not shorten this view's cold wait.
+            *state.cached_tools.lock().unwrap() =
+                Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = Arc::new(Mutex::new(release_rx));
+            let mut live = Router::new();
+            live.add_supervised(
+                "late".into(),
+                Vec::new(),
+                Arc::new(move || {
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                    Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
+                }),
+                ReconnectBackoff::default(),
+                json!({"revision":1}),
+            );
+            let live = Arc::new(live);
+            *state.router.lock().unwrap() = Arc::clone(&live);
+            let publisher = state.clone();
+            COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
+                hook.replace(Some(Box::new(move |snapshot| {
+                    assert!(snapshot.aggregated_tools().is_empty());
+                    assert!(snapshot.any_discovering(|id| id == "late"));
+                    // Force the request to retain the old router across publication.
+                    // Wait for the actual supervisor result, not a scheduler delay.
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut seen = started_supervisors();
+                    release_tx.send(()).unwrap();
+                    while !live.has_ready_reconnects() && Instant::now() < deadline {
+                        seen = wait_for_started_supervisor(seen, deadline);
+                    }
+                    assert!(live.has_ready_reconnects(), "fixture did not connect");
+                    adopt_reconnected_servers(
+                        &publisher.host,
+                        &publisher.stdio_upstream,
+                        &publisher.profile,
+                    );
+                    assert!(!snapshot.any_discovering(|_| true));
+                    assert!(!snapshot.any_publishing_first_catalog(|_| true));
+                    assert!(snapshot.aggregated_tools().is_empty());
+                    assert!(publisher
+                        .router
+                        .lock()
+                        .unwrap()
+                        .aggregated_tools()
+                        .iter()
+                        .any(|tool| tool["name"] == "late__cached"));
+                })));
+            });
+            let allowed = HashSet::from(["late".to_string()]);
+            let started = Instant::now();
+            let reply = process_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"","server":server}}}),
             &SearchGuard::default(), Some(&allowed), None, None, None, Some("cursor"), None, DiscoveryMode::Lazy,
         ).unwrap();
-        assert!(
-            started.elapsed()
-                < Duration::from_millis(
-                    clients::discovery_capabilities("cursor").cold_full_list_wait_ms,
-                ),
-            "fixture exceeded the client's budget"
-        );
-        assert!(
-            reply["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("late__cached"),
-            "first search read an unpublished catalog: {reply}"
-        );
+            assert!(
+                started.elapsed()
+                    < Duration::from_millis(
+                        clients::discovery_capabilities("cursor").cold_full_list_wait_ms,
+                    ),
+                "fixture exceeded the client's budget"
+            );
+            assert!(
+                reply["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("late__cached"),
+                "first search read an unpublished catalog: {reply}"
+            );
+        }
     }
 
     #[test]

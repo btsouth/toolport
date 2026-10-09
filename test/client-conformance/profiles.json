@@ -1,0 +1,610 @@
+{
+  "recordedAt": "2026-10-09",
+  "profiles": [
+    {
+      "id": "claude-desktop",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://modelcontextprotocol.io/docs/develop/connect-local-servers",
+      "observedSessionKind": null
+    },
+    {
+      "id": "cursor",
+      "evidence": "captured health command",
+      "initialize": {
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-11-25",
+          "capabilities": {
+            "elicitation": {
+              "form": {}
+            }
+          },
+          "clientInfo": {
+            "name": "Cursor",
+            "version": "1.0.0"
+          }
+        },
+        "jsonrpc": "2.0",
+        "id": 0
+      },
+      "initialMethods": [
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+        "resources/list",
+        "prompts/list"
+      ],
+      "listChanged": {
+        "supported": null,
+        "detail": "Unverified for this installed CLI"
+      },
+      "source": "https://cursor.com/docs/mcp",
+      "observedSessionKind": "CLI health command, not model session"
+    },
+    {
+      "id": "droid",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://docs.factory.ai/cli/configuration/mcp",
+      "observedSessionKind": null
+    },
+    {
+      "id": "crush",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://raw.githubusercontent.com/charmbracelet/crush/main/README.md",
+      "observedSessionKind": null
+    },
+    {
+      "id": "anythingllm",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://docs.anythingllm.com/mcp-compatibility/overview",
+      "observedSessionKind": null
+    },
+    {
+      "id": "vscode",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://code.visualstudio.com/docs/copilot/customization/mcp-servers",
+      "observedSessionKind": null
+    },
+    {
+      "id": "amp",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://ampcode.com/manual",
+      "observedSessionKind": null
+    },
+    {
+      "id": "windsurf",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://docs.windsurf.com/windsurf/cascade/mcp",
+      "observedSessionKind": null
+    },
+    {
+      "id": "devin-cli",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://docs.devin.ai/work-with-devin/devin-cli",
+      "observedSessionKind": null
+    },
+    {
+      "id": "opencode",
+      "evidence": "captured health command",
+      "initialize": {
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-11-25",
+          "capabilities": {
+            "roots": {}
+          },
+          "clientInfo": {
+            "name": "opencode",
+            "version": "1.18.31"
+          }
+        },
+        "jsonrpc": "2.0",
+        "id": 0
+      },
+      "initialMethods": ["initialize", "notifications/initialized", "tools/list"],
+      "listChanged": {
+        "supported": true,
+        "detail": "Yes, source handler directly re-lists; latency unmeasured"
+      },
+      "source": "https://raw.githubusercontent.com/anomalyco/opencode/388406238bd5ca15564a762840a2362c3a45bd9c/packages/opencode/src/mcp/index.ts",
+      "observedSessionKind": "CLI health command, not model session"
+    },
+    {
+      "id": "kilo-code",
+      "evidence": "captured health command",
+      "initialize": {
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-11-25",
+          "capabilities": {
+            "roots": {}
+          },
+          "clientInfo": {
+            "name": "kilo",
+            "version": "7.8.8"
+          }
+        },
+        "jsonrpc": "2.0",
+        "id": 0
+      },
+      "initialMethods": ["initialize", "notifications/initialized", "tools/list"],
+      "listChanged": {
+        "supported": null,
+        "detail": "Unverified, do not infer OpenCode parity"
+      },
+      "source": "https://kilo.ai/docs/code-with-ai/mcp/using-mcp-in-kilo-code",
+      "observedSessionKind": "CLI health command, not model session"
+    },
+    {
+      "id": "grok",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://grok.com/build",
+      "observedSessionKind": null
+    },
+    {
+      "id": "codex",
+      "evidence": "captured health command",
+      "initialize": {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-06-18",
+          "capabilities": {
+            "experimental": {
+              "codex/auth-change": {}
+            },
+            "elicitation": {
+              "form": {},
+              "url": {}
+            }
+          },
+          "clientInfo": {
+            "name": "codex-mcp-client",
+            "title": "Codex",
+            "version": "0.159.3"
+          }
+        }
+      },
+      "initialMethods": ["initialize", "notifications/initialized", "tools/list"],
+      "listChanged": {
+        "supported": false,
+        "detail": "No generic list-change handler found in pinned source"
+      },
+      "source": "docs/clients.md",
+      "observedSessionKind": "unauthenticated CLI startup via exec; no successful model turn",
+      "variants": [
+        {
+          "kind": "app-server MCP status, no model turn",
+          "initialize": {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+              "protocolVersion": "2025-06-18",
+              "capabilities": {
+                "elicitation": {
+                  "form": {},
+                  "url": {}
+                }
+              },
+              "clientInfo": {
+                "name": "codex-mcp-client",
+                "title": "Codex",
+                "version": "0.159.3"
+              }
+            }
+          },
+          "initialMethods": [
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "resources/list",
+            "resources/templates/list"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "github-copilot-cli",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli",
+      "observedSessionKind": null
+    },
+    {
+      "id": "antigravity",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://antigravity.google/docs/mcp",
+      "observedSessionKind": null
+    },
+    {
+      "id": "claude-code",
+      "evidence": "captured health command",
+      "initialize": {
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-11-25",
+          "capabilities": {
+            "roots": {
+              "listChanged": true
+            },
+            "elicitation": {}
+          },
+          "clientInfo": {
+            "name": "claude-code",
+            "title": "Claude Code",
+            "version": "2.1.286",
+            "description": "Anthropic's agentic coding tool",
+            "websiteUrl": "https://claude.com/claude-code"
+          }
+        },
+        "jsonrpc": "2.0",
+        "id": 0
+      },
+      "initialMethods": ["initialize", "notifications/initialized", "tools/list"],
+      "listChanged": {
+        "supported": true,
+        "detail": "Yes, docs; latency unmeasured"
+      },
+      "source": "https://code.claude.com/docs/en/mcp.md",
+      "observedSessionKind": "CLI health command, not model session"
+    },
+    {
+      "id": "gemini-cli",
+      "evidence": "captured health command",
+      "initialize": {
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-06-18",
+          "capabilities": {},
+          "clientInfo": {
+            "name": "mcp-test-client",
+            "version": "0.0.1"
+          }
+        },
+        "jsonrpc": "2.0",
+        "id": 0
+      },
+      "initialMethods": ["initialize", "notifications/initialized", "ping"],
+      "listChanged": {
+        "supported": true,
+        "detail": "Yes, source refreshes tools/resources/prompts; latency unmeasured"
+      },
+      "source": "docs/clients.md",
+      "observedSessionKind": "CLI health command, not model session"
+    },
+    {
+      "id": "qwen-code",
+      "evidence": "captured health command",
+      "initialize": {
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-11-25",
+          "capabilities": {
+            "extensions": {
+              "io.modelcontextprotocol/ui": {
+                "mimeTypes": ["text/html;profile=mcp-app"]
+              }
+            }
+          },
+          "clientInfo": {
+            "name": "mcp-test-client",
+            "version": "0.0.1"
+          }
+        },
+        "jsonrpc": "2.0",
+        "id": 0
+      },
+      "initialMethods": ["initialize", "notifications/initialized"],
+      "listChanged": {
+        "supported": null,
+        "detail": "Unverified, do not infer Gemini parity"
+      },
+      "source": "https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/",
+      "observedSessionKind": "CLI health command, not model session"
+    },
+    {
+      "id": "junie",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://www.jetbrains.com/help/junie/model-context-protocol-mcp.html",
+      "observedSessionKind": null
+    },
+    {
+      "id": "cline",
+      "evidence": "source",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": true,
+        "detail": "Yes, source 300 ms debounce, max 2 s deferral, 3 retries"
+      },
+      "source": "https://raw.githubusercontent.com/cline/cline/main/src/services/mcp/McpHub.ts",
+      "observedSessionKind": null
+    },
+    {
+      "id": "roo-code",
+      "evidence": "source",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "No handler found in inspected source; not proof of absence in other versions"
+      },
+      "source": "https://raw.githubusercontent.com/RooCodeInc/Roo-Code/main/src/services/mcp/McpHub.ts",
+      "observedSessionKind": null
+    },
+    {
+      "id": "warp",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://docs.warp.dev/knowledge-and-collaboration/mcp",
+      "observedSessionKind": null
+    },
+    {
+      "id": "amazon-q",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-mcp-configuration.html",
+      "observedSessionKind": null
+    },
+    {
+      "id": "kiro",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://kiro.dev/docs/mcp/",
+      "observedSessionKind": null
+    },
+    {
+      "id": "kimi-code",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://moonshotai.github.io/kimi-cli/en/customization/mcp.html",
+      "observedSessionKind": null
+    },
+    {
+      "id": "zcode",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://zcode.z.ai/",
+      "observedSessionKind": null
+    },
+    {
+      "id": "zed",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": true,
+        "detail": "Yes, official docs; latency unmeasured"
+      },
+      "source": "https://zed.dev/docs/ai/mcp",
+      "observedSessionKind": null
+    },
+    {
+      "id": "lm-studio",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://lmstudio.ai/docs/app/plugins/mcp",
+      "observedSessionKind": null
+    },
+    {
+      "id": "jan",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://jan.ai/docs/desktop/mcp",
+      "observedSessionKind": null
+    },
+    {
+      "id": "boltai",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://docs.boltai.com/docs/plugins/mcp-servers",
+      "observedSessionKind": null
+    },
+    {
+      "id": "pi",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/README.md",
+      "observedSessionKind": null
+    },
+    {
+      "id": "omp",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/README.md",
+      "observedSessionKind": null
+    },
+    {
+      "id": "goose",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://block.github.io/goose/docs/getting-started/using-extensions/",
+      "observedSessionKind": null
+    },
+    {
+      "id": "hermes",
+      "evidence": "captured health command",
+      "initialize": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-11-25",
+          "capabilities": {
+            "sampling": {
+              "tools": {}
+            },
+            "elicitation": {
+              "form": {},
+              "url": {}
+            }
+          },
+          "clientInfo": {
+            "name": "mcp",
+            "version": "0.1.0"
+          },
+          "_meta": {}
+        }
+      },
+      "initialMethods": ["initialize", "notifications/initialized", "tools/list"],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp",
+      "observedSessionKind": "CLI health command, not model session"
+    },
+    {
+      "id": "continue",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://docs.continue.dev/customize/deep-dives/mcp",
+      "observedSessionKind": null
+    },
+    {
+      "id": "witsy",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://raw.githubusercontent.com/nbonamy/witsy/main/README.md",
+      "observedSessionKind": null
+    }
+  ]
+}

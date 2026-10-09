@@ -265,6 +265,15 @@ fn tool_list(cfg: &Config, grown: bool) -> Value {
         json!({ "name": "legacy_elicitation", "description": "Issue a legacy server-to-client elicitation request.",
                 "inputSchema": { "type": "object", "properties": {} } }),
     ];
+    if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") {
+        tools.extend([
+            json!({"name":"structured", "description":"Return typed fixture data.",
+                "inputSchema":{"type":"object","properties":{}},
+                "outputSchema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"]}}),
+            json!({"name":"large", "description":"Return a bounded large fixture result.",
+                "inputSchema":{"type":"object","properties":{"bytes":{"type":"integer"}}}}),
+        ]);
+    }
     // A fixture marker lets rooted launches advertise different schemas for
     // the same tool name, as real project-scoped servers can.
     if let Ok(marker) = std::fs::read_to_string("toolport-mock-schema.txt") {
@@ -481,6 +490,12 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
             return None;
         }
         "tools/list" => tool_list(cfg, state.grown),
+        "resources/read" if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") => {
+            json!({"contents":[{"uri":req["params"]["uri"],"mimeType":"text/plain","text":"fixture resource"}]})
+        }
+        "prompts/get" if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") => {
+            json!({"messages":[{"role":"user","content":{"type":"text","text":"fixture prompt"}}]})
+        }
         "resources/list" => resource_list(state.grown),
         "resources/subscribe" => {
             if let Some(uri) = req["params"]["uri"].as_str() {
@@ -603,6 +618,20 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
                 return None;
             }
             let text = match name {
+                "structured" if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") => {
+                    return Some(success(
+                        id,
+                        json!({"content":[{"type":"text","text":"{\"answer\":42}"}],"structuredContent":{"answer":42},"isError":false}),
+                    ));
+                }
+                "large" if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") => {
+                    let bytes = args
+                        .get("bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        .min(17 * 1024 * 1024);
+                    "x".repeat(bytes as usize)
+                }
                 "echo" => args
                     .get("text")
                     .and_then(|t| t.as_str())
@@ -904,15 +933,24 @@ fn serve_concurrent(cfg: Config, state: State) {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
             let mut pre = Vec::new();
-            let resp = handle(
-                &cfg,
-                &mut state.lock().unwrap_or_else(|e| e.into_inner()),
-                &req,
-                &mut pre,
-            );
+            let (resp, grew) = {
+                let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                let was_grown = state.grown;
+                let resp = handle(&cfg, &mut state, &req, &mut pre);
+                (resp, state.grown && !was_grown)
+            };
             let mut out = out.lock().unwrap_or_else(|e| e.into_inner());
             for message in pre.iter().chain(resp.as_ref()) {
                 let _ = writeln!(out, "{message}");
+            }
+            if grew {
+                for method in [
+                    "notifications/tools/list_changed",
+                    "notifications/resources/list_changed",
+                    "notifications/prompts/list_changed",
+                ] {
+                    let _ = writeln!(out, "{}", json!({"jsonrpc":"2.0","method":method}));
+                }
             }
             let _ = out.flush();
         });

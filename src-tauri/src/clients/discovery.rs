@@ -51,6 +51,14 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             cold_full_list_wait_ms: 5_000,
             evidence: "https://cursor.com/blog/dynamic-context-discovery",
         },
+        "opencode" | "gemini-cli" | "cline" | "zed" => DiscoveryCapabilities {
+            native_tool_search: None,
+            tools_list_changed: Some(true),
+            // Keep the conservative budget: handler registration alone does not
+            // establish how quickly every installed version refreshes its catalog.
+            cold_full_list_wait_ms: 5_000,
+            evidence: "docs/client-conformance.md (source and notification evidence)",
+        },
         "anthropic-api" => DiscoveryCapabilities {
             native_tool_search: Some(true),
             tools_list_changed: None,
@@ -82,6 +90,18 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn verified_refresh_does_not_imply_native_search_or_a_shorter_startup_budget() {
+        for id in ["opencode", "gemini-cli", "cline", "zed"] {
+            let caps = capabilities(id);
+            assert_eq!(caps.tools_list_changed, Some(true), "{id}");
+            assert_eq!(caps.native_tool_search, None, "{id}");
+            assert_eq!(caps.auto_mode(), "lazy", "{id}");
+            assert_eq!(caps.cold_full_list_wait_ms, 5_000, "{id}");
+        }
+        assert_eq!(capabilities("codex").tools_list_changed, Some(false));
+        assert_eq!(capabilities("cursor").tools_list_changed, None);
+    }
     #[test]
     fn every_definition_carries_capability_evidence_and_preserves_overrides() {
         let mut registry = crate::registry::Registry::default();
