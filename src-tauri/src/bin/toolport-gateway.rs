@@ -30387,7 +30387,8 @@ mod tests {
         let clients: Vec<_> = ["one", "two", "both", "echo"]
             .into_iter()
             .map(|profile| {
-                let (allowed, caller) = resolve_adapter_caller(&reg, profile, Some(profile), None);
+                let (allowed, mut caller) = resolve_adapter_caller(&reg, profile, Some(profile), None);
+                caller.discovery = Some(DiscoveryMode::Full);
                 let sid = mint_mcp_session(&state, Some(&caller.session_owner))
                     .unwrap_or_else(|_| panic!("mint fixture session"));
                 (profile, allowed, caller, sid)
