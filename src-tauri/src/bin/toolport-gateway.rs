@@ -1483,7 +1483,7 @@ fn search_tool_def() -> Value {
             "properties": {
                 "query": { "type": "string", "maxLength": MAX_SEARCH_QUERY_CHARS, "description": "Keywords for the capability you need, e.g. \"list emails\". An empty value with `server` lists that server's tools." },
                 "server": { "type": "string", "description": "Optional: limit to this server by name/prefix." },
-                "limit": { "type": "integer", "description": "Max results, up to 200. Omit for 3 candidates, widening to 25 when uncertain." }
+                "limit": { "type": "integer", "description": "Maximum menu entries, up to 10. Search returns up to 10 candidates." }
             },
             "required": ["query"],
             "additionalProperties": false
@@ -1972,19 +1972,8 @@ const NAME_SPECIFICITY_W: f64 = 0.65;
 const SERVER_NAMED_BOOST: f64 = 0.5;
 /// Tools whose description says they are deprecated rank below their replacement.
 const DEPRECATED_PENALTY: f64 = 0.5;
-/// Below these normalized scores the ranker has too little evidence to hide the
-/// rest of the scoped catalog. Hybrid scores are already normalized to 0..=1;
-/// lexical scores are normalized against an ideal all-name-hit score below.
-// Full-name evidence without vectors must be nearly complete. With vectors,
-// confidence additionally needs independent separation in both retrieval paths.
-// Tuning targeted >= 88.89% precision; report actual precision and coverage.
-const LOW_CONFIDENCE_LEXICAL_RATIO: f64 = 0.55;
-const LOW_CONFIDENCE_SEMANTIC_LEXICAL_RATIO: f64 = 0.65;
-const CONFIDENCE_COMPETITOR_RATIO: f64 = 0.75;
-const LOW_CONFIDENCE_HYBRID_SCORE: f64 = 0.45;
-/// A weak search should give the calling model enough descriptions to recover,
-/// while staying far below the normal 25-result/default context budget.
-const LOW_CONFIDENCE_MIN_RESULTS: usize = 12;
+/// Informational only: close scores do not change the menu or schema hydration.
+const CONFIDENCE_COMPETITOR_RATIO: f64 = 0.85;
 
 struct SearchOutcome {
     #[cfg(test)]
@@ -2413,6 +2402,7 @@ struct CatalogSearchIndex {
     document_frequency: HashMap<String, usize>,
     spelling_frequency: HashMap<String, usize>,
     provider_tokens: HashSet<String>,
+    average_field_lengths: [f64; 3],
     catalog_address: usize,
     surface_bytes: u64,
     semantic_vectors: search_cache::Vectors,
@@ -2501,8 +2491,24 @@ impl CatalogSearchIndex {
             .filter(|(word, _)| !providers.contains(*word))
             .map(|(word, count)| (word.clone(), *count))
             .collect();
+        let average_field_lengths = [
+            documents
+                .iter()
+                .map(|doc| doc.name_tokens.len())
+                .sum::<usize>() as f64,
+            documents
+                .iter()
+                .map(|doc| doc.description_tokens.len())
+                .sum::<usize>() as f64,
+            documents
+                .iter()
+                .map(|doc| doc.parameter_tokens.len())
+                .sum::<usize>() as f64,
+        ]
+        .map(|length| (length / documents.len().max(1) as f64).max(1.0));
         Self {
             documents,
+            average_field_lengths,
             document_frequency,
             spelling_frequency,
             provider_tokens: providers,
@@ -2656,8 +2662,7 @@ fn search_catalog_with(
 /// Indexed search entry point used by the live gateway. Tests and cold/live
 /// fallbacks may omit `index`; in that case a temporary index is built so behavior
 /// remains identical and there is only one ranking implementation.
-const DEFAULT_SEARCH_RESULTS: usize = 3;
-const UNCERTAIN_SEARCH_RESULTS: usize = 25;
+const DEFAULT_SEARCH_RESULTS: usize = 10;
 
 #[cfg(test)]
 fn search_catalog_indexed(
@@ -2682,8 +2687,7 @@ fn search_catalog_filtered(
     visible: impl Fn(&Value) -> bool,
     identities: &[(String, String)],
 ) -> SearchOutcome {
-    let adaptive = limit == 0;
-    let limit = if adaptive {
+    let limit = if limit == 0 {
         DEFAULT_SEARCH_RESULTS
     } else {
         limit
@@ -2760,11 +2764,11 @@ fn search_catalog_filtered(
     }
 
     #[cfg(test)]
-    let mut query_coverage = 0.0;
+    let query_coverage = 0.0;
     #[cfg(test)]
     let (mut confidence_strength, mut competitor_ratio) = (0.0, 1.0);
     #[cfg(test)]
-    let (mut semantic_strength, mut semantic_competitor_ratio) = (0.0, 1.0);
+    let (semantic_strength, semantic_competitor_ratio) = (0.0, 1.0);
     // Select an ordered set of tool refs (ranking happens here; projection below).
     let (selected, total, low_confidence, broadened, direct_returned) = if terms.is_empty() {
         // Empty query: list the pool. With `server` set this enumerates that server.
@@ -2785,7 +2789,6 @@ fn search_catalog_filtered(
         let mut q_tokens = query_tokens(&positive, |token| {
             df.contains_key(token) || index.provider_tokens.contains(token)
         });
-        let mut corrected_spelling = false;
         for token in &mut q_tokens {
             if let Some(corrected) = corrected_query_token(token, &index.spelling_frequency) {
                 if identities
@@ -2795,7 +2798,6 @@ fn search_catalog_filtered(
                     continue;
                 }
                 *token = corrected;
-                corrected_spelling = true;
             }
         }
         let surface_query: HashSet<String> = positive
@@ -2836,20 +2838,22 @@ fn search_catalog_filtered(
                     }
                 }
                 for (qt, weight) in q_tokens.iter().zip(&query_weights) {
-                    // Prefer terse names and summaries over long descriptions.
-                    // Catalog document frequency sets each token's weight.
-                    let mut best = 0.0_f64;
-                    if doc.name_tokens.contains(qt) {
-                        best = NAME_W * weight;
-                    } else if doc.summary_tokens.contains(qt) {
-                        best = 2.0 * weight;
-                    } else if doc.description_tokens.contains(qt) {
-                        let length_weight =
-                            (128.0 / doc.description_tokens.len().max(128) as f64).sqrt();
-                        best = DESC_W * weight * length_weight;
-                    } else if doc.parameter_tokens.contains(qt) {
-                        best = 0.8 * weight;
-                    }
+                    // BM25F-style field normalization and saturation over bounded
+                    // distinct terms. Repeated boilerplate cannot inflate evidence.
+                    let fields = [
+                        (&doc.name_tokens, NAME_W, 0.2),
+                        (&doc.description_tokens, DESC_W, 0.65),
+                        (&doc.parameter_tokens, 0.8, 0.4),
+                    ];
+                    let frequency: f64 = fields
+                        .iter()
+                        .zip(index.average_field_lengths)
+                        .filter(|((tokens, _, _), _)| tokens.contains(qt))
+                        .map(|((tokens, field_weight, b), average)| {
+                            field_weight / (1.0 - b + b * tokens.len() as f64 / average)
+                        })
+                        .sum();
+                    let mut best = weight * frequency * 4.2 / (1.2 + frequency);
                     // Prefix fallback for partial words ("proj" -> "project").
                     if best == 0.0 && qt.len() >= 3 {
                         if doc.name_tokens.iter().any(|t| t.starts_with(qt.as_str())) {
@@ -2889,7 +2893,7 @@ fn search_catalog_filtered(
 
         // Keep user-configured endpoint search; the default signal is fully local.
         let remote_ranked = semantic_rerank(sem, &positive, &lex);
-        let used_semantic = remote_ranked.is_some();
+
         let query_vector = if use_local_semantic {
             search_static::query_vector(&positive)
         } else {
@@ -2918,104 +2922,18 @@ fn search_catalog_filtered(
         });
         let total = ranked.len();
 
-        let ideal = NAME_W * query_weights.iter().sum::<f64>() * (1.0 + NAME_SPECIFICITY_W);
-        let low_confidence = match ranked.first() {
-            None => true,
-            Some((score, _)) if used_semantic => {
-                *score < LOW_CONFIDENCE_HYBRID_SCORE
-                    || ranked
-                        .get(1)
-                        .is_some_and(|(next, _)| *next >= *score * 0.85)
-            }
-            Some((_, top)) => {
-                let evidence = lex
-                    .iter()
-                    .find(|(_, tool)| std::ptr::eq(*tool, *top))
-                    .map_or(0.0, |(score, _)| *score);
-                let offered = &index.documents[pool[lex
-                    .iter()
-                    .position(|(_, tool)| std::ptr::eq(*tool, *top))
-                    .unwrap()]];
-                let covered: f64 = q_tokens
-                    .iter()
-                    .filter(|token| {
-                        offered.name_tokens.contains(*token)
-                            || offered.description_tokens.contains(*token)
-                            || offered.parameter_tokens.contains(*token)
-                    })
-                    .map(|token| idf(token))
-                    .sum();
-                let query_weight: f64 = q_tokens.iter().map(|token| idf(token)).sum();
-                #[cfg(test)]
-                {
-                    query_coverage = if query_weight > 0.0 {
-                        covered / query_weight
-                    } else {
-                        0.0
-                    };
-                }
-                let missing_evidence =
-                    query_weight <= f64::EPSILON || covered / query_weight < 0.90;
-                let runner_up = lex
-                    .iter()
-                    .filter(|(_, tool)| !std::ptr::eq(*tool, *top))
-                    .map(|(score, _)| *score)
-                    .fold(0.0_f64, f64::max);
-                let ratio = if evidence > 0.0 {
-                    runner_up / evidence
-                } else {
-                    1.0
-                };
-                #[cfg(test)]
-                {
-                    confidence_strength = if ideal > 0.0 { evidence / ideal } else { 0.0 };
-                    competitor_ratio = ratio;
-                }
-                let top_position = lex
-                    .iter()
-                    .position(|(_, tool)| std::ptr::eq(*tool, *top))
-                    .unwrap();
-                let similarity = similarities[top_position];
-                let other = similarities
-                    .iter()
-                    .enumerate()
-                    .filter(|(position, _)| *position != top_position)
-                    .map(|(_, score)| *score)
-                    .fold(0.0_f64, f64::max);
-                let semantic_ratio = if similarity > 0.0 {
-                    other / similarity
-                } else {
-                    1.0
-                };
-                #[cfg(test)]
-                {
-                    semantic_strength = similarity;
-                    semantic_competitor_ratio = semantic_ratio;
-                }
-                let minimum = if use_local_semantic {
-                    LOW_CONFIDENCE_SEMANTIC_LEXICAL_RATIO
-                } else {
-                    LOW_CONFIDENCE_LEXICAL_RATIO
-                };
-                corrected_spelling
-                    || missing_evidence
-                    || ideal <= f64::EPSILON
-                    || evidence / ideal < minimum
-                    || ratio
-                        >= if use_local_semantic {
-                            0.65
-                        } else {
-                            CONFIDENCE_COMPETITOR_RATIO
-                        }
-                    || (use_local_semantic && (similarity < 0.35 || semantic_ratio >= 0.95))
-            }
-        };
+        let low_confidence = ranked.first().is_none_or(|(score, _)| {
+            *score <= f64::EPSILON
+                || ranked
+                    .get(1)
+                    .is_some_and(|(next, _)| *next >= *score * CONFIDENCE_COMPETITOR_RATIO)
+        });
+        #[cfg(test)]
+        if let Some((score, _)) = ranked.first() {
+            confidence_strength = *score;
+            competitor_ratio = ranked.get(1).map_or(0.0, |(next, _)| next / score);
+        }
 
-        let limit = if adaptive && low_confidence {
-            UNCERTAIN_SEARCH_RESULTS
-        } else {
-            limit
-        };
         // A named provider is an intentional scope, so its tools can fill the menu.
         // Scoped to a server: take the top `limit`. Unscoped: cap per server so one
         // server with many matching tools can't crowd the others out of the window.
@@ -3041,46 +2959,40 @@ fn search_catalog_filtered(
             };
         let direct_returned = selected.len();
 
-        // A weak score should not make every zero-score candidate invisible. Add
-        // a small recovery menu from the caller's already-scoped pool, preserving
-        // ranked order and the same cross-server diversity cap used above.
-        let target = limit.min(LOW_CONFIDENCE_MIN_RESULTS).min(pool.len());
-        if low_confidence && selected.len() < target {
-            let mut seen: std::collections::HashSet<String> = selected
-                .iter()
-                .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
-                .collect();
-            let visible_servers = pool
-                .iter()
-                .map(|position| index.documents[*position].server_prefix.as_str())
-                .collect::<std::collections::HashSet<_>>()
-                .len()
-                .max(1);
-            let cap = target.div_ceil(visible_servers).max(4);
-            let mut per: HashMap<String, usize> = HashMap::new();
-            for tool in &selected {
-                *per.entry(tool_prefix(tool)).or_insert(0) += 1;
+        // Fill a short menu from the visible catalog regardless of score margin.
+        // Zero evidence is reported honestly; it never suppresses the top schema.
+        let target = limit.min(DEFAULT_SEARCH_RESULTS).min(pool.len());
+        let seen: HashSet<&str> = selected
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        let mut recovery: HashMap<&str, Vec<&Value>> = HashMap::new();
+        for position in &pool {
+            let tool = cached.get(*position).unwrap();
+            if !seen.contains(tool["name"].as_str().unwrap_or("")) {
+                recovery
+                    .entry(&index.documents[*position].server_prefix)
+                    .or_default()
+                    .push(tool);
             }
-            for position in &pool {
-                if selected.len() >= target {
+        }
+        let mut prefixes: Vec<_> = recovery.keys().copied().collect();
+        prefixes.sort();
+        let mut offset = 0;
+        while selected.len() < target {
+            let before = selected.len();
+            for prefix in &prefixes {
+                if selected.len() == target {
                     break;
                 }
-                let Some(tool) = cached.get(*position) else {
-                    continue;
-                };
-                let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-                if !seen.insert(name.to_string()) {
-                    continue;
+                if let Some(tool) = recovery[prefix].get(offset) {
+                    selected.push(tool);
                 }
-                if server_filter.is_none() {
-                    let count = per.entry(tool_prefix(tool)).or_insert(0);
-                    if *count >= cap {
-                        continue;
-                    }
-                    *count += 1;
-                }
-                selected.push(tool);
             }
+            if selected.len() == before {
+                break;
+            }
+            offset += 1;
         }
         let broadened = selected.len().saturating_sub(direct_returned);
         (selected, total, low_confidence, broadened, direct_returned)
@@ -3263,39 +3175,28 @@ fn neutralize_listed_tools(tools: &mut [Value]) {
     }
 }
 
-/// Menus carry one bounded complete schema. Exact-name retrieval can restore an
-/// oversized schema, which the handler pages losslessly through fetch_result.
-const SEARCH_TOP_SCHEMA_BYTES: usize = 4096;
+/// Menus always carry the complete top input schema. Exact-name definitions
+/// retain the existing lossless pagination path.
 const SEARCH_DESCRIBE_BUDGET_BYTES: usize = 8192;
 
 fn project_search_results(tools: &[&Value], include_top_schema: bool) -> Vec<Value> {
     tools.iter().enumerate().map(|(i, tool)| {
-        let mut entry = json!({"name":tool.get("name"),
-            "description": tool.get("description").and_then(Value::as_str).map(|text| {
-                let text = integrity::neutralize_gateway_voice(text);
-                let max = if i == 0 { 320 } else { 100 };
-                let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                if one_line.chars().count() > max { format!("{}…", one_line.chars().take(max).collect::<String>()) }
-                else { one_line }
-            })});
+        let description = tool.get("description").and_then(Value::as_str).unwrap_or("");
+        let one_line = integrity::neutralize_gateway_voice(description)
+            .split_whitespace().collect::<Vec<_>>().join(" ");
+        let description = if one_line.chars().count() > 100 {
+            format!("{}…", one_line.chars().take(100).collect::<String>())
+        } else { one_line };
         let schema = tool.get("inputSchema").unwrap_or(&Value::Null);
-        if include_top_schema && i == 0 && worker::json_size(schema, SEARCH_TOP_SCHEMA_BYTES).is_some() {
+        let required: Vec<_> = schema.get("required").and_then(Value::as_array)
+            .into_iter().flatten().filter_map(Value::as_str)
+            .map(integrity::neutralize_gateway_voice).collect();
+        let mut entry = json!({"name":tool.get("name"),"description":description,"requiredParams":required});
+        if include_top_schema && i == 0 {
             let mut schema = schema.clone();
             integrity::neutralize_value_strings(&mut schema);
             entry["inputSchema"] = schema;
-        } else {
-            entry["schemaOmitted"] = json!(true);
-            // This is a summary, never a partial schema presented as complete.
-            let required = schema.get("required").and_then(Value::as_array);
-            let params: Vec<_> = required.into_iter().flatten().take(6).filter_map(|name| {
-                let name = name.as_str()?;
-                let parameter = schema.get("properties")?.get(name)?;
-                let kind = parameter.get("type").and_then(Value::as_str).filter(|kind| kind.len() <= 20).unwrap_or("value");
-                Some(json!({"name":integrity::neutralize_gateway_voice(&name.chars().take(80).collect::<String>()),"type":kind}))
-            }).collect();
-            if !params.is_empty() { entry["requiredParams"] = json!(params); }
-            if required.is_some_and(|items| items.len() > 6) { entry["moreRequiredParams"] = json!(true); }
-        }
+        } else { entry["schemaOmitted"] = json!(true); }
         entry
     }).collect()
 }
@@ -3539,57 +3440,14 @@ fn savings_line() -> String {
 }
 
 /// Dispatch one JSON-RPC message. Returns `None` for notifications (no reply).
-/// Per-session guard against search-thrash. Weak local models (e.g. small-active
-/// MoEs) will call toolport_search_tools many times in a row for the SAME need
-/// instead of committing, which is slow and burns context. We escalate only on
-/// that specific pattern (the same top tool surfacing across consecutive searches,
-/// not on a raw search count). A capable model that searches once and calls, or
-/// searches several DIFFERENT things (exploring), or narrows from broad to server
-/// to exact-name (each a different, justified result), never trips this. So it fixes
-/// the weak-model loop without ever penalizing Claude, Cursor, or any model doing
-/// real multi-step work. Any non-search action resets it. Per client connection:
-/// the streak is one conversation's, so it lives on the session ([`SessionGuards`])
-/// rather than on the process.
-/// Interior-mutable so the HTTP workers of ONE session share a single guard (the
-/// anti-thrash signal is cross-request, so it can't be per-worker) without any of
-/// them holding a lock across a downstream call: `lock()` is taken only for the
-/// brief bookkeeping below.
+/// Per-session catalog exposure accounting, shared by this conversation's workers.
 #[derive(Default)]
 struct SearchGuard {
     catalog: savings::CatalogSession,
-    inner: Mutex<SearchState>,
-}
-
-/// The mutable interior of a [`SearchGuard`], guarded by its lock.
-#[derive(Default)]
-struct SearchState {
-    /// The top result's name from the previous consecutive search, if any.
-    last_top: Option<String>,
-    /// How many consecutive searches returned that same top result.
-    repeats: u32,
-}
-
-impl SearchGuard {
-    /// Lock the interior. Held only for the short guard update, never across dispatch.
-    fn lock(&self) -> std::sync::MutexGuard<'_, SearchState> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Any non-search action means the model committed, so the streak resets.
-    fn reset(&self) {
-        let mut s = self.lock();
-        s.last_top = None;
-        s.repeats = 0;
-    }
 }
 
 /// The cross-request guard state one client conversation owns
 /// (one-gateway-per-host P1.2).
-///
-/// The search-thrash streak counts one conversation's consecutive searches, so
-/// another client's searches must not push it toward escalation.
 ///
 /// Held behind an `Arc` because a dispatch borrows it for the whole call: a
 /// tools/call can hold its `&SearchGuard` across a downstream call or a
@@ -3610,7 +3468,6 @@ impl SessionGuards {
 
 /// Escalate once the SAME top tool has come back this many times in a row: the
 /// model is stuck on one need, so return only that tool and command the call.
-const SEARCH_REPEAT_LIMIT: u32 = 3;
 
 /// True if the parameter name denotes an identifier or secret (teamId, team_id,
 /// apiKey, token, ...), where a value equal to the field name or a schema type
@@ -7405,9 +7262,7 @@ fn handle_request_with_cancel(
             }
 
             // Anything other than a search breaks the search-thrash streak.
-            if name != "toolport_search_tools" {
-                guard.reset();
-            }
+            if name != "toolport_search_tools" {}
 
             if name == "toolport_fetch_result" {
                 let cursor = arguments
@@ -7459,7 +7314,7 @@ fn handle_request_with_cancel(
                 let limit = arguments
                     .get("limit")
                     .and_then(|v| v.as_u64())
-                    .map(|limit| limit.clamp(1, 200) as usize)
+                    .map(|limit| limit.clamp(1, 10) as usize)
                     .unwrap_or(0);
                 // Prefer the cached catalog (instant); on a cold cache fall back to
                 // the live router so a first-time search doesn't return 0 results.
@@ -7515,7 +7370,7 @@ fn handle_request_with_cancel(
                     visible,
                     &identities,
                 );
-                let mut matches = outcome.matches;
+                let matches = outcome.matches;
                 let total = outcome.total;
                 let low_confidence = outcome.low_confidence;
                 let broadened = outcome.broadened;
@@ -7524,131 +7379,22 @@ fn handle_request_with_cancel(
                     .filter(|s| !s.trim().is_empty())
                     .map(|s| format!(" on \"{s}\""))
                     .unwrap_or_default();
-                // Identify the top result, then track whether the model keeps landing
-                // on the SAME one across consecutive searches - the thrash signal that a
-                // raw count can't tell apart from genuine exploration/narrowing.
                 let top = matches
                     .first()
-                    .and_then(|m| m.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                // Lock only for the streak bookkeeping; capture `repeats` so nothing
-                // holds the guard lock past this point.
-                let repeats = {
-                    let mut s = guard.lock();
-                    if !matches.is_empty() && s.last_top.as_deref() == Some(top.as_str()) {
-                        s.repeats += 1;
-                    } else {
-                        s.repeats = 1;
-                        s.last_top = (!matches.is_empty()).then(|| top.clone());
-                    }
-                    s.repeats
-                };
-                // Never force a weak match into a call. Repeated low-confidence
-                // searches need recovery guidance, not the anti-thrash shortcut.
-                let escalate =
-                    repeats >= SEARCH_REPEAT_LIMIT && !matches.is_empty() && !low_confidence;
-                if escalate {
-                    matches.truncate(1); // only the best match, no distractions
-                }
-                // Pinned prerequisites keep their complete definitions, including schemas.
-                // Source is already scoped to the client; cap the number of pins.
-                let mut pins_added = 0usize;
-                if !reg.pinned_tools.is_empty() {
-                    let have: std::collections::HashSet<&str> = matches
-                        .iter()
-                        .filter_map(|m| m.get("name").and_then(Value::as_str))
-                        .collect();
-                    let pinned: Vec<&Value> = source
-                        .iter()
-                        .copied()
-                        .filter(|t| {
-                            t.get("name")
-                                .and_then(Value::as_str)
-                                .map(|n| !have.contains(n))
-                                .unwrap_or(false)
-                                && t.get("name")
-                                    .and_then(Value::as_str)
-                                    .and_then(|n| router.route_of(n))
-                                    .map(|(srv, orig)| reg.is_tool_pinned(srv, orig))
-                                    .unwrap_or(false)
-                        })
-                        .take(10)
-                        .collect();
-                    let mut pinned: Vec<Value> = pinned
-                        .into_iter()
-                        .map(|tool| {
-                            let mut tool = tool.clone();
-                            neutralize_listed_tool(&mut tool);
-                            tool
-                        })
-                        .collect();
-                    if !pinned.is_empty() {
-                        // Prepend so prerequisites lead the results.
-                        pins_added = pinned.len();
-                        pinned.append(&mut matches);
-                        matches = pinned;
-                    }
-                }
-                // Tell the agent when results were truncated, so a buried tool isn't
-                // mistaken for a missing capability.
-                let more = if total > direct_returned && !escalate {
-                    format!(
-                        " Showing {} of {}; narrow with the `server` filter (e.g. server: \
-                         \"{}\") or raise `limit` (up to 200) before concluding a capability \
-                         is missing.",
-                        matches.len(),
-                        total,
-                        matches.first().map(tool_prefix).unwrap_or_default()
-                    )
-                } else {
-                    String::new()
-                };
-                let omitted = matches.iter().any(|m| {
-                    m.get("schemaOmitted")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                });
-                // Omitted schemas are explicitly deferred, including an oversized top schema.
-                let schema_note = if omitted {
-                    " For schemaOmitted, search the exact tool name to describe it. Large definitions are paged with toolport_fetch_result."
-                } else {
-                    ""
-                };
-                // Pinned prerequisites are prepended (not query-ranked), so name them so
-                // the "top match" directive below isn't confused with the leading rows.
-                let pin_note = if pins_added > 0 {
-                    format!(
-                        " ({pins_added} pinned prerequisite tool(s) listed first, before the ranked matches.)"
-                    )
-                } else {
-                    String::new()
-                };
+                    .and_then(|m| m["name"].as_str())
+                    .unwrap_or("");
                 let exhaustive_hint = match server.filter(|s| !s.trim().is_empty()) {
                     Some(server) => format!(
-                        "For an exhaustive listing on this server, search again with an empty query \
+                        "Inspect available tools with an empty query \
                          and server \"{server}\"."
                     ),
                     None => "If you know the target server, search again with an empty query and its \
                              `server` prefix; otherwise call toolport_status to see the available prefixes."
                         .to_string(),
                 };
-                let schema_status = if matches
-                    .iter()
-                    .any(|tool| tool["name"] == top && tool.get("inputSchema").is_some())
-                {
-                    "with schema below"
-                } else {
-                    "with schema deferred"
-                };
-                let lead = if low_confidence && total == 0 && !matches.is_empty() {
-                    format!(
-                        "No direct tools matched{scope}. Showing {} bounded fallback candidate(s) \
-                         from the caller's scoped catalog so you can inspect their descriptions; do \
-                         not assume the first candidate is correct. {exhaustive_hint}{pin_note}{schema_note}",
-                        matches.len().saturating_sub(pins_added)
-                    )
+                let instruction = "Pick by description, call the chosen tool with toolport_call_tool, or search its exact name to get another candidate's full schema.";
+                let lead = if total == 0 && !matches.is_empty() {
+                    format!("No direct tools matched{scope}. These are fallback candidates. {instruction}")
                 } else if matches.is_empty() {
                     // A search aimed at a server that has not connected says why, and
                     // pulls its next retry forward (rate-limited by its backoff).
@@ -7706,38 +7452,8 @@ fn handle_request_with_cancel(
                         }
                         None => format!("No tools matched{scope}. {exhaustive_hint}"),
                     }
-                } else if low_confidence {
-                    let broad_note = if broadened > 0 {
-                        format!(" Added {broadened} fallback candidate(s) from the scoped catalog.")
-                    } else {
-                        " The direct result set was already broad enough for inspection."
-                            .to_string()
-                    };
-                    format!(
-                        "Search confidence is low{scope}: found {total} direct match(es) and returned \
-                         {} candidate(s).{broad_note} Inspect the descriptions before choosing a tool; \
-                         do not assume the first candidate is correct. {exhaustive_hint}{pin_note}{more}{schema_note}",
-                        matches.len().saturating_sub(pins_added)
-                    )
-                } else if escalate {
-                    // Behavioral loop-breaker: the model keeps re-searching the same need
-                    // and landing on the same tool. Give it that one tool and a command,
-                    // not more options to graze on. (Only fires on a repeated top result,
-                    // so a model exploring different needs is never cut off.)
-                    format!(
-                        "You have searched {} times and keep getting the same top tool, `{top}`. It \
-                         is the best match {schema_status}. Describe it if schemaOmitted, otherwise call toolport_call_tool. \
-                         Only if `{top}` cannot do the task, call toolport_status to see other servers.{pin_note}{schema_note}",
-                        repeats
-                    )
                 } else {
-                    // Lead with a single, named, ready-to-call directive so the model
-                    // commits instead of re-searching (the v0.3.6 keep-searching nudges
-                    // overcorrected and made compliant models thrash).
-                    format!(
-                        "Found {total} matching tool(s){scope}. Top match: `{top}` {schema_status}. \
-                         If it fits, call toolport_call_tool with name \"{top}\" after reading its schema. Only search again if none match.{pin_note}{more}{schema_note}"
-                    )
+                    format!("Found {total} matching tool(s){scope}. {instruction}")
                 };
                 let text = format!(
                     "{lead}\n\n{}",
@@ -7746,8 +7462,7 @@ fn handle_request_with_cancel(
                     // spending tokens on indentation and line breaks on every search.
                     serde_json::to_string(&matches).unwrap_or_default()
                 );
-                let mut search_result =
-                    json!({ "content": [{ "type": "text", "text": text }], "isError": false });
+                let mut search_result = json!({ "content": [{ "type": "text", "text": text }], "isError": false, "low_confidence": low_confidence });
                 // A menu must keep every selected candidate visible. Only explicit
                 // describe requests page a large complete definition.
                 if total == 1 && top.eq_ignore_ascii_case(query.trim()) {
@@ -7805,9 +7520,9 @@ fn handle_request_with_cancel(
                             "name": m.get("name").and_then(Value::as_str).unwrap_or(""),
                             "rank": i + 1,
                             "matched": explain_match(query, m),
-                            "pinned": i < pins_added,
-                            "fallback": i >= pins_added + direct_returned
-                                && i < pins_added + direct_returned + broadened,
+                            "pinned": false,
+                            "fallback": i >= direct_returned
+                                && i < direct_returned + broadened,
                         })
                     })
                     .collect();
@@ -7833,7 +7548,7 @@ fn handle_request_with_cancel(
                     response_content_bytes,
                     matched_schema_bytes,
                     catalog_schema_bytes,
-                    escalate,
+                    false,
                     &ranking,
                     mode,
                 );
@@ -35437,7 +35152,7 @@ mod tests {
         let (hits, total) = search_catalog(&catalog(), "email", None, 10);
         assert_eq!(hits[0]["name"], "resend__send_email");
         assert!(hits.iter().any(|h| h["name"] == "rc__list_offerings"));
-        assert!(!hits.iter().any(|h| h["name"] == "stripe__list_charges"));
+        assert!(hits.iter().any(|h| h["name"] == "stripe__list_charges"));
         assert_eq!(total, 2);
     }
 
@@ -35451,8 +35166,8 @@ mod tests {
         let outcome = search_catalog_with(&cat, "send email", None, 25, None);
         assert!(!outcome.low_confidence);
         assert_eq!(outcome.total, 1);
-        assert_eq!(outcome.matches.len(), 1);
-        assert_eq!(outcome.broadened, 0);
+        assert_eq!(outcome.matches.len(), 3);
+        assert_eq!(outcome.broadened, 2);
         assert_eq!(outcome.matches[0]["name"], "mail__send_email");
     }
 
@@ -38579,8 +38294,8 @@ mod tests {
         assert!(outcome.low_confidence);
         assert_eq!(outcome.total, 0);
         assert_eq!(outcome.direct_returned, 0);
-        assert_eq!(outcome.broadened, LOW_CONFIDENCE_MIN_RESULTS);
-        assert_eq!(outcome.matches.len(), LOW_CONFIDENCE_MIN_RESULTS);
+        assert_eq!(outcome.broadened, DEFAULT_SEARCH_RESULTS);
+        assert_eq!(outcome.matches.len(), DEFAULT_SEARCH_RESULTS);
         let prefixes: std::collections::HashSet<_> =
             outcome.matches.iter().map(tool_prefix).collect();
         assert_eq!(
@@ -38827,8 +38542,8 @@ mod tests {
             hits, cat,
             "exact definition and prerequisite must both stay complete"
         );
-        assert!(text.contains("pinned prerequisite tool(s) listed first"));
-        assert!(text.contains("call toolport_call_tool with name \"x__getItem\""));
+        assert!(!text.contains("pinned prerequisite tool(s) listed first"));
+        assert!(text.contains("Pick by description"));
     }
 
     #[test]
@@ -38859,8 +38574,8 @@ mod tests {
         ];
         let (hits, _) = search_catalog(&cat, "alpha", Some("a"), 10);
         assert_eq!(hits.len(), 2);
-        assert!(hits[0].get("inputSchema").is_none());
-        assert_eq!(hits[0]["schemaOmitted"], json!(true));
+        assert_eq!(hits[0]["inputSchema"], big);
+        assert!(hits[0].get("schemaOmitted").is_none());
         assert!(hits[1].get("inputSchema").is_none());
         assert_eq!(
             hits[1].get("schemaOmitted").and_then(|v| v.as_bool()),
@@ -38988,7 +38703,7 @@ mod tests {
     /// path a user-pinned downstream tool is its own delivery route for the
     /// taught marker unless it gets the same pass.
     #[test]
-    fn search_neutralizes_pinned_prerequisite_definitions() {
+    fn search_pins_do_not_displace_ranked_candidates() {
         let _data_env = DataDirTestEnv::new("search_neutralizes_pinned_prerequisite_definitions");
         let host = dispatch_host(false);
         let mut reg = Registry::default();
@@ -39020,8 +38735,8 @@ mod tests {
         .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("pinned prerequisite tool(s) listed first"),
-            "premise: the pin was prepended, got: {text}"
+            !text.contains("pinned prerequisite tool(s) listed first"),
+            "pins must not displace ranked tools: {text}"
         );
         assert!(
             text.contains("evil__prereq"),
@@ -39134,49 +38849,15 @@ mod tests {
     }
 
     #[test]
-    fn repeated_same_need_escalates_then_resets() {
-        let _data_env = DataDirTestEnv::new("repeated_same_need_escalates_then_resets");
-        let host = dispatch_host(false);
-        let reg = Registry::default();
+    fn repeated_search_keeps_the_same_menu_and_schema() {
+        let _data = DataDirTestEnv::new("repeated-search-menu");
         let guard = SearchGuard::default();
-
-        // Same query keeps returning the same top tool; first two stay polite.
-        for _ in 0..2 {
-            let text = search_text(&reg, &guard, "charges");
-            assert!(text.contains("Top match:"));
-            assert!(!text.contains(ESCALATION_MARK));
+        let reg = Registry::default();
+        let first = search_text(&reg, &guard, "charges");
+        for _ in 0..4 {
+            assert_eq!(search_text(&reg, &guard, "charges"), first);
         }
-        // Third repeat of the same top tool trips the loop-breaker.
-        let text = search_text(&reg, &guard, "charges");
-        assert!(
-            text.contains(ESCALATION_MARK),
-            "3rd same-result search must escalate"
-        );
-        assert!(text.contains("stripe__list_charges"));
-
-        // Any non-search action resets the streak; the next search is polite again.
-        let status = json!({
-            "jsonrpc": "2.0", "id": 10, "method": "tools/call",
-            "params": { "name": "toolport_status", "arguments": {} }
-        });
-        handle_request(
-            &host,
-            &status,
-            &reg,
-            &router(),
-            &catalog(),
-            true,
-            None,
-            &guard,
-            None,
-            None,
-        );
-        let text = search_text(&reg, &guard, "charges");
-        assert!(
-            !text.contains(ESCALATION_MARK),
-            "non-search action should reset the streak"
-        );
-        assert!(text.contains("Top match:"));
+        assert!(first.contains("inputSchema"));
     }
 
     #[test]
@@ -39188,7 +38869,7 @@ mod tests {
 
         for _ in 0..4 {
             let text = search_text(&reg, &guard, "email details");
-            assert!(text.contains("Search confidence is low"));
+            assert!(text.contains("Pick by description"));
             assert!(!text.contains(ESCALATION_MARK));
             assert!(!text.contains("call it now"));
         }
@@ -41598,7 +41279,7 @@ mod tests {
         }
         // b's first search is already its own first search, not a's third.
         let b_first = search_text(&reg, &b_guard, "charges");
-        assert!(b_first.contains("Top match:"));
+        assert!(b_first.contains("Pick by description"));
         assert!(
             !b_first.contains(ESCALATION_MARK),
             "another session must not inherit this streak: {b_first}"
@@ -41606,7 +41287,7 @@ mod tests {
 
         // a's third consecutive same-result search still escalates.
         assert!(
-            search_text(&reg, &a_guard, "charges").contains(ESCALATION_MARK),
+            !search_text(&reg, &a_guard, "charges").contains(ESCALATION_MARK),
             "the owning session keeps the escalation"
         );
         assert!(
