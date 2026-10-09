@@ -473,8 +473,8 @@ pub(crate) fn record_session_at(path: &Path, mut entry: Value) {
     write_line_at(path, &entry);
 }
 
-pub fn record_internal(tool: &str, duration_ms: u64, cold: bool, client: Option<&str>) {
-    let mut entry = json!({"ts": epoch_millis() as u64, "kind":"internal", "ok":true, "server":"toolport", "tool":tool, "durationMs":duration_ms, "cold":cold});
+pub fn record_internal(tool: &str, duration_ms: u64, cold: bool, client: Option<&str>, ok: bool) {
+    let mut entry = json!({"ts": epoch_millis() as u64, "kind":"internal", "ok":ok, "server":"toolport", "tool":tool, "durationMs":duration_ms, "cold":cold});
     if let Some(client) = client {
         entry["client"] = json!(client);
     }

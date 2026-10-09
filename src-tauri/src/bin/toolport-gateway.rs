@@ -6109,6 +6109,7 @@ fn render_script_validation(validation: ScriptValidation, client: Option<&str>) 
         plan,
         unresolved,
     } = validation;
+    if let Some(kind) = outcome.failure_kind { CODE_MODE_FAILURE.with(|failure| failure.set(Some(kind))); }
     let planned = plan.len();
 
     // `finished` is deliberately NOT called `complete`. It says only that the dry
@@ -15376,6 +15377,7 @@ fn process_request_wire(
             started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             cold,
             client,
+            response.as_ref().is_some_and(|r| r.envelope.get("error").is_none() && r.envelope.pointer("/result/isError").and_then(Value::as_bool) != Some(true)),
         );
     }
     if let Some(response) = &mut response {

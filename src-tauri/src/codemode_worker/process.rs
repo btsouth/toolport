@@ -426,11 +426,6 @@ pub fn run_script(
         Ok(mut outcome) => {
             // Boa also counts callAsync entries queued before an early JS error.
             outcome.calls = outcome.calls.max(calls).min(limits.max_calls);
-            if outcome.failure_kind == Some(codemode::FailureKind::ScriptException)
-                && records.iter().any(|r| !r.ok)
-            {
-                outcome.failure_kind = Some(codemode::FailureKind::DownstreamFailure);
-            }
             outcome.progress = records;
             outcome.checkpoint = checkpoint;
             outcome

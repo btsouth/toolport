@@ -128,7 +128,7 @@ impl ActivitySnapshot {
                     run_id: entry["runId"].as_str().map(str::to_string),
                     approval_decision: is_approval
                         .then(|| entry["decision"].as_str().unwrap_or("unknown").to_string()),
-                    ok: call_ok.unwrap_or(true),
+                    ok: call_ok.unwrap_or_else(|| entry["ok"].as_bool().unwrap_or(true)),
                     held: entry
                         .get("held")
                         .and_then(serde_json::Value::as_bool)

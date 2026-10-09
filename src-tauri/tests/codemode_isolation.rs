@@ -377,7 +377,7 @@ fn allocating_scripts_fail_without_killing_stdio_gateway() {
             .filter(|entry| {
                 entry["server"] == "toolport"
                     && entry["tool"] == "run_script"
-                    && entry["error"] == "code_mode_memory_budget"
+                    && entry["failureKind"] == "memory_limit"
             })
             .count()
             == 2
@@ -387,7 +387,7 @@ fn allocating_scripts_fail_without_killing_stdio_gateway() {
             .iter()
             .filter(|entry| entry["server"] == "toolport"
                 && entry["tool"] == "run_script"
-                && entry["error"] == "code_mode_memory_budget")
+                && entry["failureKind"] == "memory_limit")
             .count(),
         2
     );

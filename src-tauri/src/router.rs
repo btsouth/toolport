@@ -9479,6 +9479,7 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_scoped_adoption_leaves_other_servers_to_their_owner() {
+        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-scoped-adoption");
         let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
         router.servers[0].start(true);
         assert!(wait_until(|| router.has_ready_reconnects()));
