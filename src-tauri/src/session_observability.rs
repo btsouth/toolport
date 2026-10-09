@@ -329,6 +329,37 @@ impl Drop for Session {
 mod tests {
     use super::*;
     #[test]
+    fn pending_approval_retains_captured_identity_and_run_after_request_ends() {
+        let _data = crate::registry::DataDirTestEnv::new("session-pending-approval-context");
+        let pending = {
+            let _guard = ContextGuard::enter(Context {
+                session_id: Some("opaque-session".into()),
+                run_id: Some("opaque-run".into()),
+                client_name: Some("Unknown app (via Cursor)".into()),
+                client_label: Some("kt 1 https://private.example/token".into()),
+                ..Context::default()
+            });
+            crate::audit::PendingApprovalAudit::new(
+                "fixture",
+                "work",
+                None,
+                None,
+                "destructive",
+                "opaque-args-hash",
+            )
+        };
+        pending.finish("withdrawn", 5);
+        let rows = crate::audit::read_recent(1).unwrap();
+        let row = &rows[0];
+        assert_eq!(row["clientName"], "Unknown app (via Cursor)");
+        assert_eq!(row["clientLabel"], "kt 1 [link]");
+        assert_eq!(row["sessionId"], "opaque-session");
+        assert_eq!(row["runId"], "opaque-run");
+        assert_eq!(row["decision"], "withdrawn");
+        assert!(!row.to_string().contains("private.example"));
+    }
+
+    #[test]
     fn session_summary_is_bounded_private_and_excluded_from_call_stats() {
         let _lock = crate::registry::data_dir_test_lock();
         let dir = std::env::temp_dir().join(format!(

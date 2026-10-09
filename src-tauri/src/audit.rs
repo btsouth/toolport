@@ -360,6 +360,7 @@ impl PendingApprovalAudit {
         if let Some(label) = client_label.and_then(crate::approval::sanitize_client_label) {
             entry["clientLabel"] = json!(label);
         }
+        crate::session_observability::enrich(&mut entry);
         Self {
             path: audit_path(),
             entry,
