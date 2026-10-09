@@ -14711,7 +14711,7 @@ for line in sys.stdin:
                 }
                 for _ in 0..4 {
                     let error = transport
-                        .post(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call"}), true)
+                        .post(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{}}}), true)
                         .unwrap_err();
                     assert_eq!(error.call_failure().kind, expected);
                     assert!(!error.is_health_failure());
