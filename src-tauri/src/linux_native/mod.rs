@@ -760,6 +760,8 @@ fn build_sidebar(
     let quarantine_badge = gtk::Label::builder()
         .visible(false)
         .css_classes(["toolport-badge", "review"])
+        .valign(gtk::Align::Center)
+        .halign(gtk::Align::Start)
         .build();
 
     let tools_action = gtk::gio::SimpleAction::new("show-server-tools", None);
@@ -2202,6 +2204,8 @@ fn client_section_title(title: &str, count: usize) -> gtk::Box {
     );
     let count = gtk::Label::new(Some(&count.to_string()));
     count.add_css_class("toolport-badge");
+    count.set_valign(gtk::Align::Center);
+    count.set_halign(gtk::Align::Start);
     heading.append(&count);
     heading
 }
@@ -2260,7 +2264,7 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             .label(&client.name)
             .halign(gtk::Align::Start)
             .ellipsize(gtk::pango::EllipsizeMode::End)
-            .tooltip_text(&client.name)
+            .tooltip_text(format!("{}\nClient id: {}", client.name, client.id))
             .css_classes(["heading"])
             .build(),
     );
@@ -2322,34 +2326,32 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             .css_classes(["toolport-muted"])
             .build(),
     );
-    let mode = crate::clients::discovery_capabilities(&client.id)
-        .resolve_mode(client.discovery_mode.as_deref());
-    let discovery_hint = match mode {
-        "full" => "Full tool list. Client per-tool permission rules need Full mode.",
-        "grouped" => {
-            "Browse a server, then call tools. Client per-tool permission rules need Full mode."
-        }
-        _ => "Search, then call tools. Client per-tool permission rules need Full mode.",
-    };
-    copy.append(
-        &gtk::Label::builder()
-            .label(discovery_hint)
-            .xalign(0.0)
-            .wrap(true)
-            .css_classes(["toolport-muted"])
-            .build(),
-    );
-    card.append(&copy);
-    if client.gateway_state != state::ClientGatewayState::Connected {
-        let (status, class) = match client.gateway_state {
-            state::ClientGatewayState::Customized => ("Customized", "review"),
-            state::ClientGatewayState::Disconnected => ("Not connected", "disabled"),
-            state::ClientGatewayState::Connected => unreachable!(),
+    if client.gateway_state == state::ClientGatewayState::Connected {
+        let mode = crate::clients::discovery_capabilities(&client.id)
+            .resolve_mode(client.discovery_mode.as_deref());
+        let discovery_hint = match mode {
+            "full" => "Full tool list. Client per-tool permission rules need Full mode.",
+            "grouped" => {
+                "Browse a server, then call tools. Client per-tool permission rules need Full mode."
+            }
+            _ => "Search, then call tools. Client per-tool permission rules need Full mode.",
         };
-        let badge = gtk::Label::new(Some(status));
+        copy.append(
+            &gtk::Label::builder()
+                .label(discovery_hint)
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["toolport-muted"])
+                .build(),
+        );
+    }
+    card.append(&copy);
+    if client.gateway_state == state::ClientGatewayState::Customized {
+        let badge = gtk::Label::new(Some("Customized"));
         badge.add_css_class("toolport-badge");
-        badge.add_css_class(class);
-        badge.set_tooltip_text(Some(&format!("Client id: {}", client.id)));
+        badge.set_valign(gtk::Align::Center);
+        badge.set_halign(gtk::Align::Start);
+        badge.add_css_class("review");
         card.append(&badge);
     }
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -4046,6 +4048,8 @@ fn security_notice_card(
         .replace('_', " ");
     let badge = gtk::Label::new(Some(&kind));
     badge.add_css_class("toolport-badge");
+    badge.set_valign(gtk::Align::Center);
+    badge.set_halign(gtk::Align::Start);
     badge.add_css_class(if crate::integrity::event_severity(event) == "high" {
         "error"
     } else {
@@ -4070,6 +4074,8 @@ fn security_notice_card(
     if count > 1 {
         let recurrence = gtk::Label::new(Some(&format!("×{count}")));
         recurrence.add_css_class("toolport-badge");
+        recurrence.set_valign(gtk::Align::Center);
+        recurrence.set_halign(gtk::Align::Start);
         recurrence.add_css_class("review");
         recurrence.set_tooltip_text(Some(&format!("Recurred in {count} separate time windows")));
         row.append(&recurrence);
@@ -4721,6 +4727,8 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     {
         let badge = gtk::Label::new(Some(&label));
         badge.add_css_class("toolport-badge");
+        badge.set_valign(gtk::Align::Center);
+        badge.set_halign(gtk::Align::Start);
         badge.add_css_class(class);
         badge.set_tooltip_text(Some(tooltip));
         card.append(&badge);
@@ -4736,8 +4744,9 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     };
     let badge = gtk::Label::new(Some(status));
     badge.add_css_class("toolport-badge");
-    badge.add_css_class(class);
     badge.set_valign(gtk::Align::Center);
+    badge.set_halign(gtk::Align::Start);
+    badge.add_css_class(class);
     card.append(&badge);
     card
 }
@@ -5065,6 +5074,8 @@ fn tool_identity_row(identity: &crate::integrity::ToolIdentity) -> gtk::Box {
     if identity.quarantined {
         let badge = gtk::Label::new(Some("Quarantined"));
         badge.add_css_class("toolport-badge");
+        badge.set_valign(gtk::Align::Center);
+        badge.set_halign(gtk::Align::Start);
         badge.add_css_class("review");
         title.append(&badge);
     }
@@ -5161,6 +5172,8 @@ impl ApprovalPage {
         );
         let count = gtk::Label::new(None);
         count.add_css_class("toolport-badge");
+        count.set_valign(gtk::Align::Center);
+        count.set_halign(gtk::Align::Start);
         count.add_css_class("warning");
         heading.append(&count);
         root.append(&heading);
@@ -6908,6 +6921,8 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
     if server.requires_review {
         let badge = gtk::Label::new(Some("Review in Teams"));
         badge.add_css_class("toolport-badge");
+        badge.set_valign(gtk::Align::Center);
+        badge.set_halign(gtk::Align::Start);
         badge.add_css_class("review");
         badge.set_tooltip_text(Some(
             "This team server must be reviewed before its command or private address can run",
@@ -9029,6 +9044,97 @@ fn state_card(icon_name: &str, title: &str, body: &str, error: bool) -> gtk::Box
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn client_rows_keep_disconnected_copy_short_and_badges_compact() {
+        use super::*;
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.ClientRowsFixture")
+            .build();
+        let server_page = ServerPage {
+            app: app.clone(),
+            server_count: gtk::Label::new(None),
+            enabled_count: gtk::Label::new(None),
+            profile_count: gtk::Label::new(None),
+            section_title: gtk::Label::new(None),
+            posture: gtk::Label::new(None),
+            search: gtk::SearchEntry::new(),
+            feedback: gtk::Label::new(None),
+            list: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            last_snapshot: Default::default(),
+            feedback_timer: Default::default(),
+            health_rows: Default::default(),
+            rows: Default::default(),
+            no_matches: Default::default(),
+            off_heading: Default::default(),
+            health: Default::default(),
+        };
+        let page = ClientPage::new(&app, server_page);
+        let mut client = state::ClientView {
+            id: "cursor".into(),
+            name: "Cursor".into(),
+            app_present: true,
+            config_exists: true,
+            uses_connectors: false,
+            server_count: 2,
+            movable_server_count: 0,
+            gateway_state: state::ClientGatewayState::Disconnected,
+            shared_http: false,
+            legacy_bearer_argv: false,
+            scope_id: None,
+            scope_name: None,
+            discovery_mode: None,
+            config_error: false,
+        };
+        let mut heights = Vec::new();
+        for state in [
+            state::ClientGatewayState::Disconnected,
+            state::ClientGatewayState::Customized,
+            state::ClientGatewayState::Connected,
+        ] {
+            client.gateway_state = state;
+            let row = client_card(&client, page.clone());
+            let copy = row.first_child().unwrap().next_sibling().unwrap();
+            let name = copy.first_child().unwrap();
+            assert!(name.tooltip_text().unwrap().contains("Client id: cursor"));
+            let detail = name.next_sibling().unwrap();
+            assert!(detail
+                .clone()
+                .downcast::<gtk::Label>()
+                .unwrap()
+                .text()
+                .starts_with("2 local MCP servers"));
+            assert_eq!(
+                detail.next_sibling().is_some(),
+                state == state::ClientGatewayState::Connected
+            );
+            let after_copy = copy.next_sibling().unwrap();
+            if state == state::ClientGatewayState::Customized {
+                let badge = after_copy.clone().downcast::<gtk::Label>().unwrap();
+                assert_eq!(badge.text(), "Customized");
+                assert_eq!(badge.valign(), gtk::Align::Center);
+                assert_eq!(badge.halign(), gtk::Align::Start);
+            } else {
+                assert!(!after_copy.has_css_class("toolport-badge"));
+            }
+            if state == state::ClientGatewayState::Disconnected {
+                assert_eq!(after_copy.valign(), gtk::Align::Center);
+                let button = after_copy
+                    .first_child()
+                    .unwrap()
+                    .downcast::<gtk::Button>()
+                    .unwrap();
+                assert_eq!(button.label().as_deref(), Some("Connect"));
+            }
+            heights.push(row.measure(gtk::Orientation::Vertical, 880).1);
+        }
+        assert!(
+            heights[0] < heights[2],
+            "Disconnected rows should be shorter: {heights:?}"
+        );
+    }
+
     #[test]
     fn gtk_legacy_reset_preserves_scope_and_uses_one_migration_action() {
         use super::*;
