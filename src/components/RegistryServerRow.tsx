@@ -119,20 +119,20 @@ export function RegistryServerRow({
             ? "MCP OAuth refresh failed"
             : "MCP endpoint auth required"
       : status === "connected"
-      ? `Ready · ${health?.toolCount ?? 0} tool${health?.toolCount === 1 ? "" : "s"}`
-      : status === "error"
-        ? "Error"
-        : status === "checking"
-          ? initializing
-            ? launcher
-              ? "Installing…"
-              : "Initializing…"
-            : "Checking…"
-          : requiredLaunch.length
-            ? missingPlainLaunch.length
-              ? `Setup required: ${missingPlainLaunch.map((input) => input.label).join(", ")}`
-              : "Disabled · check launch setup"
-            : "Disabled";
+        ? `Ready · ${health?.toolCount ?? 0} tool${health?.toolCount === 1 ? "" : "s"}`
+        : status === "error"
+          ? "Error"
+          : status === "checking"
+            ? initializing
+              ? launcher
+                ? "Installing…"
+                : "Initializing…"
+              : "Checking…"
+            : requiredLaunch.length
+              ? missingPlainLaunch.length
+                ? `Setup required: ${missingPlainLaunch.map((input) => input.label).join(", ")}`
+                : "Disabled · check launch setup"
+              : "Disabled";
 
   // Next free "Name (N)" for the duplicate-for-another-account action.
   const existingNames = new Set(registry?.servers.map((s) => s.name.toLowerCase()) ?? []);

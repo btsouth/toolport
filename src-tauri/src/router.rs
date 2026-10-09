@@ -1437,7 +1437,7 @@ impl PendingStatus {
     pub fn describe(&self) -> String {
         let error = client_safe_error(&self.last_error);
         if self.needs_auth {
-            format!("needs sign-in in Toolport (last error: {error})")
+            format!("MCP endpoint needs sign-in in Toolport (last error: {error})")
         } else if self.connecting {
             format!("connecting (last error: {error})")
         } else {
@@ -3292,7 +3292,11 @@ impl Router {
         slot.wait_for_start(cancel, dispatch_cancelled_continuation)
             .map_err(|detail| {
                 CallFailure::new(
-                    if slot.status().is_some_and(|status| status.needs_auth) {
+                    if !dispatch_cancelled_continuation
+                        && cancel.is_some_and(CancelContext::is_cancelled)
+                    {
+                        CallFailureKind::Cancelled
+                    } else if slot.status().is_some_and(|status| status.needs_auth) {
                         CallFailureKind::Auth {
                             target: crate::call_failure::AuthTarget::Endpoint,
                         }
@@ -3314,11 +3318,11 @@ impl Router {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(remaining) = breaker.open_remaining(Instant::now()) {
-                return Err(format!(
+                return Err(CallFailure::new(CallFailureKind::Unavailable { after_send: false }, format!(
                     "server '{}' is temporarily unavailable (too many recent failures; retrying in {}s)",
                     slot.id,
                     remaining.as_secs() + 1
-                ).into());
+                )));
             }
             // Cooldown elapsed but the failure streak is still at/over threshold: this
             // call is the half-open probe of a tripped breaker.
@@ -3369,10 +3373,16 @@ impl Router {
                 Ok(v) => {
                     slot.successes.fetch_add(1, Ordering::AcqRel);
                     if let Some(supervisor) = &slot.supervisor {
-                        supervisor
+                        let mut state = supervisor
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .failures = 0;
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.failures = 0;
+                        if state.state == SupervisorState::NeedsAuth
+                            && slot.generation.load(Ordering::Acquire) == generation
+                        {
+                            state.state = SupervisorState::Ready;
+                            state.last_error.clear();
+                        }
                     }
                     slot.breaker
                         .lock()
@@ -3396,6 +3406,26 @@ impl Router {
                     attempt += 1;
                 }
                 Err(e) => {
+                    if matches!(
+                        e.call_failure().kind,
+                        CallFailureKind::Auth {
+                            target: crate::call_failure::AuthTarget::Endpoint
+                                | crate::call_failure::AuthTarget::OAuthRefresh
+                        }
+                    ) {
+                        if let Some(supervisor) = &slot.supervisor {
+                            let mut state = supervisor
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if state.state == SupervisorState::Ready
+                                && slot.generation.load(Ordering::Acquire) == generation
+                                && slot.successes.load(Ordering::Acquire) == successes
+                            {
+                                state.state = SupervisorState::NeedsAuth;
+                                state.last_error = e.to_string();
+                            }
+                        }
+                    }
                     if matches!(e, TransportError::FrameRejected(_)) {
                         // Retire every owned call without replay, including read-only
                         // calls. Concurrent failures of one stream count once.
@@ -3579,11 +3609,11 @@ impl Router {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .open_remaining(Instant::now())
             {
-                return Some(Err(format!(
+                return Some(Err(CallFailure::new(CallFailureKind::Unavailable { after_send: false }, format!(
                     "server '{}' is temporarily unavailable (too many recent failures; retrying in {}s)",
                     slot.id,
                     remaining.as_secs() + 1
-                ).into()));
+                ))));
             }
             if slot.generation.load(Ordering::Acquire) == generation {
                 eprintln!("toolport: server '{}' is down; re-spawning it", slot.id);
@@ -4117,7 +4147,10 @@ mod tests {
         use crate::downstream::HttpTransport;
         use std::io::Write;
         let _lock = crate::registry::data_dir_test_lock();
-        let scratch = std::env::temp_dir().join(format!("toolport-f1-timeout-{}", crate::approval::new_correlation_id()));
+        let scratch = std::env::temp_dir().join(format!(
+            "toolport-f1-timeout-{}",
+            crate::approval::new_correlation_id()
+        ));
         std::fs::create_dir_all(&scratch).unwrap();
         let _data = crate::registry::DataDirOverride::set(&scratch);
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
@@ -8035,6 +8068,45 @@ for line in sys.stdin:
         assert!(wait_until(|| router.has_ready_reconnects()));
         router.adopt_ready_reconnects();
         router.activate_supervisors();
+    }
+
+    #[test]
+    fn endpoint_auth_pauses_supervision_but_service_auth_keeps_endpoint_healthy() {
+        use crate::call_failure::AuthTarget;
+        for target in [
+            AuthTarget::Endpoint,
+            AuthTarget::OAuthRefresh,
+            AuthTarget::ServiceCredential,
+            AuthTarget::Scope,
+        ] {
+            let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
+            router.servers[0].start(true);
+            ready_supervisor(&mut router);
+            let kind = CallFailureKind::Auth { target };
+            let result: Result<Value, CallFailure> = router.call_with_retry_typed(
+                &router.servers[0],
+                None,
+                false,
+                ReplayPolicy::NoAmbiguousReplay,
+                SlotAccess::Shared,
+                |_| Err(TransportError::Classified(kind.clone(), "opaque".into())),
+            );
+            assert_eq!(result.unwrap_err().kind, kind);
+            let endpoint_auth = matches!(target, AuthTarget::Endpoint | AuthTarget::OAuthRefresh);
+            assert_eq!(
+                router.servers[0].status().unwrap().needs_auth,
+                endpoint_auth
+            );
+            assert_eq!(router.pending_statuses().len(), usize::from(endpoint_auth));
+            assert_eq!(
+                router.servers[0]
+                    .breaker
+                    .lock()
+                    .unwrap()
+                    .consecutive_failures,
+                0
+            );
+        }
     }
 
     #[test]

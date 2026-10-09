@@ -14412,6 +14412,58 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn http_deadline_before_send_does_not_claim_uncertain_completion_or_send_late() {
+        use super::*;
+        let _lock = crate::registry::data_dir_test_lock();
+        let scratch = std::env::temp_dir().join(format!(
+            "toolport-f1-before-send-{}",
+            crate::approval::new_correlation_id()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&scratch);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let (started, start) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let released = Mutex::new(released);
+        let refresh: RefreshFn = Box::new(move |_, _| {
+            started.send(()).unwrap();
+            released
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            Ok(None)
+        });
+        let transport = HttpTransport::guarded_with_timeout(
+            &format!("http://{}/", server.server_addr()),
+            None,
+            Some(refresh),
+            false,
+            Duration::from_secs(1),
+        );
+        let handle = transport.concurrent().unwrap();
+        let caller = std::thread::spawn(move || {
+            handle.request_with_cancel("tools/call", json!({"name":"write"}), None)
+        });
+        start.recv_timeout(Duration::from_secs(3)).unwrap();
+        let failure = caller.join().unwrap().unwrap_err().call_failure();
+        assert_eq!(
+            failure.kind,
+            crate::call_failure::CallFailureKind::Timeout { after_send: false }
+        );
+        release.send(()).unwrap();
+        assert!(
+            server
+                .recv_timeout(Duration::from_millis(300))
+                .unwrap()
+                .is_none(),
+            "the expired worker must not dispatch a late mutation"
+        );
+        drop(_data);
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
     fn http_read_errors_preserve_timeout_io_and_protocol_categories() {
         use super::*;
         use crate::call_failure::CallFailureKind as K;

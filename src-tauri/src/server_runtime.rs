@@ -110,20 +110,24 @@ pub fn probe_one(server: &ServerEntry) -> ProbeResult {
             auth_required: false,
             auth_target: None,
         },
-        Err(error) => ProbeResult {
-            server_id: server.id.clone(),
-            ok: false,
-            tool_count: 0,
-            auth_required: remote::is_auth_error(&error) || missing_secret(server),
-            auth_target: if missing_secret(server) {
-                Some(crate::call_failure::AuthTarget::ServiceCredential)
-            } else if remote::is_auth_error(&error) {
-                Some(crate::call_failure::AuthTarget::Endpoint)
-            } else {
-                None
-            },
-            error: Some(error),
-        },
+        Err(error) => {
+            let missing_credential = missing_secret(server);
+            let auth_rejected = remote::is_auth_error(&error);
+            ProbeResult {
+                server_id: server.id.clone(),
+                ok: false,
+                tool_count: 0,
+                auth_required: auth_rejected || missing_credential,
+                auth_target: if missing_credential || (auth_rejected && server.url.is_none()) {
+                    Some(crate::call_failure::AuthTarget::ServiceCredential)
+                } else if auth_rejected {
+                    Some(crate::call_failure::AuthTarget::Endpoint)
+                } else {
+                    None
+                },
+                error: Some(error),
+            }
+        }
     }
 }
 
