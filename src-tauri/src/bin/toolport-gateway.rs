@@ -39501,6 +39501,8 @@ mod tests {
         }
     }
 
+    include!("token_budget_tests.rs");
+
     #[test]
     fn discovery_surface_token_measurement() {
         let _env = DataDirTestEnv::new("discovery-token-cost");
