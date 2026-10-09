@@ -2423,16 +2423,19 @@ fn search_catalog_indexed(
     let requested = query.trim();
     if !requested.is_empty() {
         let named = |position: &usize| cached.get(*position);
-        let exact = pool.iter().filter_map(named).find(|tool| {
-            tool.get("name").and_then(Value::as_str) == Some(requested)
-        }).or_else(|| {
-            let mut folded = pool.iter().filter_map(named).filter(|tool| {
-                tool.get("name").and_then(Value::as_str)
-                    .is_some_and(|name| name.eq_ignore_ascii_case(requested))
+        let exact = pool
+            .iter()
+            .filter_map(named)
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some(requested))
+            .or_else(|| {
+                let mut folded = pool.iter().filter_map(named).filter(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(requested))
+                });
+                let first = folded.next()?;
+                folded.next().is_none().then_some(first)
             });
-            let first = folded.next()?;
-            folded.next().is_none().then_some(first)
-        });
         if let Some(tool) = exact {
             let mut definition = tool.clone();
             neutralize_listed_tool(&mut definition);
@@ -2594,31 +2597,31 @@ fn search_catalog_indexed(
         let total = ranked.len();
 
         let low_confidence = match ranked.first() {
-                None => true,
-                Some((top_score, _)) if used_semantic => *top_score < LOW_CONFIDENCE_HYBRID_SCORE,
-                Some((top_score, _)) => {
-                    // Normalize the raw lexical score against an ideal result where
-                    // every meaningful query token hits a tool name. Missing query
-                    // terms still contribute to the denominator, which is exactly the
-                    // weak-evidence case that should broaden.
-                    let ideal_idf: f64 = q_tokens
-                        .iter()
-                        .map(|qt| {
-                            let matched_idf = std::iter::once(qt.as_str())
-                                .chain(synonym_group(qt).iter().copied())
-                                .filter(|candidate| df.contains_key(*candidate))
-                                .map(idf)
-                                .fold(0.0_f64, f64::max);
-                            if matched_idf > 0.0 {
-                                matched_idf
-                            } else {
-                                idf(qt)
-                            }
-                        })
-                        .sum();
-                    let ideal = NAME_W * ideal_idf * (1.0 + NAME_SPECIFICITY_W);
-                    ideal <= f64::EPSILON || *top_score / ideal < LOW_CONFIDENCE_LEXICAL_RATIO
-                }
+            None => true,
+            Some((top_score, _)) if used_semantic => *top_score < LOW_CONFIDENCE_HYBRID_SCORE,
+            Some((top_score, _)) => {
+                // Normalize the raw lexical score against an ideal result where
+                // every meaningful query token hits a tool name. Missing query
+                // terms still contribute to the denominator, which is exactly the
+                // weak-evidence case that should broaden.
+                let ideal_idf: f64 = q_tokens
+                    .iter()
+                    .map(|qt| {
+                        let matched_idf = std::iter::once(qt.as_str())
+                            .chain(synonym_group(qt).iter().copied())
+                            .filter(|candidate| df.contains_key(*candidate))
+                            .map(idf)
+                            .fold(0.0_f64, f64::max);
+                        if matched_idf > 0.0 {
+                            matched_idf
+                        } else {
+                            idf(qt)
+                        }
+                    })
+                    .sum();
+                let ideal = NAME_W * ideal_idf * (1.0 + NAME_SPECIFICITY_W);
+                ideal <= f64::EPSILON || *top_score / ideal < LOW_CONFIDENCE_LEXICAL_RATIO
+            }
         };
 
         // Scoped to a server: take the top `limit`. Unscoped: cap per server so one
@@ -37343,7 +37346,10 @@ mod tests {
             "string"
         );
         assert!(hits[0].get("schemaOmitted").is_none());
-        assert_eq!(hits[0], cat[1], "exact lookup must keep the full definition");
+        assert_eq!(
+            hits[0], cat[1],
+            "exact lookup must keep the full definition"
+        );
         let index = CatalogSearchIndex::build(&cat);
         let indexed = search_catalog_indexed(
             &cat,
@@ -37382,16 +37388,23 @@ mod tests {
             let index = CatalogSearchIndex::build(&cat);
             for expected in &cat {
                 let outcome = search_catalog_indexed(
-                    &cat, expected["name"].as_str().unwrap(), None, 25, None, Some(&index),
+                    &cat,
+                    expected["name"].as_str().unwrap(),
+                    None,
+                    25,
+                    None,
+                    Some(&index),
                 );
                 assert_eq!(outcome.matches, vec![expected.clone()]);
                 assert_eq!(outcome.total, 1);
                 assert!(!outcome.low_confidence);
             }
-            let ambiguous = search_catalog_indexed(
-                &cat, &first.to_uppercase(), None, 25, None, Some(&index),
+            let ambiguous =
+                search_catalog_indexed(&cat, &first.to_uppercase(), None, 25, None, Some(&index));
+            assert_eq!(
+                ambiguous.total, 2,
+                "ambiguous folded names must keep the menu"
             );
-            assert_eq!(ambiguous.total, 2, "ambiguous folded names must keep the menu");
             assert_eq!(ambiguous.matches.len(), 2);
         }
     }
@@ -37408,12 +37421,24 @@ mod tests {
             json!({"name": "x__getItem", "description": "Get item. ".repeat(100), "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": true}, "outputSchema": {"type": "string"}}),
         ];
         let response = handle_request(
-            &host, &search_req("x__getItem"), &reg, &router, &cat, true,
-            None, &SearchGuard::default(), None, None,
-        ).unwrap();
+            &host,
+            &search_req("x__getItem"),
+            &reg,
+            &router,
+            &cat,
+            true,
+            None,
+            &SearchGuard::default(),
+            None,
+            None,
+        )
+        .unwrap();
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         let hits: Vec<Value> = serde_json::from_str(text.split_once("\n\n").unwrap().1).unwrap();
-        assert_eq!(hits, cat, "exact definition and prerequisite must both stay complete");
+        assert_eq!(
+            hits, cat,
+            "exact definition and prerequisite must both stay complete"
+        );
         assert!(text.contains("pinned prerequisite tool(s) listed first"));
         assert!(text.contains("call toolport_call_tool with name \"x__getItem\""));
     }
