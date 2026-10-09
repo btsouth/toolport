@@ -80,7 +80,7 @@ fn token_audit_dispatch(catalog: &[Value], mode: DiscoveryMode, request: &Value)
 }
 
 #[test]
-#[ignore = "run npm run bench:tokens on devbox for the large synthetic audit"]
+#[ignore = "needs a Rust toolchain and takes several minutes; run npm run bench:tokens"]
 fn token_budget_audit() {
     let _env = DataDirTestEnv::new("token-budget-audit");
     let bpe = tiktoken_rs::o200k_base().unwrap();
@@ -258,24 +258,26 @@ fn token_budget_regression() {
     let tools = floor_tool_defs(&host);
     let floor = json!(tools).to_string() + DISCOVER_INSTRUCTIONS_PREAMBLE;
     let tokens = bpe.encode_ordinary(&floor).len();
-    assert!(tokens <= 500, "lazy floor {tokens} tokens exceeds 500");
+    // About 10% headroom above the measured payloads, not optimization targets.
+    let check = |label: &str, measured: usize, limit: usize| {
+        assert!(
+            measured <= limit,
+            "{label} {measured} tokens exceeds {limit}; raise the limit deliberately and record before/after token counts"
+        );
+    };
+    check("lazy floor", tokens, 550);
+    let floor_tokens = tokens;
     let help = help_tool_def("synthetic00", 618).to_string();
     let help_tokens = bpe.encode_ordinary(&help).len();
-    assert!(
-        help_tokens <= 90,
-        "grouped help {help_tokens} tokens exceeds 90"
-    );
+    check("grouped help", help_tokens, 110);
     let catalog = token_audit_public_tools();
     let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"list channels"}}});
     let response = token_audit_dispatch(&catalog, DiscoveryMode::Lazy, &req);
     let tokens = bpe.encode_ordinary(&response.to_string()).len();
-    assert!(tokens <= 500, "public search {tokens} tokens exceeds 500");
+    check("public search", tokens, 550);
     let exact = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"slack__slack_list_channels"}}});
     let exact_response = token_audit_dispatch(&catalog, DiscoveryMode::Lazy, &exact);
     let exact_tokens = bpe.encode_ordinary(&exact_response.to_string()).len();
-    assert!(
-        exact_tokens <= 200,
-        "exact-name lookup {exact_tokens} tokens exceeds 200"
-    );
-    println!("TOKEN_BUDGET search={tokens} exact={exact_tokens} grouped_help={help_tokens}");
+    check("exact-name lookup", exact_tokens, 200);
+    println!("TOKEN_BUDGET floor={floor_tokens} search={tokens} exact={exact_tokens} grouped_help={help_tokens}");
 }

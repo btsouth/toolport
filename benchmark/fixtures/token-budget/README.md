@@ -1,6 +1,7 @@
 # Token budget fixtures
 
-Run `npm run bench:tokens` on devbox. This uses actual gateway dispatch and the
+Run `npm run bench:tokens` with a Rust toolchain; it takes several minutes.
+This uses actual gateway dispatch and the
 bundled `tiktoken-rs` `o200k_base` vocabulary, with no API calls or real client data.
 Outputs, including exact serialized payloads, go into `.verify/token-budget.json`.
 The ordinary Rust `token_budget_regression` test checks fixed OpenAI token budgets.
@@ -8,7 +9,7 @@ The ordinary Rust `token_budget_regression` test checks fixed OpenAI token budge
 `shape.json` contains only anonymous description/schema byte-size pairs from a
 read-only 1,639-tool cache snapshot on 2026-10-09. The original server counts were
 587, 357, 333, 224, 115, 15, 8. The synthetic 1,707-tool catalog scales the other
-large groups to 618, 376, 333, 236, 121, 15, 8, preserving the stated 333-tool server.
+large groups to 618, 376, 333, 236, 121, 15, 8, preserving the 333-tool group.
 No private names, descriptions, schemas, arguments, results or settings appear here.
 The generator spreads size samples deterministically and builds repeated property
 objects from public text. It approximates byte shape, not private token frequency
@@ -34,8 +35,10 @@ Claude Code or Codex sessions. Vendor framing, native search instructions,
 server instruction policies, cached billing and tool-selection behavior remain
 outside the benchmark. Full MCP wire size must not be called native model cost.
 
-Exact-name search is Toolport's describe operation. A successful top match already
-has its schema, so the separate describe round is optional. Full passthrough calls
+Exact-name search is Toolport's describe operation. Exact hits return the full
+description, inputSchema, annotations and outputSchema when present, plus pinned
+prerequisites. Fuzzy matches keep budgeted descriptions and schemas; describe a
+known name when its full definition is needed. Full passthrough calls
 can be direct; native deferral adds its own search round before direct dispatch.
 The large-result whole-fetch measurement bypasses normal page size only to total
 the stored body. Actual clients use bounded pages; projection measures one row.

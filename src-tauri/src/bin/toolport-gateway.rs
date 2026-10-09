@@ -1601,6 +1601,7 @@ fn floor_tool_defs_with_code_mode(code_mode: bool) -> Vec<Value> {
 /// meta-tool array plus the built-in `initialize` instructions, with Code Mode off.
 /// The byte guard complements the exact `o200k_base` gate in token_budget_regression;
 /// bytes alone cannot establish a token budget for JSON or non-ASCII text.
+/// The default floor goal is at most 550 o200k_base tokens, including 10% headroom.
 const META_TOOL_FLOOR_BYTE_BUDGET: usize = 2_400;
 
 /// The floor, named in the error a client gets when it calls a meta-tool that 2.0
@@ -1825,7 +1826,8 @@ fn help_tool_def(prefix: &str, tool_count: usize) -> Value {
         "name": format!("help_{prefix}"),
         "description": format!(
             "Browse {tool_count} tools on \"{prefix}\". Filter with `query`; empty lists tools. \
-             Call with toolport_call_tool. For schemaOmitted, search the exact tool name."
+             Call toolport_call_tool with `name` set to the exact name shown. \
+             For schemaOmitted, search the exact tool name."
         ),
         "inputSchema": {
             "type": "object",
@@ -2415,6 +2417,35 @@ fn search_catalog_indexed(
         .map(|(position, _)| position)
         .collect();
 
+    // A known exposed name retrieves the full definition from the scoped pool.
+    // Routing preserves case, so prefer an exact match and only fold case when
+    // there is one unambiguous candidate. Collisions stay in the fuzzy menu.
+    let requested = query.trim();
+    if !requested.is_empty() {
+        let named = |position: &usize| cached.get(*position);
+        let exact = pool.iter().filter_map(named).find(|tool| {
+            tool.get("name").and_then(Value::as_str) == Some(requested)
+        }).or_else(|| {
+            let mut folded = pool.iter().filter_map(named).filter(|tool| {
+                tool.get("name").and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(requested))
+            });
+            let first = folded.next()?;
+            folded.next().is_none().then_some(first)
+        });
+        if let Some(tool) = exact {
+            let mut definition = tool.clone();
+            neutralize_listed_tool(&mut definition);
+            return SearchOutcome {
+                matches: vec![definition],
+                total: 1,
+                low_confidence: false,
+                broadened: 0,
+                direct_returned: 1,
+            };
+        }
+    }
+
     // Select an ordered set of tool refs (ranking happens here; projection below).
     let (selected, total, low_confidence, broadened, direct_returned) = if terms.is_empty() {
         // Empty query: list the pool. With `server` set this enumerates that server.
@@ -2554,37 +2585,15 @@ fn search_catalog_indexed(
         // pure lexical (positive scores only, highest first), identical to before.
         let semantic_ranked = semantic_rerank(sem, query, &lex);
         let used_semantic = semantic_ranked.is_some();
-        let mut ranked: Vec<(f64, &Value)> = semantic_ranked.unwrap_or_else(|| {
+        let ranked: Vec<(f64, &Value)> = semantic_ranked.unwrap_or_else(|| {
             let mut s: Vec<(f64, &Value)> =
                 lex.iter().filter(|(sc, _)| *sc > 0.0).cloned().collect();
             s.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
             s
         });
-        // An agent follows schemaOmitted recovery by searching the exact exposed
-        // name it was given. Make that contract deterministic: an exact name must
-        // lead even when another tool happens to score higher on shared tokens.
-        // This also guarantees project_budgeted keeps the requested tool's schema.
-        let exact_position = ranked.iter().position(|(_, tool)| {
-            tool.get("name")
-                .and_then(Value::as_str)
-                .map(|name| name.eq_ignore_ascii_case(query.trim()))
-                .unwrap_or(false)
-        });
-        if let Some(position) = exact_position.filter(|position| *position > 0) {
-            let exact = ranked.remove(position);
-            ranked.insert(0, exact);
-        }
-        // Exact-name search retrieves a known definition, not a fuzzy menu.
-        // Keep its complete schema; the handler still adds scoped pinned prerequisites.
-        if exact_position.is_some() {
-            ranked.truncate(1);
-        }
         let total = ranked.len();
 
-        let low_confidence = if exact_position.is_some() {
-            false
-        } else {
-            match ranked.first() {
+        let low_confidence = match ranked.first() {
                 None => true,
                 Some((top_score, _)) if used_semantic => *top_score < LOW_CONFIDENCE_HYBRID_SCORE,
                 Some((top_score, _)) => {
@@ -2610,7 +2619,6 @@ fn search_catalog_indexed(
                     let ideal = NAME_W * ideal_idf * (1.0 + NAME_SPECIFICITY_W);
                     ideal <= f64::EPSILON || *top_score / ideal < LOW_CONFIDENCE_LEXICAL_RATIO
                 }
-            }
         };
 
         // Scoped to a server: take the top `limit`. Unscoped: cap per server so one
@@ -7169,7 +7177,7 @@ fn handle_request_with_cancel(
                     // overcorrected and made compliant models thrash).
                     format!(
                         "Found {total} matching tool(s){scope}. Top match: `{top}` with complete schema. \
-                         If it fits, call it with toolport_call_tool. Only search again if none match.{pin_note}{more}{schema_note}"
+                         If it fits, call toolport_call_tool with name \"{top}\". Only search again if none match.{pin_note}{more}{schema_note}"
                     )
                 };
                 let text = format!(
@@ -33523,7 +33531,8 @@ mod tests {
         assert!(
             bytes <= META_TOOL_FLOOR_BYTE_BUDGET,
             "the lazy meta-tool floor is {bytes} bytes (tools {} + instructions {}); \
-             the budget is {META_TOOL_FLOOR_BYTE_BUDGET} bytes, about 520 o200k tokens",
+             the budget is {META_TOOL_FLOOR_BYTE_BUDGET} bytes; raise the limit deliberately \
+             and record before/after byte and token counts",
             tools_json.len(),
             DISCOVER_INSTRUCTIONS_PREAMBLE.len()
         );
