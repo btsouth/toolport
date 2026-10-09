@@ -6696,7 +6696,8 @@ fn probe_status_line(probe: &crate::server_runtime::ProbeResult) -> (String, &'s
                 }
                 Some(crate::call_failure::AuthTarget::Scope) => "Service permission required",
                 Some(crate::call_failure::AuthTarget::OAuthRefresh) => "MCP OAuth refresh failed",
-                _ => "MCP endpoint auth required",
+                Some(crate::call_failure::AuthTarget::Endpoint) => "MCP endpoint auth required",
+                None => "Authentication required",
             }
             .to_string(),
             "review",
@@ -10000,7 +10001,7 @@ mod tests {
         );
         assert_eq!(
             probe_status_line(&probe(false, 0, true)),
-            ("MCP endpoint auth required".to_string(), "review")
+            ("Authentication required".to_string(), "review")
         );
         assert_eq!(
             probe_status_line(&probe(false, 0, false)),

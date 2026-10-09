@@ -3395,7 +3395,7 @@ fn recovery_hint(
         kind
     };
     let kind = tool.and_then(|tool| tool.get("inputSchema")).map_or_else(
-        || kind.clone(),
+        || kind.clone().with_schema(&Value::Null, arguments),
         |schema| kind.clone().with_schema(schema, arguments),
     );
     let read_only = tool

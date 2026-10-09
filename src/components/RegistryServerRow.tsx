@@ -117,7 +117,9 @@ export function RegistryServerRow({
           ? "Service permission required"
           : health?.authTarget === "oauth_refresh"
             ? "MCP OAuth refresh failed"
-            : "MCP endpoint auth required"
+            : health?.authTarget === "endpoint"
+              ? "MCP endpoint auth required"
+              : "Authentication required"
       : status === "connected"
         ? `Ready · ${health?.toolCount ?? 0} tool${health?.toolCount === 1 ? "" : "s"}`
         : status === "error"

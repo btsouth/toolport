@@ -14547,7 +14547,10 @@ for line in sys.stdin:
             "the delayed response must exceed the configured timeout"
         );
         let error = result.unwrap_err();
-        assert_eq!(error.call_failure().kind, crate::call_failure::CallFailureKind::Timeout { after_send: true });
+        assert_eq!(
+            error.call_failure().kind,
+            crate::call_failure::CallFailureKind::Timeout { after_send: true }
+        );
         assert!(error.is_health_failure());
         assert!(
             started.elapsed() < Duration::from_millis(800),

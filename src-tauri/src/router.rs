@@ -22,7 +22,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde_json::{json, Value};
 
-use crate::call_failure::{CallFailure, CallFailureKind};
+use crate::call_failure::{AuthTarget, CallFailure, CallFailureKind};
 use crate::downstream::{
     backoff_delay, is_implausible_shrink, CacheHint, CancelContext, DownstreamServer, MrtrRequest,
     ServerDispatch, TransportError, HTTP_MAX_RETRIES, HTTP_RETRY_CAP,
@@ -694,6 +694,7 @@ pub enum SupervisorState {
 }
 
 struct Supervisor {
+    auth_target: Option<AuthTarget>,
     state: SupervisorState,
     connect: Connect,
     backoff: ReconnectBackoff,
@@ -717,6 +718,7 @@ impl ServerSlot {
     ) -> Self {
         let mut slot = Self::new(id.clone(), DownstreamServer::stopped(id, tools), None);
         slot.supervisor = Some(Mutex::new(Supervisor {
+            auth_target: None,
             state: SupervisorState::Stopped,
             connect,
             backoff,
@@ -759,6 +761,7 @@ impl ServerSlot {
         Some(PendingStatus {
             id: self.id.clone(),
             needs_auth: state.state == SupervisorState::NeedsAuth,
+            auth_target: state.auth_target,
             connecting: state.state == SupervisorState::Starting,
             failures: state.failures,
             last_error: state.last_error.clone(),
@@ -1363,6 +1366,7 @@ impl PendingServer {
         PendingStatus {
             id: self.id.clone(),
             needs_auth: state.needs_auth,
+            auth_target: None,
             connecting: state.in_flight || state.ready.is_some(),
             failures: state.failures,
             last_error: state.last_error.clone(),
@@ -1425,6 +1429,7 @@ impl PendingServer {
 pub struct PendingStatus {
     pub id: String,
     pub needs_auth: bool,
+    pub auth_target: Option<AuthTarget>,
     /// An attempt is running, or one just connected and is joining the catalog.
     pub connecting: bool,
     pub failures: u32,
@@ -1437,7 +1442,14 @@ impl PendingStatus {
     pub fn describe(&self) -> String {
         let error = client_safe_error(&self.last_error);
         if self.needs_auth {
-            format!("MCP endpoint needs sign-in in Toolport (last error: {error})")
+            let guidance = match self.auth_target {
+                Some(AuthTarget::Endpoint) => "MCP endpoint needs sign-in in Toolport",
+                Some(AuthTarget::OAuthRefresh) => "MCP OAuth refresh failed; reconnect in Toolport",
+                Some(AuthTarget::ServiceCredential) => "service API credential required",
+                Some(AuthTarget::Scope) => "service scope or permission required",
+                None => "needs sign-in in Toolport",
+            };
+            format!("{guidance} (last error: {error})")
         } else if self.connecting {
             format!("connecting (last error: {error})")
         } else {
@@ -3296,10 +3308,12 @@ impl Router {
                         && cancel.is_some_and(CancelContext::is_cancelled)
                     {
                         CallFailureKind::Cancelled
-                    } else if slot.status().is_some_and(|status| status.needs_auth) {
-                        CallFailureKind::Auth {
-                            target: crate::call_failure::AuthTarget::Endpoint,
-                        }
+                    } else if let Some(status) = slot.status().filter(|status| status.needs_auth) {
+                        status
+                            .auth_target
+                            .map_or(CallFailureKind::Internal, |target| CallFailureKind::Auth {
+                                target,
+                            })
                     } else {
                         CallFailureKind::Unavailable { after_send: false }
                     },
@@ -3381,6 +3395,7 @@ impl Router {
                             && slot.generation.load(Ordering::Acquire) == generation
                         {
                             state.state = SupervisorState::Ready;
+                            state.auth_target = None;
                             state.last_error.clear();
                         }
                     }
@@ -3422,6 +3437,9 @@ impl Router {
                                 && slot.successes.load(Ordering::Acquire) == successes
                             {
                                 state.state = SupervisorState::NeedsAuth;
+                                if let CallFailureKind::Auth { target } = e.call_failure().kind {
+                                    state.auth_target = Some(target);
+                                }
                                 state.last_error = e.to_string();
                             }
                         }
@@ -8098,6 +8116,13 @@ for line in sys.stdin:
                 endpoint_auth
             );
             assert_eq!(router.pending_statuses().len(), usize::from(endpoint_auth));
+            if endpoint_auth {
+                assert_eq!(
+                    router.servers[0].status().unwrap().auth_target,
+                    Some(target)
+                );
+            }
+
             assert_eq!(
                 router.servers[0]
                     .breaker
