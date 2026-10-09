@@ -12361,6 +12361,13 @@ for line in sys.stdin:
         );
         let other = fixture.request("other", json!({"name":"other"}), None);
         fixture.wait_for_pending(3);
+        // Registration precedes the write. Exercise cancellation of an in-flight
+        // call, rather than racing a valid cancellation before dispatch.
+        for name in ["cancelled", "other"] {
+            fixture.wait_for_frame(name, |frame| {
+                frame["method"] == "tools/call" && frame["params"]["name"] == name
+            });
+        }
         registry.cancel("cancelled", None);
         assert!(matches!(
             cancelled.join().unwrap(),
