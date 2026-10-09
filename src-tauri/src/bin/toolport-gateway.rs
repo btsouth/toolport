@@ -7147,11 +7147,13 @@ fn handle_request_with_cancel(
                             status.id,
                             status.describe()
                         ),
-                        None if router.any_discovering(|id| {
-                            allowed.is_none_or(|set| server_in_allowed_scope(id, set))
-                        }) || router.any_publishing_first_catalog(|id| {
-                            allowed.is_none_or(|set| server_in_allowed_scope(id, set))
-                        }) =>
+                        None
+                            if server.is_none()
+                                && (router.pending_statuses().iter().any(|status| {
+                                    allowed.is_none_or(|set| server_in_allowed_scope(&status.id, set))
+                                }) || router.any_publishing_first_catalog(|id| {
+                                    allowed.is_none_or(|set| server_in_allowed_scope(id, set))
+                                })) =>
                         {
                             "Servers are still connecting. Retry or check toolport_status.".into()
                         }
