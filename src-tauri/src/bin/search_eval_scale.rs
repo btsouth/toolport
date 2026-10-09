@@ -888,6 +888,21 @@ fn search_top_schema_factoring_preserves_every_constraint_and_instance_data() {
 }
 
 #[test]
+fn search_small_repeated_schema_fragments_are_lossless() {
+    let parameter = json!({"type":"string", "example":"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0"});
+    let properties: serde_json::Map<String, Value> = (0..80)
+        .map(|i| (format!("field{i}"), parameter.clone()))
+        .collect();
+    let schema = json!({"type":"object", "properties":properties});
+    let mut compact = compact_search_schema(schema.clone());
+    assert!(
+        serde_json::to_vec(&compact).unwrap().len() < serde_json::to_vec(&schema).unwrap().len()
+    );
+    conduit_lib::router::inline_refs(&mut compact);
+    assert_eq!(compact, schema);
+}
+
+#[test]
 fn search_schema_factoring_is_lossless_on_the_public_catalog() {
     for tool in scale_catalog() {
         let schema = &tool["inputSchema"];
@@ -971,10 +986,18 @@ fn search_menu_meets_o200k_context_budget() {
     response_tokens.sort();
     menu_tokens.sort();
     let p95 = |tokens: &[usize]| tokens[((tokens.len() - 1) as f64 * 0.95).ceil() as usize];
-    // 3212 is origin/next/2.0 at 1fec712a, measured on these same 450 requests
-    // with production-normalized schemas. Menu budget allows ordinary text variation.
+    println!(
+        "TOKEN_BUDGET response_p50={} response_p95={} response_max={} menu_p95={}",
+        response_tokens[(response_tokens.len() - 1).div_ceil(2)],
+        p95(&response_tokens),
+        response_tokens.last().unwrap(),
+        p95(&menu_tokens)
+    );
+    // Never worse than base: origin/next/2.0 at 1fec712a measured p95=3212
+    // on these same 450 requests with production-normalized schemas.
+    const BASE_RESPONSE_P95_TOKENS: usize = 3212;
     assert!(
-        p95(&response_tokens) <= 3212,
+        p95(&response_tokens) <= BASE_RESPONSE_P95_TOKENS,
         "whole-response p95 {} > upstream 3212",
         p95(&response_tokens)
     );
