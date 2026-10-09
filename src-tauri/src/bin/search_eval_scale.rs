@@ -220,8 +220,11 @@ fn search_scale_measure() {
                 .1;
             let mut menu: Value = serde_json::from_str(entries).unwrap();
             for entry in menu.as_array_mut().unwrap() {
-                if let Some(row) = entry.as_array_mut() { row.truncate(3); }
-                else { entry.as_object_mut().unwrap().remove("inputSchema"); }
+                if let Some(row) = entry.as_array_mut() {
+                    row.truncate(3);
+                } else {
+                    entry.as_object_mut().unwrap().remove("inputSchema");
+                }
             }
             row["menu_tokens"] = json!(tokenizer
                 .encode_ordinary(&serde_json::to_string(&menu).unwrap())
@@ -894,4 +897,90 @@ fn search_schema_factoring_is_lossless_on_the_public_catalog() {
         }
         assert_eq!(&compact, schema, "schema changed for {}", tool["name"]);
     }
+}
+
+#[test]
+fn search_menu_meets_o200k_context_budget() {
+    let _data = DataDirTestEnv::new("search-menu-budget");
+    let tools = scale_catalog();
+    let index = CatalogSearchIndex::build(&tools);
+    let intents: Vec<Value> = serde_json::from_str(DEV_V2).unwrap();
+    let host = dispatch_host(false);
+    let reg = Registry::default();
+    let router = router();
+    let tokenizer = tiktoken_rs::o200k_base().unwrap();
+    let mut response_tokens = Vec::new();
+    let mut menu_tokens = Vec::new();
+    for intent in intents {
+        let mut arguments = json!({"query":intent["query"],"limit":1});
+        if let Some(server) = intent["server"].as_str() {
+            arguments["server"] = json!(server);
+        }
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"toolport_search_tools","arguments":arguments}});
+        let response = handle_request_with_cancel(
+            &host,
+            &request,
+            &reg,
+            &router,
+            &tools,
+            DiscoveryMode::Lazy,
+            None,
+            &SearchGuard::default(),
+            None,
+            None,
+            None,
+            None,
+            Some(&index),
+            None,
+            None,
+        )
+        .unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let mut menu: Value = serde_json::from_str(text.split_once("\n\n").unwrap().1).unwrap();
+        let rows = menu.as_array_mut().unwrap();
+        let visible = tools
+            .iter()
+            .filter(|tool| {
+                intent["server"]
+                    .as_str()
+                    .is_none_or(|server| tool_prefix(tool).contains(server))
+            })
+            .count();
+        assert_eq!(
+            rows.len(),
+            visible.min(10),
+            "search must return the fixed menu even with limit=1"
+        );
+        for (position, row) in rows.iter_mut().enumerate() {
+            let row = row.as_array_mut().unwrap();
+            assert!(row[0].is_string() && row[1].is_string() && row[2].is_array());
+            assert_eq!(row.len(), if position == 0 { 4 } else { 3 });
+            if position == 0 {
+                assert!(row[3].is_object(), "top schema must always be present");
+            }
+            row.truncate(3);
+        }
+        menu_tokens.push(
+            tokenizer
+                .encode_ordinary(&serde_json::to_string(&menu).unwrap())
+                .len(),
+        );
+        response_tokens.push(tokenizer.encode_ordinary(text).len());
+    }
+    response_tokens.sort();
+    menu_tokens.sort();
+    let p95 = |tokens: &[usize]| tokens[((tokens.len() - 1) as f64 * 0.95).ceil() as usize];
+    // 3212 is origin/next/2.0 at 1fec712a, measured on these same 450 requests
+    // with production-normalized schemas. Menu budget allows ordinary text variation.
+    assert!(
+        p95(&response_tokens) <= 3212,
+        "whole-response p95 {} > upstream 3212",
+        p95(&response_tokens)
+    );
+    assert!(
+        p95(&menu_tokens) <= 600,
+        "menu p95 {} > 600",
+        p95(&menu_tokens)
+    );
 }

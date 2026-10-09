@@ -3272,10 +3272,19 @@ fn project_search_results(tools: &[&Value], include_top_schema: bool) -> Vec<Val
             integrity::neutralize_value_strings(&mut schema);
             compact_search_schema(schema)
         })
-    } else { None };
+    } else {
+        None
+    };
     // Give descriptions room when the full schema is small. Large schemas keep
     // every constraint; their menu lines get shorter to preserve the context budget.
-    let description_limit = if top_schema.as_ref().is_some_and(|schema| worker::json_size(schema, 4096).is_none()) { 24 } else { 100 };
+    let description_limit = if top_schema
+        .as_ref()
+        .is_some_and(|schema| worker::json_size(schema, 4096).is_none())
+    {
+        24
+    } else {
+        100
+    };
     tools.iter().enumerate().map(|(i, tool)| {
         let description = tool.get("description").and_then(Value::as_str).unwrap_or("");
         let one_line = integrity::neutralize_gateway_voice(description)
@@ -7546,17 +7555,28 @@ fn handle_request_with_cancel(
                     format!("Found {total} matching tool(s){scope}. {instruction}")
                 };
                 let exact = total == 1 && top.eq_ignore_ascii_case(query.trim());
-                let menu: Vec<Vec<&Value>> = matches.iter().map(|tool| {
-                    let mut row = vec![&tool["name"], &tool["description"], &tool["requiredParams"]];
-                    if let Some(schema) = tool.get("inputSchema") { row.push(schema); }
-                    row
-                }).collect();
+                let menu: Vec<Vec<&Value>> = matches
+                    .iter()
+                    .map(|tool| {
+                        let mut row =
+                            vec![&tool["name"], &tool["description"], &tool["requiredParams"]];
+                        if let Some(schema) = tool.get("inputSchema") {
+                            row.push(schema);
+                        }
+                        row
+                    })
+                    .collect();
                 let text = format!(
                     "{lead}\n\n{}",
                     // This JSON is model input, not a human-facing log. Compact encoding
                     // preserves every field and the complete top schema while avoiding
                     // spending tokens on indentation and line breaks on every search.
-                    if exact { serde_json::to_string(&matches) } else { serde_json::to_string(&menu) }.unwrap_or_default()
+                    if exact {
+                        serde_json::to_string(&matches)
+                    } else {
+                        serde_json::to_string(&menu)
+                    }
+                    .unwrap_or_default()
                 );
                 let mut search_result = json!({ "content": [{ "type": "text", "text": text }], "isError": false, "low_confidence": low_confidence });
                 // A menu must keep every selected candidate visible. Only explicit

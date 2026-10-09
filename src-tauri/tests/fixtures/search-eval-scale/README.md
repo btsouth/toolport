@@ -28,7 +28,7 @@ TOOLPORT_SEARCH_BLIND_INTENTS=/absolute/path/new-blind-intents.json \
 The original 66-intent gate remains a regression check. The combined 408-intent
 set is an author-written historical diagnostic, with its lower scores reported;
 it no longer supplies the ranking acceptance target. The development sanity gate
-uses dev-v2 families and includes confident precision. The blind scoring slot
+uses dev-v2 recall at 3 and 10 plus no-match honesty. The blind scoring slot
 remains separate, and an absent path prints a skip notice.
 
 Top-1, top-3 and MRR use 338 resolvable requests with labelled alternatives.
@@ -76,26 +76,34 @@ self-check. No expected tool or resource family appears in both subsets.
 unseen data. Only the lead sees the blind set.
 
 The harness normalizes every input schema with production's schema compatibility
-normalizer and local reference inliner. Recall is measured at 1, 3, 5, 8, 12 and 25.
+normalizer and local reference inliner. Recall is measured at 1, 3, 5, 8, 10, 12 and 25.
 Confident precision is correct ranked #1 answers divided by all confident answers;
 confident coverage is confident answers divided by all requests. Ambiguous or
 unavailable requests marked confident count against precision. Correct #1 answers
 flagged uncertain are also counted and reported. Undefined precision is null.
-The family self-check floors were fixed before scoring: top-1 40%, top-3 55%,
-top-5 63%, top-8 68%, top-12 72%, top-25 78%, MRR 0.52, ambiguity honesty 65%,
-no-match honesty 95%. Confident precision cannot regress below round 3: 75% on
-this self-check and 30/35 on all dev-v2. Coverage is reported alongside it.
+The family self-check floors are recall at 3 >=55%, recall at 10 >=75%,
+no-match honesty >=95%, and explicit rejection precision >=90% when defined.
+These sit below development measurements and do not imply blind acceptance.
+Confidence precision is diagnostic only; it no longer gates payloads or quality.
+The menu token gate uses o200k: p95 <=600 for the menu and <=3212 for the entire
+response, matching upstream 1fec712a on these 450 normalized requests.
 
 Use `SEARCH_SCALE_SPLIT=external` and `SEARCH_SCALE_INTENTS` with an absolute
-path to measure supplied development data. Zero measures the adaptive menu;
-25 measures retrieval depth. Uncertain menus retain the bounded top schema and
-explicit uncertainty guidance. Exact-name lookup returns the complete definition.
+path to measure supplied development data. Ranking diagnostics use depth 25;
+production always returns the first 10 ranked candidates, filling a short menu
+from the visible catalog when evidence is absent. Rows carry the exposed name,
+a short description and every required parameter name. Row 1 also carries the
+complete input schema. Repeated schema fragments use local definitions without
+losing constraints or documentation; exact-name lookups preserve the original
+complete definition and existing lossless paging. Description lines allow 100
+characters with small schemas and 24 with large schemas to meet the token budget.
+The informational low_confidence flag never changes menu size or schema hydration.
+
 The `search-static` Cargo feature is default on for ordinary desktop builds.
 With `--no-default-features`, pass `--features test-support,search-static` to
 measure it on and `--features test-support` for a model-free binary.
 
-Confidence is calibrated on tuning only, with a fixed score/margin grid. It
-requires separate lexical and cosine margins when vectors are ready, and stronger
-absolute lexical evidence without them. It does not recognize providers, request
-phrases or expected labels. Confident precision and coverage are development
-measurements, not a guarantee for new catalogs or the lead's blind set.
+Low confidence reports close scores or missing query evidence. It is not a
+calibrated probability and never directs a client to trust the first candidate.
+Development measurements are not a guarantee for new catalogs or the lead's
+blind set. Live client discovery and valid dispatch are the execution target.
