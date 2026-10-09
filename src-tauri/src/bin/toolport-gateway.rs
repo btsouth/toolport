@@ -10839,16 +10839,7 @@ fn resolve_live_profile(
     client_id: Option<&str>,
     env_profile: &Option<String>,
 ) -> Option<String> {
-    let profile_ref = match client_id.and_then(|id| reg.client_scopes.get(id)) {
-        Some(p) if p.trim().is_empty() => return Some(reg.default_access_id()),
-        Some(p) => Some(p.as_str()),
-        None => env_profile.as_deref(),
-    };
-    Some(
-        profile_ref
-            .map(|profile| reg.resolve_profile_id(profile))
-            .unwrap_or_else(|| reg.default_access_id()),
-    )
+    clients::resolve_launch_profile(reg, client_id, env_profile)
 }
 
 /// The profile that actually governs a client's scope right now: a folder-scoped override

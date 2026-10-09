@@ -6,6 +6,32 @@ use std::path::Path;
 
 const MAX_PARENTS: usize = 8;
 
+#[derive(Default)]
+pub struct ParentApp(std::sync::OnceLock<Option<String>>);
+impl ParentApp {
+    pub fn resolve(&self, pid: u32) -> Option<String> {
+        self.resolve_with(|| parent_app(pid))
+    }
+    fn resolve_with(&self, read: impl FnOnce() -> Option<String>) -> Option<String> {
+        let _ = &self.0;
+        read()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Generation {
+    parent: u32,
+    started: u64,
+}
+
+fn stable_process(
+    mut generation: impl FnMut() -> Option<Generation>,
+    name: impl FnOnce() -> Option<String>,
+) -> Option<(u32, String)> {
+    let before = generation()?;
+    Some((before.parent, name()?))
+}
+
 pub fn parent_app(pid: u32) -> Option<String> {
     walk(pid, process)
 }
@@ -153,6 +179,28 @@ fn process(_: u32) -> Option<(u32, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn one_parent_walk_per_lifetime_including_failures() {
+        for result in [Some("Cursor".to_string()), None] {
+            let cached = ParentApp::default();
+            let mut walks = 0;
+            for _ in 0..20 {
+                assert_eq!(cached.resolve_with(|| { walks += 1; result.clone() }), result);
+            }
+            assert_eq!(walks, 1);
+        }
+    }
+
+    #[test]
+    fn reused_process_generation_returns_unknown() {
+        let mut reads = 0;
+        assert_eq!(stable_process(|| {
+            reads += 1;
+            Some(Generation {parent: 9, started: reads})
+        }, || Some("Cursor".into())), None);
+        assert_eq!(reads, 2);
+    }
+
     #[test]
     fn walks_launchers_and_retains_only_a_sanitized_basename() {
         let rows = [

@@ -1513,6 +1513,24 @@ pub fn trusted_client_name(client: Option<&str>, recorded_name: Option<&str>) ->
     "An AI client".to_string()
 }
 
+/// Scope-selecting identity is independent from display-only attribution.
+pub fn resolve_launch_profile(
+    reg: &crate::registry::Registry,
+    client_id: Option<&str>,
+    env_profile: &Option<String>,
+) -> Option<String> {
+    let profile_ref = match client_id.and_then(|id| reg.client_scopes.get(id)) {
+        Some(p) if p.trim().is_empty() => return Some(reg.default_access_id()),
+        Some(p) => Some(p.as_str()),
+        None => env_profile.as_deref(),
+    };
+    Some(
+        profile_ref
+            .map(|profile| reg.resolve_profile_id(profile))
+            .unwrap_or_else(|| reg.default_access_id()),
+    )
+}
+
 fn defs() -> Vec<ClientDef> {
     vec![
         ClientDef {
@@ -9600,6 +9618,64 @@ command = "npx"
         std::fs::write(&path, custom).unwrap();
         assert!(repair_secondary_claude_config(&path, current).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
+    }
+
+    #[test]
+    fn every_adapter_identity_repair_preserves_effective_tools() {
+        let data = crate::registry::DataDirTestEnv::new("f3-all-adapter-scope");
+        let mut reg: crate::registry::Registry = serde_json::from_value(serde_json::json!({
+            "version":2,
+            "servers":[{"id":"public","name":"Public","command":"fixture","transport":"stdio"},
+                       {"id":"sensitive","name":"Sensitive","command":"fixture","transport":"stdio"}],
+            "profiles":[{"id":"narrow","name":"Narrow","enabledServerIds":["public"],"toolScope":{"public":["echo"]}},
+                        {"id":"wide","name":"Wide","enabledServerIds":["public","sensitive"]}]
+        })).unwrap();
+        for def in defs() {
+            reg.client_scopes.insert(def.id.into(), "wide".into());
+            for (scope_key, scope_id, profile) in [
+                (crate::brand::CLIENT_ID, None, Some("narrow")),
+                (crate::brand::CLIENT_ID, None, None),
+                (crate::brand::CLIENT_ID_LEGACY, Some("legacy"), Some("narrow")),
+                (crate::brand::CLIENT_ID, Some("existing"), Some("narrow")),
+            ] {
+                reg.client_scopes.insert("legacy".into(), "narrow".into());
+                reg.client_scopes.insert("existing".into(), "narrow".into());
+                let path = data.dir.join("adapter-config");
+                std::fs::remove_file(&path).ok();
+                let mut entry = sample_gateway(profile, def.id);
+                entry.env.retain(|env| env.key != crate::brand::CLIENT_ID);
+                if let Some(id) = scope_id {
+                    entry.env.push(EnvVar {key:scope_key.into(), value:Some(id.into()), secret:false, unknown_fields:Default::default()});
+                }
+                edit_format(def.format, &path, Some(&entry), true).unwrap();
+                let read_env = || {
+                    let text = read_config_file(&path).unwrap();
+                    let value = mutation::value(def.format, Some(&text)).unwrap();
+                    let container = moved::server_container(def.format, &value);
+                    let entry = if matches!(def.format, Format::YamlMcpServersList) { &container[0] } else { &container[GATEWAY_ENTRY_NAME] };
+                    let key = match def.format { Format::YamlExtensions => "envs", Format::JsonOpenCodeMcp => "environment", _ => "env" };
+                    entry[key].as_object().cloned().unwrap_or_default()
+                };
+                let effective_tools = |env: &serde_json::Map<String, serde_json::Value>| {
+                    let id = [crate::brand::CLIENT_ID, crate::brand::CLIENT_ID_LEGACY].into_iter().find_map(|key| env.get(key).and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()));
+                    let profile = env.get(crate::brand::PROFILE).and_then(|v| v.as_str()).map(str::to_string);
+                    let profile = resolve_launch_profile(&reg, id, &profile).unwrap();
+                    let mut tools: Vec<_> = reg.enabled_servers_for(&profile).iter().flat_map(|server| {
+                        let allowlist = reg.access_profile(&profile).and_then(|p| p.tool_scope.get(&server.id));
+                        ["echo", "add"].into_iter().filter(move |tool| allowlist.is_none_or(|list| list.iter().any(|t| t == tool))).map(move |tool| format!("{}__{tool}", server.id))
+                    }).collect();
+                    tools.sort();
+                    tools
+                };
+                let before = read_env();
+                backfill_gateway_identity(&def, &path, GATEWAY_ENTRY_NAME, def.id).unwrap();
+                let after = read_env();
+                assert_eq!(effective_tools(&before), effective_tools(&after), "{} scope changed", def.id);
+                for key in [crate::brand::CLIENT_ID, crate::brand::CLIENT_ID_LEGACY, crate::brand::PROFILE] {
+                    assert_eq!(before.get(key), after.get(key), "{} {key} changed", def.id);
+                }
+            }
+        }
     }
 
     #[test]
