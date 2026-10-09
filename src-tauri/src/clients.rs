@@ -9698,6 +9698,46 @@ command = "npx"
     }
 
     #[test]
+    fn stale_repair_preserves_scope_environment_over_inherited_values() {
+        let data = crate::registry::DataDirTestEnv::new("f3-inherited-scope");
+        let path = data.dir.join("client.json");
+        for env in [
+            serde_json::json!({"TOOLPORT_CLIENT_ID":"", "TOOLPORT_PROFILE":"narrow"}),
+            serde_json::json!({"CONDUIT_CLIENT_ID":"legacy", "TOOLPORT_PROFILE":"narrow"}),
+            serde_json::json!({"TOOLPORT_PROFILE":"", "CONDUIT_PROFILE":""}),
+        ] {
+            let raw = serde_json::json!({"mcpServers":{"toolport":{"command":"conduit-gateway", "env":env}}});
+            std::fs::write(&path, raw.to_string()).unwrap();
+            let repaired = repair_gateway_entry(
+                Format::JsonMcpServers, &path, GATEWAY_ENTRY_NAME, "claude-code",
+            ).unwrap();
+            let after: std::collections::HashMap<_, _> = repaired.env.iter()
+                .map(|item| (item.key.as_str(), item.value.as_deref().unwrap_or("")))
+                .collect();
+            // Explicit empty values mask inherited values. Legacy values must
+            // keep their precedence relative to inherited modern values.
+            let resolve = |lookup: &dyn Fn(&str) -> Option<String>| {
+                [crate::brand::CLIENT_ID, crate::brand::CLIENT_ID_LEGACY,
+                 crate::brand::PROFILE, crate::brand::PROFILE_LEGACY]
+                    .chunks(2)
+                    .map(|keys| keys.iter().find_map(|key| lookup(key)
+                        .filter(|value| !value.trim().is_empty())))
+                    .collect::<Vec<_>>()
+            };
+            let inherited = |key: &str| match key {
+                crate::brand::CLIENT_ID => Some("wide-client".to_string()),
+                crate::brand::PROFILE => Some("wide-profile".to_string()),
+                _ => None,
+            };
+            let before = resolve(&|key| env.get(key).and_then(|v| v.as_str())
+                .map(str::to_string).or_else(|| inherited(key)));
+            let after = resolve(&|key| after.get(key).map(|v| (*v).to_string())
+                .or_else(|| inherited(key)));
+            assert_eq!(before, after, "scope environment changed: {env}");
+        }
+    }
+
+    #[test]
     fn every_adapter_identity_repair_preserves_effective_tools() {
         let data = crate::registry::DataDirTestEnv::new("f3-all-adapter-scope");
         let mut reg: crate::registry::Registry = serde_json::from_value(serde_json::json!({
