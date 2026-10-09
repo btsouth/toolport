@@ -8446,6 +8446,112 @@ mod tests {
 mod member_review_tests {
     use super::*;
 
+    #[test]
+    fn sync_regression_publish_preserves_disabled_servers_and_metadata() {
+        let complete = json!({"servers":[
+            {"id":"paused", "name":"Paused", "transport":"http", "url":"https://1.2.3.4/mcp",
+             "disabled":true, "note":"Keep until renewal", "future":{"owner":"ops"}},
+            {"id":"existing", "name":"Existing", "transport":"http", "url":"https://1.2.3.4/old",
+             "note":"Dashboard notes", "future":{"owner":"finance"}}
+        ], "futurePolicy":{"keep":true}});
+        let fixture = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", fixture.server_addr());
+        let stored = complete.clone();
+        let server = std::thread::spawn(move || {
+            let request = fixture.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+            let mut view = stored;
+            if !request.url().ends_with("?manage=1") {
+                view["servers"].as_array_mut().unwrap().retain(|s| s["disabled"] != true);
+                for entry in view["servers"].as_array_mut().unwrap() {
+                    entry.as_object_mut().unwrap().remove("note");
+                }
+            }
+            request.respond(tiny_http::Response::from_string(json!({"version":4,"config":view}).to_string())).unwrap();
+            let mut request = fixture.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body).unwrap();
+            request.respond(tiny_http::Response::from_string(json!({"version":5}).to_string())).unwrap();
+            serde_json::from_str::<Value>(&body).unwrap()
+        });
+        let (version, config) = fetch_config_for_update(&url, "review-team", "fixture-token").unwrap();
+        let selected = json!([
+            {"id":"new", "name":"New", "transport":"http", "url":"https://1.2.3.4/new"},
+            {"id":"existing", "name":"Edited", "transport":"http", "url":"https://1.2.3.4/edited"}
+        ]);
+        let servers = additive_server_set(&config["servers"], &selected).unwrap();
+        let config = replace_server_set(config, servers).unwrap();
+        push_config(&url, "review-team", "fixture-token", &config, version).unwrap();
+        let published = server.join().unwrap();
+        let index = server_index(&published["config"]["servers"]).unwrap();
+        assert_eq!(index.get("paused"), Some(&&complete["servers"][0]));
+        assert_eq!(index["existing"]["note"], complete["servers"][1]["note"]);
+        assert_eq!(index["existing"]["future"], complete["servers"][1]["future"]);
+        assert_eq!(index["existing"]["url"], selected[1]["url"]);
+        assert!(index.contains_key("new"));
+        assert_eq!(published["config"]["futurePolicy"], complete["futurePolicy"]);
+        assert_eq!(published["base_version"], 4);
+    }
+
+    fn bound_personal_registry() -> Registry {
+        let mut reg = registry();
+        reg.version = 3;
+        stage_team_config(&mut reg, "review-team", &config("first"), 1, &[]).unwrap();
+        decide(&mut reg, "server:remote", true);
+        let managed = reg.servers.iter().find(|s| s.id == remote_id(&reg)).unwrap().clone();
+        let mut personal = managed.clone();
+        personal.id = "remote".into();
+        personal.source = None;
+        personal.unknown_fields.remove(TEAM_ORIGINAL_ID_FIELD);
+        personal.enabled = false;
+        reg.servers.push(personal.clone());
+        crate::local_auth::bind(&mut reg, &managed, &personal).unwrap();
+        reg
+    }
+
+    #[test]
+    fn sync_regression_remote_delete_or_disable_keeps_personal_off() {
+        for role in ["admin", "member"] {
+            // A dashboard disable is absent from the runtime view, just like deletion.
+            // Also accept a full management payload without importing a disabled row.
+            let mut disabled = config("first");
+            disabled["servers"][1]["disabled"] = json!(true);
+            for removed in [json!({"servers":[]}), disabled] {
+                let mut reg = bound_personal_registry();
+                reg.team.as_mut().unwrap().role = role.into();
+                let mut other = reg.profiles[0].clone();
+                other.id = "other".into();
+                other.enabled_server_ids.push("remote".into());
+                reg.profiles.push(other);
+                stage_team_config(&mut reg, "review-team", &removed, 2, &[]).unwrap();
+                assert!(!reg.server_enabled("remote"), "role={role}");
+                assert!(reg.profiles.iter().all(|p| !p.enabled_server_ids.contains(&"remote".into())));
+                assert!(reg.servers.iter().all(|s| saved_team_original_id(s) != Some("remote")));
+                assert_eq!(reg.servers.iter().find(|s| s.id == "remote").unwrap().url.as_deref(), Some("https://1.2.3.4/mcp"));
+                stage_team_config(&mut reg, "review-team", &removed, 3, &[]).unwrap();
+                // Re-enable from the dashboard needs fresh review, with neither route running.
+                stage_team_config(&mut reg, "review-team", &config("first"), 4, &[]).unwrap();
+                let id = remote_id(&reg);
+                assert!(server_change_held(&reg, &id));
+                assert!(!reg.server_enabled(&id));
+                assert!(!reg.server_enabled("remote"));
+                decide(&mut reg, "server:remote", true);
+                assert!(reg.server_enabled(&id));
+                assert!(!reg.server_enabled("remote"));
+                // An old binding must not resurrect the revoked original when leaving later.
+                remove_team(&mut reg, "review-team");
+                assert!(!reg.server_enabled("remote"));
+            }
+        }
+    }
+
+    #[test]
+    fn sync_regression_disconnect_restores_bound_personal_route() {
+        let mut reg = bound_personal_registry();
+        remove_team(&mut reg, "review-team");
+        assert!(reg.server_enabled("remote"));
+        assert!(reg.is_enabled("default", "remote"));
+    }
+
     fn registry() -> Registry {
         let mut reg = Registry::default();
         reg.team = Some(serde_json::from_value(json!({"teamId":"review-team", "serverUrl":"https://teams.toolport.app", "role":"member"})).unwrap());
