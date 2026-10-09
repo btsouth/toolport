@@ -1,5 +1,35 @@
-//! Release freed glibc arena pages after large catalog builds. Only the gateway
-//! uses this module; desktop binaries and code-mode worker limits are unchanged.
+//! Reuse glibc response arenas and release free pages after catalog builds.
+//! Only the gateway uses this module; desktop binaries and code-mode worker
+//! limits are unchanged.
+
+pub fn configure_daemon() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    linux::configure();
+}
+
+pub(super) fn serialize(
+    response: &super::GatewayResponse,
+    sse: bool,
+) -> Result<String, serde_json::Error> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if let Some(result) = linux::serialize(response, sse) {
+        return result;
+    }
+    serialize_framed(response, sse)
+}
+
+fn serialize_framed(
+    response: &super::GatewayResponse,
+    sse: bool,
+) -> Result<String, serde_json::Error> {
+    response.to_json().map(|body| {
+        if sse {
+            super::mcp_sse_body(&body)
+        } else {
+            body
+        }
+    })
+}
 
 pub struct AfterBuild(pub usize);
 
@@ -18,8 +48,85 @@ pub fn request(tools: usize) {
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod linux {
-    use std::sync::{mpsc, OnceLock};
+    use std::sync::{mpsc, Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
+
+    use super::super::GatewayResponse;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Large replies repeatedly serialized on ephemeral HTTP threads otherwise
+    // leave resident free pages spread across their glibc arena tops.
+    const MIN_RESPONSE_BYTES: usize = 256 * 1024;
+    const SERIALIZER_WAIT: Duration = Duration::from_secs(2);
+    static DAEMON: AtomicBool = AtomicBool::new(false);
+    type WireResult = Result<String, serde_json::Error>;
+    struct SerializeJob {
+        response: GatewayResponse,
+        sse: bool,
+        reply: mpsc::SyncSender<WireResult>,
+    }
+    static SERIALIZER: OnceLock<Option<mpsc::SyncSender<SerializeJob>>> = OnceLock::new();
+
+    pub fn configure() {
+        DAEMON.store(true, Ordering::Relaxed);
+    }
+
+    fn serializer_pool() -> Option<mpsc::SyncSender<SerializeJob>> {
+        let (sender, receiver) = mpsc::sync_channel::<SerializeJob>(8);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut started = false;
+        for index in 0..2 {
+            let receiver = Arc::clone(&receiver);
+            started |= std::thread::Builder::new()
+                .name(format!("gateway-wire-{index}"))
+                .spawn(move || loop {
+                    let job = match receiver.lock() {
+                        Ok(receiver) => receiver.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok(job) = job else {
+                        return;
+                    };
+                    let _ = job
+                        .reply
+                        .send(super::serialize_framed(&job.response, job.sse));
+                })
+                .is_ok();
+        }
+        started.then_some(sender)
+    }
+
+    pub(super) fn serialize(response: &GatewayResponse, sse: bool) -> Option<WireResult> {
+        if !DAEMON.load(Ordering::Relaxed)
+            || response.surface.as_ref()?.json.get().len() < MIN_RESPONSE_BYTES
+        {
+            return None;
+        }
+        let sender = SERIALIZER.get_or_init(serializer_pool).as_ref()?;
+        Some(serialize_on(sender, response, sse, SERIALIZER_WAIT))
+    }
+
+    fn serialize_on(
+        sender: &mpsc::SyncSender<SerializeJob>,
+        response: &GatewayResponse,
+        sse: bool,
+        wait: Duration,
+    ) -> WireResult {
+        let (reply, result) = mpsc::sync_channel(1);
+        let job = SerializeJob {
+            response: response.clone(),
+            sse,
+            reply,
+        };
+        // A full queue or unavailable worker keeps the synchronous path. No
+        // catalog locks are held while waiting, and the request owns a fallback.
+        if sender.try_send(job).is_ok() {
+            if let Ok(result) = result.recv_timeout(wait) {
+                return result;
+            }
+        }
+        super::serialize_framed(response, sse)
+    }
 
     const MIN_TOOLS: usize = 256;
     const DEFER: Duration = Duration::from_secs(1);
@@ -82,6 +189,100 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn surface_response() -> GatewayResponse {
+            let tools = vec![serde_json::json!({
+                "name": "fixture__lookup",
+                "description": "Quoted \"text\" and UTF-8 é\n".repeat(20_000),
+                "inputSchema": {"type":"object", "properties":{"'x-Cwd'":{"type":"string"}}}
+            })];
+            GatewayResponse {
+                envelope: serde_json::json!({
+                    "jsonrpc":"2.0", "id":"request-é", "result":{
+                        "tools":[], "_meta":{"fixture":true}, "nextCursor":"next"
+                    }
+                }),
+                surface: Some(Arc::new(conduit_lib::savings::SerializedSurface::new(
+                    &tools,
+                ))),
+            }
+        }
+
+        #[test]
+        fn serializers_preserve_wire_bytes_for_concurrent_request_envelopes() {
+            let sender = serializer_pool().unwrap();
+            let original = surface_response();
+            let mut pending = Vec::new();
+            // Eight jobs fit the bounded queue even before workers receive any.
+            for id in 0..8 {
+                let mut response = original.clone();
+                response.envelope["id"] = serde_json::json!(format!("request-{id}-é\n\""));
+                let sse = id % 2 == 1;
+                let raw = serde_json::to_string(&response).unwrap();
+                let expected = if sse {
+                    format!("event: message\ndata: {raw}\n\n")
+                } else {
+                    raw
+                };
+                let (reply, result) = mpsc::sync_channel(1);
+                assert!(sender
+                    .try_send(SerializeJob {
+                        response,
+                        sse,
+                        reply
+                    })
+                    .is_ok());
+                pending.push((result, expected));
+            }
+            for (result, expected) in pending {
+                assert_eq!(
+                    result
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap()
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn serialization_falls_back_for_full_closed_and_stalled_queues() {
+            let response = surface_response();
+            let expected = serde_json::to_string(&response).unwrap();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let (reply, _result) = mpsc::sync_channel(1);
+            sender
+                .try_send(SerializeJob {
+                    response: response.clone(),
+                    sse: false,
+                    reply,
+                })
+                .unwrap_or_else(|_| panic!("empty queue"));
+            assert_eq!(
+                serialize_on(&sender, &response, false, Duration::ZERO).unwrap(),
+                expected
+            );
+            let queued = receiver.try_recv().unwrap();
+            assert_eq!(serde_json::to_string(&queued.response).unwrap(), expected);
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            drop(receiver);
+            assert_eq!(
+                serialize_on(&sender, &response, false, Duration::ZERO).unwrap(),
+                expected
+            );
+
+            let (sender, receiver) = mpsc::sync_channel(1);
+            // An expired local wait models an unavailable worker without sleeps.
+            assert_eq!(
+                serialize_on(&sender, &response, false, Duration::ZERO).unwrap(),
+                expected
+            );
+            let queued = receiver.try_recv().unwrap();
+            assert_eq!(serde_json::to_string(&queued.response).unwrap(), expected);
+        }
 
         #[test]
         fn trim_delay_defers_first_and_idle_builds_and_limits_bursts() {
