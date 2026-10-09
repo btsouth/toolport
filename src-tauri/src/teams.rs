@@ -2532,7 +2532,15 @@ fn stage_publisher_handoffs(
         // because its Team copy is in use. Re-sharing a change must keep that route.
         let using_team_copy =
             !personal_on && crate::local_auth::bound_copy_enabled(before, &profile, id);
-        let (outcome, message) = if !personal_on && !using_team_copy {
+        // Sync may revoke this route after the share was confirmed. A stale
+        // handoff snapshot must not turn its personal original back on.
+        let removed_shared_route = using_team_copy && managed_copy_of(reg, id).is_err();
+        let (outcome, message) = if removed_shared_route {
+            (
+                HandoffOutcome::NotEnabled,
+                "Removed or disabled by the team. Your personal server stays off.".to_string(),
+            )
+        } else if !personal_on && !using_team_copy {
             (
                 HandoffOutcome::NotEnabled,
                 if predicted {
@@ -8538,7 +8546,7 @@ mod member_review_tests {
     #[test]
     fn sync_regression_editing_disabled_definition_keeps_it_disabled() {
         let mut reg = bound_personal_registry();
-        stage_team_config(&mut reg, "review-team", &json!({"servers":[]}), 2, &[]).unwrap();
+        let before = reg.clone();
         let selected = selected_export(&reg, &["remote".into()]).unwrap();
         let mut remote = selected.clone();
         remote[0]["disabled"] = json!(true);
@@ -8548,7 +8556,11 @@ mod member_review_tests {
         let preview =
             share_selections(&reg, &remote, &selected, &json!({"servers":merged})).unwrap();
         assert_eq!(preview[0].team_change, "Already shared");
-        assert_ne!(preview[0].local.outcome, HandoffOutcome::Switched);
+        assert_eq!(preview[0].local.outcome, HandoffOutcome::NotEnabled);
+        assert_eq!(
+            preview[0].local.message,
+            "Removed or disabled by the team. Your personal server stays off."
+        );
         let mut edited = selected;
         edited[0]["url"] = json!("https://1.2.3.4/edited");
         let merged = additive_server_set(&remote, &edited).unwrap();
@@ -8561,6 +8573,9 @@ mod member_review_tests {
             .servers
             .iter()
             .all(|s| s.source.as_deref() != Some("team:review-team")));
+        let handoffs = stage_publisher_handoffs(&mut reg, &before, &["remote".into()], false);
+        assert_eq!(handoffs[0].outcome, HandoffOutcome::NotEnabled);
+        assert!(!reg.server_enabled("remote"));
     }
 
     fn bound_personal_registry() -> Registry {
