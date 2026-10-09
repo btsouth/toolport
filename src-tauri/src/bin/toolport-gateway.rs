@@ -57,6 +57,7 @@ use conduit_lib::secrets;
 use conduit_lib::semantic;
 use conduit_lib::session_store::SessionStore;
 use conduit_lib::shaping;
+use conduit_lib::tool_definitions::{CatalogRef, SerializedTools, SharedTools, ToolCatalog};
 use conduit_lib::topology::LaunchKey;
 
 #[cfg(any(unix, windows))]
@@ -695,17 +696,17 @@ fn mcp_app_tool_is_model_visible(tool: &Value) -> bool {
     }
 }
 
-fn named_tool_is_model_visible(name: &str, cached: &[Value], router: &Router) -> bool {
+fn named_tool_is_model_visible(name: &str, cached: &dyn ToolCatalog, router: &Router) -> bool {
     cached
         .iter()
         .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
         .map(mcp_app_tool_is_model_visible)
         .or_else(|| {
             router
-                .aggregated_tools()
-                .into_iter()
+                .shared_tools()
+                .iter()
                 .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
-                .map(|tool| mcp_app_tool_is_model_visible(&tool))
+                .map(mcp_app_tool_is_model_visible)
         })
         .unwrap_or(true)
 }
@@ -1638,7 +1639,6 @@ fn removed_meta_tool_error(name: &str) -> String {
     )
 }
 
-
 // --- Grouped discovery mode (CONDUIT_DISCOVERY=grouped) ---
 //
 // Between `lazy` (a constant handful of meta-tools; best for a capable model that
@@ -1807,10 +1807,10 @@ fn namespaced_prefix(t: &Value) -> Option<String> {
 /// Distinct server prefixes in a catalog, in first-seen order, so the advertised
 /// `help_<server>` tools have a stable order across lists.
 #[cfg(test)]
-fn distinct_server_prefixes(catalog: &[Value]) -> Vec<String> {
+fn distinct_server_prefixes(catalog: &dyn ToolCatalog) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for t in catalog {
+    for t in catalog.iter() {
         if let Some(p) = namespaced_prefix(t) {
             if seen.insert(p.clone()) {
                 out.push(p);
@@ -1842,11 +1842,11 @@ fn help_tool_def(prefix: &str, tool_count: usize) -> Value {
 /// The tool set advertised in lazy mode: the fixed agent-facing floor, plus
 /// (in grouped mode) one `help_<server>` browse tool per server. `catalog` must
 /// already be scoped to the calling client.
-fn grouped_tool_defs(host: &HostState, catalog: &[Value]) -> Vec<Value> {
+fn grouped_tool_defs(host: &HostState, catalog: &dyn ToolCatalog) -> Vec<Value> {
     grouped_tool_defs_with_code_mode(host.code_mode_enabled(), catalog)
 }
 
-fn grouped_tool_defs_with_code_mode(code_mode: bool, catalog: &[Value]) -> Vec<Value> {
+fn grouped_tool_defs_with_code_mode(code_mode: bool, catalog: &dyn ToolCatalog) -> Vec<Value> {
     grouped_tool_defs_from_tools(code_mode, catalog.iter())
 }
 
@@ -2240,11 +2240,11 @@ struct CatalogSearchIndex {
 }
 
 impl CatalogSearchIndex {
-    fn build(tools: &[Value]) -> Self {
+    fn build(tools: &dyn ToolCatalog) -> Self {
         let mut documents = Vec::with_capacity(tools.len());
         let mut document_frequency = HashMap::new();
 
-        for tool in tools {
+        for tool in tools.iter() {
             let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
             let description = tool
                 .get("description")
@@ -2271,13 +2271,13 @@ impl CatalogSearchIndex {
         Self {
             documents,
             document_frequency,
-            catalog_address: tools.as_ptr() as usize,
-            surface_bytes: savings::surface_bytes(tools),
+            catalog_address: tools.address(),
+            surface_bytes: savings::surface_bytes(tools.iter()),
         }
     }
 
-    fn matches_catalog(&self, tools: &[Value]) -> bool {
-        self.documents.len() == tools.len() && self.catalog_address == tools.as_ptr() as usize
+    fn matches_catalog(&self, tools: &dyn ToolCatalog) -> bool {
+        self.documents.len() == tools.len() && self.catalog_address == tools.address()
     }
 
     /// Conservative auxiliary-memory estimate for regression tests and diagnostics.
@@ -2314,24 +2314,36 @@ thread_local! {
 
 #[derive(Debug)]
 struct CatalogSnapshot {
-    tools: Vec<Value>,
+    tools: SharedTools,
     search: CatalogSearchIndex,
 }
 
 impl CatalogSnapshot {
-    fn new(mut tools: Vec<Value>) -> Self {
+    fn new(tools: impl Into<SharedTools>) -> Self {
+        let mut tools = tools.into();
         #[cfg(test)]
         CATALOG_SNAPSHOT_BUILDS.with(|count| count.set(count.get() + 1));
         // Normalize both fresh and disk-cached catalogs. Without this, the first
         // tools/list after restart could replay pre-SOU-454 incidental ordering
         // until the background router build replaced it.
-        tools.sort_by(|left, right| {
-            left.get("name")
-                .and_then(Value::as_str)
-                .cmp(&right.get("name").and_then(Value::as_str))
-        });
+        tools.sort();
         let search = CatalogSearchIndex::build(&tools);
         Self { tools, search }
+    }
+
+    fn has_tool_prefix(&self, prefix: &str) -> bool {
+        // Snapshot names are sorted. Discovery checks each server on every list,
+        // so find its first possible name instead of scanning the whole catalog.
+        let index = self.tools.0.partition_point(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_none_or(|name| name < prefix)
+        });
+        self.tools
+            .get(index)
+            .and_then(|tool| tool.get("name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.starts_with(prefix))
     }
 }
 
@@ -2357,7 +2369,7 @@ type SharedCatalog = Arc<Mutex<Arc<CatalogSnapshot>>>;
 /// `search_catalog_with` so it can pass the semantic config).
 #[cfg(test)]
 fn search_catalog(
-    cached: &[Value],
+    cached: &dyn ToolCatalog,
     query: &str,
     server: Option<&str>,
     limit: usize,
@@ -2371,7 +2383,7 @@ fn search_catalog(
 /// identical to before, semantic only ever adds, never degrades.
 #[cfg(test)]
 fn search_catalog_with(
-    cached: &[Value],
+    cached: &dyn ToolCatalog,
     query: &str,
     server: Option<&str>,
     limit: usize,
@@ -2384,7 +2396,7 @@ fn search_catalog_with(
 /// fallbacks may omit `index`; in that case a temporary index is built so behavior
 /// remains identical and there is only one ranking implementation.
 fn search_catalog_indexed(
-    cached: &[Value],
+    cached: &dyn ToolCatalog,
     query: &str,
     server: Option<&str>,
     limit: usize,
@@ -2892,7 +2904,7 @@ fn with_status_notes(summary: String) -> String {
 fn enabled_summary(
     host: &HostState,
     reg: &Registry,
-    cached: &[Value],
+    cached: &dyn ToolCatalog,
     profile: Option<&str>,
     allowed: Option<&std::collections::HashSet<String>>,
 ) -> String {
@@ -2999,7 +3011,7 @@ fn enabled_summary(
         // belong to instead. An ambiguous prefix resolves to nothing and is counted for
         // neither twin, which is the same fail-closed answer scoping gives (SBS-866).
         let owners = unique_prefix_owners(reg);
-        for t in cached {
+        for t in cached.iter() {
             let prefix = tool_prefix(t);
             if prefix.is_empty() {
                 continue;
@@ -3318,7 +3330,7 @@ fn resource_stem(param: &str) -> String {
 /// teamId), tools whose name mentions it rank first. General across every
 /// server; only the gateway can do this because it holds the whole catalog.
 fn source_tool_hints(
-    catalog: &[Value],
+    catalog: &dyn ToolCatalog,
     server: &str,
     resource: Option<&str>,
     max: usize,
@@ -3351,7 +3363,7 @@ fn source_tool_hints(
 
 /// A one-line recovery hint naming sibling list/get tools, appended when a call
 /// fails so the model can source a missing/invalid identifier and retry.
-fn recovery_hint(catalog: &[Value], server: &str) -> String {
+fn recovery_hint(catalog: &dyn ToolCatalog, server: &str) -> String {
     let hints = source_tool_hints(catalog, server, None, 3);
     if hints.is_empty() {
         String::new()
@@ -3373,9 +3385,9 @@ fn server_of_tool(name: &str) -> &str {
 }
 
 /// Count a flat aggregated catalog by owning server.
-fn tools_per_server(tools: &[Value]) -> HashMap<String, usize> {
+fn tools_per_server(tools: &dyn ToolCatalog) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for tool in tools {
+    for tool in tools.iter() {
         if let Some(name) = tool.get("name").and_then(Value::as_str) {
             *counts.entry(server_of_tool(name).to_string()).or_default() += 1;
         }
@@ -3403,10 +3415,11 @@ fn tools_per_server(tools: &[Value]) -> HashMap<String, usize> {
 /// exactly as [`conduit_lib::downstream::apply_catalog_refresh`] does on the refresh path.
 /// The caller owns `streaks` (the host's map); tests drive this with their own.
 fn preserve_collapsed_servers(
-    new_tools: Vec<Value>,
-    previous: &[Value],
+    new_tools: impl Into<SharedTools>,
+    previous: &dyn ToolCatalog,
     streaks: &mut HashMap<String, u8>,
-) -> Vec<Value> {
+) -> SharedTools {
+    let new_tools = new_tools.into();
     if previous.is_empty() {
         return new_tools;
     }
@@ -3443,14 +3456,17 @@ fn preserve_collapsed_servers(
     if collapsed.is_empty() {
         return new_tools;
     }
-    let mut guarded: Vec<Value> = new_tools
-        .into_iter()
-        .filter(|tool| {
-            tool.get("name")
-                .and_then(Value::as_str)
-                .is_none_or(|name| !collapsed.iter().any(|s| s == server_of_tool(name)))
-        })
-        .collect();
+    let mut guarded = SharedTools(
+        new_tools
+            .0
+            .into_iter()
+            .filter(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_none_or(|name| !collapsed.iter().any(|s| s == server_of_tool(name)))
+            })
+            .collect(),
+    );
     for server in &collapsed {
         glog(&format!(
             "toolport: server '{}' rebuilt with {} tool(s) but was {}; keeping the previous catalog for it ({}/{})",
@@ -3460,16 +3476,13 @@ fn preserve_collapsed_servers(
             streaks.get(server).copied().unwrap_or(0),
             conduit_lib::downstream::EMPTY_CATALOG_CONFIRMATIONS,
         ));
-        guarded.extend(
-            previous
-                .iter()
-                .filter(|tool| {
-                    tool.get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| server_of_tool(name) == server.as_str())
-                })
-                .cloned(),
-        );
+        guarded
+            .0
+            .extend(previous.shared().0.into_iter().filter(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| server_of_tool(name) == server.as_str())
+            }));
     }
     guarded
 }
@@ -3481,8 +3494,8 @@ fn preserve_collapsed_servers(
 /// tool must not wave it through (fail-closed). A truly unknown tool fails at routing
 /// anyway, so the only effect is that a genuinely-destructive-but-uncached tool is never
 /// silently ungated.
-fn tool_is_destructive_fail_closed(name: &str, cached: &[Value], router: &Router) -> bool {
-    let lookup = |tools: &[Value]| {
+fn tool_is_destructive_fail_closed(name: &str, cached: &dyn ToolCatalog, router: &Router) -> bool {
+    let lookup = |tools: &dyn ToolCatalog| {
         tools
             .iter()
             .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
@@ -3491,14 +3504,14 @@ fn tool_is_destructive_fail_closed(name: &str, cached: &[Value], router: &Router
     if let Some(d) = lookup(cached) {
         return d;
     }
-    if let Some(d) = lookup(&router.aggregated_tools()) {
+    if let Some(d) = lookup(&router.shared_tools()) {
         return d;
     }
     true
 }
 
-fn tool_fingerprint_for(name: &str, cached: &[Value], router: &Router) -> Option<String> {
-    let lookup = |tools: &[Value]| {
+fn tool_fingerprint_for(name: &str, cached: &dyn ToolCatalog, router: &Router) -> Option<String> {
+    let lookup = |tools: &dyn ToolCatalog| {
         tools
             .iter()
             .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
@@ -3508,7 +3521,7 @@ fn tool_fingerprint_for(name: &str, cached: &[Value], router: &Router) -> Option
     // tool re-prompts instead of matching an approval bound to its stale cached
     // form. `cached` is only a cold-start fallback before downstream servers
     // connect and the router has nothing to aggregate yet.
-    lookup(&router.aggregated_tools()).or_else(|| lookup(cached))
+    lookup(&router.shared_tools()).or_else(|| lookup(cached))
 }
 
 /// Keep only tools a scoped client may see. `None` = no scoping (every tool passes).
@@ -3523,7 +3536,7 @@ fn tool_fingerprint_for(name: &str, cached: &[Value], router: &Router) -> Option
 /// every scoped client. A name `route_of` cannot attribute is dropped unless it is a
 /// known gateway meta-tool: fail closed rather than guess an owner.
 fn scope_tools(
-    tools: &[Value],
+    tools: &dyn ToolCatalog,
     allowed: Option<&std::collections::HashSet<String>>,
     route_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<Value> {
@@ -3542,12 +3555,48 @@ fn scope_tools(
     }
 }
 
+fn scope_shared_tools(
+    tools: &dyn ToolCatalog,
+    allowed: Option<&HashSet<String>>,
+    route_of: impl Fn(&str) -> Option<String>,
+) -> SharedTools {
+    let mut tools = tools.shared();
+    if let Some(set) = allowed {
+        tools.retain(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| tool_in_scope(name, set, &route_of))
+        });
+    }
+    tools
+}
+
+fn scoped_catalog_digests(
+    tools: &dyn ToolCatalog,
+    allowed: Option<&HashSet<String>>,
+    route_of: impl Fn(&str) -> Option<String>,
+) -> Vec<[u8; 32]> {
+    let tools = tools.shared();
+    tools
+        .0
+        .iter()
+        .filter(|tool| {
+            allowed.is_none_or(|set| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| tool_in_scope(name, set, &route_of))
+            })
+        })
+        .map(|tool| tool.digest)
+        .collect()
+}
+
 /// UI-linked tools are part of MCP Apps discovery, not ordinary model-context
 /// discovery. An Apps-capable host must receive their `_meta.ui.resourceUri`
 /// even when Toolport is otherwise in lazy/grouped mode; hosts then apply the
 /// extension's model/app visibility rules themselves.
 fn mcp_app_tools_for_client(
-    catalog: &[Value],
+    catalog: &dyn ToolCatalog,
     allowed: Option<&std::collections::HashSet<String>>,
     router: &Router,
     reg: &Registry,
@@ -3911,7 +3960,7 @@ fn content_binding_decision(
 /// - the live definition fingerprint no longer matches what was approved (or is gone), or
 /// - the live router now blocks the exposed tool (quarantine / policy).
 ///
-/// Fingerprints are taken **only** from `live.aggregated_tools()` — never the request
+/// Fingerprints are taken **only** from `live.shared_tools()` — never the request
 /// cache. A cache fallback would treat a tool removed (or quarantined out of the live
 /// aggregation) as still present and miss `StaleState`.
 ///
@@ -3935,7 +3984,7 @@ fn post_hitl_revalidation(
         None => {}
     }
     let live_fp = live
-        .aggregated_tools()
+        .shared_tools()
         .iter()
         .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
         .map(integrity::fingerprint);
@@ -4176,7 +4225,7 @@ impl RoutedCallProfiler {
 fn execute_call(
     reg: &Registry,
     router: &Router,
-    cached: &[Value],
+    cached: &dyn ToolCatalog,
     client: Option<&str>,
     client_name: Option<&str>,
     allowed: Option<&std::collections::HashSet<String>>,
@@ -4222,8 +4271,11 @@ fn execute_call(
         }
     }
     let router = fresh.as_deref().unwrap_or(router);
-    let fresh_catalog = fresh.as_ref().map(|view| view.aggregated_tools());
-    let cached = fresh_catalog.as_deref().unwrap_or(cached);
+    let fresh_catalog = fresh.as_ref().map(|view| view.shared_tools());
+    let cached = fresh_catalog
+        .as_ref()
+        .map(|tools| tools as &dyn ToolCatalog)
+        .unwrap_or(cached);
     let mut confirmed = false;
     let shape = opts.shape;
     if !opts.allow_app_only && !named_tool_is_model_visible(name, cached, router) {
@@ -5531,7 +5583,7 @@ struct Defended {
 /// are dropped either way: they cannot become `servers.*` stubs and must not appear
 /// in `listTools` as if they were catalog entries.
 fn script_catalog_tools(
-    cached: &[Value],
+    cached: &dyn ToolCatalog,
     allowed: Option<&std::collections::HashSet<String>>,
     route_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
@@ -5598,7 +5650,7 @@ fn validate_script(
     script: &str,
     input: codemode::ScriptInput,
     limits: codemode::Limits,
-    cached: &[Value],
+    cached: &dyn ToolCatalog,
     allowed: Option<&std::collections::HashSet<String>>,
     route_of: impl Fn(&str) -> Option<String>,
 ) -> ScriptValidation {
@@ -5738,7 +5790,7 @@ fn render_script_validation(validation: ScriptValidation, client: Option<&str>) 
 fn validate_script_dispatch(
     script: &str,
     input: codemode::ScriptInput,
-    cached: &[Value],
+    cached: &dyn ToolCatalog,
     allowed: Option<&std::collections::HashSet<String>>,
     client: Option<&str>,
     route_of: impl Fn(&str) -> Option<String>,
@@ -5768,7 +5820,7 @@ fn validate_script_dispatch(
 fn run_script_dispatch(
     reg: &Registry,
     router_arc: Option<&Arc<Router>>,
-    cached: &[Value],
+    cached: &dyn ToolCatalog,
     client: Option<&str>,
     client_name: Option<&str>,
     allowed: Option<&std::collections::HashSet<String>>,
@@ -5883,7 +5935,7 @@ fn run_script_dispatch(
 fn execute_script_dispatch(
     reg: &Registry,
     router_arc: &Arc<Router>,
-    cached: &[Value],
+    cached: &dyn ToolCatalog,
     client: Option<&str>,
     client_name: Option<&str>,
     allowed: Option<&std::collections::HashSet<String>>,
@@ -6213,7 +6265,7 @@ fn handle_request(
     req: &Value,
     reg: &Registry,
     router: &Router,
-    cached: &[Value],
+    cached: &dyn ToolCatalog,
     lazy: bool,
     profile: Option<&str>,
     guard: &SearchGuard,
@@ -6533,8 +6585,8 @@ fn build_tool_surfaces(
 ) -> ToolSurfaces {
     let live;
     let catalog = if snapshot.tools.is_empty() {
-        live = router.aggregated_tools();
-        live.as_slice()
+        live = router.shared_tools();
+        &live as &dyn ToolCatalog
     } else {
         &snapshot.tools
     };
@@ -6617,7 +6669,7 @@ fn build_tool_surfaces(
 
 /// Check coldness without cloning a potentially multi-megabyte tool catalog.
 fn has_scoped_tools(
-    tools: &[Value],
+    tools: &dyn ToolCatalog,
     allowed: Option<&HashSet<String>>,
     router: &Router,
     reg: &Registry,
@@ -6642,7 +6694,7 @@ fn tool_surface(
     host: &HostState,
     reg: &Registry,
     router: &Router,
-    catalog: &[Value],
+    catalog: &dyn ToolCatalog,
     allowed: Option<&std::collections::HashSet<String>>,
     mode: DiscoveryMode,
 ) -> Vec<Value> {
@@ -6660,7 +6712,7 @@ fn tool_surface_with_code_mode(
     code_mode: bool,
     reg: &Registry,
     router: &Router,
-    catalog: &[Value],
+    catalog: &dyn ToolCatalog,
     allowed: Option<&std::collections::HashSet<String>>,
     mode: DiscoveryMode,
 ) -> Vec<Value> {
@@ -6708,7 +6760,7 @@ fn handle_request_with_cancel(
     req: &Value,
     reg: &Registry,
     router: &Router,
-    cached: &[Value],
+    cached: &dyn ToolCatalog,
     mode: DiscoveryMode,
     profile: Option<&str>,
     guard: &SearchGuard,
@@ -6812,9 +6864,9 @@ fn handle_request_with_cancel(
             // The same policy-filtered catalog and surface builder serve the real
             // response and the hypothetical full-mode baseline for this client.
             let catalog = if cached.is_empty() {
-                router.aggregated_tools()
+                router.shared_tools()
             } else {
-                drop_blocked_from_cache(cached.to_vec(), router, reg)
+                drop_blocked_from_cache(cached.shared(), router, reg)
             };
             let tools = tool_surface(host, reg, router, &catalog, allowed, mode);
             if mode != DiscoveryMode::Full {
@@ -6950,8 +7002,8 @@ fn handle_request_with_cancel(
                 // Prefer the cached catalog (instant); on a cold cache fall back to
                 // the live router so a first-time search doesn't return 0 results.
                 let live;
-                let base: &[Value] = if cached.is_empty() {
-                    live = router.aggregated_tools();
+                let base: &dyn ToolCatalog = if cached.is_empty() {
+                    live = router.shared_tools();
                     &live
                 } else {
                     cached
@@ -6961,12 +7013,12 @@ fn handle_request_with_cancel(
                 // host. Such tools are exposed separately for the host/view.
                 let model_visible;
                 let base = if base.iter().any(|tool| !mcp_app_tool_is_model_visible(tool)) {
-                    model_visible = base
-                        .iter()
-                        .filter(|tool| mcp_app_tool_is_model_visible(tool))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    model_visible.as_slice()
+                    model_visible = {
+                        let mut visible = base.shared();
+                        visible.retain(mcp_app_tool_is_model_visible);
+                        visible
+                    };
+                    &model_visible
                 } else {
                     base
                 };
@@ -6974,7 +7026,7 @@ fn handle_request_with_cancel(
                 // Scoped HTTP callers still get a fail-closed filtered copy and a
                 // temporary index built only from that visible subset.
                 let scoped;
-                let (source, source_index): (&[Value], Option<&CatalogSearchIndex>) =
+                let (source, source_index): (&dyn ToolCatalog, Option<&CatalogSearchIndex>) =
                     if allowed.is_none() {
                         (
                             base,
@@ -6982,7 +7034,7 @@ fn handle_request_with_cancel(
                         )
                     } else {
                         let owners = unique_prefix_owners(reg);
-                        scoped = scope_tools(base, allowed, |n| {
+                        scoped = scope_shared_tools(base, allowed, |n| {
                             owner_of_exposed_tool(Some(router), &owners, n)
                         });
                         (&scoped, None)
@@ -7235,7 +7287,10 @@ fn handle_request_with_cancel(
                 let matched_schema_bytes = savings::surface_bytes(&matches);
                 let catalog_schema_bytes = source_index
                     .filter(|index| index.matches_catalog(source))
-                    .map_or_else(|| savings::surface_bytes(source), |index| index.surface_bytes);
+                    .map_or_else(
+                        || savings::surface_bytes(source.iter()),
+                        |index| index.surface_bytes,
+                    );
                 if mode != DiscoveryMode::Full {
                     savings::record_discovery(&text, matched_schema_bytes);
                 }
@@ -8543,12 +8598,12 @@ fn notify_tools_changed(
 fn notify_tools_changed_for_catalog_diff(
     stdio: &SessionState,
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
-    previous: &[Value],
-    current: &[Value],
+    previous: &dyn ToolCatalog,
+    current: &dyn ToolCatalog,
     previous_router: &Router,
     current_router: &Router,
     reg: &Registry,
-    previous_adapter_tools: Option<&HashMap<String, Vec<Value>>>,
+    previous_adapter_tools: Option<&HashMap<String, Vec<[u8; 32]>>>,
 ) {
     notify_list_changed(stdio, None, "notifications/tools/list_changed");
     let Some(sessions) = mcp_sessions else {
@@ -8570,10 +8625,10 @@ fn notify_tools_changed_for_catalog_diff(
         let owner = session.owner.clone();
         let changed = *changed_by_scope.entry(owner.clone()).or_insert_with(|| {
             let Some(owner) = owner else {
-                return previous != current;
+                return previous.digests() != current.digests();
             };
             let Some(scope) = owner.scope else {
-                return previous != current;
+                return previous.digests() != current.digests();
             };
             let allowed: std::collections::HashSet<String> = scope.into_iter().collect();
             if let (Some(profile), Some(prior_tool_scope)) =
@@ -8592,20 +8647,23 @@ fn notify_tools_changed_for_catalog_diff(
                     .cloned()
                     .unwrap_or_else(|| {
                         let before_router = previous_router.with_tool_allow(prior_allow);
-                        scope_tools(&before_router.aggregated_tools(), Some(&allowed), |name| {
-                            owner_of_exposed_tool(Some(&before_router), &owners, name)
-                        })
+                        scoped_catalog_digests(
+                            &before_router.shared_tools(),
+                            Some(&allowed),
+                            |name| owner_of_exposed_tool(Some(&before_router), &owners, name),
+                        )
                     });
                 let after_router = current_router.with_tool_allow(current_allow);
-                let after = scope_tools(&after_router.aggregated_tools(), Some(&allowed), |name| {
-                    owner_of_exposed_tool(Some(&after_router), &owners, name)
-                });
+                let after =
+                    scoped_catalog_digests(&after_router.shared_tools(), Some(&allowed), |name| {
+                        owner_of_exposed_tool(Some(&after_router), &owners, name)
+                    });
                 return before != after;
             }
-            let before = scope_tools(previous, Some(&allowed), |name| {
+            let before = scoped_catalog_digests(previous, Some(&allowed), |name| {
                 owner_of_exposed_tool(Some(previous_router), &owners, name)
             });
-            let after = scope_tools(current, Some(&allowed), |name| {
+            let after = scoped_catalog_digests(current, Some(&allowed), |name| {
                 owner_of_exposed_tool(Some(current_router), &owners, name)
             });
             before != after
@@ -9638,8 +9696,9 @@ type IntegrityCheckFailure = (String, BTreeSet<String>);
 /// prove the drifted definition is never published in the first place. Registered and
 /// consumed on one thread, so a parallel test's gate cannot trigger it.
 #[cfg(test)]
-static INTEGRITY_GATE_OBSERVER: Mutex<Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>> =
-    Mutex::new(None);
+static INTEGRITY_GATE_OBSERVER: Mutex<
+    Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>,
+> = Mutex::new(None);
 
 #[cfg(test)]
 fn observe_integrity_gate() {
@@ -9655,7 +9714,7 @@ fn observe_integrity_gate() {
 
 fn maybe_check_integrity(
     registry: &Arc<Mutex<Registry>>,
-    tools: &[Value],
+    tools: &dyn ToolCatalog,
     profile: Option<&str>,
 ) -> Result<Option<BTreeSet<String>>, IntegrityCheckFailure> {
     let (blocking, quarantine_on) = {
@@ -9733,9 +9792,10 @@ fn maybe_check_integrity(
 fn requarantine_if_needed(
     registry: &Arc<Mutex<Registry>>,
     built: &mut Router,
-    tools: Vec<Value>,
+    tools: impl Into<SharedTools>,
     profile: Option<&str>,
-) -> Vec<Value> {
+) -> SharedTools {
+    let tools = tools.into();
     match maybe_check_integrity(registry, &tools, profile) {
         Ok(Some(pending)) => {
             requarantine_after_integrity_change(built, pending, integrity::quarantined(profile))
@@ -9761,14 +9821,14 @@ fn requarantine_if_needed(
 /// `ready` gate (watcher, self-heal, reconnect, `${ROOT}`) therefore can never observe
 /// a not-yet-quarantined definition, even for the instant the gate's file I/O takes: the
 /// slot only ever receives the already-filtered catalogue. Callers must persist the
-/// RETURNED catalog rather than the one from `built.aggregated_tools()`.
+/// RETURNED catalog rather than the one from `built.shared_tools()`.
 fn publish_built_router(
     registry: &Arc<Mutex<Registry>>,
     router: &Arc<Mutex<Arc<Router>>>,
     mut built: Router,
     profile: Option<&str>,
-) -> Vec<Value> {
-    let tools = built.aggregated_tools();
+) -> SharedTools {
+    let tools = built.shared_tools();
     let tools = requarantine_if_needed(registry, &mut built, tools, profile);
     let mut live = router
         .lock()
@@ -9783,7 +9843,7 @@ fn requarantine_after_integrity_change(
     router: &mut Router,
     pending: BTreeSet<String>,
     persisted: Result<BTreeSet<String>, String>,
-) -> Vec<Value> {
+) -> SharedTools {
     // Only a successful read is allowed to lift a fail-closed catalog (SBS-871).
     let store_read_ok = persisted.is_ok();
     let mut enforce = match persisted {
@@ -9807,14 +9867,14 @@ fn requarantine_after_integrity_change(
         // Store still unreadable: install the union, but leave any fail-closed hide up.
         router.requarantine(enforce);
     }
-    router.aggregated_tools()
+    router.shared_tools()
 }
 
 fn fail_closed_integrity_catalog(
     router: &mut Router,
     profile: Option<&str>,
     pending: BTreeSet<String>,
-) -> Vec<Value> {
+) -> SharedTools {
     let mut fail_closed = router.quarantined().clone();
     fail_closed.extend(pending);
     // If the quarantine write succeeded but the subsequent pin write failed, the durable
@@ -9827,7 +9887,7 @@ fn fail_closed_integrity_catalog(
     // so a fail-closed catalog stays hidden. `reconcile_quarantine` lifts it on the
     // next watcher tick that actually reads the store (SBS-871).
     router.requarantine(fail_closed);
-    router.aggregated_tools()
+    router.shared_tools()
 }
 
 /// The quarantine set the router SHOULD be enforcing right now, mirroring how the
@@ -10038,24 +10098,27 @@ fn router_is_fail_closed(router: &Arc<Mutex<Arc<Router>>>) -> bool {
 /// preferred by `tools/list` for an instant answer, so a policy change (or a
 /// quarantine) otherwise keeps advertising a tool `route_call` will refuse.
 /// Blocking was always enforced; this stops the catalog disagreeing with it.
-fn drop_blocked_from_cache(catalog: Vec<Value>, router: &Router, reg: &Registry) -> Vec<Value> {
+fn drop_blocked_from_cache(
+    catalog: impl Into<SharedTools>,
+    router: &Router,
+    reg: &Registry,
+) -> SharedTools {
     // The destructive gate is evaluated straight off the tool JSON rather than
     // through `router.is_blocked`, because the cache exists precisely to answer
     // `tools/list` before the servers finish connecting, and until then the
     // router has no `blocked` entries to consult.
     let deny_destructive = reg.deny_destructive_effective();
+    let mut catalog = catalog.into();
+    catalog.retain(|tool| {
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            return true;
+        };
+        if deny_destructive && cached_tool_is_destructive(tool, name) {
+            return false;
+        }
+        !router.is_blocked(name)
+    });
     catalog
-        .into_iter()
-        .filter(|tool| {
-            let Some(name) = tool.get("name").and_then(Value::as_str) else {
-                return true;
-            };
-            if deny_destructive && cached_tool_is_destructive(tool, name) {
-                return false;
-            }
-            !router.is_blocked(name)
-        })
-        .collect()
 }
 
 /// The destructive gate, evaluated the way the router evaluates it.
@@ -10082,7 +10145,7 @@ impl HostState {
     /// Freeze every access profile before a refresh mutates the shared slots.
     /// A session can initialize during the refresh, so freezing only registered
     /// owners leaves its prior view unavailable at fanout time.
-    fn adapter_tools_before_refresh(&self, router: &Router) -> HashMap<String, Vec<Value>> {
+    fn adapter_tools_before_refresh(&self, router: &Router) -> HashMap<String, Vec<[u8; 32]>> {
         let reg = self
             .registry
             .lock()
@@ -10110,7 +10173,7 @@ impl HostState {
                 .iter()
                 .map(|server| server.id.clone())
                 .collect();
-            let tools = scope_tools(&view.aggregated_tools(), Some(&allowed), |name| {
+            let tools = scoped_catalog_digests(&view.shared_tools(), Some(&allowed), |name| {
                 owner_of_exposed_tool(Some(&view), &owners, name)
             });
             catalogs.insert(profile, tools);
@@ -10121,7 +10184,7 @@ impl HostState {
     /// Persist a rebuilt catalog and fan out `notifications/tools/list_changed`.
     fn persist_and_emit_with_sessions(
         &self,
-        tools: &[Value],
+        tools: &dyn ToolCatalog,
         cached_tools: &SharedCatalog,
         router: &Arc<Mutex<Arc<Router>>>,
         previous_router: Option<&Router>,
@@ -10129,7 +10192,7 @@ impl HostState {
         mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
         profile: Option<&str>,
         scope_diff_only: bool,
-        previous_adapter_tools: Option<&HashMap<String, Vec<Value>>>,
+        previous_adapter_tools: Option<&HashMap<String, Vec<[u8; 32]>>>,
     ) {
         let live = router
             .lock()
@@ -10142,7 +10205,6 @@ impl HostState {
             cached_tools
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .tools
                 .clone()
         });
         if router_is_fail_closed(router) {
@@ -10157,7 +10219,7 @@ impl HostState {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
-                self.preserve_collapsed_servers_guarded(tools.to_vec(), &current.tools)
+                self.preserve_collapsed_servers_guarded(tools.shared(), &current.tools)
             };
             // A guarded rebuild keeps the previous catalog for a collapsed server in
             // the cache, but the router was already published from the degraded
@@ -10172,18 +10234,18 @@ impl HostState {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 Arc::make_mut(&mut guard).adopt_restored_routes(prev, &tools);
             }
-            let next = Arc::new(CatalogSnapshot::new(tools.clone()));
+            let next = Arc::new(CatalogSnapshot::new(tools));
             let index_bytes = next.search.estimated_auxiliary_bytes();
             *cached_tools
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&next);
             gtrace(&format!(
                 "search index rebuilt: {} tools, ~{} KiB auxiliary, {:.2} ms",
-                tools.len(),
+                next.tools.len(),
                 index_bytes.div_ceil(1024),
                 started.elapsed().as_secs_f64() * 1000.0
             ));
-            save_tool_cache(&tools, profile);
+            save_tool_cache(&next.tools, profile);
         }
         if let (Some(previous), Some(previous_router)) =
             (previous_catalog.as_deref(), previous_router)
@@ -10191,7 +10253,6 @@ impl HostState {
             let current = cached_tools
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .tools
                 .clone();
             let current_router = router
                 .lock()
@@ -10205,8 +10266,8 @@ impl HostState {
             notify_tools_changed_for_catalog_diff(
                 stdio,
                 mcp_sessions,
-                previous,
-                &current,
+                &previous.tools,
+                &current.tools,
                 previous_router,
                 &current_router,
                 &reg,
@@ -10304,11 +10365,26 @@ fn save_server_catalogs(router: &Router, profile: Option<&str>) {
 }
 
 fn save_server_catalogs_for_launches(router: &Router, profile: Option<&str>, keys: &[LaunchKey]) {
-    if let (Some(path), Some(catalogs)) = (server_catalog_path(profile), router.raw_catalogs()) {
-        let catalogs: HashMap<_, _> = catalogs
+    let Some(path) = server_catalog_path(profile) else {
+        return;
+    };
+    #[derive(serde::Serialize)]
+    struct ServerCatalog {
+        spec: String,
+        tools: SerializedTools,
+    }
+    #[derive(serde::Serialize)]
+    struct Cache {
+        version: u64,
+        servers: HashMap<String, ServerCatalog>,
+    }
+    let Some(catalogs) = router.raw_catalogs() else {
+        return;
+    };
+    let raw = {
+        let servers = catalogs
             .into_iter()
             .map(|(id, tools)| {
-                // Persist only the digest: launch specs can contain literal env values.
                 let spec = keys
                     .iter()
                     .find(|key| key.server == id)
@@ -10318,21 +10394,30 @@ fn save_server_catalogs_for_launches(router: &Router, profile: Option<&str>, key
                             &router.launch_spec(&id).unwrap_or(&Value::Null).to_string(),
                         )
                     });
-                let entry = json!({"spec": spec, "tools": tools});
-                (id, entry)
+                (id, ServerCatalog { spec, tools })
             })
             .collect();
-        if let Ok(raw) =
-            serde_json::to_string(&json!({"version": TOOL_CACHE_VERSION, "servers": catalogs}))
-        {
-            let _ = registry::atomic_write(&path, &raw);
-        }
+        serde_json::to_string(&Cache {
+            version: TOOL_CACHE_VERSION,
+            servers,
+        })
+    };
+    if let Ok(raw) = raw {
+        let _ = registry::atomic_write(&path, &raw);
     }
 }
 
-fn save_tool_cache(tools: &[Value], profile: Option<&str>) {
+fn save_tool_cache(tools: &dyn ToolCatalog, profile: Option<&str>) {
     if let Some(path) = tool_cache_path(profile) {
-        let wrapped = json!({ "version": TOOL_CACHE_VERSION, "tools": tools });
+        #[derive(serde::Serialize)]
+        struct Cache<'a> {
+            version: u64,
+            tools: CatalogRef<'a>,
+        }
+        let wrapped = Cache {
+            version: TOOL_CACHE_VERSION,
+            tools: CatalogRef(tools),
+        };
         if let Ok(s) = serde_json::to_string(&wrapped) {
             // Atomic + unique temp: several gateways share this cache file, so a
             // torn or interleaved write would leave an inconsistent catalog.
@@ -10590,10 +10675,10 @@ fn adopt_reconnected_servers(
             .router
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (**guard).clone()
+        Arc::clone(&guard)
     };
     let previous_adapter_tools = host.adapter_tools_before_refresh(&previous_router);
-    let mut next = previous_router.clone();
+    let mut next = (*previous_router).clone();
     let adopted = next.adopt_ready_reconnects();
     if adopted.is_empty() {
         return;
@@ -11166,7 +11251,7 @@ fn visible_root_list(
         });
         let view = scoped.as_ref().unwrap_or(router);
         let owners = unique_prefix_owners(reg);
-        return scope_tools(&view.aggregated_tools(), allowed.as_ref(), |name| {
+        return scope_tools(&view.shared_tools(), allowed.as_ref(), |name| {
             owner_of_exposed_tool(Some(view), &owners, name)
         });
     }
@@ -11793,16 +11878,13 @@ impl HostState {
             return;
         }
         let rooted_ids: HashSet<&str> = keys.iter().map(|key| key.server.as_str()).collect();
-        let tools: Vec<Value> = view
-            .aggregated_tools()
-            .into_iter()
-            .filter(|tool| {
-                tool["name"]
-                    .as_str()
-                    .and_then(|name| view.route_of(name))
-                    .is_some_and(|(server, _)| rooted_ids.contains(server))
-            })
-            .collect();
+        let mut tools = view.shared_tools();
+        tools.retain(|tool| {
+            tool["name"]
+                .as_str()
+                .and_then(|name| view.route_of(name))
+                .is_some_and(|(server, _)| rooted_ids.contains(server))
+        });
         let pending = match maybe_check_integrity(&self.registry, &tools, Some(scope)) {
             Ok(pending) => pending.unwrap_or_default(),
             Err((error, _)) => {
@@ -12248,7 +12330,7 @@ impl HostState {
     ) -> (Arc<Router>, Arc<CatalogSnapshot>) {
         let resolved = reg.resolve_profile_id(profile);
         if !resolved.starts_with("@all-enabled:") && reg.access_profile(&resolved).is_none() {
-            let catalog = Arc::new(CatalogSnapshot::new(base.aggregated_tools()));
+            let catalog = Arc::new(CatalogSnapshot::new(base.shared_tools()));
             return (base, catalog);
         }
         let allow: HashMap<String, HashSet<String>> = adapter_tool_scope(reg, &resolved)
@@ -12275,7 +12357,7 @@ impl HostState {
             // A rebuild won after this request took its snapshot. Keep serving
             // that snapshot, but never pin its old downstream slots in the host.
             let view = Arc::new(base.with_tool_allow(allow));
-            let catalog = Arc::new(CatalogSnapshot::new(view.aggregated_tools()));
+            let catalog = Arc::new(CatalogSnapshot::new(view.shared_tools()));
             return (view, catalog);
         }
         let key = Arc::as_ptr(&base) as usize;
@@ -12295,7 +12377,7 @@ impl HostState {
             }
         }
         let router = Arc::new(base.with_tool_allow(allow.clone()));
-        let catalog = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        let catalog = Arc::new(CatalogSnapshot::new(router.shared_tools()));
         scoped.by_profile.insert(
             resolved,
             ProfileToolView {
@@ -12325,9 +12407,10 @@ impl HostState {
     /// rebuild and belong to the router it protects.
     fn preserve_collapsed_servers_guarded(
         &self,
-        new_tools: Vec<Value>,
-        previous: &[Value],
-    ) -> Vec<Value> {
+        new_tools: impl Into<SharedTools>,
+        previous: &dyn ToolCatalog,
+    ) -> SharedTools {
+        let new_tools = new_tools.into();
         let mut streaks = self
             .rebuild_shrink_streaks
             .lock()
@@ -13631,9 +13714,12 @@ fn broker_url_elicitation(
         approval::ApprovalDecision::Denied => ServerRequestAction::Respond(
             upstream_json_rpc_response(id, Ok(json!({ "action": "decline" }))),
         ),
-        approval::ApprovalDecision::Timeout | approval::ApprovalDecision::Withdrawn => ServerRequestAction::Respond(
-            upstream_json_rpc_response(id, Ok(json!({ "action": "cancel" }))),
-        ),
+        approval::ApprovalDecision::Timeout | approval::ApprovalDecision::Withdrawn => {
+            ServerRequestAction::Respond(upstream_json_rpc_response(
+                id,
+                Ok(json!({ "action": "cancel" })),
+            ))
+        }
         approval::ApprovalDecision::Unreachable | approval::ApprovalDecision::StaleState => {
             ServerRequestAction::Respond(missing_modern_client_capability(
                 id,
@@ -14220,7 +14306,7 @@ fn finish_startup_build(
 ) {
     glog(&format!(
         "background build: {} tools from {} servers",
-        built.aggregated_tools().len(),
+        built.shared_tools().len(),
         built.server_count()
     ));
     // Snapshot the pre-build router before publishing: authoritative routes for tools
@@ -14244,7 +14330,7 @@ fn finish_startup_build(
     host.invalidate_tool_scope_views();
     // Read AFTER the integrity gate: it can newly quarantine a tool or keep a
     // fail-closed catalog, so a pre-gate read would persist the wrong state.
-    let mut persisted_tools: Option<Vec<Value>> = None;
+    let mut persisted_tools: Option<SharedTools> = None;
     if router_is_fail_closed(&host.router) {
         clear_catalog_for_fail_closed(&host.cached_tools, profile);
     } else if !tools.is_empty() {
@@ -14892,13 +14978,7 @@ fn process_request_wire(
         live.discover_uncached(|id| {
             allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
                 && (discovery == DiscoveryMode::Full
-                    || !cached.tools.iter().any(|tool| {
-                        tool.get("name")
-                            .and_then(Value::as_str)
-                            .is_some_and(|name| {
-                                name.starts_with(&format!("{}__", sanitize_segment(id)))
-                            })
-                    }))
+                    || !cached.has_tool_prefix(&format!("{}__", sanitize_segment(id))))
         });
     }
 
@@ -15156,16 +15236,12 @@ fn process_request_wire(
             // when publication has not yet added this server's tools.
             let search_cache_lag = search_server.is_some_and(|server| {
                 let prefix = format!("{}__", sanitize_segment(server));
-                !cache_snapshot.tools.iter().any(|tool| {
-                    tool.get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| name.starts_with(&prefix))
-                })
+                !cache_snapshot.has_tool_prefix(&prefix)
             });
             if !daemon_adapter
                 && (cold && (method == "tools/list" || tool_search) || search_cache_lag)
             {
-                cache_snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+                cache_snapshot = Arc::new(CatalogSnapshot::new(router.shared_tools()));
             }
             // Do not wait on rebuild_lock after the deadline: a slow publisher
             // must not turn a bounded cold list into a client startup timeout.
@@ -15521,7 +15597,7 @@ fn http_tool_defs(
                 .router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .aggregated_tools()
+                .shared_tools()
         } else {
             cached.tools.clone()
         }
@@ -18376,12 +18452,7 @@ fn proxy_public_http_connection(
     }
     // The daemon detects the public caller's full socket close. Keep the write
     // side open during the relay so waiting callers do not appear abandoned.
-    let _ = relay_http_response(
-        &mut client,
-        &mut upstream,
-        Arc::new(|| {}),
-        Arc::new(|| {}),
-    );
+    let _ = relay_http_response(&mut client, &mut upstream, Arc::new(|| {}), Arc::new(|| {}));
 }
 
 /// The desktop keeps this lightweight public listener as its child. The heavy
@@ -19175,7 +19246,10 @@ fn handle_connection(
         ),
         (b"Access-Control-Allow-Headers", allow_headers.as_bytes()),
         // Browser clients need session identity and untrusted-data provenance.
-        (b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()),
+        (
+            b"Access-Control-Expose-Headers",
+            EXPOSED_HTTP_HEADERS.as_bytes(),
+        ),
     ];
     for (name, value) in cors {
         // Skip a header that won't encode rather than panicking the thread.
@@ -19454,11 +19528,13 @@ fn main() {
                         "{}",
                         serde_json::to_string(&results).expect("serializable disconnect results")
                     );
-                    conduit_lib::telemetry::exit_with(if results.iter().any(|result| result.error.is_some()) {
-                        1
-                    } else {
-                        0
-                    });
+                    conduit_lib::telemetry::exit_with(
+                        if results.iter().any(|result| result.error.is_some()) {
+                            1
+                        } else {
+                            0
+                        },
+                    );
                 }
                 Err(error) => {
                     eprintln!("toolport-gateway --disconnect-all: {error}");
@@ -22042,8 +22118,7 @@ mod tests {
         let _env = DataDirTestEnv::new("partial-cache-lazy-first-list");
         let state = http_state(false);
         let mut router = cache_router();
-        *state.cached_tools.lock().unwrap() =
-            Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        *state.cached_tools.lock().unwrap() = Arc::new(CatalogSnapshot::new(router.shared_tools()));
         let release = hanging_supervisor(&mut router, "hang");
         *state.router.lock().unwrap() = Arc::new(router);
         let started = Instant::now();
@@ -22816,8 +22891,7 @@ mod tests {
         let mut live = cache_router();
         let release = hanging_supervisor(&mut live, "hang");
         live.prepare_lazy_use("hang");
-        *state.cached_tools.lock().unwrap() =
-            Arc::new(CatalogSnapshot::new(live.aggregated_tools()));
+        *state.cached_tools.lock().unwrap() = Arc::new(CatalogSnapshot::new(live.shared_tools()));
         *state.router.lock().unwrap() = Arc::new(live);
         let started = Instant::now();
         let allowed = HashSet::from(["cache".to_string()]);
@@ -25806,7 +25880,6 @@ mod tests {
         assert!(explicit_on.code_mode);
     }
 
-
     /// A failed registry load must not advertise or run Code Mode, even when
     /// a later request snapshot contains an explicit opt-in.
     #[test]
@@ -26716,14 +26789,7 @@ mod tests {
 
         let listener_inflight = Arc::clone(&inflight);
         std::thread::spawn(move || {
-            serve_http_loop_with_inflight(
-                server,
-                state,
-                None,
-                search,
-                true,
-                listener_inflight,
-            )
+            serve_http_loop_with_inflight(server, state, None, search, true, listener_inflight)
         });
         std::thread::sleep(Duration::from_millis(50));
 
@@ -29504,7 +29570,7 @@ mod tests {
     /// The (personal, team) exposed tool names, resolved through the router rather
     /// than assumed: the second twin carries whatever de-duplication suffix the
     /// router picked.
-    fn twin_tool_names(router: &Router, cached: &[Value]) -> (String, String) {
+    fn twin_tool_names(router: &Router, cached: &dyn ToolCatalog) -> (String, String) {
         let find = |server: &str| {
             cached
                 .iter()
@@ -30267,6 +30333,182 @@ mod tests {
         }
         assert!(unrelated.outbound.lock().unwrap().is_empty());
         assert!(restricted.outbound.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn catalog_publication_notifies_only_profiles_with_digest_changes() {
+        let _env = DataDirTestEnv::new("profile-catalog-digest-publication");
+        let state = http_state(false);
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        let mut reg = Registry::default();
+        reg.servers = vec![stub_server("one", "One"), stub_server("two", "Two")];
+        for server in &mut reg.servers {
+            server.enabled = true;
+        }
+        reg.profiles = [
+            ("one", vec!["one"], HashMap::new()),
+            ("two", vec!["two"], HashMap::new()),
+            ("both", vec!["one", "two"], HashMap::new()),
+            (
+                "echo",
+                vec!["one"],
+                HashMap::from([("one".into(), vec!["echo".into()])]),
+            ),
+        ]
+        .into_iter()
+        .map(|(id, servers, tool_scope)| registry::Profile {
+            id: id.into(),
+            name: id.into(),
+            enabled_server_ids: servers.into_iter().map(str::to_string).collect(),
+            tool_scope,
+            instructions: None,
+            unknown_fields: Default::default(),
+        })
+        .collect();
+        *state.registry.lock().unwrap() = reg.clone();
+        let build = |tools: Vec<Value>| {
+            let mut router = Router::new();
+            router.add(
+                DownstreamServer::connect("one".into(), Box::new(MockRoute { tools })).unwrap(),
+            );
+            router.add(
+                DownstreamServer::connect(
+                    "two".into(),
+                    Box::new(MockRoute {
+                        tools: vec![json!({"name":"echo"})],
+                    }),
+                )
+                .unwrap(),
+            );
+            router
+        };
+        let mut tools = vec![
+            json!({"name":"echo", "description":"Echo", "inputSchema":{"type":"object"}}),
+            json!({"name":"greet", "description":"Greet", "inputSchema":{"type":"object"}}),
+        ];
+        let initial = build(tools.clone());
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(initial.shared_tools()));
+        swap_router(&state, initial);
+        let clients: Vec<_> = ["one", "two", "both", "echo"]
+            .into_iter()
+            .map(|profile| {
+                let (allowed, mut caller) =
+                    resolve_adapter_caller(&reg, profile, Some(profile), None);
+                caller.discovery = Some(DiscoveryMode::Full);
+                let sid = mint_mcp_session(&state, Some(&caller.session_owner))
+                    .unwrap_or_else(|_| panic!("mint fixture session"));
+                (profile, allowed, caller, sid)
+            })
+            .collect();
+        for (phase, expected) in [
+            ("schema", vec!["one", "both", "echo"]),
+            ("description", vec!["one", "both"]),
+            ("addition", vec!["one", "both"]),
+            ("reorder", vec![]),
+            ("unchanged", vec![]),
+        ] {
+            let previous = state.router.lock().unwrap().clone();
+            let frozen = state.host.adapter_tools_before_refresh(&previous);
+            match phase {
+                "schema" => {
+                    tools[0]["inputSchema"]["properties"] = json!({"text":{"type":"string"}})
+                }
+                "description" => tools[1]["description"] = json!("Updated greeting"),
+                "addition" => tools.push(json!({"name":"wave"})),
+                "reorder" => tools.reverse(),
+                _ => {}
+            }
+            let next = build(tools.clone());
+            let next_tools = next.shared_tools();
+            swap_router(&state, next);
+            state.host.persist_and_emit_with_sessions(
+                &next_tools,
+                &state.cached_tools,
+                &state.router,
+                Some(&previous),
+                &state.stdio_upstream,
+                Some(&state.mcp_sessions),
+                None,
+                true,
+                Some(&frozen),
+            );
+            for (profile, allowed, caller, sid) in &clients {
+                let notes = drain_session(&state, sid);
+                assert_eq!(
+                    notes.len(),
+                    usize::from(expected.contains(profile)),
+                    "{phase}: profile {profile}: {notes:?}"
+                );
+                if let Some(note) = notes.first() {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(note).unwrap()["method"],
+                        "notifications/tools/list_changed"
+                    );
+                }
+                let out = handle_http(
+                    &state,
+                    &SearchGuard::default(),
+                    "POST",
+                    "/mcp",
+                    &json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}).to_string(),
+                    Some(sid),
+                    None,
+                    allowed.as_ref(),
+                    Some(caller),
+                );
+                assert_eq!(out.status, 200, "{phase}: {}", out.body);
+                let response: Value = serde_json::from_str(&out.body).unwrap();
+                let listed = response["result"]["tools"]
+                    .as_array()
+                    .expect("profile tools/list");
+                assert!(listed.iter().any(|tool| tool["name"]
+                    == if *profile == "two" {
+                        "two__echo"
+                    } else {
+                        "one__echo"
+                    }));
+                if *profile == "echo" {
+                    assert!(!listed
+                        .iter()
+                        .any(|tool| tool["name"] == "one__greet" || tool["name"] == "one__wave"));
+                }
+                if *profile == "two" {
+                    assert!(!listed.iter().any(|tool| tool["name"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with("one__"))));
+                } else {
+                    let echo = listed
+                        .iter()
+                        .find(|tool| tool["name"] == "one__echo")
+                        .unwrap();
+                    assert_eq!(
+                        echo["inputSchema"]["properties"]["text"],
+                        json!({"type":"string"}),
+                        "{phase}: profile {profile} must read the published schema"
+                    );
+                    if *profile != "echo" {
+                        let greet = listed
+                            .iter()
+                            .find(|tool| tool["name"] == "one__greet")
+                            .unwrap();
+                        assert_eq!(
+                            greet["description"],
+                            if phase == "schema" {
+                                "Greet"
+                            } else {
+                                "Updated greeting"
+                            },
+                            "{phase}: profile {profile} must read the published description"
+                        );
+                        assert_eq!(
+                            listed.iter().any(|tool| tool["name"] == "one__wave"),
+                            matches!(phase, "addition" | "reorder" | "unchanged")
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -34056,7 +34298,8 @@ mod tests {
             )
             .unwrap();
             let full_tools = full["result"]["tools"].as_array().unwrap();
-            let has = |tools: &[Value], name: &str| tools.iter().any(|tool| tool["name"] == name);
+            let has =
+                |tools: &dyn ToolCatalog, name: &str| tools.iter().any(|tool| tool["name"] == name);
             assert!(full_tools.iter().any(|tool| tool["name"] == "alpha__work"));
             assert!(!full_tools.iter().any(|tool| tool["name"] == "beta__work"));
             assert_eq!(has(full_tools, "toolport_run_script"), code);
@@ -35762,7 +36005,11 @@ mod tests {
             (**guard).clone()
         };
 
-        fail_closed_integrity_catalog(&mut live, Some("sbs714-gateway"), set_of(&["srv__new_drift"]));
+        fail_closed_integrity_catalog(
+            &mut live,
+            Some("sbs714-gateway"),
+            set_of(&["srv__new_drift"]),
+        );
 
         assert_eq!(
             live.quarantined(),
@@ -36720,7 +36967,7 @@ mod tests {
         )
         .unwrap();
         // The next real tools/list publishes greet; the current catalog has echo.
-        growing.tools.retain(|tool| tool["name"] == "echo");
+        growing.tools.retain_names(|name| name == Some("echo"));
         router.add(growing);
         router.add(
             DownstreamServer::connect(
@@ -36731,7 +36978,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let cached = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        let cached = Arc::new(CatalogSnapshot::new(router.shared_tools()));
         let reg_path = registry::resolved_path().unwrap();
         let mut on_disk = live.clone();
         on_disk.set_client_discovery("cursor", Some("lazy"));
@@ -38594,8 +38841,9 @@ mod tests {
     #[test]
     fn search_prefers_exact_words_named_services_and_current_tools() {
         let tool = |name: &str, description: &str| json!({ "name": name, "description": description, "inputSchema": {} });
-        let top =
-            |cat: &[Value], query: &str| search_catalog(cat, query, None, 5).0[0]["name"].clone();
+        let top = |cat: &dyn ToolCatalog, query: &str| {
+            search_catalog(cat, query, None, 5).0[0]["name"].clone()
+        };
 
         // The exact verb beats a synonym, and a plural object reads as a list.
         let cat = vec![
@@ -38693,6 +38941,28 @@ mod tests {
             assert_eq!(indexed.broadened, rebuilt.broadened);
             assert_eq!(indexed.direct_returned, rebuilt.direct_returned);
         }
+    }
+
+    #[test]
+    fn cached_prefix_discovery_keeps_nested_and_overridden_names() {
+        let snapshot = CatalogSnapshot::new(vec![
+            json!({"name":"zz__read"}),
+            json!({"name":"a__b__read"}),
+            json!({"name":"a___read"}),
+            json!({"name":"renamed"}),
+            json!({"name":"aaaa__read"}),
+            json!({"name":7}),
+            json!({}),
+        ]);
+        assert!(snapshot.has_tool_prefix("a__"));
+        assert!(snapshot.has_tool_prefix("a__b__"));
+        assert!(snapshot.has_tool_prefix("a___"));
+        assert!(snapshot.has_tool_prefix("aaaa__"));
+        assert!(snapshot.has_tool_prefix("zz__"));
+        assert!(!snapshot.has_tool_prefix("aa__"));
+        assert!(!snapshot.has_tool_prefix("a__missing__"));
+        assert!(!snapshot.has_tool_prefix("renamed__"));
+        assert!(!CatalogSnapshot::default().has_tool_prefix("a__"));
     }
 
     #[test]
@@ -38819,7 +39089,7 @@ mod tests {
         let mut router = Router::new();
         router.add(server);
         let router = Arc::new(router);
-        let catalog = CatalogSnapshot::new(router.aggregated_tools());
+        let catalog = CatalogSnapshot::new(router.shared_tools());
         let host = dispatch_host(true);
         let reg = Registry::default();
         let guard = SearchGuard::default();
@@ -38907,7 +39177,7 @@ mod tests {
                 ],
             })).unwrap());
         }
-        let catalog = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        let catalog = Arc::new(CatalogSnapshot::new(router.shared_tools()));
         (reg, Arc::new(router), catalog)
     }
 
@@ -39018,8 +39288,7 @@ mod tests {
         router.add(
             DownstreamServer::connect("apps".into(), Box::new(McpAppsServer::default())).unwrap(),
         );
-        *state.cached_tools.lock().unwrap() =
-            Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        *state.cached_tools.lock().unwrap() = Arc::new(CatalogSnapshot::new(router.shared_tools()));
         *state.router.lock().unwrap() = Arc::new(router);
         for mode in [
             DiscoveryMode::Full,
@@ -39132,7 +39401,7 @@ mod tests {
         let mut router = Router::new();
         router.add_with_reconnect(connect(true), Some(Box::new(move || Some(connect(false)))));
         let router = Arc::new(router);
-        let snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        let snapshot = Arc::new(CatalogSnapshot::new(router.shared_tools()));
         *host.cached_tools.lock().unwrap() = Arc::clone(&snapshot);
         let request = modern_apps_req(1, "tools/list", json!({}));
         let _caps = UpstreamCapabilitiesGuard::enter(&request);
@@ -39250,7 +39519,7 @@ mod tests {
                 &get(&reg, &router, &snapshot, None, None, DiscoveryMode::Full)
             ));
         }
-        let mut tools = snapshot.tools.clone();
+        let mut tools = snapshot.tools.to_vec();
         tools[0]["inputSchema"]["properties"]["newField"] = json!({"type":"number"});
         let next = Arc::new(CatalogSnapshot::new(tools));
         let schema = get(&reg, &router, &next, None, None, DiscoveryMode::Full);
@@ -39547,7 +39816,7 @@ mod tests {
         drop(cache);
         let large = Arc::new(CatalogSnapshot::new((0..10_000).map(|i| json!({
             "name":format!("alpha__read_{i}"),"description":"x".repeat(2700),"inputSchema":{"type":"object"}
-        })).collect()));
+        })).collect::<Vec<_>>()));
         *host.cached_tools.lock().unwrap() = Arc::clone(&large);
         for profile in ["large-a", "large-b", "large-c"] {
             cached_tool_surfaces(
@@ -39593,7 +39862,7 @@ mod tests {
         let host = dispatch_host(false);
         let (reg, router, old) = tool_surface_fixture();
         let reg = Arc::new(reg);
-        let mut tools = old.tools.clone();
+        let mut tools = old.tools.to_vec();
         for tool in &mut tools {
             tool["description"] = json!("new generation");
         }
@@ -39673,10 +39942,13 @@ mod tests {
             "name": "new__schedule_meeting", "description": "Schedule a meeting", "inputSchema": {}
         })]);
 
-        assert_eq!(old.search.surface_bytes, savings::surface_bytes(&old.tools));
+        assert_eq!(
+            old.search.surface_bytes,
+            savings::surface_bytes(&old.tools.to_vec())
+        );
         assert_eq!(
             next.search.surface_bytes,
-            savings::surface_bytes(&next.tools)
+            savings::surface_bytes(&next.tools.to_vec())
         );
         assert!(old.search.matches_catalog(&old.tools));
         assert!(next.search.matches_catalog(&next.tools));

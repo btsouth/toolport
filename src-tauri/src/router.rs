@@ -27,6 +27,10 @@ use crate::downstream::{
     ServerDispatch, TransportError, HTTP_MAX_RETRIES, HTTP_RETRY_CAP,
 };
 use crate::registry::ToolOverride;
+use crate::tool_definitions::{
+    content_digest, SerializedTools, SharedTools, ToolCatalog, ToolDefinition, ToolPolicyMetadata,
+};
+use std::sync::Weak;
 
 const TASK_HANDLE_PREFIX: &str = "toolport-task:v1:";
 const TASK_HANDLE_NONCE_LEN: usize = 24;
@@ -487,7 +491,7 @@ impl ToolPolicy {
         exposed: &str,
         server_id: &str,
         orig: &str,
-        tool: &Value,
+        tool: ToolPolicyMetadata,
     ) -> Option<&'static str> {
         // Tool-granular profile scope: if this server is narrowed to an allow-list, a tool
         // not on it is outside this client's scope (hidden + blocked, same as disabled).
@@ -509,7 +513,7 @@ impl ToolPolicy {
         exposed: &str,
         server_id: &str,
         orig: &str,
-        tool: &Value,
+        tool: ToolPolicyMetadata,
     ) -> Option<&'static str> {
         if !self.allows_server(server_id) {
             return Some("on a server that is turned off");
@@ -521,7 +525,7 @@ impl ToolPolicy {
         {
             return Some("disabled");
         }
-        if self.deny_destructive && is_destructive(tool) {
+        if self.deny_destructive && tool.destructive {
             return Some("blocked by the destructive-tool policy");
         }
         if self.fail_closed_catalog {
@@ -582,6 +586,7 @@ struct ServerSlot {
     id: String,
     inner: Mutex<DownstreamServer>,
     tool_revision: AtomicU64,
+    definitions: Mutex<HashMap<[u8; 32], Weak<ToolDefinition>>>,
     /// Fast-fail state for a server that keeps failing (dead/hung), so we don't pay
     /// its full read timeout on every call once it's clearly down.
     breaker: Mutex<Breaker>,
@@ -616,6 +621,7 @@ impl ServerSlot {
             id,
             inner: Mutex::new(server),
             tool_revision: AtomicU64::new(0),
+            definitions: Mutex::default(),
             breaker: Mutex::new(Breaker::default()),
             reconnect,
             in_flight: InFlightLimit::default(),
@@ -1519,7 +1525,8 @@ pub struct Router {
     /// linear scan and without locking any server to read its id.
     by_id: HashMap<String, usize>,
     /// Exposed (client-facing) tools, names already sanitized, in add order.
-    tools: Vec<Value>,
+    /// All views share each immutable normalized definition.
+    tools: SharedTools,
     /// Exposed tool name -> (server id, original downstream tool name).
     routes: HashMap<String, (String, String)>,
     /// Argument aliases compiled alongside the published tool definitions.
@@ -1568,7 +1575,7 @@ pub struct Router {
 
 #[derive(Clone)]
 struct RestoredTool {
-    definition: Value,
+    definition: Arc<ToolDefinition>,
     exposed: String,
     server: String,
     original: String,
@@ -1611,7 +1618,15 @@ impl Router {
     ) -> HashMap<String, String> {
         let mut router = Self::new();
         router.set_overrides(overrides);
-        router.index_server(server_id, tools, &[], &[], &[], false);
+        router.index_server(
+            server_id,
+            &tools.to_vec().into(),
+            &[],
+            &[],
+            &[],
+            false,
+            &Mutex::default(),
+        );
         router
             .routes
             .into_iter()
@@ -1773,10 +1788,12 @@ impl Router {
                 } else {
                     &Value::Null
                 };
-                match live
-                    .policy
-                    .blocked_reason_unscoped(exposed, server_id, orig, definition)
-                {
+                match live.policy.blocked_reason_unscoped(
+                    exposed,
+                    server_id,
+                    orig,
+                    ToolPolicyMetadata::from(definition),
+                ) {
                     Some(reason) => Err(format!("tool '{exposed}' is {reason}")),
                     None => Ok(()),
                 }
@@ -1794,11 +1811,12 @@ impl Router {
     fn index_server(
         &mut self,
         server_id: &str,
-        tools: &[Value],
+        tools: &SerializedTools,
         resources: &[Value],
         resource_templates: &[Value],
         prompts: &[Value],
         route_mcp_apps: bool,
+        cache: &Mutex<HashMap<[u8; 32], Weak<ToolDefinition>>>,
     ) {
         // Allocate the exposed name regardless of policy so toggling one tool
         // never renames its siblings (their `_2` suffixes stay put), and in an
@@ -1806,9 +1824,9 @@ impl Router {
         if !tools.is_empty() {
             self.catalog_servers.insert(server_id.to_string());
         }
-        let tool_names = self.allocate_exposed_names(server_id, tools);
-        for (idx, tool) in tools.iter().enumerate() {
-            let Some(orig) = tool.get("name").and_then(|n| n.as_str()) else {
+        let tool_names = self.allocate_names(server_id, tools.names());
+        for (idx, orig) in tools.names().into_iter().enumerate() {
+            let Some(orig) = orig else {
                 continue;
             };
             let base = tool_names[idx]
@@ -1841,24 +1859,44 @@ impl Router {
             };
             // Policy: disabled / scope / destructive gate on the ORIGINAL downstream
             // name (server_id + orig); quarantine gates on the final exposed name.
-            if let Some(reason) = self.policy.blocked_reason(&exposed, server_id, orig, tool) {
+            if let Some(reason) =
+                self.policy
+                    .blocked_reason(&exposed, server_id, orig, tools.policy_metadata(idx))
+            {
                 self.blocked.insert(exposed, reason.to_string());
                 continue;
             }
-            let mut t = tool.clone();
-            if let Some(desc) = ov_desc {
-                t["description"] = json!(desc);
+            let key = content_digest(&(tools.digest(idx), &exposed, &ov_desc));
+            let mut definitions = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let definition = definitions
+                .get(&key)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let mut t = tools.materialize(idx);
+                    if let Some(desc) = ov_desc {
+                        t["description"] = json!(desc);
+                    }
+                    t["name"] = json!(exposed);
+                    let mut compiled = None;
+                    if let Some(schema) = t.get_mut("inputSchema") {
+                        let arguments = crate::schema_compat::normalize(schema);
+                        inline_refs(schema);
+                        if !arguments.is_empty() {
+                            compiled = Some(Arc::new(arguments));
+                        }
+                    }
+                    let definition = Arc::new(ToolDefinition::with_arguments(t, compiled));
+                    definitions.insert(key, Arc::downgrade(&definition));
+                    definition
+                });
+            drop(definitions);
+            if let Some(arguments) = &definition.arguments {
+                self.schema_arguments
+                    .insert(exposed.clone(), Arc::clone(arguments));
             }
-            t["name"] = json!(exposed);
-            if let Some(schema) = t.get_mut("inputSchema") {
-                let arguments = crate::schema_compat::normalize(schema);
-                inline_refs(schema);
-                if !arguments.is_empty() {
-                    self.schema_arguments
-                        .insert(exposed.clone(), Arc::new(arguments));
-                }
-            }
-            self.tools.push(t);
+            self.tools.0.push(definition);
             self.routes
                 .insert(exposed, (server_id.to_string(), orig.to_string()));
 
@@ -1866,7 +1904,7 @@ impl Router {
             // tool linkage is therefore an authoritative route hint, subject to
             // the same first-writer collision rule as ordinary resources below.
             if route_mcp_apps {
-                if let Some(uri) = mcp_app_resource_uri(tool) {
+                if let Some(uri) = tools.app_uri(idx) {
                     match self.resource_routes.get(uri) {
                         Some(owner) if owner != server_id => {
                             eprintln!(
@@ -1964,21 +2002,26 @@ impl Router {
     pub fn add_with_reconnect(&mut self, server: DownstreamServer, reconnect: Option<Reconnect>) {
         let id = server.id.clone();
         let route_mcp_apps = supports_mcp_app_html(server.extensions());
+        let tools = server.tools.clone();
+        let resources = server.resources.clone();
+        let templates = server.resource_templates.clone();
+        let prompts = server.prompts.clone();
+        let slot = Arc::new(ServerSlot::new(id.clone(), server, reconnect));
         self.index_server(
             &id,
-            &server.tools,
-            &server.resources,
-            &server.resource_templates,
-            &server.prompts,
+            &tools,
+            &resources,
+            &templates,
+            &prompts,
             route_mcp_apps,
+            &slot.definitions,
         );
         self.catalog_servers.insert(id.clone());
         let idx = self.servers.len();
         if !self.server_order.contains(&id) {
             self.server_order.push(id.clone());
         }
-        self.servers
-            .push(Arc::new(ServerSlot::new(id.clone(), server, reconnect)));
+        self.servers.push(slot);
         self.by_id.insert(id, idx);
     }
 
@@ -2019,7 +2062,7 @@ impl Router {
         true
     }
 
-    pub fn raw_catalogs(&self) -> Option<HashMap<String, Vec<Value>>> {
+    pub fn raw_catalogs(&self) -> Option<HashMap<String, SerializedTools>> {
         self.servers
             .iter()
             .map(|slot| Some((slot.id.clone(), slot.inner.try_lock().ok()?.tools.clone())))
@@ -2532,20 +2575,21 @@ impl Router {
     /// keeps exposed names unique; authorization must use the raw registry id,
     /// not this prefix.
     fn allocate_exposed_names(&mut self, server_id: &str, items: &[Value]) -> Vec<Option<String>> {
-        fn raw_name(item: &Value) -> Option<&str> {
-            item.get("name").and_then(|n| n.as_str())
-        }
-        let mut order: Vec<usize> = (0..items.len()).collect();
-        // Ties (a server listing the same raw name twice) fall back to list
-        // position, which keeps the sort total and the result reproducible.
-        order.sort_by(|&a, &b| {
-            raw_name(&items[a])
-                .cmp(&raw_name(&items[b]))
-                .then(a.cmp(&b))
-        });
-        let mut out = vec![None; items.len()];
+        self.allocate_names(
+            server_id,
+            items
+                .iter()
+                .map(|item| item.get("name").and_then(Value::as_str))
+                .collect(),
+        )
+    }
+
+    fn allocate_names(&mut self, server_id: &str, names: Vec<Option<&str>>) -> Vec<Option<String>> {
+        let mut order: Vec<usize> = (0..names.len()).collect();
+        order.sort_by(|&a, &b| names[a].cmp(&names[b]).then(a.cmp(&b)));
+        let mut out = vec![None; names.len()];
         for i in order {
-            if let Some(orig) = raw_name(&items[i]) {
+            if let Some(orig) = names[i] {
                 out[i] = Some(self.exposed_name(server_id, orig));
             }
         }
@@ -2581,18 +2625,14 @@ impl Router {
         self.blocked.contains_key(exposed)
     }
 
-    pub fn aggregated_tools(&self) -> Vec<Value> {
+    pub fn shared_tools(&self) -> SharedTools {
         let mut tools = self.tools.clone();
-        // MCP 2026-07-28 recommends deterministic tool ordering so both response
-        // caches and LLM prompt caches survive incidental downstream reorderings.
-        // Exposed names are unique, making them a stable total key across refreshes
-        // and gateway restarts without changing routing ownership.
-        tools.sort_by(|left, right| {
-            left.get("name")
-                .and_then(Value::as_str)
-                .cmp(&right.get("name").and_then(Value::as_str))
-        });
+        tools.sort();
         tools
+    }
+
+    pub fn aggregated_tools(&self) -> Vec<Value> {
+        self.shared_tools().to_vec()
     }
 
     fn aggregate_cache_hints(
@@ -2965,18 +3005,27 @@ impl Router {
     /// never re-derive the original name by splitting the exposed name on `__`
     /// (overrides and `_2` collision suffixes make that split wrong, see
     /// [`Self::route_of`]). Only exposed names this router does not already
-    /// route are adopted, so a healthy server is never touched. Policy is
+    /// route from a live slot are adopted. Previously restored routes keep
+    /// their candidates across repeated adoption. Policy is
     /// re-evaluated per restored tool before adoption: the rebuilt router only
     /// indexed the degraded connect, so tools quarantined or disabled since the
     /// previous build are absent from its `blocked` map and must not slip back
     /// in through the guarded catalog (which still carries them from the cache).
-    pub fn adopt_restored_routes(&mut self, previous: &Router, catalog: &[Value]) {
-        let mut candidates = Vec::new();
-        let mut seen = HashSet::new();
-        for tool in catalog {
+    pub fn adopt_restored_routes(&mut self, previous: &Router, catalog: &dyn ToolCatalog) {
+        // Rebuilds have already reapplied these routes. Keep their provenance,
+        // including tools visible only in a profile, across repeated publication.
+        let mut candidates = std::mem::take(&mut self.restored_candidates);
+        let mut seen: HashSet<String> =
+            candidates.iter().map(|tool| tool.exposed.clone()).collect();
+        for tool in catalog.shared().0 {
             let Some(exposed) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
+            // Healthy definitions remain available from the live slots. Retaining
+            // them as restoration candidates duplicates every schema on reconnect.
+            if self.routes.contains_key(exposed) && !seen.contains(exposed) {
+                continue;
+            }
             // The previous router indexed the same exposed name; reuse its
             // (server, original) pair verbatim instead of re-deriving it.
             let Some((server_id, original)) = previous.route_of(exposed) else {
@@ -3023,14 +3072,17 @@ impl Router {
         }
         if !collapsed.is_empty() {
             let unrestricted = previous.with_tool_allow(HashMap::new());
-            for tool in unrestricted.aggregated_tools() {
+            for tool in unrestricted.shared_tools().0 {
                 let Some(exposed) = tool.get("name").and_then(Value::as_str) else {
                     continue;
                 };
                 let Some((server_id, original)) = unrestricted.route_of(exposed) else {
                     continue;
                 };
-                if collapsed.contains(server_id) && seen.insert(exposed.to_string()) {
+                if collapsed.contains(server_id)
+                    && (!self.routes.contains_key(exposed) || seen.contains(exposed))
+                    && seen.insert(exposed.to_string())
+                {
                     candidates.push(RestoredTool {
                         definition: tool.clone(),
                         exposed: exposed.to_string(),
@@ -3061,7 +3113,7 @@ impl Router {
                 &candidate.exposed,
                 &candidate.server,
                 &candidate.original,
-                &candidate.definition,
+                ToolPolicyMetadata::from(&**candidate.definition),
             ) {
                 self.blocked
                     .insert(candidate.exposed.clone(), reason.to_string());
@@ -3075,7 +3127,7 @@ impl Router {
                 self.schema_arguments
                     .insert(candidate.exposed.clone(), Arc::clone(arguments));
             }
-            self.tools.push(candidate.definition.clone());
+            self.tools.0.push(candidate.definition.clone());
             self.seen.insert(candidate.exposed.clone());
         }
     }
@@ -3104,7 +3156,7 @@ impl Router {
 
     fn rebuild_aggregation_with_reserved(&mut self, restored: &[RestoredTool]) {
         self.restored_candidates.clear();
-        self.tools.clear();
+        self.tools = SharedTools::default();
         self.catalog_servers.clear();
         self.routes.clear();
         self.schema_arguments.clear();
@@ -3122,8 +3174,7 @@ impl Router {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .tools
-                        .iter()
-                        .any(|tool| tool["name"] == candidate.original)
+                        .contains_name(&candidate.original)
                 });
             if !still_advertised {
                 self.seen.insert(candidate.exposed.clone());
@@ -3136,12 +3187,14 @@ impl Router {
         self.template_routes.clear();
         self.prompts.clear();
         self.prompt_routes.clear();
-        // Clone the Arcs (cheap) and snapshot each slot's lists under its lock, so
-        // we hold neither a slot lock nor a borrow of `self.servers` across the
-        // `&mut self` re-index.
+        // Snapshot catalogs under each slot lock, then normalize/index without
+        // blocking dispatch or raw_catalogs' nonblocking persistence snapshot.
         let slots: Vec<Arc<ServerSlot>> = self.servers.clone();
         for slot in &slots {
-            let (tools, resources, resource_templates, prompts, route_mcp_apps) = {
+            if slot.catalog_complete() {
+                self.catalog_servers.insert(slot.id.clone());
+            }
+            let (tools, resources, templates, prompts, route_mcp_apps) = {
                 let s = slot
                     .inner
                     .lock()
@@ -3154,17 +3207,19 @@ impl Router {
                     supports_mcp_app_html(s.extensions()),
                 )
             };
-            if slot.catalog_complete() {
-                self.catalog_servers.insert(slot.id.clone());
-            }
             self.index_server(
                 &slot.id,
                 &tools,
                 &resources,
-                &resource_templates,
+                &templates,
                 &prompts,
                 route_mcp_apps,
+                &slot.definitions,
             );
+            slot.definitions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|_, value| value.strong_count() > 0);
         }
     }
 
@@ -4129,7 +4184,8 @@ mod tests {
                 "a b": {"type": "string"},
                 "kids": {"type": "array", "items": {"$ref": "#/$defs/Node"}}
             }}}
-        }})];
+        }})]
+        .into();
         let mut router = Router::new();
         router.add(server);
         let mut args = json!({"a_b": "top", "kids": [
@@ -4153,7 +4209,8 @@ mod tests {
         let mut server = mock_server("s");
         server.tools = vec![
             json!({"name": "echo", "inputSchema": {"properties": {"'x-Cwd'": {"type": "string"}}}}),
-        ];
+        ]
+        .into();
         let raw = server.tools.clone();
         let mut previous = Router::new();
         previous.add(server);
@@ -4178,6 +4235,45 @@ mod tests {
             view.schema_arguments["s__echo"].restore(&mut args).unwrap();
             assert_eq!(args, json!({"'x-Cwd'": "/tmp"}));
         }
+    }
+
+    #[test]
+    fn reindex_releases_slot_before_waiting_for_definition_cache() {
+        let mut router = Router::new();
+        router.add(mock_server("s"));
+        let slot = router.servers[0].clone();
+        let raw = slot.inner.lock().unwrap().tools.clone();
+        let prior_sharers = raw.storage_sharers();
+        let cache = slot.definitions.lock().unwrap();
+        let snapshot = router.clone();
+        let worker = std::thread::spawn(move || snapshot.reindexed());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while raw.storage_sharers() == prior_sharers && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let snapshotted = raw.storage_sharers() > prior_sharers;
+        let callable = loop {
+            if slot.inner.try_lock().is_ok() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        let persisted = router.raw_catalogs().is_some();
+        drop(cache);
+        let rebuilt = worker.join().unwrap();
+        assert!(
+            snapshotted,
+            "reindex must snapshot serialized tools before indexing"
+        );
+        assert!(
+            persisted,
+            "catalog persistence must not skip an indexing slot"
+        );
+        assert!(callable, "dispatch must not wait on schema indexing");
+        assert_eq!(rebuilt.shared_tools(), router.shared_tools());
     }
 
     /// A fake downstream server: advertises `echo` + `add`, echoes calls back.
@@ -5936,6 +6032,82 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn cloned_router_shares_definitions_until_indexing_changes_its_view() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "cloned_router_shares_definitions_until_indexing_changes_its_view",
+        );
+        let mut base = Router::new();
+        base.add(mock_server("shared"));
+        let before = base.aggregated_tools();
+        let mut view = base.clone();
+        assert!(base
+            .tools
+            .0
+            .iter()
+            .zip(&view.tools.0)
+            .all(|(a, b)| Arc::ptr_eq(a, b)));
+
+        view.add(mock_server("another"));
+        assert_eq!(view.tools.len(), base.tools.len() + 2);
+        assert!(base
+            .tools
+            .0
+            .iter()
+            .zip(&view.tools.0)
+            .all(|(a, b)| Arc::ptr_eq(a, b)));
+        assert_eq!(base.aggregated_tools(), before);
+        assert!(base.route_of("another__echo").is_none());
+        assert!(view.route_of("another__echo").is_some());
+
+        let snapshot = view.clone();
+        view.requarantine(BTreeSet::from(["shared__echo".to_string()]));
+        assert!(view.route_of("shared__echo").is_none());
+        assert!(snapshot.route_of("shared__echo").is_some());
+        assert_eq!(base.aggregated_tools(), before);
+    }
+
+    #[test]
+    fn normalized_definitions_and_arguments_are_shared_across_profile_rebuilds() {
+        let mut base = Router::new();
+        base.add(DownstreamServer::stopped(
+            "shared".into(),
+            vec![json!({
+                "name": "read", "inputSchema": {"type":"object", "properties": {
+                    "'x-Cwd'": {"type":"string"}
+                }}
+            })],
+        ));
+        let original = base.shared_tools();
+        let profile = base.with_tool_allow(HashMap::from([(
+            "shared".into(),
+            HashSet::from(["read".into()]),
+        )]));
+        let clone = profile.with_tool_allow(HashMap::new());
+        assert!(Arc::ptr_eq(&original.0[0], &profile.tools.0[0]));
+        assert!(Arc::ptr_eq(&original.0[0], &clone.tools.0[0]));
+        assert!(Arc::ptr_eq(
+            &base.schema_arguments["shared__read"],
+            &profile.schema_arguments["shared__read"]
+        ));
+        let mut overridden = base.clone();
+        overridden.set_overrides(HashMap::from([(
+            "shared".into(),
+            HashMap::from([(
+                "read".into(),
+                ToolOverride {
+                    name: None,
+                    description: Some("Changed".into()),
+                    unknown_fields: Default::default(),
+                },
+            )]),
+        )]));
+        overridden.rebuild_aggregation();
+        assert!(!Arc::ptr_eq(&original.0[0], &overridden.tools.0[0]));
+        assert_ne!(original.0[0].digest, overridden.tools.0[0].digest);
+        assert_eq!(original[0]["description"], Value::Null);
+    }
+
+    #[test]
     fn profile_views_share_downstreams_but_reindex_distinct_tool_scopes() {
         let mut base = Router::with_policy(ToolPolicy {
             allow: HashMap::from([("shared".to_string(), HashSet::new())]),
@@ -6393,6 +6565,9 @@ for line in sys.stdin:
         rebuilt.rebuild_aggregation();
         rebuilt.adopt_restored_routes(&previous, &previous.aggregated_tools());
 
+        let prior_live = rebuilt.clone();
+        rebuilt.rebuild_preserving_restored();
+        rebuilt.adopt_restored_routes(&prior_live, &prior_live.shared_tools());
         let profile = rebuilt.with_tool_allow(HashMap::from([(
             "atlassian".to_string(),
             HashSet::from(["t39".to_string()]),
@@ -6421,6 +6596,43 @@ for line in sys.stdin:
         quarantined.requarantine(BTreeSet::from(["atlassian__t39".to_string()]));
         assert!(quarantined.route_of("atlassian__t39").is_none());
         assert!(quarantined.is_blocked("atlassian__t39"));
+    }
+
+    #[test]
+    fn review_repeat_adoption_keeps_restored_candidates() {
+        let previous = router_with_catalogs(&[("atlassian", 40)]);
+        let mut guarded = router_with_catalogs(&[("atlassian", 3)]);
+        let catalog = previous.aggregated_tools();
+        guarded.adopt_restored_routes(&previous, &catalog);
+        assert_eq!(guarded.route_of("atlassian__t39"), Some(("atlassian", "t39")));
+        // Refresh path: next = live clone, rebuilt, published, then adopted again
+        // with previous_router = the guarded live router.
+        let prior_live = guarded.clone();
+        let mut next = guarded.clone();
+        next.rebuild_preserving_restored();
+        next.adopt_restored_routes(&prior_live, &catalog);
+        assert_eq!(next.route_of("atlassian__t39"), Some(("atlassian", "t39")));
+        let profile = next.with_tool_allow(HashMap::new());
+        assert_eq!(
+            profile.route_of("atlassian__t39"),
+            Some(("atlassian", "t39")),
+            "profile view lost restored route"
+        );
+        let mut policy = next.clone();
+        policy.requarantine(BTreeSet::new());
+        assert_eq!(
+            policy.route_of("atlassian__t39"),
+            Some(("atlassian", "t39")),
+            "policy rebuild lost restored route"
+        );
+        let mut registry = next.registry_policy();
+        registry.deny_destructive = true;
+        assert!(next.apply_registry_policy(registry));
+        assert_eq!(next.route_of("atlassian__t39"), Some(("atlassian", "t39")));
+        assert!(next.route_call("atlassian__t39", json!({})).is_ok());
+        next.requarantine(BTreeSet::from(["atlassian__t39".to_string()]));
+        assert!(next.route_of("atlassian__t39").is_none());
+        assert!(next.is_blocked("atlassian__t39"));
     }
 
     #[test]
@@ -6478,6 +6690,26 @@ for line in sys.stdin:
         // The other 39 restored tools are still adopted (3 degraded + 36 more).
         assert!(names.contains("atlassian__t39"));
         assert_eq!(names.len(), 39, "3 degraded + 36 restored, t30 quarantined");
+    }
+
+    #[test]
+    fn healthy_catalogs_are_not_retained_as_restoration_candidates() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "healthy_catalogs_are_not_retained_as_restoration_candidates",
+        );
+        let previous = router_with_catalogs(&[("healthy", 40)]);
+        let mut rebuilt = router_with_catalogs(&[("healthy", 40)]);
+        let catalog = previous.aggregated_tools();
+        rebuilt.adopt_restored_routes(&previous, &catalog);
+        assert!(rebuilt.restored_candidates.is_empty());
+        assert_eq!(rebuilt.aggregated_tools(), catalog);
+
+        let profile = rebuilt.with_tool_allow(HashMap::from([(
+            "healthy".to_string(),
+            HashSet::from(["t39".to_string()]),
+        )]));
+        assert_eq!(profile.aggregated_tools().len(), 1);
+        assert_eq!(profile.route_of("healthy__t39"), Some(("healthy", "t39")));
     }
 
     #[test]
@@ -7733,7 +7965,7 @@ for line in sys.stdin:
         let inner = router.servers[0].inner.lock().unwrap();
         assert!(router.raw_catalogs().is_none());
         drop(inner);
-        assert_eq!(router.raw_catalogs().unwrap()["s"][0]["name"], "echo");
+        assert_eq!(router.raw_catalogs().unwrap()["s"].materialize(0)["name"], "echo");
     }
 
     #[test]

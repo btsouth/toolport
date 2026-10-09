@@ -2238,7 +2238,7 @@ fn verify_setup_gateway(
         });
     }
     Ok(SetupVerification {
-        tools: gateway.tools.clone(),
+        tools: gateway.tools.materialize_all(),
         servers,
     })
 }
