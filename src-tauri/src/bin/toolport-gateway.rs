@@ -14666,13 +14666,13 @@ fn process_request(
 
 fn catalog_wait_budget(
     discovery: DiscoveryMode,
-    scoped_search: bool,
+    tool_search: bool,
     client: Option<&str>,
     setup: bool,
 ) -> Duration {
     if setup {
         downstream::SETUP_CATALOG_WAIT_BUDGET
-    } else if discovery == DiscoveryMode::Full || scoped_search {
+    } else if discovery == DiscoveryMode::Full || tool_search {
         Duration::from_millis(
             clients::discovery_capabilities(client.unwrap_or("")).cold_full_list_wait_ms,
         )
@@ -14705,13 +14705,13 @@ fn process_request_wire(
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     // One deadline includes startup and rooted composition, rather than granting
     // each phase another budget. Warm tools lists never enter the catalog wait.
-    let search_server = (method == "tools/call"
-        && req["params"]["name"] == "toolport_search_tools")
+    let tool_search = method == "tools/call" && req["params"]["name"] == "toolport_search_tools";
+    let search_server = tool_search
         .then(|| req["params"]["arguments"]["server"].as_str())
         .flatten();
     let tools_list_budget = catalog_wait_budget(
         discovery,
-        search_server.is_some(),
+        tool_search,
         client,
         std::env::args().any(|arg| arg == "--setup-review"),
     );
@@ -14819,7 +14819,7 @@ fn process_request_wire(
         _ => false,
     };
     if wait {
-        let deadline = if method == "tools/list" || search_server.is_some() {
+        let deadline = if method == "tools/list" || tool_search {
             tools_list_deadline
         } else {
             Instant::now() + Duration::from_secs(30)
@@ -15050,12 +15050,12 @@ fn process_request_wire(
         (rooted, cached)
     };
     let (mut router, mut cache_snapshot) = catalog_for_view(rooted_router);
-    if method == "tools/list" || search_server.is_some() {
+    if method == "tools/list" || tool_search {
         let visible = |id: &str| {
             search_server.is_none_or(|server| server == id)
                 && allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
         };
-        if search_server.is_some() {
+        if tool_search {
             router.demand_servers(visible);
             router.discover_uncached(visible);
         }
@@ -15119,7 +15119,9 @@ fn process_request_wire(
                         .is_some_and(|name| name.starts_with(&prefix))
                 })
             });
-            if !daemon_adapter && (cold && method == "tools/list" || search_cache_lag) {
+            if !daemon_adapter
+                && (cold && (method == "tools/list" || tool_search) || search_cache_lag)
+            {
                 cache_snapshot = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
             }
             // Do not wait on rebuild_lock after the deadline: a slow publisher

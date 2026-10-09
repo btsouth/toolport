@@ -8,7 +8,9 @@ npm run test:client-conformance
 
 It builds with `test-support`, replays captured health-command initialize params
 through the real stdio adapter and daemon, and exercises Auto discovery for every
-adapter in the generated client inventory. Inventory drift fails the test. There
+adapter in the generated client inventory. Cold Lazy search waits for the first
+visible catalog within the client budget, including when no server filter is
+provided. Inventory drift fails the test. There
 are no real client executables, model calls, credentials or platform keychains in
 the offline suite. Node is required, as it is for the existing gateway smoke.
 
