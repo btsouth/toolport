@@ -2865,6 +2865,17 @@ fn search_catalog_filtered(
                     let exact_form = doc.surface_name_tokens.intersection(&surface_query).count();
                     score *=
                         1.0 + 0.1 * exact_form as f64 / doc.surface_name_tokens.len().max(1) as f64;
+                    // Favor coherent evidence across the requested words over
+                    // a single rare name hit. This uses only indexed tool text.
+                    let covered: f64 = q_tokens.iter().zip(&query_weights)
+                        .filter(|(token, _)| doc.name_tokens.contains(*token)
+                            || doc.description_tokens.contains(*token)
+                            || doc.parameter_tokens.contains(*token))
+                        .map(|(_, weight)| weight).sum();
+                    let requested: f64 = query_weights.iter().sum();
+                    if requested > 0.0 {
+                        score *= 1.0 + covered / requested;
+                    }
                     if *named {
                         score *= 1.0 + SERVER_NAMED_BOOST;
                     }
@@ -38628,7 +38639,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_name_keeps_pinned_prerequisites_and_named_call_guidance() {
+    fn exact_name_returns_one_complete_definition_with_pins() {
         let _env = DataDirTestEnv::new("exact-name-pinned-prerequisites");
         let host = dispatch_host(false);
         let mut reg = Registry::default();
@@ -38654,8 +38665,8 @@ mod tests {
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         let hits: Vec<Value> = serde_json::from_str(text.split_once("\n\n").unwrap().1).unwrap();
         assert_eq!(
-            hits, cat,
-            "exact definition and prerequisite must both stay complete"
+            hits, vec![cat[1].clone()],
+            "exact lookup must preserve the complete single definition"
         );
         assert!(!text.contains("pinned prerequisite tool(s) listed first"));
         assert!(text.contains("Pick by description"));
