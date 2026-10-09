@@ -4133,7 +4133,10 @@ fn resolve_adapter_caller(
         Some(allowed),
         HttpCaller {
             audit_label: Some(clients::trusted_client_name(
-                Some(&format!("adapter:{client_id}")),
+                Some(&format!(
+                    "adapter:{}",
+                    conduit_lib::session_observability::display_client_id(client_id)
+                )),
                 None,
             )),
             session_owner: McpSessionOwner {
@@ -15320,7 +15323,9 @@ fn process_request_wire(
         state
             .attribution_id
             .clone()
-            .or_else(|| state.client_id.clone())
+            .or_else(|| {
+                state.client_id.as_deref().map(conduit_lib::session_observability::display_client_id)
+            })
     }
     .map(|id| format!("adapter:{id}"));
     let display_client = display_client.as_deref().or(client);
@@ -20488,11 +20493,12 @@ fn main() {
     let http_mode = http_port_opt.is_some() || daemon_mode;
     glog("=== gateway start ===");
     glog(&format!(
-        "cwd={:?} TOOLPORT_REGISTRY={:?} registry_path={:?} dir_resolution={:?} profile={env_profile:?} client_id={client_id:?}",
+        "cwd={:?} TOOLPORT_REGISTRY={:?} registry_path={:?} dir_resolution={:?} profile={env_profile:?} client_id={:?}",
         std::env::current_dir().ok(),
         conduit_lib::brand::env_var("TOOLPORT_REGISTRY", "CONDUIT_REGISTRY"),
         registry::resolved_path(),
         registry::conduit_dir_resolution(),
+        client_id.as_deref().map(conduit_lib::session_observability::display_client_id),
     ));
     if registry::conduit_dir_resolution() == registry::DirResolution::VirtualizedFallback {
         // Loud, not fatal: inside an MSIX container with no UNC escape, the data
@@ -28757,6 +28763,21 @@ mod tests {
             unknown_fields: Default::default(),
         });
         assert_eq!(http_client_label(&reg, Some("tok2")).as_deref(), Some("c2"));
+    }
+
+    #[test]
+    fn private_adapter_id_keeps_authorization_and_scope() {
+        for id in ["/home/private/customer.env", "sk-live-abcdefghijk123456789"] {
+            let mut reg = Registry::default();
+            let profile = reg.add_profile("Private scope");
+            reg.client_scopes.insert(id.into(), profile.clone());
+            let (_, caller) = resolve_adapter_caller(&reg, id, None, None);
+            assert_eq!(caller.session_owner.identity, format!("adapter:{id}"));
+            assert_eq!(caller.profile, Some(profile));
+            assert_eq!(caller.audit_label.as_deref(), Some("An AI client"));
+            assert_eq!(conduit_lib::session_observability::display_client_id(id), "[private]");
+            assert!(conduit_lib::session_observability::telemetry_principal(&caller.session_owner.identity).is_none());
+        }
     }
 
     #[test]

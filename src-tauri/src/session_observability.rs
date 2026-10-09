@@ -52,6 +52,23 @@ pub fn display_label(label: &str) -> Option<String> {
     crate::approval::sanitize_client_label(&safe)
 }
 
+/// Retain only registered HTTP IDs and known adapter IDs in observation rows.
+pub fn telemetry_principal(client: &str) -> Option<&str> {
+    (client.starts_with("client:")
+        || client
+            .strip_prefix("adapter:")
+            .is_some_and(|id| crate::clients::known_adapter_name(id).is_some()))
+    .then_some(client)
+}
+
+/// Scope lookup keeps the raw launch ID. Display and diagnostics reject private values.
+pub fn display_client_id(id: &str) -> String {
+    match display_label(id) {
+        Some(safe) if safe == id => safe,
+        _ => "[private]".into(),
+    }
+}
+
 pub struct DispatchTimer {
     started: Instant,
     previous: (Option<u64>, Option<bool>),
@@ -89,6 +106,16 @@ impl Drop for DispatchTimer {
 
 pub fn enrich(entry: &mut Value) {
     let ctx = current();
+    if entry.get("runId").is_some() || ctx.run_id.is_some() {
+        if entry["client"]
+            .as_str()
+            .is_some_and(|c| telemetry_principal(c).is_none())
+        {
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("client");
+            }
+        }
+    }
     if let Some(ms) = ctx.dispatch_ms {
         entry["dispatchMs"] = json!(ms);
     }
@@ -234,13 +261,7 @@ impl Session {
             id: crate::approval::new_correlation_id(),
             audit_path: crate::audit::audit_path(),
             // Anonymous process IDs and token-derived legacy principals are not retained.
-            client: client
-                .filter(|c| {
-                    c.starts_with("client:")
-                        || c.strip_prefix("adapter:")
-                            .is_some_and(|id| crate::clients::known_adapter_name(id).is_some())
-                })
-                .map(str::to_string),
+            client: client.and_then(telemetry_principal).map(str::to_string),
             name: display_label(&crate::clients::trusted_client_name(display_client, name))
                 .unwrap_or_else(|| "An AI client".into()),
             client_type,
@@ -345,6 +366,59 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn private_principals_never_reach_new_telemetry_rows() {
+        let data = crate::registry::DataDirTestEnv::new("f3-private-principals");
+        for id in [
+            "/home/private/customer.env",
+            "C:\x5cprivate\x5ccustomer.env",
+            "../private/customer.env",
+            "sk-live-abcdefghijk123456789",
+        ] {
+            assert_eq!(display_client_id(id), "[private]");
+            let principal = format!("adapter:{id}");
+            let session = Session::start(Some(&principal), None, None, "stdio", "reinitialize");
+            let _context = ContextGuard::enter(Context {
+                run_id: Some("opaque".into()),
+                ..session.context()
+            });
+            for tool in ["search", "server/discover"] {
+                crate::audit::record_internal(tool, 1, true, Some(&principal), true);
+            }
+            crate::audit::record_code_mode(
+                false,
+                1,
+                Some(crate::codemode::FailureKind::DownstreamFailure),
+                Some(&principal),
+            );
+            session.close(CloseReason::Reinitialize);
+        }
+        assert!(crate::telemetry::flush_for_test(
+            std::time::Duration::from_secs(5)
+        ));
+        let rows = crate::audit::read_all().unwrap();
+        assert_eq!(rows.len(), 20);
+        for row in &rows {
+            assert!(row.get("client").is_none(), "{row}");
+        }
+        let text = std::fs::read_to_string(data.dir.join("audit.jsonl")).unwrap();
+        for private in ["customer.env", "sk-live-abcdefghijk123456789"] {
+            assert!(!text.contains(private), "{text}");
+        }
+        for principal in ["adapter:claude-code", "client:registered-id"] {
+            assert_eq!(telemetry_principal(principal), Some(principal));
+            crate::audit::record_internal("search", 1, false, Some(principal), true);
+            crate::audit::record_code_mode(true, 1, None, Some(principal));
+        }
+        let rows = crate::audit::read_recent(4).unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|row| row["client"]
+            .as_str()
+            .and_then(telemetry_principal)
+            .is_some()));
+        assert_eq!(display_client_id("claude-code"), "claude-code");
+    }
+
     #[test]
     fn display_identity_never_replaces_the_recorded_principal() {
         let _data = crate::registry::DataDirTestEnv::new("f3-display-identity");

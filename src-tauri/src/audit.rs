@@ -476,7 +476,7 @@ pub(crate) fn record_session_at(path: &Path, mut entry: Value) {
 
 pub fn record_internal(tool: &str, duration_ms: u64, cold: bool, client: Option<&str>, ok: bool) {
     let mut entry = json!({"ts": epoch_millis() as u64, "kind":"internal", "ok":ok, "server":"toolport", "tool":tool, "durationMs":duration_ms, "cold":cold});
-    if let Some(client) = client {
+    if let Some(client) = client.and_then(crate::session_observability::telemetry_principal) {
         entry["client"] = json!(client);
     }
     write_line(&entry);
@@ -494,7 +494,7 @@ pub fn record_code_mode(
         ok,
         Some(duration_ms),
         None,
-        client,
+        client.and_then(crate::session_observability::telemetry_principal),
         None,
         None,
         None,

@@ -17,7 +17,6 @@ impl ParentApp {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Generation {
     parent: u32,
@@ -28,24 +27,30 @@ struct Generation {
 fn stable_process(
     mut generation: impl FnMut() -> Option<Generation>,
     name: impl FnOnce() -> Option<String>,
-) -> Option<(u32, String)> {
+) -> Option<(Generation, String)> {
     let before = generation()?;
     let name = name()?;
-    (generation()? == before).then_some((before.parent, name))
+    (generation()? == before).then_some((before, name))
 }
 
 pub fn parent_app(pid: u32) -> Option<String> {
     walk(pid, process)
 }
 
-fn walk(mut pid: u32, mut read: impl FnMut(u32) -> Option<(u32, String)>) -> Option<String> {
+fn walk(mut pid: u32, mut read: impl FnMut(u32) -> Option<(Generation, String)>) -> Option<String> {
     let mut seen = HashSet::new();
     let mut fallback = None;
+    let mut child_started = None;
     for _ in 0..MAX_PARENTS {
         if pid <= 1 || !seen.insert(pid) {
             break;
         }
-        let (parent, name) = read(pid)?;
+        let (generation, name) = read(pid)?;
+        // A terminated parent's PID can be reused by a newer unrelated process.
+        if child_started.is_some_and(|started| generation.started > started) {
+            return None;
+        }
+        child_started = Some(generation.started);
         // Skip the adapter itself; examine its parents, including generic launchers.
         if seen.len() > 1 {
             let name = Path::new(&name).file_name()?.to_str()?;
@@ -76,13 +81,13 @@ fn walk(mut pid: u32, mut read: impl FnMut(u32) -> Option<(u32, String)>) -> Opt
             }
             fallback.get_or_insert(name);
         }
-        pid = parent;
+        pid = generation.parent;
     }
     fallback
 }
 
 #[cfg(target_os = "linux")]
-fn process(pid: u32) -> Option<(u32, String)> {
+fn process(pid: u32) -> Option<(Generation, String)> {
     stable_process(
         || linux_generation(pid),
         || {
@@ -113,7 +118,7 @@ fn linux_generation(pid: u32) -> Option<Generation> {
 }
 
 #[cfg(target_os = "macos")]
-fn process(pid: u32) -> Option<(u32, String)> {
+fn process(pid: u32) -> Option<(Generation, String)> {
     stable_process(
         || macos_generation(pid),
         || {
@@ -156,7 +161,7 @@ fn macos_generation(pid: u32) -> Option<Generation> {
 }
 
 #[cfg(windows)]
-fn process(pid: u32) -> Option<(u32, String)> {
+fn process(pid: u32) -> Option<(Generation, String)> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -194,7 +199,13 @@ fn process(pid: u32) -> Option<(u32, String)> {
         found
     }?;
     let after = windows_generation(pid)?;
-    (before == after).then_some(found)
+    (before == after).then_some((
+        Generation {
+            parent: found.0,
+            started: before,
+        },
+        found.1,
+    ))
 }
 
 #[cfg(windows)]
@@ -219,7 +230,7 @@ fn windows_generation(pid: u32) -> Option<u64> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn process(_: u32) -> Option<(u32, String)> {
+fn process(_: u32) -> Option<(Generation, String)> {
     None
 }
 
@@ -232,7 +243,13 @@ mod tests {
             let cached = ParentApp::default();
             let mut walks = 0;
             for _ in 0..20 {
-                assert_eq!(cached.resolve_with(|| { walks += 1; result.clone() }), result);
+                assert_eq!(
+                    cached.resolve_with(|| {
+                        walks += 1;
+                        result.clone()
+                    }),
+                    result
+                );
             }
             assert_eq!(walks, 1);
         }
@@ -241,10 +258,19 @@ mod tests {
     #[test]
     fn reused_process_generation_returns_unknown() {
         let mut reads = 0;
-        assert_eq!(stable_process(|| {
-            reads += 1;
-            Some(Generation {parent: 9, started: reads})
-        }, || Some("Cursor".into())), None);
+        assert_eq!(
+            stable_process(
+                || {
+                    reads += 1;
+                    Some(Generation {
+                        parent: 9,
+                        started: reads,
+                    })
+                },
+                || Some("Cursor".into())
+            ),
+            None
+        );
         assert_eq!(reads, 2);
     }
 
@@ -252,12 +278,69 @@ mod tests {
     fn missing_or_reused_parent_discards_launcher_fallback() {
         assert_eq!(
             walk(10, |pid| match pid {
-                10 => Some((9, "toolport-gateway".into())),
-                9 => Some((8, "node".into())),
+                10 => Some((
+                    Generation {
+                        parent: 9,
+                        started: 100
+                    },
+                    "toolport-gateway".into()
+                )),
+                9 => Some((
+                    Generation {
+                        parent: 8,
+                        started: 90
+                    },
+                    "node".into()
+                )),
                 _ => None,
             }),
             None
         );
+    }
+
+    #[test]
+    fn newer_parent_returns_unknown_even_after_a_launcher() {
+        for launcher in [false, true] {
+            assert_eq!(
+                walk(10, |pid| match pid {
+                    10 => Some((
+                        Generation {
+                            parent: 9,
+                            started: 100
+                        },
+                        "toolport-gateway".into()
+                    )),
+                    9 if launcher => Some((
+                        Generation {
+                            parent: 8,
+                            started: 100
+                        },
+                        "node".into()
+                    )),
+                    _ => Some((
+                        Generation {
+                            parent: 1,
+                            started: 200
+                        },
+                        "UnrelatedApp".into()
+                    )),
+                }),
+                None
+            );
+        }
+        for parent_started in [90, 100] {
+            assert_eq!(
+                walk(10, |pid| Some((
+                    Generation {
+                        parent: if pid == 10 { 9 } else { 1 },
+                        started: if pid == 10 { 100 } else { parent_started },
+                    },
+                    "Cursor".into()
+                )))
+                .as_deref(),
+                Some("Cursor")
+            );
+        }
     }
 
     #[test]
@@ -268,10 +351,13 @@ mod tests {
             (8, (1, "/private/app/Cursor\u{202e}")),
         ];
         assert_eq!(
-            walk(10, |pid| rows
-                .iter()
-                .find(|r| r.0 == pid)
-                .map(|r| (r.1 .0, r.1 .1.into())))
+            walk(10, |pid| rows.iter().find(|r| r.0 == pid).map(|r| (
+                Generation {
+                    parent: r.1 .0,
+                    started: r.0 as u64
+                },
+                r.1 .1.into()
+            )))
             .as_deref(),
             Some("Cursor")
         );
@@ -282,13 +368,28 @@ mod tests {
         assert_eq!(
             walk(100, |pid| {
                 reads += 1;
-                Some((pid - 1, "node".into()))
+                Some((
+                    Generation {
+                        parent: pid - 1,
+                        started: pid as u64,
+                    },
+                    "node".into(),
+                ))
             })
             .as_deref(),
             Some("node")
         );
         assert_eq!(reads, MAX_PARENTS);
         assert_eq!(walk(10, |_| None), None);
-        assert_eq!(walk(10, |pid| Some((pid, "node".into()))), None);
+        assert_eq!(
+            walk(10, |pid| Some((
+                Generation {
+                    parent: pid,
+                    started: 100
+                },
+                "node".into()
+            ))),
+            None
+        );
     }
 }
