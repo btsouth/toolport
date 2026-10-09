@@ -39409,6 +39409,7 @@ mod tests {
 
     #[test]
     fn tool_surface_wire_hit_is_byte_identical_to_uncached_for_every_mode_and_era() {
+        let _clock = CacheHint::freeze_clock_for_test();
         let _env = DataDirTestEnv::new("tool-surface-wire-equality");
         let state = http_state(false);
         let (reg, router, snapshot) = tool_surface_fixture();

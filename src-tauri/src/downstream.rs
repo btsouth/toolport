@@ -371,10 +371,45 @@ impl Default for CacheHint {
     }
 }
 
+#[cfg(feature = "test-support")]
+thread_local! {
+    static CACHE_HINT_TEST_TIME: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+fn cache_hint_now() -> Instant {
+    #[cfg(feature = "test-support")]
+    if let Some(now) = CACHE_HINT_TEST_TIME.with(std::cell::Cell::get) {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(feature = "test-support")]
+pub struct CacheHintClockGuard {
+    previous: Option<Instant>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for CacheHintClockGuard {
+    fn drop(&mut self) {
+        CACHE_HINT_TEST_TIME.with(|clock| clock.set(self.previous));
+    }
+}
+
 impl CacheHint {
+    /// Freeze this thread's cache clock without changing production TTL behavior.
+    #[cfg(feature = "test-support")]
+    pub fn freeze_clock_for_test() -> CacheHintClockGuard {
+        CacheHintClockGuard {
+            previous: CACHE_HINT_TEST_TIME.with(|clock| clock.replace(Some(Instant::now()))),
+            _thread: std::marker::PhantomData,
+        }
+    }
+
     pub fn from_result(result: &Value) -> Self {
         let ttl_ms = result.get("ttlMs").and_then(Value::as_u64).unwrap_or(0);
-        let now = Instant::now();
+        let now = cache_hint_now();
         let expires_at = (ttl_ms > 0)
             .then(|| Duration::from_millis(ttl_ms))
             .and_then(|ttl| now.checked_add(ttl));
@@ -387,7 +422,7 @@ impl CacheHint {
     }
 
     pub fn local(ttl_ms: u64) -> Self {
-        let now = Instant::now();
+        let now = cache_hint_now();
         let expires_at = (ttl_ms > 0)
             .then(|| Duration::from_millis(ttl_ms))
             .and_then(|ttl| now.checked_add(ttl));
@@ -417,7 +452,7 @@ impl CacheHint {
 
     pub fn remaining_ttl_ms(&self) -> u64 {
         self.expires_at
-            .and_then(|expires| expires.checked_duration_since(Instant::now()))
+            .and_then(|expires| expires.checked_duration_since(cache_hint_now()))
             .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64)
             .unwrap_or(0)
     }
@@ -430,7 +465,7 @@ impl CacheHint {
     /// stale, but the protocol does not require clients to hammer the server; the
     /// existing list-changed notification path remains the invalidation mechanism.
     pub fn needs_refresh(&self) -> bool {
-        self.refresh_after.is_some_and(|at| Instant::now() >= at)
+        self.refresh_after.is_some_and(|at| cache_hint_now() >= at)
     }
 
     fn mark_stale_and_defer(&mut self) {
