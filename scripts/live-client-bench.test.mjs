@@ -24,6 +24,32 @@ const catalog = [
 ];
 const call = (name, args) => ({ namespace: "demo", params: { name, arguments: args } });
 const task = { expected: [{ name: "demo__read", args: { id: 42 } }] };
+test("validates schema formats on optional arguments", () => {
+  const formatCatalog = [
+    {
+      name: "demo__notify",
+      inputSchema: {
+        type: "object",
+        properties: { email: { type: "string", format: "email" } },
+      },
+    },
+  ];
+  const formatTask = { expected: [{ name: "demo__notify", args: {} }] };
+  assert.equal(
+    score(formatTask, [call("notify", { email: "invalid" })], formatCatalog, true)
+      .success,
+    false,
+  );
+  assert.equal(
+    score(
+      formatTask,
+      [call("notify", { email: "alex@example.test" })],
+      formatCatalog,
+      true,
+    ).success,
+    true,
+  );
+});
 test("requires both valid schema and requested values", () => {
   assert.equal(score(task, [call("read", { id: 42 })], catalog, true).success, true);
   assert.equal(score(task, [call("read", { id: "42" })], catalog, true).success, false);

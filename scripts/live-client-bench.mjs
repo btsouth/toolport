@@ -26,7 +26,7 @@ const records = (file) => {
     throw e;
   }
 };
-const ajv = new Ajv({ strict: false, allErrors: true, validateFormats: false });
+const ajv = new Ajv({ strict: false, allErrors: true });
 addFormats(ajv);
 const validators = new Map();
 const schemaErrors = new Map();
