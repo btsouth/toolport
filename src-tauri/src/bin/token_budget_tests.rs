@@ -256,7 +256,7 @@ fn token_budget_regression() {
     let bpe = tiktoken_rs::o200k_base().unwrap();
     let host = dispatch_host(false);
     let tools = floor_tool_defs(&host);
-    let floor = json!(tools).to_string() + DISCOVER_INSTRUCTIONS_PREAMBLE;
+    let floor = json!(tools).to_string() + &discovery_instructions(DiscoveryMode::Lazy, None);
     let tokens = bpe.encode_ordinary(&floor).len();
     // About 10% headroom above the measured payloads, not optimization targets.
     let check = |label: &str, measured: usize, limit: usize| {

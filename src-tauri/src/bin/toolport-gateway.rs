@@ -22217,9 +22217,16 @@ mod tests {
     fn gateway_alias_cache_rejects_pre_reservation_names() {
         let _env = DataDirTestEnv::new("gateway-alias-cache-version");
         for name in ["toolport_search_tools", "toolport_call_tool"] {
-            std::fs::write(tool_cache_path(None).unwrap(),
-                json!({"version":2,"tools":[{"name":name,"inputSchema":{"type":"object"}}]}).to_string()).unwrap();
-            assert!(load_tool_cache(None).is_empty(), "legacy alias {name} must be rebuilt");
+            std::fs::write(
+                tool_cache_path(None).unwrap(),
+                json!({"version":2,"tools":[{"name":name,"inputSchema":{"type":"object"}}]})
+                    .to_string(),
+            )
+            .unwrap();
+            assert!(
+                load_tool_cache(None).is_empty(),
+                "legacy alias {name} must be rebuilt"
+            );
         }
     }
 
