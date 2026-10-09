@@ -222,7 +222,8 @@ fn search_scale_measure() {
                 .1;
             let mut menu: Value = serde_json::from_str(entries).unwrap();
             for entry in menu.as_array_mut().unwrap() {
-                entry.as_object_mut().unwrap().remove("inputSchema");
+                if let Some(row) = entry.as_array_mut() { row.truncate(3); }
+                else { entry.as_object_mut().unwrap().remove("inputSchema"); }
             }
             row["menu_tokens"] = json!(tokenizer
                 .encode_ordinary(&serde_json::to_string(&menu).unwrap())

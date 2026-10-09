@@ -1483,7 +1483,7 @@ fn search_tool_def() -> Value {
             "properties": {
                 "query": { "type": "string", "maxLength": MAX_SEARCH_QUERY_CHARS, "description": "Keywords for the capability you need, e.g. \"list emails\". An empty value with `server` lists that server's tools." },
                 "server": { "type": "string", "description": "Optional: limit to this server by name/prefix." },
-                "limit": { "type": "integer", "description": "Maximum menu entries, up to 10. Search returns up to 10 candidates." }
+                "limit": { "type": "integer", "description": "Retained for compatibility. The menu always returns up to 10 candidates." }
             },
             "required": ["query"],
             "additionalProperties": false
@@ -3307,8 +3307,8 @@ fn project_search_results(tools: &[&Value], include_top_schema: bool) -> Vec<Val
         let description = tool.get("description").and_then(Value::as_str).unwrap_or("");
         let one_line = integrity::neutralize_gateway_voice(description)
             .split_whitespace().collect::<Vec<_>>().join(" ");
-        let description = if one_line.chars().count() > 100 {
-            format!("{}…", one_line.chars().take(100).collect::<String>())
+        let description = if one_line.chars().count() > 64 {
+            format!("{}…", one_line.chars().take(64).collect::<String>())
         } else { one_line };
         let schema = tool.get("inputSchema").unwrap_or(&Value::Null);
         let required: Vec<_> = schema.get("required").and_then(Value::as_array)
@@ -7434,11 +7434,7 @@ fn handle_request_with_cancel(
                     ));
                 }
                 let server = arguments.get("server").and_then(|v| v.as_str());
-                let limit = arguments
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|limit| limit.clamp(1, 10) as usize)
-                    .unwrap_or(0);
+                let limit = DEFAULT_SEARCH_RESULTS;
                 // Prefer the cached catalog (instant); on a cold cache fall back to
                 // the live router so a first-time search doesn't return 0 results.
                 let live;
@@ -7518,7 +7514,7 @@ fn handle_request_with_cancel(
                              `server` prefix; otherwise call toolport_status to see the available prefixes."
                         .to_string(),
                 };
-                let instruction = "Pick by description, call the chosen tool with toolport_call_tool, or search its exact name to get another candidate's full schema.";
+                let instruction = "Rows: name, description, required parameters; #1 also has its full schema. Pick by description, call the chosen tool with toolport_call_tool, or search its exact name to get another candidate's full schema.";
                 let lead = if total == 0 && !matches.is_empty() {
                     format!("No direct tools matched{scope}. These are bounded fallback candidates. {instruction} {exhaustive_hint}")
                 } else if matches.is_empty() {
@@ -7581,17 +7577,23 @@ fn handle_request_with_cancel(
                 } else {
                     format!("Found {total} matching tool(s){scope}. {instruction}")
                 };
+                let exact = total == 1 && top.eq_ignore_ascii_case(query.trim());
+                let menu: Vec<Value> = matches.iter().map(|tool| {
+                    let mut row = vec![tool["name"].clone(), tool["description"].clone(), tool["requiredParams"].clone()];
+                    if let Some(schema) = tool.get("inputSchema") { row.push(schema.clone()); }
+                    Value::Array(row)
+                }).collect();
                 let text = format!(
                     "{lead}\n\n{}",
                     // This JSON is model input, not a human-facing log. Compact encoding
                     // preserves every field and the complete top schema while avoiding
                     // spending tokens on indentation and line breaks on every search.
-                    serde_json::to_string(&matches).unwrap_or_default()
+                    if exact { serde_json::to_string(&matches) } else { serde_json::to_string(&menu) }.unwrap_or_default()
                 );
                 let mut search_result = json!({ "content": [{ "type": "text", "text": text }], "isError": false, "low_confidence": low_confidence });
                 // A menu must keep every selected candidate visible. Only explicit
                 // describe requests page a large complete definition.
-                if total == 1 && top.eq_ignore_ascii_case(query.trim()) {
+                if exact {
                     shaping::shape_result(&mut search_result, SEARCH_DESCRIBE_BUDGET_BYTES, client);
                 }
                 let response_content_bytes = search_result["content"][0]["text"]
@@ -38813,7 +38815,7 @@ mod tests {
         );
         let tools: Value = serde_json::from_str(payload).expect("valid search result JSON");
         assert!(
-            tools[0]["inputSchema"].is_object(),
+            tools[0][3].is_object(),
             "the top match must remain ready to invoke with its complete schema"
         );
     }
@@ -38977,7 +38979,8 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(search_text(&reg, &guard, "charges"), first);
         }
-        assert!(first.contains("inputSchema"));
+        let menu: Value = serde_json::from_str(first.split_once("\n\n").unwrap().1).unwrap();
+        assert!(menu[0][3].is_object());
     }
 
     #[test]
