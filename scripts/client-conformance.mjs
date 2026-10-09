@@ -83,11 +83,12 @@ async function changedCatalog(
 async function baseline(profile) {
   await withFixture(profile, false, async (_fixture, client) => {
     await client.initialize();
-    const native = ["claude-code", "codex", "cursor"].includes(profile.id);
+    const native = ["codex", "cursor"].includes(profile.id);
     const tools = await catalog(client, native ? "mock__echo" : "toolport_search_tools");
     assert.equal(
       tools.some((t) => t.name === "toolport_call_tool"),
-      !native,
+      true,
+      "Auto clients retain scoped call helpers, including non-refreshing Full clients",
     );
     if (!native) {
       const search = await client.call("toolport_search_tools", {
@@ -139,6 +140,15 @@ async function replay(profile) {
       pass(`${profile.id}: notification then source/documented re-list profile`);
     } else {
       await client.notification("notifications/tools/list_changed");
+      if (["codex", "cursor"].includes(profile.id)) {
+        const search = await client.call("toolport_search_tools", {
+          query: "mock__greet",
+        });
+        success(search);
+        assert(textOf(search).includes("mock__greet"));
+        success(await client.call("mock__greet", { name: "fixture" }, true));
+        pass(`${profile.id}: Full helpers recover a changed catalog without re-listing`);
+      }
       pass(
         `${profile.id}: notification delivered; client re-list ${profile.listChanged.supported === false ? "unsupported" : "unknown"}`,
       );
