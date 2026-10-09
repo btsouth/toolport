@@ -10142,7 +10142,6 @@ impl HostState {
             cached_tools
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .tools
                 .clone()
         });
         if router_is_fail_closed(router) {
@@ -10172,18 +10171,18 @@ impl HostState {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 Arc::make_mut(&mut guard).adopt_restored_routes(prev, &tools);
             }
-            let next = Arc::new(CatalogSnapshot::new(tools.clone()));
+            let next = Arc::new(CatalogSnapshot::new(tools));
             let index_bytes = next.search.estimated_auxiliary_bytes();
             *cached_tools
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&next);
             gtrace(&format!(
                 "search index rebuilt: {} tools, ~{} KiB auxiliary, {:.2} ms",
-                tools.len(),
+                next.tools.len(),
                 index_bytes.div_ceil(1024),
                 started.elapsed().as_secs_f64() * 1000.0
             ));
-            save_tool_cache(&tools, profile);
+            save_tool_cache(&next.tools, profile);
         }
         if let (Some(previous), Some(previous_router)) =
             (previous_catalog.as_deref(), previous_router)
@@ -10191,7 +10190,6 @@ impl HostState {
             let current = cached_tools
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .tools
                 .clone();
             let current_router = router
                 .lock()
@@ -10205,8 +10203,8 @@ impl HostState {
             notify_tools_changed_for_catalog_diff(
                 stdio,
                 mcp_sessions,
-                previous,
-                &current,
+                &previous.tools,
+                &current.tools,
                 previous_router,
                 &current_router,
                 &reg,
@@ -10590,10 +10588,10 @@ fn adopt_reconnected_servers(
             .router
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (**guard).clone()
+        Arc::clone(&guard)
     };
     let previous_adapter_tools = host.adapter_tools_before_refresh(&previous_router);
-    let mut next = previous_router.clone();
+    let mut next = (*previous_router).clone();
     let adopted = next.adopt_ready_reconnects();
     if adopted.is_empty() {
         return;

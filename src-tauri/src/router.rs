@@ -1519,7 +1519,8 @@ pub struct Router {
     /// linear scan and without locking any server to read its id.
     by_id: HashMap<String, usize>,
     /// Exposed (client-facing) tools, names already sanitized, in add order.
-    tools: Vec<Value>,
+    /// Router snapshots share definitions until indexing changes this view.
+    tools: Arc<Vec<Value>>,
     /// Exposed tool name -> (server id, original downstream tool name).
     routes: HashMap<String, (String, String)>,
     /// Argument aliases compiled alongside the published tool definitions.
@@ -1858,7 +1859,7 @@ impl Router {
                         .insert(exposed.clone(), Arc::new(arguments));
                 }
             }
-            self.tools.push(t);
+            Arc::make_mut(&mut self.tools).push(t);
             self.routes
                 .insert(exposed, (server_id.to_string(), orig.to_string()));
 
@@ -2582,7 +2583,7 @@ impl Router {
     }
 
     pub fn aggregated_tools(&self) -> Vec<Value> {
-        let mut tools = self.tools.clone();
+        let mut tools = self.tools.as_ref().clone();
         // MCP 2026-07-28 recommends deterministic tool ordering so both response
         // caches and LLM prompt caches survive incidental downstream reorderings.
         // Exposed names are unique, making them a stable total key across refreshes
@@ -2977,6 +2978,11 @@ impl Router {
             let Some(exposed) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
+            // Healthy definitions remain available from the live slots. Retaining
+            // them as restoration candidates duplicates every schema on reconnect.
+            if self.routes.contains_key(exposed) {
+                continue;
+            }
             // The previous router indexed the same exposed name; reuse its
             // (server, original) pair verbatim instead of re-deriving it.
             let Some((server_id, original)) = previous.route_of(exposed) else {
@@ -3030,7 +3036,10 @@ impl Router {
                 let Some((server_id, original)) = unrestricted.route_of(exposed) else {
                     continue;
                 };
-                if collapsed.contains(server_id) && seen.insert(exposed.to_string()) {
+                if collapsed.contains(server_id)
+                    && !self.routes.contains_key(exposed)
+                    && seen.insert(exposed.to_string())
+                {
                     candidates.push(RestoredTool {
                         definition: tool.clone(),
                         exposed: exposed.to_string(),
@@ -3075,7 +3084,7 @@ impl Router {
                 self.schema_arguments
                     .insert(candidate.exposed.clone(), Arc::clone(arguments));
             }
-            self.tools.push(candidate.definition.clone());
+            Arc::make_mut(&mut self.tools).push(candidate.definition.clone());
             self.seen.insert(candidate.exposed.clone());
         }
     }
@@ -3104,7 +3113,7 @@ impl Router {
 
     fn rebuild_aggregation_with_reserved(&mut self, restored: &[RestoredTool]) {
         self.restored_candidates.clear();
-        self.tools.clear();
+        self.tools = Arc::default();
         self.catalog_servers.clear();
         self.routes.clear();
         self.schema_arguments.clear();
@@ -5936,6 +5945,28 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn cloned_router_shares_definitions_until_indexing_changes_its_view() {
+        let _data = crate::registry::DataDirTestEnv::new("cloned_router_shares_definitions_until_indexing_changes_its_view");
+        let mut base = Router::new();
+        base.add(mock_server("shared"));
+        let before = base.aggregated_tools();
+        let mut view = base.clone();
+        assert!(Arc::ptr_eq(&base.tools, &view.tools));
+
+        view.add(mock_server("another"));
+        assert!(!Arc::ptr_eq(&base.tools, &view.tools));
+        assert_eq!(base.aggregated_tools(), before);
+        assert!(base.route_of("another__echo").is_none());
+        assert!(view.route_of("another__echo").is_some());
+
+        let snapshot = view.clone();
+        view.requarantine(BTreeSet::from(["shared__echo".to_string()]));
+        assert!(view.route_of("shared__echo").is_none());
+        assert!(snapshot.route_of("shared__echo").is_some());
+        assert_eq!(base.aggregated_tools(), before);
+    }
+
+    #[test]
     fn profile_views_share_downstreams_but_reindex_distinct_tool_scopes() {
         let mut base = Router::with_policy(ToolPolicy {
             allow: HashMap::from([("shared".to_string(), HashSet::new())]),
@@ -6478,6 +6509,24 @@ for line in sys.stdin:
         // The other 39 restored tools are still adopted (3 degraded + 36 more).
         assert!(names.contains("atlassian__t39"));
         assert_eq!(names.len(), 39, "3 degraded + 36 restored, t30 quarantined");
+    }
+
+    #[test]
+    fn healthy_catalogs_are_not_retained_as_restoration_candidates() {
+        let _data = crate::registry::DataDirTestEnv::new("healthy_catalogs_are_not_retained_as_restoration_candidates");
+        let previous = router_with_catalogs(&[("healthy", 40)]);
+        let mut rebuilt = router_with_catalogs(&[("healthy", 40)]);
+        let catalog = previous.aggregated_tools();
+        rebuilt.adopt_restored_routes(&previous, &catalog);
+        assert!(rebuilt.restored_candidates.is_empty());
+        assert_eq!(rebuilt.aggregated_tools(), catalog);
+
+        let profile = rebuilt.with_tool_allow(HashMap::from([(
+            "healthy".to_string(),
+            HashSet::from(["t39".to_string()]),
+        )]));
+        assert_eq!(profile.aggregated_tools().len(), 1);
+        assert_eq!(profile.route_of("healthy__t39"), Some(("healthy", "t39")));
     }
 
     #[test]
