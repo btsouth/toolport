@@ -6058,19 +6058,19 @@ fn repair_gateway_entry(
             {
                 return Err("Invalid gateway scope environment".into());
             }
-        }
-        if let Some(value) = [key, legacy].into_iter().find_map(|candidate| {
-            prior[env_key]
+            if let Some(value) = prior[env_key]
                 .get(candidate)
                 .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-        }) {
-            entry.env.push(crate::registry::EnvVar {
-                key: key.into(),
-                value: Some(value.into()),
-                secret: false,
-                unknown_fields: Default::default(),
-            });
+            {
+                // Empty values mask inherited scope variables. Keep both aliases
+                // as written so inherited modern keys keep their precedence.
+                entry.env.push(crate::registry::EnvVar {
+                    key: candidate.into(),
+                    value: Some(value.into()),
+                    secret: false,
+                    unknown_fields: Default::default(),
+                });
+            }
         }
     }
     entry.env.push(crate::registry::EnvVar {
@@ -6638,13 +6638,14 @@ fn gateway_entry_needs_rewrite(
     {
         return true;
     }
-    // Migrate CONDUIT_CLIENT_ID / CONDUIT_PROFILE → TOOLPORT_* on launch when the
-    // entry name and path are already current (SOU-318 only renamed the key).
+    // Legacy-only entries need display identity once. Preserve their scope keys
+    // because normalizing aliases can override an inherited modern scope value.
     if let Some(text) = config_text {
         let has_legacy = text.contains(crate::brand::CLIENT_ID_LEGACY)
             || text.contains(crate::brand::PROFILE_LEGACY);
-        let has_new =
-            text.contains(crate::brand::CLIENT_ID) || text.contains(crate::brand::PROFILE);
+        let has_new = text.contains(crate::brand::CLIENT_ID)
+            || text.contains(crate::brand::PROFILE)
+            || text.contains(crate::brand::ATTRIBUTION_ID);
         if has_legacy && !has_new {
             return true;
         }
@@ -9424,6 +9425,12 @@ bad = "not-a-table"
             current,
             Some(r#"{"env":{"TOOLPORT_CLIENT_ID":"claude-code"}}"#)
         ));
+        assert!(!gateway_entry_needs_rewrite(
+            GATEWAY_ENTRY_NAME,
+            current,
+            current,
+            Some(r#"{"env":{"CONDUIT_CLIENT_ID":"claude-code","TOOLPORT_ATTRIBUTION_ID":"claude-code"}}"#)
+        ));
 
         // Installing over a config whose only gateway entry is the legacy name renames
         // it in place: the entry is retained-out by identity and re-inserted under the
@@ -9689,10 +9696,12 @@ command = "npx"
             let raw = serde_json::json!({"mcpServers":{"conduit":{"command":command,"env":{"TOOLPORT_PROFILE":"narrow","CONDUIT_CLIENT_ID":"existing"}}}});
             std::fs::write(&path, raw.to_string()).unwrap();
             repair_secondary_claude_config(&path, current.to_str().unwrap()).unwrap();
-            let after: serde_json::Value = serde_json::from_str(&read_config_file(&path).unwrap()).unwrap();
+            let after: serde_json::Value =
+                serde_json::from_str(&read_config_file(&path).unwrap()).unwrap();
             let env = &after["mcpServers"][GATEWAY_ENTRY_NAME]["env"];
             assert_eq!(env[crate::brand::PROFILE], "narrow");
-            assert_eq!(env[crate::brand::CLIENT_ID], "existing");
+            assert_eq!(env[crate::brand::CLIENT_ID_LEGACY], "existing");
+            assert!(env.get(crate::brand::CLIENT_ID).is_none());
             assert_eq!(env[crate::brand::ATTRIBUTION_ID], "claude-code-secondary");
         }
     }
@@ -9709,30 +9718,50 @@ command = "npx"
             let raw = serde_json::json!({"mcpServers":{"toolport":{"command":"conduit-gateway", "env":env}}});
             std::fs::write(&path, raw.to_string()).unwrap();
             let repaired = repair_gateway_entry(
-                Format::JsonMcpServers, &path, GATEWAY_ENTRY_NAME, "claude-code",
-            ).unwrap();
-            let after: std::collections::HashMap<_, _> = repaired.env.iter()
+                Format::JsonMcpServers,
+                &path,
+                GATEWAY_ENTRY_NAME,
+                "claude-code",
+            )
+            .unwrap();
+            let after: std::collections::HashMap<_, _> = repaired
+                .env
+                .iter()
                 .map(|item| (item.key.as_str(), item.value.as_deref().unwrap_or("")))
                 .collect();
             // Explicit empty values mask inherited values. Legacy values must
             // keep their precedence relative to inherited modern values.
             let resolve = |lookup: &dyn Fn(&str) -> Option<String>| {
-                [crate::brand::CLIENT_ID, crate::brand::CLIENT_ID_LEGACY,
-                 crate::brand::PROFILE, crate::brand::PROFILE_LEGACY]
-                    .chunks(2)
-                    .map(|keys| keys.iter().find_map(|key| lookup(key)
-                        .filter(|value| !value.trim().is_empty())))
-                    .collect::<Vec<_>>()
+                [
+                    crate::brand::CLIENT_ID,
+                    crate::brand::CLIENT_ID_LEGACY,
+                    crate::brand::PROFILE,
+                    crate::brand::PROFILE_LEGACY,
+                ]
+                .chunks(2)
+                .map(|keys| {
+                    keys.iter()
+                        .find_map(|key| lookup(key).filter(|value| !value.trim().is_empty()))
+                })
+                .collect::<Vec<_>>()
             };
             let inherited = |key: &str| match key {
                 crate::brand::CLIENT_ID => Some("wide-client".to_string()),
                 crate::brand::PROFILE => Some("wide-profile".to_string()),
                 _ => None,
             };
-            let before = resolve(&|key| env.get(key).and_then(|v| v.as_str())
-                .map(str::to_string).or_else(|| inherited(key)));
-            let after = resolve(&|key| after.get(key).map(|v| (*v).to_string())
-                .or_else(|| inherited(key)));
+            let before = resolve(&|key| {
+                env.get(key)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| inherited(key))
+            });
+            let after = resolve(&|key| {
+                after
+                    .get(key)
+                    .map(|v| (*v).to_string())
+                    .or_else(|| inherited(key))
+            });
             assert_eq!(before, after, "scope environment changed: {env}");
         }
     }
@@ -9749,11 +9778,28 @@ command = "npx"
         })).unwrap();
         for def in defs() {
             reg.client_scopes.insert(def.id.into(), "wide".into());
-            for (scope_key, scope_id, profile) in [
-                (crate::brand::CLIENT_ID, None, Some("narrow")),
-                (crate::brand::CLIENT_ID, None, None),
-                (crate::brand::CLIENT_ID_LEGACY, Some("legacy"), Some("narrow")),
-                (crate::brand::CLIENT_ID, Some("existing"), Some("narrow")),
+            for (scope_key, scope_id, profile, inherit_id) in [
+                (crate::brand::CLIENT_ID, None, Some("narrow"), false),
+                (crate::brand::CLIENT_ID, None, None, false),
+                (
+                    crate::brand::CLIENT_ID_LEGACY,
+                    Some("legacy"),
+                    Some("narrow"),
+                    false,
+                ),
+                (
+                    crate::brand::CLIENT_ID,
+                    Some("existing"),
+                    Some("narrow"),
+                    false,
+                ),
+                (crate::brand::CLIENT_ID, Some(""), Some("narrow"), true),
+                (
+                    crate::brand::CLIENT_ID_LEGACY,
+                    Some("legacy"),
+                    Some("narrow"),
+                    true,
+                ),
             ] {
                 reg.client_scopes.insert("legacy".into(), "narrow".into());
                 reg.client_scopes.insert("existing".into(), "narrow".into());
@@ -9762,41 +9808,87 @@ command = "npx"
                 let mut entry = sample_gateway(profile, def.id);
                 entry.env.retain(|env| env.key != crate::brand::CLIENT_ID);
                 if let Some(id) = scope_id {
-                    entry.env.push(EnvVar {key:scope_key.into(), value:Some(id.into()), secret:false, unknown_fields:Default::default()});
+                    entry.env.push(EnvVar {
+                        key: scope_key.into(),
+                        value: Some(id.into()),
+                        secret: false,
+                        unknown_fields: Default::default(),
+                    });
                 }
                 edit_format(def.format, &path, Some(&entry), true).unwrap();
                 let read_env = || {
                     let text = read_config_file(&path).unwrap();
                     let value = mutation::value(def.format, Some(&text)).unwrap();
                     let container = moved::server_container(def.format, &value);
-                    let entry = if matches!(def.format, Format::YamlMcpServersList) { &container[0] } else { &container[GATEWAY_ENTRY_NAME] };
-                    let key = match def.format { Format::YamlExtensions => "envs", Format::JsonOpenCodeMcp => "environment", _ => "env" };
+                    let entry = if matches!(def.format, Format::YamlMcpServersList) {
+                        &container[0]
+                    } else {
+                        &container[GATEWAY_ENTRY_NAME]
+                    };
+                    let key = match def.format {
+                        Format::YamlExtensions => "envs",
+                        Format::JsonOpenCodeMcp => "environment",
+                        _ => "env",
+                    };
                     entry[key].as_object().cloned().unwrap_or_default()
                 };
-                let effective_tools = |env: &serde_json::Map<String, serde_json::Value>| {
-                    let id = [crate::brand::CLIENT_ID, crate::brand::CLIENT_ID_LEGACY].into_iter().find_map(|key| env.get(key).and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()));
-                    let profile = env.get(crate::brand::PROFILE).and_then(|v| v.as_str()).map(str::to_string);
+                let effective_launch = |env: &serde_json::Map<String, serde_json::Value>| {
+                    let id = [crate::brand::CLIENT_ID, crate::brand::CLIENT_ID_LEGACY]
+                        .into_iter()
+                        .find_map(|key| {
+                            env.get(key)
+                                .and_then(|v| v.as_str())
+                                .or_else(|| {
+                                    (inherit_id && key == crate::brand::CLIENT_ID).then_some(def.id)
+                                })
+                                .filter(|s| !s.trim().is_empty())
+                        });
+                    let profile = env
+                        .get(crate::brand::PROFILE)
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
                     let profile = resolve_launch_profile(&reg, id, &profile).unwrap();
-                    let mut tools: Vec<_> = reg.enabled_servers_for(&profile).iter().flat_map(|server| {
-                        let allowlist = reg.access_profile(&profile).and_then(|p| p.tool_scope.get(&server.id));
-                        ["echo", "add"].into_iter().filter(move |tool| allowlist.is_none_or(|list| list.iter().any(|t| t == tool))).map(move |tool| format!("{}__{tool}", server.id))
-                    }).collect();
+                    let mut tools: Vec<_> = reg
+                        .enabled_servers_for(&profile)
+                        .iter()
+                        .flat_map(|server| {
+                            let allowlist = reg
+                                .access_profile(&profile)
+                                .and_then(|p| p.tool_scope.get(&server.id));
+                            ["echo", "add"]
+                                .into_iter()
+                                .filter(move |tool| {
+                                    allowlist.is_none_or(|list| list.iter().any(|t| t == tool))
+                                })
+                                .map(move |tool| format!("{}__{tool}", server.id))
+                        })
+                        .collect();
                     tools.sort();
-                    tools
+                    (profile, tools)
                 };
                 let before = read_env();
                 backfill_gateway_identity(&def, &path, GATEWAY_ENTRY_NAME, def.id).unwrap();
                 let after = read_env();
-                assert_eq!(effective_tools(&before), effective_tools(&after), "{} scope changed", def.id);
-                for key in [crate::brand::CLIENT_ID, crate::brand::CLIENT_ID_LEGACY, crate::brand::PROFILE] {
+                assert_eq!(
+                    effective_launch(&before),
+                    effective_launch(&after),
+                    "{} scope changed",
+                    def.id
+                );
+                for key in [
+                    crate::brand::CLIENT_ID,
+                    crate::brand::CLIENT_ID_LEGACY,
+                    crate::brand::PROFILE,
+                    crate::brand::PROFILE_LEGACY,
+                ] {
                     assert_eq!(before.get(key), after.get(key), "{} {key} changed", def.id);
                 }
                 let repaired =
                     repair_gateway_entry(def.format, &path, GATEWAY_ENTRY_NAME, def.id).unwrap();
                 edit_format(def.format, &path, Some(&repaired), true).unwrap();
                 assert_eq!(
-                    effective_tools(&before),
-                    effective_tools(&read_env()),
+                    effective_launch(&before),
+                    effective_launch(&read_env()),
                     "{} command repair scope changed",
                     def.id
                 );
