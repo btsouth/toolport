@@ -531,16 +531,22 @@ pub fn resolve(reference: &str) -> Result<String, ResolveError> {
             .filter(|v| !v.is_empty() && !v.chars().any(char::is_control))
             .ok_or_else(|| error(Some(p), ErrorState::NotFound));
     }
-    if p.scheme == "bw://"
-        && std::env::var("BW_SESSION")
+    let binary = checked_cli(
+        p,
+        &install_dirs(),
+        std::env::var("BW_SESSION")
             .ok()
-            .is_none_or(|v| v.is_empty())
-    {
+            .is_some_and(|v| !v.is_empty()),
+    )?;
+    read_cli(p, reference, &binary, TIMEOUT)
+}
+
+fn checked_cli(p: &Provider, dirs: &[PathBuf], bw_session: bool) -> Result<PathBuf, ResolveError> {
+    let binary = cli_in(p, dirs).ok_or_else(|| error(Some(p), ErrorState::NotInstalled))?;
+    if p.scheme == "bw://" && !bw_session {
         return Err(error(Some(p), ErrorState::Locked));
     }
-    let binary =
-        cli_in(p, &install_dirs()).ok_or_else(|| error(Some(p), ErrorState::NotInstalled))?;
-    read_cli(p, reference, &binary, TIMEOUT)
+    Ok(binary)
 }
 
 /// A transient clone consumed only by a connection. Never pass it to registry/sync writers.
@@ -823,6 +829,30 @@ mod tests {
             "  synthetic-ref-value  "
         );
     }
+    #[cfg(unix)]
+    #[test]
+    fn bitwarden_missing_cli_and_missing_session_are_distinct() {
+        let tmp = Scratch::new();
+        let p = &PROVIDERS[5];
+        assert_eq!(
+            checked_cli(p, std::slice::from_ref(&tmp.0), false)
+                .unwrap_err()
+                .state,
+            ErrorState::NotInstalled
+        );
+        let binary = tmp.fake(p.binary, "exit 1");
+        assert_eq!(
+            checked_cli(p, std::slice::from_ref(&tmp.0), false)
+                .unwrap_err()
+                .state,
+            ErrorState::Locked
+        );
+        assert_eq!(
+            checked_cli(p, std::slice::from_ref(&tmp.0), true).unwrap(),
+            binary
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn fake_path_not_installed_and_relative_path_are_rejected() {
