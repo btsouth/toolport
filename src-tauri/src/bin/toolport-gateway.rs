@@ -2330,6 +2330,21 @@ impl CatalogSnapshot {
         let search = CatalogSearchIndex::build(&tools);
         Self { tools, search }
     }
+
+    fn has_tool_prefix(&self, prefix: &str) -> bool {
+        // Snapshot names are sorted. Discovery checks each server on every list,
+        // so find its first possible name instead of scanning the whole catalog.
+        let index = self.tools.0.partition_point(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_none_or(|name| name < prefix)
+        });
+        self.tools
+            .get(index)
+            .and_then(|tool| tool.get("name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.starts_with(prefix))
+    }
 }
 
 impl Default for CatalogSnapshot {
@@ -14963,13 +14978,7 @@ fn process_request_wire(
         live.discover_uncached(|id| {
             allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
                 && (discovery == DiscoveryMode::Full
-                    || !cached.tools.iter().any(|tool| {
-                        tool.get("name")
-                            .and_then(Value::as_str)
-                            .is_some_and(|name| {
-                                name.starts_with(&format!("{}__", sanitize_segment(id)))
-                            })
-                    }))
+                    || !cached.has_tool_prefix(&format!("{}__", sanitize_segment(id))))
         });
     }
 
@@ -15227,11 +15236,7 @@ fn process_request_wire(
             // when publication has not yet added this server's tools.
             let search_cache_lag = search_server.is_some_and(|server| {
                 let prefix = format!("{}__", sanitize_segment(server));
-                !cache_snapshot.tools.iter().any(|tool| {
-                    tool.get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| name.starts_with(&prefix))
-                })
+                !cache_snapshot.has_tool_prefix(&prefix)
             });
             if !daemon_adapter
                 && (cold && (method == "tools/list" || tool_search) || search_cache_lag)
@@ -38936,6 +38941,28 @@ mod tests {
             assert_eq!(indexed.broadened, rebuilt.broadened);
             assert_eq!(indexed.direct_returned, rebuilt.direct_returned);
         }
+    }
+
+    #[test]
+    fn cached_prefix_discovery_keeps_nested_and_overridden_names() {
+        let snapshot = CatalogSnapshot::new(vec![
+            json!({"name":"zz__read"}),
+            json!({"name":"a__b__read"}),
+            json!({"name":"a___read"}),
+            json!({"name":"renamed"}),
+            json!({"name":"aaaa__read"}),
+            json!({"name":7}),
+            json!({}),
+        ]);
+        assert!(snapshot.has_tool_prefix("a__"));
+        assert!(snapshot.has_tool_prefix("a__b__"));
+        assert!(snapshot.has_tool_prefix("a___"));
+        assert!(snapshot.has_tool_prefix("aaaa__"));
+        assert!(snapshot.has_tool_prefix("zz__"));
+        assert!(!snapshot.has_tool_prefix("aa__"));
+        assert!(!snapshot.has_tool_prefix("a__missing__"));
+        assert!(!snapshot.has_tool_prefix("renamed__"));
+        assert!(!CatalogSnapshot::default().has_tool_prefix("a__"));
     }
 
     #[test]
