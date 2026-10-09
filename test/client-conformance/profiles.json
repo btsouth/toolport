@@ -226,7 +226,7 @@
         "detail": "No generic list-change handler found in pinned source"
       },
       "source": "docs/clients.md",
-      "observedSessionKind": "CLI health command, not model session",
+      "observedSessionKind": "unauthenticated CLI startup via exec; no successful model turn",
       "variants": [
         {
           "kind": "app-server MCP status, no model turn",

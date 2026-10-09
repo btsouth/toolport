@@ -6,7 +6,7 @@ Run the fixture suite on devbox or CI:
 npm run test:client-conformance
 ```
 
-It builds with `test-support`, replays captured health-command initialize params
+It builds with `test-support`, replays captured startup/health-command initialize params
 through the real stdio adapter and daemon, and exercises Auto discovery for every
 adapter in the generated client inventory. Cold Lazy search waits for the first
 visible catalog within the client budget, including when no server filter is
@@ -25,7 +25,7 @@ The captured profiles cover Claude Code, Codex, Cursor, OpenCode, Gemini CLI,
 Qwen Code, Kilo Code and Hermes. Health commands may only initialize or ping, so their
 actual follow-up method sequence is replayed separately from synthetic calls.
 Cursor's health command opened two sessions; the profile represents one session.
-Codex has separate CLI and app-server status captures. A two-client check also
+Codex has separate unauthenticated CLI startup and app-server status captures. A two-client check also
 uses the same request ID in both sessions and verifies isolated responses while
 sharing one daemon and downstream connection.
 

@@ -318,7 +318,7 @@ try {
   }
   pass("failed executable spawn cleans up without waiting for an impossible exit");
   console.log(
-    `Client conformance: ${checks} scenario groups passed; ${profiles.length} adapter baselines, ${captures.length} captured health variants across ${profiles.filter((p) => p.initialize).length} clients. Authenticated model/GUI acceptance not implied.`,
+    `Client conformance: ${checks} scenario groups passed; ${profiles.length} adapter baselines, ${captures.length} captured startup/health variants across ${profiles.filter((p) => p.initialize).length} clients. Authenticated model/GUI acceptance not implied.`,
   );
 } catch (error) {
   console.error(`[FAIL] ${error.stack}`);
