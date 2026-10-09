@@ -314,7 +314,9 @@ impl Session {
             row["firstCatalogSize"] = json!(count);
             row["firstCatalogRevision"] = json!(revision);
         }
-        if let Some(path) = &self.audit_path { crate::audit::record_session_at(path, row); }
+        if let Some(path) = &self.audit_path {
+            crate::audit::record_session_at(path, row);
+        }
     }
 }
 impl Drop for Session {
