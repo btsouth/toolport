@@ -1450,16 +1450,16 @@ fn status_tool_def() -> Value {
 fn search_tool_def() -> Value {
     json!({
         "name": "toolport_search_tools",
-        "description": "Your gateway to every connected MCP server's tools; use it first for any \
-            external action or data. Menu rows are [name, description, required parameters, \
-            optional full schema]; the first row always includes its schema. Search an exact \
-            name for the complete single definition. Pick by description and call with toolport_call_tool.",
+        "description": "Search live tools before declaring one absent; local filters miss this inventory. \
+            Up to ten rows: [name, description, required parameters, optional schema]; \
+            #1 has its full schema. Search an exact name for its complete definition. \
+            Pick by description; call with toolport_call_tool.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": { "type": "string", "maxLength": MAX_SEARCH_QUERY_CHARS, "description": "Keywords for the capability you need, e.g. \"list emails\". An empty value with `server` lists that server's tools." },
                 "server": { "type": "string", "description": "Optional: limit to this server by name/prefix." },
-                "limit": { "type": "integer", "description": "Retained for compatibility. The menu always returns up to 10 candidates." }
+                "limit": { "type": "integer", "description": "Compatibility only. Always up to 10 candidates." }
             },
             "required": ["query"],
             "additionalProperties": false
@@ -1839,7 +1839,7 @@ fn help_tool_def(prefix: &str, tool_count: usize) -> Value {
         "description": format!(
             "Browse {tool_count} tools on \"{prefix}\" before declaring a capability absent. Filter with `query`; empty lists tools. \
              Call toolport_call_tool with `name` set to the exact name shown. \
-             For schemaOmitted, search the exact tool name."
+             Search an exact tool name for its complete definition."
         ),
         "inputSchema": {
             "type": "object",
@@ -38906,19 +38906,34 @@ mod tests {
             let allowed = access
                 .as_ref()
                 .map(|servers| servers.iter().cloned().collect());
-            let response = handle_request(
-                &host,
-                &request,
-                &reg,
-                &router,
-                &catalog,
-                true,
-                None,
-                &SearchGuard::default(),
-                allowed.as_ref(),
-                None,
-            )
-            .unwrap();
+            let run = |mode, client| {
+                handle_request_with_cancel(
+                    &host,
+                    &request,
+                    &reg,
+                    &router,
+                    &catalog,
+                    mode,
+                    None,
+                    &SearchGuard::default(),
+                    allowed.as_ref(),
+                    None,
+                    client,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+            let response = run(DiscoveryMode::Lazy, Some("claude-code"));
+            for client in ["adapter:codex", "adapter:cursor"] {
+                assert_eq!(
+                    run(DiscoveryMode::Full, Some(client))["result"]["content"],
+                    response["result"]["content"],
+                    "Full recovery must return the same scoped menu and prerequisites: {client}"
+                );
+            }
             let text = response["result"]["content"][0]["text"].as_str().unwrap();
             let entries: Vec<Value> =
                 serde_json::from_str(text.split_once("\n\n").unwrap().1).unwrap();
