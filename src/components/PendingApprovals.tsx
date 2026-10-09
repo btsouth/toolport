@@ -61,16 +61,18 @@ export function PendingApprovals() {
   const prevCount = useRef(0);
   // Monotonic request id: the interval poll, both event listeners, and a decision's error
   // path can all start a refresh, so an older response can land last and momentarily
-  // resurrect a resolved row (or hide a new one). Only the newest request may write,
-  // the same guard the sidebar badge and the quarantine card already carry.
+  // resurrect a resolved row (or hide a new one). Order applied responses rather than
+  // outstanding requests so a slow IPC call is not starved by every newer poll.
   const reqId = useRef(0);
+  const appliedId = useRef(0);
 
   const refresh = useCallback(async () => {
     const id = ++reqId.current;
     try {
       const list = await listPendingApprovals();
-      // A stale response must not write: the newer list is the authority.
-      if (id !== reqId.current) return;
+      // A response older than the last applied list must not write.
+      if (id <= appliedId.current) return;
+      appliedId.current = id;
       setPending(list);
       // Prune resolving ids the backend has confirmed gone (authoritative removal).
       setResolving((s) => {
@@ -115,7 +117,9 @@ export function PendingApprovals() {
     setResolving((s) => new Set(s).add(id));
     try {
       await decideApproval(id, approved, scope);
-      // Intentionally NOT removed here — the approval-resolved event + poll remove it.
+      // Read the authoritative queue after the acknowledgement as well as on
+      // events. A delayed or missed event must not leave the decision onscreen.
+      await refresh();
     } catch (e) {
       toastError(`Couldn't record your decision: ${e}`);
       setResolving((s) => {

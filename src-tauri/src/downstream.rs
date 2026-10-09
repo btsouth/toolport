@@ -12598,8 +12598,8 @@ for line in sys.stdin:
         );
         let other = fixture.request("other", json!({"name":"other"}), None);
         fixture.wait_for_pending(3);
-        // Registration precedes the write. Exercise cancellation of an in-flight
-        // call, rather than racing a valid cancellation before dispatch.
+        // Pending registration precedes the write. This case asserts three
+        // dispatched calls, so neither cancellation nor reset may win first.
         for name in ["cancelled", "other"] {
             fixture.wait_for_frame(name, |frame| {
                 frame["method"] == "tools/call" && frame["params"]["name"] == name
