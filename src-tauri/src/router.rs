@@ -9067,6 +9067,7 @@ for line in sys.stdin:
 
     #[test]
     fn call_auth_keeps_demands_open_and_recovers_on_success() {
+        let _data = crate::registry::DataDirTestEnv::new("f3-call-auth-keeps-demands-open");
         use crate::call_failure::AuthTarget;
         for target in [
             AuthTarget::Endpoint,
@@ -9381,6 +9382,7 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_service_credentials_wait_for_configuration_changes() {
+        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-service-credentials");
         let calls = Arc::new(AtomicU64::new(0));
         let count = Arc::clone(&calls);
         let connect: Connect = Arc::new(move || {
