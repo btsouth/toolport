@@ -35,8 +35,9 @@ export function referenceProvider(reference?: string) {
 }
 
 export function secretReferenceReview(server: import("./types").ServerEntry): string[] {
-  const destination =
-    server.url || [server.command, ...server.args].filter(Boolean).join(" ");
+  const destination = server.command
+    ? [server.command, ...server.args].join(" ")
+    : server.url || "unknown destination";
   const uses = [
     ...server.env.map((e) => ({ field: `env:${e.key}`, ref: e.source?.ref })),
     ...(server.launch?.inputs ?? []).map((i) => ({
@@ -48,7 +49,7 @@ export function secretReferenceReview(server: import("./types").ServerEntry): st
       ref: h.source?.ref ?? server.env.find((e) => e.key === h.env)?.source?.ref,
     })),
   ];
-  if (server.transport !== "stdio" && !server.headerKeys?.length) {
+  if (!server.command && server.transport !== "stdio" && !server.headerKeys?.length) {
     const bearer = server.env.find((e) => e.secret && e.source);
     if (bearer)
       uses.push({

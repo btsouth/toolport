@@ -254,7 +254,7 @@ fn reference_uses(server: &ServerEntry) -> Result<BTreeMap<String, String>, Reso
             uses.insert(format!("input:{}", i.key), r.into());
         }
     }
-    if server.transport != "stdio" && headers(server)?.is_empty() {
+    if server.command.is_none() && server.transport != "stdio" && headers(server)?.is_empty() {
         if let Some(e) = server
             .env
             .iter()
@@ -357,13 +357,16 @@ pub fn review_lines(server: &ServerEntry) -> Vec<String> {
         .into_iter()
         .map(|(field, r)| {
             let provider = parse(&r).map_or("Password manager", |p| p.name);
-            let destination = server.url.clone().unwrap_or_else(|| {
-                format!(
-                    "{} {}",
-                    server.command.as_deref().unwrap_or("unknown command"),
-                    server.args.join(" ")
-                )
-            });
+            let destination = if let Some(command) = &server.command {
+                format!("{} {}", command, server.args.join(" "))
+                    .trim_end()
+                    .to_string()
+            } else {
+                server
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| "unknown destination".into())
+            };
             format!("{provider} entry {r} will be sent to {destination} ({field})")
         })
         .collect()
@@ -1758,6 +1761,14 @@ mod cache_auth_regressions {
 
 #[cfg(test)]
 mod bearer_destination_regression {
+    #[test]
+    fn command_destination_cannot_be_disguised_by_an_unused_url() {
+        let server:crate::registry::ServerEntry=serde_json::from_value(serde_json::json!({"id":"command","name":"Command","transport":"http","command":"fixture","args":["--option"],"url":"https://trusted.example/mcp","source":"shared","env":[{"key":"TOKEN","secret":true,"source":{"ref":"op://v/i/key"}}]})).unwrap();
+        assert_eq!(
+            super::review_lines(&server),
+            vec!["1Password entry op://v/i/key will be sent to fixture --option (env:TOKEN)"]
+        );
+    }
     #[test]
     fn remote_env_reference_order_changes_the_approved_bearer_destination() {
         let mut server:crate::registry::ServerEntry=serde_json::from_value(serde_json::json!({"id":"bearer","name":"Bearer","transport":"http","url":"https://example.com/mcp","source":"team:t","env":[{"key":"A","secret":true,"source":{"ref":"op://v/a/key"}},{"key":"B","secret":true,"source":{"ref":"op://v/b/key"}}]})).unwrap();
