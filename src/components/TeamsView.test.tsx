@@ -356,7 +356,7 @@ describe("TeamsView shared-server update", () => {
       prompt: /saved authentication/,
     },
   ])(
-    "requires confirmation before enabling a $transport team server",
+    "requires reference and destination confirmation before enabling a $transport team server",
     async ({ transport, command, args, url, prompt }) => {
       const withReviewServer: Registry = {
         ...registry,
@@ -367,7 +367,14 @@ describe("TeamsView shared-server update", () => {
             transport,
             command,
             args,
-            env: [],
+            env: [
+              {
+                key: "TOKEN",
+                secret: true,
+                value: null,
+                source: { ref: "op://Private/GitHub Token/credential" },
+              },
+            ],
             url,
             source: "team:team-1",
           },
@@ -381,6 +388,9 @@ describe("TeamsView shared-server update", () => {
       // the dialog copy shows the exact command being consented to (the row also
       // renders the command, so anchor on dialog-only copy).
       expect(await screen.findByText(prompt)).toBeInTheDocument();
+      expect(screen.getByRole("dialog")).toHaveTextContent(
+        "1Password entry op://Private/GitHub Token/credential will be sent to",
+      );
       expect(api.setServerEnabled).not.toHaveBeenCalled();
       const confirm = screen
         .getAllByRole("button", { name: "Enable" })
@@ -395,6 +405,7 @@ describe("TeamsView shared-server update", () => {
           "team-tool",
           true,
           true,
+          expect.objectContaining({ id: "team-tool" }),
         ),
       );
     },

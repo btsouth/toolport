@@ -25,7 +25,9 @@ export function SecretReferenceField({
     setResult("");
     try {
       await testSecretReference(serverId, value);
-      setResult("Success in the desktop app environment. The MCP client gateway may use different environment variables or PATH.");
+      setResult(
+        "Success in the desktop app environment. The MCP client gateway may use different environment variables or PATH.",
+      );
     } catch (error) {
       setResult(
         typeof error === "object" && error && "message" in error
@@ -76,7 +78,9 @@ export function SecretReferenceField({
         </Button>
       </div>
       <p className="text-xs text-muted-foreground">
-        Test uses the desktop app environment. The MCP client gateway may use different environment variables or PATH. Only the reference syncs. Sign in to this provider on each machine.
+        Test uses the desktop app environment. The MCP client gateway may use different
+        environment variables or PATH. Only the reference syncs. Sign in to this provider
+        on each machine.
       </p>
       {result && (
         <p role="status" className="text-xs">

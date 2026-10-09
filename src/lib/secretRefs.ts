@@ -35,11 +35,31 @@ export function referenceProvider(reference?: string) {
 }
 
 export function secretReferenceReview(server: import("./types").ServerEntry): string[] {
-  const destination = server.url || [server.command, ...server.args].filter(Boolean).join(" ");
+  const destination =
+    server.url || [server.command, ...server.args].filter(Boolean).join(" ");
   const uses = [
     ...server.env.map((e) => ({ field: `env:${e.key}`, ref: e.source?.ref })),
-    ...(server.launch?.inputs ?? []).map((i) => ({ field: `input:${i.key}`, ref: i.source?.ref })),
-    ...(server.headerKeys ?? []).map((h) => ({ field: `header:${h.key}`, ref: h.source?.ref ?? server.env.find((e) => e.key === h.env)?.source?.ref })),
+    ...(server.launch?.inputs ?? []).map((i) => ({
+      field: `input:${i.key}`,
+      ref: i.source?.ref,
+    })),
+    ...(server.headerKeys ?? []).map((h) => ({
+      field: `header:${h.key}`,
+      ref: h.source?.ref ?? server.env.find((e) => e.key === h.env)?.source?.ref,
+    })),
   ];
-  return uses.filter((u) => u.ref).map((u) => `${referenceProvider(u.ref)?.name ?? "Password manager"} entry ${u.ref} will be sent to ${destination} (${u.field})`);
+  if (server.transport !== "stdio" && !server.headerKeys?.length) {
+    const bearer = server.env.find((e) => e.secret && e.source);
+    if (bearer)
+      uses.push({
+        field: `header:Authorization (env:${bearer.key})`,
+        ref: bearer.source?.ref,
+      });
+  }
+  return uses
+    .filter((u) => u.ref)
+    .map(
+      (u) =>
+        `${referenceProvider(u.ref)?.name ?? "Password manager"} entry ${u.ref} will be sent to ${destination} (${u.field})`,
+    );
 }

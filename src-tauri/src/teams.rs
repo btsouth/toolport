@@ -4434,6 +4434,19 @@ fn restore_local_launch_values(
 }
 
 fn restore_local_references(entry: &mut ServerEntry, old: &ServerEntry) {
+    if let Some(overrides) = old.unknown_fields.get("memberSecretRefs").and_then(Value::as_object) {
+        entry.unknown_fields.insert("memberSecretRefs".into(), json!(overrides));
+        for (location, reference) in overrides {
+            let Some((field,key)) = location.split_once(':') else { continue; };
+            match field {
+                "env" => if let Some(env) = entry.env.iter_mut().find(|e| e.key == key) { env.secret=true;env.value=None;env.unknown_fields.insert("source".into(),json!({"ref":reference})); },
+                "input" => if let Some(input) = entry.launch.iter_mut().flat_map(|l| &mut l.inputs).find(|i| i.key == key) { input.secret=true;input.value=None;input.unknown_fields.insert("source".into(),json!({"ref":reference})); },
+                "header" => if let Some(headers) = entry.unknown_fields.get_mut("headerKeys").and_then(Value::as_array_mut) { for h in headers.iter_mut().filter(|h| h["key"] == key) { h["source"]=json!({"ref":reference}); } },
+                _ => {},
+            }
+        }
+    }
+
     for env in &mut entry.env {
         if !env.unknown_fields.contains_key("source") {
             if let Some(r) = old
@@ -4870,6 +4883,42 @@ pub fn remove_team(reg: &mut Registry, team_id: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn activation_counts_reference_inputs_as_configured_without_reading_keychain() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let endpoint = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let mut reg = publisher_registry();
+            let conn = reg.team.as_mut().unwrap();
+            conn.server_url = format!("http://{}",endpoint.server_addr());
+            conn.reporting_device_id = "0123456789abcdef0123456789abcdef".into();
+            conn.managed_server_ids.insert("refs".into(),"shared-refs".into());
+            let conn = conn.clone();
+            reg.servers.push(serde_json::from_value(json!({"id":"refs","name":"Refs","source":"team:publisher-test","transport":"stdio","command":"fixture","args":["<launch-input>"],"env":[{"key":"TOKEN","secret":true,"source":{"ref":"op://Private/Token/key"}}],"launch":{"inputs":[{"key":"INPUT","label":"Input","secret":true,"required":true,"source":{"ref":"vault://secret/service#key"}}],"bindings":[{"index":0,"parts":[{"kind":"input","key":"INPUT"}]}],"requiredEnv":["TOKEN"]}})).unwrap());
+            crate::registry::save(&reg).unwrap();
+            let worker = std::thread::spawn(move || {
+                let mut request = endpoint.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+                let mut body=String::new();request.as_reader().read_to_string(&mut body).unwrap();
+                let body:Value=serde_json::from_str(&body).unwrap();
+                assert_eq!(body["missingCredentials"],0);
+                assert_eq!(body["servers"]["shared-refs"]["missingCredentials"],0);
+                request.respond(tiny_http::Response::from_string(json!({"acknowledgedRevision":body["revision"]}).to_string())).unwrap();
+            });
+            report_activation(&conn,"fixture-token").unwrap();worker.join().unwrap();
+        });
+    }
+    #[test]
+    fn member_override_wins_over_shared_reference_and_is_never_exported() {
+        let mut reg=base_registry();
+        let config=json!({"servers":[{"id":"service","name":"Service","transport":"stdio","command":"fixture","env":[{"key":"TOKEN","source":{"ref":"op://Team/Token/key"}}]}]});
+        apply_team_config(&mut reg,"t",&config);
+        let id=reg.servers.iter().find(|s|s.source.as_deref()==Some("team:t")).unwrap().id.clone();
+        crate::registry_controller::apply_secret_reference(&mut reg,&id,"TOKEN","op://Private/My Token/key").unwrap();
+        apply_team_config(&mut reg,"t",&config);
+        let s=reg.servers.iter().find(|s|s.id==id).unwrap();
+        assert_eq!(crate::secret_refs::reference_for(&s.env[0]),Some("op://Private/My Token/key"));
+        let export=crate::sharing_controller::build_export(&reg,None,None,None);
+        assert!(!export.to_string().contains("memberSecretRefs"));
+    }
     #[test]
     fn public_remote_references_are_reviewed_and_environment_attacks_blocked() {
         let config = json!({"id":"ref","name":"Ref","transport":"http","url":"https://example.com/mcp","headerKeys":[{"key":"X-Api-Key","source":{"ref":"op://Private/GitHub Token/credential"}}]});

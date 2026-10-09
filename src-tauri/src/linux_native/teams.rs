@@ -1128,7 +1128,7 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
     };
     let target = format!(
         "{target}\n{}",
-        crate::secret_refs::review_lines(server).join("\n")
+        crate::secret_refs::review_lines(&server).join("\n")
     );
     copy.append(
         &gtk::Label::builder()

@@ -38,6 +38,7 @@ pub(crate) fn build_export(
         .map(|server| {
             let mut server = server.clone();
             server.id.clear();
+            server.unknown_fields.remove("memberSecretRefs");
             for entry in &mut server.env {
                 entry.value = None;
             }
@@ -204,6 +205,7 @@ pub(crate) fn apply_import_selected(
         if let Some(launch) = &server.launch {
             server.launch = Some(launch.without_values());
         }
+        server.unknown_fields.remove("memberSecretRefs");
         server.source = Some("shared".to_string());
         crate::secret_refs::validate_server(&server).map_err(|e| e.to_string())?;
         if crate::secret_refs::has_references(&server) {

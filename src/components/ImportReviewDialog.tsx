@@ -390,7 +390,11 @@ export function ImportRow({
           </span>
         }
       </div>
-      {item.referenceReview?.map((line) => <p key={line} className="mt-1 text-xs break-all">{line}</p>)}
+      {item.referenceReview?.map((line) => (
+        <p key={line} className="mt-1 text-xs break-all">
+          {line}
+        </p>
+      ))}
       {!!item.updates?.length && (
         <p className="mt-1 text-xs text-muted-foreground">
           Changes: {item.updates.join(", ")}
@@ -548,9 +552,16 @@ export function isPrivateHostUrl(url: string | null | undefined): boolean {
  * and refuses without an explicit reviewed flag, so a miss here costs a clear error
  * rather than an unreviewed enable. */
 export function needsTeamEnableReview(
-  server: Pick<ServerEntry, "source" | "transport" | "command" | "url"> & Partial<Pick<ServerEntry, "env" | "headerKeys" | "launch">>,
+  server: Pick<ServerEntry, "source" | "transport" | "command" | "url"> &
+    Partial<Pick<ServerEntry, "env" | "headerKeys" | "launch">>,
 ): boolean {
-  if ((server.source?.startsWith("team:") || server.source === "shared") && (server.env?.some((e) => e.source) || server.headerKeys?.some((h) => h.source) || server.launch?.inputs.some((i) => i.source))) return true;
+  if (
+    (server.source?.startsWith("team:") || server.source === "shared") &&
+    (server.env?.some((e) => e.source) ||
+      server.headerKeys?.some((h) => h.source) ||
+      server.launch?.inputs.some((i) => i.source))
+  )
+    return true;
   if (!server.source?.startsWith("team:")) return false;
   if (server.transport === "stdio" || !!server.command) return true;
   // Anything that is not a plain https:// URL to a dotted public name is treated as

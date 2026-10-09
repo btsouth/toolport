@@ -416,7 +416,9 @@ export function TeamsView({
               }
               title={`Enable "${s.name}"?`}
               description={
-                secretReferenceReview(s).join("\n") + "\n" + (isLocal
+                secretReferenceReview(s).join("\n") +
+                "\n" +
+                (isLocal
                   ? `This runs a local command on your machine: ${detail}. Only enable it if you trust your team and recognize this command.`
                   : `This connects Toolport to ${detail} using this server's saved authentication. Verify the address and credentials before enabling it.`)
               }

@@ -888,7 +888,7 @@ export function setServerEnabled(
     serverId,
     enabled,
     reviewed,
-    reviewedDefinition,
+    ...(reviewedDefinition ? { reviewedDefinition } : {}),
   });
 }
 

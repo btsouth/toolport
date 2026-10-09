@@ -629,7 +629,7 @@ impl RegistrySnapshot {
                             crate::secret_refs::headers(server)
                                 .unwrap_or_default()
                                 .into_iter()
-                                .map(|h| h.key),
+                                .map(|h| if h.source.is_some() { h.key } else { h.env.unwrap_or(h.key) }),
                         )
                         .collect(),
                     client_credentials: server.client_credentials.as_ref().map(|credentials| {

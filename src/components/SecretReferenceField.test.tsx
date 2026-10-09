@@ -17,7 +17,7 @@ describe("SecretReferenceField", () => {
     await userEvent.click(screen.getByRole("button", { name: "Test" }));
     await waitFor(() =>
       expect(screen.getByRole("status")).toHaveTextContent(
-        "This machine can read the key",
+        "Success in the desktop app environment",
       ),
     );
     expect(testReference).toHaveBeenCalledWith("docs", "op://Engineering/Docs/key");

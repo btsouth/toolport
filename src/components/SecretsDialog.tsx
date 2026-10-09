@@ -141,7 +141,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   const secretKeys = [
     ...new Set([
       ...server.env.filter((e) => e.secret).map((e) => e.key),
-      ...(server.headerKeys ?? []).map((h) => h.key),
+      ...(server.headerKeys ?? []).map((h) => (h.source ? h.key : (h.env ?? h.key))),
     ]),
   ];
   const [references, setReferences] = useState<Record<string, string | undefined>>({});

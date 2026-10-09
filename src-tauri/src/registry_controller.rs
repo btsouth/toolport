@@ -2536,6 +2536,7 @@ pub fn apply_secret_declaration(
         .iter_mut()
         .find(|server| server.id == server_id)
         .ok_or_else(|| format!("No server with id '{server_id}'"))?;
+    if let Some(overrides) = server.unknown_fields.get_mut("memberSecretRefs").and_then(serde_json::Value::as_object_mut) { overrides.remove(&format!("env:{key}")); overrides.remove(&format!("header:{key}")); }
     if let Some(header) = server.unknown_fields.get_mut("headerKeys").and_then(serde_json::Value::as_array_mut).and_then(|hs| hs.iter_mut().find(|h| h["key"] == key)) {
         if let Some(object) = header.as_object_mut() { object.remove("source"); }
         registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
@@ -2568,6 +2569,7 @@ pub fn apply_secret_removal(
         .iter_mut()
         .find(|server| server.id == server_id)
         .ok_or_else(|| format!("No server with id '{server_id}'"))?;
+    if let Some(overrides) = server.unknown_fields.get_mut("memberSecretRefs").and_then(serde_json::Value::as_object_mut) { overrides.remove(&format!("env:{key}")); overrides.remove(&format!("header:{key}")); }
     server.env.retain(|entry| entry.key != key);
     registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
     Ok(())
@@ -2795,6 +2797,7 @@ pub fn apply_launch_secret_generation(
         .iter_mut()
         .find(|server| server.id == server_id)
         .ok_or_else(|| format!("No server with id '{server_id}'"))?;
+    if let Some(overrides) = server.unknown_fields.get_mut("memberSecretRefs").and_then(serde_json::Value::as_object_mut) { overrides.remove(&format!("input:{key}")); }
     if !server.launch.as_ref().is_some_and(|launch| {
         launch
             .inputs
@@ -2839,7 +2842,7 @@ pub fn apply_server_enabled(
             .find(|server| server.id == server_id)
         {
             if server.launch.is_some() {
-                crate::launch_inputs::resolve_args(server)?;
+                crate::launch_inputs::check_ready_for_enable(server)?;
             }
             server.check_enable_allowed(reviewed)?;
             if reviewed {
@@ -5348,6 +5351,8 @@ pub fn apply_secret_reference(
         .find(|s| s.id == server_id)
         .ok_or("Server not found")?;
     crate::secret_refs::check_policy(server, reference).map_err(|e| e.to_string())?;
+    let location = if server.launch.iter().flat_map(|l| &l.inputs).any(|i| i.key == key) { "input" }
+        else if crate::secret_refs::headers(server).map_err(|e| e.to_string())?.iter().any(|h| h.key == key) { "header" } else { "env" };
     if let Some(input) = server
         .launch
         .as_mut()
@@ -5382,6 +5387,10 @@ pub fn apply_secret_reference(
             .insert("source".into(), serde_json::json!({"ref": reference}));
     }
     crate::secret_refs::validate_server(server).map_err(|e| e.to_string())?;
+    if crate::secret_refs::is_shared(server) {
+        let overrides = server.unknown_fields.entry("memberSecretRefs").or_insert_with(|| serde_json::json!({}));
+        overrides[format!("{location}:{key}")] = serde_json::json!(reference);
+    }
     reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
     Ok(())
 }

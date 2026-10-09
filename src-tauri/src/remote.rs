@@ -1283,10 +1283,7 @@ fn guard_connect_target(server: &ServerEntry) -> Result<(), String> {
 fn first_vaulted_secret(server: &ServerEntry) -> Result<Option<String>, String> {
     for e in &server.env {
         if e.secret && e.value.is_none() && e.key != secrets::IMPORTED_URL_KEY {
-            if let Some(v) = match &e.value {
-                Some(v) => Some(v.clone()),
-                None => secrets::get_secret_result(&server.id, &e.key)?,
-            } {
+            if let Some(v) = secrets::get_secret_result(&server.id, &e.key)? {
                 return Ok(Some(v));
             }
         }
@@ -1908,6 +1905,7 @@ fn connect_remote_inner(
                         block_private,
                         request_timeout,
                     )?;
+                    transport.set_credential_headers(header_values.clone())?;
                     transport.set_connect_timeout(initialize_timeout);
                     if let Some(handler) = server_handler.clone() {
                         transport.set_server_request_handler(handler);
@@ -1938,6 +1936,32 @@ fn connect_remote_inner(
 mod tests {
     use super::*;
 
+    #[test]
+    fn legacy_team_headers_keep_oauth_bearer_and_refresh_callback() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint=RotatingEndpoint::new();endpoint.seed();
+            let mut state=load_state("rotation").unwrap().unwrap();state.expires_at=Some(now_epoch_seconds()+3600);
+            secrets::set_secret("rotation",STATE_KEY,&serde_json::to_string(&state).unwrap()).unwrap();
+            let mut server=remote_server(&endpoint.url,None);server.id="rotation".into();
+            server.unknown_fields.insert("headerKeys".into(),serde_json::json!([{"key":"X-Api-Key","env":"API_HEADER"}]));
+            secrets::set_secret("rotation","API_HEADER","header-fixture").unwrap();
+            let mut connection=connect_remote(&server).unwrap();
+            let result=connection.call("fixture",serde_json::json!({})).unwrap();
+            assert_eq!(result["authorization"],"Bearer token-0");
+            assert_eq!(endpoint.count(),0);
+        });
+    }
+    #[test]
+    fn legacy_headers_do_not_skip_client_credentials_state_validation() {
+        secrets::tests::with_isolated_vault(|| {
+            let mut server=remote_server("https://example.com/mcp",None);
+            server.client_credentials=Some(crate::registry::ClientCredentials {client_id:"client".into(), ..Default::default()});
+            server.unknown_fields.insert("headerKeys".into(),serde_json::json!([{"key":"X-Api-Key","env":"API_HEADER"}]));
+            secrets::set_secret(&server.id,"API_HEADER","header-fixture").unwrap();
+            let result=secrets::tests::with_failed_read(CC_STATE_KEY,||connect_remote(&server));
+            assert!(result.err().unwrap().contains("client-credentials state"));
+        });
+    }
     #[test]
     fn inline_secret_env_does_not_replace_existing_bearer_keychain_lookup() {
         let server: ServerEntry = serde_json::from_value(serde_json::json!({"id":"old","name":"Old","transport":"http","url":"https://example.invalid/mcp","env":[{"key":"TOKEN","secret":true,"value":"inline-never-bearer"}]})).unwrap();
@@ -4178,7 +4202,9 @@ mod reference_redaction_tests {
 
     #[test]
     fn reference_errors_are_opaque_and_auth_triggers_reconnection() {
-        let redaction = Redaction(vec!["synthetic-ref-value".into()], vec![]);
+        let reference = "op://auth-test/item/key";
+        assert_eq!(crate::secret_refs::test_cached_value(reference, "old"), "old");
+        let redaction = Redaction(vec!["synthetic-ref-value".into()], vec![reference.into()]);
         let e = redaction.connection_error(
             crate::downstream::TransportError::Fatal("tail ends in ref-value".into()),
             true,
@@ -4195,6 +4221,7 @@ mod reference_redaction_tests {
             true,
         );
         assert!(e.is_health_failure());
+        assert_eq!(crate::secret_refs::test_cached_value(reference, "new"), "new");
         assert!(!e.to_string().contains("synthetic-ref-value"));
         let payload=redaction.value(serde_json::json!({"content":[{"text":"synthetic-ref-value"}],"synthetic-ref-value":"synthetic-ref-value"}));
         assert!(!payload.to_string().contains("synthetic-ref-value"));

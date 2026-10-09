@@ -603,11 +603,24 @@ function App() {
     setOnboardingStep(0);
   }
 
-  async function applyToggle(serverId: string, enabled: boolean, reviewed = false, reviewedDefinition?: ServerEntry) {
+  async function applyToggle(
+    serverId: string,
+    enabled: boolean,
+    reviewed = false,
+    reviewedDefinition?: ServerEntry,
+  ) {
     if (!profileId) return;
     setBusyId(serverId);
     try {
-      const next = await setServerEnabled(profileId, serverId, enabled, reviewed, reviewedDefinition);
+      const next = reviewedDefinition
+        ? await setServerEnabled(
+            profileId,
+            serverId,
+            enabled,
+            reviewed,
+            reviewedDefinition,
+          )
+        : await setServerEnabled(profileId, serverId, enabled, reviewed);
       applyRegistryChange(next);
     } catch (e) {
       toastError(`Couldn't toggle: ${e}`);
@@ -1093,9 +1106,11 @@ function App() {
         }
         description={
           confirmEnableTeam
-            ? secretReferenceReview(confirmEnableTeam).join("\n") + "\n" + (confirmEnableTeam.transport === "stdio" || confirmEnableTeam.command
-              ? `This runs a local command on your machine: ${[confirmEnableTeam.command, ...(confirmEnableTeam.args ?? [])].join(" ")}. Only enable it if you trust your team and recognize this command.`
-              : `This connects Toolport to ${confirmEnableTeam.url ?? ""}, using its saved authentication. Verify the destination before enabling it.`)
+            ? secretReferenceReview(confirmEnableTeam).join("\n") +
+              "\n" +
+              (confirmEnableTeam.transport === "stdio" || confirmEnableTeam.command
+                ? `This runs a local command on your machine: ${[confirmEnableTeam.command, ...(confirmEnableTeam.args ?? [])].join(" ")}. Only enable it if you trust your team and recognize this command.`
+                : `This connects Toolport to ${confirmEnableTeam.url ?? ""}, using its saved authentication. Verify the destination before enabling it.`)
             : undefined
         }
         confirmLabel="Enable"

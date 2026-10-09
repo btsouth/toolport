@@ -7045,7 +7045,7 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
     }
 
     if server.requires_review {
-        let badge = gtk::Label::new(Some("Review in Teams"));
+        let badge = gtk::Label::new(Some("Review required"));
         badge.add_css_class("toolport-badge");
         badge.set_valign(gtk::Align::Center);
         badge.set_halign(gtk::Align::Start);
@@ -7055,6 +7055,7 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
         ));
         card.append(&badge);
         let review = gtk::Button::with_label("Review references");
+        review.set_visible(!server.secret_references.is_empty());
         let page = page.clone();
         let id = server.id.clone();
         let profile = profile_id.to_string();
@@ -7085,14 +7086,17 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
                 if response != "enable" {
                     return;
                 }
-                match crate::registry_controller::set_server_enabled_after_reference_review(
-                    &profile, &entry,
-                ) {
-                    Ok(reg) => page.set_registry_state(state::RegistryState::Ready(
-                        state::RegistrySnapshot::from_registry(reg),
-                    )),
-                    Err(e) => page.show_feedback(&e, true),
-                }
+                let profile = profile.clone();
+                let entry = entry.clone();
+                let page = page.clone();
+                gtk::glib::spawn_future_local(async move {
+                    let result = gtk::gio::spawn_blocking(move || crate::registry_controller::set_server_enabled_after_reference_review(&profile, &entry)).await;
+                    match result {
+                        Ok(Ok(reg)) => page.render(state::RegistryState::Ready(state::RegistrySnapshot::from_registry(reg))),
+                        Ok(Err(e)) => page.show_feedback(&e, true),
+                        Err(_) => page.show_feedback("The reference review stopped. Retry enabling the server.", true),
+                    }
+                });
             });
             dialog.present();
         });
@@ -10786,7 +10790,7 @@ fn secret_reference_fields(
         .placeholder_text("Secret reference")
         .build();
     reference.set_tooltip_text(Some(
-        "Only the reference syncs. Sign in to this provider on each machine.",
+        "Test uses the desktop app environment. The MCP client gateway may use different environment variables or PATH. Only the reference syncs.",
     ));
     let reference_for_provider = reference.clone();
     provider.connect_selected_notify(move |provider| {

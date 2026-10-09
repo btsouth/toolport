@@ -510,7 +510,12 @@ export function ServerDialog({
             setTouched((previous) => new Set([...previous, event.target.id]));
         }}
       >
-        {initial && secretReferenceReview(initial).map((line) => <p key={line} className="text-sm break-all">{line}</p>)}
+        {initial &&
+          secretReferenceReview(initial).map((line) => (
+            <p key={line} className="text-sm break-all">
+              {line}
+            </p>
+          ))}
         <DialogHeader>
           <DialogTitle>{editing ? "Edit server" : "Add MCP server"}</DialogTitle>
         </DialogHeader>

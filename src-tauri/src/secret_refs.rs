@@ -123,7 +123,7 @@ fn path(s: &str) -> bool {
                 && p != "."
                 && p != ".."
                 && p.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "_-.{}[]".contains(c))
+                    .all(|c| c.is_ascii_alphanumeric() || "_-.{}[]".contains(c) || c == ' ')
         })
 }
 fn uuid(s: &str) -> bool {
@@ -252,6 +252,17 @@ fn reference_uses(server: &ServerEntry) -> Result<BTreeMap<String, String>, Reso
     for i in server.launch.iter().flat_map(|l| &l.inputs) {
         if let Some(r) = source(&i.unknown_fields)? {
             uses.insert(format!("input:{}", i.key), r.into());
+        }
+    }
+    if server.transport != "stdio" && headers(server)?.is_empty() {
+        if let Some(e) = server
+            .env
+            .iter()
+            .find(|e| e.secret && e.unknown_fields.contains_key("source"))
+        {
+            if let Some(r) = reference_for(e) {
+                uses.insert(format!("header:Authorization (env:{})", e.key), r.into());
+            }
         }
     }
     for h in headers(server)? {
@@ -838,6 +849,13 @@ fn cached(reference: &str) -> Result<String, ResolveError> {
         limited_read(reference)
     })
 }
+#[cfg(test)]
+pub(crate) fn test_cached_value(reference: &str, value: &str) -> String {
+    cached_with(reference, CACHE.get_or_init(Default::default), || {
+        Ok(value.into())
+    })
+    .unwrap()
+}
 pub fn invalidate(reference: &str) {
     if let Some(cache) = CACHE.get() {
         let cell = cache
@@ -858,7 +876,10 @@ pub fn invalidate_server(server: &ServerEntry) {
 fn resolve_values(server: &ServerEntry) -> Result<HashMap<String, String>, ResolveError> {
     resolve_values_with(server, cached)
 }
-fn resolve_values_with(server: &ServerEntry, read_ref: impl Fn(&str) -> Result<String, ResolveError> + Sync) -> Result<HashMap<String, String>, ResolveError> {
+fn resolve_values_with(
+    server: &ServerEntry,
+    read_ref: impl Fn(&str) -> Result<String, ResolveError> + Sync,
+) -> Result<HashMap<String, String>, ResolveError> {
     for r in reference_uses(server)?.values() {
         check_policy(server, r)?;
     }
@@ -991,7 +1012,10 @@ mod tests {
         let tmp = Scratch::new();
         let p = parse("op://v/i/key").unwrap();
         let binary = tmp.fake("op", "sleep 1 &\nprintf 'fixture-key'");
-        assert_eq!(read_cli(p, p.example, &binary, Duration::from_millis(200)).unwrap(), "fixture-key");
+        assert_eq!(
+            read_cli(p, p.example, &binary, Duration::from_millis(200)).unwrap(),
+            "fixture-key"
+        );
     }
     #[cfg(unix)]
     #[test]
@@ -1000,7 +1024,10 @@ mod tests {
         let p = parse("op://v/i/key").unwrap();
         let binary = tmp.fake("op", "pwd");
         let home = std::env::var("HOME").unwrap();
-        assert_eq!(read_cli(p, p.example, &binary, Duration::from_secs(1)).unwrap(), home);
+        assert_eq!(
+            read_cli(p, p.example, &binary, Duration::from_secs(1)).unwrap(),
+            home
+        );
     }
     #[test]
     fn closed_provider_table_and_frontend_match() {
@@ -1415,19 +1442,45 @@ mod review_regressions {
     fn synced_env_exfiltration_is_denied_in_every_output_field() {
         let _data = crate::registry::DataDirTestEnv::new("ref-attack");
         for provenance in ["team:malicious", "team:personal-pro", "shared"] {
-            for reference in ["env:BWS_ACCESS_TOKEN", "env:BW_SESSION", "env:VAULT_TOKEN", "env:OP_SERVICE_ACCOUNT_TOKEN", "env:TOOLPORT_SECRET_TOKEN"] {
+            for reference in [
+                "env:BWS_ACCESS_TOKEN",
+                "env:BW_SESSION",
+                "env:VAULT_TOKEN",
+                "env:OP_SERVICE_ACCOUNT_TOKEN",
+                "env:TOOLPORT_SECRET_TOKEN",
+            ] {
                 let mut s = remote(provenance);
-                s.unknown_fields.insert("secretSources".into(), serde_json::json!({"allowedPrefixes":["env:"]}));
-                s.unknown_fields.insert("headerKeys".into(), serde_json::json!([{"key":"X-Api-Key","source":{"ref":reference}}]));
-                assert_eq!(resolve_server(&s).unwrap_err().state, ErrorState::PolicyDenied);
+                s.unknown_fields.insert(
+                    "secretSources".into(),
+                    serde_json::json!({"allowedPrefixes":["env:"]}),
+                );
+                s.unknown_fields.insert(
+                    "headerKeys".into(),
+                    serde_json::json!([{"key":"X-Api-Key","source":{"ref":reference}}]),
+                );
+                assert_eq!(
+                    resolve_server(&s).unwrap_err().state,
+                    ErrorState::PolicyDenied
+                );
                 assert!(approve_server(&s).is_err());
                 s.unknown_fields.remove("headerKeys");
-                s.env.push(serde_json::from_value(serde_json::json!({"key":"TOKEN","secret":true,"source":{"ref":reference}})).unwrap());
-                assert_eq!(resolve_server(&s).unwrap_err().state, ErrorState::PolicyDenied);
+                s.env.push(
+                    serde_json::from_value(
+                        serde_json::json!({"key":"TOKEN","secret":true,"source":{"ref":reference}}),
+                    )
+                    .unwrap(),
+                );
+                assert_eq!(
+                    resolve_server(&s).unwrap_err().state,
+                    ErrorState::PolicyDenied
+                );
             }
         }
         let mut local = remote("manual");
-        local.unknown_fields.insert("headerKeys".into(), serde_json::json!([{"key":"X-Api-Key","source":{"ref":"env:BWS_ACCESS_TOKEN"}}]));
+        local.unknown_fields.insert(
+            "headerKeys".into(),
+            serde_json::json!([{"key":"X-Api-Key","source":{"ref":"env:BWS_ACCESS_TOKEN"}}]),
+        );
         validate_server(&local).unwrap();
     }
     #[test]
@@ -1435,20 +1488,36 @@ mod review_regressions {
         let _data = crate::registry::DataDirTestEnv::new("ref-approval");
         for provenance in ["team:malicious", "team:personal-pro", "shared"] {
             let s = remote(provenance);
-            assert_eq!(resolve_server(&s).unwrap_err().state, ErrorState::ApprovalRequired);
+            assert_eq!(
+                resolve_server(&s).unwrap_err().state,
+                ErrorState::ApprovalRequired
+            );
             assert!(s.needs_team_enable_review());
             assert!(s.check_enable_allowed(false).is_err());
             approve_server(&s).unwrap();
             check_approval(&s).unwrap();
             assert!(check_reviewed_definition(&s, None).is_err());
-            for (field, value) in [("url","https://another.example/mcp"),("header","Authorization"),("reference","bws://be8e0ad8-d545-4017-a55a-b02f014d4158")] {
+            for (field, value) in [
+                ("url", "https://another.example/mcp"),
+                ("header", "Authorization"),
+                ("reference", "bws://be8e0ad8-d545-4017-a55a-b02f014d4158"),
+            ] {
                 let mut changed = s.clone();
                 match field {
                     "url" => changed.url = Some(value.into()),
-                    "header" => changed.unknown_fields.get_mut("headerKeys").unwrap()[0]["key"] = Value::String(value.into()),
-                    _ => changed.unknown_fields.get_mut("headerKeys").unwrap()[0]["source"]["ref"] = Value::String(value.into()),
+                    "header" => {
+                        changed.unknown_fields.get_mut("headerKeys").unwrap()[0]["key"] =
+                            Value::String(value.into())
+                    }
+                    _ => {
+                        changed.unknown_fields.get_mut("headerKeys").unwrap()[0]["source"]["ref"] =
+                            Value::String(value.into())
+                    }
                 }
-                assert_eq!(check_approval(&changed).unwrap_err().state, ErrorState::ApprovalRequired);
+                assert_eq!(
+                    check_approval(&changed).unwrap_err().state,
+                    ErrorState::ApprovalRequired
+                );
                 assert!(check_reviewed_definition(&changed, Some(&s)).is_err());
             }
             let encoded = serde_json::to_string(&s).unwrap();
@@ -1460,22 +1529,53 @@ mod review_regressions {
         let _data = crate::registry::DataDirTestEnv::new("ref-command-approval");
         let s:ServerEntry=serde_json::from_value(serde_json::json!({"id":"cmd","name":"Cmd","source":"team:t","transport":"stdio","command":"npx","args":["trusted"],"env":[{"key":"TOKEN","secret":true,"source":{"ref":"op://Private/GitHub Token/credential"}}]})).unwrap();
         approve_server(&s).unwrap();
-        for changed in [ {let mut c=s.clone();c.command=Some("evil".into());c}, {let mut c=s.clone();c.args.push("evil".into());c}, {let mut c=s.clone();c.cwd=Some("/evil".into());c}, {let mut c=s.clone();c.env[0].key="OTHER".into();c} ] {
+        for changed in [
+            {
+                let mut c = s.clone();
+                c.command = Some("evil".into());
+                c
+            },
+            {
+                let mut c = s.clone();
+                c.args.push("evil".into());
+                c
+            },
+            {
+                let mut c = s.clone();
+                c.cwd = Some("/evil".into());
+                c
+            },
+            {
+                let mut c = s.clone();
+                c.env[0].key = "OTHER".into();
+                c
+            },
+        ] {
             assert!(check_approval(&changed).is_err());
         }
     }
     #[test]
     fn teams_shaped_header_keys_read_the_env_keychain_account() {
         let mut s = remote("team:good");
-        s.unknown_fields.insert("headerKeys".into(), serde_json::json!([{"key":"X-Api-Key","env":"API_TOKEN"}]));
-        let headers = resolve_headers_with(&s, |id,key| { assert_eq!((id,key),("attack","API_TOKEN"));Ok(Some("fixture-token".into())) }).unwrap();
-        assert_eq!(headers, vec![("X-Api-Key".into(),"fixture-token".into())]);
+        s.unknown_fields.insert(
+            "headerKeys".into(),
+            serde_json::json!([{"key":"X-Api-Key","env":"API_TOKEN"}]),
+        );
+        let headers = resolve_headers_with(&s, |id, key| {
+            assert_eq!((id, key), ("attack", "API_TOKEN"));
+            Ok(Some("fixture-token".into()))
+        })
+        .unwrap();
+        assert_eq!(headers, vec![("X-Api-Key".into(), "fixture-token".into())]);
         assert!(!has_references(&s));
     }
     #[test]
     fn teams_header_env_reference_is_bound_to_both_output_names() {
         let mut s = remote("team:t");
-        s.unknown_fields.insert("headerKeys".into(), serde_json::json!([{"key":"X-Api-Key","env":"TOKEN"}]));
+        s.unknown_fields.insert(
+            "headerKeys".into(),
+            serde_json::json!([{"key":"X-Api-Key","env":"TOKEN"}]),
+        );
         s.env.push(serde_json::from_value(serde_json::json!({"key":"TOKEN","secret":true,"source":{"ref":"op://Private/GitHub Token/credential"}})).unwrap());
         let uses = reference_uses(&s).unwrap();
         assert!(uses.contains_key("env:TOKEN") && uses.contains_key("header:X-Api-Key"));
@@ -1484,20 +1584,57 @@ mod review_regressions {
     #[test]
     fn prefixes_match_segments_and_allow_vendor_path_spaces() {
         assert!(prefix_matches("op://Eng", "op://Eng/Token/key"));
-        assert!(!prefix_matches("op://Eng", "op://Engineering-Private/Token/key"));
-        for r in ["op://Private/GitHub Token/credential","dl://My Account/password","doppler://my project/prod/API_KEY","vault://secret/my service#token","infisical://project/prod/my service/TOKEN"] { parse(r).unwrap(); }
-        for r in ["op://Private/ GitHub/key","op://Private/GitHub /key","op://Private/GitHub  Token/key","op://Private/GitHub\tToken/key","op://Private/-GitHub Token/key"] { assert!(parse(r).is_err(),"{r}"); }
+        assert!(!prefix_matches(
+            "op://Eng",
+            "op://Engineering-Private/Token/key"
+        ));
+        for r in [
+            "op://Private/GitHub Token/credential",
+            "dl://My Account/password",
+            "doppler://my project/prod/API_KEY",
+            "vault://secret/my service#token",
+            "infisical://project/prod/my service/TOKEN",
+        ] {
+            parse(r).unwrap();
+        }
+        for r in [
+            "op://Private/ GitHub/key",
+            "op://Private/GitHub /key",
+            "op://Private/GitHub  Token/key",
+            "op://Private/GitHub\tToken/key",
+            "op://Private/-GitHub Token/key",
+        ] {
+            assert!(parse(r).is_err(), "{r}");
+        }
     }
     #[test]
     fn concurrent_reads_share_one_value_and_cache_only_successes() {
         let cache = Mutex::new(HashMap::new());
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| { for _ in 0..8 { scope.spawn(|| {
-            assert_eq!(cached_with("op://v/i/key", &cache, || { calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);std::thread::sleep(Duration::from_millis(30));Ok("fixture".into()) }).unwrap(),"fixture");
-        }); } });
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),1);
-        for _ in 0..2 { assert!(cached_with("op://v/missing/key",&cache,||{calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);Err(error(None,ErrorState::Locked))}).is_err()); }
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),3);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    assert_eq!(
+                        cached_with("op://v/i/key", &cache, || {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(30));
+                            Ok("fixture".into())
+                        })
+                        .unwrap(),
+                        "fixture"
+                    );
+                });
+            }
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for _ in 0..2 {
+            assert!(cached_with("op://v/missing/key", &cache, || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(error(None, ErrorState::Locked))
+            })
+            .is_err());
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 }
 
@@ -1507,16 +1644,59 @@ mod pool_regressions {
     #[test]
     fn server_reference_pool_is_bounded_concurrent_and_deduplicated() {
         let mut s:ServerEntry=serde_json::from_value(serde_json::json!({"id":"pool","name":"Pool","transport":"stdio","command":"fixture","env":[]})).unwrap();
-        for n in 0..9 { s.env.push(serde_json::from_value(serde_json::json!({"key":format!("TOKEN_{n}"),"secret":true,"source":{"ref":format!("op://v/item{}/key",n%8)}})).unwrap()); }
-        let active=std::sync::atomic::AtomicUsize::new(0);
-        let peak=std::sync::atomic::AtomicUsize::new(0);
-        let calls=std::sync::atomic::AtomicUsize::new(0);
-        let values=resolve_values_with(&s, |_| { use std::sync::atomic::Ordering::SeqCst;
-            let current=active.fetch_add(1,SeqCst)+1; peak.fetch_max(current,SeqCst); calls.fetch_add(1,SeqCst);
-            std::thread::sleep(Duration::from_millis(25)); active.fetch_sub(1,SeqCst); Ok("fixture".into())
-        }).unwrap();
-        assert_eq!(values.len(),8);
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),8);
+        for n in 0..9 {
+            s.env.push(serde_json::from_value(serde_json::json!({"key":format!("TOKEN_{n}"),"secret":true,"source":{"ref":format!("op://v/item{}/key",n%8)}})).unwrap());
+        }
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let values = resolve_values_with(&s, |_| {
+            use std::sync::atomic::Ordering::SeqCst;
+            let current = active.fetch_add(1, SeqCst) + 1;
+            peak.fetch_max(current, SeqCst);
+            calls.fetch_add(1, SeqCst);
+            std::thread::sleep(Duration::from_millis(25));
+            active.fetch_sub(1, SeqCst);
+            Ok("fixture".into())
+        })
+        .unwrap();
+        assert_eq!(values.len(), 8);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 8);
         assert!((2..=4).contains(&peak.load(std::sync::atomic::Ordering::SeqCst)));
+    }
+}
+
+#[cfg(test)]
+mod cache_auth_regressions {
+    use super::*;
+    #[test]
+    fn auth_rejection_invalidates_the_reference_cache() {
+        let reference = "op://cache-auth-regression/item/key";
+        let cache = CACHE.get_or_init(Default::default);
+        assert_eq!(
+            cached_with(reference, cache, || Ok("old".into())).unwrap(),
+            "old"
+        );
+        let server:ServerEntry=serde_json::from_value(serde_json::json!({"id":"cache","name":"Cache","transport":"http","url":"https://example.com/mcp","env":[],"headerKeys":[{"key":"X-Key","source":{"ref":reference}}]})).unwrap();
+        invalidate_server(&server);
+        assert_eq!(
+            cached_with(reference, cache, || Ok("new".into())).unwrap(),
+            "new"
+        );
+        invalidate(reference);
+    }
+}
+
+#[cfg(test)]
+mod bearer_destination_regression {
+    #[test]
+    fn remote_env_reference_order_changes_the_approved_bearer_destination() {
+        let mut server:crate::registry::ServerEntry=serde_json::from_value(serde_json::json!({"id":"bearer","name":"Bearer","transport":"http","url":"https://example.com/mcp","source":"team:t","env":[{"key":"A","secret":true,"source":{"ref":"op://v/a/key"}},{"key":"B","secret":true,"source":{"ref":"op://v/b/key"}}]})).unwrap();
+        let before = super::approval_identity(&server).unwrap();
+        assert!(super::review_lines(&server)
+            .iter()
+            .any(|l| l.contains("header:Authorization (env:A)")));
+        server.env.reverse();
+        assert_ne!(before, super::approval_identity(&server).unwrap());
     }
 }
