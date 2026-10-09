@@ -1599,10 +1599,8 @@ fn floor_tool_defs_with_code_mode(code_mode: bool) -> Vec<Value> {
 
 /// UTF-8 byte ceiling for the default lazy-mode floor: the serialized `tools/list`
 /// meta-tool array plus the built-in `initialize` instructions, with Code Mode off.
-/// The goal is at most 600 `tiktoken o200k_base` tokens. Rust tests have no tokenizer,
-/// so this bounds bytes instead: the floor measures about 4.6 bytes/token with
-/// `o200k_base`, so 2,400 bytes is roughly 520 tokens, and even at a conservative
-/// 4 bytes/token it is exactly 600. See the regression test for the exact breakdown.
+/// The byte guard complements the exact `o200k_base` gate in token_budget_regression;
+/// bytes alone cannot establish a token budget for JSON or non-ASCII text.
 const META_TOOL_FLOOR_BYTE_BUDGET: usize = 2_400;
 
 /// The floor, named in the error a client gets when it calls a meta-tool that 2.0
@@ -1826,10 +1824,8 @@ fn help_tool_def(prefix: &str, tool_count: usize) -> Value {
     json!({
         "name": format!("help_{prefix}"),
         "description": format!(
-            "Browse the {tool_count} tool(s) on the \"{prefix}\" server: returns each tool's exact \
-             name, what it does, and its input schema. Pick one and run it with toolport_call_tool \
-             (name = the exact name shown). Pass an optional `query` to filter to a capability \
-             (recommended when a server has many tools)."
+            "Browse {tool_count} tools on \"{prefix}\". Filter with `query`; empty lists tools. \
+             Call with toolport_call_tool. For schemaOmitted, search the exact tool name."
         ),
         "inputSchema": {
             "type": "object",
@@ -2577,6 +2573,11 @@ fn search_catalog_indexed(
         if let Some(position) = exact_position.filter(|position| *position > 0) {
             let exact = ranked.remove(position);
             ranked.insert(0, exact);
+        }
+        // Exact-name search retrieves a known definition, not a fuzzy menu.
+        // Keep its complete schema; the handler still adds scoped pinned prerequisites.
+        if exact_position.is_some() {
+            ranked.truncate(1);
         }
         let total = ranked.len();
 
@@ -7092,8 +7093,7 @@ fn handle_request_with_cancel(
                 // Note only clarifies the OMITTED results need a follow-up; the first
                 // result always carries its schema, so it never does.
                 let schema_note = if omitted {
-                    " Results flagged schemaOmitted have no input schema here; to call one, \
-                     search its exact name or pass `server` to get its schema."
+                    " For schemaOmitted, search the exact tool name for its schema."
                 } else {
                     ""
                 };
@@ -7168,9 +7168,8 @@ fn handle_request_with_cancel(
                     // commits instead of re-searching (the v0.3.6 keep-searching nudges
                     // overcorrected and made compliant models thrash).
                     format!(
-                        "Found {total} matching tool(s){scope}. Top match: `{top}`. Its complete \
-                         schema is below; if it fits, call it with toolport_call_tool using name \
-                         \"{top}\". Only search again if none match.{pin_note}{more}{schema_note}"
+                        "Found {total} matching tool(s){scope}. Top match: `{top}` with complete schema. \
+                         If it fits, call it with toolport_call_tool. Only search again if none match.{pin_note}{more}{schema_note}"
                     )
                 };
                 let text = format!(
@@ -37321,13 +37320,41 @@ mod tests {
                 "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } } }
             }),
         ];
-        let (hits, _) = search_catalog(&cat, "filesystem__read_file", None, 5);
+        let (hits, total) = search_catalog(&cat, "filesystem__read_file", None, 5);
+        assert_eq!(
+            total, 1,
+            "exact-name retrieval must not return a fuzzy menu"
+        );
+        assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["name"], "filesystem__read_file");
         assert_eq!(
             hits[0]["inputSchema"]["properties"]["path"]["type"],
             "string"
         );
         assert!(hits[0].get("schemaOmitted").is_none());
+        let index = CatalogSearchIndex::build(&cat);
+        let indexed = search_catalog_indexed(
+            &cat,
+            " filesystem__READ_FILE ",
+            Some("filesystem"),
+            25,
+            None,
+            Some(&index),
+        );
+        assert_eq!(indexed.matches, hits);
+        assert!(!indexed.low_confidence);
+        let denied = search_catalog_indexed(
+            &cat,
+            "filesystem__read_file",
+            Some("another"),
+            25,
+            None,
+            Some(&index),
+        );
+        assert!(
+            denied.matches.is_empty(),
+            "exact lookup must honor the server filter"
+        );
     }
 
     #[test]

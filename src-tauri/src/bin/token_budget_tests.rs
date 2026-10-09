@@ -258,17 +258,24 @@ fn token_budget_regression() {
     let tools = floor_tool_defs(&host);
     let floor = json!(tools).to_string() + DISCOVER_INSTRUCTIONS_PREAMBLE;
     let tokens = bpe.encode_ordinary(&floor).len();
-    assert!(tokens <= 600, "lazy floor {tokens} tokens exceeds 600");
+    assert!(tokens <= 500, "lazy floor {tokens} tokens exceeds 500");
     let help = help_tool_def("synthetic00", 618).to_string();
     let help_tokens = bpe.encode_ordinary(&help).len();
     assert!(
-        help_tokens <= 150,
-        "grouped help {help_tokens} tokens exceeds 150"
+        help_tokens <= 90,
+        "grouped help {help_tokens} tokens exceeds 90"
     );
     let catalog = token_audit_public_tools();
     let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"list channels"}}});
     let response = token_audit_dispatch(&catalog, DiscoveryMode::Lazy, &req);
     let tokens = bpe.encode_ordinary(&response.to_string()).len();
-    assert!(tokens <= 2200, "public search {tokens} tokens exceeds 2200");
-    println!("TOKEN_BUDGET floor={tokens} search tokens; grouped_help={help_tokens}");
+    assert!(tokens <= 500, "public search {tokens} tokens exceeds 500");
+    let exact = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"slack__slack_list_channels"}}});
+    let exact_response = token_audit_dispatch(&catalog, DiscoveryMode::Lazy, &exact);
+    let exact_tokens = bpe.encode_ordinary(&exact_response.to_string()).len();
+    assert!(
+        exact_tokens <= 200,
+        "exact-name lookup {exact_tokens} tokens exceeds 200"
+    );
+    println!("TOKEN_BUDGET search={tokens} exact={exact_tokens} grouped_help={help_tokens}");
 }
