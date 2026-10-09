@@ -178,6 +178,13 @@ pub struct ApprovalRequest {
     /// Which client/agent triggered it (for display + attribution), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
+    /// Gateway-observed display name, never an authorization principal.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_client_label"
+    )]
+    pub client_name: Option<String>,
     /// Untrusted initialize clientInfo label. Never an access principal.
     #[serde(
         default,
@@ -780,6 +787,7 @@ mod tests {
             token: "tok".into(),
             id: "p08-outcomes".into(),
             client: None,
+            client_name: crate::session_observability::current().client_name,
             client_label: None,
             server: "s".into(),
             tool: "t".into(),
@@ -863,6 +871,7 @@ mod tests {
             token: "tok".into(),
             id: "abc".into(),
             client: Some("cursor".into()),
+            client_name: crate::session_observability::current().client_name,
             client_label: None,
             server: "db".into(),
             tool: "drop_table".into(),
@@ -973,6 +982,7 @@ mod tests {
             token: "tok".into(),
             id: "abc".into(),
             client: None,
+            client_name: crate::session_observability::current().client_name,
             client_label: None,
             server: "db".into(),
             tool: "drop_table".into(),
@@ -1245,10 +1255,22 @@ mod p08b_revision_tests {
     fn p08b_r1_registered_clients_use_registry_labels() {
         let _env = crate::registry::DataDirTestEnv::new("p08b-r1-registry-label");
         let mut registry = crate::registry::Registry::default();
-        registry.http_clients.push(crate::registry::HttpClient { id: "real".into(), label: "My assistant".into(), token_sha256: "unused".into(), profile: String::new(), unknown_fields: Default::default() });
+        registry.http_clients.push(crate::registry::HttpClient {
+            id: "real".into(),
+            label: "My assistant".into(),
+            token_sha256: "unused".into(),
+            profile: String::new(),
+            unknown_fields: Default::default(),
+        });
         crate::registry::save(&registry).unwrap();
-        assert_eq!(crate::clients::trusted_client_name(Some("client:real"), None), "My assistant");
-        assert_eq!(crate::clients::trusted_client_name(Some("client:unknown"), None), "An AI client");
+        assert_eq!(
+            crate::clients::trusted_client_name(Some("client:real"), None),
+            "My assistant"
+        );
+        assert_eq!(
+            crate::clients::trusted_client_name(Some("client:unknown"), None),
+            "An AI client"
+        );
     }
 
     #[test]
@@ -1310,6 +1332,7 @@ mod p10c_decision_tests {
             token: "tok".into(),
             id: "poll".into(),
             client: None,
+            client_name: crate::session_observability::current().client_name,
             client_label: None,
             server: "s".into(),
             tool: "t".into(),

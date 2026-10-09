@@ -164,6 +164,7 @@ pub fn terminated_outcome(
         final_result_bytes: 0,
         checkpoint: None,
         error: Some(reason),
+        failure_kind: Some(crate::codemode::FailureKind::WorkerFailure),
     }
 }
 

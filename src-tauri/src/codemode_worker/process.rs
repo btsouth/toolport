@@ -95,18 +95,24 @@ fn memory_termination(child: &mut Child) -> Option<String> {
     }
 }
 
-fn exit_reason(child: &mut Child) -> String {
+fn exit_reason(child: &mut Child) -> (codemode::FailureKind, String) {
     let until = Instant::now() + exit_grace();
     loop {
         match child.try_wait() {
             Ok(Some(status)) if memory::is_memory_termination(&status) => {
-                return memory_budget_error();
+                return (codemode::FailureKind::MemoryLimit, memory_budget_error());
             }
             Ok(Some(status)) => {
-                return format!("code mode worker terminated before returning a result ({status})")
+                return (
+                    codemode::FailureKind::WorkerFailure,
+                    format!("code mode worker terminated before returning a result ({status})"),
+                )
             }
             _ if Instant::now() >= until => {
-                return "code mode worker pipe closed before returning a result".into()
+                return (
+                    codemode::FailureKind::WorkerFailure,
+                    "code mode worker pipe closed before returning a result".into(),
+                )
             }
             _ => std::thread::sleep(Duration::from_millis(1)),
         }
@@ -229,12 +235,15 @@ pub fn run_script(
     let mut seen_ids = std::collections::HashSet::new();
     let mut seen_indices = std::collections::HashSet::new();
     let mut checkpoint = None;
+    let mut failure_kind = codemode::FailureKind::WorkerFailure;
     let result = loop {
         if cancel.as_ref().is_some_and(CancelContext::is_cancelled) {
+            failure_kind = codemode::FailureKind::Cancelled;
             break Err("code mode script was cancelled".to_string());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            failure_kind = codemode::FailureKind::Deadline;
             break Err("code mode worker exceeded its wall-clock deadline".to_string());
         }
         let event = match incoming.recv_timeout(remaining.min(Duration::from_millis(25))) {
@@ -246,7 +255,9 @@ pub fn run_script(
         };
         match event {
             Event::PipeClosed(error) => {
-                break Err(format!("{}: {error}", exit_reason(&mut child.0)));
+                let (kind, reason) = exit_reason(&mut child.0);
+                failure_kind = kind;
+                break Err(format!("{reason}: {error}"));
             }
             Event::Failure(error) => {
                 // A worker killed for exceeding its budget can be torn down
@@ -254,7 +265,10 @@ pub fn run_script(
                 // clean pipe close. Attribute a memory termination with the same
                 // message the pipe-close path uses.
                 break Err(match memory_termination(&mut child.0) {
-                    Some(reason) => format!("{reason}: {error}"),
+                    Some(reason) => {
+                        failure_kind = codemode::FailureKind::MemoryLimit;
+                        format!("{reason}: {error}")
+                    }
                     None => error,
                 });
             }
@@ -412,6 +426,11 @@ pub fn run_script(
         Ok(mut outcome) => {
             // Boa also counts callAsync entries queued before an early JS error.
             outcome.calls = outcome.calls.max(calls).min(limits.max_calls);
+            if outcome.failure_kind == Some(codemode::FailureKind::ScriptException)
+                && records.iter().any(|r| !r.ok)
+            {
+                outcome.failure_kind = Some(codemode::FailureKind::DownstreamFailure);
+            }
             outcome.progress = records;
             outcome.checkpoint = checkpoint;
             outcome
@@ -421,6 +440,7 @@ pub fn run_script(
                 error.push_str("; host calls may still be in flight, cancellation requested; do not automatically retry them");
             }
             let mut outcome = super::terminated_outcome(calls, records, error);
+            outcome.failure_kind = Some(failure_kind);
             outcome.checkpoint = checkpoint;
             outcome
         }
@@ -623,6 +643,7 @@ fn worker_run() {
         .clone()
     {
         outcome.error = Some(error);
+        outcome.failure_kind = Some(codemode::FailureKind::WorkerFailure);
     }
     let mut writer = client
         .writer

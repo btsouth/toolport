@@ -12,8 +12,8 @@ mod onboarding;
 mod package_updates;
 mod pairing;
 mod settings;
-mod single_instance;
 mod setup;
+mod single_instance;
 mod state;
 mod teams;
 mod theme;
@@ -2014,14 +2014,33 @@ impl ClientPage {
         });
     }
 
-    fn show_import_review(&self, candidates: Vec<crate::registry_controller::ClientImportCandidate>) {
-        let Some(parent) = self.root.root().and_downcast::<gtk::Window>() else { return; };
-        let items = candidates.into_iter().map(|candidate| crate::registry_controller::SetupItem {
-            key: candidate.key, name: candidate.name, transport: candidate.transport,
-            command: candidate.command, args: candidate.args, url: candidate.url,
-            env_keys: candidate.credentials.iter().map(|env| env.key.clone()).collect(),
-            credentials: candidate.credentials, unsupported: candidate.unsupported, updates: Vec::new(), is_new: true,
-        }).collect();
+    fn show_import_review(
+        &self,
+        candidates: Vec<crate::registry_controller::ClientImportCandidate>,
+    ) {
+        let Some(parent) = self.root.root().and_downcast::<gtk::Window>() else {
+            return;
+        };
+        let items = candidates
+            .into_iter()
+            .map(|candidate| crate::registry_controller::SetupItem {
+                key: candidate.key,
+                name: candidate.name,
+                transport: candidate.transport,
+                command: candidate.command,
+                args: candidate.args,
+                url: candidate.url,
+                env_keys: candidate
+                    .credentials
+                    .iter()
+                    .map(|env| env.key.clone())
+                    .collect(),
+                credentials: candidate.credentials,
+                unsupported: candidate.unsupported,
+                updates: Vec::new(),
+                is_new: true,
+            })
+            .collect();
         let page = self.clone();
         setup::review(&parent, "Review servers to import", items,
             "Review each command and URL. Values are saved using your keychain choices. Missing inputs stay off.",
@@ -2380,10 +2399,7 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             let client_for_connect = client.clone();
             let page_for_connect = page.clone();
             connect.connect_clicked(move |_| {
-                confirm_client_migrate(
-                    &client_for_connect,
-                    page_for_connect.clone(),
-                );
+                confirm_client_migrate(&client_for_connect, page_for_connect.clone());
             });
             actions.append(&connect);
         }
@@ -2520,10 +2536,7 @@ fn connected_client_actions_menu(client: state::ClientView, page: ClientPage) ->
         let menu_for_migrate = menu.clone();
         migrate.connect_clicked(move |_| {
             menu_for_migrate.popdown();
-            confirm_client_migrate(
-                &client_for_migrate,
-                page_for_migrate.clone(),
-            );
+            confirm_client_migrate(&client_for_migrate, page_for_migrate.clone());
         });
         content.append(&migrate);
         content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
@@ -2709,7 +2722,12 @@ fn run_client_mutation(
                         "Disconnected {client_name} from Toolport. Restart {client_name} to apply it."
                     )
                 };
-                page.refresh_with_confirmation(std::iter::once(message).chain(result.outcome.warnings).collect::<Vec<_>>().join(" "));
+                page.refresh_with_confirmation(
+                    std::iter::once(message)
+                        .chain(result.outcome.warnings)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
             }
             Ok(Err(error)) => page.show_error(&format!("{client_name}: {error}")),
             Err(_) => page.show_error(&format!("{client_name}: the operation stopped")),
@@ -5886,26 +5904,47 @@ fn build_content(
 
 fn open_shared_setup(url: &str, page: ServerPage) {
     if let Some((origin, team)) = crate::teams::parse_pair_link(url) {
-        if crate::registry::load().is_ok_and(|reg| crate::teams::pair_target_is_current(&reg, &origin, &team)) {
-            if let Some(action) = page.app.lookup_action("show-teams") { action.activate(None); }
-            if let Some(window) = page.app.active_window() { window.present(); }
+        if crate::registry::load()
+            .is_ok_and(|reg| crate::teams::pair_target_is_current(&reg, &origin, &team))
+        {
+            if let Some(action) = page.app.lookup_action("show-teams") {
+                action.activate(None);
+            }
+            if let Some(window) = page.app.active_window() {
+                window.present();
+            }
             return;
         }
-        for window in page.app.windows() { if window.title().as_deref() == Some("Toolport setup") { window.close(); } }
-        let (parent_app, connected_app, feedback) = (page.app.clone(), page.app.clone(), page.clone());
+        for window in page.app.windows() {
+            if window.title().as_deref() == Some("Toolport setup") {
+                window.close();
+            }
+        }
+        let (parent_app, connected_app, feedback) =
+            (page.app.clone(), page.app.clone(), page.clone());
         let hooks = pairing::PairingHooks {
             parent: Box::new(move || parent_app.active_window()),
             feedback: Box::new(move |message, error| feedback.show_feedback(message, error)),
             connected: Box::new(move || {
-                if let Some(action) = connected_app.lookup_action("show-teams") { action.activate(None); }
-                if let Some(window) = connected_app.active_window() { window.present(); }
+                if let Some(action) = connected_app.lookup_action("show-teams") {
+                    action.activate(None);
+                }
+                if let Some(window) = connected_app.active_window() {
+                    window.present();
+                }
             }),
-            open_url: Box::new(|url| { let _ = crate::oauth::open_web_url(url); }),
+            open_url: Box::new(|url| {
+                let _ = crate::oauth::open_web_url(url);
+            }),
         };
         let pair_origin = origin.clone();
-        pairing::request(hooks, &origin, Box::new(move |cancel, show| {
-            crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
-        }));
+        pairing::request(
+            hooks,
+            &origin,
+            Box::new(move |cancel, show| {
+                crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
+            }),
+        );
         return;
     }
     let Some(id) = crate::sharing_controller::parse_share_url(url) else {
@@ -9502,11 +9541,38 @@ mod tests {
     #[test]
     fn p08b_r1_hyphenated_activity_filter_uses_one_server() {
         let _env = crate::registry::DataDirTestEnv::new("p08b-r1-gtk-filter");
-        crate::audit::record_routed_call(&crate::registry::Registry::default(), "team-slack", "read", true, Some(850), None, Some("adapter:claude-code"), None, None, None, None);
-        crate::audit::record_decision("team-slack", "delete", Some("adapter:claude-code"), None, "destructive", "denied", &serde_json::json!({}), Some(1500));
+        crate::audit::record_routed_call(
+            &crate::registry::Registry::default(),
+            "team-slack",
+            "read",
+            true,
+            Some(850),
+            None,
+            Some("adapter:claude-code"),
+            None,
+            None,
+            None,
+            None,
+        );
+        crate::audit::record_decision(
+            "team-slack",
+            "delete",
+            Some("adapter:claude-code"),
+            None,
+            "destructive",
+            "denied",
+            &serde_json::json!({}),
+            Some(1500),
+        );
         let snapshot = state::load_activity_snapshot().unwrap();
-        assert_eq!(activity_server_filter_options(&snapshot.recent), vec!["All servers", "team_slack"]);
-        assert_eq!(filter_calls(&snapshot.recent, Some("team_slack"), false).len(), snapshot.recent.len());
+        assert_eq!(
+            activity_server_filter_options(&snapshot.recent),
+            vec!["All servers", "team_slack"]
+        );
+        assert_eq!(
+            filter_calls(&snapshot.recent, Some("team_slack"), false).len(),
+            snapshot.recent.len()
+        );
     }
 
     #[test]

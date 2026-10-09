@@ -56,6 +56,7 @@ use conduit_lib::savings;
 use conduit_lib::searchtrace;
 use conduit_lib::secrets;
 use conduit_lib::semantic;
+use conduit_lib::session_observability as observation;
 use conduit_lib::session_store::SessionStore;
 use conduit_lib::shaping;
 use conduit_lib::tool_definitions::{CatalogRef, SerializedTools, SharedTools, ToolCatalog};
@@ -70,6 +71,7 @@ mod search_cache;
 mod search_static;
 
 thread_local! {
+    static CODE_MODE_FAILURE: std::cell::Cell<Option<codemode::FailureKind>> = const { std::cell::Cell::new(None) };
     static APPROVAL_CANCEL: std::cell::RefCell<Option<downstream::CancelContext>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -4129,7 +4131,10 @@ fn resolve_adapter_caller(
     (
         Some(allowed),
         HttpCaller {
-            audit_label: Some(client_id.to_string()),
+            audit_label: Some(clients::trusted_client_name(
+                Some(&format!("adapter:{client_id}")),
+                None,
+            )),
             session_owner: McpSessionOwner {
                 identity: format!("adapter:{client_id}"),
                 profile: Some(profile.clone()),
@@ -4817,6 +4822,7 @@ fn execute_call(
                 token: String::new(),
                 id: new_correlation_id(),
                 client: client.map(str::to_string),
+                client_name: crate::session_observability::current().client_name,
                 client_label: active_client_label(),
                 server: server_id.to_string(),
                 tool: tool.to_string(),
@@ -5621,6 +5627,7 @@ fn approve_pii_release(
         token: String::new(),
         id: new_correlation_id(),
         client: client.map(str::to_string),
+        client_name: crate::session_observability::current().client_name,
         client_label: active_client_label(),
         server: server.to_string(),
         tool: tool.to_string(),
@@ -6334,6 +6341,7 @@ fn execute_script_dispatch(
     // request reach its HTTP client but then misclassifies it as legacy when a
     // downstream asks for sampling/elicitation/roots (SBS-551, extending WS2-3).
     let request_context = active_request_context();
+    let observation_context = observation::current();
     let live_view_resolver = active_live_router_resolver();
 
     // Arc + Send + Sync so independent callAsync work can run on a small host thread pool.
@@ -6365,6 +6373,7 @@ fn execute_script_dispatch(
             );
             result
         };
+        let _observation = observation::ContextGuard::enter(observation_context.clone());
         let _context = ActiveRequestContextGuard::enter(request_context.clone());
         let _live_view = LiveRouterResolverGuard::enter(live_view_resolver.clone());
         run()
@@ -6398,6 +6407,8 @@ fn execute_script_dispatch(
         cancel.clone(),
         host_calls,
     );
+
+    CODE_MODE_FAILURE.with(|kind| kind.set(outcome.failure_kind));
 
     // Account the round-trips this one call replaced (calls - 1), composing with the
     // lazy-discovery savings in the same log + counter.
@@ -6680,6 +6691,7 @@ fn handle_request(
 struct GatewayResponse {
     envelope: Value,
     surface: Option<Arc<savings::SerializedSurface>>,
+    observation: Option<Arc<observation::Session>>,
 }
 
 impl From<Value> for GatewayResponse {
@@ -6687,6 +6699,27 @@ impl From<Value> for GatewayResponse {
         Self {
             envelope,
             surface: None,
+            observation: None,
+        }
+    }
+}
+
+impl GatewayResponse {
+    fn catalog_delivery(&self) -> Option<observation::CatalogDelivery> {
+        if let Some(surface) = &self.surface {
+            return Some(observation::CatalogDelivery {
+                count: surface.tool_count(),
+                fingerprint: surface.hash,
+            });
+        }
+        self.envelope
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .map(|tools| observation::catalog_delivery(tools))
+    }
+    fn delivered(&self) {
+        if let (Some(session), Some(catalog)) = (&self.observation, self.catalog_delivery()) {
+            session.list_delivered(catalog);
         }
     }
 }
@@ -7692,6 +7725,12 @@ fn handle_request_with_cancel(
                     ));
                 }
                 let started = Instant::now();
+                let _run = observation::ContextGuard::enter(observation::Context {
+                    run_id: Some(approval::new_correlation_id()),
+                    ..observation::current()
+                });
+                CODE_MODE_FAILURE
+                    .with(|kind| kind.set(Some(codemode::FailureKind::SyntaxValidation)));
                 let result = run_script_dispatch(
                     reg,
                     router_arc,
@@ -7707,28 +7746,17 @@ fn handle_request_with_cancel(
                     .get("isError")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let detail = result
-                    .pointer("/structuredContent/toolportScript/error")
-                    .or_else(|| result.pointer("/structuredContent/toolportValidate/error"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                // Log attribution and a bounded category, never submitted source,
-                // input values, or arbitrary text thrown by a script.
-                let reason = failed.then_some(
-                    if detail.starts_with("code mode script exceeded its memory budget") {
-                        "code_mode_memory_budget"
-                    } else if detail.contains("wall-clock") {
-                        "code_mode_deadline"
-                    } else {
-                        "code_mode_failed"
-                    },
-                );
-                audit::record_timed(
-                    "toolport",
-                    "run_script",
+                let failure = if failed {
+                    CODE_MODE_FAILURE
+                        .with(|kind| kind.get())
+                        .or(Some(codemode::FailureKind::ScriptException))
+                } else {
+                    None
+                };
+                audit::record_code_mode(
                     !failed,
-                    Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
-                    reason,
+                    started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    failure,
                     client,
                 );
                 return Some(success(id, result));
@@ -9132,12 +9160,20 @@ fn await_stdio_client_ready(stdio: &SessionState, timeout: Duration) -> bool {
 }
 
 /// Put one bare `list_changed` notification on stdout.
-fn write_stdio_list_changed(stdout: &Arc<Mutex<std::io::Stdout>>, method: &str) {
+fn write_stdio_list_changed(
+    stdio: &SessionState,
+    stdout: &Arc<Mutex<std::io::Stdout>>,
+    method: &str,
+) {
     let msg = json!({ "jsonrpc": "2.0", "method": method });
     let mut out = stdout
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = write_json_line(&mut *out, &msg);
+    if write_json_line(&mut *out, &msg).is_ok() && method == "notifications/tools/list_changed" {
+        if let Some(session) = stdio.observation() {
+            session.notification_delivered();
+        }
+    }
 }
 
 /// Record that the raw-stdio peer finished the handshake, and replay whatever
@@ -9199,7 +9235,7 @@ fn drain_stdio_deferred(stdio: &SessionState) {
     // Outside the queue lock: writing takes the stdout mutex, and no other path
     // holds these two at once.
     for method in deferred {
-        write_stdio_list_changed(&stdout, &method);
+        write_stdio_list_changed(stdio, &stdout, &method);
     }
 }
 
@@ -9240,7 +9276,7 @@ fn notify_list_changed(
                 ready
             };
             if ready {
-                write_stdio_list_changed(&stdout, method);
+                write_stdio_list_changed(stdio, &stdout, method);
             }
         }
     }
@@ -13274,6 +13310,8 @@ struct SessionState {
     wait: (Mutex<()>, Condvar),
     client_upstream: Mutex<ClientUpstreamCaps>,
     client_label: Mutex<Option<String>>,
+    observation: Mutex<Option<Arc<observation::Session>>>,
+    observation_shared: AtomicBool,
     upstream_pending: Mutex<HashMap<String, std::sync::mpsc::Sender<Value>>>,
     next_upstream_id: AtomicI64,
     /// The upstream client's project root for the `${ROOT}` cwd token (issue #239),
@@ -13367,6 +13405,8 @@ impl SessionState {
             wait: (Mutex::new(()), Condvar::new()),
             client_upstream: Mutex::new(ClientUpstreamCaps::default()),
             client_label: Mutex::new(None),
+            observation: Mutex::new(None),
+            observation_shared: AtomicBool::new(false),
             upstream_pending: Mutex::new(HashMap::new()),
             next_upstream_id: AtomicI64::new(1),
             client_root: Arc::new(Mutex::new(None)),
@@ -13650,10 +13690,26 @@ impl SessionState {
         self.upstream_call_timeout(method, params, upstream_rpc_timeout(method))
     }
 
-    fn close(&self) {
+    fn observation(&self) -> Option<Arc<observation::Session>> {
+        self.observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn close_reason(&self, reason: observation::CloseReason) {
+        if !self.observation_shared.load(Ordering::Relaxed) {
+            if let Some(session) = self.observation() {
+                session.close(reason);
+            }
+        }
         self.cancellations.close();
         self.closed.store(true, Ordering::SeqCst);
         self.wait.1.notify_all();
+    }
+
+    fn close(&self) {
+        self.close_reason(observation::CloseReason::ClientDisconnect);
     }
 
     fn try_begin_listen(&self) -> bool {
@@ -13677,7 +13733,13 @@ impl SessionState {
                 let mut out = stdout
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                write_json_line(&mut *out, &value).is_ok()
+                let delivered = write_json_line(&mut *out, &value).is_ok();
+                if delivered && value["method"] == "notifications/tools/list_changed" {
+                    if let Some(session) = self.observation() {
+                        session.notification_delivered();
+                    }
+                }
+                delivered
             }
             SessionTransportFace::Http => {
                 let mut outbound = self
@@ -13740,6 +13802,8 @@ struct McpSseReader {
     cancel_guard: Option<downstream::CancelGuard>,
     buf: Vec<u8>,
     pos: usize,
+    tools_changed: bool,
+    pending_deliveries: Arc<AtomicUsize>,
 }
 
 impl McpSseReader {
@@ -13750,6 +13814,8 @@ impl McpSseReader {
             cancel_guard: None,
             buf: Vec::new(),
             pos: 0,
+            tools_changed: false,
+            pending_deliveries: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -13760,6 +13826,8 @@ impl McpSseReader {
             cancel_guard: None,
             buf: Vec::new(),
             pos: 0,
+            tools_changed: false,
+            pending_deliveries: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -13774,10 +13842,20 @@ impl Read for McpSseReader {
                 let n = dest.len().min(self.buf.len() - self.pos);
                 dest[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
                 self.pos += n;
+                if self.pos == self.buf.len() && self.tools_changed {
+                    self.pending_deliveries.fetch_add(1, Ordering::Relaxed);
+                    self.tools_changed = false;
+                }
                 return Ok(n);
             }
             match self.session.next_sse_chunk(MCP_SSE_KEEPALIVE) {
                 Some(chunk) => {
+                    self.tools_changed = chunk.starts_with(b"event: message\ndata: ")
+                        && serde_json::from_slice::<Value>(
+                            &chunk[b"event: message\ndata: ".len()..],
+                        )
+                        .ok()
+                        .is_some_and(|v| v["method"] == "notifications/tools/list_changed");
                     self.buf = chunk;
                     self.pos = 0;
                 }
@@ -13853,7 +13931,7 @@ fn reap_stale_mcp_sessions(state: &GatewayState) {
             .collect()
     };
     for (id, session) in stale {
-        session.close();
+        session.close_reason(observation::CloseReason::Expired);
         cleanup_resource_subs_for_session(state, &id);
         clear_mcp_session_tables(&id);
     }
@@ -14030,6 +14108,7 @@ fn broker_url_elicitation(
         token: String::new(),
         id: format!("toolport-url-{}", new_correlation_id()),
         client: None,
+        client_name: crate::session_observability::current().client_name,
         client_label: None,
         server: screened.origin.clone(),
         tool: "browser interaction".to_string(),
@@ -15169,6 +15248,120 @@ fn process_request_wire(
     client_name: Option<&str>,
     discovery: DiscoveryMode,
 ) -> Option<GatewayResponse> {
+    let holder = if !state.http {
+        Some(state.stdio_upstream.clone())
+    } else {
+        active_mcp_session()
+            .or_else(adapter_lifetime_key)
+            .and_then(|id| {
+                state
+                    .mcp_sessions
+                    .lock()
+                    .ok()
+                    .and_then(|sessions| sessions.get(&id).cloned())
+            })
+    };
+    let method = req["method"].as_str().unwrap_or("");
+    let label = approval::client_info_label(req.get("params"));
+    let reason = if method == "initialize" {
+        "initialize"
+    } else if upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
+        "modern_first_request"
+    } else {
+        "legacy_first_request"
+    };
+    let name = clients::trusted_client_name(client, client_name);
+    let observed = if let Some(holder) = &holder {
+        let mut current = holder
+            .observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if method == "initialize" {
+            if let Some(previous) = current.take() {
+                previous.close(observation::CloseReason::Reinitialize);
+            }
+        }
+        current
+            .get_or_insert_with(|| {
+                observation::Session::start(
+                    client,
+                    Some(&name),
+                    label.as_deref(),
+                    if state.http { "http" } else { "stdio" },
+                    reason,
+                )
+            })
+            .clone()
+    } else {
+        // Modern remote HTTP has no protocol session. A request is the only
+        // observable lifetime; never merge two windows merely by bearer identity.
+        observation::Session::start(
+            client,
+            Some(&name),
+            label.as_deref(),
+            "http_request",
+            "sessionless_request",
+        )
+    };
+    let _context = observation::ContextGuard::enter(observed.context());
+    let internal = match (method, req["params"]["name"].as_str()) {
+        ("server/discover", _) => Some("describe"),
+        ("tools/call", Some("toolport_search_tools")) => Some("search"),
+        ("tools/call", Some("toolport_call_tool")) => Some("call_dispatch"),
+        _ => None,
+    };
+    let base = state
+        .router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let cold = base
+        .any_missing_catalog(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
+        || state
+            .cached_tools
+            .lock()
+            .map(|c| c.tools.is_empty())
+            .unwrap_or(true);
+    let started = Instant::now();
+    let mut response = process_request_wire_inner(
+        state,
+        req,
+        guard,
+        allowed,
+        adapter_profile,
+        connection_profile,
+        cancel,
+        client,
+        Some(&name),
+        discovery,
+    );
+    if let Some(tool) = internal {
+        audit::record_internal(
+            tool,
+            started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            cold,
+            client,
+        );
+    }
+    if let Some(response) = &mut response {
+        response.observation = Some(observed.clone());
+    }
+    response
+}
+
+fn process_request_wire_inner(
+    state: &GatewayState,
+    req: &Value,
+    guard: &SearchGuard,
+    allowed: Option<&std::collections::HashSet<String>>,
+    adapter_profile: Option<&str>,
+    // The profile an HTTP caller is scoped to (`HttpCaller::profile`); `None` on stdio.
+    connection_profile: Option<&str>,
+    cancel: Option<downstream::CancelContext>,
+    client: Option<&str>,
+    client_name: Option<&str>,
+    discovery: DiscoveryMode,
+) -> Option<GatewayResponse> {
     let _approval_cancel = ApprovalCancelGuard::enter(cancel.clone());
     let _transport = UpstreamTransportGuard::enter(if state.http {
         UpstreamTransport::Http
@@ -15728,6 +15921,7 @@ fn process_request_wire(
         return Some(GatewayResponse {
             envelope,
             surface: Some(exposed),
+            observation: None,
         });
     }
     handle_request_with_cancel(
@@ -15824,6 +16018,7 @@ fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
         // `stdio_may_speak`; the peer's post-handshake message is the other, and
         // either one may land last.
         if write_stdio_response(&state.stdio_upstream, &resp) {
+            resp.delivered();
             state.stdio_upstream.mark_stdio_responded();
             drain_stdio_deferred(&state.stdio_upstream);
         }
@@ -16228,6 +16423,8 @@ struct HttpOut {
     extra: Vec<(String, String)>,
     /// Long-lived MCP SSE listen stream (chunked response).
     mcp_listen: Option<McpListen>,
+    catalog_delivery: Option<(Arc<observation::Session>, observation::CatalogDelivery)>,
+    observation: Option<Arc<observation::Session>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -16257,6 +16454,8 @@ impl HttpOut {
             body,
             extra: Vec::new(),
             mcp_listen: None,
+            catalog_delivery: None,
+            observation: None,
         }
     }
 
@@ -16626,7 +16825,7 @@ fn handle_mcp_http(
             }
             match mcp_require_session(state, headers.session_id, session_owner) {
                 Ok((sid, session)) => {
-                    session.close();
+                    session.close_reason(observation::CloseReason::ClientDelete);
                     state
                         .mcp_sessions
                         .lock()
@@ -16723,7 +16922,29 @@ fn handle_mcp_http(
                     session_owner,
                     ModernSubscriptionTransport::Http,
                 ) {
-                    Ok((key, session)) => HttpOut::modern_mcp_listen(state.clone(), key, session),
+                    Ok((key, session)) => {
+                        let lifetime = adapter_lifetime(state, session_owner);
+                        let observed = lifetime
+                            .as_ref()
+                            .and_then(|s| s.observation())
+                            .unwrap_or_else(|| {
+                                observation::Session::start(
+                                    client,
+                                    client_name,
+                                    None,
+                                    "http_subscription",
+                                    "modern_subscription",
+                                )
+                            });
+                        *session
+                            .observation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observed);
+                        session
+                            .observation_shared
+                            .store(lifetime.is_some(), Ordering::Relaxed);
+                        HttpOut::modern_mcp_listen(state.clone(), key, session)
+                    }
                     Err(response) => HttpOut::new(
                         200,
                         "application/json",
@@ -16922,6 +17143,11 @@ fn handle_mcp_http(
                     } else {
                         200
                     };
+                    let catalog_delivery = resp
+                        .observation
+                        .as_ref()
+                        .zip(resp.catalog_delivery())
+                        .map(|(session, catalog)| (session.clone(), catalog));
                     if resp.surface.is_none() {
                         let body = serde_json::to_string(&resp.envelope).unwrap_or_else(|_| {
                             json!({
@@ -16931,7 +17157,10 @@ fn handle_mcp_http(
                             })
                             .to_string()
                         });
-                        return mcp_rpc_response(status, body, session_id.as_deref(), prefer_sse);
+                        let mut out = mcp_rpc_response(status, body, session_id.as_deref(), prefer_sse);
+                        out.catalog_delivery = catalog_delivery;
+                        out.observation = resp.observation.clone();
+                        return out;
                     }
                     let body = gateway_memory::serialize(&resp, prefer_sse).unwrap_or_else(|_| {
                         let body = json!({
@@ -16946,7 +17175,10 @@ fn handle_mcp_http(
                             body
                         }
                     });
-                    mcp_rpc_response_ready(status, body, session_id.as_deref(), prefer_sse)
+                    let mut out = mcp_rpc_response_ready(status, body, session_id.as_deref(), prefer_sse);
+                    out.catalog_delivery = catalog_delivery;
+                    out.observation = resp.observation.clone();
+                    out
                 }
                 None => {
                     let body = json!({
@@ -19048,7 +19280,31 @@ fn respond_mcp_sse_listen(request: tiny_http::Request, mut out: HttpOut, allow_h
     };
     reader.cancel_guard = listen.cancel_guard;
     let version = request.http_version().clone();
-    let mut writer = request.into_writer();
+    struct DeliveryWriter<W> {
+        inner: W,
+        session: Arc<SessionState>,
+        pending: Arc<AtomicUsize>,
+    }
+    impl<W: Write> Write for DeliveryWriter<W> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()?;
+            let delivered = self.pending.swap(0, Ordering::Relaxed);
+            if let Some(session) = self.session.observation() {
+                for _ in 0..delivered {
+                    session.notification_delivered();
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut writer = DeliveryWriter {
+        inner: request.into_writer(),
+        session: reader.session.clone(),
+        pending: reader.pending_deliveries.clone(),
+    };
     let _ = write_mcp_sse_response(&mut writer, &version, &headers, &mut reader);
 }
 
@@ -19238,18 +19494,20 @@ fn healthz_out(state: &GatewayState, method: &str) -> HttpOut {
     }
 }
 
-fn respond_http<R: Read>(request: tiny_http::Request, response: tiny_http::Response<R>) {
+fn respond_http<R: Read>(request: tiny_http::Request, response: tiny_http::Response<R>) -> bool {
     let cancellations = request.remote_addr().and_then(|peer| {
         http_connection_cancellations()
             .lock()
             .ok()
             .and_then(|connections| connections.get(peer).cloned())
     });
-    if request.respond(response).is_ok() {
+    let delivered = request.respond(response).is_ok();
+    if delivered {
         if let Some(cancellations) = cancellations {
             cancellations.finish_connection();
         }
     }
+    delivered
 }
 
 /// Handle one accepted HTTP request end to end: parse, CORS, auth/scope, dispatch,
@@ -19521,7 +19779,23 @@ fn handle_connection(
             )
         };
         match resolved {
-            Some((allowed, resolved_caller)) => {
+            Some((allowed, mut resolved_caller)) => {
+                if private_daemon_bearer
+                    && adapter_client_id
+                        .as_deref()
+                        .is_some_and(|id| clients::known_adapter_name(id).is_none())
+                {
+                    if let Some(pid) = request
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.equiv("Toolport-Adapter-Pid"))
+                        .and_then(|h| h.value.as_str().parse::<u32>().ok())
+                    {
+                        if let Some(name) = conduit_lib::client_process::parent_app(pid) {
+                            resolved_caller.audit_label = Some(format!("Unknown app (via {name})"));
+                        }
+                    }
+                }
                 caller = Some(resolved_caller);
                 Some(allowed)
             }
@@ -19643,7 +19917,16 @@ fn handle_connection(
             response = response.with_header(h);
         }
     }
-    respond_http(request, response);
+    if respond_http(request, response) {
+        if let Some((session, catalog)) = out.catalog_delivery {
+            session.list_delivered(catalog);
+        }
+    }
+    if let Some(session) = out.observation {
+        if session.is_request() {
+            session.close(observation::CloseReason::RequestComplete);
+        }
+    }
 }
 
 /// Flags `toolport-gateway` recognizes on the command line today, kept in one
@@ -24597,6 +24880,7 @@ mod tests {
             token: String::new(),
             id: "id".into(),
             client: None,
+            client_name: crate::session_observability::current().client_name,
             client_label: None,
             server: "db".into(),
             tool: "drop".into(),
@@ -24654,6 +24938,7 @@ mod tests {
             token: String::new(),
             id: "id".into(),
             client: None,
+            client_name: crate::session_observability::current().client_name,
             client_label: None,
             server: "crm".into(),
             tool: "export_all".into(),
@@ -35908,6 +36193,7 @@ mod tests {
                     token: String::new(),
                     id: "1".into(),
                     client: None,
+                    client_name: crate::session_observability::current().client_name,
                     client_label: None,
                     server: "s".into(),
                     tool: "t".into(),

@@ -1480,13 +1480,31 @@ fn scan_roo_code_plugins() -> Vec<McpServer> {
 
 /// Resolve display identity only from Toolport-owned names, never clientInfo.
 /// Recorded friendly names remain authoritative for historical Activity rows.
+pub fn known_adapter_name(id: &str) -> Option<String> {
+    if id == "claude-code-secondary" {
+        return Some("Claude Code (secondary)".into());
+    }
+    defs()
+        .into_iter()
+        .find(|def| def.id == id)
+        .map(|def| def.name.to_string())
+}
+
 pub fn trusted_client_name(client: Option<&str>, recorded_name: Option<&str>) -> String {
     if let Some(name) = recorded_name.filter(|name| !name.is_empty()) {
         return name.to_string();
     }
     if let Some(id) = client.and_then(|client| client.strip_prefix("adapter:")) {
-        if let Some(def) = defs().into_iter().find(|def| def.id == id) {
-            return def.name.to_string();
+        if let Some(name) = known_adapter_name(id) {
+            return name;
+        }
+        if let Some(pid) = id
+            .strip_prefix("adapter-pid-")
+            .and_then(|pid| pid.parse().ok())
+        {
+            if let Some(name) = crate::client_process::parent_app(pid) {
+                return format!("Unknown app (via {name})");
+            }
         }
     }
     if let Some(id) = client.and_then(|client| client.strip_prefix("client:")) {
@@ -3282,7 +3300,10 @@ pub struct WriteOutcome {
     pub recovery_path: Option<PathBuf>,
 }
 
-fn revision_outcome(client_id: &str, result: Result<WriteOutcome, String>) -> Result<WriteOutcome, String> {
+fn revision_outcome(
+    client_id: &str,
+    result: Result<WriteOutcome, String>,
+) -> Result<WriteOutcome, String> {
     let mut outcome = result?;
     let path = Path::new(&outcome.path);
     outcome.recovery_path = Some(restore::record_path(client_id, path)?);
@@ -3801,10 +3822,18 @@ fn rewrite_json_key_preserving(
     }
     let before = parse_json_value(original)?;
     if let Some(prop) = obj.get(key) {
-        if let (Some(child), Some(before), Some(after)) = (prop.object_value(), before.get(key).and_then(serde_json::Value::as_object), new_value.as_object()) {
+        if let (Some(child), Some(before), Some(after)) = (
+            prop.object_value(),
+            before.get(key).and_then(serde_json::Value::as_object),
+            new_value.as_object(),
+        ) {
             patch_json_object(&child, before, after)?;
-        } else { prop.set_value(serde_to_cst_input(new_value)); }
-    } else { obj.append(key, serde_to_cst_input(new_value)); }
+        } else {
+            prop.set_value(serde_to_cst_input(new_value));
+        }
+    } else {
+        obj.append(key, serde_to_cst_input(new_value));
+    }
     Ok(root.to_string())
 }
 
@@ -5991,12 +6020,10 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
 }
 
 /// A secondary Claude config has no distinct registry client id. Preserve its frozen
-/// profile and omit `TOOLPORT_CLIENT_ID`; otherwise every secondary resolves through
-/// the primary `claude-code` client scope and silently changes tool sets on repair.
+/// profile under a separate adapter identity, so it never resolves through the
+/// primary `claude-code` scope or silently changes tool sets on repair.
 fn secondary_claude_gateway_entry(profile: Option<&str>) -> Result<ServerEntry, String> {
-    let mut entry = gateway_entry(profile, "claude-code")?;
-    entry.env.retain(|var| var.key != crate::brand::CLIENT_ID);
-    Ok(entry)
+    gateway_entry(profile, "claude-code-secondary")
 }
 
 fn edit_json_gateway(
@@ -6285,6 +6312,16 @@ fn edit_format(
     Ok(())
 }
 
+fn backfill_gateway_identity(
+    def: &ClientDef,
+    path: &Path,
+    entry_name: &str,
+    id: &str,
+) -> Result<(), String> {
+    backup_file(def.id, path)?;
+    moved::backfill_identity(def.format, path, entry_name, id)
+}
+
 /// Add Toolport's stdio gateway entry to a client's config (preserves existing servers).
 /// `profile` scopes the client to one profile via `TOOLPORT_PROFILE` (None = all).
 pub fn install_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOutcome, String> {
@@ -6328,12 +6365,16 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             restored: restored_names,
             used_move_record: moved::matches_path(client_id, &path)?,
             revision: None,
-        warnings: Vec::new(),
-        recovery_path: None,
+            warnings: Vec::new(),
+            recovery_path: None,
         });
     }
     let current = crate::registry_controller::registry_for_disconnect()?;
-    restore::check_legacy_gateway(def.format, &path, current.client_managed_entries.get(client_id))?;
+    restore::check_legacy_gateway(
+        def.format,
+        &path,
+        current.client_managed_entries.get(client_id),
+    )?;
     let restored = moved::restore(client_id, def.format, &path)?;
     if restored.is_none() && (!mutation::exists(&path) || !read_client(&def).gateway_installed) {
         return Ok(WriteOutcome {
@@ -6365,11 +6406,19 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
 pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) -> Result<(), String> {
     let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
     let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
-    restore::check_finished(client_id, Path::new(&outcome.path), outcome.revision.as_deref())?;
+    restore::check_finished(
+        client_id,
+        Path::new(&outcome.path),
+        outcome.revision.as_deref(),
+    )?;
     if outcome.used_move_record {
         moved::forget(client_id)?;
     }
-    restore::finish(client_id, Path::new(&outcome.path), outcome.revision.as_deref())?;
+    restore::finish(
+        client_id,
+        Path::new(&outcome.path),
+        outcome.revision.as_deref(),
+    )?;
     Ok(())
 }
 
@@ -6394,10 +6443,18 @@ pub fn setup_revision(client_id: &str) -> Result<String, String> {
 
 /// Stage registry changes against the reviewed server container, then release
 /// the config lock before any vault read, unlock prompt or transport verification.
-pub(crate) fn stage_reviewed<T>(client_id: &str, revision: &str, stage: impl FnOnce() -> Result<T,String>) -> Result<T,String> {
+pub(crate) fn stage_reviewed<T>(
+    client_id: &str,
+    revision: &str,
+    stage: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
     let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
     let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
-    if setup_revision(client_id)? != revision { return Err("Client config changed. Review it again before connecting. Config unchanged.".into()); }
+    if setup_revision(client_id)? != revision {
+        return Err(
+            "Client config changed. Review it again before connecting. Config unchanged.".into(),
+        );
+    }
     stage()
 }
 
@@ -6777,7 +6834,12 @@ fn repoint_stale_gateways_in(
         let config_text = find_def(&client.id)
             .and_then(|def| resolved_definition_path(&def).ok())
             .and_then(|path| read_config_file(&path).ok());
-        if !gateway_entry_needs_rewrite(entry_name, stored, current, config_text.as_deref()) {
+        if !gateway_entry_needs_rewrite(entry_name, stored, current, config_text.as_deref())
+            && entry
+                .env_keys
+                .iter()
+                .any(|key| key == crate::brand::CLIENT_ID)
+        {
             continue;
         }
         let profile = config_text
@@ -6802,7 +6864,37 @@ fn repoint_stale_gateways_in(
                         .as_deref()
                         .and_then(profile_from_config_text)
                         .or_else(|| profile.clone());
-                    install_gateway(&client.id, fresh_profile.as_deref())
+                    if !gateway_entry_needs_rewrite(
+                        entry_name,
+                        stored,
+                        current,
+                        config_text.as_deref(),
+                    ) {
+                        backfill_gateway_identity(&def, &path, entry_name, &client.id)?;
+                        let mut updated = gateway_entry(fresh_profile.as_deref(), &client.id)?;
+                        updated.command = Some(current.to_string());
+                        let detected = read_client(&def);
+                        let server = detected
+                            .servers
+                            .iter()
+                            .find(|s| detected_is_gateway(s))
+                            .ok_or("Gateway disappeared during identity repair")?;
+                        let mut managed = ManagedEntry::from_gateway_entry(&updated);
+                        managed.args = server.args.clone();
+
+                        Ok(WriteOutcome {
+                            path: path.display().to_string(),
+                            backup: None,
+                            managed: Some(managed),
+                            restored: Vec::new(),
+                            used_move_record: false,
+                            revision: None,
+                            warnings: Vec::new(),
+                            recovery_path: None,
+                        })
+                    } else {
+                        install_gateway(&client.id, fresh_profile.as_deref())
+                    }
                 })
             });
         match rewrite {
@@ -6861,6 +6953,16 @@ fn repoint_other_claude_configs(current: &str, outcome: &mut RepointOutcome) {
             stored,
         } = repair;
         let write = mutation::run("claude-code", &path, Format::JsonMcpServers, || {
+            if !gateway_entry_needs_rewrite(GATEWAY_ENTRY_NAME, &stored, current, None) {
+                let def = find_def("claude-code").ok_or("Unknown client")?;
+                backup_secondary_claude_file(&path)?;
+                return backfill_gateway_identity(
+                    &def,
+                    &path,
+                    GATEWAY_ENTRY_NAME,
+                    "claude-code-secondary",
+                );
+            }
             secondary_claude_gateway_entry(profile.as_deref()).and_then(|entry| {
                 backup_secondary_claude_file(&path)?;
                 edit_json_gateway(&path, "mcpServers", Some(&entry), true)
@@ -6915,7 +7017,16 @@ fn claude_configs_needing_repair(paths: &[PathBuf], current: &str) -> Vec<Claude
         let Some((entry_name, stored)) = claude_gateway_entry_in(&text) else {
             continue;
         };
-        if !gateway_entry_needs_rewrite(&entry_name, &stored, current, Some(&text)) {
+        if !gateway_entry_needs_rewrite(&entry_name, &stored, current, Some(&text))
+            && serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| {
+                    v["mcpServers"][&entry_name]["env"][crate::brand::CLIENT_ID]
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .is_some()
+        {
             continue;
         }
         out.push(ClaudeRepair {

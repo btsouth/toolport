@@ -224,6 +224,15 @@ function failNotInstalled(detail) {
   setTimeout(() => process.exit(1), 30_000);
 }
 
+export function pluginIdentity(env = process.env, host) {
+  if (env.TOOLPORT_CLIENT_ID?.trim()) return env.TOOLPORT_CLIENT_ID;
+  if (env.CONDUIT_CLIENT_ID?.trim()) return env.CONDUIT_CLIENT_ID;
+  if (host === "claude-code" || "CLAUDE_PLUGIN_ROOT" in env) return "claude-code";
+  if ("CURSOR_PLUGIN_ROOT" in env) return "cursor";
+  if ("CODEX_PLUGIN_ROOT" in env) return "codex";
+  return "toolport-plugin";
+}
+
 export function spawnFirst(
   binaries,
   {
@@ -231,6 +240,8 @@ export function spawnFirst(
     spawnImpl = spawn,
     stdio = "inherit",
     windowsHide = true,
+    env = process.env,
+    host,
   } = {},
 ) {
   return new Promise((resolve, reject) => {
@@ -240,7 +251,7 @@ export function spawnFirst(
         reject(lastError ?? new Error("no gateway candidates"));
         return;
       }
-      const child = spawnImpl(binaries[index], args, { stdio, windowsHide });
+      const child = spawnImpl(binaries[index], args, { stdio, windowsHide, env: { ...env, TOOLPORT_CLIENT_ID: pluginIdentity(env, host) } });
       let started = false;
       child.once("spawn", () => {
         started = true;
@@ -279,7 +290,10 @@ async function main() {
   }
   const binaries = override ? [override] : gatewayCandidates();
   try {
-    process.exit(await spawnFirst(binaries));
+    const args = process.argv.slice(2);
+    const hostIndex = args.indexOf("--plugin-host");
+    const host = hostIndex < 0 ? undefined : args.splice(hostIndex, 2)[1];
+    process.exit(await spawnFirst(binaries, { args, host }));
   } catch (error) {
     failNotInstalled(error?.code === "ENOENT" ? "not on PATH either" : error?.message);
   }

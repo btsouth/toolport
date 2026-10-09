@@ -543,6 +543,7 @@ impl Session {
     fn with_identity(&self, request: ureq::Request) -> ureq::Request {
         let request = request
             .set(ADAPTER_CLIENT_ID_HEADER, &self.client_id)
+            .set("Toolport-Adapter-Pid", &std::process::id().to_string())
             .set("Toolport-Adapter-Instance", &self.instance);
         let request = match &self.env_profile {
             Some(profile) => request.set(ADAPTER_PROFILE_HEADER, profile),
