@@ -269,6 +269,8 @@ export function TeamsView({
 
   // The same local-only hint the GTK picker shows, from the last sync.
   const shareHint = (server: (typeof personalServers)[number]) => {
+    if (server.teamRouteRemoved && registry && !isEnabled(registry, server.id))
+      return "Removed or disabled by the team. Your personal server stays off.";
     const copies = teamServers.filter(
       (s) => team?.managedServerIds?.[s.id] === server.id,
     );

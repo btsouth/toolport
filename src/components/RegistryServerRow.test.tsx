@@ -43,6 +43,18 @@ function renderRow(enabled: boolean, result?: ProbeResult, rowServer = server) {
 }
 
 describe("RegistryServerRow status accessibility", () => {
+  it("explains why a removed shared server's personal original stays off", () => {
+    const view = renderRow(false, undefined, { ...server, teamRouteRemoved: true });
+    expect(
+      screen.getByText(
+        "Removed or disabled by the team. Your personal server stays off.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Toggle Example" })).not.toBeChecked();
+    view.unmount();
+    renderRow(true, health({ ok: true }), { ...server, teamRouteRemoved: true });
+    expect(screen.queryByText(/Your personal server stays off/)).not.toBeInTheDocument();
+  });
   it.each([
     ["endpoint", "MCP endpoint auth required"],
     ["service_credential", "Service credential required"],
