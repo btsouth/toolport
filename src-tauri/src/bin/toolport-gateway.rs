@@ -30334,6 +30334,7 @@ mod tests {
     fn catalog_publication_notifies_only_profiles_with_digest_changes() {
         let _env = DataDirTestEnv::new("profile-catalog-digest-publication");
         let state = http_state(false);
+        state.daemon_mode.store(true, Ordering::SeqCst);
         let mut reg = Registry::default();
         reg.servers = vec![stub_server("one", "One"), stub_server("two", "Two")];
         for server in &mut reg.servers {
