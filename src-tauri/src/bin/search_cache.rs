@@ -271,7 +271,9 @@ mod tests {
         evict(&root, 0, std::time::Duration::from_secs(86400));
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         std::fs::write(root.join("old"), b"old").unwrap();
-        std::fs::File::open(root.join("old"))
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("old"))
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
             .unwrap();
