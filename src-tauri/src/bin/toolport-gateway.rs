@@ -57,7 +57,7 @@ use conduit_lib::secrets;
 use conduit_lib::semantic;
 use conduit_lib::session_store::SessionStore;
 use conduit_lib::shaping;
-use conduit_lib::tool_definitions::{CatalogRef, DownstreamTools, SharedTools, ToolCatalog};
+use conduit_lib::tool_definitions::{CatalogRef, SerializedTools, SharedTools, ToolCatalog};
 use conduit_lib::topology::LaunchKey;
 
 #[cfg(any(unix, windows))]
@@ -704,9 +704,9 @@ fn named_tool_is_model_visible(name: &str, cached: &dyn ToolCatalog, router: &Ro
         .or_else(|| {
             router
                 .shared_tools()
-                .into_iter()
+                .iter()
                 .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
-                .map(|tool| mcp_app_tool_is_model_visible(&tool))
+                .map(mcp_app_tool_is_model_visible)
         })
         .unwrap_or(true)
 }
@@ -10356,7 +10356,7 @@ fn save_server_catalogs_for_launches(router: &Router, profile: Option<&str>, key
     #[derive(serde::Serialize)]
     struct ServerCatalog {
         spec: String,
-        tools: DownstreamTools,
+        tools: SerializedTools,
     }
     #[derive(serde::Serialize)]
     struct Cache {
@@ -36786,7 +36786,7 @@ mod tests {
         )
         .unwrap();
         // The next real tools/list publishes greet; the current catalog has echo.
-        growing.tools.retain(|tool| tool["name"] == "echo");
+        growing.tools.retain_names(|name| name == Some("echo"));
         router.add(growing);
         router.add(
             DownstreamServer::connect(

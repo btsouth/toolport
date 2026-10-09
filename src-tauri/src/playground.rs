@@ -20,7 +20,7 @@ fn server(server_id: &str) -> Result<ServerEntry, String> {
 pub fn list_tools(server_id: &str) -> Result<Vec<serde_json::Value>, String> {
     let mut tools = crate::server_runtime::connect_server(&server(server_id)?)?
         .tools
-        .to_vec();
+        .materialize_all();
     annotate_quarantine(server_id, &mut tools)?;
     Ok(tools)
 }
@@ -86,7 +86,7 @@ pub struct Capabilities {
 pub fn capabilities(server_id: &str) -> Result<Capabilities, String> {
     let mut downstream = crate::server_runtime::connect_server(&server(server_id)?)?;
     downstream.load_resources_prompts();
-    let mut tools = downstream.tools.to_vec();
+    let mut tools = downstream.tools.materialize_all();
     annotate_quarantine(server_id, &mut tools)?;
     Ok(Capabilities {
         tools,

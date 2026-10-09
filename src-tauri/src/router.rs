@@ -28,7 +28,7 @@ use crate::downstream::{
 };
 use crate::registry::ToolOverride;
 use crate::tool_definitions::{
-    content_digest, DownstreamTools, SharedTools, ToolCatalog, ToolDefinition,
+    content_digest, SerializedTools, SharedTools, ToolCatalog, ToolDefinition, ToolPolicyMetadata,
 };
 use std::sync::Weak;
 
@@ -491,7 +491,7 @@ impl ToolPolicy {
         exposed: &str,
         server_id: &str,
         orig: &str,
-        tool: &Value,
+        tool: ToolPolicyMetadata,
     ) -> Option<&'static str> {
         // Tool-granular profile scope: if this server is narrowed to an allow-list, a tool
         // not on it is outside this client's scope (hidden + blocked, same as disabled).
@@ -513,7 +513,7 @@ impl ToolPolicy {
         exposed: &str,
         server_id: &str,
         orig: &str,
-        tool: &Value,
+        tool: ToolPolicyMetadata,
     ) -> Option<&'static str> {
         if !self.allows_server(server_id) {
             return Some("on a server that is turned off");
@@ -525,7 +525,7 @@ impl ToolPolicy {
         {
             return Some("disabled");
         }
-        if self.deny_destructive && is_destructive(tool) {
+        if self.deny_destructive && tool.destructive {
             return Some("blocked by the destructive-tool policy");
         }
         if self.fail_closed_catalog {
@@ -1788,10 +1788,12 @@ impl Router {
                 } else {
                     &Value::Null
                 };
-                match live
-                    .policy
-                    .blocked_reason_unscoped(exposed, server_id, orig, definition)
-                {
+                match live.policy.blocked_reason_unscoped(
+                    exposed,
+                    server_id,
+                    orig,
+                    ToolPolicyMetadata::from(definition),
+                ) {
                     Some(reason) => Err(format!("tool '{exposed}' is {reason}")),
                     None => Ok(()),
                 }
@@ -1809,7 +1811,7 @@ impl Router {
     fn index_server(
         &mut self,
         server_id: &str,
-        tools: &DownstreamTools,
+        tools: &SerializedTools,
         resources: &[Value],
         resource_templates: &[Value],
         prompts: &[Value],
@@ -1857,12 +1859,10 @@ impl Router {
             };
             // Policy: disabled / scope / destructive gate on the ORIGINAL downstream
             // name (server_id + orig); quarantine gates on the final exposed name.
-            if let Some(reason) = self.policy.blocked_reason(
-                &exposed,
-                server_id,
-                orig,
-                &json!({"destructiveHint": tools.is_destructive(idx)}),
-            ) {
+            if let Some(reason) =
+                self.policy
+                    .blocked_reason(&exposed, server_id, orig, tools.policy_metadata(idx))
+            {
                 self.blocked.insert(exposed, reason.to_string());
                 continue;
             }
@@ -1874,7 +1874,7 @@ impl Router {
                 .get(&key)
                 .and_then(Weak::upgrade)
                 .unwrap_or_else(|| {
-                    let mut t = tools.get(idx);
+                    let mut t = tools.materialize(idx);
                     if let Some(desc) = ov_desc {
                         t["description"] = json!(desc);
                     }
@@ -2002,17 +2002,17 @@ impl Router {
     pub fn add_with_reconnect(&mut self, server: DownstreamServer, reconnect: Option<Reconnect>) {
         let id = server.id.clone();
         let route_mcp_apps = supports_mcp_app_html(server.extensions());
+        let tools = server.tools.clone();
+        let resources = server.resources.clone();
+        let templates = server.resource_templates.clone();
+        let prompts = server.prompts.clone();
         let slot = Arc::new(ServerSlot::new(id.clone(), server, reconnect));
-        let server = slot
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.index_server(
             &id,
-            &server.tools,
-            &server.resources,
-            &server.resource_templates,
-            &server.prompts,
+            &tools,
+            &resources,
+            &templates,
+            &prompts,
             route_mcp_apps,
             &slot.definitions,
         );
@@ -2021,7 +2021,6 @@ impl Router {
         if !self.server_order.contains(&id) {
             self.server_order.push(id.clone());
         }
-        drop(server);
         self.servers.push(slot);
         self.by_id.insert(id, idx);
     }
@@ -2063,7 +2062,7 @@ impl Router {
         true
     }
 
-    pub fn raw_catalogs(&self) -> Option<HashMap<String, DownstreamTools>> {
+    pub fn raw_catalogs(&self) -> Option<HashMap<String, SerializedTools>> {
         self.servers
             .iter()
             .map(|slot| Some((slot.id.clone(), slot.inner.try_lock().ok()?.tools.clone())))
@@ -3012,15 +3011,18 @@ impl Router {
     /// previous build are absent from its `blocked` map and must not slip back
     /// in through the guarded catalog (which still carries them from the cache).
     pub fn adopt_restored_routes(&mut self, previous: &Router, catalog: &dyn ToolCatalog) {
-        let mut candidates = Vec::new();
-        let mut seen = HashSet::new();
+        // Rebuilds have already reapplied these routes. Keep their provenance,
+        // including tools visible only in a profile, across repeated publication.
+        let mut candidates = std::mem::take(&mut self.restored_candidates);
+        let mut seen: HashSet<String> =
+            candidates.iter().map(|tool| tool.exposed.clone()).collect();
         for tool in catalog.shared().0 {
             let Some(exposed) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
             // Healthy definitions remain available from the live slots. Retaining
             // them as restoration candidates duplicates every schema on reconnect.
-            if self.routes.contains_key(exposed) {
+            if self.routes.contains_key(exposed) && !seen.contains(exposed) {
                 continue;
             }
             // The previous router indexed the same exposed name; reuse its
@@ -3077,7 +3079,7 @@ impl Router {
                     continue;
                 };
                 if collapsed.contains(server_id)
-                    && !self.routes.contains_key(exposed)
+                    && (!self.routes.contains_key(exposed) || seen.contains(exposed))
                     && seen.insert(exposed.to_string())
                 {
                     candidates.push(RestoredTool {
@@ -3110,7 +3112,7 @@ impl Router {
                 &candidate.exposed,
                 &candidate.server,
                 &candidate.original,
-                &candidate.definition,
+                ToolPolicyMetadata::from(&**candidate.definition),
             ) {
                 self.blocked
                     .insert(candidate.exposed.clone(), reason.to_string());
@@ -3171,8 +3173,7 @@ impl Router {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .tools
-                        .iter()
-                        .any(|tool| tool["name"] == candidate.original)
+                        .contains_name(&candidate.original)
                 });
             if !still_advertised {
                 self.seen.insert(candidate.exposed.clone());
@@ -3185,24 +3186,33 @@ impl Router {
         self.template_routes.clear();
         self.prompts.clear();
         self.prompt_routes.clear();
-        // Clone slot handles so indexing can borrow raw catalog bytes without
-        // cloning definitions or borrowing self.servers across the mutation.
+        // Snapshot catalogs under each slot lock, then normalize/index without
+        // blocking dispatch or raw_catalogs' nonblocking persistence snapshot.
         let slots: Vec<Arc<ServerSlot>> = self.servers.clone();
         for slot in &slots {
             if slot.catalog_complete() {
                 self.catalog_servers.insert(slot.id.clone());
             }
-            let s = slot
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (tools, resources, templates, prompts, route_mcp_apps) = {
+                let s = slot
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (
+                    s.tools.clone(),
+                    s.resources.clone(),
+                    s.resource_templates.clone(),
+                    s.prompts.clone(),
+                    supports_mcp_app_html(s.extensions()),
+                )
+            };
             self.index_server(
                 &slot.id,
-                &s.tools,
-                &s.resources,
-                &s.resource_templates,
-                &s.prompts,
-                supports_mcp_app_html(s.extensions()),
+                &tools,
+                &resources,
+                &templates,
+                &prompts,
+                route_mcp_apps,
                 &slot.definitions,
             );
             slot.definitions

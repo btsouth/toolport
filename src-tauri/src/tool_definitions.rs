@@ -3,6 +3,7 @@ use serde::{ser::SerializeSeq, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     io::Write,
     ops::{Deref, Index},
     sync::Arc,
@@ -260,14 +261,48 @@ impl Serialize for CatalogRef<'_> {
     }
 }
 
-/// Original downstream catalogs retain canonical bytes, not a second parsed tree.
-/// Names and digests let routing and normalization find a definition without parsing.
+/// Original downstream catalogs stored as immutable canonical JSON bytes.
+/// Name, policy, app and header metadata are indexed without a second parsed tree.
+/// Materialization explicitly parses bytes each time. Router normalization caches
+/// the resulting definition per slot; list/search/profile/notification paths use
+/// those shared definitions instead of materializing this storage.
 #[derive(Clone, Debug, Default)]
-pub struct DownstreamTools(Arc<Vec<RawTool>>);
+pub struct SerializedTools(Arc<SerializedCatalog>);
+#[derive(Debug, Clone, Default)]
+struct SerializedCatalog {
+    tools: Vec<Arc<RawTool>>,
+    by_name: HashMap<String, usize>,
+}
+impl SerializedCatalog {
+    fn index_names(&mut self) {
+        self.by_name.clear();
+        for (index, tool) in self.tools.iter().enumerate() {
+            if let Some(name) = &tool.name {
+                // Match the original first-match lookup for duplicate names.
+                self.by_name.entry(name.clone()).or_insert(index);
+            }
+        }
+    }
+}
+
+/// Policy inputs compiled from the original downstream definition. Add future
+/// definition-dependent policy fields here so every enforcement path supplies them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ToolPolicyMetadata {
+    pub destructive: bool,
+}
+impl From<&Value> for ToolPolicyMetadata {
+    fn from(tool: &Value) -> Self {
+        Self {
+            destructive: crate::router::is_destructive(tool),
+        }
+    }
+}
 #[derive(Debug, Clone)]
 struct RawTool {
     name: Option<String>,
-    destructive: bool,
+    policy: ToolPolicyMetadata,
+    headers: Result<Vec<crate::downstream::HeaderParamSpec>, String>,
     app_uri: Option<String>,
     json: Box<serde_json::value::RawValue>,
     digest: [u8; 32],
@@ -275,7 +310,8 @@ struct RawTool {
 impl RawTool {
     fn new(value: Value) -> Self {
         Self {
-            destructive: crate::router::is_destructive(&value),
+            policy: ToolPolicyMetadata::from(&value),
+            headers: crate::downstream::header_param_specs(&value),
             app_uri: value
                 .pointer("/_meta/ui/resourceUri")
                 .or_else(|| value.pointer("/_meta/ui~1resourceUri"))
@@ -294,75 +330,113 @@ impl RawTool {
         serde_json::from_str(self.json.get()).expect("stored JSON is valid")
     }
 }
-impl DownstreamTools {
+impl SerializedTools {
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.0.tools.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0.tools.is_empty()
     }
     pub fn names(&self) -> Vec<Option<&str>> {
-        self.0.iter().map(|tool| tool.name.as_deref()).collect()
+        self.0
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_deref())
+            .collect()
     }
-    pub fn is_destructive(&self, index: usize) -> bool {
-        self.0[index].destructive
+    pub fn contains_name(&self, name: &str) -> bool {
+        self.0.by_name.contains_key(name)
+    }
+    pub(crate) fn policy_metadata(&self, index: usize) -> ToolPolicyMetadata {
+        self.0.tools[index].policy
+    }
+    pub(crate) fn header_specs(
+        &self,
+        name: &str,
+    ) -> Result<&[crate::downstream::HeaderParamSpec], String> {
+        let Some(index) = self.0.by_name.get(name) else {
+            return Ok(&[]);
+        };
+        self.0.tools[*index]
+            .headers
+            .as_deref()
+            .map_err(Clone::clone)
     }
     pub fn app_uri(&self, index: usize) -> Option<&str> {
-        self.0[index].app_uri.as_deref()
+        self.0.tools[index].app_uri.as_deref()
     }
     pub fn digest(&self, index: usize) -> [u8; 32] {
-        self.0[index].digest
+        self.0.tools[index].digest
     }
-    pub fn iter(&self) -> impl Iterator<Item = Value> + '_ {
-        self.0.iter().map(RawTool::parse)
+    /// Parse one definition on a normalized-definition cache miss.
+    pub fn materialize(&self, index: usize) -> Value {
+        self.0.tools[index].parse()
     }
-    pub fn get(&self, index: usize) -> Value {
-        self.0[index].parse()
-    }
-    pub fn named(&self, name: &str) -> Option<Value> {
-        self.0
-            .iter()
-            .find(|t| t.name.as_deref() == Some(name))
-            .map(RawTool::parse)
-    }
-    pub fn to_vec(&self) -> Vec<Value> {
-        self.iter().collect()
+    /// Explicitly parse every definition for APIs returning owned raw JSON.
+    pub fn materialize_all(&self) -> Vec<Value> {
+        self.0.tools.iter().map(|tool| tool.parse()).collect()
     }
     pub fn clear(&mut self) {
         self.0 = Arc::default();
     }
     pub fn push(&mut self, tool: Value) {
-        Arc::make_mut(&mut self.0).push(RawTool::new(tool));
+        let catalog = Arc::make_mut(&mut self.0);
+        let tool = Arc::new(RawTool::new(tool));
+        if let Some(name) = &tool.name {
+            catalog
+                .by_name
+                .entry(name.clone())
+                .or_insert(catalog.tools.len());
+        }
+        catalog.tools.push(tool);
     }
-    pub fn retain(&mut self, mut keep: impl FnMut(&Value) -> bool) {
-        Arc::make_mut(&mut self.0).retain(|tool| keep(&tool.parse()));
+    #[cfg(test)]
+    pub fn retain_names(&mut self, mut keep: impl FnMut(Option<&str>) -> bool) {
+        let catalog = Arc::make_mut(&mut self.0);
+        catalog.tools.retain(|tool| keep(tool.name.as_deref()));
+        catalog.index_names();
     }
 }
-impl From<Vec<Value>> for DownstreamTools {
+impl From<Vec<Value>> for SerializedTools {
     fn from(values: Vec<Value>) -> Self {
-        Self(Arc::new(values.into_iter().map(RawTool::new).collect()))
+        let mut catalog = SerializedCatalog {
+            tools: values
+                .into_iter()
+                .map(|value| Arc::new(RawTool::new(value)))
+                .collect(),
+            by_name: HashMap::new(),
+        };
+        catalog.index_names();
+        Self(Arc::new(catalog))
     }
 }
-impl Serialize for DownstreamTools {
+impl Serialize for SerializedTools {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut seq = s.serialize_seq(Some(self.len()))?;
-        for tool in self.0.iter() {
+        for tool in &self.0.tools {
             seq.serialize_element(&tool.json)?;
         }
         seq.end()
     }
 }
-impl PartialEq for DownstreamTools {
+impl PartialEq for SerializedTools {
     fn eq(&self, other: &Self) -> bool {
         self.0
+            .tools
             .iter()
             .map(|t| t.digest)
-            .eq(other.0.iter().map(|t| t.digest))
+            .eq(other.0.tools.iter().map(|t| t.digest))
     }
 }
-impl PartialEq<Vec<Value>> for DownstreamTools {
+impl PartialEq<Vec<Value>> for SerializedTools {
     fn eq(&self, other: &Vec<Value>) -> bool {
-        self.iter().eq(other.iter().cloned())
+        self.len() == other.len()
+            && self
+                .0
+                .tools
+                .iter()
+                .zip(other)
+                .all(|(tool, value)| tool.parse() == *value)
     }
 }
 
@@ -376,17 +450,17 @@ mod tests {
         let values = vec![
             json!({"name":"read", "inputSchema":{"type":"object", "properties":{"nested":{"type":"object"}}}}),
         ];
-        let mut raw = DownstreamTools::from(values.clone());
+        let mut raw = SerializedTools::from(values.clone());
         let prior = raw.clone();
         assert!(Arc::ptr_eq(&raw.0, &prior.0));
         assert_eq!(
             serde_json::to_vec(&raw).unwrap(),
             serde_json::to_vec(&values).unwrap()
         );
-        assert_eq!(raw.named("read"), Some(values[0].clone()));
+        assert_eq!(raw.materialize(0), values[0]);
         raw.push(json!({"name":"next"}));
         assert!(!Arc::ptr_eq(&raw.0, &prior.0));
-        assert_eq!(prior.to_vec(), values);
+        assert_eq!(prior.materialize_all(), values);
         assert_eq!(raw.len(), 2);
     }
 
@@ -399,9 +473,12 @@ mod tests {
             json!({"name":"read", "_meta":{"ui":{"resourceUri":7}, "ui/resourceUri":"ui://fallback"}}),
             json!({"name":"read", "_meta":{"ui/resourceUri":"ui://fallback"}}),
         ];
-        let raw = DownstreamTools::from(values.clone());
+        let raw = SerializedTools::from(values.clone());
         for (i, value) in values.iter().enumerate() {
-            assert_eq!(raw.is_destructive(i), crate::router::is_destructive(value));
+            assert_eq!(
+                raw.policy_metadata(i).destructive,
+                crate::router::is_destructive(value)
+            );
         }
         assert_eq!(raw.app_uri(3), None);
         assert_eq!(raw.app_uri(4), Some("ui://fallback"));

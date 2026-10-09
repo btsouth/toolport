@@ -6,7 +6,7 @@
 //! its tools. The transport is abstracted so the router can be tested with a mock
 //! instead of spawning real processes.
 
-use crate::tool_definitions::DownstreamTools;
+use crate::tool_definitions::SerializedTools;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -62,7 +62,7 @@ impl SubscriptionFilter {
 use serde_json::{json, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct HeaderParamSpec {
+pub(crate) struct HeaderParamSpec {
     header_name: String,
     path: Vec<String>,
 }
@@ -210,7 +210,7 @@ fn collect_header_param_specs(
     Ok(())
 }
 
-fn header_param_specs(tool: &Value) -> Result<Vec<HeaderParamSpec>, String> {
+pub(crate) fn header_param_specs(tool: &Value) -> Result<Vec<HeaderParamSpec>, String> {
     let Some(schema) = tool.get("inputSchema") else {
         return Ok(Vec::new());
     };
@@ -263,6 +263,7 @@ fn encode_header_param(value: &Value) -> Result<Option<String>, TransportError> 
     }
 }
 
+#[cfg(test)]
 fn tool_request_headers(
     tools: &[Value],
     tool_name: &str,
@@ -275,11 +276,18 @@ fn tool_request_headers(
         return Ok(Vec::new());
     };
     let specs = header_param_specs(tool).map_err(TransportError::Fatal)?;
+    headers_from_specs(&specs, arguments)
+}
+
+fn headers_from_specs(
+    specs: &[HeaderParamSpec],
+    arguments: &Value,
+) -> Result<Vec<(String, String)>, TransportError> {
     let mut headers = Vec::new();
     for spec in specs {
         if let Some(value) = value_at_path(arguments, &spec.path) {
             if let Some(encoded) = encode_header_param(value)? {
-                headers.push((spec.header_name, encoded));
+                headers.push((spec.header_name.clone(), encoded));
             }
         }
     }
@@ -468,7 +476,7 @@ impl CatalogStorage for Vec<Value> {
         self.len()
     }
 }
-impl CatalogStorage for DownstreamTools {
+impl CatalogStorage for SerializedTools {
     fn item_count(&self) -> usize {
         self.len()
     }
@@ -7809,7 +7817,7 @@ impl Transport for StoppedTransport {
 pub struct DownstreamServer {
     pub id: String,
     transport: Box<dyn Transport>,
-    pub tools: DownstreamTools,
+    pub tools: SerializedTools,
     pub resources: Vec<Value>,
     /// Parameterized resource URI templates (`resources/templates/list`).
     /// Refreshed with concrete resources on `resources/list_changed` because
@@ -8185,7 +8193,7 @@ impl DownstreamServer {
             tools: if self.modern_http {
                 self.tools.clone()
             } else {
-                DownstreamTools::default()
+                SerializedTools::default()
             },
             caps_extensions: self.caps_extensions.clone(),
             call_timeout: self.call_timeout,
@@ -8685,7 +8693,7 @@ pub trait ServerDispatch {
     fn era(&self) -> &Era;
     fn modern_http(&self) -> bool;
     /// Tool definitions, for modern HTTP routing headers.
-    fn tools(&self) -> &DownstreamTools;
+    fn tools(&self) -> &SerializedTools;
     fn extensions(&self) -> &serde_json::Map<String, Value>;
     fn server_handler(&self) -> Option<&ServerRequestHandler>;
     /// The locked server, for operations that change connection state. `None`
@@ -8870,10 +8878,11 @@ pub trait ServerDispatch {
         mrtr: Option<&MrtrRequest>,
     ) -> Result<Value, TransportError> {
         let headers = if self.modern_http() {
-            match self.tools().named(tool) {
-                Some(definition) => tool_request_headers(&[definition], tool, &arguments)?,
-                None => Vec::new(),
-            }
+            let specs = self
+                .tools()
+                .header_specs(tool)
+                .map_err(TransportError::Fatal)?;
+            headers_from_specs(specs, &arguments)?
         } else {
             Vec::new()
         };
@@ -8971,7 +8980,7 @@ impl ServerDispatch for DownstreamServer {
         self.modern_http
     }
 
-    fn tools(&self) -> &DownstreamTools {
+    fn tools(&self) -> &SerializedTools {
         &self.tools
     }
 
@@ -9017,7 +9026,7 @@ pub struct CallHandle {
     era: Era,
     modern_http: bool,
     /// Only filled for modern HTTP, the one case that reads tool definitions.
-    tools: DownstreamTools,
+    tools: SerializedTools,
     caps_extensions: serde_json::Map<String, Value>,
     call_timeout: Duration,
     server_handler: Option<ServerRequestHandler>,
@@ -9043,7 +9052,7 @@ impl ServerDispatch for CallHandle {
         self.modern_http
     }
 
-    fn tools(&self) -> &DownstreamTools {
+    fn tools(&self) -> &SerializedTools {
         &self.tools
     }
 
@@ -9410,7 +9419,7 @@ mod tests {
         let mut server = DownstreamServer::connect("ttl".to_string(), Box::new(expiring)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(15));
         server.refresh_tools_if_stale();
-        assert_eq!(server.tools.get(0)["name"], "fresh");
+        assert_eq!(server.tools.materialize(0)["name"], "fresh");
 
         // No third scripted response: this panics if zero/missing TTL turns the
         // one-second watcher into an unbounded polling loop.
@@ -9424,7 +9433,7 @@ mod tests {
         ]);
         let mut server = DownstreamServer::connect("zero".to_string(), Box::new(zero)).unwrap();
         server.refresh_tools_if_stale();
-        assert_eq!(server.tools.get(0)["name"], "stable");
+        assert_eq!(server.tools.materialize(0)["name"], "stable");
     }
 
     #[test]
@@ -9611,7 +9620,7 @@ mod tests {
         assert_eq!(server.resource_templates.len(), 2);
         assert_eq!(server.prompts.len(), 2);
         assert!(server.supports_completions());
-        assert_eq!(server.tools.get(1)["name"], "two");
+        assert_eq!(server.tools.materialize(1)["name"], "two");
         assert_eq!(server.resources[1]["uri"], "two:");
         assert_eq!(server.resource_templates[1]["uriTemplate"], "two://{id}");
         assert_eq!(server.prompts[1]["name"], "two");
@@ -9757,7 +9766,7 @@ mod tests {
         let mut server = DownstreamServer {
             id: "fixture".to_string(),
             transport: Box::new(transport),
-            tools: crate::tool_definitions::DownstreamTools::default(),
+            tools: crate::tool_definitions::SerializedTools::default(),
             resources: Vec::new(),
             resource_templates: Vec::new(),
             prompts: Vec::new(),
@@ -9799,7 +9808,7 @@ mod tests {
         let mut server = DownstreamServer {
             id: "fixture".to_string(),
             transport: Box::new(transport),
-            tools: crate::tool_definitions::DownstreamTools::default(),
+            tools: crate::tool_definitions::SerializedTools::default(),
             resources: vec![json!({"uri":"stable-r:"})],
             resource_templates: vec![json!({"uriTemplate":"stable://{id}"})],
             prompts: vec![json!({"name":"stable-p"})],
@@ -9847,7 +9856,7 @@ mod tests {
         let mut server = DownstreamServer {
             id: "fixture".to_string(),
             transport: Box::new(transport),
-            tools: crate::tool_definitions::DownstreamTools::default(),
+            tools: crate::tool_definitions::SerializedTools::default(),
             resources: vec![json!({"uri":"stable-r:"})],
             resource_templates: vec![json!({"uriTemplate":"stable://{id}"})],
             prompts: Vec::new(),
