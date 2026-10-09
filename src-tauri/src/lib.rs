@@ -7,6 +7,7 @@ pub mod brand;
 pub mod catalog;
 pub mod child_ledger;
 pub mod clients;
+pub mod tool_definitions;
 pub mod codemode;
 pub mod codemode_worker;
 pub mod daemon;

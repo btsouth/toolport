@@ -121,13 +121,16 @@ pub const ESTIMATE_METHOD: &str = "utf8_bytes_div_4";
 
 /// Exact UTF-8 size of the serialized MCP `tools` array, including brackets and
 /// commas. This is the canonical byte measurement for catalog surfaces.
-pub fn surface_bytes(tools: &[Value]) -> u64 {
+pub fn surface_bytes<T: std::borrow::Borrow<Value>>(tools: impl IntoIterator<Item = T>) -> u64 {
     serialize_surface(tools, |_, _| {})
 }
 
 /// Serialize the array once while exposing each element's exact byte length to
 /// attribution. This produces the same bytes as serde_json::to_vec(tools).
-fn serialize_surface(tools: &[Value], on_tool: impl FnMut(&Value, u64)) -> u64 {
+fn serialize_surface<T: std::borrow::Borrow<Value>>(
+    tools: impl IntoIterator<Item = T>,
+    on_tool: impl FnMut(&Value, u64),
+) -> u64 {
     let mut writer = SurfaceWriter::default();
     write_surface(&mut writer, tools, on_tool);
     writer.len

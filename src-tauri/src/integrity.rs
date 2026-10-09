@@ -13,6 +13,7 @@
 //! to `security.jsonl` (a sibling of the audit/savings logs). Detection only:
 //! v1 observes and warns, it never blocks. The app surfaces the events.
 
+use crate::tool_definitions::ToolCatalog;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -585,20 +586,26 @@ fn with_store_lock_using<T>(
 /// security event for each drift. Returns the drift events (also written to
 /// `security.jsonl`). A tool whose server has never been pinned is treated as a
 /// fresh baseline (no drift); only servers we've already seen can "drift".
-pub fn check(profile: Option<&str>, current: &[Value]) -> Result<Vec<Value>, String> {
+pub fn check(
+    profile: Option<&str>,
+    current: &(impl ToolCatalog + ?Sized),
+) -> Result<Vec<Value>, String> {
     check_with_pin_policy(profile, current, false)
 }
 
 /// Detect drift while deferring high-risk pin changes until their quarantine record is durable.
 /// The gateway follows a successful quarantine write with [`accept_quarantined_pins`]. If that
 /// write fails, the old pin remains in place and the same drift is detected again on retry.
-pub fn check_staged(profile: Option<&str>, current: &[Value]) -> Result<Vec<Value>, String> {
+pub fn check_staged(
+    profile: Option<&str>,
+    current: &(impl ToolCatalog + ?Sized),
+) -> Result<Vec<Value>, String> {
     check_with_pin_policy(profile, current, true)
 }
 
 fn check_with_pin_policy(
     profile: Option<&str>,
-    current: &[Value],
+    current: &(impl ToolCatalog + ?Sized),
     defer_quarantine_candidates: bool,
 ) -> Result<Vec<Value>, String> {
     // Serialize the pin baseline's load-modify-save so a concurrent gateway's re-baseline can't
@@ -614,7 +621,7 @@ fn check_with_pin_policy(
 
 fn check_inner(
     profile: Option<&str>,
-    current: &[Value],
+    current: &(impl ToolCatalog + ?Sized),
     defer_quarantine_candidates: bool,
 ) -> Result<Vec<Value>, String> {
     check_inner_with(profile, current, defer_quarantine_candidates, save_pins)
@@ -622,7 +629,7 @@ fn check_inner(
 
 fn check_inner_with(
     profile: Option<&str>,
-    current: &[Value],
+    current: &(impl ToolCatalog + ?Sized),
     defer_quarantine_candidates: bool,
     save: impl FnOnce(Option<&str>, &Pins) -> Result<(), String>,
 ) -> Result<Vec<Value>, String> {
@@ -644,7 +651,7 @@ fn check_inner_with(
 
     let mut now: Pins = BTreeMap::new();
 
-    for t in current {
+    for t in current.values() {
         // `current` is the router's aggregated DOWNSTREAM catalog, so every entry is a
         // real routed tool. Do NOT gate on a `server__` prefix: a tool renamed via a
         // tool override has an arbitrary exposed name with no `__`, and gating on `__`
@@ -784,7 +791,7 @@ fn check_inner_with(
 /// failure cannot consume the old baseline and make the drift disappear on retry/restart.
 pub fn accept_staged_pins(
     profile: Option<&str>,
-    current: &[Value],
+    current: &(impl ToolCatalog + ?Sized),
     events: &[Value],
 ) -> Result<(), String> {
     let names = quarantine_candidates(current, events);
@@ -808,7 +815,7 @@ pub fn accept_staged_pins(
         };
         let stamp = epoch_millis();
         let mut updated = pins.clone();
-        for tool in current {
+        for tool in current.values() {
             let Some(name) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
@@ -1994,7 +2001,7 @@ fn release_all_inner(
 /// failures are returned distinctly so the gateway can retain its live blocked set.
 pub fn apply_quarantine(
     profile: Option<&str>,
-    current: &[Value],
+    current: &(impl ToolCatalog + ?Sized),
     events: &[Value],
 ) -> Result<bool, String> {
     let path = quarantine_path(profile).ok_or_else(|| {
@@ -2018,10 +2025,13 @@ fn is_high_risk_drift(event: &Value) -> bool {
 /// Tool names an integrity failure must keep blocked in memory until their quarantine record is
 /// durable. Baseline tamper invalidates the whole catalog; ordinary enforcement shares the exact
 /// same high-risk predicate as persistence in [`apply_quarantine_inner_with`].
-pub fn quarantine_candidates(current: &[Value], events: &[Value]) -> BTreeSet<String> {
+pub fn quarantine_candidates(
+    current: &(impl ToolCatalog + ?Sized),
+    events: &[Value],
+) -> BTreeSet<String> {
     if baseline_tamper_detected(events) {
         return current
-            .iter()
+            .values()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
             .collect();
     }
@@ -2039,7 +2049,7 @@ pub fn quarantine_candidates(current: &[Value], events: &[Value]) -> BTreeSet<St
 
 fn apply_quarantine_inner(
     profile: Option<&str>,
-    current: &[Value],
+    current: &(impl ToolCatalog + ?Sized),
     events: &[Value],
 ) -> Result<bool, String> {
     apply_quarantine_inner_with(profile, current, events, save_quarantine)
@@ -2047,7 +2057,7 @@ fn apply_quarantine_inner(
 
 fn apply_quarantine_inner_with(
     profile: Option<&str>,
-    current: &[Value],
+    current: &(impl ToolCatalog + ?Sized),
     events: &[Value],
     save: impl FnOnce(Option<&str>, &Quarantine) -> Result<(), String>,
 ) -> Result<bool, String> {
@@ -2085,7 +2095,7 @@ fn apply_quarantine_inner_with(
                 added = true;
             }
         }
-        for tool in current {
+        for tool in current.values() {
             let Some(name) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
@@ -2157,7 +2167,7 @@ fn apply_quarantine_inner_with(
         if !q.contains_key(tool) {
             let server = e.get("server").and_then(Value::as_str).unwrap_or("?");
             let pending = current
-                .iter()
+                .values()
                 .find(|candidate| candidate.get("name").and_then(Value::as_str) == Some(tool))
                 .map(pin_of)
                 .ok_or_else(|| {
@@ -2194,8 +2204,8 @@ fn apply_quarantine_inner_with(
 }
 
 /// Whether the tool named `name` in `current` is destructive (MCP annotations).
-fn is_destructive_named(current: &[Value], name: &str) -> bool {
-    current.iter().any(|t| {
+fn is_destructive_named(current: &(impl ToolCatalog + ?Sized), name: &str) -> bool {
+    current.values().any(|t| {
         t.get("name").and_then(Value::as_str) == Some(name) && crate::router::is_destructive(t)
     })
 }

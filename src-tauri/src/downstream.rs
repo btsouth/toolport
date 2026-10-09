@@ -6,6 +6,7 @@
 //! its tools. The transport is abstracted so the router can be tested with a mock
 //! instead of spawning real processes.
 
+use crate::tool_definitions::DownstreamTools;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -459,6 +460,20 @@ pub fn is_implausible_shrink(previous: usize, new: usize) -> bool {
     new * 2 < previous
 }
 
+trait CatalogStorage: From<Vec<Value>> {
+    fn item_count(&self) -> usize;
+}
+impl CatalogStorage for Vec<Value> {
+    fn item_count(&self) -> usize {
+        self.len()
+    }
+}
+impl CatalogStorage for DownstreamTools {
+    fn item_count(&self) -> usize {
+        self.len()
+    }
+}
+
 /// Apply a successful list refresh, holding off on an implausible collapse.
 ///
 /// - A refresh that keeps at least half the previous catalog always replaces it
@@ -468,8 +483,9 @@ pub fn is_implausible_shrink(previous: usize, new: usize) -> bool {
 ///   Requiring confirmation rather than refusing outright keeps a genuine
 ///   downsizing (revoked scopes, an admin pruning tools) from being pinned to a
 ///   stale catalog forever.
+
 fn apply_catalog_refresh(
-    previous: &mut Vec<Value>,
+    previous: &mut impl CatalogStorage,
     new_items: Vec<Value>,
     shrink_streak: &mut u8,
     cache_hint: &mut CacheHint,
@@ -477,9 +493,9 @@ fn apply_catalog_refresh(
     server_id: &str,
     kind: &str,
 ) -> bool {
-    if is_implausible_shrink(previous.len(), new_items.len()) {
+    if is_implausible_shrink(previous.item_count(), new_items.len()) {
         *shrink_streak = shrink_streak.saturating_add(1);
-        let (before, after) = (previous.len(), new_items.len());
+        let (before, after) = (previous.item_count(), new_items.len());
         if *shrink_streak < EMPTY_CATALOG_CONFIRMATIONS {
             cache_hint.mark_stale_and_defer();
             let msg = format!(
@@ -496,12 +512,12 @@ fn apply_catalog_refresh(
         crate::gatewaylog::append(&msg);
         *shrink_streak = 0;
         *cache_hint = new_hint;
-        *previous = new_items;
+        *previous = new_items.into();
         return true;
     }
     *shrink_streak = 0;
     *cache_hint = new_hint;
-    *previous = new_items;
+    *previous = new_items.into();
     true
 }
 
@@ -7793,7 +7809,7 @@ impl Transport for StoppedTransport {
 pub struct DownstreamServer {
     pub id: String,
     transport: Box<dyn Transport>,
-    pub tools: Vec<Value>,
+    pub tools: DownstreamTools,
     pub resources: Vec<Value>,
     /// Parameterized resource URI templates (`resources/templates/list`).
     /// Refreshed with concrete resources on `resources/list_changed` because
@@ -8072,7 +8088,7 @@ impl DownstreamServer {
         Ok(DownstreamServer {
             id,
             transport,
-            tools,
+            tools: tools.into(),
             resources: Vec::new(),
             resource_templates: Vec::new(),
             prompts: Vec::new(),
@@ -8102,7 +8118,7 @@ impl DownstreamServer {
         Self {
             id,
             transport: Box::new(StoppedTransport),
-            tools,
+            tools: tools.into(),
             resources: Vec::new(),
             resource_templates: Vec::new(),
             prompts: Vec::new(),
@@ -8169,7 +8185,7 @@ impl DownstreamServer {
             tools: if self.modern_http {
                 self.tools.clone()
             } else {
-                Vec::new()
+                DownstreamTools::default()
             },
             caps_extensions: self.caps_extensions.clone(),
             call_timeout: self.call_timeout,
@@ -8669,7 +8685,7 @@ pub trait ServerDispatch {
     fn era(&self) -> &Era;
     fn modern_http(&self) -> bool;
     /// Tool definitions, for modern HTTP routing headers.
-    fn tools(&self) -> &[Value];
+    fn tools(&self) -> &DownstreamTools;
     fn extensions(&self) -> &serde_json::Map<String, Value>;
     fn server_handler(&self) -> Option<&ServerRequestHandler>;
     /// The locked server, for operations that change connection state. `None`
@@ -8854,7 +8870,10 @@ pub trait ServerDispatch {
         mrtr: Option<&MrtrRequest>,
     ) -> Result<Value, TransportError> {
         let headers = if self.modern_http() {
-            tool_request_headers(self.tools(), tool, &arguments)?
+            match self.tools().named(tool) {
+                Some(definition) => tool_request_headers(&[definition], tool, &arguments)?,
+                None => Vec::new(),
+            }
         } else {
             Vec::new()
         };
@@ -8952,7 +8971,7 @@ impl ServerDispatch for DownstreamServer {
         self.modern_http
     }
 
-    fn tools(&self) -> &[Value] {
+    fn tools(&self) -> &DownstreamTools {
         &self.tools
     }
 
@@ -8998,7 +9017,7 @@ pub struct CallHandle {
     era: Era,
     modern_http: bool,
     /// Only filled for modern HTTP, the one case that reads tool definitions.
-    tools: Vec<Value>,
+    tools: DownstreamTools,
     caps_extensions: serde_json::Map<String, Value>,
     call_timeout: Duration,
     server_handler: Option<ServerRequestHandler>,
@@ -9024,7 +9043,7 @@ impl ServerDispatch for CallHandle {
         self.modern_http
     }
 
-    fn tools(&self) -> &[Value] {
+    fn tools(&self) -> &DownstreamTools {
         &self.tools
     }
 
@@ -9055,15 +9074,6 @@ impl ServerDispatch for CallHandle {
     ) -> Result<Value, TransportError> {
         self.transport.request_with_cancel(method, params, cancel)
     }
-}
-
-/// Pull a named array field out of a JSON-RPC result, or an empty vec.
-fn extract_array(result: &Value, key: &str) -> Vec<Value> {
-    result
-        .get(key)
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default()
 }
 
 /// Why a paginated traversal stopped before the server ran out of pages.
@@ -9151,7 +9161,7 @@ fn fetch_paginated_list(
         let params = cursor
             .as_ref()
             .map_or_else(|| json!({}), |value| json!({ "cursor": value }));
-        let result = match transport.request(method, params) {
+        let mut result = match transport.request(method, params) {
             Ok(result) => result,
             Err(error) if page_index > 0 => {
                 return Ok(PaginatedList::truncated(
@@ -9169,7 +9179,11 @@ fn fetch_paginated_list(
             None => page_hint,
         });
 
-        let page = extract_array(&result, key);
+        let page = result
+            .get_mut(key)
+            .and_then(Value::as_array_mut)
+            .map(std::mem::take)
+            .unwrap_or_default();
         // Per-page shape, behind the debug flag. Without this the only recorded
         // fact is the final total, which cannot distinguish "the server owns a
         // small catalog" from "we stopped reading a large one" - the ambiguity
@@ -9396,7 +9410,7 @@ mod tests {
         let mut server = DownstreamServer::connect("ttl".to_string(), Box::new(expiring)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(15));
         server.refresh_tools_if_stale();
-        assert_eq!(server.tools[0]["name"], "fresh");
+        assert_eq!(server.tools.get(0)["name"], "fresh");
 
         // No third scripted response: this panics if zero/missing TTL turns the
         // one-second watcher into an unbounded polling loop.
@@ -9410,7 +9424,7 @@ mod tests {
         ]);
         let mut server = DownstreamServer::connect("zero".to_string(), Box::new(zero)).unwrap();
         server.refresh_tools_if_stale();
-        assert_eq!(server.tools[0]["name"], "stable");
+        assert_eq!(server.tools.get(0)["name"], "stable");
     }
 
     #[test]
@@ -9597,7 +9611,7 @@ mod tests {
         assert_eq!(server.resource_templates.len(), 2);
         assert_eq!(server.prompts.len(), 2);
         assert!(server.supports_completions());
-        assert_eq!(server.tools[1]["name"], "two");
+        assert_eq!(server.tools.get(1)["name"], "two");
         assert_eq!(server.resources[1]["uri"], "two:");
         assert_eq!(server.resource_templates[1]["uriTemplate"], "two://{id}");
         assert_eq!(server.prompts[1]["name"], "two");
@@ -9617,7 +9631,7 @@ mod tests {
         let mut server = DownstreamServer {
             id: "fixture".to_string(),
             transport: Box::new(transport),
-            tools: vec![json!({"name":"stable"})],
+            tools: vec![json!({"name":"stable"})].into(),
             resources: Vec::new(),
             resource_templates: Vec::new(),
             prompts: Vec::new(),
@@ -9656,7 +9670,7 @@ mod tests {
         let mut server = DownstreamServer {
             id: "fixture".to_string(),
             transport: Box::new(transport),
-            tools: vec![json!({"name":"stable"})],
+            tools: vec![json!({"name":"stable"})].into(),
             resources: Vec::new(),
             resource_templates: Vec::new(),
             prompts: Vec::new(),
@@ -9701,7 +9715,7 @@ mod tests {
         let mut server = DownstreamServer {
             id: "fixture".to_string(),
             transport: Box::new(transport),
-            tools: vec![json!({"name":"stable"})],
+            tools: vec![json!({"name":"stable"})].into(),
             resources: Vec::new(),
             resource_templates: Vec::new(),
             prompts: Vec::new(),
@@ -9743,7 +9757,7 @@ mod tests {
         let mut server = DownstreamServer {
             id: "fixture".to_string(),
             transport: Box::new(transport),
-            tools: Vec::new(),
+            tools: crate::tool_definitions::DownstreamTools::default(),
             resources: Vec::new(),
             resource_templates: Vec::new(),
             prompts: Vec::new(),
@@ -9785,7 +9799,7 @@ mod tests {
         let mut server = DownstreamServer {
             id: "fixture".to_string(),
             transport: Box::new(transport),
-            tools: Vec::new(),
+            tools: crate::tool_definitions::DownstreamTools::default(),
             resources: vec![json!({"uri":"stable-r:"})],
             resource_templates: vec![json!({"uriTemplate":"stable://{id}"})],
             prompts: vec![json!({"name":"stable-p"})],
@@ -9833,7 +9847,7 @@ mod tests {
         let mut server = DownstreamServer {
             id: "fixture".to_string(),
             transport: Box::new(transport),
-            tools: Vec::new(),
+            tools: crate::tool_definitions::DownstreamTools::default(),
             resources: vec![json!({"uri":"stable-r:"})],
             resource_templates: vec![json!({"uriTemplate":"stable://{id}"})],
             prompts: Vec::new(),
