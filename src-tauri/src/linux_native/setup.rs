@@ -224,11 +224,7 @@ pub(super) fn review(
             } else {
                 "Found"
             }));
-            state.add_css_class(if required_found {
-                "dim-label"
-            } else {
-                "warning"
-            });
+            state.add_css_class(if required_found { "dim-label" } else { "warning" });
             row.add_suffix(&state);
             Some(state)
         } else {
@@ -281,11 +277,7 @@ pub(super) fn review(
                     });
                     state.remove_css_class("warning");
                     state.remove_css_class("dim-label");
-                    state.add_css_class(if required_found {
-                        "dim-label"
-                    } else {
-                        "warning"
-                    });
+                    state.add_css_class(if required_found { "dim-label" } else { "warning" });
                 }
                 refresh_confirm();
             }

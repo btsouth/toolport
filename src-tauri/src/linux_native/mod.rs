@@ -1763,7 +1763,7 @@ impl ServerPage {
                     tool_count: 0,
                     error: Some(error),
                     auth_required: false,
-            auth_target: None,
+                    auth_target: None,
                 },
                 Err(_) => crate::server_runtime::ProbeResult {
                     server_id: server_id.clone(),
@@ -1771,7 +1771,7 @@ impl ServerPage {
                     tool_count: 0,
                     error: Some("the probe stopped unexpectedly".to_string()),
                     auth_required: false,
-            auth_target: None,
+                    auth_target: None,
                 },
             };
             let outcome = page.health.borrow_mut().complete(
@@ -6689,12 +6689,18 @@ fn probe_status_line(probe: &crate::server_runtime::ProbeResult) -> (String, &'s
             "success",
         )
     } else if probe.auth_required {
-        (match probe.auth_target {
-            Some(crate::call_failure::AuthTarget::ServiceCredential) => "Service credential required",
-            Some(crate::call_failure::AuthTarget::Scope) => "Service permission required",
-            Some(crate::call_failure::AuthTarget::OAuthRefresh) => "MCP OAuth refresh failed",
-            _ => "MCP endpoint auth required",
-        }.to_string(), "review")
+        (
+            match probe.auth_target {
+                Some(crate::call_failure::AuthTarget::ServiceCredential) => {
+                    "Service credential required"
+                }
+                Some(crate::call_failure::AuthTarget::Scope) => "Service permission required",
+                Some(crate::call_failure::AuthTarget::OAuthRefresh) => "MCP OAuth refresh failed",
+                _ => "MCP endpoint auth required",
+            }
+            .to_string(),
+            "review",
+        )
     } else {
         ("Error".to_string(), "error")
     }

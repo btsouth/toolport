@@ -3292,10 +3292,7 @@ impl Router {
         slot.wait_for_start(cancel, dispatch_cancelled_continuation)
             .map_err(|detail| {
                 CallFailure::new(
-                    if slot
-                        .status()
-                        .is_some_and(|status| status.needs_auth)
-                    {
+                    if slot.status().is_some_and(|status| status.needs_auth) {
                         CallFailureKind::Auth {
                             target: crate::call_failure::AuthTarget::Endpoint,
                         }
@@ -4118,10 +4115,11 @@ mod tests {
 
     fn http_timeout_with_successful_sibling(body_stage: bool) {
         use crate::downstream::HttpTransport;
-        use std::io::{Read, Write};
+        use std::io::Write;
         let _lock = crate::registry::data_dir_test_lock();
-        let scratch = tempfile::tempdir().unwrap();
-        let _data = crate::registry::DataDirOverride::set(scratch.path());
+        let scratch = std::env::temp_dir().join(format!("toolport-f1-timeout-{}", crate::approval::new_correlation_id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&scratch);
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let url = format!("http://{}/mcp", server.server_addr());
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -4238,6 +4236,8 @@ mod tests {
         stop.store(true, Ordering::Release);
         release_tx.send(()).unwrap();
         wire.join().unwrap();
+        drop(_data);
+        std::fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]

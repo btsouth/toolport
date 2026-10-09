@@ -115,7 +115,13 @@ pub fn probe_one(server: &ServerEntry) -> ProbeResult {
             ok: false,
             tool_count: 0,
             auth_required: remote::is_auth_error(&error) || missing_secret(server),
-            auth_target: if missing_secret(server) { Some(crate::call_failure::AuthTarget::ServiceCredential) } else if remote::is_auth_error(&error) { Some(crate::call_failure::AuthTarget::Endpoint) } else { None },
+            auth_target: if missing_secret(server) {
+                Some(crate::call_failure::AuthTarget::ServiceCredential)
+            } else if remote::is_auth_error(&error) {
+                Some(crate::call_failure::AuthTarget::Endpoint)
+            } else {
+                None
+            },
             error: Some(error),
         },
     }
