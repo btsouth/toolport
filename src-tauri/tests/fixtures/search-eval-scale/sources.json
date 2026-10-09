@@ -1,0 +1,164 @@
+{
+  "sources": [
+    {
+      "server": "stripe",
+      "count": 585,
+      "url": "https://github.com/btsouth/toolport-mcp-servers/blob/9a558eab32ea0c3bbfa78cefb42806195ea46b24/data/stripe-curated.tools.json",
+      "license": "MIT",
+      "capture": "published server definitions"
+    },
+    {
+      "server": "vercel",
+      "count": 333,
+      "url": "https://github.com/btsouth/toolport-mcp-servers/blob/9a558eab32ea0c3bbfa78cefb42806195ea46b24/data/vercel-curated.tools.json",
+      "license": "MIT",
+      "capture": "published server definitions"
+    },
+    {
+      "server": "cloudflare",
+      "count": 357,
+      "url": "https://github.com/btsouth/toolport-mcp-servers/blob/9a558eab32ea0c3bbfa78cefb42806195ea46b24/data/cloudflare-curated.tools.json",
+      "license": "MIT",
+      "capture": "published server definitions"
+    },
+    {
+      "server": "github",
+      "count": 26,
+      "url": "https://github.com/AutomateLab-tech/mcp-tool-catalog/blob/3ce31dcb0ad5709d8eef537fa1cb077230d8aa9c/data/tools.jsonl",
+      "package": "@modelcontextprotocol/server-github",
+      "license": "CC-BY-4.0",
+      "attribution": "AutomateLab-tech, MCP servers tool catalog",
+      "capture": "public tools/list snapshot; package version not recorded upstream"
+    },
+    {
+      "server": "gitlab",
+      "count": 57,
+      "url": "https://github.com/AutomateLab-tech/mcp-tool-catalog/blob/3ce31dcb0ad5709d8eef537fa1cb077230d8aa9c/data/tools.jsonl",
+      "package": "@ttpears/gitlab-mcp-server",
+      "license": "CC-BY-4.0",
+      "attribution": "AutomateLab-tech, MCP servers tool catalog",
+      "capture": "public tools/list snapshot; package version not recorded upstream"
+    },
+    {
+      "server": "linear",
+      "count": 24,
+      "url": "https://github.com/AutomateLab-tech/mcp-tool-catalog/blob/3ce31dcb0ad5709d8eef537fa1cb077230d8aa9c/data/tools.jsonl",
+      "package": "mcp-server-linear",
+      "license": "CC-BY-4.0",
+      "attribution": "AutomateLab-tech, MCP servers tool catalog",
+      "capture": "public tools/list snapshot; package version not recorded upstream"
+    },
+    {
+      "server": "jira",
+      "count": 11,
+      "url": "https://github.com/AutomateLab-tech/mcp-tool-catalog/blob/3ce31dcb0ad5709d8eef537fa1cb077230d8aa9c/data/tools.jsonl",
+      "package": "@john8844/jira-mcp-server",
+      "license": "CC-BY-4.0",
+      "attribution": "AutomateLab-tech, MCP servers tool catalog",
+      "capture": "public tools/list snapshot; package version not recorded upstream"
+    },
+    {
+      "server": "confluence",
+      "count": 5,
+      "url": "https://github.com/AutomateLab-tech/mcp-tool-catalog/blob/3ce31dcb0ad5709d8eef537fa1cb077230d8aa9c/data/tools.jsonl",
+      "package": "@aashari/mcp-server-atlassian-confluence",
+      "license": "CC-BY-4.0",
+      "attribution": "AutomateLab-tech, MCP servers tool catalog",
+      "capture": "public tools/list snapshot; package version not recorded upstream"
+    },
+    {
+      "server": "slack",
+      "count": 8,
+      "url": "https://github.com/AutomateLab-tech/mcp-tool-catalog/blob/3ce31dcb0ad5709d8eef537fa1cb077230d8aa9c/data/tools.jsonl",
+      "package": "@modelcontextprotocol/server-slack",
+      "license": "CC-BY-4.0",
+      "attribution": "AutomateLab-tech, MCP servers tool catalog",
+      "capture": "public tools/list snapshot; package version not recorded upstream"
+    },
+    {
+      "server": "notion",
+      "count": 22,
+      "url": "https://github.com/AutomateLab-tech/mcp-tool-catalog/blob/3ce31dcb0ad5709d8eef537fa1cb077230d8aa9c/data/tools.jsonl",
+      "package": "@notionhq/notion-mcp-server",
+      "license": "CC-BY-4.0",
+      "attribution": "AutomateLab-tech, MCP servers tool catalog",
+      "capture": "public tools/list snapshot; package version not recorded upstream"
+    },
+    {
+      "server": "postgres",
+      "count": 19,
+      "url": "https://github.com/AutomateLab-tech/mcp-tool-catalog/blob/3ce31dcb0ad5709d8eef537fa1cb077230d8aa9c/data/tools.jsonl",
+      "package": "@henkey/postgres-mcp-server",
+      "license": "CC-BY-4.0",
+      "attribution": "AutomateLab-tech, MCP servers tool catalog",
+      "capture": "public tools/list snapshot; package version not recorded upstream"
+    },
+    {
+      "server": "filesystem",
+      "count": 14,
+      "url": "https://github.com/AutomateLab-tech/mcp-tool-catalog/blob/3ce31dcb0ad5709d8eef537fa1cb077230d8aa9c/data/tools.jsonl",
+      "package": "@modelcontextprotocol/server-filesystem",
+      "license": "CC-BY-4.0",
+      "attribution": "AutomateLab-tech, MCP servers tool catalog",
+      "capture": "public tools/list snapshot; package version not recorded upstream"
+    },
+    {
+      "server": "playwright",
+      "count": 23,
+      "url": "https://github.com/AutomateLab-tech/mcp-tool-catalog/blob/3ce31dcb0ad5709d8eef537fa1cb077230d8aa9c/data/tools.jsonl",
+      "package": "@playwright/mcp",
+      "license": "CC-BY-4.0",
+      "attribution": "AutomateLab-tech, MCP servers tool catalog",
+      "capture": "public tools/list snapshot; package version not recorded upstream"
+    },
+    {
+      "server": "google_workspace",
+      "count": 104,
+      "url": "https://github.com/AutomateLab-tech/mcp-tool-catalog/blob/3ce31dcb0ad5709d8eef537fa1cb077230d8aa9c/data/tools.jsonl",
+      "package": "@piotr-agier/google-drive-mcp",
+      "license": "CC-BY-4.0",
+      "attribution": "AutomateLab-tech, MCP servers tool catalog",
+      "capture": "public tools/list snapshot; package version not recorded upstream"
+    },
+    {
+      "server": "aws_lambda",
+      "count": 16,
+      "url": "https://github.com/AutomateLab-tech/mcp-tool-catalog/blob/3ce31dcb0ad5709d8eef537fa1cb077230d8aa9c/data/tools.jsonl",
+      "package": "@chinchillaenterprises/mcp-lambda-cron",
+      "license": "CC-BY-4.0",
+      "attribution": "AutomateLab-tech, MCP servers tool catalog",
+      "capture": "public tools/list snapshot; package version not recorded upstream"
+    },
+    {
+      "server": "supabase",
+      "count": 29,
+      "url": "https://www.npmjs.com/package/@supabase/mcp-server-supabase/v/0.13.0",
+      "package": "@supabase/mcp-server-supabase",
+      "version": "0.13.0",
+      "license": "Apache-2.0",
+      "capture": "tools/list on devbox, placeholder token, no tools/call"
+    },
+    {
+      "server": "sentry",
+      "count": 9,
+      "url": "https://www.npmjs.com/package/@sentry/mcp-server/v/0.42.0",
+      "package": "@sentry/mcp-server",
+      "version": "0.42.0",
+      "license": "FSL-1.1-ALv2",
+      "capture": "tools/list on devbox, placeholder token, no tools/call"
+    },
+    {
+      "server": "clerk",
+      "count": 65,
+      "url": "https://github.com/btsouth/toolport-mcp-servers/blob/9a558eab32ea0c3bbfa78cefb42806195ea46b24/data/clerk-curated.tools.json",
+      "license": "MIT",
+      "capture": "first 65 unique names in lexical order; scale filler, excluded from intent labels"
+    }
+  ],
+  "duplicate_names_kept_first": [
+    "stripe__create_test_helpers_issuing_personalization_designs_personalization_desig_3",
+    "stripe__create_test_helpers_issuing_personalization_designs_personalization_desig_3"
+  ],
+  "selection": "Complete selected provider catalogs; stable lexical Clerk fill. Only namespace prefixes added; descriptions and schemas unchanged.",
+  "sha256": "50ea884843966c820b4a42df881f4aefc6de7723c213d0892d1005c1eb29e8ef"
+}

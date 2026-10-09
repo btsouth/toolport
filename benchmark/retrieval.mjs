@@ -167,8 +167,12 @@ class Gateway {
       arguments: { query, limit },
     });
     const text = r.result?.content?.[0]?.text ?? "";
-    // The result embeds the matches as a JSON-ish block; pull tool names in order.
-    return [...text.matchAll(/"name"\s*:\s*"([^"]+)"/g)].map((m) => m[1]);
+    // Read menu rows and exact-name definitions without treating schema fields
+    // named "name" as candidates.
+    const rows = JSON.parse(text.slice(text.indexOf("\n\n") + 2));
+    return rows
+      .map((row) => (Array.isArray(row) ? row[0] : row.name))
+      .filter((name) => typeof name === "string");
   }
   stop() {
     try {

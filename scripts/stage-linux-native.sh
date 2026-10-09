@@ -16,7 +16,7 @@ cargo build \
   --release \
   --locked \
   --no-default-features \
-  --features gtk-desktop \
+  --features gtk-desktop,search-static \
   --bin toolport-gtk \
   --bin toolport-gateway
 
