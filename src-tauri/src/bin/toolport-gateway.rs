@@ -1976,21 +1976,10 @@ const DEPRECATED_PENALTY: f64 = 0.5;
 const CONFIDENCE_COMPETITOR_RATIO: f64 = 0.85;
 
 struct SearchOutcome {
-    #[cfg(test)]
-    confidence_strength: f64,
-    #[cfg(test)]
-    query_coverage: f64,
-    #[cfg(test)]
-    competitor_ratio: f64,
-    #[cfg(test)]
-    semantic_strength: f64,
-    #[cfg(test)]
-    semantic_competitor_ratio: f64,
     matches: Vec<Value>,
     /// Number of candidates with a positive lexical or hybrid score.
     total: usize,
-    /// The active ranker did not have enough evidence to treat its top result as
-    /// authoritative. The handler uses this to avoid the "call it now" directive.
+    /// Informational weak query evidence or close scores. Never changes payloads.
     low_confidence: bool,
     /// Number of zero-score catalog candidates appended as a recovery menu.
     broadened: usize,
@@ -2749,26 +2738,10 @@ fn search_catalog_filtered(
                 low_confidence: false,
                 broadened: 0,
                 direct_returned: 1,
-                #[cfg(test)]
-                confidence_strength: 1.0,
-                #[cfg(test)]
-                query_coverage: 1.0,
-                #[cfg(test)]
-                competitor_ratio: 0.0,
-                #[cfg(test)]
-                semantic_strength: 1.0,
-                #[cfg(test)]
-                semantic_competitor_ratio: 0.0,
             };
         }
     }
 
-    #[cfg(test)]
-    let query_coverage = 0.0;
-    #[cfg(test)]
-    let (mut confidence_strength, mut competitor_ratio) = (0.0, 1.0);
-    #[cfg(test)]
-    let (semantic_strength, semantic_competitor_ratio) = (0.0, 1.0);
     // Select an ordered set of tool refs (ranking happens here; projection below).
     let (selected, total, low_confidence, broadened, direct_returned) = if terms.is_empty() {
         // Empty query: list the pool. With `server` set this enumerates that server.
@@ -2958,11 +2931,6 @@ fn search_catalog_filtered(
                     .get(1)
                     .is_some_and(|(next, _)| *next >= *score * CONFIDENCE_COMPETITOR_RATIO)
         });
-        #[cfg(test)]
-        if let Some((score, _)) = ranked.first() {
-            confidence_strength = *score;
-            competitor_ratio = ranked.get(1).map_or(0.0, |(next, _)| next / score);
-        }
 
         // A menu is a prefix of the same ranked list at every retrieval depth.
         // Provider caps would discard strong candidates solely for sharing a server.
@@ -3009,16 +2977,6 @@ fn search_catalog_filtered(
     };
 
     SearchOutcome {
-        #[cfg(test)]
-        confidence_strength,
-        #[cfg(test)]
-        query_coverage,
-        #[cfg(test)]
-        competitor_ratio,
-        #[cfg(test)]
-        semantic_strength,
-        #[cfg(test)]
-        semantic_competitor_ratio,
         matches: project_search_results(&selected, true),
         total,
         low_confidence,
@@ -3308,12 +3266,22 @@ fn compact_search_schema(mut schema: Value) -> Value {
 }
 
 fn project_search_results(tools: &[&Value], include_top_schema: bool) -> Vec<Value> {
+    let mut top_schema = if include_top_schema {
+        tools.first().map(|tool| {
+            let mut schema = tool.get("inputSchema").unwrap_or(&Value::Null).clone();
+            integrity::neutralize_value_strings(&mut schema);
+            compact_search_schema(schema)
+        })
+    } else { None };
+    // Give descriptions room when the full schema is small. Large schemas keep
+    // every constraint; their menu lines get shorter to preserve the context budget.
+    let description_limit = if top_schema.as_ref().is_some_and(|schema| worker::json_size(schema, 4096).is_none()) { 24 } else { 100 };
     tools.iter().enumerate().map(|(i, tool)| {
         let description = tool.get("description").and_then(Value::as_str).unwrap_or("");
         let one_line = integrity::neutralize_gateway_voice(description)
             .split_whitespace().collect::<Vec<_>>().join(" ");
-        let description = if one_line.chars().count() > 64 {
-            format!("{}…", one_line.chars().take(64).collect::<String>())
+        let description = if one_line.chars().count() > description_limit {
+            format!("{}…", one_line.chars().take(description_limit).collect::<String>())
         } else { one_line };
         let schema = tool.get("inputSchema").unwrap_or(&Value::Null);
         let required: Vec<_> = schema.get("required").and_then(Value::as_array)
@@ -3321,9 +3289,7 @@ fn project_search_results(tools: &[&Value], include_top_schema: bool) -> Vec<Val
             .map(integrity::neutralize_gateway_voice).collect();
         let mut entry = json!({"name":tool.get("name"),"description":description,"requiredParams":required});
         if include_top_schema && i == 0 {
-            let mut schema = schema.clone();
-            integrity::neutralize_value_strings(&mut schema);
-            entry["inputSchema"] = compact_search_schema(schema);
+            entry["inputSchema"] = top_schema.take().unwrap();
         } else { entry["schemaOmitted"] = json!(true); }
         entry
     }).collect()
@@ -7388,9 +7354,6 @@ fn handle_request_with_cancel(
                     arguments = json!({ "query": q, "server": server });
                 }
             }
-
-            // Anything other than a search breaks the search-thrash streak.
-            if name != "toolport_search_tools" {}
 
             if name == "toolport_fetch_result" {
                 let cursor = arguments

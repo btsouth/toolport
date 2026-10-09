@@ -107,8 +107,6 @@ fn evaluate(
         rows.push(
             json!({"id":intent["id"],"kind":kind,"query":query,"server":server,
             "expected":expected,"category":intent["category"],"rank":rank,"names":names,
-            "confidence_strength":outcome.confidence_strength,"query_coverage":outcome.query_coverage,"competitor_ratio":outcome.competitor_ratio,
-            "semantic_strength":outcome.semantic_strength,"semantic_competitor_ratio":outcome.semantic_competitor_ratio,
             "low_confidence":outcome.low_confidence,"direct_matches":outcome.total,
             "candidate_coverage":candidates,"latency_us":micros,"returned":names.len()}),
         );
