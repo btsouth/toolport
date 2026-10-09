@@ -22346,83 +22346,85 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_scoped_search_waits_for_first_catalog() {
-        let _env = DataDirTestEnv::new("reviewed-scoped-search");
-        let state = http_state(false);
-        // Another client's warm catalog must not shorten this view's cold wait.
-        *state.cached_tools.lock().unwrap() =
-            Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let release_rx = Arc::new(Mutex::new(release_rx));
-        let mut live = Router::new();
-        live.add_supervised(
-            "late".into(),
-            Vec::new(),
-            Arc::new(move || {
-                release_rx
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(10))
-                    .unwrap();
-                Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
-            }),
-            ReconnectBackoff::default(),
-            json!({"revision":1}),
-        );
-        let live = Arc::new(live);
-        *state.router.lock().unwrap() = Arc::clone(&live);
-        let publisher = state.clone();
-        COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
-            hook.replace(Some(Box::new(move |snapshot| {
-                assert!(snapshot.aggregated_tools().is_empty());
-                assert!(snapshot.any_discovering(|id| id == "late"));
-                // Force the request to retain the old router across publication.
-                // Wait for the actual supervisor result, not a scheduler delay.
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let mut seen = started_supervisors();
-                release_tx.send(()).unwrap();
-                while !live.has_ready_reconnects() && Instant::now() < deadline {
-                    seen = wait_for_started_supervisor(seen, deadline);
-                }
-                assert!(live.has_ready_reconnects(), "fixture did not connect");
-                adopt_reconnected_servers(
-                    &publisher.host,
-                    &publisher.stdio_upstream,
-                    &publisher.profile,
-                );
-                assert!(!snapshot.any_discovering(|_| true));
-                assert!(!snapshot.any_publishing_first_catalog(|_| true));
-                assert!(snapshot.aggregated_tools().is_empty());
-                assert!(publisher
-                    .router
-                    .lock()
-                    .unwrap()
-                    .aggregated_tools()
-                    .iter()
-                    .any(|tool| tool["name"] == "late__cached"));
-            })));
-        });
-        let allowed = HashSet::from(["late".to_string()]);
-        let started = Instant::now();
-        let reply = process_request(
+    fn reviewed_search_waits_for_first_catalog() {
+        for server in [None, Some("late")] {
+            let _env = DataDirTestEnv::new("reviewed-cold-search");
+            let state = http_state(false);
+            // Another client's warm catalog must not shorten this view's cold wait.
+            *state.cached_tools.lock().unwrap() =
+                Arc::new(CatalogSnapshot::new(vec![json!({"name":"other__cached"})]));
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = Arc::new(Mutex::new(release_rx));
+            let mut live = Router::new();
+            live.add_supervised(
+                "late".into(),
+                Vec::new(),
+                Arc::new(move || {
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                    Ok(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap())
+                }),
+                ReconnectBackoff::default(),
+                json!({"revision":1}),
+            );
+            let live = Arc::new(live);
+            *state.router.lock().unwrap() = Arc::clone(&live);
+            let publisher = state.clone();
+            COLD_TOOLS_SNAPSHOT_HOOK.with(|hook| {
+                hook.replace(Some(Box::new(move |snapshot| {
+                    assert!(snapshot.aggregated_tools().is_empty());
+                    assert!(snapshot.any_discovering(|id| id == "late"));
+                    // Force the request to retain the old router across publication.
+                    // Wait for the actual supervisor result, not a scheduler delay.
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut seen = started_supervisors();
+                    release_tx.send(()).unwrap();
+                    while !live.has_ready_reconnects() && Instant::now() < deadline {
+                        seen = wait_for_started_supervisor(seen, deadline);
+                    }
+                    assert!(live.has_ready_reconnects(), "fixture did not connect");
+                    adopt_reconnected_servers(
+                        &publisher.host,
+                        &publisher.stdio_upstream,
+                        &publisher.profile,
+                    );
+                    assert!(!snapshot.any_discovering(|_| true));
+                    assert!(!snapshot.any_publishing_first_catalog(|_| true));
+                    assert!(snapshot.aggregated_tools().is_empty());
+                    assert!(publisher
+                        .router
+                        .lock()
+                        .unwrap()
+                        .aggregated_tools()
+                        .iter()
+                        .any(|tool| tool["name"] == "late__cached"));
+                })));
+            });
+            let allowed = HashSet::from(["late".to_string()]);
+            let started = Instant::now();
+            let reply = process_request(
             &state,
-            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"","server":"late"}}}),
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"","server":server}}}),
             &SearchGuard::default(), Some(&allowed), None, None, None, Some("cursor"), None, DiscoveryMode::Lazy,
         ).unwrap();
-        assert!(
-            started.elapsed()
-                < Duration::from_millis(
-                    clients::discovery_capabilities("cursor").cold_full_list_wait_ms,
-                ),
-            "fixture exceeded the client's budget"
-        );
-        assert!(
-            reply["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("late__cached"),
-            "first search read an unpublished catalog: {reply}"
-        );
+            assert!(
+                started.elapsed()
+                    < Duration::from_millis(
+                        clients::discovery_capabilities("cursor").cold_full_list_wait_ms,
+                    ),
+                "fixture exceeded the client's budget"
+            );
+            assert!(
+                reply["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("late__cached"),
+                "first search read an unpublished catalog: {reply}"
+            );
+        }
     }
 
     #[test]
