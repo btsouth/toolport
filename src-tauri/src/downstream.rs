@@ -7100,7 +7100,7 @@ impl HttpTransport {
                 req = req.timeout(deadline.saturating_duration_since(Instant::now()));
             }
             let response = req.send_string(&payload);
-            if matches!(&response, Ok(_) | Err(ureq::Error::Status(_, _))) {
+            if matches!(&response, Err(ureq::Error::Status(_, _))) {
                 self.concurrency.responses.fetch_add(1, Ordering::AcqRel);
             }
             if cancel.is_some_and(HttpCancelSignal::is_cancelled) {
@@ -7169,6 +7169,7 @@ impl HttpTransport {
         self.accept_auth(accepted_auth);
         // Drain so the connection returns to the pool without leaving bytes unread.
         let _ = read_capped(resp, 64 * 1024);
+        self.concurrency.responses.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -7272,6 +7273,9 @@ impl HttpTransport {
                         continue;
                     }
                     None => {}
+                }
+                if v.get("result").is_some() || v.get("error").is_some() {
+                    self.concurrency.responses.fetch_add(1, Ordering::AcqRel);
                 }
                 if http_response_id_matches(&v, Some(&wanted)) {
                     return Ok(Some(v));
@@ -7416,7 +7420,7 @@ impl HttpTransport {
                 started.store(true, Ordering::Release);
             }
             let response = req.send_string(&payload);
-            if matches!(&response, Ok(_) | Err(ureq::Error::Status(_, _))) {
+            if matches!(&response, Err(ureq::Error::Status(_, _))) {
                 self.concurrency.responses.fetch_add(1, Ordering::AcqRel);
             }
             // Cancellation wins even when the socket becomes readable at the same
@@ -7533,6 +7537,7 @@ impl HttpTransport {
             }
         }
         if !expect_response {
+            self.concurrency.responses.fetch_add(1, Ordering::AcqRel);
             return Ok(None);
         }
 
@@ -7550,6 +7555,9 @@ impl HttpTransport {
             .map_err(http_read_error)?;
         let response: Value = serde_json::from_slice(&bytes)
             .map_err(|e| TransportError::Fatal(format!("bad JSON response: {e}")))?;
+        // Headers alone do not show that a pending MCP call is making progress:
+        // a wedged server can accept POSTs and never finish any response body.
+        self.concurrency.responses.fetch_add(1, Ordering::AcqRel);
         if !http_response_id_matches(&response, body.get("id")) {
             return Err(TransportError::Fatal(
                 "HTTP response id did not match its request".into(),

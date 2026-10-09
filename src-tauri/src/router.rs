@@ -4334,7 +4334,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .consecutive_failures,
-            if live_sibling || body_stage { 0 } else { 3 }
+            if live_sibling { 0 } else { 3 }
         );
         assert_eq!(
             spawns.load(Ordering::SeqCst),
@@ -4376,6 +4376,11 @@ mod tests {
     #[test]
     fn dead_http_timeouts_open_breaker_without_replay() {
         http_timeout_health(false, false);
+    }
+
+    #[test]
+    fn stalled_http_bodies_open_breaker_without_replay() {
+        http_timeout_health(true, false);
     }
 
     #[test]
