@@ -179,6 +179,17 @@ try {
   expect(await footer.boundingBox()).toEqual(setupFooterBefore);
   expect(setupFooterBefore.y + setupFooterBefore.height).toBeLessThanOrEqual(360);
   await page.screenshot({ path: path.join(output, "short-onboarding.png") });
+  await page.setViewportSize({ width: 1240, height: 900 });
+  await page.screenshot({
+    animations: "disabled",
+    path: path.join(output, "onboarding-react-welcome.png"),
+  });
+  await page.getByRole("button", { name: /Set up MCP servers/ }).click();
+  await expect(page.getByText(/import your existing servers/)).toBeVisible();
+  await page.screenshot({
+    animations: "disabled",
+    path: path.join(output, "onboarding-react-add.png"),
+  });
   await dialog.getByRole("button", { name: "Skip setup", exact: true }).click();
   const fixture = await page.evaluate(() => window.toolportFixture);
   expect(fixture.missing).toEqual([]);
@@ -352,25 +363,6 @@ try {
   await expect(page.getByText("Beta", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Browse catalog", exact: true }).click();
   await expect(page.getByText("NoteKit", { exact: true }).last()).toBeVisible();
-  await page.getByRole("button", { name: "Add 2", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Review Local notes" })).toBeVisible();
-  await expect(page.getByText(/Credentials: PAT/)).toBeVisible();
-  await page.screenshot({
-    animations: "disabled",
-    path: path.join(output, "setup-collection-review.png"),
-  });
-  await page.getByRole("button", { name: "Add selected servers" }).click();
-  await page.getByRole("button", { name: "Servers", exact: true }).click();
-  await expect(
-    page.getByRole("switch", { name: "Toggle NoteKit", exact: true }),
-  ).toBeChecked();
-  await expect(
-    page.getByRole("switch", { name: "Toggle Calendar", exact: true }),
-  ).not.toBeChecked();
-  await page.screenshot({
-    animations: "disabled",
-    path: path.join(output, "setup-collection-added.png"),
-  });
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   await page.goto(`${baseURL}/fixtures/?setup=1`);
   await page.getByRole("button", { name: "Browse catalog", exact: true }).click();

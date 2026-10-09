@@ -51,7 +51,6 @@ pub mod server_runtime;
 pub mod session_store;
 pub mod shaping;
 pub mod sharing_controller;
-pub mod stacks;
 pub mod stdio_adapter;
 pub mod team_activity;
 pub mod teams;

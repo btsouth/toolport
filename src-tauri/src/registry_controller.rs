@@ -927,26 +927,6 @@ pub fn add_catalog_entry(entry: crate::catalog::CatalogEntry) -> Result<Registry
     Ok(registry)
 }
 
-pub fn add_catalog_stack(
-    entries: Vec<crate::catalog::CatalogEntry>,
-) -> Result<(Registry, usize), String> {
-    registry::update(|registry| {
-        let mut names = registry
-            .servers
-            .iter()
-            .map(|server| server.name.to_lowercase())
-            .collect::<std::collections::HashSet<_>>();
-        let mut added = 0usize;
-        for entry in entries {
-            if names.insert(entry.name.to_lowercase()) {
-                apply_add_entry(registry, catalog_server(entry));
-                added += 1;
-            }
-        }
-        Ok(added)
-    })
-}
-
 pub fn update_server_fields(server_id: &str, fields: ServerFields) -> Result<Registry, String> {
     let (registry, ()) =
         registry::update(|registry| apply_update_server_fields(registry, server_id, fields))?;
@@ -3932,26 +3912,14 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_catalog_and_collection_add_enable_valid_definitions() {
+    fn reviewed_catalog_add_enables_valid_definitions() {
         let fixture = MoveFixture::new(&Registry::default());
         let entry = |name: &str, env: Vec<&str>| {
             serde_json::from_value::<crate::catalog::CatalogEntry>(serde_json::json!({"name":name,"description":"fixture","transport":"stdio","command":"fixture","args":[],"url":null,"envKeys":env,"source":"curated","homepage":null,"category":"Local tools"})).unwrap()
         };
         assert!(add_catalog_entry(entry("catalog", vec![])).unwrap().servers[0].enabled);
-        let (registry, count) = add_catalog_stack(vec![
-            entry("collection", vec![]),
-            entry("missing", vec!["PAT"]),
-        ])
-        .unwrap();
-        assert_eq!(count, 2);
-        assert!(
-            registry
-                .servers
-                .iter()
-                .find(|s| s.name == "collection")
-                .unwrap()
-                .enabled
-        );
+        let registry = add_catalog_entry(entry("missing", vec!["PAT"])).unwrap();
+        assert_eq!(registry.servers.len(), 2);
         assert!(
             !registry
                 .servers

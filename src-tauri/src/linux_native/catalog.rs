@@ -17,7 +17,6 @@ type RegistryFetch = std::sync::Arc<
 struct CatalogSnapshot {
     entries: Vec<crate::catalog::CatalogEntry>,
     existing: HashSet<String>,
-    stacks: Option<Vec<crate::stacks::Stack>>,
 }
 
 #[derive(Clone, Default)]
@@ -33,8 +32,6 @@ pub(super) struct CatalogPage {
     search: gtk::SearchEntry,
     suggestion_popover: gtk::Popover,
     suggestion_list: gtk::Box,
-    stack_heading: gtk::Label,
-    stack_list: gtk::FlowBox,
     server_count: gtk::Label,
     list: gtk::Box,
     feedback: gtk::Label,
@@ -44,7 +41,6 @@ pub(super) struct CatalogPage {
     suggestion_state: Rc<RefCell<SuggestionState>>,
     suggestion_limit: Rc<Cell<usize>>,
     rendered: Rc<RefCell<Option<CatalogSnapshot>>>,
-    expanded_stacks: Rc<RefCell<HashSet<String>>>,
     pending_notice: Rc<RefCell<Option<String>>>,
     feedback_timer: Rc<RefCell<Option<gtk::glib::SourceId>>>,
     /// Self-hosted entries are configured in the Add server editor rather than
@@ -127,20 +123,6 @@ impl CatalogPage {
             .build();
         feedback.set_visible(false);
         page.append(&feedback);
-        let stack_heading = gtk::Label::builder()
-            .label("Collections")
-            .halign(gtk::Align::Start)
-            .css_classes(["heading"])
-            .build();
-        page.append(&stack_heading);
-        let stack_list = gtk::FlowBox::new();
-        stack_list.set_selection_mode(gtk::SelectionMode::None);
-        stack_list.set_min_children_per_line(1);
-        stack_list.set_max_children_per_line(2);
-        stack_list.set_column_spacing(10);
-        stack_list.set_row_spacing(10);
-        stack_list.set_homogeneous(true);
-        page.append(&stack_list);
         let server_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         server_header.append(
             &gtk::Label::builder()
@@ -166,8 +148,6 @@ impl CatalogPage {
             search,
             suggestion_popover,
             suggestion_list,
-            stack_heading,
-            stack_list,
             server_count,
             list,
             feedback,
@@ -177,7 +157,6 @@ impl CatalogPage {
             suggestion_state: Rc::new(RefCell::new(SuggestionState::default())),
             suggestion_limit: Rc::new(Cell::new(SUGGESTION_BATCH)),
             rendered: Rc::new(RefCell::new(None)),
-            expanded_stacks: Rc::new(RefCell::new(HashSet::new())),
             pending_notice: Rc::new(RefCell::new(None)),
             feedback_timer: Rc::new(RefCell::new(None)),
             server_page,
@@ -464,30 +443,24 @@ impl CatalogPage {
                     .iter()
                     .flat_map(crate::catalog::installed_server_identities)
                     .collect();
-                Ok::<_, String>((entries, existing, Some(crate::stacks::stacks())))
+                Ok::<_, String>((entries, existing))
             })
             .await;
             if generation != page.request_generation.get() {
                 return;
             }
             match result {
-                Ok(Ok((entries, existing, stacks))) => page.render(entries, existing, stacks),
+                Ok(Ok((entries, existing))) => page.render(entries, existing),
                 Ok(Err(error)) => page.show_error(&error),
                 Err(_) => page.show_error("the catalog search stopped unexpectedly"),
             }
         });
     }
 
-    fn render(
-        &self,
-        entries: Vec<crate::catalog::CatalogEntry>,
-        existing: HashSet<String>,
-        stacks: Option<Vec<crate::stacks::Stack>>,
-    ) {
+    fn render(&self, entries: Vec<crate::catalog::CatalogEntry>, existing: HashSet<String>) {
         let snapshot = CatalogSnapshot {
             entries: entries.clone(),
             existing: existing.clone(),
-            stacks: stacks.clone(),
         };
         let unchanged = self.rendered.borrow().as_ref() == Some(&snapshot);
         self.rendered.replace(Some(snapshot));
@@ -498,19 +471,8 @@ impl CatalogPage {
         }
         self.server_count
             .set_label(&format!("{} available", entries.len()));
-        self.stack_heading.set_visible(stacks.is_some());
-        self.stack_list.set_visible(stacks.is_some());
         if unchanged {
             return;
-        }
-        while let Some(child) = self.stack_list.first_child() {
-            self.stack_list.remove(&child);
-        }
-        if let Some(stacks) = stacks {
-            for stack in stacks {
-                self.stack_list
-                    .insert(&stack_card(stack, &existing, self.clone()), -1);
-            }
         }
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
@@ -683,150 +645,6 @@ fn configure_self_hosted(entry: &crate::catalog::CatalogEntry, hint: &str, page:
         let page = page.clone();
         editor.connect_destroy(move |_| page.refresh());
     }
-}
-
-fn stack_card(
-    stack: crate::stacks::Stack,
-    existing: &HashSet<String>,
-    page: CatalogPage,
-) -> gtk::Box {
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    card.add_css_class("toolport-card");
-    card.append(
-        &gtk::Label::builder()
-            .label(&stack.name)
-            .halign(gtk::Align::Start)
-            .css_classes(["heading"])
-            .build(),
-    );
-    card.append(
-        &gtk::Label::builder()
-            .label(&stack.description)
-            .halign(gtk::Align::Fill)
-            .xalign(0.0)
-            .wrap(true)
-            .lines(2)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["toolport-muted"])
-            .build(),
-    );
-    let missing = stack
-        .servers
-        .iter()
-        .filter(|entry| {
-            !crate::catalog::installed_entry_identity(&entry)
-                .is_some_and(|identity| existing.contains(&identity))
-        })
-        .count();
-    // Setup steps up front: which credential each server needs and where to
-    // create it, so "Add Collection" is not a leap of faith.
-    {
-        let steps = gtk::Expander::new(Some("Setup steps"));
-        steps.set_expanded(page.expanded_stacks.borrow().contains(&stack.id));
-        let stack_id = stack.id.clone();
-        let expanded_stacks = page.expanded_stacks.clone();
-        steps.connect_expanded_notify(move |steps| {
-            if steps.is_expanded() {
-                expanded_stacks.borrow_mut().insert(stack_id.clone());
-            } else {
-                expanded_stacks.borrow_mut().remove(&stack_id);
-            }
-        });
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        list.set_margin_top(6);
-        for entry in &stack.servers {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            let mut line = entry.name.clone();
-            let launch_labels = entry
-                .launch
-                .as_ref()
-                .map(|launch| {
-                    launch
-                        .inputs
-                        .iter()
-                        .filter(|input| input.required)
-                        .map(|input| input.label.as_str())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            match entry.setup_hint.as_deref() {
-                Some(hint) => line.push_str(&format!(" · {hint}")),
-                None if entry.env_keys.is_empty() && launch_labels.is_empty() => {
-                    line.push_str(" · no credential needed")
-                }
-                None if !entry.env_keys.is_empty() => {
-                    line.push_str(&format!(" · needs {}", entry.env_keys.join(", ")))
-                }
-                None => {}
-            }
-            if !launch_labels.is_empty() {
-                line.push_str(&format!(" · launch setup: {}", launch_labels.join(", ")));
-            }
-            row.append(
-                &gtk::Label::builder()
-                    .label(line)
-                    .halign(gtk::Align::Fill)
-                    .hexpand(true)
-                    .xalign(0.0)
-                    .wrap(true)
-                    .css_classes(["caption", "toolport-muted"])
-                    .build(),
-            );
-            if let Some(credentials_url) = entry.credentials_url.clone() {
-                let get = gtk::Button::with_label("Get credential");
-                get.add_css_class("flat");
-                get.set_tooltip_text(Some(&credentials_url));
-                get.connect_clicked(move |_| {
-                    let _ = crate::oauth::open_web_url(&credentials_url);
-                });
-                row.append(&get);
-            }
-            list.append(&row);
-        }
-        steps.set_child(Some(&list));
-        card.append(&steps);
-    }
-    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    footer.append(
-        &gtk::Label::builder()
-            .label(format!("{} servers · {} new", stack.servers.len(), missing))
-            .halign(gtk::Align::Start)
-            .hexpand(true)
-            .css_classes(["caption", "toolport-muted"])
-            .build(),
-    );
-    let add = gtk::Button::with_label(if missing == 0 {
-        "Added"
-    } else {
-        "Add Collection"
-    });
-    add.set_sensitive(missing > 0);
-    add.add_css_class(if missing == 0 {
-        "toolport-secondary-action"
-    } else {
-        "suggested-action"
-    });
-    let name = stack.name.clone();
-    let missing_entries: Vec<_> = stack
-        .servers
-        .iter()
-        .filter(|entry| {
-            !crate::catalog::installed_entry_identity(entry)
-                .is_some_and(|identity| existing.contains(&identity))
-        })
-        .cloned()
-        .collect();
-    add.connect_clicked(move |_| {
-        let Some(parent) = page.root.root().and_downcast::<gtk::Window>() else {
-            return;
-        };
-        let entries = missing_entries.clone();
-        let refreshed = page.clone();
-        super::setup::collection(&parent, &name, entries, move || refreshed.refresh());
-    });
-    footer.append(&add);
-    card.append(&footer);
-    card
 }
 
 fn catalog_card(
@@ -1094,7 +912,7 @@ mod tests {
             ("outage", HashSet::new()),
             ("installed", HashSet::from([identity])),
         ] {
-            page.render(entries.clone(), existing, None);
+            page.render(entries.clone(), existing);
             if state == "normal" {
                 window.present();
             }
