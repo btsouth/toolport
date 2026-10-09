@@ -582,3 +582,344 @@ pub fn resolve_headers(server: &ServerEntry) -> Result<Vec<(String, String)>, Re
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "toolport-ref-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        #[cfg(unix)]
+        fn fake(&self, name: &str, body: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.0.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn closed_provider_table_and_frontend_match() {
+        let ts = include_str!("../../src/lib/secretRefs.ts");
+        let mut seen = std::collections::HashSet::new();
+        for p in PROVIDERS {
+            assert!(seen.insert(p.scheme));
+            assert!(p.docs.starts_with("https://"));
+            assert!(ts.contains(p.scheme) && ts.contains(p.example));
+            assert_eq!(parse(p.example).unwrap().name, p.name);
+            assert!(!p.sign_in.is_empty());
+        }
+        assert_eq!(PROVIDERS.len(), 10);
+    }
+    #[test]
+    fn rejects_executable_flags_traversal_controls_and_credential_payloads() {
+        for r in [
+            "exec:op read",
+            "op://-out/file/key",
+            "op://v/../key",
+            "op://v/i/key?out-file=/tmp/leak",
+            "op://v/i/key\n",
+            "env:-TOKEN",
+            "env:TO KEN",
+            "vault://secret/--file#token",
+            "bw://name/password",
+            "lpass://.*//password",
+            "dl://id/password?json=$.password",
+            "keeper://8f8I-OqPV58o2r91wVgZ_A/file/secret",
+            "env:TOKEN\0",
+        ] {
+            assert_eq!(
+                parse(r).unwrap_err().state,
+                ErrorState::InvalidReference,
+                "{r}"
+            );
+        }
+        for v in [
+            serde_json::json!({"ref":"env:TOKEN", "command":"evil"}),
+            serde_json::json!({"ref":"env:TOKEN", "env":{"PATH":"evil"}}),
+            serde_json::json!("op://v/i/key"),
+        ] {
+            assert!(source(&[("source".into(), v)].into_iter().collect()).is_err());
+        }
+    }
+    #[test]
+    fn fixed_commands_use_arguments_without_shells() {
+        let cases = [
+            (
+                "op://Engineering/Docs/key",
+                vec!["read", "--no-newline", "op://Engineering/Docs/key"],
+            ),
+            (
+                "doppler://docs/prod/TOKEN",
+                vec![
+                    "secrets",
+                    "get",
+                    "TOKEN",
+                    "--plain",
+                    "--project",
+                    "docs",
+                    "--config",
+                    "prod",
+                ],
+            ),
+            (
+                "vault://secret/docs#token",
+                vec!["kv", "get", "-field=token", "secret/docs"],
+            ),
+            (
+                "keeper://8f8I-OqPV58o2r91wVgZ_A/field/password",
+                vec![
+                    "secret",
+                    "notation",
+                    "keeper://8f8I-OqPV58o2r91wVgZ_A/field/password",
+                ],
+            ),
+            (
+                "dl://QD145B53-B987-4CFE-9408-F25803DC47A4/password",
+                vec!["read", "dl://QD145B53-B987-4CFE-9408-F25803DC47A4/password"],
+            ),
+            (
+                "lpass://123456789/password",
+                vec!["show", "--password", "--color=never", "123456789"],
+            ),
+        ];
+        for (r, args) in cases {
+            assert_eq!(arguments(parse(r).unwrap(), r), args);
+        }
+        assert_eq!(
+            arguments(parse(PROVIDERS[2].example).unwrap(), PROVIDERS[2].example),
+            [
+                "secrets",
+                "get",
+                "TOKEN",
+                "--plain",
+                "--silent",
+                "--telemetry=false",
+                "--projectId",
+                "docs",
+                "--env",
+                "prod",
+                "--path",
+                "/services"
+            ]
+        );
+    }
+    fn server() -> ServerEntry {
+        serde_json::from_value(serde_json::json!({"id":"refs", "name":"Refs", "transport":"stdio", "command":"mock", "env":[{"key":"TOKEN", "secret":true, "source":{"ref":"op://Engineering/Docs/key"}}]})).unwrap()
+    }
+    #[test]
+    fn policy_is_checked_before_resolution_and_empty_allowlist_denies() {
+        let mut s = server();
+        s.unknown_fields.insert(
+            "secretSources".into(),
+            serde_json::json!({"allowedPrefixes":["op://Engineering/"]}),
+        );
+        validate_server(&s).unwrap();
+        assert_eq!(
+            check_policy(&s, "op://Personal/Docs/key")
+                .unwrap_err()
+                .state,
+            ErrorState::PolicyDenied
+        );
+        s.unknown_fields.insert(
+            "secretSources".into(),
+            serde_json::json!({"allowedPrefixes":[]}),
+        );
+        assert_eq!(
+            resolve_server(&s).unwrap_err().state,
+            ErrorState::PolicyDenied
+        );
+        s.unknown_fields.insert(
+            "secretSources".into(),
+            serde_json::json!({"allowedPrefixes":"op://"}),
+        );
+        assert!(validate_server(&s).is_err());
+    }
+    #[test]
+    fn refs_are_exclusive_with_inline_values_and_header_commands() {
+        let mut s = server();
+        s.env[0].value = Some("do-not-persist".into());
+        assert!(validate_server(&s).is_err());
+        s.env[0].value = None;
+        s.env[0].secret = false;
+        assert!(validate_server(&s).is_err());
+        s.env[0].secret = true;
+        s.unknown_fields.insert("headerKeys".into(),serde_json::json!([{"key":"X-Api-Key", "source":{"ref":"op://Engineering/Docs/key","command":"evil"}}]));
+        assert!(validate_server(&s).is_err());
+    }
+    #[test]
+    fn registry_and_setup_export_roundtrip_locations_only() {
+        let mut reg = crate::registry::Registry::default();
+        let mut s = server();
+        s.unknown_fields.insert(
+            "headerKeys".into(),
+            serde_json::json!([{"key":"X-Api-Key","source":{"ref":"op://Engineering/Docs/key"}}]),
+        );
+        reg.servers.push(s);
+        let encoded = serde_json::to_string(&reg).unwrap();
+        let roundtrip: crate::registry::Registry = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            reference_for(&roundtrip.servers[0].env[0]),
+            Some("op://Engineering/Docs/key")
+        );
+        let export = crate::sharing_controller::build_export(&roundtrip, None, None, None);
+        assert_eq!(
+            export["servers"][0]["env"][0]["source"]["ref"],
+            "op://Engineering/Docs/key"
+        );
+        assert_eq!(
+            export["servers"][0]["headerKeys"][0]["source"]["ref"],
+            "op://Engineering/Docs/key"
+        );
+        assert!(export["servers"][0]["env"][0].get("value").is_none());
+    }
+    #[test]
+    fn missing_environment_is_distinct() {
+        assert_eq!(
+            resolve("env:TOOLPORT_FAKE_MISSING_REF_428976")
+                .unwrap_err()
+                .state,
+            ErrorState::NotFound
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn fake_path_success_preserves_spaces_and_never_runs_shell_interpolation() {
+        let tmp = Scratch::new();
+        let p = parse(PROVIDERS[0].example).unwrap();
+        let binary = tmp.fake(p.binary, "printf '  synthetic-ref-value  '");
+        assert_eq!(
+            cli_in(p, std::slice::from_ref(&tmp.0)),
+            Some(binary.clone())
+        );
+        assert_eq!(
+            read_cli(p, p.example, &binary, Duration::from_secs(1)).unwrap(),
+            "  synthetic-ref-value  "
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn fake_path_not_installed_and_relative_path_are_rejected() {
+        let tmp = Scratch::new();
+        let p = parse(PROVIDERS[0].example).unwrap();
+        assert!(cli_in(p, std::slice::from_ref(&tmp.0)).is_none());
+        assert!(cli_in(p, &[PathBuf::from(".")]).is_none());
+        let e = read_cli(p, p.example, &tmp.0.join("missing"), Duration::from_secs(1)).unwrap_err();
+        assert_eq!(e.state, ErrorState::NotInstalled);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn fake_errors_never_echo_stdout_stderr_or_reference() {
+        let tmp = Scratch::new();
+        let p = parse(PROVIDERS[0].example).unwrap();
+        for (body, state) in [
+            (
+                "printf 'synthetic-ref-value'; printf 'locked synthetic-ref-value' >&2; exit 1",
+                ErrorState::Locked,
+            ),
+            (
+                "printf 'not found synthetic-ref-value' >&2; exit 1",
+                ErrorState::NotFound,
+            ),
+            (
+                "printf 'synthetic-ref-value' >&2; exit 1",
+                ErrorState::Failed,
+            ),
+        ] {
+            let binary = tmp.fake(p.binary, body);
+            let e = read_cli(p, p.example, &binary, Duration::from_secs(1)).unwrap_err();
+            assert_eq!(e.state, state);
+            let emitted = serde_json::to_string(&e).unwrap();
+            assert!(!emitted.contains("synthetic-ref-value") && !emitted.contains(p.example));
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn fake_timeout_kills_cli_and_its_pipe_holding_child() {
+        let tmp = Scratch::new();
+        let p = parse(PROVIDERS[0].example).unwrap();
+        let binary = tmp.fake(p.binary, "/bin/sleep 10");
+        let start = Instant::now();
+        let e = read_cli(p, p.example, &binary, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(e.state, ErrorState::Timeout);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn fake_output_parsing_for_every_vendor() {
+        let tmp = Scratch::new();
+        for p in PROVIDERS.iter().filter(|p| p.scheme != "env:") {
+            let body = if p.scheme == "bws://" {
+                format!(
+                    "printf '%s' '{{\"id\":\"{}\",\"value\":\"synthetic-ref-value\"}}'",
+                    &p.example[p.scheme.len()..]
+                )
+            } else {
+                "printf 'synthetic-ref-value\\n'".into()
+            };
+            let binary = tmp.fake(p.binary, &body);
+            assert_eq!(
+                read_cli(p, p.example, &binary, Duration::from_secs(1)).unwrap(),
+                "synthetic-ref-value",
+                "{}",
+                p.name
+            );
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn fake_output_rejects_multiple_values_invalid_json_missing_and_oversize() {
+        let tmp = Scratch::new();
+        let p = parse(PROVIDERS[0].example).unwrap();
+        for body in [
+            "printf 'one\\ntwo\\n'",
+            "printf ''",
+            "/usr/bin/head -c 70000 /dev/zero",
+        ] {
+            let binary = tmp.fake(p.binary, body);
+            assert_eq!(
+                read_cli(p, p.example, &binary, Duration::from_secs(1))
+                    .unwrap_err()
+                    .state,
+                ErrorState::InvalidOutput
+            );
+        }
+        let p = &PROVIDERS[2];
+        let binary = tmp.fake(p.binary, "printf '*not found*\\n'");
+        assert_eq!(
+            read_cli(p, p.example, &binary, Duration::from_secs(1))
+                .unwrap_err()
+                .state,
+            ErrorState::NotFound
+        );
+        let p = &PROVIDERS[4];
+        for body in [
+            "printf '{broken'",
+            "printf '{}'",
+            "printf '{\"value\":\"bad\",\"id\":\"wrong\"}'",
+        ] {
+            let binary = tmp.fake(p.binary, body);
+            assert_eq!(
+                read_cli(p, p.example, &binary, Duration::from_secs(1))
+                    .unwrap_err()
+                    .state,
+                ErrorState::InvalidOutput
+            );
+        }
+    }
+}

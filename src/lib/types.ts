@@ -409,8 +409,14 @@ export interface CatalogEntry {
 
 // --- Toolport registry (source of truth) ---
 
-export interface SecretReference { ref: string }
-export interface HeaderKey { key: string; env?: string; source?: SecretReference }
+export interface SecretReference {
+  ref: string;
+}
+export interface HeaderKey {
+  key: string;
+  env?: string;
+  source?: SecretReference;
+}
 export interface EnvVar {
   source?: SecretReference;
   key: string;

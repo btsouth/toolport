@@ -303,7 +303,10 @@ export function ServerDialog({
       secretSources: initial?.secretSources,
       env: declared.map((r) => ({
         key: r.key.trim(),
-        value: !r.source && (withSecretValues || r.secret === false) && r.value ? r.value : null,
+        value:
+          !r.source && (withSecretValues || r.secret === false) && r.value
+            ? r.value
+            : null,
         secret: r.source ? true : r.secret !== false,
         ...(r.source ? { source: r.source } : {}),
       })),
@@ -722,17 +725,54 @@ export function ServerDialog({
                   value={row.key}
                   onChange={(e) => setEnvRow(i, "key", e.target.value)}
                 />
-                {row.secret !== false && <select aria-label={`Key source for ${row.key || "variable"}`} className="rounded border bg-background p-1 text-xs" value={row.source ? "reference" : "paste"} onChange={(e) => setEnvRows((rows) => rows.map((r,j) => j === i ? { ...r, value: "", source: e.target.value === "reference" ? { ref: "op://Engineering/Docs/key" } : undefined } : r))}>
-                  <option value="paste">Paste a key</option><option value="reference">From a password manager</option>
-                </select>}
-                {row.source ? <SecretReferenceField serverId={currentEditId ?? ""} value={row.source.ref} onChange={(ref) => setEnvRows((rows) => rows.map((r,j) => j === i ? { ...r, source: { ref } } : r))} /> : <Input
-                  type={row.secret === false ? "text" : "password"}
-                  placeholder={
-                    initial?.env.some((e) => e.key === row.key) ? "•••• (saved)" : "value"
-                  }
-                  value={row.value}
-                  onChange={(e) => setEnvRow(i, "value", e.target.value)}
-                />}
+                {row.secret !== false && (
+                  <select
+                    aria-label={`Key source for ${row.key || "variable"}`}
+                    className="rounded border bg-background p-1 text-xs"
+                    value={row.source ? "reference" : "paste"}
+                    onChange={(e) =>
+                      setEnvRows((rows) =>
+                        rows.map((r, j) =>
+                          j === i
+                            ? {
+                                ...r,
+                                value: "",
+                                source:
+                                  e.target.value === "reference"
+                                    ? { ref: "op://Engineering/Docs/key" }
+                                    : undefined,
+                              }
+                            : r,
+                        ),
+                      )
+                    }
+                  >
+                    <option value="paste">Paste a key</option>
+                    <option value="reference">From a password manager</option>
+                  </select>
+                )}
+                {row.source ? (
+                  <SecretReferenceField
+                    serverId={currentEditId ?? ""}
+                    value={row.source.ref}
+                    onChange={(ref) =>
+                      setEnvRows((rows) =>
+                        rows.map((r, j) => (j === i ? { ...r, source: { ref } } : r)),
+                      )
+                    }
+                  />
+                ) : (
+                  <Input
+                    type={row.secret === false ? "text" : "password"}
+                    placeholder={
+                      initial?.env.some((e) => e.key === row.key)
+                        ? "•••• (saved)"
+                        : "value"
+                    }
+                    value={row.value}
+                    onChange={(e) => setEnvRow(i, "value", e.target.value)}
+                  />
+                )}
                 <label className="flex shrink-0 items-center gap-1 text-xs">
                   <input
                     type="checkbox"
@@ -741,7 +781,13 @@ export function ServerDialog({
                     onChange={(e) =>
                       setEnvRows((rows) =>
                         rows.map((r, j) =>
-                          j === i ? { ...r, secret: e.target.checked, source: e.target.checked ? r.source : undefined } : r,
+                          j === i
+                            ? {
+                                ...r,
+                                secret: e.target.checked,
+                                source: e.target.checked ? r.source : undefined,
+                              }
+                            : r,
                         ),
                       )
                     }

@@ -86,7 +86,13 @@ export function RegistryServerRow({
     server.command !== null
       ? [server.command, ...server.args].join(" ")
       : (server.url ?? "");
-  const providers = [...new Set([...server.env, ...(server.headerKeys ?? [])].map((e) => referenceProvider(e.source?.ref)?.name).filter(Boolean))];
+  const providers = [
+    ...new Set(
+      [...server.env, ...(server.headerKeys ?? [])]
+        .map((e) => referenceProvider(e.source?.ref)?.name)
+        .filter(Boolean),
+    ),
+  ];
   const secretCount = server.env.filter((e) => e.secret).length;
   const status = statusOf(enabled, health);
   const requiredLaunch = server.launch?.inputs.filter((input) => input.required) ?? [];
@@ -170,7 +176,11 @@ export function RegistryServerRow({
 
         <span title={server.name} className="min-w-0 flex-1 truncate text-sm font-medium">
           {server.name}
-          {providers.length > 0 && <span className="ml-2 text-[10px] font-normal text-muted-foreground">Keys from {providers.join(", ")}</span>}
+          {providers.length > 0 && (
+            <span className="ml-2 text-[10px] font-normal text-muted-foreground">
+              Keys from {providers.join(", ")}
+            </span>
+          )}
         </span>
 
         {isTeam ? (

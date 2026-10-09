@@ -9730,3 +9730,36 @@ mod member_pairing_regression {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+mod secret_reference_sync_tests {
+    use super::*;
+    #[test]
+    fn team_and_personal_workspace_roundtrip_refs_without_values() {
+        let mut local=Registry::default();
+        local.servers.push(serde_json::from_value(json!({"id":"docs", "name":"Docs", "transport":"http", "url":"https://example.invalid/mcp", "env":[{"key":"TOKEN", "secret":true,"source":{"ref":"op://Engineering/Docs/key"}}],"headerKeys":[{"key":"X-Api-Key","source":{"ref":"vault://secret/docs#token"}}]})).unwrap());
+        let exported=team_server_export(&local);
+        assert_eq!(exported[0]["env"][0]["source"]["ref"],"op://Engineering/Docs/key");
+        assert!(exported[0]["env"][0].get("value").is_none());
+        for team in ["team", "personal-pro"] {
+            let mut target=Registry::default(); let result=apply_team_config(&mut target,team,&json!({"servers":exported,"secretSources":{"allowedPrefixes":["op://", "vault://"]}}));
+            assert_eq!(result.blocked,0); assert_eq!(target.servers.len(),1);
+            assert_eq!(crate::secret_refs::reference_for(&target.servers[0].env[0]),Some("op://Engineering/Docs/key"));
+            assert_eq!(target.servers[0].unknown_fields["headerKeys"][0]["source"]["ref"],"vault://secret/docs#token");
+            assert_eq!(target.servers[0].unknown_fields["secretSources"]["allowedPrefixes"],json!(["op://", "vault://"]));
+            let result=apply_team_config(&mut target,team,&json!({"servers":exported,"secretSources":{"allowedPrefixes":["env:"]}}));
+            assert_eq!(result.blocked,1); assert!(target.servers.is_empty());
+        }
+    }
+    #[test]
+    fn executable_sources_are_blocked_instead_of_dropped() {
+        for source in [json!({"ref":"exec:steal"}),json!({"ref":"env:TOKEN","command":"steal"}),json!({"ref":"op://-out/tmp/key"})] {
+            assert!(matches!(classify_team_server(&json!({"id":"x","name":"X","transport":"http","url":"https://example.invalid/mcp","env":[{"key":"TOKEN","source":source}]}),"team:t"),TeamClass::Blocked));
+        }
+    }
+    #[test]
+    fn changed_reference_revokes_existing_command_consent() {
+        let a:ServerEntry=serde_json::from_value(json!({"id":"x","name":"X","transport":"stdio","command":"mock","env":[{"key":"TOKEN","secret":true,"source":{"ref":"op://v/i/key"}}]})).unwrap();
+        let mut b=a.clone();b.env[0].unknown_fields.insert("source".into(),json!({"ref":"op://v/other/key"}));assert_ne!(consent_fingerprint(&a),consent_fingerprint(&b));
+    }
+}
