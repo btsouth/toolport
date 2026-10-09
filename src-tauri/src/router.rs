@@ -803,7 +803,9 @@ impl ServerSlot {
             if state.publishing
                 || !(demand && state.state == SupervisorState::Stopped
                     || (state.state == SupervisorState::Backoff
-                        || state.state == SupervisorState::NeedsAuth && !state.ever_ready)
+                        || state.state == SupervisorState::NeedsAuth
+                            && state.auth_target == Some(AuthTarget::Endpoint)
+                            && !state.ever_ready)
                         && (now >= state.next_attempt
                             || demand
                                 && now.saturating_duration_since(state.last_attempt)
@@ -8727,6 +8729,34 @@ for line in sys.stdin:
         assert_eq!(auth_calls.load(Ordering::SeqCst), 2);
         assert!(!router.servers[0].status().unwrap().needs_auth);
         assert!(router.route_call("s__echo", json!({})).is_ok());
+    }
+
+    #[test]
+    fn supervisor_service_credentials_wait_for_configuration_changes() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&calls);
+        let connect: Connect = Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Err(ConnectFailure {
+                message: "missing service credential".to_string(),
+                needs_auth: true,
+                auth_target: Some(AuthTarget::ServiceCredential),
+            })
+        });
+        let router = supervised_fixture(connect);
+        let slot = &router.servers[0];
+        assert!(slot.start(true));
+        assert!(wait_until(|| slot.status().unwrap().needs_auth));
+        let due = slot
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .next_attempt;
+        assert!(!slot.start_at(false, due));
+        assert!(!slot.start_at(true, due + Duration::from_secs(60)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
