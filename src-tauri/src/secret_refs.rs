@@ -796,7 +796,12 @@ fn checked_cli(p: &Provider, dirs: &[PathBuf], bw_session: bool) -> Result<PathB
     Ok(binary)
 }
 
-type CacheCell = Arc<Mutex<Option<String>>>;
+#[derive(Default)]
+struct Flight {
+    result: Mutex<Option<Result<String, ResolveError>>>,
+    ready: std::sync::Condvar,
+}
+type CacheCell = Arc<Flight>;
 static CACHE: OnceLock<Mutex<HashMap<String, CacheCell>>> = OnceLock::new();
 static CACHE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn enable_gateway_cache() {
@@ -807,21 +812,37 @@ fn cached_with(
     cache: &Mutex<HashMap<String, CacheCell>>,
     read: impl FnOnce() -> Result<String, ResolveError>,
 ) -> Result<String, ResolveError> {
-    let cell = cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(reference.into())
-        .or_insert_with(|| Arc::new(Mutex::new(None)))
-        .clone();
-    let mut value = cell.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(value) = &*value {
-        return Ok(value.clone());
+    let (cell, leader) = {
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        match cache.entry(reference.into()) {
+            std::collections::hash_map::Entry::Occupied(entry) => (entry.get().clone(), false),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                (entry.insert(Arc::new(Flight::default())).clone(), true)
+            }
+        }
+    };
+    if leader {
+        let result = read();
+        *cell.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.clone());
+        cell.ready.notify_all();
+        // Waiters retain this flight's failure. A later call starts a fresh read.
+        if result.is_err() {
+            let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache
+                .get(reference)
+                .is_some_and(|current| Arc::ptr_eq(current, &cell))
+            {
+                cache.remove(reference);
+            }
+        }
+        result
+    } else {
+        let mut result = cell.result.lock().unwrap_or_else(|e| e.into_inner());
+        while result.is_none() {
+            result = cell.ready.wait(result).unwrap_or_else(|e| e.into_inner());
+        }
+        result.as_ref().unwrap().clone()
     }
-    let result = read();
-    if let Ok(result) = &result {
-        *value = Some(result.clone());
-    }
-    result
 }
 static READ_SLOTS: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
 fn limited_read(reference: &str) -> Result<String, ResolveError> {
@@ -858,14 +879,10 @@ pub(crate) fn test_cached_value(reference: &str, value: &str) -> String {
 }
 pub fn invalidate(reference: &str) {
     if let Some(cache) = CACHE.get() {
-        let cell = cache
+        cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(reference)
-            .cloned();
-        if let Some(cell) = cell {
-            *cell.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        }
+            .remove(reference);
     }
 }
 pub fn invalidate_server(server: &ServerEntry) {
@@ -1641,6 +1658,58 @@ mod review_regressions {
 #[cfg(test)]
 mod pool_regressions {
     use super::*;
+    #[test]
+    fn concurrent_failed_reads_share_a_flight_but_later_retries_read_again() {
+        let cache = Mutex::new(HashMap::new());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reference = "op://v/locked/key";
+        std::thread::scope(|scope| {
+            let cache = &cache;
+            let calls = &calls;
+            scope.spawn(move || {
+                assert!(cached_with(reference, cache, || {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    Err(error(None, ErrorState::Locked))
+                })
+                .is_err());
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            for _ in 0..4 {
+                scope.spawn(move || {
+                    assert!(cached_with(reference, cache, || {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err(error(None, ErrorState::Locked))
+                    })
+                    .is_err());
+                });
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let joined = loop {
+                let joined = cache
+                    .lock()
+                    .unwrap()
+                    .get(reference)
+                    .is_some_and(|flight| Arc::strong_count(flight) == 6);
+                if joined || Instant::now() >= deadline {
+                    break joined;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            release_tx.send(()).unwrap();
+            assert!(joined, "all waiters joined the same active flight");
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(cached_with(reference, &cache, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(error(None, ErrorState::Locked))
+        })
+        .is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
     #[test]
     fn server_reference_pool_is_bounded_concurrent_and_deduplicated() {
         let mut s:ServerEntry=serde_json::from_value(serde_json::json!({"id":"pool","name":"Pool","transport":"stdio","command":"fixture","env":[]})).unwrap();
