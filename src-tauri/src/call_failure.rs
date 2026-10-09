@@ -238,10 +238,10 @@ impl CallFailureKind {
             }
             Self::Timeout { .. } => "Timed out waiting for the endpoint. Retry the read later.",
             Self::Unavailable { after_send: true } if !read_only => {
-                "Connection failed after send; may have completed, check before retrying."
+                "Downstream failed after send; may have completed, check before retrying."
             }
             Self::Unavailable { .. } => {
-                "Toolport cannot reach the MCP endpoint. Check its connection."
+                "Downstream unavailable. Check its connection or service status."
             }
             Self::Cancelled => "Call cancelled. Check state before repeating a write.",
             Self::Internal => "Call failed. Check the error details.",
@@ -482,14 +482,14 @@ mod tests {
             (
                 CallFailureKind::Unavailable { after_send: true },
                 false,
-                "Connection failed after send; may have completed, check before retrying.",
+                "Downstream failed after send; may have completed, check before retrying.",
                 72,
             ),
             (
                 CallFailureKind::Unavailable { after_send: false },
                 false,
-                "Toolport cannot reach the MCP endpoint. Check its connection.",
-                61,
+                "Downstream unavailable. Check its connection or service status.",
+                63,
             ),
             (
                 CallFailureKind::Cancelled,
