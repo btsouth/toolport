@@ -908,9 +908,7 @@ impl ServerSlot {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.state == SupervisorState::Ready
-                || state.state == SupervisorState::NeedsAuth
-                    && state.ever_ready
-                    && Instant::now() >= state.next_attempt
+                || state.state == SupervisorState::NeedsAuth && state.ever_ready
             {
                 state.last_use = Instant::now();
                 return Ok(());
@@ -3492,9 +3490,6 @@ impl Router {
                                     state.auth_target = Some(target);
                                 }
                                 state.last_error = e.to_string();
-                                state.failures = state.failures.saturating_add(1);
-                                state.next_attempt =
-                                    Instant::now() + state.backoff.delay(state.failures);
                             }
                         }
                     }
@@ -3600,9 +3595,7 @@ impl Router {
             .map(|s| s.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
         if lifecycle.as_ref().is_some_and(|s| {
             s.state != SupervisorState::Ready
-                && !(s.state == SupervisorState::NeedsAuth
-                    && s.ever_ready
-                    && Instant::now() >= s.next_attempt)
+                && !(s.state == SupervisorState::NeedsAuth && s.ever_ready)
         }) {
             drop(lifecycle);
             return (Err(TransportError::Busy(slot.unavailable())), None);
@@ -8240,157 +8233,210 @@ for line in sys.stdin:
         let scratch = std::env::temp_dir().join(crate::approval::new_correlation_id());
         std::fs::create_dir_all(&scratch).unwrap();
         let data = crate::registry::DataDirOverride::set(&scratch);
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/mcp", server.server_addr());
-        let code = Arc::new(AtomicU32::new(200));
-        let status = Arc::clone(&code);
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = Arc::clone(&stop);
-        let initializes = Arc::new(AtomicU32::new(0));
-        let inits = Arc::clone(&initializes);
-        let wire = std::thread::spawn(move || {
-            while !stopped.load(Ordering::Acquire) {
-                let Some(mut request) = server.recv_timeout(Duration::from_millis(50)).unwrap()
-                else {
-                    continue;
-                };
-                let mut text = String::new();
-                request.as_reader().read_to_string(&mut text).unwrap();
-                let body: Value = serde_json::from_str(&text).unwrap();
-                let status = if body["method"] == "tools/call" && body["params"]["name"] == "echo" {
-                    status.load(Ordering::Acquire)
-                } else {
-                    200
-                };
-                let result = match body["method"].as_str().unwrap_or_default() {
-                    "initialize" => {
-                        inits.fetch_add(1, Ordering::SeqCst);
-                        json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}}})
+        for has_session in [true, false] {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/mcp", server.server_addr());
+            let code = Arc::new(AtomicU32::new(200));
+            let status = Arc::clone(&code);
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = Arc::clone(&stop);
+            let initializes = Arc::new(AtomicU32::new(0));
+            let inits = Arc::clone(&initializes);
+            let calls = Arc::new(AtomicU32::new(0));
+            let counted = Arc::clone(&calls);
+            let wire = std::thread::spawn(move || {
+                while !stopped.load(Ordering::Acquire) {
+                    let Some(mut request) = server.recv_timeout(Duration::from_millis(50)).unwrap()
+                    else {
+                        continue;
+                    };
+                    let mut text = String::new();
+                    request.as_reader().read_to_string(&mut text).unwrap();
+                    let body: Value = serde_json::from_str(&text).unwrap();
+                    let status =
+                        if body["method"] == "tools/call" && body["params"]["name"] == "echo" {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            status.load(Ordering::Acquire)
+                        } else {
+                            200
+                        };
+                    let result = match body["method"].as_str().unwrap_or_default() {
+                        "initialize" => {
+                            inits.fetch_add(1, Ordering::SeqCst);
+                            json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}}})
+                        }
+                        "tools/list" => {
+                            json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}},{"name":"sibling","inputSchema":{"type":"object"}}]})
+                        }
+                        _ => json!({"content":[{"type":"text","text":"ok"}]}),
+                    };
+                    if matches!(status, 201 | 202) {
+                        let wrong = json!({"jsonrpc":"2.0","id":999,"result":result});
+                        let (text, content_type) = if status == 202 {
+                            (format!("data: {wrong}\n\n"), "text/event-stream")
+                        } else {
+                            (wrong.to_string(), "application/json")
+                        };
+                        request
+                            .respond(
+                                tiny_http::Response::from_string(text).with_header(
+                                    tiny_http::Header::from_bytes("Content-Type", content_type)
+                                        .unwrap(),
+                                ),
+                            )
+                            .unwrap();
+                        continue;
                     }
-                    "tools/list" => {
-                        json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}},{"name":"sibling","inputSchema":{"type":"object"}}]})
+                    let response = if status == 400 {
+                        json!({"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"session missing"}})
+                    } else if status == 422 {
+                        json!({"jsonrpc":"2.0","id":body["id"],"error":{"code":-32602,"message":"invalid args"}})
+                    } else {
+                        json!({"jsonrpc":"2.0","id":body["id"],"result":result})
+                    };
+                    let mut response = tiny_http::Response::from_string(response.to_string())
+                        .with_status_code(if status == 422 { 400 } else { status as u16 })
+                        .with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        );
+                    if has_session && body["method"] == "initialize" {
+                        response = response.with_header(
+                            tiny_http::Header::from_bytes("Mcp-Session-Id", "fixture-session")
+                                .unwrap(),
+                        );
                     }
-                    _ => json!({"content":[{"type":"text","text":"ok"}]}),
-                };
-                let response = if status == 400 {
-                    json!({"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"session missing"}})
+                    if status == 403 {
+                        response = response.with_header(
+                            tiny_http::Header::from_bytes(
+                                "WWW-Authenticate",
+                                "Bearer error=\"insufficient_scope\", scope=\"write\"",
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    request.respond(response).unwrap();
+                }
+            });
+            let connect: Connect = Arc::new(move || {
+                let mut transport = HttpTransport::new(&url);
+                let reauthorize: ScopeReauthorizeFn = Box::new(|_| Err("declined".into()));
+                transport.set_scope_reauthorize(Some(reauthorize));
+                DownstreamServer::connect("s".into(), Box::new(transport))
+                    .map_err(|message| failure(&message, false))
+            });
+            let mut router = supervised_fixture(connect);
+            router.servers[0].start(true);
+            ready_supervisor(&mut router);
+            for status in [403, 403, 500, 500, 500, 501, 505, 422] {
+                code.store(status, Ordering::Release);
+                let error = router
+                    .route_call_typed("s__echo", json!({}), None, None, None)
+                    .unwrap_err();
+                let expected = if status == 403 {
+                    CallFailureKind::Auth {
+                        target: AuthTarget::Scope,
+                    }
                 } else if status == 422 {
-                    json!({"jsonrpc":"2.0","id":body["id"],"error":{"code":-32602,"message":"invalid args"}})
+                    CallFailureKind::InvalidInput {
+                        missing: vec![],
+                        invalid: vec![],
+                    }
                 } else {
-                    json!({"jsonrpc":"2.0","id":body["id"],"result":result})
+                    CallFailureKind::ServerError { after_send: true }
                 };
-                let mut response = tiny_http::Response::from_string(response.to_string())
-                    .with_status_code(if status == 422 { 400 } else { status as u16 })
-                    .with_header(
-                        tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
-                    );
-                if status == 403 {
-                    response = response.with_header(
-                        tiny_http::Header::from_bytes(
-                            "WWW-Authenticate",
-                            "Bearer error=\"insufficient_scope\", scope=\"write\"",
-                        )
-                        .unwrap(),
-                    );
+                assert_eq!(error.kind, expected);
+                assert!(!router.servers[0].status().unwrap().needs_auth);
+                if status != 500 {
+                    assert!(router.route_call("s__sibling", json!({})).is_ok());
                 }
-                request.respond(response).unwrap();
+                assert_eq!(
+                    router.servers[0]
+                        .breaker
+                        .lock()
+                        .unwrap()
+                        .consecutive_failures,
+                    0
+                );
             }
-        });
-        let connect: Connect = Arc::new(move || {
-            let mut transport = HttpTransport::new(&url);
-            let reauthorize: ScopeReauthorizeFn = Box::new(|_| Err("declined".into()));
-            transport.set_scope_reauthorize(Some(reauthorize));
-            DownstreamServer::connect("s".into(), Box::new(transport))
-                .map_err(|message| failure(&message, false))
-        });
-        let mut router = supervised_fixture(connect);
-        router.servers[0].start(true);
-        ready_supervisor(&mut router);
-        for status in [403, 403, 500, 500, 500, 501, 505, 422] {
-            code.store(status, Ordering::Release);
-            let error = router
-                .route_call_typed("s__echo", json!({}), None, None, None)
-                .unwrap_err();
-            let expected = if status == 403 {
-                CallFailureKind::Auth {
-                    target: AuthTarget::Scope,
+            for status in [201, 202] {
+                code.store(status, Ordering::Release);
+                let before = calls.load(Ordering::SeqCst);
+                let error = router
+                    .route_call_typed("s__echo", json!({}), None, None, None)
+                    .unwrap_err();
+                assert_eq!(
+                    error.kind,
+                    CallFailureKind::ServerError { after_send: true }
+                );
+                assert!(error.kind.guidance(false).contains("may have completed"));
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    before + 1,
+                    "mismatched replies never replay"
+                );
+                assert!(router.route_call("s__sibling", json!({})).is_ok());
+            }
+            code.store(401, Ordering::Release);
+            // Repeated rejects must still reach the wire, without accumulating a
+            // server-wide delay. A working sibling immediately clears the display.
+            for _ in 0..10 {
+                for _ in 0..6 {
+                    assert_eq!(
+                        router
+                            .route_call_typed("s__echo", json!({}), None, None, None)
+                            .unwrap_err()
+                            .kind,
+                        CallFailureKind::Auth {
+                            target: AuthTarget::Endpoint
+                        }
+                    );
+                    assert!(router.servers[0].status().unwrap().needs_auth);
                 }
-            } else if status == 422 {
-                CallFailureKind::InvalidInput {
-                    missing: vec![],
-                    invalid: vec![],
-                }
-            } else {
-                CallFailureKind::ServerError { after_send: true }
-            };
-            assert_eq!(error.kind, expected);
+                assert!(router.route_call("s__sibling", json!({})).is_ok());
+                assert!(!router.servers[0].status().unwrap().needs_auth);
+            }
+            code.store(200, Ordering::Release);
+            assert!(router.route_call("s__echo", json!({})).is_ok());
             assert!(!router.servers[0].status().unwrap().needs_auth);
-            if status != 500 {
+            assert_eq!(
+                initializes.load(Ordering::SeqCst),
+                1,
+                "auth recovery uses the existing connection"
+            );
+            for status in [400, 404] {
+                code.store(status, Ordering::Release);
+                for _ in 0..if has_session { 1 } else { 4 } {
+                    assert_eq!(
+                        router
+                            .route_call_typed("s__echo", json!({}), None, None, None)
+                            .unwrap_err()
+                            .kind,
+                        CallFailureKind::http_status(status as u16, has_session)
+                    );
+                }
+                code.store(200, Ordering::Release);
+                if has_session {
+                    router.servers[0]
+                        .supervisor
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .next_attempt = Instant::now();
+                    assert!(router.servers[0].start(true));
+                    ready_supervisor(&mut router);
+                }
                 assert!(router.route_call("s__sibling", json!({})).is_ok());
             }
             assert_eq!(
-                router.servers[0]
-                    .breaker
-                    .lock()
-                    .unwrap()
-                    .consecutive_failures,
-                0
+                initializes.load(Ordering::SeqCst),
+                if has_session { 3 } else { 1 },
+                "only invalid sessions initialize again"
             );
+            stop.store(true, Ordering::Release);
+            wire.join().unwrap();
         }
-        code.store(401, Ordering::Release);
-        assert_eq!(
-            router
-                .route_call_typed("s__echo", json!({}), None, None, None)
-                .unwrap_err()
-                .kind,
-            CallFailureKind::Auth {
-                target: AuthTarget::Endpoint
-            }
-        );
-        assert!(router.servers[0].status().unwrap().needs_auth);
-        code.store(200, Ordering::Release);
-        router.servers[0]
-            .supervisor
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .next_attempt = Instant::now();
-        assert!(router.route_call("s__echo", json!({})).is_ok());
-        assert!(!router.servers[0].status().unwrap().needs_auth);
-        assert_eq!(
-            initializes.load(Ordering::SeqCst),
-            1,
-            "auth recovery uses the existing connection"
-        );
-        for status in [400, 404] {
-            code.store(status, Ordering::Release);
-            assert_eq!(
-                router
-                    .route_call_typed("s__echo", json!({}), None, None, None)
-                    .unwrap_err()
-                    .kind,
-                CallFailureKind::Unavailable { after_send: true }
-            );
-            code.store(200, Ordering::Release);
-            router.servers[0]
-                .supervisor
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .next_attempt = Instant::now();
-            assert!(router.servers[0].start(true));
-            ready_supervisor(&mut router);
-            assert!(router.route_call("s__sibling", json!({})).is_ok());
-        }
-        assert_eq!(
-            initializes.load(Ordering::SeqCst),
-            3,
-            "invalid sessions initialize again"
-        );
-        stop.store(true, Ordering::Release);
-        wire.join().unwrap();
         drop(data);
         std::fs::remove_dir_all(scratch).unwrap();
     }
@@ -8471,7 +8517,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn endpoint_auth_pauses_supervision_but_service_auth_keeps_endpoint_healthy() {
+    fn call_auth_keeps_demands_open_and_recovers_on_success() {
         use crate::call_failure::AuthTarget;
         for target in [
             AuthTarget::Endpoint,
@@ -8505,27 +8551,28 @@ for line in sys.stdin:
                 );
             }
             if endpoint_auth {
-                let calls = AtomicU32::new(0);
-                let blocked: Result<Value, CallFailure> = router.call_with_retry_typed(
-                    &router.servers[0],
-                    None,
-                    false,
-                    ReplayPolicy::NoAmbiguousReplay,
-                    SlotAccess::Shared,
-                    |_| {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        Ok(json!({}))
-                    },
-                );
-                assert_eq!(blocked.unwrap_err().kind, kind);
-                assert_eq!(calls.load(Ordering::SeqCst), 0);
-                router.servers[0]
-                    .supervisor
-                    .as_ref()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .next_attempt = Instant::now();
+                for _ in 0..10 {
+                    let rejected: Result<Value, CallFailure> = router.call_with_retry_typed(
+                        &router.servers[0],
+                        None,
+                        false,
+                        ReplayPolicy::NoAmbiguousReplay,
+                        SlotAccess::Shared,
+                        |_| Err(TransportError::Classified(kind.clone(), "opaque".into())),
+                    );
+                    assert_eq!(rejected.unwrap_err().kind, kind);
+                    assert!(router.servers[0].status().unwrap().needs_auth);
+                    assert_eq!(
+                        router.servers[0]
+                            .supervisor
+                            .as_ref()
+                            .unwrap()
+                            .lock()
+                            .unwrap()
+                            .failures,
+                        0
+                    );
+                }
             }
             if matches!(
                 target,

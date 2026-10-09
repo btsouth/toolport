@@ -7023,6 +7023,26 @@ impl HttpTransport {
         }
     }
 
+    fn http_status_failure(&self, code: u16) -> crate::call_failure::CallFailureKind {
+        if matches!(code, 400 | 404) {
+            let has_session = !self.is_modern()
+                && self
+                    .session_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some();
+            if has_session {
+                // Recover on a new demand, never replay the rejected POST.
+                self.concurrency
+                    .session_invalid
+                    .store(true, Ordering::Release);
+                self.concurrency.closed.store(true, Ordering::Release);
+            }
+            return crate::call_failure::CallFailureKind::http_status(code, has_session);
+        }
+        crate::call_failure::CallFailureKind::http_status(code, true)
+    }
+
     /// POST JSON-RPC without waiting for a response body (inline replies mid-SSE).
     fn send_post_no_response(&mut self, body: &Value) -> Result<(), TransportError> {
         self.send_post_no_response_cancel(body, None)
@@ -7147,7 +7167,7 @@ impl HttpTransport {
                                 target: crate::call_failure::AuthTarget::Scope,
                             }
                         } else {
-                            crate::call_failure::CallFailureKind::http_status(code, true)
+                            self.http_status_failure(code)
                         },
                         format!(
                             "HTTP {code}: {}",
@@ -7284,7 +7304,8 @@ impl HttpTransport {
             }
         }
         if mismatched_response {
-            return Err(TransportError::Fatal(
+            return Err(TransportError::Classified(
+                crate::call_failure::CallFailureKind::ServerError { after_send: true },
                 "SSE response id did not match its request".into(),
             ));
         }
@@ -7484,14 +7505,6 @@ impl HttpTransport {
                             }
                         }
                     }
-                    if matches!(code, 400 | 404) && !self.is_modern() {
-                        // Retire the invalid legacy session. Recover on a new demand,
-                        // never replay the POST that received this response.
-                        self.concurrency
-                            .session_invalid
-                            .store(true, Ordering::Release);
-                        self.concurrency.closed.store(true, Ordering::Release);
-                    }
                     let detail: String = detail.chars().take(200).collect();
                     let hint = if code == 401 || code == 403 {
                         " (needs authentication)"
@@ -7504,7 +7517,7 @@ impl HttpTransport {
                                 target: crate::call_failure::AuthTarget::Scope,
                             }
                         } else {
-                            crate::call_failure::CallFailureKind::http_status(code, true)
+                            self.http_status_failure(code)
                         },
                         format!("HTTP {code}{hint}: {detail}"),
                     ));
@@ -7559,7 +7572,8 @@ impl HttpTransport {
         // a wedged server can accept POSTs and never finish any response body.
         self.concurrency.responses.fetch_add(1, Ordering::AcqRel);
         if !http_response_id_matches(&response, body.get("id")) {
-            return Err(TransportError::Fatal(
+            return Err(TransportError::Classified(
+                crate::call_failure::CallFailureKind::ServerError { after_send: true },
                 "HTTP response id did not match its request".into(),
             ));
         }
@@ -14632,7 +14646,8 @@ for line in sys.stdin:
             } else {
                 let error = result.unwrap_err();
                 if !frames.is_empty() {
-                    assert_eq!(error.call_failure().kind, crate::call_failure::CallFailureKind::Internal);
+                    assert_eq!(error.call_failure().kind, crate::call_failure::CallFailureKind::ServerError { after_send: true });
+                    assert!(error.call_failure().kind.guidance(false).contains("may have completed"));
                     assert!(!error.is_health_failure());
                     wire.join().unwrap();
                     continue;
@@ -14642,6 +14657,81 @@ for line in sys.stdin:
                 assert!(error.is_health_failure());
             }
             wire.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn sessionless_http_errors_and_wrong_json_ids_are_per_call() {
+        use crate::call_failure::CallFailureKind;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        for modern in [false, true] {
+            for (status, expected) in [
+                (
+                    400,
+                    CallFailureKind::InvalidInput {
+                        missing: vec![],
+                        invalid: vec![],
+                    },
+                ),
+                (404, CallFailureKind::NotFound),
+                (200, CallFailureKind::ServerError { after_send: true }),
+            ] {
+                let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+                let url = format!("http://{}/mcp", server.server_addr());
+                let hits = Arc::new(AtomicUsize::new(0));
+                let counted = Arc::clone(&hits);
+                let wire = std::thread::spawn(move || {
+                    for _ in 0..4 {
+                        let request = server
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap()
+                            .unwrap();
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        request
+                            .respond(
+                                tiny_http::Response::from_string(
+                                    r#"{"jsonrpc":"2.0","id":99,"result":{}}"#,
+                                )
+                                .with_status_code(status)
+                                .with_header(
+                                    tiny_http::Header::from_bytes(
+                                        "Content-Type",
+                                        "application/json",
+                                    )
+                                    .unwrap(),
+                                ),
+                            )
+                            .unwrap();
+                    }
+                });
+                let mut transport = HttpTransport::new(&url);
+                if modern {
+                    transport.protocol_meta = Some(json!({}));
+                }
+                for _ in 0..4 {
+                    let error = transport
+                        .post(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call"}), true)
+                        .unwrap_err();
+                    assert_eq!(error.call_failure().kind, expected);
+                    assert!(!error.is_health_failure());
+                    assert!(transport.connection_reset_reason().is_none());
+                    assert!(!transport.concurrency.closed.load(Ordering::Acquire));
+                    if status == 200 {
+                        assert!(error
+                            .call_failure()
+                            .kind
+                            .guidance(false)
+                            .contains("may have completed"));
+                    }
+                }
+                wire.join().unwrap();
+                assert_eq!(
+                    hits.load(Ordering::SeqCst),
+                    4,
+                    "one POST per call, no replay"
+                );
+            }
         }
     }
 

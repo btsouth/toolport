@@ -1799,6 +1799,7 @@ impl ServerPage {
             row.label.add_css_class(class);
             row.label
                 .set_tooltip_text(probe.error.as_deref().filter(|error| !error.is_empty()));
+            row.authenticate.set_label(probe_auth_action(probe));
             row.authenticate.set_visible(probe.auth_required);
             row.copy_error
                 .set_visible(!probe.ok && probe.error.is_some());
@@ -6673,6 +6674,14 @@ fn approval_queue_notification(
     ))
 }
 
+fn probe_auth_action(probe: &crate::server_runtime::ProbeResult) -> &'static str {
+    if probe.auth_target == Some(crate::call_failure::AuthTarget::ServiceCredential) {
+        "Edit service key"
+    } else {
+        "Sign in"
+    }
+}
+
 /// One row's health line and badge class from a finished probe.
 fn probe_status_line(probe: &crate::server_runtime::ProbeResult) -> (String, &'static str) {
     if probe.ok {
@@ -6860,7 +6869,7 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
     text.append(&health);
     card.append(&text);
 
-    let authenticate = gtk::Button::with_label("Authenticate");
+    let authenticate = gtk::Button::with_label("Sign in");
     authenticate.add_css_class("suggested-action");
     authenticate.set_valign(gtk::Align::Center);
     authenticate.set_visible(false);
@@ -6925,6 +6934,7 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
             let (status, class) = probe_status_line(previous);
             health.set_label(&format!("{} · {status}", server.transport));
             health.add_css_class(class);
+            authenticate.set_label(probe_auth_action(previous));
             authenticate.set_visible(previous.auth_required);
             copy_error.set_visible(!previous.ok && previous.error.is_some());
         }
@@ -10010,9 +10020,17 @@ mod tests {
     #[test]
     fn probe_auth_ownership_is_visible() {
         use crate::call_failure::AuthTarget;
-        for (target, text) in [
-            (AuthTarget::Endpoint, "MCP endpoint auth required"),
-            (AuthTarget::ServiceCredential, "Service credential required"),
+        for (target, text, action) in [
+            (
+                AuthTarget::Endpoint,
+                "MCP endpoint auth required",
+                "Sign in",
+            ),
+            (
+                AuthTarget::ServiceCredential,
+                "Service credential required",
+                "Edit service key",
+            ),
         ] {
             let probe = crate::server_runtime::ProbeResult {
                 server_id: "fixture".into(),
@@ -10023,6 +10041,7 @@ mod tests {
                 auth_target: Some(target),
             };
             assert_eq!(probe_status_line(&probe), (text.into(), "review"));
+            assert_eq!(probe_auth_action(&probe), action);
         }
     }
 
