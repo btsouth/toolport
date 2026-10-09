@@ -6546,6 +6546,27 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn review_repeat_adoption_keeps_restored_candidates() {
+        let previous = router_with_catalogs(&[("atlassian", 40)]);
+        let mut guarded = router_with_catalogs(&[("atlassian", 3)]);
+        let catalog = previous.aggregated_tools();
+        guarded.adopt_restored_routes(&previous, &catalog);
+        assert_eq!(guarded.route_of("atlassian__t39"), Some(("atlassian", "t39")));
+        // Refresh path: next = live clone, rebuilt, published, then adopted again
+        // with previous_router = the guarded live router.
+        let prior_live = guarded.clone();
+        let mut next = guarded.clone();
+        next.rebuild_preserving_restored();
+        next.adopt_restored_routes(&prior_live, &catalog);
+        assert_eq!(next.route_of("atlassian__t39"), Some(("atlassian", "t39")));
+        let profile = next.with_tool_allow(HashMap::new());
+        assert_eq!(profile.route_of("atlassian__t39"), Some(("atlassian", "t39")), "profile view lost restored route");
+        let mut policy = next.clone();
+        policy.requarantine(BTreeSet::new());
+        assert_eq!(policy.route_of("atlassian__t39"), Some(("atlassian", "t39")), "policy rebuild lost restored route");
+    }
+
+    #[test]
     fn guarded_route_keeps_its_name_when_a_new_server_collides() {
         let previous = router_with_catalogs(&[("a-b", 40)]);
         let mut guarded = router_with_catalogs(&[("a-b", 3)]);
