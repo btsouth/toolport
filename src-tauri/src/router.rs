@@ -6812,7 +6812,11 @@ for line in sys.stdin:
                 ),
                 (
                     "toolport".into(),
-                    if native { HashMap::new() } else { HashMap::from([("echo".into(), override_for())]) },
+                    if native {
+                        HashMap::new()
+                    } else {
+                        HashMap::from([("echo".into(), override_for())])
+                    },
                 ),
             ]));
             router.add(mock_server("s"));

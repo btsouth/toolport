@@ -185,8 +185,16 @@ mod tests {
     #[test]
     fn reserved_alias_quarantine_annotation_uses_legacy_binding() {
         let _lock = crate::registry::data_dir_test_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let _data = crate::registry::DataDirOverride::set(dir.path());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-playground-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = crate::registry::DataDirOverride::set(&dir);
         let mut registry = crate::registry::Registry::default();
         registry.tool_overrides.insert(
             "s".into(),
@@ -199,7 +207,7 @@ mod tests {
                 },
             )]),
         );
-        crate::registry::save_to(&dir.path().join("registry.json"), &registry).unwrap();
+        crate::registry::save_to(&dir.join("registry.json"), &registry).unwrap();
         let profile = registry.default_access_id();
         crate::integrity::apply_quarantine(
             Some(&profile),
@@ -214,5 +222,7 @@ mod tests {
         annotate_quarantine("s", &mut tools).unwrap();
         assert_eq!(tools[0]["toolportQuarantine"], "quarantined");
         assert_eq!(tools[1]["toolportQuarantine"], "clear");
+        drop(data);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
