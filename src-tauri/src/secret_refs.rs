@@ -452,7 +452,33 @@ fn read_cli(
     if !status.success() {
         // Inspect in memory only. Never interpolate stdout, stderr, refs or OS errors.
         let lower = String::from_utf8_lossy(&err).to_ascii_lowercase();
+        // Login guidance takes precedence over an unavailable local cache/key.
         let state = if [
+            "sign in",
+            "signin",
+            "signed in",
+            "signed out",
+            "log in",
+            "login",
+            "logged in",
+            "logged out",
+            "locked",
+            "session",
+            "unauthorized",
+            "authentication",
+            "not authenticated",
+            "unauthenticated",
+            "invalid auth token",
+            "permission denied",
+            "access token",
+            "403",
+            "401",
+        ]
+        .iter()
+        .any(|s| lower.contains(s))
+        {
+            ErrorState::Locked
+        } else if [
             "not found",
             "no secret",
             "does not exist",
@@ -463,24 +489,6 @@ fn read_cli(
         .any(|s| lower.contains(s))
         {
             ErrorState::NotFound
-        } else if [
-            "sign in",
-            "signin",
-            "log in",
-            "login",
-            "locked",
-            "session",
-            "unauthorized",
-            "authentication",
-            "permission denied",
-            "access token",
-            "403",
-            "401",
-        ]
-        .iter()
-        .any(|s| lower.contains(s))
-        {
-            ErrorState::Locked
         } else {
             ErrorState::Failed
         };
@@ -876,6 +884,18 @@ mod tests {
             (
                 "printf 'not found synthetic-ref-value' >&2; exit 1",
                 ErrorState::NotFound,
+            ),
+            (
+                "printf 'Could not find decryption key. Please login. synthetic-ref-value' >&2; exit 1",
+                ErrorState::Locked,
+            ),
+            (
+                "printf 'Not authenticated. synthetic-ref-value' >&2; exit 1",
+                ErrorState::Locked,
+            ),
+            (
+                "printf 'Invalid Auth Token. synthetic-ref-value' >&2; exit 1",
+                ErrorState::Locked,
             ),
             (
                 "printf 'synthetic-ref-value' >&2; exit 1",
