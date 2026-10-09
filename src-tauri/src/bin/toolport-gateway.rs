@@ -40738,8 +40738,10 @@ mod tests {
                     &SearchGuard::default(), Some(&allowed), None, None, None, Some(client), None, mode,
                 ).unwrap()
             };
+            let mut session_ids = Vec::new();
             for query in ["work", "s__work"] {
                 let response = run(search_name, json!({"query":query}));
+                session_ids.push(response.observation.as_ref().unwrap().context().session_id.unwrap());
                 let text = response.envelope["result"]["content"][0]["text"]
                     .as_str()
                     .unwrap();
@@ -40754,19 +40756,13 @@ mod tests {
             } else {
                 run(search_name, json!({"query":"work"}))
             };
-            let session_id = response
-                .observation
-                .as_ref()
-                .unwrap()
-                .context()
-                .session_id
-                .unwrap();
+            session_ids.push(response.observation.as_ref().unwrap().context().session_id.unwrap());
             assert!(conduit_lib::telemetry::flush_for_test(Duration::from_secs(5)));
             let rows: Vec<_> = audit::read_all()
                 .unwrap()
                 .into_iter()
                 .filter(|row| {
-                    row["sessionId"] == session_id
+                    row["sessionId"].as_str().is_some_and(|id| session_ids.iter().any(|session| session == id))
                         && (row["kind"] == "internal" || row["tool"] == "work")
                 })
                 .collect();
