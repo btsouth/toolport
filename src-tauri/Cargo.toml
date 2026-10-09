@@ -21,6 +21,7 @@ required-features = ["gtk-desktop"]
 [[bin]]
 name = "toolport-gateway"
 path = "src/bin/toolport-gateway.rs"
+required-features = ["search-static"]
 
 [[bin]]
 name = "mock-mcp-server"
@@ -31,7 +32,7 @@ required-features = ["test-support"]
 
 [features]
 default = ["desktop", "search-static"]
-# Offline bundled model; headless callers opt in explicitly with --no-default-features.
+# Required by every gateway build, including headless and bundled sidecars.
 search-static = ["dep:tokenizers"]
 desktop = [
     "dep:tauri",

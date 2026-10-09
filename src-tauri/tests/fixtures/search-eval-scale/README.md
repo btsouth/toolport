@@ -21,11 +21,13 @@ JSON array with the same intent shape as `dev.json`. Run the slot on devbox:
 ```bash
 TOOLPORT_SEARCH_BLIND_INTENTS=/absolute/path/new-blind-intents.json \
   cargo test --locked --manifest-path src-tauri/Cargo.toml \
-  --no-default-features --features test-support --bin toolport-gateway \
+  --no-default-features --features test-support,search-static --bin toolport-gateway \
   search_scale_blind_quality_gate -- --nocapture
 ```
 
-The original 66-intent gate remains a regression check. The combined 408-intent
+Every gateway requires `search-static`, including headless builds. Model-off
+gateways are unsupported and Cargo rejects an explicit build without the feature.
+The original 66-intent gate remains a regression check on the shipped configuration. The combined 408-intent
 set is an author-written historical diagnostic, with its lower scores reported;
 it no longer supplies the ranking acceptance target. The development sanity gate
 uses dev-v2 recall at 3 and 10 plus no-match honesty. The blind scoring slot
@@ -101,9 +103,9 @@ complete definition and existing lossless paging. Description lines allow 100
 characters with small schemas and 24 with large schemas to meet the token budget.
 The informational low_confidence flag never changes menu size or schema hydration.
 
-The `search-static` Cargo feature is default on for ordinary desktop builds.
-With `--no-default-features`, pass `--features test-support,search-static` to
-measure it on and `--features test-support` for a model-free binary.
+The `search-static` Cargo feature is required for every gateway. Headless tests
+use `--no-default-features --features test-support,search-static`. Benchmark-only
+lexical comparisons use `SEARCH_LEXICAL_ONLY=1` with the same compiled model.
 
 Low confidence reports close scores or missing query evidence. It is not a
 calibrated probability and never directs a client to trust the first candidate.

@@ -43,7 +43,7 @@ function buildGateway(triple) {
     `[sidecar] building toolport-gateway (${profile}) ${triple ? "for " + triple : "(host)"}`,
   );
   execSync(
-    `cargo build ${debug ? "" : "--release "}${targetArg}--bin toolport-gateway --no-default-features`,
+    `cargo build ${debug ? "" : "--release "}${targetArg}--bin toolport-gateway --no-default-features --features search-static`,
     {
       cwd: "src-tauri",
       stdio: "inherit",

@@ -66,32 +66,8 @@ use conduit_lib::topology::LaunchKey;
 static CODE_MODE_ALLOCATOR: worker::WorkerAllocator = worker::WorkerAllocator;
 
 mod gateway_memory;
-#[cfg(feature = "search-static")]
 mod search_cache;
-#[cfg(feature = "search-static")]
 mod search_static;
-#[cfg(not(feature = "search-static"))]
-mod search_cache {
-    #[derive(Debug, Default)]
-    pub struct Vectors(pub std::sync::Arc<std::sync::OnceLock<Vec<Vec<f32>>>>);
-    impl Vectors {
-        pub fn build(_: &dyn conduit_lib::tool_definitions::ToolCatalog) -> Self {
-            Self::default()
-        }
-    }
-}
-#[cfg(not(feature = "search-static"))]
-mod search_static {
-    pub fn enabled() -> bool {
-        false
-    }
-    pub fn query_vector(_: &str) -> Vec<f32> {
-        Vec::new()
-    }
-    pub fn cosine(_: &[f32], _: &[f32]) -> f64 {
-        0.0
-    }
-}
 
 thread_local! {
     static APPROVAL_CANCEL: std::cell::RefCell<Option<downstream::CancelContext>> = const { std::cell::RefCell::new(None) };

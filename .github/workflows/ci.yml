@@ -80,7 +80,7 @@ jobs:
         with:
           node-version: 20
       - name: Test check selection and required gate
-        run: node --test .github/scripts/ci-policy.test.mjs
+        run: node --test .github/scripts/ci-policy.test.mjs .github/scripts/gateway-build-features.test.mjs
       - name: Select changed native checks
         id: select
         env:
@@ -232,7 +232,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --lib --bins
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --features search-static --lib --bins
 
   build-test:
     needs: changes
@@ -319,7 +319,7 @@ jobs:
       - name: Chaos suite
         run: |
           for test in chaos_concurrency chaos_env_allowlist chaos_faulty_servers chaos_process_kill chaos_registry; do
-            cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support --test "$test"
+            cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static --test "$test"
           done
 
   cross-platform-rust:
@@ -361,7 +361,7 @@ jobs:
           save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next/2.0') }}
       - name: Compile Rust tests and record build timings
         if: matrix.os != 'windows-latest'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support --lib --bins --tests --no-run --timings
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static --lib --bins --tests --no-run --timings
 
       - name: Compile Windows Rust tests and record build timings
         if: matrix.os == 'windows-latest'
@@ -369,7 +369,7 @@ jobs:
 
       - name: Rust tests (lib + binaries + integration, no desktop)
         if: matrix.os != 'windows-latest'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support --lib --bins --tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static --lib --bins --tests
 
       # Reuse the local Windows helper so a stale debug gateway cannot lock the
       # executable while Cargo rebuilds it.
