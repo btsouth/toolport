@@ -95,6 +95,14 @@ pub struct PiiReleaseValue {
     pub origins: Vec<String>,
 }
 
+const CLIENT_LABEL_MAX_BYTES: usize = 200;
+const CLIENT_LABEL_MAX_CHARS: usize = 120;
+
+pub(crate) fn client_label_within_bounds(text: &str) -> bool {
+    text.len() <= CLIENT_LABEL_MAX_BYTES
+        && text.chars().take(CLIENT_LABEL_MAX_CHARS + 1).count() <= CLIENT_LABEL_MAX_CHARS
+}
+
 /// Client-reported text is display-only. Bound both its stored bytes and visible
 /// characters, and remove formatting that can disguise the trusted requester.
 pub fn sanitize_client_label(text: &str) -> Option<String> {
@@ -121,7 +129,7 @@ pub fn sanitize_client_label(text: &str) -> Option<String> {
         } else {
             marks = 0;
         }
-        if chars == 120 || label.len() + c.len_utf8() > 200 {
+        if chars == CLIENT_LABEL_MAX_CHARS || label.len() + c.len_utf8() > CLIENT_LABEL_MAX_BYTES {
             break;
         }
         label.push(c);
@@ -148,15 +156,24 @@ pub fn shorten_client_label(label: &str, limit: usize) -> String {
 
 pub fn client_info_label(params: Option<&serde_json::Value>) -> Option<String> {
     let info = params?.get("clientInfo")?;
-    let name = sanitize_client_label(info.get("name")?.as_str()?)?;
-    let version = info
-        .get("version")
-        .and_then(serde_json::Value::as_str)
-        .and_then(sanitize_client_label);
-    sanitize_client_label(&match version {
+    let name = info.get("name")?.as_str()?;
+    let version = info.get("version").and_then(serde_json::Value::as_str);
+    // Cropping first can hide a path separator while retaining a private prefix.
+    if !client_label_within_bounds(name)
+        || version.is_some_and(|version| !client_label_within_bounds(version))
+    {
+        return Some("[private]".into());
+    }
+    let name = sanitize_client_label(name)?;
+    let version = version.and_then(sanitize_client_label);
+    let label = match version {
         Some(version) => format!("{name} {version}"),
         None => name,
-    })
+    };
+    if !client_label_within_bounds(&label) {
+        return Some("[private]".into());
+    }
+    sanitize_client_label(&label)
 }
 
 fn deserialize_client_label<'de, D: serde::Deserializer<'de>>(

@@ -35,16 +35,20 @@ impl Drop for ContextGuard {
 
 /// Persist only bounded printable name/version tokens, never locations or secrets.
 pub fn display_label(label: &str) -> Option<String> {
+    if !crate::approval::client_label_within_bounds(label) {
+        return Some("[private]".into());
+    }
     let label = crate::approval::sanitize_client_label(label)?;
-    let label = crate::registry::redact_secret_text(&label);
-    let safe = label.replace("<redacted>", "[redacted]");
-    if !safe.chars().all(|c| {
+    if !label.chars().all(|c| {
         c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '+' | '(' | ')' | '[' | ']')
     }) {
         // Reject the entire label: a path containing spaces must not retain
         // its trailing directory or filename as an apparently valid name token.
         return Some("[private]".into());
     }
+    // Check shape before secret substitution can hide a location delimiter.
+    let label = crate::registry::redact_secret_text(&label);
+    let safe = label.replace("<redacted>", "[redacted]");
     crate::approval::sanitize_client_label(&safe)
 }
 
@@ -386,7 +390,9 @@ mod tests {
             assert_eq!(row["clientLabel"], "[private]", "{row}");
             session.close(CloseReason::ClientDisconnect);
         }
-        assert!(crate::telemetry::flush_for_test(std::time::Duration::from_secs(5)));
+        assert!(crate::telemetry::flush_for_test(
+            std::time::Duration::from_secs(5)
+        ));
         let audit = std::fs::read_to_string(data.dir.join("audit.jsonl")).unwrap();
         assert!(!audit.contains("customer-private"), "{audit}");
     }
