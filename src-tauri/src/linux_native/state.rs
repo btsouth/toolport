@@ -16,6 +16,9 @@ pub(super) struct ActivityView {
     pub(super) client_id: Option<String>,
     pub(super) client_label: Option<String>,
     pub(super) approval_decision: Option<String>,
+    pub(super) cold: Option<bool>,
+    pub(super) failure_kind: Option<String>,
+    pub(super) run_id: Option<String>,
     pub(super) ok: bool,
     pub(super) held: bool,
     pub(super) duration_ms: Option<u64>,
@@ -78,7 +81,7 @@ impl ActivitySnapshot {
         for entry in entries {
             let call_ok = crate::audit::tool_call_ok(&entry);
             let is_approval = entry["kind"] == "approval";
-            if call_ok.is_none() && !is_approval {
+            if call_ok.is_none() && !is_approval && entry["kind"] != "internal" {
                 continue;
             }
             let duration_ms = entry
@@ -118,6 +121,9 @@ impl ActivitySnapshot {
                         .get("clientLabel")
                         .and_then(serde_json::Value::as_str)
                         .and_then(crate::approval::sanitize_client_label),
+                    cold: entry["cold"].as_bool(),
+                    failure_kind: entry["failureKind"].as_str().map(str::to_string),
+                    run_id: entry["runId"].as_str().map(str::to_string),
                     approval_decision: is_approval
                         .then(|| entry["decision"].as_str().unwrap_or("unknown").to_string()),
                     ok: call_ok.unwrap_or(true),
@@ -401,6 +407,7 @@ impl ClientView {
 pub(super) struct ClientSnapshot {
     pub(super) clients: Vec<ClientView>,
     pub(super) profiles: Vec<ProfileView>,
+    pub(super) sessions: Vec<serde_json::Value>,
 }
 
 fn client_access_label(registry: &Registry, scope: Option<&str>) -> String {
@@ -474,6 +481,8 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
     Ok(ClientSnapshot {
         clients,
         profiles: client_access_options(&registry),
+        sessions: crate::audit::recent_sessions(12)
+            .map_err(|e| format!("Couldn't read client sessions: {e}"))?,
     })
 }
 

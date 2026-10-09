@@ -763,7 +763,7 @@ it("uses one server filter and one identity, time and wait meta line", async () 
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   await user.click(await screen.findByRole("button", { name: /recent calls/i }));
-  expect(screen.getByText("Claude Code 2.1 · 2m ago · waited 1.5 s")).toHaveAttribute(
+  expect(screen.getByText('Claude Code (reports "Claude Code 2.1") · 2m ago · waited 1.5 s')).toHaveAttribute(
     "title",
     expect.stringContaining("adapter:claude-code"),
   );

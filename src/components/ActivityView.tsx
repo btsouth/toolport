@@ -760,16 +760,19 @@ function CallRow({ e }: { e: AuditEntry }) {
       ? (APPROVAL_OUTCOME[e.decision ?? ""] ?? UNKNOWN_APPROVAL)
       : null;
   const RowIcon =
-    approvalOutcome?.Icon ?? (e.held ? ShieldAlert : e.ok ? CheckCircle2 : XCircle);
+    approvalOutcome?.Icon ?? (e.kind === "internal" ? Clock : e.held ? ShieldAlert : e.ok ? CheckCircle2 : XCircle);
   const duration = approvalOutcome ? e.heldMs : e.durationMs;
   const meta = [
     activityClientName(e),
     fmtAgo(e.ts),
+    ...(e.cold == null ? [] : [e.cold ? "cold catalog" : "warm catalog"]),
+    ...(e.failureKind ? [e.failureKind.replaceAll("_", " ")] : []),
+    ...(e.dispatchMs == null ? [] : [`dispatch ${fmtMs(e.dispatchMs)}`]),
     ...(duration == null
       ? []
       : [approvalOutcome ? `waited ${fmtMs(duration)}` : fmtMs(duration)]),
   ].join(" · ");
-  const hasDetail = !approvalOutcome && !e.ok && !!e.error;
+  const hasDetail = !approvalOutcome && !e.ok && (!!e.error || !!e.runId);
   return (
     <div className="rounded-md border border-border/50 text-sm">
       <div
@@ -813,7 +816,7 @@ function CallRow({ e }: { e: AuditEntry }) {
           </div>
           <div
             className="mt-1 truncate text-xs text-muted-foreground"
-            title={e.client ? `${meta} · Client: ${e.client}` : meta}
+            title={[meta, e.client && `Client: ${e.client}`, e.sessionId && `Session: ${e.sessionId}`, e.runId && `Run: ${e.runId}`].filter(Boolean).join(" · ")}
             dir="auto"
           >
             {meta}
@@ -831,8 +834,9 @@ function CallRow({ e }: { e: AuditEntry }) {
       {open && e.error && (
         <div className="border-t border-border/50 bg-destructive/5 px-3 py-2 pl-9">
           <p className="font-mono text-xs whitespace-pre-wrap break-words text-destructive">
-            {e.error}
+            {e.error ?? e.failureKind?.replaceAll("_", " ")}
           </p>
+          {e.runId && <p className="mt-1 font-mono text-xs">Run: {e.runId}</p>}
         </div>
       )}
     </div>

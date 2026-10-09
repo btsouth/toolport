@@ -451,14 +451,9 @@ fn render_clients(list: &gtk::Box, feedback: &gtk::Label, snapshot: ClientSnapsh
                 };
                 let list = list.clone();
                 let feedback = feedback.clone();
-                super::setup::connect(
-                    &parent,
-                    client_id.clone(),
-                    None,
-                    false,
-                    move || load_clients(&list, &feedback),
-                    None,
-                );
+                super::setup::connect(&parent, client_id.clone(), None, false, move || {
+                    load_clients(&list, &feedback)
+                }, None);
             });
             row.append(&connect);
         }
@@ -937,6 +932,7 @@ mod tests {
         let empty = ClientSnapshot {
             clients: Vec::new(),
             profiles: Vec::new(),
+            sessions: Vec::new(),
         };
         assert!(should_offer(&registry, &empty));
 
@@ -958,6 +954,7 @@ mod tests {
                 config_error: false,
             }],
             profiles: Vec::new(),
+            sessions: Vec::new(),
         };
         assert!(!should_offer(&registry, &connected));
 

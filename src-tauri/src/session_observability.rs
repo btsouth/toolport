@@ -10,6 +10,8 @@ pub struct Context {
     pub client_name: Option<String>,
     pub client_label: Option<String>,
     pub run_id: Option<String>,
+    pub dispatch_ms: Option<u64>,
+    pub cold: Option<bool>,
 }
 
 thread_local! {
@@ -31,19 +33,84 @@ impl Drop for ContextGuard {
     }
 }
 
+/// Bounded display metadata, with URL and registered-secret redaction.
+pub fn display_label(label: &str) -> Option<String> {
+    static URL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let label = crate::approval::sanitize_client_label(label)?;
+    let label = crate::registry::redact_secret_text(&label);
+    let pattern = URL.get_or_init(|| {
+        regex::Regex::new(r"(?i)[a-z][a-z0-9+.-]*://[^\s]+|www\.[^\s]+")
+            .expect("metadata URL pattern")
+    });
+    crate::approval::sanitize_client_label(&pattern.replace_all(&label, "[link]"))
+}
+
+pub struct DispatchTimer {
+    started: Instant,
+    previous: (Option<u64>, Option<bool>),
+}
+impl DispatchTimer {
+    pub fn start(cold: bool) -> Self {
+        let previous = CURRENT.with(|c| {
+            let mut c = c.borrow_mut();
+            let previous = (c.dispatch_ms, c.cold);
+            c.dispatch_ms = None;
+            c.cold = Some(cold);
+            previous
+        });
+        Self {
+            started: Instant::now(),
+            previous,
+        }
+    }
+    pub fn finish(&mut self) {
+        CURRENT.with(|c| {
+            c.borrow_mut().dispatch_ms =
+                Some(self.started.elapsed().as_millis().min(u64::MAX as u128) as u64)
+        });
+    }
+}
+impl Drop for DispatchTimer {
+    fn drop(&mut self) {
+        CURRENT.with(|c| {
+            let mut c = c.borrow_mut();
+            c.dispatch_ms = self.previous.0;
+            c.cold = self.previous.1;
+        });
+    }
+}
+
 pub fn enrich(entry: &mut Value) {
     let ctx = current();
+    if let Some(ms) = ctx.dispatch_ms {
+        entry["dispatchMs"] = json!(ms);
+    }
+    if let Some(cold) = ctx.cold {
+        entry["cold"] = json!(cold);
+    }
     if let Some(id) = ctx.session_id {
         entry["sessionId"] = json!(id);
     }
     if let Some(id) = ctx.run_id {
         entry["runId"] = json!(id);
+        // A nested downstream failure can echo script input. Retain only the
+        // verdict on correlated calls, never arbitrary error/result text.
+        if let Some(obj) = entry.as_object_mut() {
+            obj.remove("error");
+        }
+        if entry["ok"] == false && entry["tool"] != "run_script" {
+            entry["failureKind"] = json!(crate::codemode::FailureKind::DownstreamFailure);
+        }
     }
     if let Some(name) = ctx.client_name {
-        entry["clientName"] = json!(name);
+        if let Some(name) = display_label(&name) {
+            entry["clientName"] = json!(name);
+        }
     }
     if let Some(label) = ctx.client_label {
-        entry["clientLabel"] = json!(label);
+        if let Some(label) = display_label(&label) {
+            entry["clientLabel"] = json!(label);
+        }
     }
 }
 
@@ -144,9 +211,10 @@ impl Session {
                             .is_some_and(|id| crate::clients::known_adapter_name(id).is_some())
                 })
                 .map(str::to_string),
-            name: crate::clients::trusted_client_name(client, name),
+            name: display_label(&crate::clients::trusted_client_name(client, name))
+                .unwrap_or_else(|| "An AI client".into()),
             client_type,
-            label: label.and_then(crate::approval::sanitize_client_label),
+            label: label.and_then(display_label),
             transport,
             started: Instant::now(),
             counts: Mutex::new(Counts::default()),
@@ -163,6 +231,8 @@ impl Session {
             client_name: Some(self.name.clone()),
             client_label: self.label.clone(),
             run_id: None,
+            dispatch_ms: None,
+            cold: None,
         }
     }
     pub fn list_delivered(&self, catalog: CatalogDelivery) {
@@ -243,6 +313,96 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn session_summary_is_bounded_private_and_excluded_from_call_stats() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-session-observation-{}",
+            crate::approval::new_correlation_id()
+        ));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let session = Session::start(
+            Some("adapter:adapter-pid-123"),
+            Some("Unknown app (via fixture)"),
+            Some("kt 1 https://private.example/secret"),
+            "stdio",
+            "initialize",
+        );
+        let first = catalog_delivery(&[json!({"name":"one", "description":"not retained"})]);
+        let changed = catalog_delivery(&[json!({"name":"two", "description":"not retained"})]);
+        for _ in 0..7 {
+            session.list_delivered(first);
+        }
+        session.list_delivered(changed);
+        for _ in 0..3 {
+            session.notification_delivered();
+        }
+        session.close(CloseReason::ClientDisconnect);
+        session.close(CloseReason::Expired);
+        session.list_delivered(first);
+        assert!(crate::telemetry::flush_for_test(
+            std::time::Duration::from_secs(5)
+        ));
+        let rows = crate::audit::read_all().unwrap();
+        assert_eq!(
+            rows.len(),
+            8,
+            "start, four list and two notification checkpoints, one close"
+        );
+        let close = rows.iter().find(|r| r["phase"] == "close").unwrap();
+        assert_eq!(close["toolsListCount"], 8);
+        assert_eq!(close["listChangedCount"], 3);
+        assert_eq!(close["firstCatalogSize"], 1);
+        assert_eq!(close["firstCatalogRevision"], 1);
+        assert_eq!(close["catalogRevision"], 2);
+        assert_eq!(close["contentChanged"], true);
+        assert_eq!(close["clientType"], "unknown");
+        assert!(close.get("client").is_none());
+        assert_eq!(close["clientLabel"], "kt 1 [link]");
+        assert_eq!(close["sessionId"].as_str().unwrap().len(), 32);
+        assert_eq!(crate::audit::stats().unwrap()["total"], 0);
+        let text = serde_json::to_string(&rows).unwrap();
+        for secret in ["private.example", "not retained", "adapter-pid-123"] {
+            assert!(!text.contains(secret));
+        }
+        for row in &rows {
+            for field in [
+                "query",
+                "script",
+                "input",
+                "arguments",
+                "error",
+                "env",
+                "cwd",
+                "url",
+                "fingerprint",
+            ] {
+                assert!(row.get(field).is_none());
+            }
+        }
+        assert_eq!(crate::audit::recent_sessions(1000).unwrap().len(), 1);
+        drop(session);
+        drop(_data);
+        assert!(crate::telemetry::retire_dir_for_test(
+            &dir,
+            std::time::Duration::from_secs(5)
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn correlated_downstream_failures_keep_verdict_without_echoed_input() {
+        let _guard = ContextGuard::enter(Context {
+            run_id: Some("opaque-run".into()),
+            ..Context::default()
+        });
+        let mut row = json!({"ok":false, "tool":"get", "error":"SECRET_SCRIPT_INPUT"});
+        enrich(&mut row);
+        assert_eq!(row["failureKind"], "downstream_failure");
+        assert_eq!(row["runId"], "opaque-run");
+        assert!(row.get("error").is_none());
+    }
+
     #[test]
     fn fingerprint_detects_equal_count_content_changes() {
         let a = catalog_delivery(&[json!({"name":"one"})]);

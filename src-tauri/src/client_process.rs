@@ -25,7 +25,10 @@ fn walk(mut pid: u32, mut read: impl FnMut(u32) -> Option<(u32, String)>) -> Opt
             let name = Path::new(&name).file_name()?.to_str()?;
             let name = crate::approval::sanitize_client_label(name)?;
             let name = crate::approval::shorten_client_label(&name, 48);
-            let stem = name.trim_end_matches(".exe").to_ascii_lowercase();
+            let stem = name
+                .to_ascii_lowercase()
+                .trim_end_matches(".exe")
+                .to_string();
             if !matches!(
                 stem.as_str(),
                 "node"
@@ -74,34 +77,22 @@ fn process(pid: u32) -> Option<(u32, String)> {
 
 #[cfg(target_os = "macos")]
 fn process(pid: u32) -> Option<(u32, String)> {
-    // sysctl KERN_PROC_PID supplies only the parent id. proc_pidpath supplies
-    // the executable path, immediately reduced to its basename.
-    let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
-    let mut size = std::mem::size_of_val(&info);
-    let mut mib = [
-        libc::CTL_KERN,
-        libc::KERN_PROC,
-        libc::KERN_PROC_PID,
-        pid as i32,
-    ];
-    let ok = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as u32,
-            (&mut info as *mut libc::kinfo_proc).cast(),
-            &mut size,
-            std::ptr::null_mut(),
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as i32;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
             0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
         )
     };
-    if ok != 0 || size != std::mem::size_of_val(&info) {
+    if n != size {
         return None;
     }
-    extern "C" {
-        fn proc_pidpath(pid: i32, buffer: *mut std::ffi::c_void, size: u32) -> i32;
-    }
     let mut buf = [0u8; 4096];
-    let n = unsafe { proc_pidpath(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let n = unsafe { libc::proc_pidpath(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
     if n <= 0 {
         return None;
     }
@@ -110,7 +101,7 @@ fn process(pid: u32) -> Option<(u32, String)> {
         .to_str()
         .ok()?;
     Some((
-        info.kp_eproc.e_ppid as u32,
+        info.pbi_ppid,
         Path::new(path).file_name()?.to_str()?.to_string(),
     ))
 }

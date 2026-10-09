@@ -586,9 +586,7 @@ impl Rendezvous {
             Ok(identity) if identity.is_compatible_with(&self.compat) => Probe::Live(descriptor),
             Ok(_) | Err(ProbeFailure::Answered(_)) => Probe::Gone,
             Err(ProbeFailure::Unreachable) => match attempt_identity_probe(&descriptor) {
-                Ok(identity) if identity.is_compatible_with(&self.compat) => {
-                    Probe::Live(descriptor)
-                }
+                Ok(identity) if identity.is_compatible_with(&self.compat) => Probe::Live(descriptor),
                 Err(ProbeFailure::Silent) => Probe::Silent(descriptor),
                 _ => Probe::Gone,
             },
@@ -1195,8 +1193,9 @@ mod tests {
         let worker_key = key.clone();
         let worker = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            Rendezvous::new(&worker_dir, worker_key)
-                .ensure(|| Err("must not spawn beside a published daemon".to_string()))
+            Rendezvous::new(&worker_dir, worker_key).ensure(|| {
+                Err("must not spawn beside a published daemon".to_string())
+            })
         });
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         // Let the worker observe an absent descriptor and block on our lock.

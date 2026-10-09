@@ -1389,6 +1389,17 @@ mod tests {
         })
     }
 
+    #[test]
+    fn typed_failure_does_not_trust_thrown_limit_text() {
+        let exception = returns(
+            "throw new Error('code mode script exceeded its memory budget; wall-clock deadline');",
+        );
+        assert_eq!(exception.failure_kind, Some(FailureKind::ScriptException));
+        let syntax = returns("return )(");
+        assert_eq!(syntax.failure_kind, Some(FailureKind::SyntaxValidation));
+        assert_eq!(returns("return 42").failure_kind, None);
+    }
+
     fn run(script: &str, data: Value, call: CallBinding, limits: Limits) -> ScriptOutcome {
         run_script(script, data, call, None, limits, &[])
     }

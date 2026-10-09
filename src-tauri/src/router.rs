@@ -813,6 +813,18 @@ impl ServerSlot {
             {
                 return false;
             }
+            let reason = if state.state == SupervisorState::Backoff {
+                "health_recovery"
+            } else if state.ever_ready {
+                "idle_restart"
+            } else {
+                "demand_start"
+            };
+            crate::gatewaylog::append(&format!(
+                "supervisor_transition server={} reason={reason} prior={:?} next=Starting",
+                sanitize_segment(&self.id),
+                state.state
+            ));
             state.state = SupervisorState::Starting;
             state.last_attempt = now;
             Arc::clone(&state.connect)
@@ -982,6 +994,10 @@ impl ServerSlot {
         if !closed && !(probe && self.quiescent_since(&server, successes)) {
             return false;
         }
+        crate::gatewaylog::append(&format!(
+            "supervisor_transition server={} reason=health_recovery prior=Ready next=Backoff",
+            sanitize_segment(&self.id)
+        ));
         state.state = SupervisorState::Degraded;
         state.last_error = error.to_string();
         state.failures = state.failures.saturating_add(1);
@@ -1008,6 +1024,7 @@ impl ServerSlot {
                 // try_lock keeps a serial remote call from blocking the watcher.
                 if let Ok(mut server) = self.inner.try_lock() {
                     if server.connection_closed() == Some(true) {
+                        crate::gatewaylog::append(&format!("supervisor_transition server={} reason=connection_closed prior=Ready next=Backoff", sanitize_segment(&self.id)));
                         state.state = SupervisorState::Degraded;
                         state.last_error = "the server closed the connection".to_string();
                         state.failures = state.failures.saturating_add(1);
@@ -1024,6 +1041,7 @@ impl ServerSlot {
                         && server.suspended_calls() == 0
                         && !state.subscription_use.as_ref().is_some_and(|used| used())
                     {
+                        crate::gatewaylog::append(&format!("supervisor_transition server={} reason=idle_timeout prior=Ready next=Stopped", sanitize_segment(&self.id)));
                         state.state = SupervisorState::Stopping;
                         server.stop();
                         state.state = SupervisorState::Stopped;
@@ -9273,7 +9291,12 @@ for line in sys.stdin:
             .unavailable()
             .contains("has not connected yet"));
         let (last_attempt, retry_at) = {
-            let state = router.servers[0].supervisor.as_ref().unwrap().lock().unwrap();
+            let state = router.servers[0]
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap();
             (state.last_attempt, state.next_attempt)
         };
         assert!(!router.servers[0].start_at(true, last_attempt));

@@ -1491,20 +1491,16 @@ pub fn known_adapter_name(id: &str) -> Option<String> {
 }
 
 pub fn trusted_client_name(client: Option<&str>, recorded_name: Option<&str>) -> String {
-    if let Some(name) = recorded_name.filter(|name| !name.is_empty()) {
+    if let Some(name) = recorded_name.filter(|name| {
+        !name.is_empty()
+            && !name.starts_with("adapter-pid-")
+            && !client.is_some_and(|c| c.strip_prefix("adapter:") == Some(*name))
+    }) {
         return name.to_string();
     }
     if let Some(id) = client.and_then(|client| client.strip_prefix("adapter:")) {
         if let Some(name) = known_adapter_name(id) {
             return name;
-        }
-        if let Some(pid) = id
-            .strip_prefix("adapter-pid-")
-            .and_then(|pid| pid.parse().ok())
-        {
-            if let Some(name) = crate::client_process::parent_app(pid) {
-                return format!("Unknown app (via {name})");
-            }
         }
     }
     if let Some(id) = client.and_then(|client| client.strip_prefix("client:")) {
@@ -1939,7 +1935,7 @@ pub struct SnippetEnvVar {
 }
 
 impl Serialize for SnippetEnvVar {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok,S::Error> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serde_json::json!({"key":self.key,"value":self.value,"secret":crate::import_credentials::secret_env(&self.key,self.value.as_deref())}).serialize(serializer)
     }
 }
@@ -2301,7 +2297,9 @@ fn parse_json_snippet(
                 .get("command")
                 .is_some_and(|command| command.is_string() || command.is_array())
                 && !servers.get("url").is_some_and(serde_json::Value::is_string)
-                && !servers.get("type").is_some_and(serde_json::Value::is_string)
+                && !servers
+                    .get("type")
+                    .is_some_and(serde_json::Value::is_string)
                 && !servers
                     .get("enabled")
                     .is_some_and(serde_json::Value::is_boolean)
@@ -3176,7 +3174,6 @@ fn parse_client_content(format: Format, content: &str) -> Result<Vec<McpServer>,
         Format::YamlMcpServers => parse_hermes_yaml_servers(content),
         Format::YamlMcpServersList => parse_continue_yaml_servers(content),
     }
-
 }
 
 fn managed_matches_detected(server: &McpServer, rec: &ManagedEntry) -> bool {
@@ -6337,7 +6334,9 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
         let mut outcome = revision_outcome(client_id, uninstall_gateway_inner(client_id))?;
-        outcome.warnings.extend(disconnect_warnings(def.format, &path)?);
+        outcome
+            .warnings
+            .extend(disconnect_warnings(def.format, &path)?);
         Ok(outcome)
     })
 }
@@ -6384,8 +6383,8 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             restored: Vec::new(),
             used_move_record: false,
             revision: None,
-        warnings: Vec::new(),
-        recovery_path: None,
+            warnings: Vec::new(),
+            recovery_path: None,
         });
     }
     let mut outcome = install_or_remove(client_id, None)?;
@@ -7017,6 +7016,9 @@ fn claude_configs_needing_repair(paths: &[PathBuf], current: &str) -> Vec<Claude
         let Some((entry_name, stored)) = claude_gateway_entry_in(&text) else {
             continue;
         };
+        if !command_is_gateway_binary(&stored) {
+            continue;
+        }
         if !gateway_entry_needs_rewrite(&entry_name, &stored, current, Some(&text))
             && serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
@@ -7571,7 +7573,7 @@ mod tests {
         let repairs = claude_configs_needing_repair(
             &[
                 stale.clone(),
-                already_current,
+                already_current.clone(),
                 customized,
                 no_gateway,
                 unparseable,
@@ -7582,13 +7584,19 @@ mod tests {
 
         assert_eq!(
             repairs,
-            vec![ClaudeRepair {
-                path: stale,
-                // Preserved per file: dropping it would silently unscope this client.
-                profile: Some("work".to_string()),
-                stored: stale_command.to_string_lossy().into_owned(),
-            }],
-            "only the config pinned to a superseded gateway of ours should be repaired"
+            vec![
+                ClaudeRepair {
+                    path: stale,
+                    profile: Some("work".to_string()),
+                    stored: stale_command.to_string_lossy().into_owned(),
+                },
+                ClaudeRepair {
+                    path: already_current,
+                    profile: None,
+                    stored: current.clone()
+                }
+            ],
+            "owned gateways repair missing identity as well as stale commands"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9586,7 +9594,7 @@ command = "npx"
     }
 
     #[test]
-    fn secondary_claude_repair_keeps_profile_without_primary_client_id() {
+    fn secondary_claude_repair_keeps_profile_with_distinct_client_id() {
         let entry = secondary_claude_gateway_entry(Some("work")).unwrap();
         let env: std::collections::HashMap<_, _> = entry
             .env
@@ -9597,10 +9605,39 @@ command = "npx"
             env.get(crate::brand::PROFILE).unwrap().as_deref(),
             Some("work")
         );
-        assert!(
-            !env.contains_key(crate::brand::CLIENT_ID),
-            "a secondary config must fall through to its own frozen profile"
+        assert_eq!(
+            env.get(crate::brand::CLIENT_ID).unwrap().as_deref(),
+            Some("claude-code-secondary")
         );
+    }
+
+    #[test]
+    fn identity_backfill_preserves_raw_entry_fields_across_formats() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-identity-backfill-{}",
+            crate::approval::new_correlation_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        for (format, text) in [
+            (Format::JsonMcpServers, r#"{"mcpServers":{"toolport":{"command":"toolport-gateway","args":["--private"],"env":{"TOOLPORT_PROFILE":"work","KEEP":"fixture"},"unknown":42},"custom":{"command":"wrapper"}}}"#),
+            (Format::TomlMcpServers, "[mcp_servers.toolport]\ncommand = \"toolport-gateway\"\nargs = [\"--private\"]\nunknown = 42\n[mcp_servers.toolport.env]\nTOOLPORT_PROFILE = \"work\"\nKEEP = \"fixture\"\n"),
+            (Format::JsonOpenCodeMcp, r#"{"mcp":{"toolport":{"type":"local","command":["toolport-gateway","--private"],"environment":{"TOOLPORT_PROFILE":"work","KEEP":"fixture"},"unknown":42}}}"#),
+            (Format::YamlMcpServers, "mcp_servers:\n  toolport:\n    command: toolport-gateway\n    args: [--private]\n    unknown: 42\n    env:\n      TOOLPORT_PROFILE: work\n      KEEP: fixture\n"),
+        ] {
+            let path = dir.join("client-config"); std::fs::write(&path, text).unwrap();
+            let before = mutation::value(format, Some(text)).unwrap();
+            moved::backfill_identity(format, &path, "toolport", "cursor").unwrap();
+            let output = std::fs::read_to_string(&path).unwrap();
+            let mut after = mutation::value(format, Some(&output)).unwrap();
+            let container = if matches!(format, Format::TomlMcpServers | Format::YamlMcpServers) { "mcp_servers" } else if matches!(format, Format::JsonOpenCodeMcp) { "mcp" } else { "mcpServers" };
+            let env = if matches!(format, Format::JsonOpenCodeMcp) { "environment" } else { "env" };
+            assert_eq!(after[container]["toolport"][env][crate::brand::CLIENT_ID], "cursor");
+            after[container]["toolport"][env].as_object_mut().unwrap().remove(crate::brand::CLIENT_ID);
+            assert_eq!(before, after, "only identity may change");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     // Informational (no assert): prints what the Cursor plugin scanner finds on

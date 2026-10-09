@@ -4131,10 +4131,16 @@ fn resolve_adapter_caller(
     (
         Some(allowed),
         HttpCaller {
-            audit_label: Some(clients::trusted_client_name(
-                Some(&format!("adapter:{client_id}")),
-                None,
-            )),
+            audit_label: Some(if clients::known_adapter_name(client_id).is_none() {
+                client_id
+                    .strip_prefix("adapter-pid-")
+                    .and_then(|pid| pid.parse().ok())
+                    .and_then(conduit_lib::client_process::parent_app)
+                    .map(|name| format!("Unknown app (via {name})"))
+                    .unwrap_or_else(|| "An AI client".into())
+            } else {
+                clients::trusted_client_name(Some(&format!("adapter:{client_id}")), None)
+            }),
             session_owner: McpSessionOwner {
                 identity: format!("adapter:{client_id}"),
                 profile: Some(profile.clone()),
@@ -4624,6 +4630,10 @@ fn execute_call(
     // `None` only in test wrappers that lack `GatewayState`.
     live_router: Option<&Arc<Mutex<Arc<Router>>>>,
 ) -> Value {
+    let mut dispatch_timing =
+        observation::DispatchTimer::start(router.any_missing_catalog(|id| {
+            allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
+        }));
     let _approval_cancel = ApprovalCancelGuard::enter(cancel.clone());
     if active_live_router_resolver()
         .is_some_and(|view| (view.stale)(router, DispatchTarget::Tool(name)))
@@ -4822,7 +4832,7 @@ fn execute_call(
                 token: String::new(),
                 id: new_correlation_id(),
                 client: client.map(str::to_string),
-                client_name: crate::session_observability::current().client_name,
+                client_name: observation::current().client_name,
                 client_label: active_client_label(),
                 server: server_id.to_string(),
                 tool: tool.to_string(),
@@ -5119,15 +5129,16 @@ fn execute_call(
     // rehydration on the same leg. A host that answers an elicitation from model
     // context puts `⟦EMAIL_1⟧` in `inputResponses`, and the server would receive a
     // pseudonym where an address belongs (SBS-606).
-    let rehydrated_mrtr = match rehydrate_mrtr_for_downstream(client, server_id, name, effective_mrtr) {
-        Ok(m) => m,
-        Err(msg) => {
-            return json!({
-                "content": [{ "type": "text", "text": format!("Toolport: {msg}") }],
-                "isError": true,
-            });
-        }
-    };
+    let rehydrated_mrtr =
+        match rehydrate_mrtr_for_downstream(client, server_id, name, effective_mrtr) {
+            Ok(m) => m,
+            Err(msg) => {
+                return json!({
+                    "content": [{ "type": "text", "text": format!("Toolport: {msg}") }],
+                    "isError": true,
+                });
+            }
+        };
     let effective_mrtr = rehydrated_mrtr.as_ref().or(effective_mrtr);
     // This request kept the router it arrived with. If a newer one has gone live
     // since (a registry policy change, quarantine, or a rebuild), its policy has
@@ -5141,6 +5152,7 @@ fn execute_call(
     );
     let guidance_arguments = arguments.clone();
     match live_policy.map_err(CallFailure::from).and_then(|()| {
+        dispatch_timing.finish();
         exec_router.route_call_typed(name, arguments, cancel.clone(), client_meta, effective_mrtr)
     }) {
         Ok(mut result) => {
@@ -5627,7 +5639,7 @@ fn approve_pii_release(
         token: String::new(),
         id: new_correlation_id(),
         client: client.map(str::to_string),
-        client_name: crate::session_observability::current().client_name,
+        client_name: observation::current().client_name,
         client_label: active_client_label(),
         server: server.to_string(),
         tool: tool.to_string(),
@@ -6507,8 +6519,8 @@ fn execute_script_dispatch(
     // (SBS-881). Run the defense here, before the script's own result is returned,
     // so nothing unscanned reaches the model. The failure envelope was defended
     // part by part above and is all Toolport text now.
-    let untrusted = result["isError"] != true
-        && !defend_script_aggregate(reg, client, &owner, &mut result);
+    let untrusted =
+        result["isError"] != true && !defend_script_aggregate(reg, client, &owner, &mut result);
 
     // Intermediate calls were not shaped (full bodies stayed in the sandbox). The
     // script's aggregate can still blow the transport/context budget, so shape only
@@ -8978,6 +8990,10 @@ fn notify_tools_changed_for_catalog_diff(
         .collect();
     let msg = json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" });
     let mut changed_by_scope: HashMap<Option<McpSessionOwner>, bool> = HashMap::new();
+    let mut scoped = 0usize;
+    let mut queued = 0usize;
+    let mut dropped = 0usize;
+    let mut suppressed = 0usize;
     for session in sessions {
         if session.is_expired() || session.closed.load(Ordering::SeqCst) {
             continue;
@@ -9029,14 +9045,21 @@ fn notify_tools_changed_for_catalog_diff(
             before != after
         });
         if !changed {
+            suppressed += 1;
             continue;
         }
+        scoped += 1;
         if let Some(json) = session.notification_json(&msg) {
-            if !session.push_message(json, None) {
-                eprintln!("toolport: MCP session could not take a notification; dropped");
+            if session.push_message(json, None) {
+                queued += 1;
+            } else {
+                dropped += 1;
             }
+        } else {
+            suppressed += 1;
         }
     }
+    glog(&format!("catalog_notification reason=catalog_refresh prior=published content_changed={} scoped_clients={scoped} accepted={queued} dropped={dropped} suppressed={suppressed}; accepted HTTP messages await transport delivery", previous != current));
 }
 
 #[derive(Clone, Copy)]
@@ -11098,7 +11121,7 @@ fn adopt_reconnected_servers(
         Some(&previous_adapter_tools),
     );
     let msg = format!(
-        "reconnected {} after retrying; {} tools, sent tools/list_changed",
+        "catalog_publish reason=reconnect_adoption servers={} tools={}; scoped notification delivery is recorded per session",
         adopted.join(", "),
         tools.len()
     );
@@ -14108,7 +14131,7 @@ fn broker_url_elicitation(
         token: String::new(),
         id: format!("toolport-url-{}", new_correlation_id()),
         client: None,
-        client_name: crate::session_observability::current().client_name,
+        client_name: observation::current().client_name,
         client_label: None,
         server: screened.origin.clone(),
         tool: "browser interaction".to_string(),
@@ -15270,7 +15293,17 @@ fn process_request_wire(
     } else {
         "legacy_first_request"
     };
-    let name = clients::trusted_client_name(client, client_name);
+    let name = if !state.http
+        && client
+            .and_then(|c| c.strip_prefix("adapter:"))
+            .is_none_or(|id| clients::known_adapter_name(id).is_none())
+    {
+        conduit_lib::client_process::parent_app(std::process::id())
+            .map(|name| format!("Unknown app (via {name})"))
+            .unwrap_or_else(|| clients::trusted_client_name(client, client_name))
+    } else {
+        clients::trusted_client_name(client, client_name)
+    };
     let observed = if let Some(holder) = &holder {
         let mut current = holder
             .observation
@@ -15307,7 +15340,6 @@ fn process_request_wire(
     let internal = match (method, req["params"]["name"].as_str()) {
         ("server/discover", _) => Some("describe"),
         ("tools/call", Some("toolport_search_tools")) => Some("search"),
-        ("tools/call", Some("toolport_call_tool")) => Some("call_dispatch"),
         _ => None,
     };
     let base = state
@@ -16465,6 +16497,8 @@ impl HttpOut {
             ctype: "text/event-stream",
             body: String::new(),
             extra: Vec::new(),
+            catalog_delivery: None,
+            observation: None,
             mcp_listen: Some(McpListen {
                 session,
                 cleanup: None,
@@ -16479,6 +16513,8 @@ impl HttpOut {
             ctype: "text/event-stream",
             body: String::new(),
             extra: Vec::new(),
+            catalog_delivery: None,
+            observation: None,
             mcp_listen: Some(McpListen {
                 session,
                 cancel_guard: None,
@@ -18690,7 +18726,19 @@ fn spawn_daemon_idle_watchdog(
             let _ = conduit_lib::daemon::write_descriptor(&descriptor_path, &descriptor);
             continue;
         }
-        glog("daemon: idle exit");
+        glog(if update_requested {
+            "daemon_exit reason=update_idle prior=healthy"
+        } else {
+            "daemon_exit reason=idle_timeout prior=healthy"
+        });
+        for session in host
+            .mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+        {
+            session.close_reason(observation::CloseReason::GatewayShutdown);
+        }
         // Land any queued audit/savings/search-trace lines before the process exits.
         if let Some(dir) = descriptor_path.parent() {
             conduit_lib::daemon_log::end_run_cleanly(dir);
@@ -20875,10 +20923,22 @@ mod tests {
 
     #[test]
     fn disconnect_all_is_a_standalone_role_and_dry_run_cannot_start_gateway() {
-        assert_eq!(parse_args(&["--disconnect-all".into()]), ArgAction::DisconnectAll { dry_run: false });
-        assert_eq!(parse_args(&["--disconnect-all".into(), "--dry-run".into()]), ArgAction::DisconnectAll { dry_run: true });
-        assert!(matches!(parse_args(&["--dry-run".into()]), ArgAction::Unknown(_)));
-        assert!(matches!(parse_args(&["--disconnect-all".into(), "--daemon".into()]), ArgAction::Unknown(_)));
+        assert_eq!(
+            parse_args(&["--disconnect-all".into()]),
+            ArgAction::DisconnectAll { dry_run: false }
+        );
+        assert_eq!(
+            parse_args(&["--disconnect-all".into(), "--dry-run".into()]),
+            ArgAction::DisconnectAll { dry_run: true }
+        );
+        assert!(matches!(
+            parse_args(&["--dry-run".into()]),
+            ArgAction::Unknown(_)
+        ));
+        assert!(matches!(
+            parse_args(&["--disconnect-all".into(), "--daemon".into()]),
+            ArgAction::Unknown(_)
+        ));
     }
 
     /// A server whose NAME contains a write verb must not drag its read-only
@@ -23215,7 +23275,10 @@ mod tests {
             catalog_wait_budget(DiscoveryMode::Lazy, true, Some("claude-code"), true),
             downstream::SETUP_CATALOG_WAIT_BUDGET
         );
-        assert_eq!(downstream::SETUP_CATALOG_WAIT_BUDGET, Duration::from_secs(25));
+        assert_eq!(
+            downstream::SETUP_CATALOG_WAIT_BUDGET,
+            Duration::from_secs(25)
+        );
         assert!(downstream::SETUP_CATALOG_WAIT_BUDGET < downstream::STDIO_READ_TIMEOUT);
     }
 
@@ -24572,7 +24635,8 @@ mod tests {
 
     #[test]
     fn initial_modern_hitl_call_starts_mrtr_without_retry_fields() {
-        let _env = DataDirTestEnv::new("p10c-initial_modern_hitl_call_starts_mrtr_without_retry_fields");
+        let _env =
+            DataDirTestEnv::new("p10c-initial_modern_hitl_call_starts_mrtr_without_retry_fields");
         session_tables().hitl().clear();
         let request = json!({
             "params": {
@@ -24880,7 +24944,7 @@ mod tests {
             token: String::new(),
             id: "id".into(),
             client: None,
-            client_name: crate::session_observability::current().client_name,
+            client_name: observation::current().client_name,
             client_label: None,
             server: "db".into(),
             tool: "drop".into(),
@@ -24938,7 +25002,7 @@ mod tests {
             token: String::new(),
             id: "id".into(),
             client: None,
-            client_name: crate::session_observability::current().client_name,
+            client_name: observation::current().client_name,
             client_label: None,
             server: "crm".into(),
             tool: "export_all".into(),
@@ -26867,10 +26931,7 @@ mod tests {
         let host = dispatch_host(seed_code_mode_after_registry_load(Err(())));
         let mut reg = Registry::default();
         reg.code_mode = true;
-        assert!(
-            reg.code_mode,
-            "the request fixture explicitly opts in"
-        );
+        assert!(reg.code_mode, "the request fixture explicitly opts in");
 
         let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
         let list = handle_request(
@@ -29056,10 +29117,14 @@ mod tests {
         let ok = post("/s__work");
         assert_eq!(ok.status, 200, "body={}", ok.body);
         assert_eq!(ok.body, "\"called\"");
-        assert!(ok.extra.contains(&("X-Toolport-Content-Trust".into(), "untrusted".into())));
+        assert!(ok
+            .extra
+            .contains(&("X-Toolport-Content-Trust".into(), "untrusted".into())));
         for (name, _) in &ok.extra {
             assert!(
-                EXPOSED_HTTP_HEADERS.split(", ").any(|exposed| exposed.eq_ignore_ascii_case(name)),
+                EXPOSED_HTTP_HEADERS
+                    .split(", ")
+                    .any(|exposed| exposed.eq_ignore_ascii_case(name)),
                 "browser cannot read provenance header {name}"
             );
         }
@@ -30414,8 +30479,10 @@ mod tests {
         reg.servers.push(stub_server("team-slack", "Team Slack"));
         reg.servers.push(stub_server("team_slack", "slack"));
         let personal = reg.add_profile("Personal");
-        reg.set_access_server(&personal, "team-slack", true).unwrap();
-        reg.set_access_server("default", "team_slack", true).unwrap();
+        reg.set_access_server(&personal, "team-slack", true)
+            .unwrap();
+        reg.set_access_server("default", "team_slack", true)
+            .unwrap();
         reg.set_server_enabled(&personal, "team-slack", true)
             .unwrap();
         reg.set_server_enabled("default", "team_slack", true)
@@ -33530,10 +33597,8 @@ mod tests {
     fn lazy_discovery_keeps_ui_linked_tools_only_for_apps_hosts() {
         let _lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-apps-measure-{}",
-            new_correlation_id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("toolport-apps-measure-{}", new_correlation_id()));
         let _data = registry::DataDirOverride::set(&dir);
         let host = dispatch_host(false);
         let reg = Registry::default();
@@ -35029,7 +35094,11 @@ mod tests {
         let host = dispatch_host(false);
         host.set_code_mode(false);
         let tools = floor_tool_defs(&host);
-        assert_eq!(tools.len(), 4, "Code Mode off means the floor is the core four");
+        assert_eq!(
+            tools.len(),
+            4,
+            "Code Mode off means the floor is the core four"
+        );
         let tools_json = serde_json::to_string(&tools).expect("floor tools serialize");
         let instructions = discovery_instructions(DiscoveryMode::Lazy, None);
         let bytes = tools_json.len() + instructions.len();
@@ -35235,10 +35304,8 @@ mod tests {
     fn catalog_measurement_uses_actual_surfaces_for_modes_scope_and_dynamic_defs() {
         let _lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-catalog-measure-{}",
-            new_correlation_id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("toolport-catalog-measure-{}", new_correlation_id()));
         let _data = registry::DataDirOverride::set(&dir);
         let mut router = Router::new();
         for server in ["alpha", "beta"] {
@@ -35392,10 +35459,8 @@ mod tests {
     fn search_measurement_includes_lead_and_guidance_text() {
         let _lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-search-measure-{}",
-            new_correlation_id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("toolport-search-measure-{}", new_correlation_id()));
         let _data = registry::DataDirOverride::set(&dir);
         let response = handle_request(
             &dispatch_host(false),
@@ -36193,7 +36258,7 @@ mod tests {
                     token: String::new(),
                     id: "1".into(),
                     client: None,
-                    client_name: crate::session_observability::current().client_name,
+                    client_name: observation::current().client_name,
                     client_label: None,
                     server: "s".into(),
                     tool: "t".into(),
@@ -36207,7 +36272,8 @@ mod tests {
             );
             // On the old denial path the second connection never happens.
             if decision == approval::ApprovalDecision::Denied && reply.is_empty() {
-                let mut unblock = approval::dial_broker(&approval::read_endpoint_descriptor().unwrap()).unwrap();
+                let mut unblock =
+                    approval::dial_broker(&approval::read_endpoint_descriptor().unwrap()).unwrap();
                 unblock.write_all(b"{}\n").unwrap();
             }
             worker.join().unwrap();
@@ -37031,7 +37097,10 @@ mod tests {
     fn team_quarantine_at_member_off_enforces_drift_and_survives_watcher_reconciliation() {
         let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("toolport-team-quarantine-off-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-team-quarantine-off-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
@@ -37297,14 +37366,17 @@ mod tests {
                 let live = live_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let advertises = live.aggregated_tools().iter().any(|t| t["name"] == "srv__read");
-                *seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(advertises);
+                let advertises = live
+                    .aggregated_tools()
+                    .iter()
+                    .any(|t| t["name"] == "srv__read");
+                *seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(advertises);
             }),
         ));
 
-        let published =
-            publish_built_router(&state.registry, &state.router, drifted, profile);
+        let published = publish_built_router(&state.registry, &state.router, drifted, profile);
 
         *INTEGRITY_GATE_OBSERVER
             .lock()
@@ -37327,7 +37399,10 @@ mod tests {
             "the quarantine must be on the router the moment it becomes live"
         );
         assert!(
-            !live.aggregated_tools().iter().any(|t| t["name"] == "srv__read"),
+            !live
+                .aggregated_tools()
+                .iter()
+                .any(|t| t["name"] == "srv__read"),
             "the published router must not advertise the drifted tool"
         );
     }
@@ -41985,7 +42060,11 @@ mod tests {
         let anonymous = probe(&state, None, false);
         assert_eq!(anonymous.status, 401, "body={}", anonymous.body);
         let registered_client = probe(&state, Some(&caller), false);
-        assert_eq!(registered_client.status, 401, "body={}", registered_client.body);
+        assert_eq!(
+            registered_client.status, 401,
+            "body={}",
+            registered_client.body
+        );
         let registered_topology = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
