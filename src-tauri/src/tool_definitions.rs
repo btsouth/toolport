@@ -331,6 +331,11 @@ impl RawTool {
     }
 }
 impl SerializedTools {
+    #[cfg(test)]
+    pub(crate) fn storage_sharers(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+
     pub fn len(&self) -> usize {
         self.0.tools.len()
     }

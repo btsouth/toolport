@@ -3005,7 +3005,8 @@ impl Router {
     /// never re-derive the original name by splitting the exposed name on `__`
     /// (overrides and `_2` collision suffixes make that split wrong, see
     /// [`Self::route_of`]). Only exposed names this router does not already
-    /// route are adopted, so a healthy server is never touched. Policy is
+    /// route from a live slot are adopted. Previously restored routes keep
+    /// their candidates across repeated adoption. Policy is
     /// re-evaluated per restored tool before adoption: the rebuilt router only
     /// indexed the degraded connect, so tools quarantined or disabled since the
     /// previous build are absent from its `blocked` map and must not slip back
@@ -4234,6 +4235,45 @@ mod tests {
             view.schema_arguments["s__echo"].restore(&mut args).unwrap();
             assert_eq!(args, json!({"'x-Cwd'": "/tmp"}));
         }
+    }
+
+    #[test]
+    fn reindex_releases_slot_before_waiting_for_definition_cache() {
+        let mut router = Router::new();
+        router.add(mock_server("s"));
+        let slot = router.servers[0].clone();
+        let raw = slot.inner.lock().unwrap().tools.clone();
+        let prior_sharers = raw.storage_sharers();
+        let cache = slot.definitions.lock().unwrap();
+        let snapshot = router.clone();
+        let worker = std::thread::spawn(move || snapshot.reindexed());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while raw.storage_sharers() == prior_sharers && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let snapshotted = raw.storage_sharers() > prior_sharers;
+        let callable = loop {
+            if slot.inner.try_lock().is_ok() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        let persisted = router.raw_catalogs().is_some();
+        drop(cache);
+        let rebuilt = worker.join().unwrap();
+        assert!(
+            snapshotted,
+            "reindex must snapshot serialized tools before indexing"
+        );
+        assert!(
+            persisted,
+            "catalog persistence must not skip an indexing slot"
+        );
+        assert!(callable, "dispatch must not wait on schema indexing");
+        assert_eq!(rebuilt.shared_tools(), router.shared_tools());
     }
 
     /// A fake downstream server: advertises `echo` + `add`, echoes calls back.
