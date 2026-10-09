@@ -8537,7 +8537,8 @@ mod member_review_tests {
 
     #[test]
     fn sync_regression_editing_disabled_definition_keeps_it_disabled() {
-        let mut reg = registry();
+        let mut reg = bound_personal_registry();
+        stage_team_config(&mut reg, "review-team", &json!({"servers":[]}), 2, &[]).unwrap();
         let selected = selected_export(&reg, &["remote".into()]).unwrap();
         let mut remote = selected.clone();
         remote[0]["disabled"] = json!(true);
@@ -8554,7 +8555,7 @@ mod member_review_tests {
         assert_eq!(merged[0]["disabled"], true);
         assert_eq!(merged[0]["note"], remote[0]["note"]);
         assert_eq!(merged[0]["url"], edited[0]["url"]);
-        stage_team_config(&mut reg, "review-team", &json!({"servers":merged}), 1, &[])
+        stage_team_config(&mut reg, "review-team", &json!({"servers":merged}), 3, &[])
             .unwrap();
         assert!(reg
             .servers
