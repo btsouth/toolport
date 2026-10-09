@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { abstained, finalText, includes, score } from "./live-client-bench.mjs";
+import { specifications, tasksFrom } from "./live-client-bench-tasks.mjs";
 
 const catalog = [
   {
@@ -119,4 +120,40 @@ test("no-match acceptance needs an explicit model abstention", () => {
     finalText("codex", '{"item":{"type":"agent_message","text":"Unavailable"}}'),
     "Unavailable",
   );
+});
+
+test("sending a returned link permits surrounding message text", () => {
+  const link = {
+    expected: [{ name: "demo__post", args: {}, textIncludes: "https://example.test/42" }],
+  };
+  assert.equal(
+    score(link, [call("post", { text: "Issue: https://example.test/42" })], catalog, true)
+      .success,
+    true,
+  );
+  assert.equal(
+    score(link, [call("post", { text: "https://example.test/41" })], catalog, true)
+      .success,
+    false,
+  );
+});
+
+test("public development file-read alternatives retain requested arguments", () => {
+  const dev = specifications.map(([id]) => ({
+    id,
+    split: "dev",
+    primary: "demo__read",
+    query: "Read",
+    acceptable_alternatives: [],
+  }));
+  const intent = dev.find((x) => x.id === "r4-304");
+  intent.primary = "filesystem__read_text_file";
+  intent.acceptable_alternatives = ["filesystem__read_file"];
+  const fileTask = tasksFrom(dev).find((x) => x.id === "r4-304");
+  assert.deepEqual(fileTask.expected[0].alternatives, [
+    {
+      name: "filesystem__read_file",
+      args: { path: "/fixture/config.txt" },
+    },
+  ]);
 });

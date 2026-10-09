@@ -140,7 +140,16 @@ export function tasksFrom(dev) {
         name,
         args: { charge: "ch_fixture", body: { reason: "duplicate" } },
       }));
+    if (id === "r4-304")
+      expected[0].alternatives = intent.acceptable_alternatives.map((name) => ({
+        name,
+        args,
+      }));
     if (second) expected.push({ name: second, args: secondArgs });
+    if (id === "r4-299") {
+      expected[1].args = { channel_id: "C_FIXTURE" };
+      expected[1].textIncludes = "https://example.test/issues/42";
+    }
     return {
       id,
       category: intent.category,

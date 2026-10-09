@@ -8,8 +8,11 @@ const delay = Number(delayText);
 const notify = Number(notifyText);
 const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
 const tools = catalog
-  .filter((t) => t.name.startsWith(`${namespace}__`))
-  .map((t) => ({ ...t, name: t.name.slice(namespace.length + 2) }));
+  .filter((t) => namespace === "catalog" || t.name.startsWith(`${namespace}__`))
+  .map((t) => ({
+    ...t,
+    name: namespace === "catalog" ? t.name : t.name.slice(namespace.length + 2),
+  }));
 const log = (event) =>
   appendFileSync(trace, JSON.stringify({ at: Date.now(), namespace, ...event }) + "\n");
 const send = (message) =>

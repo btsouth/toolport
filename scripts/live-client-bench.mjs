@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
+import { connect, createServer } from "node:net";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -50,7 +51,10 @@ export function score(task, calls, catalog, finished) {
   const choices = task.expected.map((x) => [x, ...(x.alternatives || [])]);
   const wanted = choices.flat().map((x) => x.name);
   const normalized = calls.map((r) => ({
-    name: `${r.namespace}__${r.params.name}`.replaceAll("-", "_"),
+    name: (r.namespace === "catalog"
+      ? r.params.name
+      : `${r.namespace}__${r.params.name}`
+    ).replaceAll("-", "_"),
     args: r.params.arguments || {},
   }));
   const details = normalized.map((call) => {
@@ -58,7 +62,12 @@ export function score(task, calls, catalog, finished) {
     const validate = tool && validator(tool);
     const validSchema = Boolean(validate?.(call.args));
     const expected = choices.flat().find((x) => x.name === call.name);
-    const validValues = expected ? includes(call.args, expected.args) : false;
+    const validValues = expected
+      ? includes(call.args, expected.args) &&
+        (!expected.textIncludes ||
+          (typeof call.args.text === "string" &&
+            call.args.text.includes(expected.textIncludes)))
+      : false;
     return {
       ...call,
       validSchema,
@@ -89,17 +98,24 @@ export function score(task, calls, catalog, finished) {
   };
 }
 
-async function snapshot(dir, base = dir, output = {}) {
-  for (const entry of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
-    const name = path.join(dir, entry.name);
-    if (entry.isDirectory()) await snapshot(name, base, output);
-    else if (entry.isFile()) {
-      const s = await stat(name).catch(() => null);
-      if (s) output[path.relative(base, name)] = { mtimeMs: s.mtimeMs, size: s.size };
-    }
+async function configMetadata() {
+  const files = [
+    ".codex/config.toml",
+    ".claude.json",
+    ".claude/settings.json",
+    ".cursor/mcp.json",
+    ".cursor/cli-config.json",
+    ".config/opencode/opencode.json",
+    ".config/opencode/opencode.jsonc",
+  ];
+  const result = {};
+  for (const file of files) {
+    const metadata = await stat(path.join(os.homedir(), file)).catch(() => null);
+    result[file] = metadata ? { mtimeMs: metadata.mtimeMs, size: metadata.size } : null;
   }
-  return output;
+  return result;
 }
+
 async function runProcess(executable, args, options, timeoutMs) {
   const start = performance.now();
   const child = spawn(executable, args, {
@@ -149,12 +165,28 @@ async function runProcess(executable, args, options, timeoutMs) {
 // The wiretap inherits only an explicitly written disposable gateway environment.
 async function wiretap(configPath) {
   const cfg = readJson(configPath);
-  const child = spawn(cfg.gateway, ["--stdio-adapter"], {
-    cwd: cfg.home,
-    env: cfg.env,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+  const child = cfg.bridgePort
+    ? null
+    : spawn(cfg.gateway, ["--stdio-adapter"], {
+        cwd: cfg.home,
+        env: cfg.env,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+  const connection = cfg.bridgePort ? connect(cfg.bridgePort, "127.0.0.1") : null;
+  const sink = connection || child.stdin;
+  const source = connection || child.stdout;
   const input = createInterface({ input: process.stdin });
+  const heldIds = new Set();
+  let heldReply,
+    holdTimer,
+    notificationDelivered = false;
+  const release = () => {
+    clearTimeout(holdTimer);
+    if (heldReply) {
+      process.stdout.write(heldReply + "\n");
+      heldReply = undefined;
+    }
+  };
   const log = (direction, line) => {
     const m = JSON.parse(line);
     const safe = { at: Date.now(), direction, id: m.id, method: m.method };
@@ -165,33 +197,107 @@ async function wiretap(configPath) {
       safe.names = m.result.tools.map((t) => t.name);
       safe.catalogBytes = Buffer.byteLength(JSON.stringify(m.result));
     }
+    safe.message = m;
     if (m.error) safe.error = m.error;
     record(cfg.wire, safe);
   };
   input.on("line", (line) => {
     log("client", line);
-    child.stdin.write(line + "\n");
+    const message = JSON.parse(line);
+    if (
+      cfg.notificationHold &&
+      message.method === "tools/call" &&
+      (message.params.name === "slack__slack_list_channels" ||
+        message.params.arguments?.name === "slack__slack_list_channels")
+    )
+      heldIds.add(message.id);
+    sink.write(line + "\n");
   });
-  input.on("close", () => child.stdin.end());
-  child.stdin.on("error", () => input.close());
-  createInterface({ input: child.stdout }).on("line", (line) => {
+  input.on("close", () => sink.end());
+  sink.on("error", () => input.close());
+  createInterface({ input: source }).on("line", (line) => {
     log("server", line);
+    const message = JSON.parse(line);
+    if (message.method === "notifications/tools/list_changed") {
+      notificationDelivered = true;
+      process.stdout.write(line + "\n");
+      release();
+      return;
+    }
+    if (heldIds.has(message.id) && message.result && !notificationDelivered) {
+      heldReply = line;
+      holdTimer = setTimeout(() => {
+        record(cfg.wire, {
+          at: Date.now(),
+          method: "benchmark/notification-deadline",
+          direction: "harness",
+        });
+        release();
+      }, 10000);
+      return;
+    }
     process.stdout.write(line + "\n");
   });
-  child.stderr.pipe(process.stderr);
-  child.on("error", (error) => {
+  child?.stderr.pipe(process.stderr);
+  (connection || child).on("error", (error) => {
     console.error(error.message);
     input.close();
     process.exitCode = 1;
   });
-  child.on("exit", (code) => {
+  child?.on("exit", (code) => {
     input.close();
     process.exitCode = code ?? 1;
   });
+  connection?.on("end", () => input.close());
   process.on("SIGTERM", () => {
-    child.kill();
+    release();
+    child?.kill();
+    connection?.destroy();
     input.close();
   });
+}
+
+async function coldBridge(cfg, output) {
+  const sockets = new Set(),
+    children = new Set();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    const child = spawn(cfg.gateway, ["--stdio-adapter"], {
+      cwd: cfg.home,
+      env: cfg.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    children.add(child);
+    socket.pipe(child.stdin);
+    child.stdout.pipe(socket);
+    child.stdin.on("error", () => socket.destroy());
+    child.stderr.on("data", (data) =>
+      appendFileSync(path.join(output, "gateway-stderr.txt"), data),
+    );
+    child.on("error", (error) => {
+      record(path.join(output, "bridge-errors.jsonl"), { error: error.message });
+      socket.destroy();
+    });
+    child.on("exit", () => {
+      children.delete(child);
+      socket.end();
+    });
+    socket.on("close", () => {
+      sockets.delete(socket);
+      child.kill();
+    });
+    socket.on("error", () => child.kill());
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  cfg.bridgePort = server.address().port;
+  return async () => {
+    for (const socket of sockets) socket.destroy();
+    for (const child of children) child.kill();
+    await new Promise((resolve) => server.close(resolve));
+  };
 }
 
 async function prewarm(cfg) {
@@ -298,7 +404,7 @@ export function finalText(client, output) {
       return [];
     }
   });
-  if (client === "claude-code")
+  if (client === "claude-code" || client === "cursor")
     return events.findLast((e) => typeof e.result === "string")?.result || "";
   if (client === "codex")
     return events.findLast((e) => e.item?.type === "agent_message")?.item.text || "";
@@ -332,6 +438,18 @@ function usage(client, output) {
       output: u.output_tokens,
       reported: u,
     };
+  }
+  if (client === "cursor") {
+    const u = events.findLast((e) => e.type === "result")?.usage;
+    return u
+      ? {
+          input: u.inputTokens,
+          cachedInput: u.cacheReadTokens || 0,
+          cacheWrite: u.cacheWriteTokens || 0,
+          output: u.outputTokens,
+          reported: u,
+        }
+      : null;
   }
   if (client === "codex") {
     const u = events.findLast((e) => e.type === "turn.completed")?.usage;
@@ -370,7 +488,7 @@ async function benchmark(options) {
     out,
   } = options;
   assert(
-    ["claude-code", "codex", "opencode"].includes(client),
+    ["claude-code", "codex", "opencode", "cursor"].includes(client),
     "Supported benchmark client required",
   );
   assert(["full", "lazy", "grouped"].includes(mode), "Explicit discovery mode required");
@@ -388,7 +506,11 @@ async function benchmark(options) {
       const validate = validator(tool);
       if (validate)
         assert(
-          validate(expected.args),
+          validate(
+            expected.textIncludes
+              ? { ...expected.args, text: expected.textIncludes }
+              : expected.args,
+          ),
           `${task.id}: invalid reference args ${JSON.stringify(validate.errors)}`,
         );
       else
@@ -426,13 +548,25 @@ async function benchmark(options) {
   for (const task of tasks) {
     const label = `${client}-${mode}-${task.id}${options.delay ? `-delay${options.delay}` : ""}`;
     const output = path.join(out, label);
+    if (
+      options.resume &&
+      (await stat(path.join(output, "summary.json")).catch(() => null))
+    )
+      continue;
+    if (options.resume && (await stat(output).catch(() => null))) {
+      // Preserve a cancelled worker's incomplete artifacts alongside the rerun.
+      const { rename } = await import("node:fs/promises");
+      await rename(output, `${output}-cancelled-${Date.now()}`);
+    }
     mkdirSync(output, { recursive: false, mode: 0o700 });
     const home = await mkdtemp(path.join(os.tmpdir(), "toolport-live-bench-"));
     const data = path.join(home, "gateway-data");
     mkdirSync(data, { mode: 0o700 });
     const wire = path.join(output, "wire.jsonl"),
       downstream = path.join(output, "downstream.jsonl");
-    const namespaces = [...new Set(catalog.map((t) => t.name.split("__")[0]))];
+    const namespaces = options["single-server"]
+      ? ["catalog"]
+      : [...new Set(catalog.map((t) => t.name.split("__")[0]))];
     const warmClient = client === "codex" ? "claude-code" : "codex";
     const registry = {
       version: 3,
@@ -463,6 +597,7 @@ async function benchmark(options) {
       gateway,
       wire,
       warmClient,
+      notificationHold: Boolean(options.notification),
       env: {
         PATH: process.env.PATH,
         HOME: home,
@@ -470,9 +605,10 @@ async function benchmark(options) {
         XDG_CONFIG_HOME: path.join(home, ".config"),
         XDG_DATA_HOME: path.join(home, ".local/share"),
         XDG_CACHE_HOME: path.join(home, ".cache"),
+        DBUS_SESSION_BUS_ADDRESS: `unix:path=${path.join(home, "no-session-bus")}`,
         TOOLPORT_DATA_DIR: data,
         TOOLPORT_REGISTRY: path.join(data, "registry.json"),
-        TOOLPORT_CLIENT_ID: `client:${client}`,
+        TOOLPORT_CLIENT_ID: options["adapter-id"] || `client:${client}`,
         TOOLPORT_DISCOVERY: mode,
         TOOLPORT_CODE_MODE: "0",
         TOOLPORT_SECRET_KEY: "disposable-public-fixture-key",
@@ -481,8 +617,11 @@ async function benchmark(options) {
     const shimFile = path.join(home, "gateway.json");
     writeFileSync(shimFile, JSON.stringify(cfg));
     const mcp = { command: process.execPath, args: [self, "--wiretap", shimFile] };
-    const prompt = `This is an isolated MCP capability test with deterministic mock results. Use only tools from the toolport MCP server. Do not use shell, files, web, other servers, or delegate work. Execute the request, then reply briefly. If no matching capability exists, say unavailable without making an unrelated call. Request: ${task.prompt}`;
-    const env = { ...process.env, NO_COLOR: "1", TERM: "dumb", TMPDIR: home };
+    const recovery = options.recovery
+      ? " First call toolport_status and use the exact server prefixes it returns; never assume a service name is the server prefix. If advertised, explicitly use toolport_search_tools to discover the requested capability with that server filter. If the catalog is loading, retry discovery at most twice before saying unavailable."
+      : "";
+    const prompt = `${options.bootstrap ? "First inspect ALL_TOOLS for toolport discovery helpers by filtering only for toolport. Use toolport_search_tools or a help_ tool to discover the requested capability, even if a capability-specific filter of ALL_TOOLS returns no matches. " : ""}This is an isolated MCP capability test with deterministic mock results. Use only tools from the toolport MCP server. Do not use shell, files, web, other servers, or delegate work. Execute the request, then reply briefly. If no matching capability exists, say unavailable without making an unrelated call.${recovery} Request: ${task.prompt}`;
+    const env = { ...process.env, NO_COLOR: "1", TERM: "dumb", TMPDIR: home, PWD: home };
     for (const key of Object.keys(env))
       if (/^(TOOLPORT_|CONDUIT_|T3_|CLAUDECODE)/.test(key)) delete env[key];
     let args;
@@ -550,6 +689,10 @@ async function benchmark(options) {
         prompt,
       ];
       if (options.model) args.splice(1, 0, "-m", options.model);
+      if (options.debug) {
+        env.RUST_LOG = "codex_core=debug";
+        args.splice(args.indexOf("--ephemeral"), 1);
+      }
       if (options["fixture-approvals"]) {
         const sandbox = args.indexOf("-s");
         args.splice(sandbox, 2, "--dangerously-bypass-approvals-and-sandbox");
@@ -616,6 +759,63 @@ async function benchmark(options) {
       args = [...readonlyArgs, "--", executable, ...args];
       launchExecutable = "/usr/bin/bwrap";
       codexHomeProtected = true;
+    } else if (client === "cursor") {
+      const projectConfig = path.join(home, ".cursor");
+      mkdirSync(projectConfig);
+      writeFileSync(
+        path.join(projectConfig, "mcp.json"),
+        JSON.stringify({ mcpServers: { toolport: mcp } }),
+      );
+      env.CURSOR_CONFIG_DIR = path.join(home, "cursor-config");
+      env.CURSOR_DATA_DIR = path.join(home, "cursor-data");
+      args = [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--approve-mcps",
+        "--trust",
+        "--force",
+        "--workspace",
+        home,
+        prompt,
+      ];
+      if (options.model) args.unshift("--model", options.model);
+      // Keep the existing login readable, but hide the real global MCP config.
+      const emptyMcp = path.join(home, "empty-mcp.json");
+      writeFileSync(emptyMcp, '{"mcpServers":{}}');
+      env.AGENT_CLI_CREDENTIAL_STORE = "file";
+      const cursorHome = path.join(os.homedir(), ".cursor");
+      const original = path.join(home, "cursor-original"),
+        upper = path.join(home, "cursor-writes"),
+        work = path.join(home, "cursor-overlay-work");
+      for (const dir of [original, upper, work]) mkdirSync(dir, { mode: 0o700 });
+      const readonly = [
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--bind",
+        home,
+        home,
+        "--bind",
+        output,
+        output,
+        "--ro-bind",
+        cursorHome,
+        original,
+        "--overlay-src",
+        cursorHome,
+        "--overlay",
+        upper,
+        work,
+        cursorHome,
+      ];
+      const globalMcp = path.join(os.homedir(), ".cursor/mcp.json");
+      if (await stat(globalMcp).catch(() => null))
+        readonly.push("--ro-bind", emptyMcp, globalMcp);
+      args = [...readonly, "--", executable, ...args];
+      launchExecutable = "/usr/bin/bwrap";
     } else {
       const opencodeFile = path.join(home, "opencode.json");
       writeFileSync(
@@ -638,12 +838,18 @@ async function benchmark(options) {
       env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
       args = ["run", "--pure", "--format", "json", prompt];
       if (options.model) args.splice(1, 0, "-m", options.model);
+      if (options.debug) args.unshift("--print-logs", "--log-level", "DEBUG");
     }
     let before;
     let result;
+    let closeBridge;
     try {
+      if (client === "codex" && options.delay) {
+        closeBridge = await coldBridge(cfg, output);
+        writeFileSync(shimFile, JSON.stringify(cfg));
+      }
       if (!options.delay) await prewarm(cfg);
-      if (client === "codex") before = await snapshot(env.CODEX_HOME);
+      before = await configMetadata();
       result = await runProcess(
         launchExecutable,
         args,
@@ -652,12 +858,14 @@ async function benchmark(options) {
       );
       writeFileSync(path.join(output, "stdout.jsonl"), result.stdout, { mode: 0o600 });
       writeFileSync(path.join(output, "stderr.txt"), result.stderr, { mode: 0o600 });
-      const changes =
-        client === "codex"
-          ? Object.entries(await snapshot(env.CODEX_HOME))
-              .filter(([name, value]) => !includes(before[name], value))
-              .map(([name]) => name)
-          : [];
+      const after = await configMetadata();
+      const changes = Object.keys({ ...before, ...after }).filter(
+        (name) => !includes(before[name], after[name]),
+      );
+      writeFileSync(
+        path.join(output, "real-config-metadata.json"),
+        JSON.stringify({ before, after, changes }, null, 2),
+      );
       const events = records(wire),
         calls = records(downstream).filter((e) => e.method === "tools/call");
       const finished =
@@ -665,7 +873,9 @@ async function benchmark(options) {
         !result.timedOut &&
         (client !== "codex" || result.stdout.includes('"type":"turn.completed"')) &&
         (client !== "claude-code" || result.stdout.includes('"is_error":false')) &&
-        (client !== "opencode" || result.stdout.includes('"type":"step_finish"'));
+        (client !== "opencode" || result.stdout.includes('"type":"step_finish"')) &&
+        (client !== "cursor" ||
+          result.stdout.includes('"type":"result","subtype":"success"'));
       const scored = options.start
         ? { success: finished, wrongCalls: calls.length, calls: [] }
         : options.notification
@@ -689,6 +899,7 @@ async function benchmark(options) {
         task: task.id,
         delayMs: Number(options.delay || 0),
         warm: !options.delay,
+        fixtureServerCount: namespaces.length,
         ...scored,
         finished,
         exitCode: result.exitCode,
@@ -705,6 +916,9 @@ async function benchmark(options) {
             : undefined,
         codexHomeProtected,
         fixtureApprovalBypass: Boolean(options["fixture-approvals"]),
+        explicitRecovery: Boolean(options.recovery),
+        nativeBootstrap: Boolean(options.bootstrap),
+        runtimeHome: home,
         realCodexHomeChanges: changes,
         searchRounds: events.filter(
           (e) =>
@@ -756,9 +970,23 @@ async function benchmark(options) {
       )
         infrastructureFailures++;
       else infrastructureFailures = 0;
-      if (changes.length && !codexHomeProtected) {
+      if (
+        changes.some((name) =>
+          ({
+            codex: [".codex/config.toml"],
+            cursor: [".cursor/mcp.json", ".cursor/cli-config.json"],
+            "claude-code": [".claude.json", ".claude/settings.json"],
+            opencode: [
+              ".config/opencode/opencode.json",
+              ".config/opencode/opencode.jsonc",
+            ],
+          })[client].includes(name),
+        ) &&
+        !codexHomeProtected &&
+        client !== "cursor"
+      ) {
         console.log(
-          "Stopped: Codex home metadata changed; inspect the retained summary.",
+          "Stopped: client config metadata changed; inspect the retained summary.",
         );
         break;
       }
@@ -767,6 +995,7 @@ async function benchmark(options) {
         break;
       }
     } finally {
+      if (closeBridge) await closeBridge();
       await cleanup(data);
     }
   }
@@ -778,7 +1007,16 @@ if (process.argv[1] === self) {
     const options = {};
     for (let i = 2; i < process.argv.length; i++) {
       const key = process.argv[i].replace(/^--/, "");
-      options[key] = ["start", "notification", "fixture-approvals"].includes(key)
+      options[key] = [
+        "start",
+        "notification",
+        "fixture-approvals",
+        "recovery",
+        "single-server",
+        "resume",
+        "debug",
+        "bootstrap",
+      ].includes(key)
         ? true
         : process.argv[++i];
     }
