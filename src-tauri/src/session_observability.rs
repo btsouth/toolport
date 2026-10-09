@@ -176,6 +176,7 @@ pub fn catalog_delivery(tools: &[Value]) -> CatalogDelivery {
 
 pub struct Session {
     id: String,
+    audit_path: Option<std::path::PathBuf>,
     client: Option<String>,
     name: String,
     client_type: String,
@@ -214,6 +215,7 @@ impl Session {
             .to_string();
         let session = Arc::new(Self {
             id: crate::approval::new_correlation_id(),
+            audit_path: crate::audit::audit_path(),
             // Anonymous process IDs and token-derived legacy principals are not retained.
             client: client
                 .filter(|c| {
@@ -312,7 +314,7 @@ impl Session {
             row["firstCatalogSize"] = json!(count);
             row["firstCatalogRevision"] = json!(revision);
         }
-        crate::audit::record_session(row);
+        if let Some(path) = &self.audit_path { crate::audit::record_session_at(path, row); }
     }
 }
 impl Drop for Session {

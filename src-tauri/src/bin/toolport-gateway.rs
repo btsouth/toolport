@@ -27351,6 +27351,7 @@ mod tests {
     /// rebuild and let the loser's Drop kill mid-flight work.
     #[test]
     fn one_host_backs_every_session_with_the_same_router_and_registry() {
+        let _data = DataDirTestEnv::new("f3-one-host-backs-every-session-with-the-same-router-and-registry");
         let first = http_state(true);
         let second = first.clone();
 
@@ -27795,6 +27796,7 @@ mod tests {
 
     #[test]
     fn http_over_cap_rejects_promptly_and_recovers() {
+        let _data = DataDirTestEnv::new("f3-http-over-cap-rejects-promptly-and-recovers");
         let state = http_state(false);
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
@@ -27951,6 +27953,7 @@ mod tests {
 
     #[test]
     fn openapi_exposes_meta_tools_as_post_paths() {
+        let _data = DataDirTestEnv::new("f3-openapi-exposes-meta-tools-as-post-paths");
         let spec = openapi_spec(&http_state(true), None, DiscoveryMode::Lazy);
         let paths = spec.get("paths").unwrap().as_object().unwrap();
         // The lazy meta-tools are each a POST path.
@@ -29056,6 +29059,7 @@ mod tests {
 
     #[test]
     fn http_options_preflight_is_answered() {
+        let _data = DataDirTestEnv::new("f3-http-options-preflight-is-answered");
         // Browsers preflight a cross-origin POST; we must answer OPTIONS so the
         // real request goes through (CORS headers themselves are added per-response).
         let state = http_state(true);
@@ -29449,6 +29453,7 @@ mod tests {
 
     #[test]
     fn legacy_http_client_still_requires_a_session() {
+        let _data = DataDirTestEnv::new("f3-legacy-http-client-still-requires-a-session");
         // The other half of dual-era: nothing about the legacy path changed.
         let state = http_state(true);
         let caller = test_caller("client:cursor", None);
@@ -29530,6 +29535,7 @@ mod tests {
     /// recorded the old boot-frozen read as a hazard; this pins the fix.
     #[test]
     fn http_bridge_follows_a_live_discovery_switch() {
+        let _data = DataDirTestEnv::new("f3-http-bridge-follows-a-live-discovery-switch");
         let state = http_state(false);
         let spec = |state: &GatewayState, caller: Option<&HttpCaller>| -> Value {
             let out = handle_http_with_headers(
@@ -29684,6 +29690,7 @@ mod tests {
 
     #[test]
     fn modern_http_transport_headers_gate_dispatch_and_map_protocol_statuses() {
+        let _data = DataDirTestEnv::new("f3-modern-http-transport-headers-gate-dispatch-and-map-protocol-statuses");
         let state = http_state(true);
         let body = modern_http_body(1, "tools/list", json!({}));
 
@@ -29906,6 +29913,7 @@ mod tests {
 
     #[test]
     fn modern_http_scope_is_resolved_per_request_not_from_session_state() {
+        let _data = DataDirTestEnv::new("f3-modern-http-scope-is-resolved-per-request-not-from-session-state");
         let state = http_state(false);
         {
             let mut reg = state.registry.lock().unwrap();
@@ -29960,6 +29968,7 @@ mod tests {
 
     #[test]
     fn modern_http_rejects_removed_resource_subscription_methods() {
+        let _data = DataDirTestEnv::new("f3-modern-http-rejects-removed-resource-subscription-methods");
         let state = http_state(true);
         let out = handle_http_with_headers(
             &state,
@@ -30092,6 +30101,7 @@ mod tests {
 
     #[test]
     fn mcp_http_get_opens_listen_stream() {
+        let _data = DataDirTestEnv::new("f3-mcp-http-get-opens-listen-stream");
         let state = http_state(true);
         let search = SearchGuard::default();
         let init = handle_http(
@@ -30134,6 +30144,7 @@ mod tests {
 
     #[test]
     fn mcp_http_get_without_sse_accept_returns_406() {
+        let _data = DataDirTestEnv::new("f3-mcp-http-get-without-sse-accept-returns-406");
         let state = http_state(true);
         let search = SearchGuard::default();
         let init = handle_http(
@@ -30174,6 +30185,7 @@ mod tests {
 
     #[test]
     fn modern_http_subscription_listen_is_sessionless_tagged_and_filtered() {
+        let _data = DataDirTestEnv::new("f3-modern-http-subscription-listen-is-sessionless-tagged-and-filtered");
         let state = http_state(true);
         let search = SearchGuard::default();
         let caller = test_caller("client:modern", None);
@@ -30287,6 +30299,7 @@ mod tests {
 
     #[test]
     fn modern_adapter_listener_keeps_its_authenticated_root() {
+        let _data = DataDirTestEnv::new("f3-modern-adapter-listener-keeps-its-authenticated-root");
         let state = http_state(true);
         state.daemon_mode.store(true, Ordering::SeqCst);
         let caller = test_caller("adapter:modern-root", None);
@@ -30321,6 +30334,7 @@ mod tests {
 
     #[test]
     fn modern_subscription_listen_rejects_bad_filters_without_a_session() {
+        let _data = DataDirTestEnv::new("f3-modern-subscription-listen-rejects-bad-filters-without-a-session");
         let state = http_state(true);
         let out = handle_http_with_headers(
             &state,
@@ -30348,6 +30362,7 @@ mod tests {
 
     #[test]
     fn modern_http_listeners_do_not_collide_across_instances_of_one_client() {
+        let _data = DataDirTestEnv::new("f3-modern-http-listeners-do-not-collide-across-instances-of-one-client");
         let state = http_state(true);
         let caller = test_caller("client:shared-token", None);
         let body = modern_http_body(
@@ -30395,6 +30410,7 @@ mod tests {
 
     #[test]
     fn cancelling_modern_stdio_listener_releases_its_resource_subscriptions() {
+        let _data = DataDirTestEnv::new("f3-cancelling-modern-stdio-listener-releases-its-resource-subscriptions");
         let state = http_state(true);
         let id = json!("listen-1");
         let key = modern_subscription_key(None, &id, ModernSubscriptionTransport::Stdio);
@@ -30438,6 +30454,7 @@ mod tests {
 
     #[test]
     fn mcp_push_server_message_queues_sse_payload() {
+        let _data = DataDirTestEnv::new("f3-mcp-push-server-message-queues-sse-payload");
         let state = http_state(true);
         let sid = mint_mcp_session(&state, None).ok().unwrap();
         let msg = json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"});
@@ -30455,6 +30472,7 @@ mod tests {
 
     #[test]
     fn fanout_mcp_notification_reaches_every_live_session() {
+        let _data = DataDirTestEnv::new("f3-fanout-mcp-notification-reaches-every-live-session");
         // SOU-328: list_changed must fan over HTTP MCP sessions, not only stdio.
         let state = http_state(true);
         let sid_a = mint_mcp_session(&state, None).ok().unwrap();
@@ -30701,6 +30719,7 @@ mod tests {
     /// description, and schema - before any call was ever made.
     #[test]
     fn http_cold_cache_withholds_the_sanitized_twin() {
+        let _data = DataDirTestEnv::new("f3-http-cold-cache-withholds-the-sanitized-twin");
         let state = http_state(false);
         *state.registry.lock().unwrap() = twin_registry();
         let cached = vec![
@@ -30738,6 +30757,7 @@ mod tests {
     /// servers the Personal token gets its own tool back, and only that one.
     #[test]
     fn http_warm_router_lists_only_the_personal_twin() {
+        let _data = DataDirTestEnv::new("f3-http-warm-router-lists-only-the-personal-twin");
         let state = http_state(false);
         *state.registry.lock().unwrap() = twin_registry();
         let router = twin_router();
@@ -31623,6 +31643,7 @@ mod tests {
 
     #[test]
     fn http_roots_refresh_updates_only_its_session_and_keeps_adapter_cwd_fallback() {
+        let _data = DataDirTestEnv::new("f3-http-roots-refresh-updates-only-its-session-and-keeps-adapter-cwd-fallback");
         let state = http_state(false);
         state.daemon_mode.store(true, Ordering::SeqCst);
         let owner_a = McpSessionOwner {
@@ -31711,6 +31732,7 @@ mod tests {
 
     #[test]
     fn adapter_initialize_seeds_its_session_root_without_changing_other_sessions() {
+        let _data = DataDirTestEnv::new("f3-adapter-initialize-seeds-its-session-root-without-changing-other-sessions");
         let state = http_state(false);
         state.daemon_mode.store(true, Ordering::SeqCst);
         let caller = test_caller("adapter:root-test", None);
@@ -31895,6 +31917,7 @@ mod tests {
 
     #[test]
     fn mcp_http_get_without_session_returns_400() {
+        let _data = DataDirTestEnv::new("f3-mcp-http-get-without-session-returns-400");
         let state = http_state(true);
         let out = handle_http(
             &state,
@@ -31912,6 +31935,7 @@ mod tests {
 
     #[test]
     fn mcp_http_bad_session_format_returns_400() {
+        let _data = DataDirTestEnv::new("f3-mcp-http-bad-session-format-returns-400");
         let state = http_state(true);
         let out = handle_http(
             &state,
@@ -31929,6 +31953,7 @@ mod tests {
 
     #[test]
     fn mcp_http_delete_without_session_returns_400() {
+        let _data = DataDirTestEnv::new("f3-mcp-http-delete-without-session-returns-400");
         let state = http_state(true);
         let out = handle_http(
             &state,
@@ -31967,6 +31992,7 @@ mod tests {
 
     #[test]
     fn mcp_http_options_preflight_returns_204() {
+        let _data = DataDirTestEnv::new("f3-mcp-http-options-preflight-returns-204");
         let state = http_state(true);
         let out = handle_http(
             &state,
@@ -32035,6 +32061,7 @@ mod tests {
 
     #[test]
     fn docs_mention_mcp_endpoint() {
+        let _data = DataDirTestEnv::new("f3-docs-mention-mcp-endpoint");
         let state = http_state(true);
         let out = handle_http(
             &state,
@@ -32063,6 +32090,7 @@ mod tests {
 
     #[test]
     fn healthz_reports_registry_readiness_and_carries_no_data() {
+        let _data = DataDirTestEnv::new("f3-healthz-reports-registry-readiness-and-carries-no-data");
         let state = http_state(true);
         let ok = healthz_out(&state, "GET");
         assert_eq!(ok.status, 200);
@@ -32446,6 +32474,7 @@ mod tests {
 
     #[test]
     fn rooted_subscriptions_consume_the_process_wide_capacity() {
+        let _data = DataDirTestEnv::new("f3-rooted-subscriptions-consume-the-process-wide-capacity");
         let state = http_state(false);
         let table = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
         {
@@ -32486,6 +32515,7 @@ mod tests {
 
     #[test]
     fn retired_root_route_cannot_report_a_new_subscription_as_open() {
+        let _data = DataDirTestEnv::new("f3-retired-root-route-cannot-report-a-new-subscription-as-open");
         let state = http_state(false);
         state.daemon_mode.store(true, Ordering::SeqCst);
         let router = cache_router();
@@ -32636,6 +32666,7 @@ mod tests {
 
     #[test]
     fn cancelled_modern_registration_rolls_back_earlier_resource_joins() {
+        let _data = DataDirTestEnv::new("f3-cancelled-modern-registration-rolls-back-earlier-resource-joins");
         let state = http_state(false);
         let router = cache_router();
         let id = json!(77);
@@ -32724,6 +32755,7 @@ mod tests {
     /// WS1-1: mint_mcp_session must release resource subs held by reaped sessions.
     #[test]
     fn mint_mcp_session_cleans_resource_subs_of_closed_sessions() {
+        let _data = DataDirTestEnv::new("f3-mint-mcp-session-cleans-resource-subs-of-closed-sessions");
         let state = http_state(false);
         let owner = McpSessionOwner {
             identity: "client:reaped-pii".into(),
@@ -32823,6 +32855,7 @@ mod tests {
 
     #[test]
     fn deliver_resource_updated_reaches_only_subscribed_http_sessions() {
+        let _data = DataDirTestEnv::new("f3-deliver-resource-updated-reaches-only-subscribed-http-sessions");
         let state = http_state(false);
         let s1 = match mint_mcp_session(&state, None) {
             Ok(s) => s,
@@ -33220,6 +33253,7 @@ mod tests {
 
     #[test]
     fn registered_http_clients_get_their_own_profiles_instructions() {
+        let _data = DataDirTestEnv::new("f3-registered-http-clients-get-their-own-profiles-instructions");
         let state = http_state(true);
         let mut reg = instructions_registry();
         for (id, profile) in [("c-media", "media"), ("c-pg", "Postgres"), ("c-all", "")] {
@@ -33287,6 +33321,7 @@ mod tests {
 
     #[test]
     fn a_daemon_adapter_gets_its_profiles_instructions() {
+        let _data = DataDirTestEnv::new("f3-a-daemon-adapter-gets-its-profiles-instructions");
         let state = http_state(false);
         state.daemon_mode.store(true, Ordering::SeqCst);
         let reg = instructions_registry();
@@ -33309,6 +33344,7 @@ mod tests {
 
     #[test]
     fn a_caller_without_its_own_profile_uses_the_gateways() {
+        let _data = DataDirTestEnv::new("f3-a-caller-without-its-own-profile-uses-the-gateways");
         // The stdio path: no caller profile, so the gateway's live profile decides.
         let state = http_state(false);
         *state.registry.lock().unwrap() = instructions_registry();
@@ -34585,6 +34621,7 @@ mod tests {
 
     #[test]
     fn progress_reaches_only_the_client_that_minted_the_token() {
+        let _data = DataDirTestEnv::new("f3-progress-reaches-only-the-client-that-minted-the-token");
         // SOU-444: progress is request-scoped, so it must land on the one client
         // whose request carried the token, never fan out like a subscription.
         let state = http_state(false);
@@ -34630,6 +34667,7 @@ mod tests {
 
     #[test]
     fn identical_client_tokens_from_two_clients_do_not_collide() {
+        let _data = DataDirTestEnv::new("f3-identical-client-tokens-from-two-clients-do-not-collide");
         // `progressToken` is client-chosen and small integers are common, so two
         // clients picking the same value is likely. Keying the route table on it
         // directly meant the second registration clobbered the first, and against
@@ -34667,6 +34705,7 @@ mod tests {
 
     #[test]
     fn progress_drops_cross_server_spoof_and_stale_tokens() {
+        let _data = DataDirTestEnv::new("f3-progress-drops-cross-server-spoof-and-stale-tokens");
         // Same lesson as SOU-398, on a notification whose correlator is chosen by
         // the client: a server must not be able to push progress for a token it
         // was never given, and a finished call must stop accepting progress.
@@ -34741,6 +34780,7 @@ mod tests {
 
     #[test]
     fn stdio_progress_is_handed_off_without_blocking_the_caller() {
+        let _data = DataDirTestEnv::new("f3-stdio-progress-is-handed-off-without-blocking-the-caller");
         // The stdio delivery branch had no test at all, and it is the primary
         // Toolport deployment. It must also never block: this runs on the
         // downstream drain thread, before that thread forwards response lines, so
@@ -34868,6 +34908,7 @@ mod tests {
 
     #[test]
     fn deliver_resource_updated_drops_cross_server_spoof() {
+        let _data = DataDirTestEnv::new("f3-deliver-resource-updated-drops-cross-server-spoof");
         // SOU-398: a server that does not own the URI must not fan out updates.
         let state = http_state(false);
         let s1 = match mint_mcp_session(&state, None) {
@@ -34918,6 +34959,7 @@ mod tests {
 
     #[test]
     fn deliver_resource_updated_silent_when_unsubscribed() {
+        let _data = DataDirTestEnv::new("f3-deliver-resource-updated-silent-when-unsubscribed");
         // Unsolicited update for a URI with no local subscription: drop, no panic.
         let state = http_state(false);
         let s1 = match mint_mcp_session(&state, None) {
@@ -36023,6 +36065,7 @@ mod tests {
 
     #[test]
     fn p08_lifetime_delete_releases_sessions_lock_before_cancel_hooks() {
+        let _data = DataDirTestEnv::new("f3-p08-lifetime-delete-releases-sessions-lock-before-cancel-hooks");
         let state = http_state(false);
         let caller = test_caller("adapter:p08-delete-lock", None);
         let key = "adapter-lifetime:p08-delete-lock".to_string();
@@ -36083,6 +36126,7 @@ mod tests {
 
     #[test]
     fn p08_sessionless_same_owner_can_start_the_same_id_on_two_connections() {
+        let _data = DataDirTestEnv::new("f3-p08-sessionless-same-owner-can-start-the-same-id-on-two-connections");
         let state = http_state(false);
         let owner = test_caller("client:shared-token", None).session_owner;
         let first = downstream::CancelRegistry::new();
@@ -36103,6 +36147,7 @@ mod tests {
 
     #[test]
     fn p08_sessionless_cancel_notification_cannot_cross_connections() {
+        let _data = DataDirTestEnv::new("f3-p08-sessionless-cancel-notification-cannot-cross-connections");
         let state = http_state(false);
         let owner = test_caller("client:shared-token", None).session_owner;
         let first = downstream::CancelRegistry::new();
@@ -36132,6 +36177,7 @@ mod tests {
 
     #[test]
     fn p08_other_owner_traffic_never_reaps_active_or_retained_calls() {
+        let _data = DataDirTestEnv::new("f3-p08-other-owner-traffic-never-reaps-active-or-retained-calls");
         let state = http_state(false);
         let owner = test_caller("client:p08-aged", None).session_owner;
         let connection = downstream::CancelRegistry::new();
@@ -36164,6 +36210,7 @@ mod tests {
 
     #[test]
     fn p08_live_adapter_lifetime_survives_session_ttl_and_initialize() {
+        let _data = DataDirTestEnv::new("f3-p08-live-adapter-lifetime-survives-session-ttl-and-initialize");
         let state = http_state(false);
         let owner = test_caller("adapter:p08-long-lived", None).session_owner;
         let connection = downstream::CancelRegistry::new();
@@ -36199,6 +36246,7 @@ mod tests {
 
     #[test]
     fn p08_old_lifetime_reader_cannot_remove_reopened_row() {
+        let _data = DataDirTestEnv::new("f3-p08-old-lifetime-reader-cannot-remove-reopened-row");
         let state = http_state(false);
         let key = "adapter-lifetime:p08-reopened".to_string();
         let mut old = SessionState::new_http(None);
@@ -36695,6 +36743,7 @@ mod tests {
 
     #[test]
     fn p08_reopening_a_legacy_session_keeps_the_adapter_live() {
+        let _data = DataDirTestEnv::new("f3-p08-reopening-a-legacy-session-keeps-the-adapter-live");
         let state = http_state(false);
         let lifetime = Arc::new(SessionState::new_http(None));
         state
@@ -41970,6 +42019,7 @@ mod tests {
     /// call) falls back to the listener-level guard.
     #[test]
     fn http_requests_use_the_guards_of_their_session() {
+        let _data = DataDirTestEnv::new("f3-http-requests-use-the-guards-of-their-session");
         let state = http_state(false);
         let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
         let s2 = mint_mcp_session(&state, None).ok().expect("mint s2");
@@ -41993,6 +42043,7 @@ mod tests {
     /// one's daemon flag or activity clock; while those were process statics it did.
     #[test]
     fn daemon_runtime_state_belongs_to_the_host() {
+        let _data = DataDirTestEnv::new("f3-daemon-runtime-state-belongs-to-the-host");
         let first = http_state(true);
         let second = http_state(true);
 
@@ -42112,6 +42163,7 @@ mod tests {
 
     #[test]
     fn expired_http_service_lease_stops_authorizing_its_bearer() {
+        let _data = DataDirTestEnv::new("f3-expired-http-service-lease-stops-authorizing-its-bearer");
         let state = http_state(true);
         let token = "expired-public-token";
         *state

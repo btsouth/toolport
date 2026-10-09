@@ -468,11 +468,9 @@ fn write_line(entry: &Value) {
 }
 
 /// Lifecycle rows are independent of the active request and never contain payloads.
-pub fn record_session(mut entry: Value) {
+pub(crate) fn record_session_at(path: &Path, mut entry: Value) {
     entry["ts"] = json!(epoch_millis() as u64);
-    if let Some(path) = audit_path() {
-        write_line_at(&path, &entry);
-    }
+    write_line_at(path, &entry);
 }
 
 pub fn record_internal(tool: &str, duration_ms: u64, cold: bool, client: Option<&str>) {
