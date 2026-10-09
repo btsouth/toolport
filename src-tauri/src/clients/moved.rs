@@ -331,7 +331,7 @@ pub(super) fn backfill_identity(
             if entry.get("env").is_none() {
                 entry["env"] = toml_edit::Item::Table(toml_edit::Table::new());
             }
-            entry["env"][key] = toml_edit::value(id);
+            entry["env"].as_table_like_mut().ok_or("Invalid gateway environment")?.insert(key, toml_edit::value(id));
             atomic_write(path, &doc.to_string())
         }
         Container::YamlMap(container_key) | Container::YamlList(container_key) => {

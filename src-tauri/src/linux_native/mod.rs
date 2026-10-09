@@ -2061,6 +2061,9 @@ impl ClientPage {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
+        if snapshot.sessions_error {
+            self.list.append(&gtk::Label::builder().label("Client session history could not be read.").halign(gtk::Align::Start).wrap(true).css_classes(["toolport-muted"]).build());
+        }
         if !sessions.is_empty() {
             self.list.append(&client_section_title("Recent client sessions", sessions.len()));
             for session in sessions {
@@ -9126,7 +9129,7 @@ mod tests {
             rows: Default::default(), no_matches: Default::default(), off_heading: Default::default(), health: Default::default(),
         };
         let clients = ClientPage::new(&app, server_page);
-        clients.render(state::ClientSnapshot { clients: Vec::new(), profiles: Vec::new(), sessions: vec![serde_json::json!({
+        clients.render(state::ClientSnapshot { clients: Vec::new(), profiles: Vec::new(), sessions_error: false, sessions: vec![serde_json::json!({
             "clientName":"Unknown app (via Cursor)", "clientLabel":"kt 1", "phase":"close",
             "toolsListCount":3, "listChangedCount":1, "firstCatalogSize":4, "contentChanged":true,
         })] });

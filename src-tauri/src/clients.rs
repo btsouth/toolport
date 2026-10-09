@@ -6917,20 +6917,10 @@ fn repoint_other_claude_configs(current: &str, outcome: &mut RepointOutcome) {
     for repair in claude_configs_needing_repair(&others, current) {
         let ClaudeRepair {
             path,
-            profile,
             stored,
+            ..
         } = repair;
-        let write = mutation::run("claude-code", &path, Format::JsonMcpServers, || {
-            if !gateway_entry_needs_rewrite(GATEWAY_ENTRY_NAME, &stored, current, None) {
-                let def = find_def("claude-code").ok_or("Unknown client")?;
-                backup_secondary_claude_file(&path)?;
-                return moved::backfill_identity(def.format, &path, GATEWAY_ENTRY_NAME, "claude-code-secondary");
-            }
-            secondary_claude_gateway_entry(profile.as_deref()).and_then(|entry| {
-                backup_secondary_claude_file(&path)?;
-                edit_json_gateway(&path, "mcpServers", Some(&entry), true)
-            })
-        });
+        let write = repair_secondary_claude_config(&path, current);
         match write {
             Ok(()) => {
                 let msg = format!(
@@ -6952,6 +6942,20 @@ fn repoint_other_claude_configs(current: &str, outcome: &mut RepointOutcome) {
             }
         }
     }
+}
+
+fn repair_secondary_claude_config(path: &Path, current: &str) -> Result<(), String> {
+    mutation::run("claude-code", path, Format::JsonMcpServers, || {
+        // Selection happened before the mutation lock. Respect a subsequent edit.
+        let fresh = claude_configs_needing_repair(&[path.to_path_buf()], current).pop()
+            .ok_or("Secondary gateway changed before repair; leaving it untouched")?;
+        backup_secondary_claude_file(path)?;
+        if !gateway_entry_needs_rewrite(GATEWAY_ENTRY_NAME, &fresh.stored, current, None) {
+            return moved::backfill_identity(Format::JsonMcpServers, path, GATEWAY_ENTRY_NAME, "claude-code-secondary");
+        }
+        let entry = secondary_claude_gateway_entry(fresh.profile.as_deref())?;
+        edit_json_gateway(path, "mcpServers", Some(&entry), true)
+    })
 }
 
 /// One secondary Claude config that needs its gateway entry repaired.
@@ -9573,6 +9577,39 @@ command = "npx"
             env.get(crate::brand::CLIENT_ID).unwrap().as_deref(),
             Some("claude-code-secondary")
         );
+    }
+
+    #[test]
+    fn secondary_identity_repair_preserves_fields_and_rechecks_ownership() {
+        let data = crate::registry::DataDirTestEnv::new("f3-secondary-ownership");
+        let current = data.dir.join(if cfg!(windows) { "toolport-gateway.exe" } else { "toolport-gateway" });
+        std::fs::write(&current, "fixture").unwrap();
+        let current = current.to_str().unwrap();
+        let path = data.dir.join("secondary.json");
+        let raw = serde_json::json!({"mcpServers":{"toolport":{"command":current,"args":["--private"],"env":{"TOOLPORT_PROFILE":"work","KEEP":"fixture"},"unknown":42}}});
+        std::fs::write(&path, raw.to_string()).unwrap();
+        assert_eq!(claude_configs_needing_repair(&[path.clone()], current).len(), 1);
+        repair_secondary_claude_config(&path, current).unwrap();
+        let mut after: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["mcpServers"]["toolport"]["env"][crate::brand::CLIENT_ID], "claude-code-secondary");
+        after["mcpServers"]["toolport"]["env"].as_object_mut().unwrap().remove(crate::brand::CLIENT_ID);
+        assert_eq!(after, raw);
+        std::fs::write(&path, raw.to_string()).unwrap();
+        assert_eq!(claude_configs_needing_repair(&[path.clone()], current).len(), 1);
+        let custom = r#"{"mcpServers":{"toolport":{"command":"manual-wrapper","env":{"KEEP":"fixture"}}}}"#;
+        std::fs::write(&path, custom).unwrap();
+        assert!(repair_secondary_claude_config(&path, current).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
+    }
+
+    #[test]
+    fn identity_backfill_rejects_malformed_environment_without_mutation() {
+        let data = crate::registry::DataDirTestEnv::new("f3-invalid-env");
+        let path = data.dir.join("config.toml");
+        let text = "[mcp_servers.toolport]\ncommand = \"toolport-gateway\"\nenv = \"invalid\"\n";
+        std::fs::write(&path, text).unwrap();
+        assert!(moved::backfill_identity(Format::TomlMcpServers, &path, "toolport", "codex").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 
     #[test]
