@@ -7492,7 +7492,7 @@ fn handle_request_with_cancel(
                         .to_string(),
                 };
                 let instruction =
-                    "Pick by description; call it, or search its exact name for the full schema.";
+                    "Pick by description; call it or search its exact name for full schema.";
                 let lead = if total == 0 && !matches.is_empty() {
                     format!("No direct tools matched{scope}. These are bounded fallback candidates. {instruction} {exhaustive_hint}")
                 } else if matches.is_empty() {
