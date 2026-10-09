@@ -1475,9 +1475,9 @@ fn search_tool_def() -> Value {
     json!({
         "name": "toolport_search_tools",
         "description": "Your gateway to every connected MCP server's tools; use it first for any \
-            external action or data. Returns a ten-candidate menu with the first candidate's full \
-            schema. Pick by description and call with toolport_call_tool. Search another \
-            candidate's exact name for its full schema.",
+            external action or data. Menu rows are [name, description, required parameters, \
+            optional full schema]; the first row always includes its schema. Search an exact \
+            name for the complete single definition. Pick by description and call with toolport_call_tool.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3281,7 +3281,7 @@ fn project_search_results(tools: &[&Value], include_top_schema: bool) -> Vec<Val
         .as_ref()
         .is_some_and(|schema| worker::json_size(schema, 4096).is_none())
     {
-        16
+        24
     } else {
         100
     };
@@ -7491,7 +7491,7 @@ fn handle_request_with_cancel(
                              `server` prefix; otherwise call toolport_status to see the available prefixes."
                         .to_string(),
                 };
-                let instruction = "Rows: name, description, required parameters, #1 schema. Pick by description, call with toolport_call_tool, or search an exact name for its full schema.";
+                let instruction = "Pick by description; call with toolport_call_tool, or search an exact name for its full schema.";
                 let lead = if total == 0 && !matches.is_empty() {
                     format!("No direct tools matched{scope}. These are bounded fallback candidates. {instruction} {exhaustive_hint}")
                 } else if matches.is_empty() {
@@ -7552,7 +7552,7 @@ fn handle_request_with_cancel(
                         None => format!("No tools matched{scope}. {exhaustive_hint}"),
                     }
                 } else {
-                    format!("Found {total} matching tool(s){scope}. {instruction}")
+                    instruction.to_string()
                 };
                 let exact = total == 1 && top.eq_ignore_ascii_case(query.trim());
                 let menu: Vec<Vec<&Value>> = matches
@@ -35121,7 +35121,7 @@ mod tests {
         )
         .unwrap();
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.starts_with("Found"));
+        assert!(text.starts_with("Pick by description"));
         // The reader's 500 ms UI budget can expire behind concurrent telemetry
         // on Windows. Await the test barrier before asserting persisted bytes.
         assert!(conduit_lib::telemetry::flush_for_test(
