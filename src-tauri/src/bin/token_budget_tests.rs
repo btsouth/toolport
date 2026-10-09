@@ -60,7 +60,7 @@ fn token_audit_measure(bpe: &tiktoken_rs::CoreBPE, text: &str) -> Value {
     })
 }
 
-fn token_audit_dispatch(catalog: &[Value], mode: DiscoveryMode, request: &Value) -> Value {
+fn token_audit_dispatch(catalog: &dyn ToolCatalog, mode: DiscoveryMode, request: &Value) -> Value {
     let host = dispatch_host(false);
     host.set_discovery_mode(mode);
     handle_request(
