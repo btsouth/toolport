@@ -37316,8 +37316,10 @@ mod tests {
             }),
             json!({
                 "name": "filesystem__read_file",
-                "description": "Read one local file.",
-                "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } } }
+                "description": "Read one local file. ".repeat(40),
+                "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } } },
+                "annotations": { "readOnlyHint": true },
+                "outputSchema": { "type": "string" }
             }),
         ];
         let (hits, total) = search_catalog(&cat, "filesystem__read_file", None, 5);
@@ -37332,6 +37334,7 @@ mod tests {
             "string"
         );
         assert!(hits[0].get("schemaOmitted").is_none());
+        assert_eq!(hits[0], cat[1], "exact lookup must keep the full definition");
         let index = CatalogSearchIndex::build(&cat);
         let indexed = search_catalog_indexed(
             &cat,
@@ -37355,6 +37358,55 @@ mod tests {
             denied.matches.is_empty(),
             "exact lookup must honor the server filter"
         );
+    }
+
+    #[test]
+    fn exact_name_preserves_case_only_collisions() {
+        for (first, second) in [
+            ("x__GetItem", "x__getItem"),
+            ("GitHub__getItem", "github__getItem"),
+        ] {
+            let cat = vec![
+                json!({"name": first, "description": "Get item", "inputSchema": {"type": "object", "required": ["upper"]}}),
+                json!({"name": second, "description": "Get item", "inputSchema": {"type": "object", "required": ["lower"]}}),
+            ];
+            let index = CatalogSearchIndex::build(&cat);
+            for expected in &cat {
+                let outcome = search_catalog_indexed(
+                    &cat, expected["name"].as_str().unwrap(), None, 25, None, Some(&index),
+                );
+                assert_eq!(outcome.matches, vec![expected.clone()]);
+                assert_eq!(outcome.total, 1);
+                assert!(!outcome.low_confidence);
+            }
+            let ambiguous = search_catalog_indexed(
+                &cat, &first.to_uppercase(), None, 25, None, Some(&index),
+            );
+            assert_eq!(ambiguous.total, 2, "ambiguous folded names must keep the menu");
+            assert_eq!(ambiguous.matches.len(), 2);
+        }
+    }
+
+    #[test]
+    fn exact_name_keeps_pinned_prerequisites_and_named_call_guidance() {
+        let _env = DataDirTestEnv::new("exact-name-pinned-prerequisites");
+        let host = dispatch_host(false);
+        let mut reg = Registry::default();
+        reg.set_tool_pinned("x", "prereq", true);
+        let router = routed_router("x", "prereq");
+        let cat = vec![
+            json!({"name": "x__prereq", "description": "Authenticate first", "inputSchema": {"type": "object"}}),
+            json!({"name": "x__getItem", "description": "Get item. ".repeat(100), "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": true}, "outputSchema": {"type": "string"}}),
+        ];
+        let response = handle_request(
+            &host, &search_req("x__getItem"), &reg, &router, &cat, true,
+            None, &SearchGuard::default(), None, None,
+        ).unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let hits: Vec<Value> = serde_json::from_str(text.split_once("\n\n").unwrap().1).unwrap();
+        assert_eq!(hits, cat, "exact definition and prerequisite must both stay complete");
+        assert!(text.contains("pinned prerequisite tool(s) listed first"));
+        assert!(text.contains("call toolport_call_tool with name \"x__getItem\""));
     }
 
     #[test]
