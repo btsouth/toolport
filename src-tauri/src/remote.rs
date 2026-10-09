@@ -1282,7 +1282,7 @@ fn guard_connect_target(server: &ServerEntry) -> Result<(), String> {
 /// anonymous exactly like the `HTTP_AUTH_KEY` path used to.
 fn first_vaulted_secret(server: &ServerEntry) -> Result<Option<String>, String> {
     for e in &server.env {
-        if e.secret && e.key != secrets::IMPORTED_URL_KEY {
+        if e.secret && e.value.is_none() && e.key != secrets::IMPORTED_URL_KEY {
             if let Some(v) = match &e.value {
                 Some(v) => Some(v.clone()),
                 None => secrets::get_secret_result(&server.id, &e.key)?,
@@ -1350,7 +1350,12 @@ pub fn connect_remote_with_handler(
             progress,
             change_dirty,
         )
-        .map_err(|error| safe_imported_error(server, error));
+        .map_err(|error| {
+            if is_auth_error(&error) {
+                crate::secret_refs::invalidate_server(server);
+            }
+            safe_imported_error(server, error)
+        });
     }
     let url = secrets::get_vault_secret_result(&server.id, secrets::IMPORTED_URL_KEY)
         .map_err(|_| "Keychain unavailable. Unlock it and retry.")?
@@ -1378,7 +1383,7 @@ struct ImportedConcurrent(
     bool,
 );
 #[derive(Clone)]
-struct Redaction(Vec<String>);
+struct Redaction(Vec<String>, Vec<String>);
 impl Redaction {
     fn for_server(server: &ServerEntry) -> Self {
         let mut values = Vec::new();
@@ -1454,7 +1459,7 @@ impl Redaction {
         values.retain(|value| !value.is_empty());
         values.sort_by_key(|value| std::cmp::Reverse(value.len()));
         values.dedup();
-        Self(values)
+        Self(values, crate::secret_refs::review_references(server))
     }
     fn text(&self, mut message: String) -> String {
         for value in &self.0 {
@@ -1496,6 +1501,9 @@ impl Redaction {
         // An auth rejection invalidates this connection, so its supervisor reads the
         // reference again. Never replay a possibly completed write automatically.
         if matches!(kind, K::Auth { .. }) {
+            for reference in &self.1 {
+                crate::secret_refs::invalidate(reference);
+            }
             return E::Classified(
                 K::Unavailable { after_send: true },
                 "Password manager credential rejected. Reconnecting will read the key again."
@@ -1767,7 +1775,7 @@ fn connect_remote_inner(
     //
     // Handled here because this is the only place that sees both the current entry
     // and the vault; the reacquire seam takes just a server id by design.
-    if !crate::secret_refs::has_references(server) && header_values.is_empty() {
+    if !crate::secret_refs::has_references(server) {
         let stale_cc =
             client_credentials_state_is_stale(server, server_id, url).or_else(|error| {
                 let update = credential_update(server_id);
@@ -1802,7 +1810,7 @@ fn connect_remote_inner(
         .iter()
         .find(|e| e.unknown_fields.contains_key("source") && e.secret)
         .and_then(|e| e.value.clone());
-    let auth = if !header_values.is_empty() {
+    let auth = if crate::secret_refs::has_references(server) && !header_values.is_empty() {
         None
     } else if reference_auth.is_some() {
         reference_auth.clone()
@@ -1822,7 +1830,7 @@ fn connect_remote_inner(
     };
     let sent_auth = auth.clone();
     let (mut transport, refreshed_during_connect) = if reference_auth.is_some()
-        || !header_values.is_empty()
+        || crate::secret_refs::has_references(server)
     {
         require_secure_for_auth(url)?;
         (
@@ -1851,7 +1859,7 @@ fn connect_remote_inner(
             ds.set_call_timeout(request_timeout);
             Ok(ds)
         }
-        Err(e) if is_auth_error(&e) && reference_auth.is_none() && header_values.is_empty() => {
+        Err(e) if is_auth_error(&e) && !crate::secret_refs::has_references(server) => {
             // The transport already gets one forced refresh per token on a 401/403.
             // If it spent one during this connect, the vault now holds a token that
             // has ALREADY been rejected, so minting yet another cannot help - and
@@ -1930,6 +1938,11 @@ fn connect_remote_inner(
 mod tests {
     use super::*;
 
+    #[test]
+    fn inline_secret_env_does_not_replace_existing_bearer_keychain_lookup() {
+        let server: ServerEntry = serde_json::from_value(serde_json::json!({"id":"old","name":"Old","transport":"http","url":"https://example.invalid/mcp","env":[{"key":"TOKEN","secret":true,"value":"inline-never-bearer"}]})).unwrap();
+        assert_eq!(first_vaulted_secret(&server).unwrap(), None);
+    }
     #[test]
     fn reviewed_url_only_vault_is_recognized_as_owned_credentials() {
         secrets::tests::with_isolated_vault(|| {
@@ -2011,10 +2024,13 @@ mod tests {
 
     #[test]
     fn reviewed_transport_preserves_rpc_errors_and_redacts_only_private_values() {
-        let redact = Redaction(vec![
-            "synthetic-pat".into(),
-            "https://example.invalid/mcp?token=secret".into(),
-        ]);
+        let redact = Redaction(
+            vec![
+                "synthetic-pat".into(),
+                "https://example.invalid/mcp?token=secret".into(),
+            ],
+            vec![],
+        );
         let frame = redact.error(crate::downstream::TransportError::FrameRejected(
             "oversized frame near synthetic-pat".into(),
         ));
@@ -4162,7 +4178,7 @@ mod reference_redaction_tests {
 
     #[test]
     fn reference_errors_are_opaque_and_auth_triggers_reconnection() {
-        let redaction = Redaction(vec!["synthetic-ref-value".into()]);
+        let redaction = Redaction(vec!["synthetic-ref-value".into()], vec![]);
         let e = redaction.connection_error(
             crate::downstream::TransportError::Fatal("tail ends in ref-value".into()),
             true,

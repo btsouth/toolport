@@ -1,3 +1,4 @@
+import { secretReferenceReview } from "@/lib/secretRefs";
 import { SecretReferenceField } from "@/components/SecretReferenceField";
 import { useRef, useState, type ReactNode } from "react";
 import {
@@ -509,6 +510,7 @@ export function ServerDialog({
             setTouched((previous) => new Set([...previous, event.target.id]));
         }}
       >
+        {initial && secretReferenceReview(initial).map((line) => <p key={line} className="text-sm break-all">{line}</p>)}
         <DialogHeader>
           <DialogTitle>{editing ? "Edit server" : "Add MCP server"}</DialogTitle>
         </DialogHeader>

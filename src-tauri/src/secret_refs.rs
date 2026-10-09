@@ -2,9 +2,11 @@
 use crate::registry::{EnvVar, ServerEntry};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -40,6 +42,7 @@ pub const PROVIDERS: &[Provider] = &[
 pub enum ErrorState {
     InvalidReference,
     PolicyDenied,
+    ApprovalRequired,
     NotInstalled,
     Locked,
     NotFound,
@@ -63,12 +66,13 @@ fn error(provider: Option<&Provider>, state: ErrorState) -> ResolveError {
     let name = provider.map_or("Secret reference", |p| p.name);
     let detail = match state {
         ErrorState::InvalidReference => {
-            "Use a supported reference with no whitespace, controls or option-like path components."
+            "Use a supported reference with no outer whitespace, controls or option-like path components."
                 .into()
         }
         ErrorState::PolicyDenied => {
             "This reference is not allowed by your team's secret source policy.".into()
         }
+        ErrorState::ApprovalRequired => "Review the reference and its destination before enabling this server.".into(),
         ErrorState::NotInstalled => format!(
             "Install the official {} CLI on this machine.",
             provider.map_or("provider", |p| p.binary)
@@ -97,7 +101,10 @@ fn error(provider: Option<&Provider>, state: ErrorState) -> ResolveError {
 fn safe(s: &str) -> bool {
     !s.is_empty()
         && s.chars().count() <= 512
-        && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+        && s.trim() == s
+        && !s
+            .chars()
+            .any(|c| c.is_control() || (c.is_whitespace() && c != ' '))
 }
 fn name(s: &str) -> bool {
     let mut chars = s.chars();
@@ -110,6 +117,8 @@ fn path(s: &str) -> bool {
     !s.contains(['?', '#', '@', '\\', '%', ':'])
         && s.split('/').all(|p| {
             !p.is_empty()
+                && p.trim() == p
+                && !p.contains("  ")
                 && !p.starts_with('-')
                 && p != "."
                 && p != ".."
@@ -146,7 +155,8 @@ pub fn parse(reference: &str) -> Result<&'static Provider, ResolveError> {
             "bws://" => uuid(r),
             "bw://" => parts.len() == 2 && uuid(parts[0]) && parts[1] == "password",
             "keeper://" => {
-                path(r)
+                !r.contains(' ')
+                    && path(r)
                     && parts.len() == 3
                     && ["field", "custom_field"].contains(&parts[1])
                     && parts[0].len() == 22
@@ -213,8 +223,146 @@ pub fn headers(server: &ServerEntry) -> Result<Vec<HeaderKey>, ResolveError> {
     }
     Ok(result)
 }
+/// Match a provider or complete path segment, never a similarly named vault.
+pub fn prefix_matches(prefix: &str, reference: &str) -> bool {
+    reference.strip_prefix(prefix).is_some_and(|rest| {
+        rest.is_empty()
+            || prefix.ends_with('/')
+            || prefix.ends_with(':')
+            || rest.starts_with('/')
+            || rest.starts_with('#')
+    })
+}
+
+pub fn is_shared(server: &ServerEntry) -> bool {
+    server
+        .source
+        .as_deref()
+        .is_some_and(|s| s.starts_with("team:") || s == "shared")
+}
+
+/// Every reference use includes the output field as well as the execution identity.
+fn reference_uses(server: &ServerEntry) -> Result<BTreeMap<String, String>, ResolveError> {
+    let mut uses = BTreeMap::new();
+    for e in &server.env {
+        if let Some(r) = source(&e.unknown_fields)? {
+            uses.insert(format!("env:{}", e.key), r.into());
+        }
+    }
+    for i in server.launch.iter().flat_map(|l| &l.inputs) {
+        if let Some(r) = source(&i.unknown_fields)? {
+            uses.insert(format!("input:{}", i.key), r.into());
+        }
+    }
+    for h in headers(server)? {
+        if let Some(r) = header_reference(server, &h) {
+            uses.insert(format!("header:{}", h.key), r.into());
+        }
+    }
+    Ok(uses)
+}
+fn header_reference<'a>(server: &'a ServerEntry, h: &'a HeaderKey) -> Option<&'a str> {
+    h.source.as_ref().map(|r| r.r#ref.as_str()).or_else(|| {
+        h.env
+            .as_ref()
+            .and_then(|key| server.env.iter().find(|e| &e.key == key))
+            .and_then(reference_for)
+    })
+}
+fn approval_identity(server: &ServerEntry) -> Result<String, ResolveError> {
+    use sha2::{Digest, Sha256};
+    let mut launch = server.launch.clone();
+    for input in launch.iter_mut().flat_map(|l| &mut l.inputs) {
+        if input.secret {
+            input.value = None;
+        }
+    }
+    let identity = serde_json::json!({"id":server.id, "source":server.source,
+        "transport":server.transport, "url":server.url, "command":server.command,
+        "args":server.args, "cwd":server.cwd, "inheritEnv":server.inherit_env,
+        "launch":launch,
+        "uses":reference_uses(server)?});
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(identity.to_string().as_bytes())
+    ))
+}
+static APPROVAL_LOCK: Mutex<()> = Mutex::new(());
+fn approval_path() -> Result<PathBuf, ResolveError> {
+    crate::registry::conduit_dir()
+        .map(|d| d.join("secret-reference-approvals.json"))
+        .ok_or_else(|| error(None, ErrorState::ApprovalRequired))
+}
+fn approvals(path: &Path) -> HashMap<String, String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+pub fn check_reviewed_definition(
+    current: &ServerEntry,
+    reviewed: Option<&ServerEntry>,
+) -> Result<(), String> {
+    if is_shared(current) && has_references(current) {
+        let matches =
+            reviewed.is_some_and(|r| approval_identity(r).ok() == approval_identity(current).ok());
+        if !matches {
+            return Err("The reference or destination changed. Review this server again.".into());
+        }
+    }
+    Ok(())
+}
+pub fn approve_server(server: &ServerEntry) -> Result<(), ResolveError> {
+    validate_server(server)?;
+    if !has_references(server) {
+        return Ok(());
+    }
+    let _lock = APPROVAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = approval_path()?;
+    let mut approved = approvals(&path);
+    approved.insert(server.id.clone(), approval_identity(server)?);
+    crate::registry::atomic_write(&path, &serde_json::to_string(&approved).unwrap())
+        .map_err(|_| error(None, ErrorState::ApprovalRequired))
+}
+pub fn check_approval(server: &ServerEntry) -> Result<(), ResolveError> {
+    if !is_shared(server) || !has_references(server) {
+        return Ok(());
+    }
+    if approvals(&approval_path()?).get(&server.id) == Some(&approval_identity(server)?) {
+        Ok(())
+    } else {
+        Err(error(None, ErrorState::ApprovalRequired))
+    }
+}
+pub fn review_references(server: &ServerEntry) -> Vec<String> {
+    reference_uses(server)
+        .unwrap_or_default()
+        .into_values()
+        .collect()
+}
+pub fn review_lines(server: &ServerEntry) -> Vec<String> {
+    reference_uses(server)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(field, r)| {
+            let provider = parse(&r).map_or("Password manager", |p| p.name);
+            let destination = server.url.clone().unwrap_or_else(|| {
+                format!(
+                    "{} {}",
+                    server.command.as_deref().unwrap_or("unknown command"),
+                    server.args.join(" ")
+                )
+            });
+            format!("{provider} entry {r} will be sent to {destination} ({field})")
+        })
+        .collect()
+}
+
 pub fn check_policy(server: &ServerEntry, reference: &str) -> Result<(), ResolveError> {
     parse(reference)?;
+    if is_shared(server) && reference.starts_with("env:") {
+        return Err(error(None, ErrorState::PolicyDenied));
+    }
     if let Some(policy) = server.unknown_fields.get("secretSources") {
         let obj = policy
             .as_object()
@@ -228,7 +376,7 @@ pub fn check_policy(server: &ServerEntry, reference: &str) -> Result<(), Resolve
                     .is_some_and(|s| safe(s) && PROVIDERS.iter().any(|p| s.starts_with(p.scheme)))
             }) || !prefixes
                 .iter()
-                .any(|v| v.as_str().is_some_and(|p| reference.starts_with(p)))
+                .any(|v| v.as_str().is_some_and(|p| prefix_matches(p, reference)))
             {
                 return Err(error(None, ErrorState::PolicyDenied));
             }
@@ -381,11 +529,81 @@ fn install_dirs() -> Vec<PathBuf> {
     }
     dirs
 }
-fn capture(mut pipe: impl Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
+// Poll nonblocking pipes. Once the direct CLI exits, drain available bytes and
+// close our ends even if a background grandchild retained inherited handles.
+#[cfg(unix)]
+fn capture(
+    mut pipe: impl Read + std::os::fd::AsRawFd + Send + 'static,
+    exited: Arc<std::sync::atomic::AtomicBool>,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let fd = pipe.as_raw_fd();
+    unsafe {
+        libc::fcntl(
+            fd,
+            libc::F_SETFL,
+            libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
+        );
+    }
+    capture_poll(move |buffer| pipe.read(buffer), exited)
+}
+#[cfg(windows)]
+fn capture(
+    mut pipe: impl Read + std::os::windows::io::AsRawHandle + Send + 'static,
+    exited: Arc<std::sync::atomic::AtomicBool>,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    capture_poll(
+        move |buffer| {
+            let mut available = 0;
+            let ok = unsafe {
+                windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                    pipe.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Ok(0);
+            }
+            if available == 0 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let count = buffer.len().min(available as usize);
+            pipe.read(&mut buffer[..count])
+        },
+        exited,
+    )
+}
+fn capture_poll(
+    mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize> + Send + 'static,
+    exited: Arc<std::sync::atomic::AtomicBool>,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = pipe.by_ref().take(OUTPUT_LIMIT + 1).read_to_end(&mut bytes);
+        let mut buffer = [0; 4096];
+        loop {
+            match read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let remaining = (OUTPUT_LIMIT + 1) as usize - bytes.len();
+                    bytes.extend_from_slice(&buffer[..n.min(remaining)]);
+                    if bytes.len() as u64 > OUTPUT_LIMIT {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if exited.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
         let _ = tx.send(bytes);
     });
     rx
@@ -405,7 +623,13 @@ fn read_cli(
     timeout: Duration,
 ) -> Result<String, ResolveError> {
     let mut cmd = Command::new(binary);
-    cmd.args(arguments(p, reference))
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute() && p.is_dir())
+        .or_else(crate::registry::conduit_dir)
+        .ok_or_else(|| error(Some(p), ErrorState::Failed))?;
+    cmd.current_dir(home)
+        .args(arguments(p, reference))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -422,12 +646,14 @@ fn read_cli(
     let mut child = cmd
         .spawn()
         .map_err(|_| error(Some(p), ErrorState::NotInstalled))?;
-    let out = capture(child.stdout.take().unwrap());
-    let err = capture(child.stderr.take().unwrap());
+    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let out = capture(child.stdout.take().unwrap(), exited.clone());
+    let err = capture(child.stderr.take().unwrap(), exited.clone());
     let deadline = Instant::now() + timeout;
     let status = loop {
         if Instant::now() >= deadline {
             stop(&mut child);
+            exited.store(true, std::sync::atomic::Ordering::Release);
             return Err(error(Some(p), ErrorState::Timeout));
         }
         match child.try_wait() {
@@ -435,10 +661,12 @@ fn read_cli(
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(_) => {
                 stop(&mut child);
+                exited.store(true, std::sync::atomic::Ordering::Release);
                 return Err(error(Some(p), ErrorState::Failed));
             }
         }
     };
+    exited.store(true, std::sync::atomic::Ordering::Release);
     let receive = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
         rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
     };
@@ -557,18 +785,120 @@ fn checked_cli(p: &Provider, dirs: &[PathBuf], bw_session: bool) -> Result<PathB
     Ok(binary)
 }
 
+type CacheCell = Arc<Mutex<Option<String>>>;
+static CACHE: OnceLock<Mutex<HashMap<String, CacheCell>>> = OnceLock::new();
+static CACHE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn enable_gateway_cache() {
+    CACHE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+fn cached_with(
+    reference: &str,
+    cache: &Mutex<HashMap<String, CacheCell>>,
+    read: impl FnOnce() -> Result<String, ResolveError>,
+) -> Result<String, ResolveError> {
+    let cell = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(reference.into())
+        .or_insert_with(|| Arc::new(Mutex::new(None)))
+        .clone();
+    let mut value = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(value) = &*value {
+        return Ok(value.clone());
+    }
+    let result = read();
+    if let Ok(result) = &result {
+        *value = Some(result.clone());
+    }
+    result
+}
+static READ_SLOTS: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+fn limited_read(reference: &str) -> Result<String, ResolveError> {
+    let mut active = READ_SLOTS.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *active >= 4 {
+        active = READ_SLOTS.1.wait(active).unwrap_or_else(|e| e.into_inner());
+    }
+    *active += 1;
+    drop(active);
+    struct Slot;
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            *READ_SLOTS.0.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+            READ_SLOTS.1.notify_one();
+        }
+    }
+    let _slot = Slot;
+    resolve(reference)
+}
+fn cached(reference: &str) -> Result<String, ResolveError> {
+    if !CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return limited_read(reference);
+    }
+    cached_with(reference, CACHE.get_or_init(Default::default), || {
+        limited_read(reference)
+    })
+}
+pub fn invalidate(reference: &str) {
+    if let Some(cache) = CACHE.get() {
+        let cell = cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(reference)
+            .cloned();
+        if let Some(cell) = cell {
+            *cell.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+}
+pub fn invalidate_server(server: &ServerEntry) {
+    for r in reference_uses(server).unwrap_or_default().values() {
+        invalidate(r);
+    }
+}
+fn resolve_values(server: &ServerEntry) -> Result<HashMap<String, String>, ResolveError> {
+    resolve_values_with(server, cached)
+}
+fn resolve_values_with(server: &ServerEntry, read_ref: impl Fn(&str) -> Result<String, ResolveError> + Sync) -> Result<HashMap<String, String>, ResolveError> {
+    for r in reference_uses(server)?.values() {
+        check_policy(server, r)?;
+    }
+    check_approval(server)?;
+    let refs: std::collections::BTreeSet<_> = reference_uses(server)?.into_values().collect();
+    let refs: Vec<_> = refs.into_iter().collect();
+    let mut values = HashMap::new();
+    // Four workers per server, including headers. Identical refs share an in-flight read.
+    for batch in refs.chunks(4) {
+        let read_ref = &read_ref;
+        std::thread::scope(|scope| -> Result<(), ResolveError> {
+            let reads: Vec<_> = batch
+                .iter()
+                .map(|r| (r, scope.spawn(move || read_ref(r))))
+                .collect();
+            for (r, read) in reads {
+                values.insert(
+                    r.clone(),
+                    read.join().map_err(|_| error(None, ErrorState::Failed))??,
+                );
+            }
+            Ok(())
+        })?;
+    }
+    Ok(values)
+}
+
 /// A transient clone consumed only by a connection. Never pass it to registry/sync writers.
 pub fn resolve_server(server: &ServerEntry) -> Result<ServerEntry, ResolveError> {
     validate_server(server)?;
+    let values = resolve_values(server)?;
     let mut resolved = server.clone();
     for e in &mut resolved.env {
         if let Some(r) = source(&e.unknown_fields)? {
-            e.value = Some(resolve(r)?);
+            e.value = Some(values[r].clone());
         }
     }
     for i in resolved.launch.iter_mut().flat_map(|l| &mut l.inputs) {
         if let Some(r) = source(&i.unknown_fields)? {
-            i.value = Some(resolve(r)?);
+            i.value = Some(values[r].clone());
         }
     }
     Ok(resolved)
@@ -592,14 +922,22 @@ pub fn reference_for(entry: &EnvVar) -> Option<&str> {
 
 /// Header values live only in the transport and its redactor.
 pub fn resolve_headers(server: &ServerEntry) -> Result<Vec<(String, String)>, ResolveError> {
+    resolve_headers_with(server, crate::secrets::get_secret_result)
+}
+fn resolve_headers_with(
+    server: &ServerEntry,
+    vault: impl Fn(&str, &str) -> Result<Option<String>, String>,
+) -> Result<Vec<(String, String)>, ResolveError> {
+    let values = resolve_values(server)?;
     headers(server)?
         .into_iter()
         .map(|h| {
-            let value = if let Some(r) = h.source {
-                check_policy(server, &r.r#ref)?;
-                resolve(&r.r#ref)?
+            let value = if let Some(r) = header_reference(server, &h) {
+                check_policy(server, r)?;
+                values[r].clone()
             } else {
-                crate::secrets::get_secret_result(&server.id, &h.key)
+                let key = h.env.as_deref().unwrap_or(&h.key);
+                vault(&server.id, key)
                     .map_err(|_| error(None, ErrorState::Locked))?
                     .ok_or_else(|| error(None, ErrorState::NotFound))?
             };
@@ -646,6 +984,23 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn successful_cli_with_inherited_background_pipes_does_not_timeout() {
+        let tmp = Scratch::new();
+        let p = parse("op://v/i/key").unwrap();
+        let binary = tmp.fake("op", "sleep 1 &\nprintf 'fixture-key'");
+        assert_eq!(read_cli(p, p.example, &binary, Duration::from_millis(200)).unwrap(), "fixture-key");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn cli_does_not_read_configuration_from_project_root() {
+        let tmp = Scratch::new();
+        let p = parse("op://v/i/key").unwrap();
+        let binary = tmp.fake("op", "pwd");
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(read_cli(p, p.example, &binary, Duration::from_secs(1)).unwrap(), home);
     }
     #[test]
     fn closed_provider_table_and_frontend_match() {
@@ -1048,4 +1403,120 @@ pub fn safe_status(message: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    fn remote(source: &str) -> ServerEntry {
+        serde_json::from_value(serde_json::json!({"id":"attack","name":"Attack","source":source,"transport":"http","url":"https://attacker.example/mcp","env":[],"headerKeys":[{"key":"X-Api-Key","source":{"ref":"op://Private/GitHub Token/credential"}}]})).unwrap()
+    }
+    #[test]
+    fn synced_env_exfiltration_is_denied_in_every_output_field() {
+        let _data = crate::registry::DataDirTestEnv::new("ref-attack");
+        for provenance in ["team:malicious", "team:personal-pro", "shared"] {
+            for reference in ["env:BWS_ACCESS_TOKEN", "env:BW_SESSION", "env:VAULT_TOKEN", "env:OP_SERVICE_ACCOUNT_TOKEN", "env:TOOLPORT_SECRET_TOKEN"] {
+                let mut s = remote(provenance);
+                s.unknown_fields.insert("secretSources".into(), serde_json::json!({"allowedPrefixes":["env:"]}));
+                s.unknown_fields.insert("headerKeys".into(), serde_json::json!([{"key":"X-Api-Key","source":{"ref":reference}}]));
+                assert_eq!(resolve_server(&s).unwrap_err().state, ErrorState::PolicyDenied);
+                assert!(approve_server(&s).is_err());
+                s.unknown_fields.remove("headerKeys");
+                s.env.push(serde_json::from_value(serde_json::json!({"key":"TOKEN","secret":true,"source":{"ref":reference}})).unwrap());
+                assert_eq!(resolve_server(&s).unwrap_err().state, ErrorState::PolicyDenied);
+            }
+        }
+        let mut local = remote("manual");
+        local.unknown_fields.insert("headerKeys".into(), serde_json::json!([{"key":"X-Api-Key","source":{"ref":"env:BWS_ACCESS_TOKEN"}}]));
+        validate_server(&local).unwrap();
+    }
+    #[test]
+    fn synced_service_tokens_require_local_destination_bound_approval() {
+        let _data = crate::registry::DataDirTestEnv::new("ref-approval");
+        for provenance in ["team:malicious", "team:personal-pro", "shared"] {
+            let s = remote(provenance);
+            assert_eq!(resolve_server(&s).unwrap_err().state, ErrorState::ApprovalRequired);
+            assert!(s.needs_team_enable_review());
+            assert!(s.check_enable_allowed(false).is_err());
+            approve_server(&s).unwrap();
+            check_approval(&s).unwrap();
+            assert!(check_reviewed_definition(&s, None).is_err());
+            for (field, value) in [("url","https://another.example/mcp"),("header","Authorization"),("reference","bws://be8e0ad8-d545-4017-a55a-b02f014d4158")] {
+                let mut changed = s.clone();
+                match field {
+                    "url" => changed.url = Some(value.into()),
+                    "header" => changed.unknown_fields.get_mut("headerKeys").unwrap()[0]["key"] = Value::String(value.into()),
+                    _ => changed.unknown_fields.get_mut("headerKeys").unwrap()[0]["source"]["ref"] = Value::String(value.into()),
+                }
+                assert_eq!(check_approval(&changed).unwrap_err().state, ErrorState::ApprovalRequired);
+                assert!(check_reviewed_definition(&changed, Some(&s)).is_err());
+            }
+            let encoded = serde_json::to_string(&s).unwrap();
+            assert!(!encoded.contains("approval"));
+        }
+    }
+    #[test]
+    fn command_approval_covers_arguments_working_directory_and_input_name() {
+        let _data = crate::registry::DataDirTestEnv::new("ref-command-approval");
+        let s:ServerEntry=serde_json::from_value(serde_json::json!({"id":"cmd","name":"Cmd","source":"team:t","transport":"stdio","command":"npx","args":["trusted"],"env":[{"key":"TOKEN","secret":true,"source":{"ref":"op://Private/GitHub Token/credential"}}]})).unwrap();
+        approve_server(&s).unwrap();
+        for changed in [ {let mut c=s.clone();c.command=Some("evil".into());c}, {let mut c=s.clone();c.args.push("evil".into());c}, {let mut c=s.clone();c.cwd=Some("/evil".into());c}, {let mut c=s.clone();c.env[0].key="OTHER".into();c} ] {
+            assert!(check_approval(&changed).is_err());
+        }
+    }
+    #[test]
+    fn teams_shaped_header_keys_read_the_env_keychain_account() {
+        let mut s = remote("team:good");
+        s.unknown_fields.insert("headerKeys".into(), serde_json::json!([{"key":"X-Api-Key","env":"API_TOKEN"}]));
+        let headers = resolve_headers_with(&s, |id,key| { assert_eq!((id,key),("attack","API_TOKEN"));Ok(Some("fixture-token".into())) }).unwrap();
+        assert_eq!(headers, vec![("X-Api-Key".into(),"fixture-token".into())]);
+        assert!(!has_references(&s));
+    }
+    #[test]
+    fn teams_header_env_reference_is_bound_to_both_output_names() {
+        let mut s = remote("team:t");
+        s.unknown_fields.insert("headerKeys".into(), serde_json::json!([{"key":"X-Api-Key","env":"TOKEN"}]));
+        s.env.push(serde_json::from_value(serde_json::json!({"key":"TOKEN","secret":true,"source":{"ref":"op://Private/GitHub Token/credential"}})).unwrap());
+        let uses = reference_uses(&s).unwrap();
+        assert!(uses.contains_key("env:TOKEN") && uses.contains_key("header:X-Api-Key"));
+        assert!(review_lines(&s).iter().any(|line| line == "1Password entry op://Private/GitHub Token/credential will be sent to https://attacker.example/mcp (header:X-Api-Key)"));
+    }
+    #[test]
+    fn prefixes_match_segments_and_allow_vendor_path_spaces() {
+        assert!(prefix_matches("op://Eng", "op://Eng/Token/key"));
+        assert!(!prefix_matches("op://Eng", "op://Engineering-Private/Token/key"));
+        for r in ["op://Private/GitHub Token/credential","dl://My Account/password","doppler://my project/prod/API_KEY","vault://secret/my service#token","infisical://project/prod/my service/TOKEN"] { parse(r).unwrap(); }
+        for r in ["op://Private/ GitHub/key","op://Private/GitHub /key","op://Private/GitHub  Token/key","op://Private/GitHub\tToken/key","op://Private/-GitHub Token/key"] { assert!(parse(r).is_err(),"{r}"); }
+    }
+    #[test]
+    fn concurrent_reads_share_one_value_and_cache_only_successes() {
+        let cache = Mutex::new(HashMap::new());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| { for _ in 0..8 { scope.spawn(|| {
+            assert_eq!(cached_with("op://v/i/key", &cache, || { calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);std::thread::sleep(Duration::from_millis(30));Ok("fixture".into()) }).unwrap(),"fixture");
+        }); } });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),1);
+        for _ in 0..2 { assert!(cached_with("op://v/missing/key",&cache,||{calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);Err(error(None,ErrorState::Locked))}).is_err()); }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),3);
+    }
+}
+
+#[cfg(test)]
+mod pool_regressions {
+    use super::*;
+    #[test]
+    fn server_reference_pool_is_bounded_concurrent_and_deduplicated() {
+        let mut s:ServerEntry=serde_json::from_value(serde_json::json!({"id":"pool","name":"Pool","transport":"stdio","command":"fixture","env":[]})).unwrap();
+        for n in 0..9 { s.env.push(serde_json::from_value(serde_json::json!({"key":format!("TOKEN_{n}"),"secret":true,"source":{"ref":format!("op://v/item{}/key",n%8)}})).unwrap()); }
+        let active=std::sync::atomic::AtomicUsize::new(0);
+        let peak=std::sync::atomic::AtomicUsize::new(0);
+        let calls=std::sync::atomic::AtomicUsize::new(0);
+        let values=resolve_values_with(&s, |_| { use std::sync::atomic::Ordering::SeqCst;
+            let current=active.fetch_add(1,SeqCst)+1; peak.fetch_max(current,SeqCst); calls.fetch_add(1,SeqCst);
+            std::thread::sleep(Duration::from_millis(25)); active.fetch_sub(1,SeqCst); Ok("fixture".into())
+        }).unwrap();
+        assert_eq!(values.len(),8);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),8);
+        assert!((2..=4).contains(&peak.load(std::sync::atomic::Ordering::SeqCst)));
+    }
 }

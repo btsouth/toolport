@@ -2842,6 +2842,9 @@ pub fn apply_server_enabled(
                 crate::launch_inputs::resolve_args(server)?;
             }
             server.check_enable_allowed(reviewed)?;
+            if reviewed {
+                crate::secret_refs::approve_server(server).map_err(|e| e.to_string())?;
+            }
         }
     }
     if registry.version >= 3 {
@@ -2867,6 +2870,22 @@ pub fn apply_server_enabled(
     } else {
         registry.set_server_enabled(profile_id, server_id, enabled)
     }
+}
+
+pub fn set_server_enabled_after_reference_review(
+    profile_id: &str,
+    reviewed: &ServerEntry,
+) -> Result<Registry, String> {
+    let (registry, ()) = registry::update(|registry| {
+        let current = registry
+            .servers
+            .iter()
+            .find(|s| s.id == reviewed.id)
+            .ok_or("Server no longer exists")?;
+        crate::secret_refs::check_reviewed_definition(current, Some(reviewed))?;
+        apply_server_enabled(registry, profile_id, &reviewed.id, true, true)
+    })?;
+    Ok(registry)
 }
 
 pub fn set_server_enabled(
@@ -5392,6 +5411,7 @@ pub fn test_secret_reference(
                 message: "Server not found.".into(),
             })?;
         crate::secret_refs::check_policy(server, reference)?;
+        crate::secret_refs::check_approval(server)?;
     }
     crate::secret_refs::resolve(reference).map(|_| ())
 }

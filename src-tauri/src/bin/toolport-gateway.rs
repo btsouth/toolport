@@ -8920,7 +8920,10 @@ fn connect_one_result(
                 if let Some(timeout) = initialize_timeout.expect("validated above") {
                     t.set_connect_timeout(timeout);
                 }
-                t.set_server_request_handler(remote::protect_server_requests(server, Arc::clone(&server_handler)));
+                t.set_server_request_handler(remote::protect_server_requests(
+                    server,
+                    Arc::clone(&server_handler),
+                ));
                 t.set_progress_sink(remote::protect_progress(server, progress));
                 DownstreamServer::connect(
                     server.id.clone(),
@@ -20277,6 +20280,7 @@ fn detach_from_client_session() {}
 
 /// Entry point: classify the command line, then run the requested role.
 fn main() {
+    conduit_lib::secret_refs::enable_gateway_cache();
     // `--help`/`--version`/an unrecognized flag are decided before anything
     // else touches disk, the keychain, or stdin - see #605. Positional args
     // and the existing four flags fall through to `Run` unchanged.
@@ -23541,11 +23545,8 @@ mod tests {
     #[test]
     fn reviewed_unscoped_no_match_waits_for_first_catalog_publication() {
         let _env = DataDirTestEnv::new("reviewed-no-match-publication");
-        let router = counting_cache_supervisor(
-            "publishing",
-            Vec::new(),
-            &Arc::new(AtomicUsize::new(0)),
-        );
+        let router =
+            counting_cache_supervisor("publishing", Vec::new(), &Arc::new(AtomicUsize::new(0)));
         router.prepare_lazy_use("publishing");
         wait_for_supervisor_result(&router);
         assert!(router.any_publishing_first_catalog(|_| true));

@@ -199,7 +199,11 @@ async fn import_servers(
             .collect(),
     };
     tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::import_client_servers_inputs(selected, &secret_choices.unwrap_or_default(), &credential_inputs.unwrap_or_default())
+        crate::registry_controller::import_client_servers_inputs(
+            selected,
+            &secret_choices.unwrap_or_default(),
+            &credential_inputs.unwrap_or_default(),
+        )
     })
     .await
     .map_err(|_| "Import stopped".to_string())??;
@@ -347,12 +351,21 @@ fn set_server_enabled(
     server_id: String,
     enabled: bool,
     reviewed: Option<bool>,
+    reviewed_definition: Option<ServerEntry>,
 ) -> Result<Registry, String> {
     let reviewed = reviewed.unwrap_or(false);
     let (reg, _) = write_registry(state.inner(), |reg| {
         // Checked inside the write closure so it sees the registry that will be
         // persisted: a team_sync_wait replace landing between a pre-lock check and
         // this write could swap the entry for one that needs review.
+        if enabled && reviewed {
+            if let Some(server) = reg.servers.iter().find(|s| s.id == server_id) {
+                crate::secret_refs::check_reviewed_definition(
+                    server,
+                    reviewed_definition.as_ref(),
+                )?;
+            }
+        }
         crate::registry_controller::apply_server_enabled(
             reg,
             &profile_id,
@@ -2096,8 +2109,14 @@ fn team_disconnect(state: State<RegistryState>) -> Result<Registry, String> {
 }
 
 #[tauri::command]
-async fn team_use_managed(app: tauri::AppHandle, state: State<'_, RegistryState>, server_id: String) -> Result<Registry, String> {
-    tauri::async_runtime::spawn_blocking(move || teams::use_managed_server(&server_id)).await.map_err(|e| e.to_string())??;
+async fn team_use_managed(
+    app: tauri::AppHandle,
+    state: State<'_, RegistryState>,
+    server_id: String,
+) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || teams::use_managed_server(&server_id))
+        .await
+        .map_err(|e| e.to_string())??;
     let fresh = reload_into_state(state.inner())?;
     let _ = app.emit("team-sync-registry", &fresh);
     Ok(fresh)
@@ -2128,11 +2147,17 @@ fn team_open_confirmation(url: String) -> Result<(), String> {
 /// only, secret values never sent). Remote instructions and policy fields are preserved, and
 /// an optimistic-concurrency conflict is returned rather than overwriting another admin.
 #[tauri::command]
-async fn team_push_preview(state: State<'_, RegistryState>, selected_ids: Option<Vec<String>>) -> Result<teams::PushPreview, String> {
+async fn team_push_preview(
+    state: State<'_, RegistryState>,
+    selected_ids: Option<Vec<String>>,
+) -> Result<teams::PushPreview, String> {
     refresh_from_disk(state.inner())?;
-    tauri::async_runtime::spawn_blocking(move || match selected_ids { Some(ids) => teams::preview_push_selected(&ids), None => teams::preview_push_current() })
-        .await
-        .map_err(|e| format!("push preview task join failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || match selected_ids {
+        Some(ids) => teams::preview_push_selected(&ids),
+        None => teams::preview_push_current(),
+    })
+    .await
+    .map_err(|e| format!("push preview task join failed: {e}"))?
 }
 
 #[tauri::command]
@@ -2528,6 +2553,7 @@ struct ImportItem {
     url: Option<String>,
     /// False if a server with this name already exists (the import would skip it).
     is_new: bool,
+    reference_review: Vec<String>,
     credentials: Vec<crate::registry_controller::CredentialReview>,
     unsupported: Option<String>,
 }
@@ -2545,6 +2571,7 @@ async fn preview_import_servers(
     Ok(candidates
         .into_iter()
         .map(|server| ImportItem {
+            reference_review: Vec::new(),
             key: Some(server.key),
             name: server.name,
             transport: server.transport,
@@ -2579,6 +2606,7 @@ fn preview_import(state: State<RegistryState>, json: String) -> Result<Vec<Impor
                 .iter()
                 .any(|e| e.name.eq_ignore_ascii_case(&s.name));
             ImportItem {
+                reference_review: crate::secret_refs::review_lines(&s),
                 key: None,
                 name: s.name,
                 transport: s.transport,
@@ -3561,7 +3589,11 @@ struct TeamPairEvent {
 
 impl TeamPairEvent {
     fn new(state: &'static str) -> Self {
-        Self { state, check: None, message: None }
+        Self {
+            state,
+            check: None,
+            message: None,
+        }
     }
 }
 
@@ -3576,12 +3608,21 @@ fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
         if let Some(current) = pairing.as_ref() {
             // A repeated link brings the waiting prompt back instead of pairing twice.
             if let Some(check) = &current.check {
-                let _ = app.emit("team-pair", TeamPairEvent { check: Some(check.clone()), ..TeamPairEvent::new("pending") });
+                let _ = app.emit(
+                    "team-pair",
+                    TeamPairEvent {
+                        check: Some(check.clone()),
+                        ..TeamPairEvent::new("pending")
+                    },
+                );
             }
             return;
         }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        *pairing = Some(TeamPairing { cancel: std::sync::Arc::clone(&cancel), check: None });
+        *pairing = Some(TeamPairing {
+            cancel: std::sync::Arc::clone(&cancel),
+            check: None,
+        });
         cancel
     };
     let pending = TeamPairGuard(std::sync::Arc::clone(&cancel));
@@ -3661,11 +3702,8 @@ fn tray_host_present() -> bool {
     let class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
     // Windows owns this class for Explorer's notification area.
     unsafe {
-        !windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(
-            class.as_ptr(),
-            std::ptr::null(),
-        )
-        .is_null()
+        !windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(class.as_ptr(), std::ptr::null())
+            .is_null()
     }
 }
 

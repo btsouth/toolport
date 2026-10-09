@@ -1345,7 +1345,9 @@ fn report_activation(conn: &TeamConnection, token: &str) -> Result<(), String> {
             {
                 continue;
             }
-            if env.value.as_deref().is_some_and(|v| !v.is_empty()) {
+            if crate::secret_refs::reference_for(env).is_some()
+                || env.value.as_deref().is_some_and(|v| !v.is_empty())
+            {
                 continue;
             }
             match crate::secrets::get_secret_result(&server.id, &env.key) {
@@ -1356,6 +1358,13 @@ fn report_activation(conn: &TeamConnection, token: &str) -> Result<(), String> {
         }
         if let Some(launch) = &server.launch {
             for input in launch.inputs.iter().filter(|input| input.required) {
+                if crate::secret_refs::source(&input.unknown_fields)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    continue;
+                }
                 if !input.secret {
                     if !input
                         .value
@@ -3104,7 +3113,7 @@ fn current_policy(reg: &Registry) -> Value {
             "forcePiiRedaction": reg.team_forced_pii_redaction,
         },
         "rateLimits": reg.team.as_ref().map(|t| &t.rate_limits),
-        "secretSources": reg.servers.iter().find_map(|s| s.unknown_fields.get("secretSources")).cloned().unwrap_or(Value::Null),
+        "secretSources": reg.servers.iter().filter(|s| reg.team.as_ref().is_some_and(|t| is_team_server(s, &tag_for(&t.team_id)))).find_map(|s| s.unknown_fields.get("secretSources")).cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -4154,10 +4163,15 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
                         &local_launch_values_by_original,
                         &legacy_launch_values_by_id,
                     );
+                    if let Some(old) = previous.iter().find(|old| old.id == entry.id) {
+                        restore_local_references(&mut entry, old);
+                    }
                     used_ids.push(entry.id.clone());
                     managed_server_ids.insert(entry.id.clone(), shared_id.clone());
                     tool_allows.insert(entry.id.clone(), allowed);
-                    if prev_consent.contains_key(&entry.id) {
+                    if prev_consent.contains_key(&entry.id)
+                        || crate::secret_refs::has_references(&entry)
+                    {
                         // Existing public remotes may own bearer tokens. A new
                         // destination cannot inherit enablement, and an unchanged
                         // re-sync must preserve a member's decision to leave it off.
@@ -4190,6 +4204,9 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
                         &local_launch_values_by_original,
                         &legacy_launch_values_by_id,
                     );
+                    if let Some(old) = previous.iter().find(|old| old.id == entry.id) {
+                        restore_local_references(&mut entry, old);
+                    }
                     used_ids.push(entry.id.clone());
                     managed_server_ids.insert(entry.id.clone(), shared_id.clone());
                     tool_allows.insert(entry.id.clone(), allowed);
@@ -4416,6 +4433,57 @@ fn restore_local_launch_values(
     }
 }
 
+fn restore_local_references(entry: &mut ServerEntry, old: &ServerEntry) {
+    for env in &mut entry.env {
+        if !env.unknown_fields.contains_key("source") {
+            if let Some(r) = old
+                .env
+                .iter()
+                .find(|e| e.key == env.key)
+                .and_then(crate::secret_refs::reference_for)
+            {
+                env.secret = true;
+                env.unknown_fields.insert("source".into(), json!({"ref":r}));
+            }
+        }
+    }
+    for input in entry.launch.iter_mut().flat_map(|l| &mut l.inputs) {
+        if !input.unknown_fields.contains_key("source") {
+            if let Some(r) = old
+                .launch
+                .iter()
+                .flat_map(|l| &l.inputs)
+                .find(|i| i.key == input.key)
+                .and_then(|i| crate::secret_refs::source(&i.unknown_fields).ok().flatten())
+            {
+                input.value = None;
+                input.secret = true;
+                input
+                    .unknown_fields
+                    .insert("source".into(), json!({"ref":r}));
+            }
+        }
+    }
+    if let (Ok(mut current), Ok(previous)) = (
+        crate::secret_refs::headers(entry),
+        crate::secret_refs::headers(old),
+    ) {
+        for header in &mut current {
+            if header.source.is_none() {
+                header.source = previous
+                    .iter()
+                    .find(|h| h.key == header.key && h.env == header.env)
+                    .and_then(|h| h.source.clone());
+            }
+        }
+        if !current.is_empty() {
+            entry
+                .unknown_fields
+                .insert("headerKeys".into(), json!(current));
+        }
+    }
+}
+
 fn plain_launch_values(entry: &ServerEntry) -> HashMap<String, String> {
     entry
         .launch
@@ -4471,8 +4539,10 @@ pub(crate) fn consent_fingerprint(entry: &ServerEntry) -> String {
             field("secretRef", &format!("{}:{r}", e.key));
         }
     }
-    if let Some(h) = entry.unknown_fields.get("headerKeys") {
-        field("headerKeys", &h.to_string());
+    for h in crate::secret_refs::headers(entry).unwrap_or_default() {
+        if let Some(r) = h.source {
+            field("headerRef", &format!("{}:{}", h.key, r.r#ref));
+        }
     }
     field("cwd", entry.cwd.as_deref().unwrap_or(""));
     field("url", entry.url.as_deref().unwrap_or(""));
@@ -4746,7 +4816,7 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         None => None,
     };
     // Loopback / LAN (RFC1918) is a legit internal server, but require opt-in like stdio.
-    if team_host_is_private(&host) {
+    if team_host_is_private(&host) || crate::secret_refs::has_references(&entry) {
         return TeamClass::Review(entry);
     }
     TeamClass::Ready(entry)
@@ -4800,6 +4870,47 @@ pub fn remove_team(reg: &mut Registry, team_id: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn public_remote_references_are_reviewed_and_environment_attacks_blocked() {
+        let config = json!({"id":"ref","name":"Ref","transport":"http","url":"https://example.com/mcp","headerKeys":[{"key":"X-Api-Key","source":{"ref":"op://Private/GitHub Token/credential"}}]});
+        assert!(matches!(classify_team_server(&config,"team:t"), TeamClass::Review(_)));
+        let mut env_attack = config;
+        env_attack["headerKeys"][0]["source"]["ref"] = json!("env:BWS_ACCESS_TOKEN");
+        assert!(matches!(classify_team_server(&env_attack,"team:t"),TeamClass::Blocked));
+    }
+    #[test]
+    fn legacy_team_headers_do_not_change_consent_fingerprint() {
+        let plain:ServerEntry=serde_json::from_value(json!({"id":"legacy","name":"Legacy","transport":"http","url":"https://example.com/mcp","env":[{"key":"API_TOKEN","secret":true}]})).unwrap();
+        let mut team_shaped = plain.clone();
+        team_shaped.unknown_fields.insert("headerKeys".into(),json!([{"key":"X-Api-Key","env":"API_TOKEN"}]));
+        assert_eq!(consent_fingerprint(&plain),consent_fingerprint(&team_shaped));
+    }
+    #[test]
+    fn member_local_references_survive_repeated_team_sync() {
+        let mut reg=base_registry();
+        let config=json!({"servers":[{"id":"service","name":"Service","transport":"stdio","command":"fixture","env":[{"key":"TOKEN"}],"headerKeys":[{"key":"X-Api-Key","env":"API_TOKEN"}]}]});
+        apply_team_config(&mut reg,"t",&config);
+        let s=reg.servers.iter_mut().find(|s|s.source.as_deref()==Some("team:t")).unwrap();
+        s.env[0].unknown_fields.insert("source".into(),json!({"ref":"op://Private/My Token/credential"}));
+        s.unknown_fields.get_mut("headerKeys").unwrap()[0]["source"]=json!({"ref":"vault://secret/service#key"});
+        for _ in 0..2 {
+            apply_team_config(&mut reg,"t",&config);
+            let s=reg.servers.iter().find(|s|s.source.as_deref()==Some("team:t")).unwrap();
+            assert_eq!(crate::secret_refs::reference_for(&s.env[0]),Some("op://Private/My Token/credential"));
+            assert_eq!(s.unknown_fields["headerKeys"][0]["source"]["ref"],"vault://secret/service#key");
+        }
+    }
+    #[test]
+    fn current_secret_policy_uses_connected_team_only() {
+        let mut reg=base_registry();
+        let other:ServerEntry=serde_json::from_value(json!({"id":"other","name":"Other","transport":"http","url":"https://example.com/mcp","source":"team:other","secretSources":{"allowedPrefixes":["op://Other/"]}})).unwrap();
+        reg.servers.insert(0,other);
+        reg.team = publisher_registry().team;
+        reg.team.as_mut().unwrap().team_id = "t".into();
+        let config=json!({"secretSources":{"allowedPrefixes":["op://Own/"]},"servers":[{"id":"own","name":"Own","transport":"http","url":"https://example.com/mcp"}]});
+        apply_team_config(&mut reg,"t",&config);
+        assert_eq!(current_policy(&reg)["secretSources"]["allowedPrefixes"],json!(["op://Own/"]));
+    }
     #[test]
     fn pairing_links_accept_only_team_and_secure_origin() {
         assert_eq!(
@@ -9742,19 +9853,49 @@ mod secret_reference_sync_tests {
         assert_eq!(exported[0]["env"][0]["source"]["ref"],"op://Engineering/Docs/key");
         assert!(exported[0]["env"][0].get("value").is_none());
         for team in ["team", "personal-pro"] {
-            let mut target=Registry::default(); let result=apply_team_config(&mut target,team,&json!({"servers":exported,"secretSources":{"allowedPrefixes":["op://", "vault://"]}}));
-            assert_eq!(result.blocked,0); assert_eq!(target.servers.len(),1);
-            assert_eq!(crate::secret_refs::reference_for(&target.servers[0].env[0]),Some("op://Engineering/Docs/key"));
-            assert_eq!(target.servers[0].unknown_fields["headerKeys"][0]["source"]["ref"],"vault://secret/docs#token");
-            assert_eq!(target.servers[0].unknown_fields["secretSources"]["allowedPrefixes"],json!(["op://", "vault://"]));
-            let result=apply_team_config(&mut target,team,&json!({"servers":exported,"secretSources":{"allowedPrefixes":["env:"]}}));
-            assert_eq!(result.blocked,1); assert!(target.servers.is_empty());
+            let mut target = Registry::default();
+            let result = apply_team_config(
+                &mut target,
+                team,
+                &json!({"servers":exported,"secretSources":{"allowedPrefixes":["op://", "vault://"]}}),
+            );
+            assert_eq!(result.blocked, 0);
+            assert_eq!(target.servers.len(), 1);
+            assert_eq!(
+                crate::secret_refs::reference_for(&target.servers[0].env[0]),
+                Some("op://Engineering/Docs/key")
+            );
+            assert_eq!(
+                target.servers[0].unknown_fields["headerKeys"][0]["source"]["ref"],
+                "vault://secret/docs#token"
+            );
+            assert_eq!(
+                target.servers[0].unknown_fields["secretSources"]["allowedPrefixes"],
+                json!(["op://", "vault://"])
+            );
+            let result = apply_team_config(
+                &mut target,
+                team,
+                &json!({"servers":exported,"secretSources":{"allowedPrefixes":["env:"]}}),
+            );
+            assert_eq!(result.blocked, 1);
+            assert!(target.servers.is_empty());
         }
     }
     #[test]
     fn executable_sources_are_blocked_instead_of_dropped() {
-        for source in [json!({"ref":"exec:steal"}),json!({"ref":"env:TOKEN","command":"steal"}),json!({"ref":"op://-out/tmp/key"})] {
-            assert!(matches!(classify_team_server(&json!({"id":"x","name":"X","transport":"http","url":"https://example.invalid/mcp","env":[{"key":"TOKEN","source":source}]}),"team:t"),TeamClass::Blocked));
+        for source in [
+            json!({"ref":"exec:steal"}),
+            json!({"ref":"env:TOKEN","command":"steal"}),
+            json!({"ref":"op://-out/tmp/key"}),
+        ] {
+            assert!(matches!(
+                classify_team_server(
+                    &json!({"id":"x","name":"X","transport":"http","url":"https://example.invalid/mcp","env":[{"key":"TOKEN","source":source}]}),
+                    "team:t"
+                ),
+                TeamClass::Blocked
+            ));
         }
     }
     #[test]

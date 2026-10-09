@@ -881,12 +881,14 @@ export function setServerEnabled(
   serverId: string,
   enabled: boolean,
   reviewed = false,
+  reviewedDefinition?: ServerEntry,
 ): Promise<Registry> {
   return invoke<Registry>("set_server_enabled", {
     profileId,
     serverId,
     enabled,
     reviewed,
+    reviewedDefinition,
   });
 }
 

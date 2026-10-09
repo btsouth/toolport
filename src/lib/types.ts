@@ -363,6 +363,7 @@ export interface AuthInfo {
 
 /** One server a shared setup would add, shown for review before importing. */
 export interface ImportItem {
+  referenceReview?: string[];
   credentials?: { key: string; secret: boolean; present: boolean; required: boolean }[];
   unsupported?: string | null;
   envKeys?: string[];

@@ -6511,6 +6511,15 @@ fn show_setup_import_review(
                 .css_classes(["toolport-muted"])
                 .build(),
         );
+        for line in &item.reference_review {
+            row.append(
+                &gtk::Label::builder()
+                    .label(line)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .build(),
+            );
+        }
         // The two facts that change the risk calculus, stated on the row that
         // carries them - not buried in the dialog preamble.
         for warning in crate::sharing_controller::import_item_warnings(&item) {
@@ -7045,6 +7054,49 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
             "This team server must be reviewed before its command or private address can run",
         ));
         card.append(&badge);
+        let review = gtk::Button::with_label("Review references");
+        let page = page.clone();
+        let id = server.id.clone();
+        let profile = profile_id.to_string();
+        review.connect_clicked(move |_| {
+            let Ok(reg) = crate::registry::load() else {
+                return;
+            };
+            let Some(entry) = reg.servers.iter().find(|s| s.id == id).cloned() else {
+                return;
+            };
+            if !crate::secret_refs::has_references(&entry) {
+                return;
+            }
+            let Some(parent) = page.app.active_window() else {
+                return;
+            };
+            let dialog = adw::MessageDialog::new(
+                Some(&parent),
+                Some("Approve references and enable?"),
+                Some(&crate::secret_refs::review_lines(&entry).join("\n")),
+            );
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("enable", "Enable");
+            dialog.set_default_response(Some("cancel"));
+            let profile = profile.clone();
+            let page = page.clone();
+            dialog.connect_response(None, move |_, response| {
+                if response != "enable" {
+                    return;
+                }
+                match crate::registry_controller::set_server_enabled_after_reference_review(
+                    &profile, &entry,
+                ) {
+                    Ok(reg) => page.set_registry_state(state::RegistryState::Ready(
+                        state::RegistrySnapshot::from_registry(reg),
+                    )),
+                    Err(e) => page.show_feedback(&e, true),
+                }
+            });
+            dialog.present();
+        });
+        card.append(&review);
     } else {
         let status = gtk::Label::new(Some(if server.enabled {
             "Enabled"
@@ -9005,7 +9057,14 @@ fn save_launch_entries(
             registry =
                 crate::registry_controller::set_secret_reference(server_id, &input.key, reference)?;
         } else if input.secret {
-            if !value.is_empty() {
+            if value.is_empty() {
+                registry = crate::registry::update(|reg| {
+                    crate::registry_controller::apply_launch_secret_generation(
+                        reg, server_id, &input.key,
+                    )
+                })?
+                .0;
+            } else {
                 registry =
                     crate::registry_controller::set_launch_secret(server_id, &input.key, value)?;
             }
@@ -9259,6 +9318,17 @@ fn state_card(icon_name: &str, title: &str, body: &str, error: bool) -> gtk::Box
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn returning_to_keychain_with_blank_launch_input_clears_reference() {
+        let input:crate::registry::LaunchInput=serde_json::from_value(serde_json::json!({"key":"TOKEN","label":"Token","secret":true,"required":true,"source":{"ref":"op://v/i/key"}})).unwrap();
+        let (edited,value)=super::launch_editor_value(&input,"",None);
+        assert_eq!(value,"");
+        assert!(!edited.unknown_fields.contains_key("source"));
+        let mut reg=crate::registry::Registry::default();
+        reg.servers.push(serde_json::from_value(serde_json::json!({"id":"ref","name":"Ref","transport":"stdio","command":"fixture","env":[],"launch":{"inputs":[input],"bindings":[]}})).unwrap());
+        crate::registry_controller::apply_launch_secret_generation(&mut reg,"ref","TOKEN").unwrap();
+        assert!(!reg.servers[0].launch.as_ref().unwrap().inputs[0].unknown_fields.contains_key("source"));
+    }
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn session_identity_visual_fixture() {
@@ -9520,7 +9590,7 @@ mod tests {
         }
         std::env::remove_var(key);
         assert!(test.is_sensitive(), "reference test must finish");
-        assert_eq!(feedback.text(), "Success. This machine can read the key.");
+        assert_eq!(feedback.text(), "Success in the desktop app environment. The MCP client gateway may use different environment variables or PATH.");
         assert_eq!(reference.text(), format!("env:{key}"));
         assert!(!feedback.text().contains("synthetic-native-key-value"));
         provider.set_selected(0);
@@ -10757,7 +10827,7 @@ fn secret_reference_fields(
             provider_field.set_sensitive(true);
             feedback.set_visible(true);
             feedback.set_label(&match result {
-                Ok(Ok(())) => "Success. This machine can read the key.".into(),
+                Ok(Ok(())) => "Success in the desktop app environment. The MCP client gateway may use different environment variables or PATH.".into(),
                 Ok(Err(e)) => e.to_string(),
                 Err(_) => "Reference test stopped".into(),
             });

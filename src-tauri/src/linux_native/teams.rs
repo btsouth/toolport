@@ -1126,6 +1126,10 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
             }
         )
     };
+    let target = format!(
+        "{target}\n{}",
+        crate::secret_refs::review_lines(server).join("\n")
+    );
     copy.append(
         &gtk::Label::builder()
             .label(&target)
@@ -1186,7 +1190,7 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
     enable.set_sensitive(!already_enabled && !held);
     enable.add_css_class("toolport-secondary-action");
     let server_name = server.name.clone();
-    let server_id = server.id.clone();
+    let reviewed_entry = server.clone();
     enable.connect_clicked(move |button| {
         let Some(parent) = page.app.active_window() else {
             return;
@@ -1203,22 +1207,17 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
         dialog.set_default_response(Some("cancel"));
         dialog.set_response_appearance("enable", adw::ResponseAppearance::Suggested);
         let page = page.clone();
-        let server_id = server_id.clone();
+        let reviewed_entry = reviewed_entry.clone();
         let button = button.clone();
         dialog.connect_response(None, move |dialog, response| {
             if response == "enable" {
                 button.set_sensitive(false);
                 let page = page.clone();
-                let server_id = server_id.clone();
+                let reviewed_entry = reviewed_entry.clone();
                 gtk::glib::spawn_future_local(async move {
                     let result = gtk::gio::spawn_blocking(move || {
                         let registry = crate::registry::load()?;
-                        crate::registry_controller::set_server_enabled(
-                            &registry.active_profile_id(),
-                            &server_id,
-                            true,
-                            true,
-                        )
+                        crate::registry_controller::set_server_enabled_after_reference_review(&registry.active_profile_id(), &reviewed_entry)
                     })
                     .await;
                     match result {
@@ -1662,7 +1661,10 @@ mod tests {
         button.emit_clicked();
         let timed_out = Rc::new(Cell::new(false));
         let timeout_state = timed_out.clone();
-        let timeout = gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || timeout_state.set(true));
+        let timeout =
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || {
+                timeout_state.set(true)
+            });
         let context = gtk::glib::MainContext::default();
         while page.busy.get() && !timed_out.get() { context.iteration(true); }
         if !timed_out.get() { timeout.remove(); }
@@ -1729,10 +1731,23 @@ mod tests {
 
     #[test]
     fn the_confirm_action_matches_what_the_share_will_do() {
-        let switch = selection("Linear", "Already shared", HandoffOutcome::Switched, "switches");
+        let switch = selection(
+            "Linear",
+            "Already shared",
+            HandoffOutcome::Switched,
+            "switches",
+        );
         let kept = selection("Linear", "Already shared", HandoffOutcome::Kept, "keeps");
-        let blocked = selection("Vercel", "Already shared", HandoffOutcome::Attention, "needs setup");
-        assert_eq!(share_action(&selection_preview(vec![switch.clone(), blocked.clone()])), Some("Use Team copies"));
+        let blocked = selection(
+            "Vercel",
+            "Already shared",
+            HandoffOutcome::Attention,
+            "needs setup",
+        );
+        assert_eq!(
+            share_action(&selection_preview(vec![switch.clone(), blocked.clone()])),
+            Some("Use Team copies")
+        );
         assert_eq!(share_action(&selection_preview(vec![kept, blocked])), None);
         let mut update = selection_preview(vec![switch]);
         update.changed = vec!["Linear".into()];
@@ -1782,7 +1797,11 @@ mod tests {
         }
         dialog.close();
 
-        let picker = share_choice_label("Linear", None, Some("Shared. The Team copy is in use in this profile."));
+        let picker = share_choice_label(
+            "Linear",
+            None,
+            Some("Shared. The Team copy is in use in this profile."),
+        );
         let mut text = String::new();
         collect(picker.upcast_ref(), &mut text);
         assert_eq!(text, "Linear\nShared. The Team copy is in use in this profile.\n");
