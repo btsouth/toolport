@@ -3563,7 +3563,7 @@ fn tool_fingerprint_for(name: &str, cached: &dyn ToolCatalog, router: &Router) -
         tools
             .iter()
             .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
-            .map(integrity::fingerprint)
+            .map(|tool| integrity::fingerprint(&router.policy_definition(tool)))
     };
     // Prefer the LIVE router definition (what actually dispatches) so a drifted
     // tool re-prompts instead of matching an approval bound to its stale cached
@@ -4035,7 +4035,7 @@ fn post_hitl_revalidation(
         .shared_tools()
         .iter()
         .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
-        .map(integrity::fingerprint);
+        .map(|tool| integrity::fingerprint(&live.policy_definition(tool)));
     match (approved_fingerprint, live_fp.as_deref()) {
         (Some(approved), Some(live_fp)) if approved == live_fp => {}
         // No fingerprint was capturable at gate time AND still isn't — fall through to the
@@ -9856,7 +9856,8 @@ fn requarantine_if_needed(
     profile: Option<&str>,
 ) -> SharedTools {
     let tools = tools.into();
-    match maybe_check_integrity(registry, &tools, profile) {
+    let policy_tools = built.policy_catalog(&tools);
+    match maybe_check_integrity(registry, &policy_tools, profile) {
         Ok(Some(pending)) => {
             requarantine_after_integrity_change(built, pending, integrity::quarantined(profile))
         }
@@ -24412,6 +24413,124 @@ mod tests {
             content_binding_decision(&approved, &json!({ "table": "orders", "hard": true })),
             Some(approval::ApprovalDecision::StaleState)
         );
+    }
+
+    #[test]
+    fn reserved_alias_upgrade_keeps_remembered_approval_and_revalidates_drift() {
+        for alias in [
+            "toolport_call_tool",
+            "toolport_search_tools",
+            "toolport_custom_echo",
+            "custom_echo",
+        ] {
+            let mut router = routed_router("s", "wipe");
+            router.set_overrides(HashMap::from([(
+                "s".into(),
+                HashMap::from([(
+                    "wipe".into(),
+                    registry::ToolOverride {
+                        name: Some(alias.into()),
+                        description: None,
+                        unknown_fields: Default::default(),
+                    },
+                )]),
+            )]));
+            let router = router.reindexed();
+            let exposed = if alias.starts_with("toolport_") {
+                "s__wipe"
+            } else {
+                alias
+            };
+            let mut legacy = router.aggregated_tools()[0].clone();
+            legacy["name"] = json!(alias);
+            let fingerprint = integrity::fingerprint(&legacy);
+            let key = approval::fingerprint_allow_key("s", "wipe", &fingerprint);
+            let mut reg = Registry::default();
+            reg.allow_tool(key);
+            let current = tool_fingerprint_for(exposed, &[], &router).unwrap();
+            assert!(
+                reg.is_tool_allowed(&approval::fingerprint_allow_key("s", "wipe", &current)),
+                "{alias}"
+            );
+            assert!(post_hitl_revalidation(Some(&fingerprint), exposed, "s", &router).is_none());
+            let mut drifted = router.clone();
+            drifted.set_overrides(HashMap::from([(
+                "s".into(),
+                HashMap::from([(
+                    "wipe".into(),
+                    registry::ToolOverride {
+                        name: Some(alias.into()),
+                        description: Some("changed definition".into()),
+                        unknown_fields: Default::default(),
+                    },
+                )]),
+            )]));
+            let drifted = drifted.reindexed();
+            let next = tool_fingerprint_for(exposed, &[], &drifted).unwrap();
+            assert!(!reg.is_tool_allowed(&approval::fingerprint_allow_key("s", "wipe", &next)));
+            assert_eq!(
+                post_hitl_revalidation(Some(&fingerprint), exposed, "s", &drifted),
+                Some(approval::ApprovalDecision::StaleState)
+            );
+            reg.revoke_tool(&approval::fingerprint_allow_key("s", "wipe", &fingerprint));
+            assert!(!reg.is_tool_allowed(&approval::fingerprint_allow_key("s", "wipe", &current)));
+        }
+    }
+
+    #[test]
+    fn reserved_alias_upgrade_keeps_pinned_prerequisites() {
+        let _env = DataDirTestEnv::new("reserved-alias-upgrade-pinned-prerequisites");
+        for alias in [
+            "toolport_call_tool",
+            "toolport_search_tools",
+            "toolport_custom_echo",
+            "custom_echo",
+        ] {
+            let host = dispatch_host(false);
+            let mut reg = Registry::default();
+            reg.set_tool_pinned("s", "prereq", true);
+            let mut router = routed_router("s", "prereq");
+            router.set_overrides(HashMap::from([(
+                "s".into(),
+                HashMap::from([(
+                    "prereq".into(),
+                    registry::ToolOverride {
+                        name: Some(alias.into()),
+                        description: None,
+                        unknown_fields: Default::default(),
+                    },
+                )]),
+            )]));
+            let router = router.reindexed();
+            let exposed = if alias.starts_with("toolport_") {
+                "s__prereq"
+            } else {
+                alias
+            };
+            let mut cat = router.aggregated_tools();
+            cat.push(json!({"name":"s__getItem", "description":"Get item", "inputSchema":{"type":"object"}}));
+            let response = handle_request(
+                &host,
+                &search_req("s__getItem"),
+                &reg,
+                &router,
+                &cat,
+                true,
+                None,
+                &SearchGuard::default(),
+                None,
+                None,
+            )
+            .unwrap();
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            let hits: Vec<Value> =
+                serde_json::from_str(text.split_once("\n\n").unwrap().1).unwrap();
+            assert_eq!(hits[0]["name"], exposed, "{alias}");
+            let denied = router.with_tool_allow(HashMap::from([("s".into(), HashSet::new())]));
+            assert!(denied.route_of(exposed).is_none());
+            assert!(denied.route_call(exposed, json!({})).is_err());
+            assert!(reg.is_tool_pinned("s", "prereq"));
+        }
     }
 
     /// SOU-321: prove the Arc::make_mut COW window, then that post-HITL revalidation
