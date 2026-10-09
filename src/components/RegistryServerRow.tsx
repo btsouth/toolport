@@ -110,7 +110,13 @@ export function RegistryServerRow({
   const isTeam = server.source?.startsWith("team:") ?? false;
 
   const label =
-    status === "connected"
+    status === "needs-auth"
+      ? health?.authTarget === "service_credential"
+        ? "Service credential required"
+        : health?.authTarget === "scope"
+          ? "Service permission required"
+          : "MCP endpoint auth required"
+      : status === "connected"
       ? `Ready · ${health?.toolCount ?? 0} tool${health?.toolCount === 1 ? "" : "s"}`
       : status === "error"
         ? "Error"

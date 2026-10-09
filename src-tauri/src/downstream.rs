@@ -1020,6 +1020,8 @@ static HTTP_CANCEL_THREADS_INFLIGHT: std::sync::atomic::AtomicUsize =
 /// instead of blocking every other agent queued on the same server.
 #[derive(Debug, Clone)]
 pub enum TransportError {
+    /// Typed call failure, preserving stage and auth ownership through dispatch.
+    Classified(crate::call_failure::CallFailureKind, String),
     /// Non-retryable protocol/application error: the request reached the server and it
     /// responded with an error (or the response was structurally invalid). Does NOT
     /// count against server health - a bad tool call is not a dead server.
@@ -1406,9 +1408,32 @@ impl TransportError {
         matches!(
             self,
             TransportError::Unavailable(_)
+                | TransportError::Classified(
+                    crate::call_failure::CallFailureKind::Timeout { .. }
+                        | crate::call_failure::CallFailureKind::Unavailable { .. },
+                    _
+                )
                 | TransportError::FrameRejected(_)
                 | TransportError::Retry { .. }
         )
+    }
+
+    pub fn call_failure(&self) -> crate::call_failure::CallFailure {
+        use crate::call_failure::{CallFailure, CallFailureKind as K};
+        let kind = match self {
+            Self::Classified(kind, _) => kind.clone(),
+            Self::Rpc(error) => K::rpc(error),
+            Self::Unavailable(_) | Self::FrameRejected(_) => K::Unavailable { after_send: true },
+            Self::Retry {
+                retry_after: Some(_),
+                ..
+            } => K::Quota,
+            Self::Retry { .. } => K::Unavailable { after_send: false },
+            Self::Cancelled(_) => K::Cancelled,
+            Self::Busy(_) => K::Unavailable { after_send: false },
+            Self::Fatal(_) => K::Internal,
+        };
+        CallFailure::new(kind, self.to_string())
     }
 
     /// The JSON-RPC `code`, when the failure was an error *response* from the
@@ -1440,6 +1465,9 @@ impl TransportError {
         }
 
         match self {
+            TransportError::Classified(crate::call_failure::CallFailureKind::Auth { .. }, _) => {
+                true
+            }
             TransportError::Rpc(error) => {
                 matches!(error.get("code").and_then(Value::as_i64), Some(401 | 403))
                     || error
@@ -1491,7 +1519,9 @@ impl TransportError {
 impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransportError::Fatal(msg) | TransportError::FrameRejected(msg) => write!(f, "{msg}"),
+            TransportError::Classified(_, msg)
+            | TransportError::Fatal(msg)
+            | TransportError::FrameRejected(msg) => write!(f, "{msg}"),
             // Rendered exactly as the flattened form was, so nothing user-facing
             // changes now that the error is carried structurally.
             TransportError::Rpc(err) => write!(f, "{err}"),
@@ -1557,6 +1587,33 @@ fn is_retryable_transport(t: &ureq::Transport) -> bool {
     matches!(
         t.kind(),
         ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed
+    )
+}
+
+fn http_read_error(error: std::io::Error) -> TransportError {
+    use crate::call_failure::CallFailureKind as K;
+    let kind = match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            K::Timeout { after_send: true }
+        }
+        std::io::ErrorKind::InvalidData => return TransportError::Fatal(error.to_string()),
+        _ => K::Unavailable { after_send: true },
+    };
+    TransportError::Classified(kind, error.to_string())
+}
+
+fn http_transport_io_error(error: &ureq::Transport) -> TransportError {
+    use std::error::Error;
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return http_read_error(std::io::Error::new(io.kind(), error.to_string()));
+        }
+        source = cause.source();
+    }
+    TransportError::Classified(
+        crate::call_failure::CallFailureKind::Unavailable { after_send: true },
+        error.to_string(),
     )
 }
 
@@ -3820,9 +3877,10 @@ impl StdioCore {
                                 .to_string(),
                         ));
                     }
-                    return Err(TransportError::Unavailable(format!(
-                        "timed out waiting for '{method}' response"
-                    )));
+                    return Err(TransportError::Classified(
+                        crate::call_failure::CallFailureKind::Timeout { after_send: true },
+                        format!("timed out waiting for '{method}' response"),
+                    ));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(TransportError::Unavailable(
@@ -5715,6 +5773,7 @@ pub struct HttpTransport {
     deadline: Option<Instant>,
     auth_gate: Arc<HttpAuthGate>,
     wire_cancel: Option<HttpCancelSignal>,
+    send_started: Option<Arc<AtomicBool>>,
     server_handler: Option<ServerRequestHandler>,
     /// Open legacy SSE response suspended while a modern upstream client
     /// fulfills a server-initiated request in a separate round trip.
@@ -5872,6 +5931,8 @@ impl ConcurrentTransport for HttpCallTransport {
         let context = request_context();
         let deadline = Instant::now() + owned.request_timeout;
         owned.deadline = Some(deadline);
+        let send_started = Arc::new(AtomicBool::new(owned.pending_mrtr.is_some()));
+        owned.send_started = Some(Arc::clone(&send_started));
         let mut retired = Vec::new();
         let mut continuation_error = None;
         let mut suspended_since = None;
@@ -6056,7 +6117,12 @@ impl ConcurrentTransport for HttpCallTransport {
                         "HTTP request cancelled by upstream client".into(),
                     ))
                 } else {
-                    Err(TransportError::Fatal("HTTP request timed out".into()))
+                    Err(TransportError::Classified(
+                        crate::call_failure::CallFailureKind::Timeout {
+                            after_send: send_started.load(Ordering::Acquire),
+                        },
+                        "HTTP request timed out".into(),
+                    ))
                 };
             }
             match receiver.recv_timeout(
@@ -6295,6 +6361,7 @@ impl HttpTransport {
             deadline: None,
             auth_gate: Arc::new(HttpAuthGate::default()),
             wire_cancel: None,
+            send_started: None,
             server_handler: None,
             pending_mrtr: None,
             resource_updated: None,
@@ -6407,6 +6474,7 @@ impl HttpTransport {
             deadline: self.deadline,
             auth_gate: Arc::clone(&self.auth_gate),
             wire_cancel: self.wire_cancel.clone(),
+            send_started: self.send_started.clone(),
             server_handler: self.server_handler.clone(),
             pending_mrtr: None,
             resource_updated: self.resource_updated.clone(),
@@ -6654,7 +6722,12 @@ impl HttpTransport {
                     if crate::remote::is_refresh_storage_or_lock_error(&error)
                         && !crate::remote::is_refresh_lock_error(&error)
                     {
-                        return Err(TransportError::Fatal(error));
+                        return Err(TransportError::Classified(
+                            crate::call_failure::CallFailureKind::Auth {
+                                target: crate::call_failure::AuthTarget::OAuthRefresh,
+                            },
+                            error,
+                        ));
                     }
                 }
                 Ok(None) => {}
@@ -6746,13 +6819,21 @@ impl HttpTransport {
             .as_ref()
         {
             if failure.token == rejected && rejected_at <= failure.recorded_at {
-                return Err(TransportError::Fatal(failure.error.clone()));
+                return Err(TransportError::Classified(
+                    crate::call_failure::CallFailureKind::Auth {
+                        target: crate::call_failure::AuthTarget::OAuthRefresh,
+                    },
+                    failure.error.clone(),
+                ));
             }
         }
         let Some(refresh) = self.refresh.as_ref() else {
-            return Err(TransportError::Fatal(format!(
-                "HTTP {code} (needs authentication): no refresh callback configured"
-            )));
+            return Err(TransportError::Classified(
+                crate::call_failure::CallFailureKind::Auth {
+                    target: crate::call_failure::AuthTarget::OAuthRefresh,
+                },
+                format!("HTTP {code} (needs authentication): no refresh callback configured"),
+            ));
         };
         if self.forced_refresh_spent() {
             // Adoption is still allowed after spending the exchange budget. This
@@ -6760,9 +6841,12 @@ impl HttpTransport {
             if self.reuse_stored_auth(&rejected)? {
                 return Ok(());
             }
-            return Err(TransportError::Fatal(format!(
-                "HTTP {code} (needs authentication): refreshed token rejected"
-            )));
+            return Err(TransportError::Classified(
+                crate::call_failure::CallFailureKind::Auth {
+                    target: crate::call_failure::AuthTarget::OAuthRefresh,
+                },
+                format!("HTTP {code} (needs authentication): refreshed token rejected"),
+            ));
         }
         let result = match refresh(true, rejected.as_deref()) {
             Ok(Some(token)) => {
@@ -6776,7 +6860,12 @@ impl HttpTransport {
             Err(e) => format!("HTTP {code} (needs authentication): token refresh failed: {e}"),
         };
         self.record_refresh_failure(rejected, result.clone());
-        Err(TransportError::Fatal(result))
+        Err(TransportError::Classified(
+            crate::call_failure::CallFailureKind::Auth {
+                target: crate::call_failure::AuthTarget::OAuthRefresh,
+            },
+            result,
+        ))
     }
 
     fn auth_gate_lock(&self) -> Result<HttpAuthGuard<'_>, TransportError> {
@@ -6828,12 +6917,12 @@ impl HttpTransport {
             .map(|scope| canonical_scope_set(&scope))
             .filter(|scope| !scope.is_empty())
             .ok_or_else(|| {
-                TransportError::Fatal(format!(
+                TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::Endpoint }, format!(
                     "HTTP {code} (needs authentication): OAuth reported insufficient_scope without the required scope"
                 ))
             })?;
         let callback = self.scope_reauthorize.as_ref().ok_or_else(|| {
-            TransportError::Fatal(format!("HTTP {code} (needs authentication): OAuth scope '{required_scope}' requires interactive authorization"))
+            TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::Endpoint }, format!("HTTP {code} (needs authentication): OAuth scope '{required_scope}' requires interactive authorization"))
         })?;
         let _gate = self.auth_gate_lock()?;
         if *self
@@ -6848,14 +6937,21 @@ impl HttpTransport {
         let first_attempt = self
             .scope_upgrade_attempts
             .lock()
-            .map_err(|_| TransportError::Fatal("OAuth scope-attempt lock poisoned".into()))?
+            .map_err(|_| {
+                TransportError::Classified(
+                    crate::call_failure::CallFailureKind::Auth {
+                        target: crate::call_failure::AuthTarget::Endpoint,
+                    },
+                    "OAuth scope-attempt lock poisoned".into(),
+                )
+            })?
             .insert(attempt_key);
         if !first_attempt {
-            return Err(TransportError::Fatal(format!("HTTP {code} (needs authentication): OAuth scope '{required_scope}' was already requested for {operation} and remains insufficient")));
+            return Err(TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::Endpoint }, format!("HTTP {code} (needs authentication): OAuth scope '{required_scope}' was already requested for {operation} and remains insufficient")));
         }
         let token = callback(&required_scope)
             .map_err(|e| {
-                TransportError::Fatal(format!(
+                TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::Endpoint }, format!(
                     "HTTP {code} (needs authentication): OAuth scope authorization failed for '{required_scope}': {e}"
                 ))
             })?;
@@ -7046,7 +7142,7 @@ impl HttpTransport {
             let mut bytes = Vec::new();
             let remaining = MAX_RESPONSE_BYTES.saturating_sub(bytes_read) as usize;
             let n = read_downstream_frame(&mut reader, &mut bytes, remaining, Some(b'\n'))
-                .map_err(|error| TransportError::Fatal(error.to_string()))?;
+                .map_err(http_read_error)?;
             let line = String::from_utf8(bytes).map_err(|error| {
                 TransportError::Fatal(format!("SSE response was not UTF-8: {error}"))
             })?;
@@ -7121,7 +7217,8 @@ impl HttpTransport {
                 }
             }
         }
-        Err(TransportError::Fatal(
+        Err(TransportError::Classified(
+            crate::call_failure::CallFailureKind::Unavailable { after_send: true },
             "no matching message in SSE stream".to_string(),
         ))
     }
@@ -7241,6 +7338,9 @@ impl HttpTransport {
             if let Some(deadline) = self.deadline {
                 req = req.timeout(deadline.saturating_duration_since(Instant::now()));
             }
+            if let Some(started) = &self.send_started {
+                started.store(true, Ordering::Release);
+            }
             let response = req.send_string(&payload);
             // Cancellation wins even when the socket becomes readable at the same
             // instant. In particular, never launch scope reauthorization or rotate
@@ -7306,9 +7406,10 @@ impl HttpTransport {
                     } else {
                         ""
                     };
-                    return Err(TransportError::Fatal(format!(
-                        "HTTP {code}{hint}: {detail}"
-                    )));
+                    return Err(TransportError::Classified(
+                        crate::call_failure::CallFailureKind::http_status(code, true),
+                        format!("HTTP {code}{hint}: {detail}"),
+                    ));
                 }
                 // Transport error (DNS / connection failure): retryable, but
                 // the Router owns the backoff sleep so the Mutex is released.
@@ -7317,6 +7418,9 @@ impl HttpTransport {
                         retry_after: None,
                         message: format!("transport error (retryable): {t}"),
                     });
+                }
+                Err(ureq::Error::Transport(t)) if t.kind() == ureq::ErrorKind::Io => {
+                    return Err(http_transport_io_error(&t));
                 }
                 Err(e) => return Err(TransportError::Fatal(e.to_string())),
             }
@@ -7349,7 +7453,7 @@ impl HttpTransport {
         let mut reader = BufReader::new(resp.into_reader());
         let mut bytes = Vec::new();
         read_downstream_frame(&mut reader, &mut bytes, MAX_RESPONSE_BYTES as usize, None)
-            .map_err(|error| TransportError::Fatal(error.to_string()))?;
+            .map_err(http_read_error)?;
         let response: Value = serde_json::from_slice(&bytes)
             .map_err(|e| TransportError::Fatal(format!("bad JSON response: {e}")))?;
         if !http_response_id_matches(&response, body.get("id")) {

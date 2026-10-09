@@ -196,6 +196,7 @@ export interface ProbeResult {
   error: string | null;
   /** Failure looks like missing credentials (remote 401/403, or unvaulted secret). */
   authRequired: boolean;
+  authTarget?: "endpoint" | "service_credential" | "scope" | "o_auth_refresh" | null;
 }
 
 /** A tool as advertised by a downstream MCP server (raw `tools/list` entry). */

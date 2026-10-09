@@ -5,6 +5,7 @@ pub mod audit;
 pub mod autostart;
 pub mod brand;
 pub mod catalog;
+pub mod call_failure;
 pub mod child_ledger;
 pub mod clients;
 pub mod tool_definitions;

@@ -22,6 +22,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde_json::{json, Value};
 
+use crate::call_failure::{CallFailure, CallFailureKind};
 use crate::downstream::{
     backoff_delay, is_implausible_shrink, CacheHint, CancelContext, DownstreamServer, MrtrRequest,
     ServerDispatch, TransportError, HTTP_MAX_RETRIES, HTTP_RETRY_CAP,
@@ -1149,6 +1150,7 @@ impl ReplayPolicy {
     fn uncertain_failure<'a>(self, error: &'a TransportError) -> Option<&'a TransportError> {
         match (self, error) {
             (Self::NoAmbiguousReplay, TransportError::Unavailable(_)) => Some(error),
+            (_, TransportError::Classified(kind, _)) if kind.uncertain() => Some(error),
             _ => None,
         }
     }
@@ -3253,15 +3255,56 @@ impl Router {
         dispatch_cancelled_continuation: bool,
         replay_policy: ReplayPolicy,
         access: SlotAccess,
-        mut f: F,
+        f: F,
     ) -> Result<T, String>
     where
         F: FnMut(&mut dyn ServerDispatch) -> Result<T, TransportError>,
     {
+        self.call_with_retry_typed(
+            slot,
+            cancel,
+            dispatch_cancelled_continuation,
+            replay_policy,
+            access,
+            f,
+        )
+        .map_err(|failure| failure.to_string())
+    }
+
+    fn call_with_retry_typed<T, F>(
+        &self,
+        slot: &Arc<ServerSlot>,
+        cancel: Option<&CancelContext>,
+        dispatch_cancelled_continuation: bool,
+        replay_policy: ReplayPolicy,
+        access: SlotAccess,
+        mut f: F,
+    ) -> Result<T, CallFailure>
+    where
+        F: FnMut(&mut dyn ServerDispatch) -> Result<T, TransportError>,
+    {
         if !dispatch_cancelled_continuation && cancel.is_some_and(CancelContext::is_cancelled) {
-            return Err("request cancelled before downstream attempt".to_string());
+            return Err(CallFailure::new(
+                CallFailureKind::Cancelled,
+                "request cancelled before downstream attempt",
+            ));
         }
-        slot.wait_for_start(cancel, dispatch_cancelled_continuation)?;
+        slot.wait_for_start(cancel, dispatch_cancelled_continuation)
+            .map_err(|detail| {
+                CallFailure::new(
+                    if slot
+                        .status()
+                        .is_some_and(|status| status.needs_auth)
+                    {
+                        CallFailureKind::Auth {
+                            target: crate::call_failure::AuthTarget::Endpoint,
+                        }
+                    } else {
+                        CallFailureKind::Unavailable { after_send: false }
+                    },
+                    detail,
+                )
+            })?;
         // Circuit breaker: a server that just failed repeatedly is fast-failed here,
         // BEFORE taking its `inner` lock, so a dead/hung server neither pays its full
         // read timeout again nor queues callers behind an in-flight timing-out call.
@@ -3278,7 +3321,7 @@ impl Router {
                     "server '{}' is temporarily unavailable (too many recent failures; retrying in {}s)",
                     slot.id,
                     remaining.as_secs() + 1
-                ));
+                ).into());
             }
             // Cooldown elapsed but the failure streak is still at/over threshold: this
             // call is the half-open probe of a tripped breaker.
@@ -3309,12 +3352,18 @@ impl Router {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .record_failure(Instant::now());
-            return Err(format!("{reason}; downstream reconnect required"));
+            return Err(CallFailure::new(
+                CallFailureKind::Unavailable { after_send: false },
+                format!("{reason}; downstream reconnect required"),
+            ));
         }
         let mut attempt = 0u32;
         loop {
             if !dispatch_cancelled_continuation && cancel.is_some_and(CancelContext::is_cancelled) {
-                return Err("request cancelled before downstream attempt".to_string());
+                return Err(CallFailure::new(
+                    CallFailureKind::Cancelled,
+                    "request cancelled before downstream attempt",
+                ));
             }
             let generation = slot.generation.load(Ordering::Acquire);
             let successes = slot.successes.load(Ordering::Acquire);
@@ -3340,7 +3389,7 @@ impl Router {
                 }) if attempt < HTTP_MAX_RETRIES => {
                     let wait = retry_wait(retry_after, attempt);
                     eprintln!("toolport: retrying downstream call after {wait:?}: {message}");
-                    wait_for_retry_or_cancel(wait, cancel).map_err(|error| error.to_string())?;
+                    wait_for_retry_or_cancel(wait, cancel).map_err(|error| error.call_failure())?;
                     attempt += 1;
                 }
                 Err(e) => {
@@ -3351,7 +3400,7 @@ impl Router {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .record_concurrent_failure(started, Instant::now());
-                        return Err(e.to_string());
+                        return Err(e.call_failure());
                     }
                     // Only a health failure (timeout / dead connection / exhausted
                     // retries) counts toward the breaker; a normal error response does
@@ -3366,7 +3415,7 @@ impl Router {
                             if replay_policy.uncertain_failure(&e).is_some() {
                                 message.push_str(". The previous operation may have completed; check before retrying it.");
                             }
-                            return Err(message);
+                            return Err(CallFailure::new(e.call_failure().kind, message));
                         }
                         // The server has now failed for a full cooldown and the probe
                         // confirms it's still down. Re-spawn the connection once and
@@ -3381,9 +3430,10 @@ impl Router {
                         // ends every call in flight. The last of them to fail does it.
                         if is_probe && Self::respawn_after_failure(slot, successes) {
                             if cancel.is_some_and(CancelContext::is_cancelled) {
-                                return Err(
-                                    "request cancelled before downstream reconnect".to_string()
-                                );
+                                return Err(CallFailure::new(
+                                    CallFailureKind::Cancelled,
+                                    "request cancelled before downstream reconnect",
+                                ));
                             }
                             if let Some(v) = self.reconnect_and_retry(
                                 slot,
@@ -3402,7 +3452,7 @@ impl Router {
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .record_concurrent_failure(started, Instant::now());
                     }
-                    return Err(e.to_string());
+                    return Err(e.call_failure());
                 }
             }
         }
@@ -3508,7 +3558,7 @@ impl Router {
         successes: u64,
         access: SlotAccess,
         f: &mut F,
-    ) -> Option<Result<T, String>>
+    ) -> Option<Result<T, CallFailure>>
     where
         F: FnMut(&mut dyn ServerDispatch) -> Result<T, TransportError>,
     {
@@ -3530,7 +3580,7 @@ impl Router {
                     "server '{}' is temporarily unavailable (too many recent failures; retrying in {}s)",
                     slot.id,
                     remaining.as_secs() + 1
-                )));
+                ).into()));
             }
             if slot.generation.load(Ordering::Acquire) == generation {
                 eprintln!("toolport: server '{}' is down; re-spawning it", slot.id);
@@ -3542,9 +3592,10 @@ impl Router {
                     return None; // still unreachable: fall through to record_failure
                 };
                 if cancel.is_some_and(CancelContext::is_cancelled) {
-                    return Some(Err(
-                        "request cancelled before retrying the reconnected downstream".to_string(),
-                    ));
+                    return Some(Err(CallFailure::new(
+                        CallFailureKind::Cancelled,
+                        "request cancelled before retrying the reconnected downstream",
+                    )));
                 }
                 // Swap the live child/connection for the fresh one.
                 let mut server = slot
@@ -3575,12 +3626,13 @@ impl Router {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .record_success();
-            return Some(Err(error.to_string()));
+            return Some(Err(error.call_failure()));
         }
         if cancel.is_some_and(CancelContext::is_cancelled) {
-            return Some(Err(
-                "request cancelled before retrying the reconnected downstream".to_string(),
-            ));
+            return Some(Err(CallFailure::new(
+                CallFailureKind::Cancelled,
+                "request cancelled before retrying the reconnected downstream",
+            )));
         }
         let (retry, started) = Self::attempt(slot, access, cancel, f);
         if retry.is_ok() {
@@ -3600,7 +3652,7 @@ impl Router {
                 if e.is_health_failure() {
                     breaker.record_concurrent_failure(started, Instant::now());
                 }
-                Err(e.to_string())
+                Err(e.call_failure())
             }
         })
     }
@@ -3634,17 +3686,39 @@ impl Router {
         meta: Option<&Value>,
         mrtr: Option<&MrtrRequest>,
     ) -> Result<Value, String> {
+        self.route_call_typed(exposed_name, arguments, cancel, meta, mrtr)
+            .map_err(|failure| failure.to_string())
+    }
+
+    pub fn route_call_typed(
+        &self,
+        exposed_name: &str,
+        arguments: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, CallFailure> {
         self.authorize(DispatchTarget::Tool(exposed_name))?;
-        let (server_id, tool) = self
-            .routes
-            .get(exposed_name)
-            .ok_or_else(|| self.no_route_message(exposed_name))?;
+        let (server_id, tool) = self.routes.get(exposed_name).ok_or_else(|| {
+            CallFailure::new(
+                CallFailureKind::NotFound,
+                self.no_route_message(exposed_name),
+            )
+        })?;
         let mut arguments = arguments;
         if let Some(plan) = self.schema_arguments.get(exposed_name) {
-            plan.restore(&mut arguments)?;
+            plan.restore(&mut arguments).map_err(|detail| {
+                CallFailure::new(
+                    CallFailureKind::InvalidInput {
+                        missing: vec![],
+                        invalid: vec![],
+                    },
+                    detail,
+                )
+            })?;
         }
         let slot = self.authorized_slot(server_id)?;
-        let (result, downstream_supports_tasks) = self.call_with_retry(
+        let (result, downstream_supports_tasks) = self.call_with_retry_typed(
             &slot,
             cancel.as_ref(),
             mrtr.is_some_and(|request| !request.is_empty()),
@@ -3662,16 +3736,19 @@ impl Router {
         if result.get("resultType").and_then(Value::as_str) == Some("task") {
             if !client_supports_tasks(meta) {
                 return Err(
-                    "downstream returned a task without the required client capability".to_string(),
+                    "downstream returned a task without the required client capability"
+                        .to_string()
+                        .into(),
                 );
             }
             if !downstream_supports_tasks {
                 return Err(
                     "downstream returned a task without advertising the Tasks extension"
-                        .to_string(),
+                        .to_string()
+                        .into(),
                 );
             }
-            expose_task_result(result, server_id)
+            expose_task_result(result, server_id).map_err(Into::into)
         } else {
             Ok(result)
         }

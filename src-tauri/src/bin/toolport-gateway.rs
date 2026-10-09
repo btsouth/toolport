@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 use conduit_lib::approval;
 use conduit_lib::approval::new_correlation_id;
 use conduit_lib::audit;
+use conduit_lib::call_failure::{CallFailure, CallFailureKind};
 use conduit_lib::clients;
 use conduit_lib::codemode;
 use conduit_lib::codemode_worker as worker;
@@ -3361,18 +3362,35 @@ fn source_tool_hints(
     hits.into_iter().map(|(_, n)| n).take(max).collect()
 }
 
-/// A one-line recovery hint naming sibling list/get tools, appended when a call
-/// fails so the model can source a missing/invalid identifier and retry.
-fn recovery_hint(catalog: &dyn ToolCatalog, server: &str) -> String {
-    let hints = source_tool_hints(catalog, server, None, 3);
-    if hints.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " If a required identifier was missing or wrong, get valid values from one of these on '{server}', then retry: {}.",
-            hints.join(", ")
-        )
+/// Trusted, bounded guidance appended only after defending downstream content.
+fn recovery_hint(
+    catalog: &dyn ToolCatalog,
+    server: &str,
+    name: &str,
+    arguments: &Value,
+    kind: CallFailureKind,
+) -> String {
+    let tool = catalog
+        .iter()
+        .find(|tool| tool["name"].as_str() == Some(name));
+    let kind = tool.and_then(|tool| tool.get("inputSchema")).map_or_else(
+        || kind.clone(),
+        |schema| kind.clone().with_schema(schema, arguments),
+    );
+    let read_only = tool
+        .and_then(|tool| tool.pointer("/annotations/readOnlyHint"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let mut text = format!(" {}", kind.guidance(read_only));
+    if kind.identifier_failure() {
+        let hints = source_tool_hints(catalog, server, None, 2);
+        // Long tool names must not expand every failure's context budget.
+        let hints: Vec<_> = hints.into_iter().filter(|hint| hint.len() <= 64).collect();
+        if !hints.is_empty() {
+            text.push_str(&format!(" Find IDs: {}.", hints.join(", ")));
+        }
     }
+    text
 }
 
 /// The server prefix of a namespaced tool name (`server__tool`). This is the
@@ -4759,14 +4777,9 @@ fn execute_call(
         cancel.as_ref(),
         effective_mrtr.is_some_and(|request| !request.is_empty()),
     );
-    match live_policy.and_then(|()| {
-        exec_router.route_call_with_cancel_and_mrtr(
-            name,
-            arguments,
-            cancel.clone(),
-            client_meta,
-            effective_mrtr,
-        )
+    let guidance_arguments = arguments.clone();
+    match live_policy.map_err(CallFailure::from).and_then(|()| {
+        exec_router.route_call_typed(name, arguments, cancel.clone(), client_meta, effective_mrtr)
     }) {
         Ok(mut result) => {
             if let Some(profiler) = &mut call_profiler {
@@ -4801,7 +4814,13 @@ fn execute_call(
             let trailer = if raw_ok {
                 String::new()
             } else {
-                recovery_hint(cached, srv)
+                recovery_hint(
+                    cached,
+                    srv,
+                    name,
+                    &guidance_arguments,
+                    CallFailureKind::tool_result(&result),
+                )
             };
             let Defended { result: out, pii } =
                 defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
@@ -4833,7 +4852,9 @@ fn execute_call(
             }
             out
         }
-        Err(e) => {
+        Err(failure) => {
+            let trailer = recovery_hint(cached, srv, name, &guidance_arguments, failure.kind);
+            let e = failure.detail;
             finish_modern_hitl(active_modern_hitl.as_deref());
             let ms = started.elapsed().as_millis() as u64;
             // Live inspection: capture the failed call too, with the error
@@ -4854,15 +4875,8 @@ fn execute_call(
             // Defend first, then audit: the error text runs through the same PII pass as
             // a successful result, and the audit row has to carry that pass's count like
             // the success path does (SBS-607).
-            let Defended { result: out, pii } = defend_and_shape(
-                reg,
-                srv,
-                tool,
-                client,
-                result,
-                &recovery_hint(cached, srv),
-                shape,
-            );
+            let Defended { result: out, pii } =
+                defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
             let defended_err = audited_error_text(&e, &out);
             audit::record_routed_call(
                 reg,

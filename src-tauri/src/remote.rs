@@ -1476,6 +1476,7 @@ impl Redaction {
     fn error(&self, error: crate::downstream::TransportError) -> crate::downstream::TransportError {
         use crate::downstream::TransportError as E;
         match error {
+            E::Classified(kind, message) => E::Classified(kind, self.text(message)),
             E::Fatal(message) => E::Fatal(self.text(message)),
             E::FrameRejected(message) => E::FrameRejected(self.text(message)),
             E::Unavailable(message) => E::Unavailable(self.text(message)),
