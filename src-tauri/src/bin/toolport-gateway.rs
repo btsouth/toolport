@@ -6914,7 +6914,7 @@ fn handle_request_with_cancel(
             };
             let mut tools = tool_surface(host, reg, router, &catalog, allowed, mode);
             if mode == DiscoveryMode::Full && full_discovery_fallback(client) {
-                tools.extend([search_tool_def(), call_tool_def()]);
+                tools.splice(2..2, [search_tool_def(), call_tool_def()]);
             }
             if mode != DiscoveryMode::Full {
                 let full = tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Full);
