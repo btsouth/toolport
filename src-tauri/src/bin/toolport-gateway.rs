@@ -7491,7 +7491,8 @@ fn handle_request_with_cancel(
                              `server` prefix; otherwise call toolport_status to see the available prefixes."
                         .to_string(),
                 };
-                let instruction = "Pick by description; call with toolport_call_tool, or search an exact name for its full schema.";
+                let instruction =
+                    "Pick by description; call it, or search its exact name for the full schema.";
                 let lead = if total == 0 && !matches.is_empty() {
                     format!("No direct tools matched{scope}. These are bounded fallback candidates. {instruction} {exhaustive_hint}")
                 } else if matches.is_empty() {
@@ -7566,18 +7567,17 @@ fn handle_request_with_cancel(
                         row
                     })
                     .collect();
-                let text = format!(
-                    "{lead}\n\n{}",
-                    // This JSON is model input, not a human-facing log. Compact encoding
-                    // preserves every field and the complete top schema while avoiding
-                    // spending tokens on indentation and line breaks on every search.
-                    if exact {
-                        serde_json::to_string(&matches)
-                    } else {
-                        serde_json::to_string(&menu)
-                    }
-                    .unwrap_or_default()
-                );
+                // Count the exact serialized menu sent to the client, not the
+                // internal object representation used for ranking and telemetry.
+                let payload = if exact {
+                    serde_json::to_string(&matches)
+                } else {
+                    serde_json::to_string(&menu)
+                }
+                .unwrap_or_default();
+                let matched_schema_bytes = payload.len() as u64;
+                let text = format!("{lead}\n\n{payload}");
+                drop(payload);
                 let mut search_result = json!({ "content": [{ "type": "text", "text": text }], "isError": false, "low_confidence": low_confidence });
                 // A menu must keep every selected candidate visible. Only explicit
                 // describe requests page a large complete definition.
@@ -7587,7 +7587,6 @@ fn handle_request_with_cancel(
                 let response_content_bytes = search_result["content"][0]["text"]
                     .as_str()
                     .map_or(0, str::len) as u64;
-                let matched_schema_bytes = savings::surface_bytes(&matches);
                 let catalog_schema_bytes = 2
                     + source.len().saturating_sub(1) as u64
                     + search_index
@@ -38792,8 +38791,8 @@ mod tests {
         assert!(text.contains("stripe__list_charges"));
         assert_eq!(resp["result"]["isError"], false);
         assert!(text.contains("Pick by description"));
-        assert!(text.contains("call with toolport_call_tool"));
-        assert!(text.contains("search an exact name"));
+        assert!(text.contains("call it"));
+        assert!(text.contains("search its exact name"));
         let (_, payload) = text
             .split_once("\n\n")
             .expect("guidance and compact JSON payload");
