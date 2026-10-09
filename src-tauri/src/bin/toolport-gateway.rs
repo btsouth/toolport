@@ -7147,15 +7147,46 @@ fn handle_request_with_cancel(
                             status.id,
                             status.describe()
                         ),
-                        None
-                            if server.is_none()
-                                && (router.pending_statuses().iter().any(|status| {
-                                    allowed.is_none_or(|set| server_in_allowed_scope(&status.id, set))
-                                }) || router.any_publishing_first_catalog(|id| {
-                                    allowed.is_none_or(|set| server_in_allowed_scope(id, set))
-                                })) =>
-                        {
-                            "Servers are still connecting. Retry or check toolport_status.".into()
+                        None if server.is_none() => {
+                            let visible = |id: &str| {
+                                allowed.is_none_or(|set| server_in_allowed_scope(id, set))
+                            };
+                            let pending: Vec<_> = router
+                                .pending_statuses()
+                                .into_iter()
+                                .filter(|status| visible(&status.id))
+                                .collect();
+                            let connecting = pending.iter().any(|status| status.connecting)
+                                || router.any_publishing_first_catalog(visible);
+                            let mut text = if connecting {
+                                "Servers are still connecting. Retry shortly or check toolport_status."
+                                    .to_string()
+                            } else {
+                                format!("No tools matched{scope}. {exhaustive_hint}")
+                            };
+                            let unavailable: Vec<_> =
+                                pending.iter().filter(|status| !status.connecting).collect();
+                            if !unavailable.is_empty() {
+                                let mut states = unavailable
+                                    .iter()
+                                    .take(3)
+                                    .map(|status| {
+                                        let state = if status.needs_auth {
+                                            "needs sign-in"
+                                        } else {
+                                            "retrying"
+                                        };
+                                        format!("{} ({state})", status.id)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                if unavailable.len() > 3 {
+                                    states
+                                        .push_str(&format!(" and {} more", unavailable.len() - 3));
+                                }
+                                text.push_str(&format!(" Unavailable: {states}."));
+                            }
+                            text
                         }
                         None => format!("No tools matched{scope}. {exhaustive_hint}"),
                     }
@@ -22398,6 +22429,154 @@ mod tests {
             !starting,
             "saved catalog discovery started a stopped server"
         );
+    }
+
+    fn reviewed_no_match_router(failures: &[(&str, bool)]) -> Router {
+        let mut router = Router::new();
+        for &(id, needs_auth) in failures {
+            router.add_supervised(
+                id.into(),
+                Vec::new(),
+                Arc::new(move || {
+                    Err(ConnectFailure {
+                        message: "HTTP 401 secret-token private-stderr".into(),
+                        needs_auth,
+                    })
+                }),
+                ReconnectBackoff {
+                    base: Duration::from_secs(60),
+                    cap: Duration::from_secs(60),
+                },
+                json!({"revision":1}),
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut seen = started_supervisors();
+            router.prepare_lazy_use(id);
+            while router.any_starting(|_| true) && Instant::now() < deadline {
+                seen = wait_for_started_supervisor(seen, deadline);
+            }
+            assert!(!router.any_starting(|_| true));
+        }
+        router
+    }
+
+    fn reviewed_no_match_text(router: &Router, allowed: Option<&HashSet<String>>) -> String {
+        let reply = handle_request(
+            &dispatch_host(false),
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"toolport_search_tools","arguments":{"query":"absent"}}}),
+            &Registry::default(),
+            router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            allowed,
+            None,
+        ).unwrap();
+        let text = reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!text.contains("secret-token"), "{text}");
+        assert!(!text.contains("private-stderr"), "{text}");
+        text
+    }
+
+    #[test]
+    fn reviewed_unscoped_no_match_needs_auth_does_not_request_retry() {
+        let _env = DataDirTestEnv::new("reviewed-no-match-auth");
+        let router = reviewed_no_match_router(&[("auth", true)]);
+        let text = reviewed_no_match_text(&router, None);
+        assert!(text.contains("No tools matched."), "{text}");
+        assert!(text.contains("auth (needs sign-in)"), "{text}");
+        assert!(text.contains("empty query"), "{text}");
+        assert!(!text.contains("still connecting"), "{text}");
+        assert!(!text.contains("Retry"), "{text}");
+    }
+
+    #[test]
+    fn reviewed_unscoped_no_match_backoff_does_not_request_retry() {
+        let _env = DataDirTestEnv::new("reviewed-no-match-backoff");
+        let router = reviewed_no_match_router(&[("flaky", false)]);
+        let text = reviewed_no_match_text(&router, None);
+        assert!(text.contains("No tools matched."), "{text}");
+        assert!(text.contains("flaky (retrying)"), "{text}");
+        assert!(text.contains("empty query"), "{text}");
+        assert!(!text.contains("still connecting"), "{text}");
+        assert!(!text.contains("Retry"), "{text}");
+    }
+
+    #[test]
+    fn reviewed_unscoped_no_match_caps_mixed_unavailable_servers() {
+        let _env = DataDirTestEnv::new("reviewed-no-match-cap");
+        let router = reviewed_no_match_router(&[
+            ("auth", true),
+            ("flaky", false),
+            ("third", true),
+            ("fourth", false),
+            ("fifth", true),
+        ]);
+        let text = reviewed_no_match_text(&router, None);
+        assert!(text.ends_with("Unavailable: auth (needs sign-in), flaky (retrying), third (needs sign-in) and 2 more.\n\n[]"), "{text}");
+        assert!(!text.contains("fourth"), "{text}");
+        assert!(!text.contains("fifth"), "{text}");
+        assert!(!text.contains("still connecting"), "{text}");
+        assert!(!text.contains("Retry"), "{text}");
+    }
+
+    #[test]
+    fn reviewed_unscoped_no_match_waits_for_first_catalog_publication() {
+        let _env = DataDirTestEnv::new("reviewed-no-match-publication");
+        let router = counting_cache_supervisor("publishing", Vec::new(), &Arc::new(AtomicUsize::new(0)));
+        router.prepare_lazy_use("publishing");
+        wait_for_supervisor_result(&router);
+        assert!(router.any_publishing_first_catalog(|_| true));
+        assert!(router.pending_statuses().iter().all(|status| !status.connecting));
+        let text = reviewed_no_match_text(&router, None);
+        assert_eq!(text, "Servers are still connecting. Retry shortly or check toolport_status.\n\n[]");
+        let text = reviewed_no_match_text(&router, Some(&HashSet::new()));
+        assert!(text.starts_with("No tools matched."), "{text}");
+        assert!(!text.contains("still connecting"), "{text}");
+        assert!(!text.contains("publishing"), "{text}");
+    }
+
+    #[test]
+    fn reviewed_unscoped_no_match_mixed_connecting_and_unavailable() {
+        let _env = DataDirTestEnv::new("reviewed-no-match-mixed");
+        let mut router = reviewed_no_match_router(&[("auth", true), ("flaky", false)]);
+        let release = hanging_supervisor(&mut router, "late");
+        router.prepare_lazy_use("late");
+        let text = reviewed_no_match_text(&router, None);
+        assert!(
+            text.starts_with("Servers are still connecting. Retry shortly"),
+            "{text}"
+        );
+        assert!(
+            text.contains("auth (needs sign-in), flaky (retrying)"),
+            "{text}"
+        );
+        drop(release);
+    }
+
+    #[test]
+    fn reviewed_unscoped_no_match_filters_unavailable_and_connecting_scope() {
+        let _env = DataDirTestEnv::new("reviewed-no-match-scope");
+        let mut router = reviewed_no_match_router(&[
+            ("auth", true),
+            ("private-auth", true),
+            ("private-flaky", false),
+        ]);
+        let release = hanging_supervisor(&mut router, "private-late");
+        router.prepare_lazy_use("private-late");
+        let allowed = HashSet::from(["auth".to_string()]);
+        let text = reviewed_no_match_text(&router, Some(&allowed));
+        assert!(text.contains("auth (needs sign-in)"), "{text}");
+        assert!(!text.contains("private"), "{text}");
+        assert!(!text.contains("still connecting"), "{text}");
+        assert!(!text.contains("Retry"), "{text}");
+        let text = reviewed_no_match_text(&router, Some(&HashSet::new()));
+        assert_eq!(text, "No tools matched. If you know the target server, search again with an empty query and its server prefix; otherwise call toolport_status to see the available prefixes.\n\n[]");
+        drop(release);
     }
 
     #[test]
