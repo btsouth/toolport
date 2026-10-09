@@ -848,6 +848,26 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn fake_fixture_publication_is_safe_during_concurrent_spawns() {
+        std::thread::scope(|threads| {
+            for _ in 0..16 {
+                threads.spawn(|| {
+                    let tmp = Scratch::new();
+                    let p = &PROVIDERS[0];
+                    for _ in 0..4 {
+                        let binary = tmp.fake(p.binary, "printf 'synthetic-ref-value'");
+                        assert_eq!(
+                            read_cli(p, p.example, &binary, Duration::from_secs(1)).unwrap(),
+                            "synthetic-ref-value"
+                        );
+                    }
+                });
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn bitwarden_missing_cli_and_missing_session_are_distinct() {
         let tmp = Scratch::new();
         let p = &PROVIDERS[5];
