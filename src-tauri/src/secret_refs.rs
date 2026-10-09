@@ -923,3 +923,14 @@ mod tests {
         }
     }
 }
+
+/// Only messages constructed by this module may bypass downstream prose redaction.
+pub fn safe_status(message: &str) -> Option<String> {
+    for p in PROVIDERS {
+        for state in [ErrorState::InvalidReference,ErrorState::PolicyDenied,ErrorState::NotInstalled,ErrorState::Locked,ErrorState::NotFound,ErrorState::Timeout,ErrorState::InvalidOutput,ErrorState::Failed] {
+            let known=error(Some(p),state).message;
+            if message == known { return Some(known); }
+        }
+    }
+    None
+}

@@ -1510,6 +1510,7 @@ impl PendingStatus {
 /// the gateway injected, so only a fixed category (with an exit or HTTP status)
 /// reaches the model. The full text is already in the gateway log.
 fn client_safe_error(error: &str) -> String {
+    if let Some(message) = crate::secret_refs::safe_status(error) { return message; }
     let lower = error.to_ascii_lowercase();
     let code_after = |marker: &str| -> Option<String> {
         let at = lower.find(marker)? + marker.len();

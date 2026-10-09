@@ -8967,7 +8967,7 @@ fn connect_one_result(
             eprintln!("toolport: {msg}");
             glog(&msg);
             Err(ConnectFailure {
-                needs_auth: server.url.is_some() && remote::is_auth_error(&e),
+                needs_auth: server.url.is_some() && !conduit_lib::secret_refs::has_references(server) && remote::is_auth_error(&e),
                 auth_target: (server.url.is_some() && remote::is_auth_error(&e))
                     .then_some(conduit_lib::call_failure::AuthTarget::Endpoint),
                 message: e,
