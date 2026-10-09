@@ -10379,8 +10379,8 @@ fn tool_cache_path(profile: Option<&str>) -> Option<PathBuf> {
 /// Bump when the shape/derivation of cached tools changes (new sanitizing, projection,
 /// schema handling), so a stale on-disk cache from an older build is discarded and
 /// rebuilt rather than served verbatim until the next server toggle.
-// Version 1 (including 1.24) has no per-server launch identity and cannot prove coverage.
-const TOOL_CACHE_VERSION: u64 = 2;
+// Version 1 has no per-server launch identity; version 2 may contain gateway-owned aliases.
+const TOOL_CACHE_VERSION: u64 = 3;
 
 fn load_tool_cache(profile: Option<&str>) -> Vec<Value> {
     let mut tools = tool_cache_path(profile)
@@ -32260,7 +32260,7 @@ mod tests {
         }
         assert_eq!(
             dispatched_instructions(&reg, Some("infra"), &initialize_req()),
-            Some(json!(discovery_instructions(DiscoveryMode::Full, None))),
+            Some(json!(discovery_instructions(DiscoveryMode::Lazy, None))),
             "a profile that sets nothing keeps the built-in text"
         );
 
@@ -32350,7 +32350,7 @@ mod tests {
         );
         assert_eq!(
             initialize("c-all"),
-            Some(json!(discovery_instructions(DiscoveryMode::Full, None))),
+            Some(json!(discovery_instructions(DiscoveryMode::Lazy, None))),
             "an unscoped client follows the active profile, which sets nothing"
         );
 
