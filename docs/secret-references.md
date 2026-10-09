@@ -1,10 +1,21 @@
 # Password manager references
 
 Choose **From a password manager** in server credentials, select the provider,
-and enter a reference. **Test** reads it once and shows success or a fixed error
-state. Only the reference is saved and synced. Sign in to the same provider on
-all machines before starting Toolport. A team can restrict references with
+and enter a reference. **Test** reads it once in the desktop app environment and
+shows success or a fixed error state. The MCP client launches its gateway with
+its own environment variables and PATH, which may differ from the desktop.
+Only the reference is saved and synced. Sign in to the same provider on
+all machines before starting the gateway. A team can restrict references with
 `secretSources.allowedPrefixes`; an empty list denies every reference.
+Prefixes match complete path segments, so `op://Eng` cannot allow
+`op://Engineering-Private`.
+
+References received through Teams, Pro or shared setup imports require local
+approval before resolution. Review shows the provider, exact reference, output
+name and destination URL or command. Approval stays on that machine and is
+invalidated when the reference or destination changes. Environment references
+are only allowed for locally created servers; they cannot be synced or imported
+from a shared setup. Member-local password manager references survive team sync.
 
 | Provider                   | Reference format                                                                 | Fixed CLI read                                                                                              | Official documentation                                                                                                   |
 | -------------------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
@@ -23,14 +34,16 @@ The existing Teams formats stay unchanged. Infisical's first component identifie
 its project ID, not a locally selected default project. Use an explicit UUID/ID
 where available. Dashlane titles can match the first duplicate; IDs avoid that.
 Keeper attachment downloads and Dashlane transforms are deliberately outside the
-API key reference grammar. References cannot include whitespace, controls,
-traversal, option-like components, query parameters, executable paths or options.
+API key reference grammar. Supported path segments may contain single interior
+spaces, such as `op://Private/GitHub Token/credential`. References cannot include
+outer whitespace, tabs, newlines, controls, traversal, option-like components,
+query parameters, executable paths or options.
 API keys must be one nonempty value without control characters.
 
 Install each official CLI in PATH or its standard local install directory.
 On Windows, Toolport uses executable CLIs, not shell command wrappers. The
 Bitwarden Password Manager CLI requires an already unlocked `BW_SESSION` in
-Toolport's local process environment. Secrets Manager requires a local
+the gateway process environment. Secrets Manager requires a local
 `BWS_ACCESS_TOKEN`; neither credential is part of sync. Providers use their own
 local sign-in state. Toolport never runs login or writes a resolved key to its
 registry, keychain, export or sync payload. Vendor-managed local caches are owned
@@ -38,7 +51,12 @@ by the vendor CLI.
 
 Each CLI read has a 120-second deadline, allowing local biometric unlock prompts.
 Terminal-only prompts need sign-in beforehand. Reads use a fixed argument vector
-without a shell. Provider stdout/stderr are bounded and never included in errors.
+without a shell, from the user's home or Toolport data directory rather than a
+project root. Provider stdout/stderr are bounded and never included in errors.
 Missing installation, locked/sign-in state, missing entry, timeout, malformed
-output and other failures have distinct states. Keys resolve at connection start
-and are held in transport memory; reconnecting or restarting reads them again.
+output and other failures have distinct states. A server resolves references
+concurrently with at most four active reads. Identical in-flight references share
+one result across servers and project roots. Successful values remain in memory
+for the gateway process lifetime; auth rejection clears the affected references.
+Restarting the gateway reads them again. A later retry also rereads a failed CLI
+lookup. Test does not use this gateway cache.
