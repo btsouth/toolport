@@ -352,7 +352,15 @@ mockIPC(
         return null;
       case "set_secret_reference": {
         const server = registry.servers.find((s) => s.id === args.serverId);
-        if (server) { let entry = server.env.find((e) => e.key === args.key); if (!entry) { entry = {key: String(args.key), value: null, secret: true}; server.env.push(entry); } entry.source = {ref: String(args.reference)}; entry.value = null; }
+        if (server) {
+          let entry = server.env.find((e) => e.key === args.key);
+          if (!entry) {
+            entry = { key: String(args.key), value: null, secret: true };
+            server.env.push(entry);
+          }
+          entry.source = { ref: String(args.reference) };
+          entry.value = null;
+        }
         return structuredClone(registry);
       }
       case "set_secret":

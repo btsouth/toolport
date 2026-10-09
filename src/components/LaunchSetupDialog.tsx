@@ -33,7 +33,11 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
 
   function onOpenChange(next: boolean) {
     if (next) {
-      setReferences(Object.fromEntries(inputs.filter((i) => i.source).map((i) => [i.key,i.source!.ref])));
+      setReferences(
+        Object.fromEntries(
+          inputs.filter((i) => i.source).map((i) => [i.key, i.source!.ref]),
+        ),
+      );
       setValues(
         Object.fromEntries(
           inputs.map((input) => [input.key, input.secret ? "" : (input.value ?? "")]),
@@ -85,21 +89,47 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
                 {input.label}
                 {input.required ? " *" : ""}
               </Label>
-              {input.secret && <select aria-label={`Key source for ${input.label}`} className="self-start rounded border bg-background p-1 text-xs" value={references[input.key] !== undefined ? "reference" : "paste"} onChange={(e) => setReferences((r) => ({ ...r, [input.key]: e.target.value === "reference" ? "op://Engineering/Docs/key" : undefined }))}><option value="paste">Paste a key</option><option value="reference">From a password manager</option></select>}
-              {references[input.key] !== undefined ? <SecretReferenceField serverId={server.id} value={references[input.key]!} onChange={(ref) => setReferences((r) => ({ ...r, [input.key]: ref }))} /> : <Input
-                id={`setup-${server.id}-${input.key}`}
-                type={input.secret ? "password" : "text"}
-                value={values[input.key] ?? ""}
-                placeholder={
-                  input.secret ? "Leave blank to keep any vaulted value" : input.label
-                }
-                onChange={(event) =>
-                  setValues((current) => ({
-                    ...current,
-                    [input.key]: event.target.value,
-                  }))
-                }
-              />}
+              {input.secret && (
+                <select
+                  aria-label={`Key source for ${input.label}`}
+                  className="self-start rounded border bg-background p-1 text-xs"
+                  value={references[input.key] !== undefined ? "reference" : "paste"}
+                  onChange={(e) =>
+                    setReferences((r) => ({
+                      ...r,
+                      [input.key]:
+                        e.target.value === "reference"
+                          ? "op://Engineering/Docs/key"
+                          : undefined,
+                    }))
+                  }
+                >
+                  <option value="paste">Paste a key</option>
+                  <option value="reference">From a password manager</option>
+                </select>
+              )}
+              {references[input.key] !== undefined ? (
+                <SecretReferenceField
+                  serverId={server.id}
+                  value={references[input.key]!}
+                  onChange={(ref) => setReferences((r) => ({ ...r, [input.key]: ref }))}
+                />
+              ) : (
+                <Input
+                  id={`setup-${server.id}-${input.key}`}
+                  type={input.secret ? "password" : "text"}
+                  value={values[input.key] ?? ""}
+                  placeholder={
+                    input.secret ? "Leave blank to keep any vaulted value" : input.label
+                  }
+                  onChange={(event) =>
+                    setValues((current) => ({
+                      ...current,
+                      [input.key]: event.target.value,
+                    }))
+                  }
+                />
+              )}
             </div>
           ))}
           <p className="text-xs text-muted-foreground">
