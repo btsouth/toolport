@@ -107,6 +107,7 @@ impl Provider {
     fn new() -> Self {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", server.server_addr());
+        let provider_origin = origin.clone();
         let expired = Arc::new(AtomicBool::new(false));
         let revoked = Arc::new(AtomicBool::new(false));
         let refreshes = Arc::new(AtomicUsize::new(0));
@@ -128,7 +129,14 @@ impl Provider {
                 let mut body = String::new();
                 request.as_reader().read_to_string(&mut body).unwrap();
                 let mut status = 200;
-                let response = if request.url() == "/token" {
+                let response = if request
+                    .url()
+                    .starts_with("/.well-known/oauth-protected-resource")
+                {
+                    json!({"resource":format!("{provider_origin}/mcp"),"authorization_servers":[provider_origin]})
+                } else if request.url() == "/.well-known/oauth-authorization-server" {
+                    json!({"issuer":provider_origin,"authorization_endpoint":format!("{provider_origin}/authorize"),"token_endpoint":format!("{provider_origin}/token")})
+                } else if request.url() == "/token" {
                     count.fetch_add(1, Ordering::SeqCst);
                     assert!(body.contains("grant_type=refresh_token"));
                     assert!(body.contains("refresh_token=fixture-refresh"));

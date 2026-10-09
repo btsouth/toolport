@@ -933,15 +933,24 @@ fn serve_concurrent(cfg: Config, state: State) {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
             let mut pre = Vec::new();
-            let resp = handle(
-                &cfg,
-                &mut state.lock().unwrap_or_else(|e| e.into_inner()),
-                &req,
-                &mut pre,
-            );
+            let (resp, grew) = {
+                let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                let was_grown = state.grown;
+                let resp = handle(&cfg, &mut state, &req, &mut pre);
+                (resp, state.grown && !was_grown)
+            };
             let mut out = out.lock().unwrap_or_else(|e| e.into_inner());
             for message in pre.iter().chain(resp.as_ref()) {
                 let _ = writeln!(out, "{message}");
+            }
+            if grew {
+                for method in [
+                    "notifications/tools/list_changed",
+                    "notifications/resources/list_changed",
+                    "notifications/prompts/list_changed",
+                ] {
+                    let _ = writeln!(out, "{}", json!({"jsonrpc":"2.0","method":method}));
+                }
             }
             let _ = out.flush();
         });

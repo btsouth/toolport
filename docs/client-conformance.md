@@ -76,15 +76,15 @@ folder. All requests and live commands have deadlines.
 Checked 2026-10-09. Installed versions and current source may differ; these facts
 establish a supported behavior, not a latency guarantee for every release.
 
-| Client | Evidence | Refresh |
-| --- | --- | --- |
-| Claude Code | [Vendor MCP docs](https://code.claude.com/docs/en/mcp) | Tools-list notifications supported |
-| OpenCode | [Client handler](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/mcp/index.ts) | Direct tools re-list handler; onclose drops the catalog |
-| Gemini CLI | [Client handlers](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/tools/mcp-client.ts) | Tools, resources and prompts refresh |
-| Cline | [Pinned client](https://github.com/cline/cline/blob/75111f347f275022abea2b2d784901920d8618be/apps/vscode/src/services/mcp/McpHub.ts) | 300 ms debounce, 2 s max deferral, bounded refresh retry |
-| Zed | [Vendor MCP docs](https://zed.dev/docs/ai/mcp) | Automatically reloads tools |
-| Codex | [Pinned catalog](https://github.com/openai/codex/blob/2351d9e1b608e6f9d9a3699b71d7eb39ee41cfa4/codex-rs/codex-mcp/src/connection_manager/tool_catalog.rs) | Generic notification refresh not established; cached tools |
-| Cursor | Isolated CLI health traffic | Tools/resources/prompts listed; notification refresh unverified |
+| Client      | Evidence                                                                                                                                                  | Refresh                                                         |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| Claude Code | [Vendor MCP docs](https://code.claude.com/docs/en/mcp)                                                                                                    | Tools-list notifications supported                              |
+| OpenCode    | [Client handler](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/mcp/index.ts)                                                       | Direct tools re-list handler; onclose drops the catalog         |
+| Gemini CLI  | [Client handlers](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/tools/mcp-client.ts)                                            | Tools, resources and prompts refresh                            |
+| Cline       | [Pinned client](https://github.com/cline/cline/blob/75111f347f275022abea2b2d784901920d8618be/apps/vscode/src/services/mcp/McpHub.ts)                      | 300 ms debounce, 2 s max deferral, bounded refresh retry        |
+| Zed         | [Vendor MCP docs](https://zed.dev/docs/ai/mcp)                                                                                                            | Automatically reloads tools                                     |
+| Codex       | [Pinned catalog](https://github.com/openai/codex/blob/2351d9e1b608e6f9d9a3699b71d7eb39ee41cfa4/codex-rs/codex-mcp/src/connection_manager/tool_catalog.rs) | Generic notification refresh not established; cached tools      |
+| Cursor      | Isolated CLI health traffic                                                                                                                               | Tools/resources/prompts listed; notification refresh unverified |
 
 Refresh support does not establish native tool search. OpenCode, Gemini, Cline
 and Zed retain Auto Lazy and their conservative five-second cold Full budget.
