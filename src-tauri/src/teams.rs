@@ -4784,7 +4784,9 @@ mod tests {
         let updated = json!([{"id":"unrelated","name":"Updated"}, {"id":"second","name":"Second"}]);
         let merged = additive_server_set(&remote, &updated).unwrap();
         assert_eq!(merged.as_array().unwrap().len(), 2);
-        assert!(merged.as_array().unwrap().contains(&updated[0]));
+        let indexed = server_index(&merged).unwrap();
+        assert_eq!(indexed["unrelated"]["name"], updated[0]["name"]);
+        assert_eq!(indexed["unrelated"]["url"], remote[0]["url"]);
     }
 
     #[test]
@@ -8531,6 +8533,33 @@ mod member_review_tests {
             complete["futurePolicy"]
         );
         assert_eq!(published["base_version"], 4);
+    }
+
+    #[test]
+    fn sync_regression_editing_disabled_definition_keeps_it_disabled() {
+        let mut reg = registry();
+        let selected = selected_export(&reg, &["remote".into()]).unwrap();
+        let mut remote = selected.clone();
+        remote[0]["disabled"] = json!(true);
+        remote[0]["note"] = json!("Paused in dashboard");
+        let merged = additive_server_set(&remote, &selected).unwrap();
+        assert_eq!(merged, remote);
+        let preview =
+            share_selections(&reg, &remote, &selected, &json!({"servers":merged})).unwrap();
+        assert_eq!(preview[0].team_change, "Already shared");
+        assert_ne!(preview[0].local.outcome, HandoffOutcome::Switched);
+        let mut edited = selected;
+        edited[0]["url"] = json!("https://1.2.3.4/edited");
+        let merged = additive_server_set(&remote, &edited).unwrap();
+        assert_eq!(merged[0]["disabled"], true);
+        assert_eq!(merged[0]["note"], remote[0]["note"]);
+        assert_eq!(merged[0]["url"], edited[0]["url"]);
+        stage_team_config(&mut reg, "review-team", &json!({"servers":merged}), 1, &[])
+            .unwrap();
+        assert!(reg
+            .servers
+            .iter()
+            .all(|s| s.source.as_deref() != Some("team:review-team")));
     }
 
     fn bound_personal_registry() -> Registry {

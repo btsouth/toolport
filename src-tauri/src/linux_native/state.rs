@@ -493,6 +493,7 @@ pub(super) struct ServerView {
     pub(super) client_credentials: Option<ClientCredentialsView>,
     pub(super) enabled: bool,
     pub(super) requires_review: bool,
+    pub(super) team_route_removed: bool,
     /// Changes whenever anything a probe reads from the registry entry does.
     pub(super) probe_fingerprint: u64,
 }
@@ -579,6 +580,9 @@ impl RegistrySnapshot {
                     }),
                     enabled,
                     requires_review: !enabled && server.needs_team_enable_review(),
+                    team_route_removed: !enabled
+                        && server.unknown_fields.get("teamRouteRemoved")
+                            == Some(&serde_json::json!(true)),
                     probe_fingerprint: probe_fingerprint(server),
                 }
             })
@@ -908,6 +912,7 @@ mod tests {
                     client_credentials: None,
                     enabled: false,
                     requires_review: false,
+                    team_route_removed: false,
                     probe_fingerprint: fingerprints[0],
                 },
                 ServerView {
@@ -925,10 +930,26 @@ mod tests {
                     client_credentials: None,
                     enabled: true,
                     requires_review: false,
+                    team_route_removed: false,
                     probe_fingerprint: fingerprints[1],
                 },
             ]
         );
+    }
+
+    #[test]
+    fn removed_team_route_explanation_tracks_the_personal_switch() {
+        let mut registry = Registry::default();
+        let mut personal = server("personal", "Saved original", "http");
+        personal
+            .unknown_fields
+            .insert("teamRouteRemoved".into(), serde_json::json!(true));
+        registry.servers.push(personal);
+        assert!(
+            RegistrySnapshot::from_registry(registry.clone()).servers[0].team_route_removed
+        );
+        registry.set_global_server_enabled("personal", true).unwrap();
+        assert!(!RegistrySnapshot::from_registry(registry).servers[0].team_route_removed);
     }
 
     #[test]
