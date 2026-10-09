@@ -29273,6 +29273,35 @@ mod tests {
     }
 
     #[test]
+    fn sessionless_notification_closes_as_a_completed_request() {
+        let _data = DataDirTestEnv::new("sessionless-notification-close");
+        let state = http_state(true);
+        let req = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION}}
+        });
+        let out = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            "POST",
+            "/mcp",
+            &req.to_string(),
+            modern_http_headers("notifications/initialized", None, None, None),
+            None,
+            None,
+        );
+        assert_eq!(out.status, 202, "{}", out.body);
+        let rows = audit::recent_sessions(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["transport"], "http_request");
+        assert_eq!(rows[0]["phase"], "close");
+        assert_eq!(rows[0]["reason"], "request_complete");
+        assert_eq!(rows[0]["toolsListCount"], 0);
+        assert_eq!(rows[0]["listChangedCount"], 0);
+    }
+
+    #[test]
     fn session_http_lists_are_delivery_bound_and_close_on_delete() {
         let _data = DataDirTestEnv::new("session-http-lifecycle");
         let state = http_state(true);
