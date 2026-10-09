@@ -20184,7 +20184,7 @@ mod tests {
             input,
             " Check tool input. Missing: deploymentId. Find IDs: s__list_deployments."
         );
-        assert_eq!(input.len(), 70);
+        assert_eq!(input.len(), 72);
         let timeout = recovery_hint(
             &catalog,
             "s",
@@ -20196,7 +20196,7 @@ mod tests {
             timeout,
             " Timed out after send; may have completed, check before retrying."
         );
-        assert_eq!(timeout.len(), 63);
+        assert_eq!(timeout.len(), 65);
         assert!(!timeout.contains("Find IDs"));
     }
 

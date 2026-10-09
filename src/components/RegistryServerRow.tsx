@@ -194,9 +194,11 @@ export function RegistryServerRow({
                 ? launcher
                   ? "Installing the server package"
                   : "Server initializing"
-                : status === "connected"
-                  ? label.replace(" · ", ", ")
-                  : STATUS_ARIA_LABEL[status]
+                : status === "needs-auth"
+                  ? label
+                  : status === "connected"
+                    ? label.replace(" · ", ", ")
+                    : STATUS_ARIA_LABEL[status]
             }
             className="sr-only"
           />
@@ -211,7 +213,7 @@ export function RegistryServerRow({
                   className="inline-flex items-center gap-1.5 rounded-md border border-warning/40 px-2.5 py-1 text-xs text-warning transition-colors hover:bg-warning/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-warning"
                 >
                   <LogIn className="size-3.5" />
-                  Authenticate
+                  {label}
                 </button>
               }
             />

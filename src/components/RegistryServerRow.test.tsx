@@ -57,7 +57,7 @@ describe("RegistryServerRow status accessibility", () => {
     ["Server disabled", false, undefined],
     ["Checking connection", true, undefined],
     ["Ready, 2 tools", true, health({ ok: true, toolCount: 2 })],
-    ["Authentication required", true, health({ authRequired: true })],
+    ["MCP endpoint auth required", true, health({ authRequired: true })],
     ["Connection error", true, health({ error: "connection refused" })],
   ] as const)("announces %s", (label, enabled, result) => {
     const view = renderRow(enabled, result);
