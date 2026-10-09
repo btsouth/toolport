@@ -2316,6 +2316,135 @@ fn matrix_pooling_quarantine_reaches_every_cached_root_view() {
     }
 }
 
+fn quarantine_release_restores_calls(reserved_alias: bool, product_release: bool) {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _data_lock = registry::data_dir_test_lock();
+    let (_fixture, dir) = Fixture::new("quarantine-release");
+    let _data_dir = registry::DataDirOverride::set(&dir);
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("files", &transcript, None)],
+        vec![],
+    );
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).unwrap();
+    reg.set_safety_level(registry::SafetyLevel::Strict);
+    reg.quarantine_on_drift = true;
+    let exposed = "files__echo";
+    let policy_name = if reserved_alias {
+        reg.tool_overrides.insert(
+            "files".into(),
+            std::collections::HashMap::from([(
+                "echo".into(),
+                registry::ToolOverride {
+                    name: Some("toolport_custom_echo".into()),
+                    description: None,
+                    unknown_fields: Default::default(),
+                },
+            )]),
+        );
+        "toolport_custom_echo"
+    } else {
+        exposed
+    };
+    registry::save_to(&path, &reg).unwrap();
+    let profile = reg.active_profile_id.as_deref().unwrap();
+    let stores = [
+        dir.join("quarantine.json"),
+        dir.join(format!(
+            "quarantine-v2-{}.json",
+            registry::profile_store_key(profile)
+        )),
+    ];
+    for store in &stores {
+        std::fs::write(
+            store,
+            json!({(policy_name): {"server": "files", "tool": "echo", "change": "changed"}})
+                .to_string(),
+        )
+        .unwrap();
+    }
+    let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+    client.initialize("matrix-quarantine-release");
+    client.wait_for_tool("__add", Duration::from_secs(30));
+    assert!(!client.tool_names().contains(&exposed.to_string()));
+    for name in [policy_name, exposed] {
+        assert_eq!(
+            client.call_tool(name, json!({"text": "held"}))["isError"],
+            true
+        );
+        assert_eq!(
+            client.call_tool(
+                "toolport_call_tool",
+                json!({"name": name, "arguments": {"text": "held"}}),
+            )["isError"],
+            true
+        );
+    }
+
+    if product_release {
+        // Both React IPC and GTK re-approve call this controller. The daemon
+        // must observe its store write without a registry edit or reconnect.
+        for scope in [None, Some(profile)] {
+            conduit_lib::registry_controller::release_quarantine(scope, policy_name).unwrap();
+            assert!(conduit_lib::integrity::quarantined(scope)
+                .unwrap()
+                .is_empty());
+        }
+    } else {
+        // The watcher explicitly supports hand edits as well as product release.
+        for store in &stores {
+            std::fs::write(store, "{}").unwrap();
+        }
+    }
+    client.wait_for_tool_where(exposed, |name| name == exposed, Duration::from_secs(10));
+    for (name, arguments) in [
+        (exposed, json!({"text": "released"})),
+        (
+            "toolport_call_tool",
+            json!({"name": exposed, "arguments": {"text": "released"}}),
+        ),
+    ] {
+        let result = client.call_tool(name, arguments);
+        assert_ne!(result["isError"], true, "released call failed: {result}");
+        assert!(result.to_string().contains("released"), "{result}");
+    }
+    if reserved_alias {
+        assert!(!client.tool_names().contains(&policy_name.to_string()));
+        assert_eq!(client.call_tool(policy_name, json!({}))["isError"], true);
+        assert_eq!(
+            client.call_tool(
+                "toolport_call_tool",
+                json!({"name": policy_name, "arguments": {}}),
+            )["isError"],
+            true
+        );
+    }
+}
+
+#[test]
+fn matrix_quarantine_release_reserved_alias_product() {
+    quarantine_release_restores_calls(true, true);
+}
+
+#[test]
+fn matrix_quarantine_release_reserved_alias_disk() {
+    quarantine_release_restores_calls(true, false);
+}
+
+#[test]
+fn matrix_quarantine_release_normal_product() {
+    quarantine_release_restores_calls(false, true);
+}
+
+#[test]
+fn matrix_quarantine_release_normal_disk() {
+    quarantine_release_restores_calls(false, false);
+}
+
 #[test]
 fn matrix_pooling_rooted_servers_launch_only_for_authorized_profiles() {
     let _guard = CASE_LOCK
