@@ -39339,6 +39339,124 @@ mod tests {
     }
 
     #[test]
+    fn full_discovery_reserved_aliases_are_unique_cached_and_uncached() {
+        let _env = DataDirTestEnv::new("full-discovery-reserved-aliases");
+        for helper in ["toolport_search_tools", "toolport_call_tool"] {
+            let state = http_state(false);
+            let mut router = Router::new();
+            router.set_overrides(HashMap::from([(
+                "alpha".into(),
+                HashMap::from([(
+                    "echo".into(),
+                    registry::ToolOverride {
+                        name: Some(helper.into()),
+                        description: None,
+                        unknown_fields: Default::default(),
+                    },
+                )]),
+            )]));
+            router.add(DownstreamServer::connect("alpha".into(), Box::new(MockRoute {
+                tools: vec![json!({"name":"echo", "inputSchema":{"type":"object", "properties":{"text":{"type":"string"}}}})],
+            })).unwrap());
+            let mut reg = Registry::default();
+            reg.servers.push(stub_server("alpha", "Alpha"));
+            *state.registry.lock().unwrap() = reg.clone();
+            *state.router.lock().unwrap() = Arc::new(router.clone());
+            for cached in [false, true] {
+                let catalog = if cached {
+                    router.aggregated_tools()
+                } else {
+                    vec![]
+                };
+                *state.cached_tools.lock().unwrap() =
+                    Arc::new(CatalogSnapshot::new(catalog.clone()));
+                for client in ["adapter:codex", "claude-code"] {
+                    let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+                    let uncached = handle_request(
+                        &state,
+                        &req,
+                        &reg,
+                        &router,
+                        &catalog,
+                        false,
+                        None,
+                        &SearchGuard::default(),
+                        None,
+                        Some(client),
+                    )
+                    .unwrap();
+                    for listed in [
+                        uncached,
+                        full_tools_list_for_client(&state, client, None),
+                        full_tools_list_for_client(&state, client, None),
+                    ] {
+                        let tools = listed["result"]["tools"].as_array().unwrap();
+                        assert_eq!(
+                            tools.iter().filter(|t| t["name"] == helper).count(),
+                            usize::from(client == "adapter:codex"),
+                            "{client}, cached={cached}: {listed}"
+                        );
+                        assert!(tools.iter().any(|t| t["name"] == "alpha__echo"), "{listed}");
+                        let names: HashSet<_> =
+                            tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+                        assert_eq!(names.len(), tools.len(), "{listed}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_instructions_match_advertised_call_helpers() {
+        let _env = DataDirTestEnv::new("discovery-instructions-helpers");
+        let state = http_state(false);
+        for mode in [
+            DiscoveryMode::Full,
+            DiscoveryMode::Lazy,
+            DiscoveryMode::Grouped,
+        ] {
+            for client in ["adapter:codex", "adapter:cursor", "claude-code", "opencode"] {
+                let run = |method: &str| {
+                    process_request(
+                        &state,
+                        &json!({"jsonrpc":"2.0","id":1,"method":method}),
+                        &SearchGuard::default(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(client),
+                        None,
+                        mode,
+                    )
+                    .unwrap()
+                };
+                let listed = run("tools/list");
+                let has_call = listed["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "toolport_call_tool");
+                for method in ["initialize", "server/discover"] {
+                    let response = run(method);
+                    let instructions = response["result"]["instructions"].as_str().unwrap();
+                    assert_eq!(
+                        instructions.contains("toolport_call_tool"),
+                        has_call,
+                        "{client}, {mode:?}, {method}: {instructions}"
+                    );
+                    if !has_call {
+                        assert!(
+                            instructions.contains("advertised tool name"),
+                            "{instructions}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn full_discovery_fallback_token_cost_stays_small() {
         let base = serde_json::to_string(&full_tool_floor(false, false)).unwrap();
         let fallback = serde_json::to_string(&full_tool_floor(false, true)).unwrap();

@@ -6409,6 +6409,43 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn gateway_owned_aliases_keep_the_original_route_after_reindexing() {
+        for reserved in [
+            "toolport_search_tools",
+            "toolport_call_tool",
+            "toolport_status",
+            "toolport_fetch_result",
+            "toolport_run_script",
+            "toolport_add_server",
+        ] {
+            let mut router = Router::new();
+            router.set_overrides(HashMap::from([(
+                "s".into(),
+                HashMap::from([(
+                    "echo".into(),
+                    ToolOverride {
+                        name: Some(reserved.into()),
+                        description: None,
+                        unknown_fields: Default::default(),
+                    },
+                )]),
+            )]));
+            router.add(mock_server("s"));
+            for view in [router.clone(), router.reindexed()] {
+                assert_eq!(
+                    view.exposed_tool_name("s", "echo"),
+                    Some("s__echo"),
+                    "{reserved}"
+                );
+                assert!(view.route_of(reserved).is_none(), "{reserved}");
+                assert!(view
+                    .route_call("s__echo", json!({"text":"retained"}))
+                    .is_ok());
+            }
+        }
+    }
+
+    #[test]
     fn server_detail_resolves_exact_upstream_names_and_overrides() {
         let tools = vec![json!({"name":"get-item"}), json!({"name":"get_item"})];
         let aliases = Router::server_tool_aliases("server-a", &tools, HashMap::new());
