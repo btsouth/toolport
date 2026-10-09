@@ -15351,12 +15351,12 @@ fn process_request_wire(
         ("tools/call", Some("toolport_search_tools")) => Some("search"),
         _ => None,
     };
-    let base = state
-        .router
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
     let cold = internal.is_some() && {
+        let base = state
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         base.any_missing_catalog(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
             || state.cached_tools.lock().map(|c| !has_scoped_tools(&c.tools, allowed, &base, &reg)).unwrap_or(true)
