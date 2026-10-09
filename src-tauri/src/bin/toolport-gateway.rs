@@ -2964,29 +2964,9 @@ fn search_catalog_filtered(
             competitor_ratio = ranked.get(1).map_or(0.0, |(next, _)| next / score);
         }
 
-        // A named provider is an intentional scope, so its tools can fill the menu.
-        // Scoped to a server: take the top `limit`. Unscoped: cap per server so one
-        // server with many matching tools can't crowd the others out of the window.
-        let mut selected: Vec<&Value> =
-            if server_filter.is_some() || servers.values().any(|(_, named)| *named) {
-                ranked.iter().take(limit).map(|(_, t)| *t).collect()
-            } else {
-                let cap = (limit / 3).max(4);
-                let mut per: HashMap<String, usize> = HashMap::new();
-                let mut out = Vec::new();
-                for (_, t) in &ranked {
-                    if out.len() >= limit {
-                        break;
-                    }
-                    let c = per.entry(tool_prefix(t)).or_insert(0);
-                    if *c >= cap {
-                        continue;
-                    }
-                    *c += 1;
-                    out.push(*t);
-                }
-                out
-            };
+        // A menu is a prefix of the same ranked list at every retrieval depth.
+        // Provider caps would discard strong candidates solely for sharing a server.
+        let mut selected: Vec<&Value> = ranked.iter().take(limit).map(|(_, tool)| *tool).collect();
         let direct_returned = selected.len();
 
         // Fill a short menu from the visible catalog regardless of score margin.
@@ -3209,6 +3189,124 @@ fn neutralize_listed_tools(tools: &mut [Value]) {
 /// retain the existing lossless pagination path.
 const SEARCH_DESCRIBE_BUDGET_BYTES: usize = 8192;
 
+/// Factor repeated schema fragments into local definitions without dropping any
+/// constraints or documentation. Exact-name lookups retain the original definition.
+fn compact_search_schema(mut schema: Value) -> Value {
+    fn scoped(node: &Value) -> bool {
+        match node {
+            Value::Object(object) => {
+                object.keys().any(|key| {
+                    ["$ref", "$id", "$anchor", "$dynamicRef", "$dynamicAnchor"]
+                        .contains(&key.as_str())
+                }) || object.values().any(scoped)
+            }
+            Value::Array(array) => array.iter().any(scoped),
+            _ => false,
+        }
+    }
+    if worker::json_size(&schema, 4096).is_some() || scoped(&schema) {
+        return schema;
+    }
+    let original = schema.clone();
+    let original_bytes = serde_json::to_vec(&original).unwrap().len();
+    fn counts(node: &Value, repeated: &mut std::collections::BTreeMap<String, usize>) {
+        match node {
+            Value::Object(object) => {
+                // References and identifiers can introduce resolution scopes.
+                // Their definitions are already compact and must stay untouched.
+                if object.contains_key("$ref") || object.contains_key("$id") {
+                    return;
+                }
+                let text = serde_json::to_string(node).unwrap_or_default();
+                if text.len() >= 256 {
+                    *repeated.entry(text).or_default() += 1;
+                }
+                for child in object.values() {
+                    counts(child, repeated);
+                }
+            }
+            Value::Array(array) => {
+                for child in array {
+                    counts(child, repeated);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn replace(
+        node: &mut Value,
+        names: &std::collections::BTreeMap<String, String>,
+        definitions: &mut serde_json::Map<String, Value>,
+        root: bool,
+    ) {
+        if let Value::Object(object) = node {
+            if object.contains_key("$ref") || object.contains_key("$id") {
+                return;
+            }
+            if !root {
+                let text = serde_json::to_string(node).unwrap_or_default();
+                if let Some(name) = names.get(&text) {
+                    definitions
+                        .entry(name.clone())
+                        .or_insert_with(|| node.clone());
+                    *node = json!({"$ref":format!("#/$defs/{name}")});
+                    return;
+                }
+            }
+            for (key, child) in object.iter_mut() {
+                // Only traverse schema positions, never enum/default/examples data.
+                match key.as_str() {
+                    "properties" | "patternProperties" | "dependentSchemas" => {
+                        if let Some(children) = child.as_object_mut() {
+                            for child in children.values_mut() {
+                                replace(child, names, definitions, false);
+                            }
+                        }
+                    }
+                    "items"
+                    | "additionalProperties"
+                    | "contains"
+                    | "not"
+                    | "if"
+                    | "then"
+                    | "else"
+                    | "propertyNames"
+                    | "unevaluatedProperties" => replace(child, names, definitions, false),
+                    "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+                        if let Some(children) = child.as_array_mut() {
+                            for child in children {
+                                replace(child, names, definitions, false);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if !schema.is_object() || schema.get("$defs").is_some() || schema.get("definitions").is_some() {
+        return schema;
+    }
+    let mut repeated = std::collections::BTreeMap::new();
+    counts(&schema, &mut repeated);
+    let names = repeated
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .enumerate()
+        .map(|(index, (text, _))| (text, format!("toolport{index}")))
+        .collect();
+    let mut definitions = serde_json::Map::new();
+    replace(&mut schema, &names, &mut definitions, true);
+    if !definitions.is_empty() {
+        schema["$defs"] = Value::Object(definitions);
+    }
+    if serde_json::to_vec(&schema).unwrap().len() < original_bytes {
+        schema
+    } else {
+        original
+    }
+}
+
 fn project_search_results(tools: &[&Value], include_top_schema: bool) -> Vec<Value> {
     tools.iter().enumerate().map(|(i, tool)| {
         let description = tool.get("description").and_then(Value::as_str).unwrap_or("");
@@ -3225,7 +3323,7 @@ fn project_search_results(tools: &[&Value], include_top_schema: bool) -> Vec<Val
         if include_top_schema && i == 0 {
             let mut schema = schema.clone();
             integrity::neutralize_value_strings(&mut schema);
-            entry["inputSchema"] = schema;
+            entry["inputSchema"] = compact_search_schema(schema);
         } else { entry["schemaOmitted"] = json!(true); }
         entry
     }).collect()
@@ -3351,7 +3449,7 @@ fn enabled_summary(
     // Tool counts by server prefix, from the live catalog, gated by the same
     // visible set so a scoped client never sees another tenant's tool counts.
     if !cached.is_empty() {
-        let mut counts: std::collections::BTreeMap<String, usize> =
+        let mut counts: std::collections::std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
         // `visible` holds RAW registry ids; a catalog prefix is the sanitized exposed
         // form, so the two are not comparable directly (a `file-system` server owns
@@ -38580,20 +38678,23 @@ mod tests {
     }
 
     #[test]
-    fn search_diversifies_across_servers_when_unscoped() {
-        // One server with many matching tools shouldn't crowd the others out.
-        let mut cat = catalog();
-        for i in 0..20 {
-            cat.push(json!({
-                "name": format!("rc__list_{i}"),
-                "description": "list things",
-                "inputSchema": {}
-            }));
-        }
-        // "list" matches stripe (1), rc (21). With a small limit, stripe must still appear.
-        let (hits, total) = search_catalog(&cat, "list", None, 6);
-        assert!(total >= 22);
-        assert!(hits.iter().any(|h| h["name"] == "stripe__list_charges"));
+    fn search_menu_preserves_ranked_prefix_at_every_limit() {
+        let cat: Vec<_> = (0..20)
+            .map(|i| {
+                json!({"name":format!("records__list_{i}"),
+            "description":"List records", "inputSchema":{}})
+            })
+            .collect();
+        let index = CatalogSearchIndex::build(&cat);
+        let names = |limit| {
+            search_catalog_indexed(&cat, "list records", None, limit, None, Some(&index))
+                .matches
+                .into_iter()
+                .map(|tool| tool["name"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(10), names(25)[..10]);
+        assert_eq!(names(3), names(10)[..3]);
     }
 
     #[test]

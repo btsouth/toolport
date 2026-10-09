@@ -868,3 +868,31 @@ fn search_negation_preserves_camelcase_and_unicode() {
     );
     assert_eq!(positive_query("İ getItem without deleting"), "İ getItem ");
 }
+
+#[test]
+fn search_top_schema_factoring_preserves_every_constraint_and_instance_data() {
+    let parameter = json!({"type":"object", "description":"Detailed parameter documentation. ".repeat(100),
+        "properties":{"kind":{"enum":["left","right"]}, "payload":{"type":"string","minLength":2}},
+        "required":["kind","payload"],"additionalProperties":false});
+    let schema = json!({"type":"object","properties":{"first":parameter,"second":parameter},
+        "required":["first","second"],"default":{"properties":{"first":parameter}}});
+    let mut compact = compact_search_schema(schema.clone());
+    assert!(
+        serde_json::to_vec(&compact).unwrap().len() < serde_json::to_vec(&schema).unwrap().len()
+    );
+    assert_eq!(compact["default"], schema["default"]);
+    conduit_lib::router::inline_refs(&mut compact);
+    assert_eq!(compact, schema);
+}
+
+#[test]
+fn search_schema_factoring_is_lossless_on_the_public_catalog() {
+    for tool in scale_catalog() {
+        let schema = &tool["inputSchema"];
+        let mut compact = compact_search_schema(schema.clone());
+        if compact.get("$defs").is_some() && schema.get("$defs").is_none() {
+            conduit_lib::router::inline_refs(&mut compact);
+        }
+        assert_eq!(&compact, schema, "schema changed for {}", tool["name"]);
+    }
+}
