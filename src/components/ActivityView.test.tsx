@@ -336,6 +336,29 @@ describe("ActivityView trust-state loading", () => {
 });
 
 describe("ActivityView recent calls", () => {
+  it("expands a typed Code Mode failure without retaining error text", async () => {
+    const user = userEvent.setup({
+      advanceTimers: (ms) => vi.advanceTimersByTime(ms),
+    });
+    const runId = "0123456789abcdef0123456789abcdef";
+    getAuditLog.mockResolvedValue([
+      entry({
+        server: "toolport",
+        tool: "run_script",
+        ok: false,
+        failureKind: "script_exception",
+        runId,
+      }),
+    ]);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    await user.click(screen.getByRole("button", { name: /recent calls/i }));
+    expect(screen.queryByText(`Run: ${runId}`)).not.toBeInTheDocument();
+    await user.click(screen.getByText("run_script"));
+    expect(screen.getByText("script exception", { exact: true })).toBeInTheDocument();
+    expect(screen.getByText(`Run: ${runId}`)).toBeInTheDocument();
+  });
+
   it("keeps an expanded error row open across a live-poll refetch", async () => {
     const user = userEvent.setup({
       advanceTimers: (ms) => vi.advanceTimersByTime(ms),

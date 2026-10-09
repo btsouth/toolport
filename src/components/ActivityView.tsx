@@ -845,7 +845,7 @@ function CallRow({ e }: { e: AuditEntry }) {
         )}
         <PiiBadge entry={e} />
       </div>
-      {open && e.error && (
+      {open && hasDetail && (
         <div className="border-t border-border/50 bg-destructive/5 px-3 py-2 pl-9">
           <p className="font-mono text-xs whitespace-pre-wrap break-words text-destructive">
             {e.error ?? e.failureKind?.replace(/_/g, " ")}
