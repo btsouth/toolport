@@ -34,9 +34,9 @@ The explicit tests support benchmark-only model substitutions through
 `SEARCH_STATIC_MODEL_DIR` (files `model.bin` and `tokenizer.json`) and lexical-only
 measurements through `SEARCH_LEXICAL_ONLY`. Shipped binaries expose neither control.
 
-Build-time control: `search-static` is in Cargo's default features. Headless
-builds with `--no-default-features` must pass `--features search-static` to bundle
-it; omit that feature for a model-free build. The latter excludes both model
-assets and the tokenizer dependency. Production encoding uses one bounded
+Every gateway requires `search-static`, including headless builds and bundled
+sidecars. Builds with `--no-default-features` must pass `--features search-static`;
+Cargo rejects a gateway build without it. Model-off gateways are unsupported.
+Production encoding uses one bounded
 worker and a private content cache capped at 32 MiB and 14 days. Scoped searches
 filter the main snapshot and cannot submit or replace worker jobs.
