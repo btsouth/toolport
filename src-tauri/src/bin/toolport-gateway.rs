@@ -9057,7 +9057,7 @@ fn notify_tools_changed_for_catalog_diff(
             suppressed += 1;
         }
     }
-    glog(&format!("catalog_notification reason=catalog_refresh prior=published content_changed={} scoped_clients={scoped} accepted={queued} dropped={dropped} suppressed={suppressed}; accepted HTTP messages await transport delivery", previous != current));
+    glog(&format!("catalog_notification reason=catalog_refresh prior=published content_changed={} scoped_clients={scoped} accepted={queued} dropped={dropped} suppressed={suppressed}; accepted HTTP messages await transport delivery", !previous.iter().eq(current.iter())));
 }
 
 #[derive(Clone, Copy)]
