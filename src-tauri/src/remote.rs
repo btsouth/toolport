@@ -1520,6 +1520,15 @@ impl crate::downstream::ConcurrentTransport for ImportedConcurrent {
     }
 }
 impl Transport for ImportedTransport {
+    fn response_count(&self) -> u64 {
+        self.0.response_count()
+    }
+    fn connection_reset_reason(&self) -> Option<String> {
+        self.0
+            .connection_reset_reason()
+            .map(|error| self.1.text(error))
+    }
+
     fn request(
         &mut self,
         method: &str,

@@ -8531,6 +8531,7 @@ fn connect_one_result(
             return Err(ConnectFailure {
                 message: err,
                 needs_auth: false,
+                auth_target: None,
             });
         }
         // Resolve the ${ROOT} token against the client's project root (issue #239)
@@ -8549,6 +8550,7 @@ fn connect_one_result(
                 return Err(ConnectFailure {
                     message: error,
                     needs_auth: false,
+                    auth_target: None,
                 });
             }
         };
@@ -8610,6 +8612,8 @@ fn connect_one_result(
             glog(&msg);
             Err(ConnectFailure {
                 needs_auth: server.url.is_some() && remote::is_auth_error(&e),
+                auth_target: (server.url.is_some() && remote::is_auth_error(&e))
+                    .then_some(conduit_lib::call_failure::AuthTarget::Endpoint),
                 message: e,
             })
         }
@@ -12203,6 +12207,7 @@ impl HostState {
                     return Err(ConnectFailure {
                         message: "launch retired".to_string(),
                         needs_auth: false,
+                        auth_target: None,
                     });
                 }
                 let mut ds = connect_one_result(
@@ -12216,6 +12221,7 @@ impl HostState {
                     return Err(ConnectFailure {
                         message: "launch retired".to_string(),
                         needs_auth: false,
+                        auth_target: None,
                     });
                 }
                 resubscribe_server_resources(&mut ds, &server_id, &subs);
@@ -22029,6 +22035,7 @@ mod tests {
                 Err(ConnectFailure {
                     message: "initialize timed out".into(),
                     needs_auth: false,
+                    auth_target: None,
                 })
             }),
             ReconnectBackoff::default(),
@@ -22238,6 +22245,7 @@ mod tests {
                 Err(ConnectFailure {
                     message: "needs authentication".into(),
                     needs_auth: true,
+                    auth_target: Some(conduit_lib::call_failure::AuthTarget::Endpoint),
                 })
             }),
             ReconnectBackoff::default(),
@@ -23081,6 +23089,7 @@ mod tests {
                     return Err(ConnectFailure {
                         message: "Temporary failure in name resolution".into(),
                         needs_auth: false,
+                        auth_target: None,
                     });
                 }
                 // The demand retry hangs rather than answering.
@@ -23088,6 +23097,7 @@ mod tests {
                 Err(ConnectFailure {
                     message: "initialize timed out".into(),
                     needs_auth: false,
+                    auth_target: None,
                 })
             }),
             ReconnectBackoff {

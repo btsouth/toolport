@@ -2402,6 +2402,11 @@ pub trait Transport: Send {
     fn concurrent(&self) -> Option<Arc<dyn ConcurrentTransport>> {
         None
     }
+    /// Response activity on this connection, including error responses.
+    fn response_count(&self) -> u64 {
+        0
+    }
+
     /// A protocol violation invalidated this connection. Only a fresh caller may
     /// reconnect; calls dispatched on the rejected stream must never replay.
     fn connection_reset_reason(&self) -> Option<String> {
@@ -3480,6 +3485,7 @@ struct StdioCore {
     stderr: Arc<Mutex<String>>,
     read_failure: Arc<Mutex<Option<String>>>,
     next_id: AtomicI64,
+    responses: AtomicU64,
     state: Mutex<StdioCoreState>,
     /// Answers server-initiated JSON-RPC (e.g. `roots/list`) by forwarding to the
     /// upstream MCP client. Set by the gateway before the connect handshake.
@@ -3586,6 +3592,7 @@ impl StdioCore {
             stderr,
             read_failure,
             next_id: AtomicI64::new(1),
+            responses: AtomicU64::new(0),
             state: Mutex::new(StdioCoreState::default()),
             server_handler: Mutex::new(None),
             launcher,
@@ -4257,6 +4264,7 @@ impl StdioCore {
         let Some(key) = value.get("id").and_then(id_key) else {
             return;
         };
+        self.responses.fetch_add(1, Ordering::AcqRel);
         // The waiter's guard can no longer find it to clean up after its client,
         // so release that client's queued server requests here if this was its
         // last call.
@@ -5338,6 +5346,10 @@ impl StdioTransport {
 }
 
 impl Transport for StdioTransport {
+    fn response_count(&self) -> u64 {
+        self.core.responses.load(Ordering::Acquire)
+    }
+
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
         self.request_with_cancel(method, params, None)
     }
@@ -5641,6 +5653,15 @@ fn insufficient_scope_challenge(
         .error
         .as_deref()
         .is_some_and(|error| error.eq_ignore_ascii_case("insufficient_scope"))
+        .then_some(())
+        .or_else(|| {
+            challenge
+                .scope
+                .as_ref()
+                .filter(|scope| !scope.is_empty())
+                .map(|_| ())
+        })
+        .is_some()
         .then_some(challenge)
 }
 
@@ -5844,6 +5865,8 @@ impl Drop for HttpAuthGuard<'_> {
 #[derive(Default)]
 struct HttpConcurrency {
     closed: AtomicBool,
+    session_invalid: AtomicBool,
+    responses: AtomicU64,
     workers: AtomicUsize,
     pending: Mutex<HashMap<String, (Instant, PendingHttpMrtr)>>,
 }
@@ -6929,12 +6952,12 @@ impl HttpTransport {
             .map(|scope| canonical_scope_set(&scope))
             .filter(|scope| !scope.is_empty())
             .ok_or_else(|| {
-                TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::Endpoint }, format!(
+                TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::Scope }, format!(
                     "HTTP {code} (needs authentication): OAuth reported insufficient_scope without the required scope"
                 ))
             })?;
         let callback = self.scope_reauthorize.as_ref().ok_or_else(|| {
-            TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::Endpoint }, format!("HTTP {code} (needs authentication): OAuth scope '{required_scope}' requires interactive authorization"))
+            TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::Scope }, format!("HTTP {code} (needs authentication): OAuth scope '{required_scope}' requires interactive authorization"))
         })?;
         let _gate = self.auth_gate_lock()?;
         if *self
@@ -6951,19 +6974,17 @@ impl HttpTransport {
             .lock()
             .map_err(|_| {
                 TransportError::Classified(
-                    crate::call_failure::CallFailureKind::Auth {
-                        target: crate::call_failure::AuthTarget::Endpoint,
-                    },
+                    crate::call_failure::CallFailureKind::Internal,
                     "OAuth scope-attempt lock poisoned".into(),
                 )
             })?
             .insert(attempt_key);
         if !first_attempt {
-            return Err(TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::Endpoint }, format!("HTTP {code} (needs authentication): OAuth scope '{required_scope}' was already requested for {operation} and remains insufficient")));
+            return Err(TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::Scope }, format!("HTTP {code} (needs authentication): OAuth scope '{required_scope}' was already requested for {operation} and remains insufficient")));
         }
         let token = callback(&required_scope)
             .map_err(|e| {
-                TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::Endpoint }, format!(
+                TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::Scope }, format!(
                     "HTTP {code} (needs authentication): OAuth scope authorization failed for '{required_scope}': {e}"
                 ))
             })?;
@@ -7018,6 +7039,7 @@ impl HttpTransport {
         let payload = body.to_string();
         self.refresh_before_send()?;
         let mut refreshed = false;
+        let mut scope_upgraded = false;
         let wire_version = self.wire_protocol_version();
         let (resp, accepted_auth) = loop {
             if self
@@ -7078,6 +7100,9 @@ impl HttpTransport {
                 req = req.timeout(deadline.saturating_duration_since(Instant::now()));
             }
             let response = req.send_string(&payload);
+            if matches!(&response, Ok(_) | Err(ureq::Error::Status(_, _))) {
+                self.concurrency.responses.fetch_add(1, Ordering::AcqRel);
+            }
             if cancel.is_some_and(HttpCancelSignal::is_cancelled) {
                 return Err(TransportError::Cancelled(
                     "HTTP request cancelled by upstream client".to_string(),
@@ -7095,9 +7120,10 @@ impl HttpTransport {
                     let operation = authorization_operation(body);
                     self.reauthorize_after_scope_challenge(code, &operation, challenge, auth)?;
                     refreshed = true;
+                    scope_upgraded = true;
                 }
                 Err(ureq::Error::Status(code, resp))
-                    if (code == 401 || code == 403) && !refreshed && self.refresh.is_some() =>
+                    if code == 401 && !refreshed && self.refresh.is_some() =>
                 {
                     let _ = read_capped(resp, 8 * 1024);
                     refreshed = true;
@@ -7112,6 +7138,22 @@ impl HttpTransport {
                         retry_after,
                         message: "HTTP 429: rate limited".to_string(),
                     });
+                }
+                Err(ureq::Error::Status(code, response)) => {
+                    let detail = read_capped(response, 8 * 1024);
+                    return Err(TransportError::Classified(
+                        if code == 401 && scope_upgraded {
+                            crate::call_failure::CallFailureKind::Auth {
+                                target: crate::call_failure::AuthTarget::Scope,
+                            }
+                        } else {
+                            crate::call_failure::CallFailureKind::http_status(code, true)
+                        },
+                        format!(
+                            "HTTP {code}: {}",
+                            detail.chars().take(200).collect::<String>()
+                        ),
+                    ));
                 }
                 Err(e) => return Err(TransportError::Fatal(e.to_string())),
             }
@@ -7156,6 +7198,7 @@ impl HttpTransport {
         params: &Value,
         mut bytes_read: u64,
     ) -> Result<Option<Value>, TransportError> {
+        let mut mismatched_response = false;
         loop {
             let mut bytes = Vec::new();
             let remaining = MAX_RESPONSE_BYTES.saturating_sub(bytes_read) as usize;
@@ -7233,9 +7276,16 @@ impl HttpTransport {
                 if http_response_id_matches(&v, Some(&wanted)) {
                     return Ok(Some(v));
                 }
+                mismatched_response |= v.get("result").is_some() || v.get("error").is_some();
             }
         }
-        Err(TransportError::Fatal(
+        if mismatched_response {
+            return Err(TransportError::Fatal(
+                "SSE response id did not match its request".into(),
+            ));
+        }
+        Err(TransportError::Classified(
+            crate::call_failure::CallFailureKind::Unavailable { after_send: true },
             "no matching message in SSE stream".to_string(),
         ))
     }
@@ -7298,6 +7348,7 @@ impl HttpTransport {
         // the `server/discover` era probe) and must not spend two forced
         // exchanges on one expired token (SOU-474).
         let mut refreshed = false;
+        let mut scope_upgraded = false;
         let wire_version = self.wire_protocol_version();
         let (resp, accepted_auth) = loop {
             if self
@@ -7365,6 +7416,9 @@ impl HttpTransport {
                 started.store(true, Ordering::Release);
             }
             let response = req.send_string(&payload);
+            if matches!(&response, Ok(_) | Err(ureq::Error::Status(_, _))) {
+                self.concurrency.responses.fetch_add(1, Ordering::AcqRel);
+            }
             // Cancellation wins even when the socket becomes readable at the same
             // instant. In particular, never launch scope reauthorization or rotate
             // an OAuth token for a request whose caller already abandoned it.
@@ -7398,13 +7452,14 @@ impl HttpTransport {
                     let operation = authorization_operation(body);
                     self.reauthorize_after_scope_challenge(code, &operation, challenge, auth)?;
                     refreshed = true;
+                    scope_upgraded = true;
                     continue;
                 }
                 // The access token likely expired: refresh it once and retry with
                 // the new token, so a long-running session self-heals instead of
                 // 401ing until the server is manually reconnected.
                 Err(ureq::Error::Status(code, r))
-                    if (code == 401 || code == 403) && !refreshed && self.refresh.is_some() =>
+                    if code == 401 && !refreshed && self.refresh.is_some() =>
                 {
                     let _ = read_capped(r, 8 * 1024);
                     refreshed = true;
@@ -7413,15 +7468,25 @@ impl HttpTransport {
                 }
                 Err(ureq::Error::Status(code, r)) => {
                     let detail = read_capped(r, 64 * 1024);
-                    if code == 400 && self.is_modern() && expect_response {
+                    if code == 400 && expect_response {
                         if let Ok(response) = serde_json::from_str::<Value>(&detail) {
                             let request_id = body.get("id");
-                            if http_response_id_matches(&response, request_id) {
-                                if let Some(error) = response.get("error") {
+                            if let Some(error) = response.get("error") {
+                                if ids_match(response.get("id"), request_id)
+                                    || error.get("code").and_then(Value::as_i64) == Some(-32602)
+                                {
                                     return Err(TransportError::Rpc(error.clone()));
                                 }
                             }
                         }
+                    }
+                    if matches!(code, 400 | 404) && !self.is_modern() {
+                        // Retire the invalid legacy session. Recover on a new demand,
+                        // never replay the POST that received this response.
+                        self.concurrency
+                            .session_invalid
+                            .store(true, Ordering::Release);
+                        self.concurrency.closed.store(true, Ordering::Release);
                     }
                     let detail: String = detail.chars().take(200).collect();
                     let hint = if code == 401 || code == 403 {
@@ -7430,7 +7495,13 @@ impl HttpTransport {
                         ""
                     };
                     return Err(TransportError::Classified(
-                        crate::call_failure::CallFailureKind::http_status(code, true),
+                        if code == 401 && scope_upgraded {
+                            crate::call_failure::CallFailureKind::Auth {
+                                target: crate::call_failure::AuthTarget::Scope,
+                            }
+                        } else {
+                            crate::call_failure::CallFailureKind::http_status(code, true)
+                        },
                         format!("HTTP {code}{hint}: {detail}"),
                     ));
                 }
@@ -7494,6 +7565,17 @@ fn http_response_id_matches(response: &Value, request_id: Option<&Value>) -> boo
 }
 
 impl Transport for HttpTransport {
+    fn response_count(&self) -> u64 {
+        self.concurrency.responses.load(Ordering::Acquire)
+    }
+
+    fn connection_reset_reason(&self) -> Option<String> {
+        self.concurrency
+            .session_invalid
+            .load(Ordering::Acquire)
+            .then(|| "MCP endpoint rejected the session".to_string())
+    }
+
     fn set_server_id(&mut self, id: &str) {
         self.auth_owner = Some(id.to_string());
     }
@@ -7779,9 +7861,7 @@ impl Transport for HttpTransport {
                             }
                         }
                         Err(ureq::Error::Status(code, response))
-                            if (code == 401 || code == 403)
-                                && !forced_refresh
-                                && auth_shell.refresh.is_some() =>
+                            if code == 401 && !forced_refresh && auth_shell.refresh.is_some() =>
                         {
                             let _ = read_capped(response, 8 * 1024);
                             forced_refresh = true;
@@ -8297,6 +8377,10 @@ impl DownstreamServer {
     /// (catalog refresh, subscriptions, reconnect) keep using `&mut self`.
     /// Whether a multiplexed connection has closed; `None` when calls to this
     /// server run one at a time.
+    pub fn response_count(&self) -> u64 {
+        self.transport.response_count()
+    }
+
     pub fn connection_reset_reason(&self) -> Option<String> {
         self.transport.connection_reset_reason()
     }
@@ -14520,6 +14604,68 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn sse_close_without_response_is_uncertain_but_wrong_ids_never_succeed() {
+        for (frames, succeeds) in [
+            ("", false),
+            ("data: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n\n", false),
+            ("data: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n", true),
+        ] {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/mcp", server.server_addr());
+            let wire = std::thread::spawn(move || {
+                let request = server.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+                request.respond(tiny_http::Response::from_string(frames)
+                    .with_header(tiny_http::Header::from_bytes("Content-Type", "text/event-stream").unwrap())).unwrap();
+            });
+            let mut transport = HttpTransport::new(&url);
+            let result = transport.post(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call"}), true);
+            if succeeds {
+                assert_eq!(result.unwrap().unwrap()["id"], 1);
+            } else {
+                let error = result.unwrap_err();
+                if !frames.is_empty() {
+                    assert_eq!(error.call_failure().kind, crate::call_failure::CallFailureKind::Internal);
+                    assert!(!error.is_health_failure());
+                    wire.join().unwrap();
+                    continue;
+                }
+                assert_eq!(error.call_failure().kind, crate::call_failure::CallFailureKind::Unavailable { after_send: true });
+                assert!(error.call_failure().kind.guidance(false).contains("may have completed"));
+                assert!(error.is_health_failure());
+            }
+            wire.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn scope_attempt_lock_poison_is_internal() {
+        let mut transport = HttpTransport::with_auth("http://127.0.0.1:1", Some("token".into()));
+        transport.set_scope_reauthorize(Some(Box::new(|_| Ok("new-token".into()))));
+        let attempts = Arc::clone(&transport.scope_upgrade_attempts);
+        let _ = std::thread::spawn(move || {
+            let _guard = attempts.lock().unwrap();
+            panic!("fixture poison");
+        })
+        .join();
+        let challenge = crate::oauth::bearer_challenge([
+            "Bearer error=\"insufficient_scope\", scope=\"write\"",
+        ])
+        .unwrap();
+        let error = transport
+            .reauthorize_after_scope_challenge(
+                403,
+                "tools/call:write",
+                challenge,
+                Some("token".into()),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.call_failure().kind,
+            crate::call_failure::CallFailureKind::Internal
+        );
+    }
+
+    #[test]
     fn configured_http_timeout_bounds_the_response_read() {
         use super::HttpTransport;
         use std::time::{Duration, Instant};
@@ -16365,6 +16511,9 @@ for line in sys.stdin:
         handle.join().unwrap();
 
         assert!(error.to_string().contains("HTTP 401"));
+        assert_eq!(error.call_failure().kind, crate::call_failure::CallFailureKind::Auth {
+            target: crate::call_failure::AuthTarget::Scope,
+        });
         assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
     }
 

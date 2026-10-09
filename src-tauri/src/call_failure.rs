@@ -32,6 +32,9 @@ pub enum CallFailureKind {
     Unavailable {
         after_send: bool,
     },
+    ServerError {
+        after_send: bool,
+    },
     Cancelled,
     Internal,
 }
@@ -65,6 +68,7 @@ impl From<String> for CallFailure {
 impl CallFailureKind {
     pub fn http_status(status: u16, endpoint: bool) -> Self {
         match status {
+            400 | 404 if endpoint => Self::Unavailable { after_send: true },
             400 | 422 => Self::InvalidInput {
                 missing: vec![],
                 invalid: vec![],
@@ -77,17 +81,15 @@ impl CallFailureKind {
                 },
             },
             403 => Self::Auth {
-                target: if endpoint {
-                    AuthTarget::Endpoint
-                } else {
-                    AuthTarget::Scope
-                },
+                target: AuthTarget::Scope,
             },
             404 => Self::NotFound,
             402 | 429 => Self::Quota,
             409 | 412 => Self::Conflict,
-            408 | 504 => Self::Timeout { after_send: true },
-            500..=599 => Self::Unavailable { after_send: true },
+            408 => Self::ServerError { after_send: true },
+            504 => Self::Unavailable { after_send: true },
+            502 | 503 => Self::Unavailable { after_send: true },
+            500..=599 => Self::ServerError { after_send: true },
             _ => Self::Internal,
         }
     }
@@ -147,7 +149,9 @@ impl CallFailureKind {
     pub fn uncertain(&self) -> bool {
         matches!(
             self,
-            Self::Timeout { after_send: true } | Self::Unavailable { after_send: true }
+            Self::Timeout { after_send: true }
+                | Self::Unavailable { after_send: true }
+                | Self::ServerError { after_send: true }
         )
     }
 
@@ -221,10 +225,10 @@ impl CallFailureKind {
             } => "Toolport cannot authenticate the MCP endpoint. Check its connection auth.",
             Self::Auth {
                 target: AuthTarget::ServiceCredential,
-            } => "The service rejected its API credential. Check the service key.",
+            } => "The server reports its API credential was rejected. Check the service key.",
             Self::Auth {
                 target: AuthTarget::Scope,
-            } => "The service denied access. Check credential scopes and permissions.",
+            } => "The server reports access was denied. Check scopes and permissions.",
             Self::Auth {
                 target: AuthTarget::OAuthRefresh,
             } => "MCP OAuth refresh failed. Reconnect in Toolport.",
@@ -243,6 +247,10 @@ impl CallFailureKind {
             Self::Unavailable { .. } => {
                 "Downstream unavailable. Check its connection or service status."
             }
+            Self::ServerError { after_send: true } if !read_only => {
+                "Server error after send; may have completed, check before retrying."
+            }
+            Self::ServerError { .. } => "Server returned an error. Check the error details.",
             Self::Cancelled => "Call cancelled. Check state before repeating a write.",
             Self::Internal => "Call failed. Check the error details.",
         };
@@ -400,6 +408,44 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn endpoint_statuses_separate_health_from_per_call_errors() {
+        for status in [500, 501, 505, 599, 408] {
+            let kind = CallFailureKind::http_status(status, true);
+            assert_eq!(kind, CallFailureKind::ServerError { after_send: true });
+            assert!(!kind.is_health_failure());
+            assert!(kind.guidance(false).contains("may have completed"));
+        }
+        for status in [400, 404, 502, 503, 504] {
+            assert_eq!(
+                CallFailureKind::http_status(status, true),
+                CallFailureKind::Unavailable { after_send: true }
+            );
+        }
+        assert_eq!(
+            CallFailureKind::http_status(403, true),
+            CallFailureKind::Auth {
+                target: AuthTarget::Scope
+            }
+        );
+        assert_eq!(
+            CallFailureKind::http_status(401, true),
+            CallFailureKind::Auth {
+                target: AuthTarget::Endpoint
+            }
+        );
+        for result in [
+            json!({"isError":true,"structuredContent":{"status":401}}),
+            json!({"isError":true,"content":[{"type":"text","text":"{\"error\":{\"code\":\"invalid_api_key\"}}"}]}),
+        ] {
+            let kind = CallFailureKind::tool_result(&result);
+            assert_eq!(
+                kind.guidance(false),
+                "The server reports its API credential was rejected. Check the service key."
+            );
+        }
+    }
+
+    #[test]
     fn model_guidance_golden_text_and_byte_budget() {
         let cases = [
             (
@@ -430,15 +476,15 @@ mod tests {
                     target: AuthTarget::ServiceCredential,
                 },
                 false,
-                "The service rejected its API credential. Check the service key.",
-                63,
+                "The server reports its API credential was rejected. Check the service key.",
+                74,
             ),
             (
                 CallFailureKind::Auth {
                     target: AuthTarget::Scope,
                 },
                 false,
-                "The service denied access. Check credential scopes and permissions.",
+                "The server reports access was denied. Check scopes and permissions.",
                 67,
             ),
             (
@@ -492,6 +538,18 @@ mod tests {
                 63,
             ),
             (
+                CallFailureKind::ServerError { after_send: true },
+                false,
+                "Server error after send; may have completed, check before retrying.",
+                67,
+            ),
+            (
+                CallFailureKind::ServerError { after_send: true },
+                true,
+                "Server returned an error. Check the error details.",
+                50,
+            ),
+            (
                 CallFailureKind::Cancelled,
                 false,
                 "Call cancelled. Check state before repeating a write.",
@@ -538,7 +596,7 @@ mod tests {
             (429, CallFailureKind::Quota),
             (402, CallFailureKind::Quota),
             (409, CallFailureKind::Conflict),
-            (504, CallFailureKind::Timeout { after_send: true }),
+            (504, CallFailureKind::Unavailable { after_send: true }),
             (503, CallFailureKind::Unavailable { after_send: true }),
         ] {
             assert_eq!(

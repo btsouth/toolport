@@ -46,11 +46,17 @@ describe("RegistryServerRow status accessibility", () => {
   it.each([
     ["endpoint", "MCP endpoint auth required"],
     ["service_credential", "Service credential required"],
-    ["scope", "Service permission required"],
-    ["oauth_refresh", "MCP OAuth refresh failed"],
   ] as const)("shows %s auth ownership", (authTarget, text) => {
     renderRow(true, health({ authRequired: true, authTarget }));
     expect(screen.getByText(text)).toBeInTheDocument();
+  });
+
+  it.each([
+    ["endpoint", "Sign in"],
+    ["service_credential", "Edit service key"],
+  ] as const)("offers a concrete %s action", (authTarget, label) => {
+    renderRow(true, health({ authRequired: true, authTarget }));
+    expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
   });
 
   it.each([

@@ -27,6 +27,21 @@ const servers: ServerEntry[] = ["GitHub", "Linear", "Stripe"].map((name, i) => (
   url: null,
   source: "manual",
 }));
+const authGuidance = new URLSearchParams(location.search).has("auth-guidance");
+if (authGuidance) {
+  servers[0] = {
+    ...servers[0],
+    name: "Remote project tools",
+    transport: "http",
+    command: null,
+    url: "https://example.invalid/mcp",
+  };
+  servers[1] = {
+    ...servers[1],
+    name: "Service API tools",
+    env: [{ key: "API_KEY", value: "", secret: true }],
+  };
+}
 const longNames = new URLSearchParams(location.search).has("long-names");
 if (longNames) servers[0].name = "A".repeat(70);
 const registry: Registry = {
@@ -443,9 +458,12 @@ mockIPC(
           },
         ];
       case "probe_servers":
-        return servers.map((s) => ({
+        return servers.map((s, i) => ({
           serverId: s.id,
-          ok: true,
+          ok: !authGuidance || i === 2,
+          authRequired: authGuidance && i < 2,
+          authTarget:
+            authGuidance && i < 2 ? (i === 0 ? "endpoint" : "service_credential") : null,
           toolCount: 25,
           error: null,
         }));

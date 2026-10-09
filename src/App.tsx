@@ -1301,7 +1301,7 @@ function ServerNextAction({
             : `${authCount + errorCount} servers need a quick check`;
   const detail =
     authCount > 0 && errorCount === 0
-      ? "Use Authenticate below to finish setup. Everything else stays available."
+      ? "Use the actions below to finish setup. Everything else stays available."
       : errorCount > 0 && authCount === 0
         ? "Open the affected rows below for the error and recovery details."
         : `${authCount} need sign-in; ${errorCount} couldn't start. The other servers stay available.`;

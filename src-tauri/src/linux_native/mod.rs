@@ -6694,10 +6694,8 @@ fn probe_status_line(probe: &crate::server_runtime::ProbeResult) -> (String, &'s
                 Some(crate::call_failure::AuthTarget::ServiceCredential) => {
                     "Service credential required"
                 }
-                Some(crate::call_failure::AuthTarget::Scope) => "Service permission required",
-                Some(crate::call_failure::AuthTarget::OAuthRefresh) => "MCP OAuth refresh failed",
                 Some(crate::call_failure::AuthTarget::Endpoint) => "MCP endpoint auth required",
-                None => "Authentication required",
+                _ => "Authentication required",
             }
             .to_string(),
             "review",
@@ -10015,8 +10013,6 @@ mod tests {
         for (target, text) in [
             (AuthTarget::Endpoint, "MCP endpoint auth required"),
             (AuthTarget::ServiceCredential, "Service credential required"),
-            (AuthTarget::Scope, "Service permission required"),
-            (AuthTarget::OAuthRefresh, "MCP OAuth refresh failed"),
         ] {
             let probe = crate::server_runtime::ProbeResult {
                 server_id: "fixture".into(),

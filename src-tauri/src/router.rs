@@ -605,6 +605,8 @@ struct ServerSlot {
     /// Calls that succeeded. A failed probe re-spawns a live multiplexed
     /// connection only if no other call succeeded while it was in flight.
     successes: AtomicU64,
+    /// Completed protocol responses, including ordinary error responses.
+    responses: AtomicU64,
     /// Calls running on a call handle. Counted while the slot lock is held to
     /// fetch the handle, so a re-spawn that checks it under the lock sees every
     /// call that could still be using the connection it replaces.
@@ -628,6 +630,7 @@ impl ServerSlot {
             in_flight: InFlightLimit::default(),
             generation: AtomicU64::new(0),
             successes: AtomicU64::new(0),
+            responses: AtomicU64::new(0),
             handle_calls: AtomicUsize::new(0),
             reconnect_gate: Mutex::new(()),
             supervisor: None,
@@ -644,6 +647,19 @@ impl ServerSlot {
         self.successes.load(Ordering::Acquire) == successes
             && self.handle_calls.load(Ordering::Acquire) == 0
             && server.suspended_calls() == 0
+    }
+
+    fn timeout_health(&self, error: &TransportError, generation: u64, responses: u64) -> bool {
+        !matches!(error.call_failure().kind, CallFailureKind::Timeout { .. })
+            || self.inner.try_lock().is_ok_and(|server| {
+                self.generation.load(Ordering::Acquire) == generation
+                    && self
+                        .responses
+                        .load(Ordering::Acquire)
+                        .wrapping_add(server.response_count())
+                        == responses
+                    && server.suspended_calls() == 0
+            })
     }
 }
 
@@ -786,7 +802,8 @@ impl ServerSlot {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.publishing
                 || !(demand && state.state == SupervisorState::Stopped
-                    || state.state == SupervisorState::Backoff
+                    || (state.state == SupervisorState::Backoff
+                        || state.state == SupervisorState::NeedsAuth && !state.ever_ready)
                         && (now >= state.next_attempt
                             || demand
                                 && now.saturating_duration_since(state.last_attempt)
@@ -809,6 +826,7 @@ impl ServerSlot {
                         Err(ConnectFailure {
                             message: "connection startup panicked".to_string(),
                             needs_auth: false,
+                            auth_target: None,
                         })
                     });
                 if let Some(slot) = weak.upgrade() {
@@ -837,6 +855,7 @@ impl ServerSlot {
                         }
                         Err(failure) => {
                             state.failures = state.failures.saturating_add(1);
+                            state.auth_target = failure.auth_target;
                             state.last_error = failure.message;
                             state.next_attempt = Instant::now()
                                 + state
@@ -886,7 +905,11 @@ impl ServerSlot {
             let mut state = supervisor
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.state == SupervisorState::Ready {
+            if state.state == SupervisorState::Ready
+                || state.state == SupervisorState::NeedsAuth
+                    && state.ever_ready
+                    && Instant::now() >= state.next_attempt
+            {
                 state.last_use = Instant::now();
                 return Ok(());
             }
@@ -945,8 +968,10 @@ impl ServerSlot {
         let mut state = supervisor
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.state != SupervisorState::Ready
-            || self.generation.load(Ordering::Acquire) != generation
+        if !matches!(
+            state.state,
+            SupervisorState::Ready | SupervisorState::NeedsAuth
+        ) || self.generation.load(Ordering::Acquire) != generation
         {
             return state.state != SupervisorState::Ready;
         }
@@ -1222,9 +1247,8 @@ impl Breaker {
 #[derive(Debug, Clone)]
 pub struct ConnectFailure {
     pub message: String,
-    /// The server refused our credentials (or has none). Retrying cannot help until
-    /// they change, and a change rewrites the registry, which rebuilds the router.
     pub needs_auth: bool,
+    pub auth_target: Option<AuthTarget>,
 }
 
 /// Connect (or re-connect) one server from scratch. Supplied by the gateway, like
@@ -1274,6 +1298,7 @@ fn reconnect_jitter() -> f64 {
 /// Retry bookkeeping for one pending server. `now` and the jitter are passed in so
 /// the transitions are unit-testable without sleeping.
 struct PendingState {
+    auth_target: Option<AuthTarget>,
     failures: u32,
     last_error: String,
     needs_auth: bool,
@@ -1287,6 +1312,7 @@ struct PendingState {
 impl PendingState {
     fn new(failure: ConnectFailure, backoff: &ReconnectBackoff, now: Instant, jitter: f64) -> Self {
         let mut state = PendingState {
+            auth_target: None,
             failures: 0,
             last_error: String::new(),
             needs_auth: false,
@@ -1328,6 +1354,7 @@ impl PendingState {
         self.failures = self.failures.saturating_add(1);
         self.last_error = failure.message;
         self.needs_auth = failure.needs_auth;
+        self.auth_target = failure.auth_target;
         // Cap after jitter, so the slowest retry is the cap itself.
         let delay = backoff
             .delay(self.failures)
@@ -1366,7 +1393,7 @@ impl PendingServer {
         PendingStatus {
             id: self.id.clone(),
             needs_auth: state.needs_auth,
-            auth_target: None,
+            auth_target: state.auth_target,
             connecting: state.in_flight || state.ready.is_some(),
             failures: state.failures,
             last_error: state.last_error.clone(),
@@ -1444,10 +1471,8 @@ impl PendingStatus {
         if self.needs_auth {
             let guidance = match self.auth_target {
                 Some(AuthTarget::Endpoint) => "MCP endpoint needs sign-in in Toolport",
-                Some(AuthTarget::OAuthRefresh) => "MCP OAuth refresh failed; reconnect in Toolport",
                 Some(AuthTarget::ServiceCredential) => "service API credential required",
-                Some(AuthTarget::Scope) => "service scope or permission required",
-                None => "needs sign-in in Toolport",
+                _ => "needs sign-in in Toolport",
             };
             format!("{guidance} (last error: {error})")
         } else if self.connecting {
@@ -2230,6 +2255,11 @@ impl Router {
                     state.ever_ready = true;
                     state.failures = 0;
                     state.last_error.clear();
+                    state.auth_target = None;
+                    slot.breaker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record_success();
                 }
             }
         }
@@ -3382,7 +3412,20 @@ impl Router {
             }
             let generation = slot.generation.load(Ordering::Acquire);
             let successes = slot.successes.load(Ordering::Acquire);
+            let responses = {
+                let server = slot
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                slot.responses
+                    .load(Ordering::Acquire)
+                    .wrapping_add(server.response_count())
+            };
             let (result, started) = Self::attempt(slot, access, cancel, &mut f);
+            if result.is_ok() || result.as_ref().is_err_and(|error| matches!(error, TransportError::Rpc(_))
+                || matches!(error, TransportError::Classified(kind, _) if !kind.is_health_failure())) {
+                slot.responses.fetch_add(1, Ordering::AcqRel);
+            }
             match result {
                 Ok(v) => {
                     slot.successes.fetch_add(1, Ordering::AcqRel);
@@ -3431,8 +3474,10 @@ impl Router {
                             let mut state = supervisor
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if state.state == SupervisorState::Ready
-                                && slot.generation.load(Ordering::Acquire) == generation
+                            if matches!(
+                                state.state,
+                                SupervisorState::Ready | SupervisorState::NeedsAuth
+                            ) && slot.generation.load(Ordering::Acquire) == generation
                                 && slot.successes.load(Ordering::Acquire) == successes
                             {
                                 state.state = SupervisorState::NeedsAuth;
@@ -3440,6 +3485,9 @@ impl Router {
                                     state.auth_target = Some(target);
                                 }
                                 state.last_error = e.to_string();
+                                state.failures = state.failures.saturating_add(1);
+                                state.next_attempt =
+                                    Instant::now() + state.backoff.delay(state.failures);
                             }
                         }
                     }
@@ -3455,7 +3503,7 @@ impl Router {
                     // Only a health failure (timeout / dead connection / exhausted
                     // retries) counts toward the breaker; a normal error response does
                     // not disable the server.
-                    if e.is_health_failure() {
+                    if e.is_health_failure() && slot.timeout_health(&e, generation, responses) {
                         if slot.degrade(generation, successes, &e.to_string(), is_probe) {
                             slot.breaker
                                 .lock()
@@ -3463,7 +3511,10 @@ impl Router {
                                 .record_concurrent_failure(started, Instant::now());
                             let mut message = slot.unavailable();
                             if replay_policy.uncertain_failure(&e).is_some() {
-                                message.push_str(". The previous operation may have completed; check before retrying it.");
+                                message.push_str(match replay_policy {
+                                    ReplayPolicy::ReadOnly => ". Retry the read after the endpoint recovers.",
+                                    ReplayPolicy::NoAmbiguousReplay => ". The previous operation may have completed; check before retrying it.",
+                                });
                             }
                             return Err(CallFailure::new(e.call_failure().kind, message));
                         }
@@ -3540,10 +3591,12 @@ impl Router {
             .supervisor
             .as_ref()
             .map(|s| s.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
-        if lifecycle
-            .as_ref()
-            .is_some_and(|s| s.state != SupervisorState::Ready)
-        {
+        if lifecycle.as_ref().is_some_and(|s| {
+            s.state != SupervisorState::Ready
+                && !(s.state == SupervisorState::NeedsAuth
+                    && s.ever_ready
+                    && Instant::now() >= s.next_attempt)
+        }) {
             drop(lifecycle);
             return (Err(TransportError::Busy(slot.unavailable())), None);
         }
@@ -3684,6 +3737,16 @@ impl Router {
                 "request cancelled before retrying the reconnected downstream",
             )));
         }
+        let generation = slot.generation.load(Ordering::Acquire);
+        let responses = {
+            let server = slot
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.responses
+                .load(Ordering::Acquire)
+                .wrapping_add(server.response_count())
+        };
         let (retry, started) = Self::attempt(slot, access, cancel, f);
         if retry.is_ok() {
             slot.successes.fetch_add(1, Ordering::AcqRel);
@@ -3699,7 +3762,7 @@ impl Router {
                 Ok(v)
             }
             Err(e) => {
-                if e.is_health_failure() {
+                if e.is_health_failure() && slot.timeout_health(&e, generation, responses) {
                     breaker.record_concurrent_failure(started, Instant::now());
                 }
                 Err(e.call_failure())
@@ -4160,7 +4223,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    fn http_timeout_with_successful_sibling(body_stage: bool) {
+    fn http_timeout_health(body_stage: bool, live_sibling: bool) {
         use crate::downstream::HttpTransport;
         use std::io::Write;
         let _lock = crate::registry::data_dir_test_lock();
@@ -4179,7 +4242,7 @@ mod tests {
         let writes = Arc::new(AtomicU32::new(0));
         let counted = writes.clone();
         let wire = std::thread::spawn(move || {
-            let mut stalled = None;
+            let mut stalled = Vec::new();
             while !stopped.load(Ordering::Acquire) {
                 let Some(mut request) = server.recv_timeout(Duration::from_millis(50)).unwrap()
                 else {
@@ -4198,7 +4261,7 @@ mod tests {
                     // Channel barriers, not sleeps, keep the write in flight while
                     // the sibling succeeds. Dropping this writer ends the fixture.
                     started_tx.send(()).unwrap();
-                    stalled = Some(output);
+                    stalled.push(output);
                     continue;
                 }
                 if body.get("id").is_none() {
@@ -4246,43 +4309,51 @@ mod tests {
             })),
         );
         let router = Arc::new(router);
-        let caller = router.clone();
-        let slow = std::thread::spawn(move || {
-            caller.route_call_typed("fixture__write", json!({}), None, None, None)
-        });
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let sibling = router
-            .route_call_typed("fixture__read", json!({}), None, None, None)
-            .unwrap();
-        assert_eq!(sibling["content"][0]["text"], "sibling succeeded");
-        let failure = slow.join().unwrap().unwrap_err();
-        assert_eq!(
-            failure.kind,
-            CallFailureKind::Timeout { after_send: true },
-            "{failure}"
-        );
+        for _ in 0..3 {
+            let caller = router.clone();
+            let slow = std::thread::spawn(move || {
+                caller.route_call_typed("fixture__write", json!({}), None, None, None)
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if live_sibling {
+                let sibling = router.route_call("fixture__read", json!({})).unwrap();
+                assert_eq!(sibling["content"][0]["text"], "sibling succeeded");
+            }
+            let failure = slow.join().unwrap().unwrap_err();
+            assert_eq!(
+                failure.kind,
+                CallFailureKind::Timeout { after_send: true },
+                "{failure}"
+            );
+        }
         assert_eq!(
             router.servers[0]
                 .breaker
                 .lock()
                 .unwrap()
                 .consecutive_failures,
-            1
+            if live_sibling || body_stage { 0 } else { 3 }
         );
         assert_eq!(
             spawns.load(Ordering::SeqCst),
             0,
-            "a timeout must not reconnect/replay an uncertain write"
+            "timeouts must not reconnect/replay"
         );
         assert_eq!(
             writes.load(Ordering::SeqCst),
-            1,
-            "the write must reach the wire once"
+            3,
+            "each write reaches the wire once"
         );
-        assert!(
-            router.route_call("fixture__read", json!({})).is_ok(),
-            "sibling connection survives the failed call"
-        );
+        if live_sibling {
+            assert!(router.route_call("fixture__read", json!({})).is_ok());
+        } else {
+            assert!(router.servers[0]
+                .breaker
+                .lock()
+                .unwrap()
+                .open_until
+                .is_some());
+        }
         stop.store(true, Ordering::Release);
         release_tx.send(()).unwrap();
         wire.join().unwrap();
@@ -4291,13 +4362,18 @@ mod tests {
     }
 
     #[test]
-    fn header_timeout_counts_health_without_replaying_or_interrupting_sibling() {
-        http_timeout_with_successful_sibling(false);
+    fn header_timeouts_with_live_siblings_leave_breaker_closed() {
+        http_timeout_health(false, true);
     }
 
     #[test]
-    fn body_timeout_counts_health_without_replaying_or_interrupting_sibling() {
-        http_timeout_with_successful_sibling(true);
+    fn body_timeouts_with_live_siblings_leave_breaker_closed() {
+        http_timeout_health(true, true);
+    }
+
+    #[test]
+    fn dead_http_timeouts_open_breaker_without_replay() {
+        http_timeout_health(false, false);
     }
 
     #[test]
@@ -5424,6 +5500,69 @@ mod tests {
         assert_eq!(breaker.consecutive_failures, 1);
         assert!(breaker.open_until.is_none(), "one event must not trip it");
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn reconnect_timeout_with_sibling_response_does_not_count_health() {
+        let mut router = Router::new();
+        router.add_with_reconnect(
+            mock_server("s"),
+            Some(Box::new(|| {
+                Some(
+                    DownstreamServer::connect(
+                        "s".into(),
+                        Box::new(GatedTransport {
+                            gate: closed_gate(),
+                            slow_fails: false,
+                            late: closed_gate(),
+                        }),
+                    )
+                    .unwrap(),
+                )
+            })),
+        );
+        let router = Arc::new(router);
+        let slot = Arc::clone(&router.servers[0]);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let caller = Arc::clone(&router);
+        let call_slot = Arc::clone(&slot);
+        let call = std::thread::spawn(move || {
+            caller
+                .reconnect_and_retry(
+                    &call_slot,
+                    None,
+                    None,
+                    0,
+                    0,
+                    SlotAccess::Shared,
+                    &mut |_| {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Err::<Value, _>(TransportError::Classified(
+                            CallFailureKind::Timeout { after_send: true },
+                            "deadline".into(),
+                        ))
+                    },
+                )
+                .unwrap()
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let sibling: Result<Value, CallFailure> = router.call_with_retry_typed(
+            &slot,
+            None,
+            false,
+            ReplayPolicy::NoAmbiguousReplay,
+            SlotAccess::Shared,
+            |_| Ok(json!({"sibling":true})),
+        );
+        assert!(sibling.is_ok());
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            call.join().unwrap().unwrap_err().kind,
+            CallFailureKind::Timeout { after_send: true }
+        );
+        assert_eq!(slot.breaker.lock().unwrap().consecutive_failures, 0);
     }
 
     #[test]
@@ -8040,6 +8179,7 @@ for line in sys.stdin:
         ConnectFailure {
             message: message.to_string(),
             needs_auth,
+            auth_target: needs_auth.then_some(AuthTarget::Endpoint),
         }
     }
 
@@ -8081,10 +8221,206 @@ for line in sys.stdin:
         router
     }
 
+    #[test]
+    fn endpoint_http_failures_keep_siblings_and_recover_auth_and_sessions() {
+        use crate::downstream::{HttpTransport, ScopeReauthorizeFn};
+        let _lock = crate::registry::data_dir_test_lock();
+        let scratch = std::env::temp_dir().join(crate::approval::new_correlation_id());
+        std::fs::create_dir_all(&scratch).unwrap();
+        let data = crate::registry::DataDirOverride::set(&scratch);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", server.server_addr());
+        let code = Arc::new(AtomicU32::new(200));
+        let status = Arc::clone(&code);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let initializes = Arc::new(AtomicU32::new(0));
+        let inits = Arc::clone(&initializes);
+        let wire = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Acquire) {
+                let Some(mut request) = server.recv_timeout(Duration::from_millis(50)).unwrap()
+                else {
+                    continue;
+                };
+                let mut text = String::new();
+                request.as_reader().read_to_string(&mut text).unwrap();
+                let body: Value = serde_json::from_str(&text).unwrap();
+                let status = if body["method"] == "tools/call" && body["params"]["name"] == "echo" {
+                    status.load(Ordering::Acquire)
+                } else {
+                    200
+                };
+                let result = match body["method"].as_str().unwrap_or_default() {
+                    "initialize" => {
+                        inits.fetch_add(1, Ordering::SeqCst);
+                        json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}}})
+                    }
+                    "tools/list" => {
+                        json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}},{"name":"sibling","inputSchema":{"type":"object"}}]})
+                    }
+                    _ => json!({"content":[{"type":"text","text":"ok"}]}),
+                };
+                let response = if status == 400 {
+                    json!({"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"session missing"}})
+                } else if status == 422 {
+                    json!({"jsonrpc":"2.0","id":body["id"],"error":{"code":-32602,"message":"invalid args"}})
+                } else {
+                    json!({"jsonrpc":"2.0","id":body["id"],"result":result})
+                };
+                let mut response = tiny_http::Response::from_string(response.to_string())
+                    .with_status_code(if status == 422 { 400 } else { status as u16 })
+                    .with_header(
+                        tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+                    );
+                if status == 403 {
+                    response = response.with_header(
+                        tiny_http::Header::from_bytes(
+                            "WWW-Authenticate",
+                            "Bearer error=\"insufficient_scope\", scope=\"write\"",
+                        )
+                        .unwrap(),
+                    );
+                }
+                request.respond(response).unwrap();
+            }
+        });
+        let connect: Connect = Arc::new(move || {
+            let mut transport = HttpTransport::new(&url);
+            let reauthorize: ScopeReauthorizeFn = Box::new(|_| Err("declined".into()));
+            transport.set_scope_reauthorize(Some(reauthorize));
+            DownstreamServer::connect("s".into(), Box::new(transport))
+                .map_err(|message| failure(&message, false))
+        });
+        let mut router = supervised_fixture(connect);
+        router.servers[0].start(true);
+        ready_supervisor(&mut router);
+        for status in [403, 403, 500, 500, 500, 501, 505, 422] {
+            code.store(status, Ordering::Release);
+            let error = router
+                .route_call_typed("s__echo", json!({}), None, None, None)
+                .unwrap_err();
+            let expected = if status == 403 {
+                CallFailureKind::Auth {
+                    target: AuthTarget::Scope,
+                }
+            } else if status == 422 {
+                CallFailureKind::InvalidInput {
+                    missing: vec![],
+                    invalid: vec![],
+                }
+            } else {
+                CallFailureKind::ServerError { after_send: true }
+            };
+            assert_eq!(error.kind, expected);
+            assert!(!router.servers[0].status().unwrap().needs_auth);
+            if status != 500 {
+                assert!(router.route_call("s__sibling", json!({})).is_ok());
+            }
+            assert_eq!(
+                router.servers[0]
+                    .breaker
+                    .lock()
+                    .unwrap()
+                    .consecutive_failures,
+                0
+            );
+        }
+        code.store(401, Ordering::Release);
+        assert_eq!(
+            router
+                .route_call_typed("s__echo", json!({}), None, None, None)
+                .unwrap_err()
+                .kind,
+            CallFailureKind::Auth {
+                target: AuthTarget::Endpoint
+            }
+        );
+        assert!(router.servers[0].status().unwrap().needs_auth);
+        code.store(200, Ordering::Release);
+        router.servers[0]
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .next_attempt = Instant::now();
+        assert!(router.route_call("s__echo", json!({})).is_ok());
+        assert!(!router.servers[0].status().unwrap().needs_auth);
+        assert_eq!(
+            initializes.load(Ordering::SeqCst),
+            1,
+            "auth recovery uses the existing connection"
+        );
+        for status in [400, 404] {
+            code.store(status, Ordering::Release);
+            assert_eq!(
+                router
+                    .route_call_typed("s__echo", json!({}), None, None, None)
+                    .unwrap_err()
+                    .kind,
+                CallFailureKind::Unavailable { after_send: true }
+            );
+            code.store(200, Ordering::Release);
+            router.servers[0]
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .next_attempt = Instant::now();
+            assert!(router.servers[0].start(true));
+            ready_supervisor(&mut router);
+            assert!(router.route_call("s__sibling", json!({})).is_ok());
+        }
+        assert_eq!(
+            initializes.load(Ordering::SeqCst),
+            3,
+            "invalid sessions initialize again"
+        );
+        stop.store(true, Ordering::Release);
+        wire.join().unwrap();
+        drop(data);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
     fn ready_supervisor(router: &mut Router) {
         assert!(wait_until(|| router.has_ready_reconnects()));
         router.adopt_ready_reconnects();
         router.activate_supervisors();
+    }
+
+    #[test]
+    fn read_only_timeout_degrade_keeps_read_wording_and_does_not_replay() {
+        let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
+        router.servers[0].start(true);
+        ready_supervisor(&mut router);
+        router.servers[0]
+            .breaker
+            .lock()
+            .unwrap()
+            .consecutive_failures = BREAKER_FAILURE_THRESHOLD;
+        let attempts = AtomicU32::new(0);
+        let result: Result<Value, CallFailure> = router.call_with_retry_typed(
+            &router.servers[0],
+            None,
+            false,
+            ReplayPolicy::ReadOnly,
+            SlotAccess::Shared,
+            |_| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(TransportError::Classified(
+                    CallFailureKind::Timeout { after_send: true },
+                    "deadline".into(),
+                ))
+            },
+        );
+        let failure = result.unwrap_err();
+        assert_eq!(failure.kind, CallFailureKind::Timeout { after_send: true });
+        assert!(failure
+            .detail
+            .contains("Retry the read after the endpoint recovers"));
+        assert!(!failure.detail.contains("may have completed"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -8121,14 +8457,45 @@ for line in sys.stdin:
                     Some(target)
                 );
             }
-            if target == AuthTarget::OAuthRefresh {
+            if endpoint_auth {
+                let calls = AtomicU32::new(0);
+                let blocked: Result<Value, CallFailure> = router.call_with_retry_typed(
+                    &router.servers[0],
+                    None,
+                    false,
+                    ReplayPolicy::NoAmbiguousReplay,
+                    SlotAccess::Shared,
+                    |_| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(json!({}))
+                    },
+                );
+                assert_eq!(blocked.unwrap_err().kind, kind);
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                router.servers[0]
+                    .supervisor
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .next_attempt = Instant::now();
+            }
+            if matches!(
+                target,
+                AuthTarget::Endpoint | AuthTarget::OAuthRefresh | AuthTarget::Scope
+            ) {
                 // A transient vault/lock failure must leave the next demand free
                 // to reread a saved winner, rather than terminally blocking it.
                 let recovered: Result<Value, CallFailure> = router.call_with_retry_typed(
-                    &router.servers[0], None, false, ReplayPolicy::NoAmbiguousReplay,
-                    SlotAccess::Shared, |_| Ok(json!({"savedWinner":true})),
+                    &router.servers[0],
+                    None,
+                    false,
+                    ReplayPolicy::NoAmbiguousReplay,
+                    SlotAccess::Shared,
+                    |_| Ok(json!({"savedWinner":true})),
                 );
                 assert_eq!(recovered.unwrap(), json!({"savedWinner":true}));
+                assert!(!router.servers[0].status().unwrap().needs_auth);
             }
 
             assert_eq!(
@@ -8309,7 +8676,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn supervisor_background_retry_waits_for_backoff_and_auth_waits_for_replacement() {
+    fn supervisor_background_and_connect_auth_retry_after_backoff() {
         let calls = Arc::new(AtomicU64::new(0));
         let mut router = supervised_fixture(flaky_connect("s", 1, Arc::clone(&calls)));
         router.servers[0].start(true);
@@ -8330,21 +8697,36 @@ for line in sys.stdin:
         let auth_calls = Arc::new(AtomicU64::new(0));
         let count = Arc::clone(&auth_calls);
         let auth: Connect = Arc::new(move || {
-            count.fetch_add(1, Ordering::SeqCst);
-            Err(failure("HTTP 401", true))
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(failure("HTTP 401", true))
+            } else {
+                Ok(mock_server("s"))
+            }
         });
-        let router = supervised_fixture(auth);
+        let mut router = supervised_fixture(auth);
         router.servers[0].start(true);
         assert!(wait_until(|| router.servers[0]
             .status()
             .unwrap()
             .needs_auth));
-        for _ in 0..10 {
-            router.maintain_supervisors();
-            router.servers[0].start(true);
-        }
-        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
-        assert!(router.servers[0].unavailable().contains("needs sign-in"));
+        let status = router.servers[0].status().unwrap();
+        assert_eq!(status.auth_target, Some(AuthTarget::Endpoint));
+        assert!(status.describe().contains("MCP endpoint"));
+        let (last, due) = {
+            let state = router.servers[0]
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap();
+            (state.last_attempt, state.next_attempt)
+        };
+        assert!(!router.servers[0].start_at(true, last));
+        assert!(router.servers[0].start_at(true, due));
+        ready_supervisor(&mut router);
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 2);
+        assert!(!router.servers[0].status().unwrap().needs_auth);
+        assert!(router.route_call("s__echo", json!({})).is_ok());
     }
 
     #[test]

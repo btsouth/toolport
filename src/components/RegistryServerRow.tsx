@@ -113,13 +113,9 @@ export function RegistryServerRow({
     status === "needs-auth"
       ? health?.authTarget === "service_credential"
         ? "Service credential required"
-        : health?.authTarget === "scope"
-          ? "Service permission required"
-          : health?.authTarget === "oauth_refresh"
-            ? "MCP OAuth refresh failed"
-            : health?.authTarget === "endpoint"
-              ? "MCP endpoint auth required"
-              : "Authentication required"
+        : health?.authTarget === "endpoint"
+          ? "MCP endpoint auth required"
+          : "Authentication required"
       : status === "connected"
         ? `Ready · ${health?.toolCount ?? 0} tool${health?.toolCount === 1 ? "" : "s"}`
         : status === "error"
@@ -205,20 +201,25 @@ export function RegistryServerRow({
             className="sr-only"
           />
           {status === "needs-auth" ? (
-            <SecretsDialog
-              server={server}
-              onSaved={onRegistryChange}
-              onChanged={onReprobe}
-              trigger={
-                <button
-                  onClick={stop}
-                  className="inline-flex items-center gap-1.5 rounded-md border border-warning/40 px-2.5 py-1 text-xs text-warning transition-colors hover:bg-warning/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-warning"
-                >
-                  <LogIn className="size-3.5" />
-                  {label}
-                </button>
-              }
-            />
+            <>
+              <StatusLabel status={status} label={label} error={health?.error ?? null} />
+              <SecretsDialog
+                server={server}
+                onSaved={onRegistryChange}
+                onChanged={onReprobe}
+                trigger={
+                  <button
+                    onClick={stop}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-warning/40 px-2.5 py-1 text-xs text-warning transition-colors hover:bg-warning/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-warning"
+                  >
+                    <LogIn className="size-3.5" />
+                    {health?.authTarget === "service_credential"
+                      ? "Edit service key"
+                      : "Sign in"}
+                  </button>
+                }
+              />
+            </>
           ) : (
             <StatusLabel status={status} label={label} error={health?.error ?? null} />
           )}
