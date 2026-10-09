@@ -107,7 +107,7 @@ fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) {
 /// Concatenate the model-facing text of an MCP tool result's content blocks, then
 /// fold in `structuredContent` so nothing is lost when the structured payload is
 /// the bloat.
-fn extract_body(result: &Value) -> String {
+fn extract_body(result: &Value) -> (String, usize) {
     let mut out = String::new();
     if let Some(blocks) = result.get("content").and_then(|c| c.as_array()) {
         for b in blocks {
@@ -119,13 +119,31 @@ fn extract_body(result: &Value) -> String {
             }
         }
     }
+    let mut source_bytes = out.len();
     if let Some(sc) = result.get("structuredContent") {
-        if !out.is_empty() {
-            out.push('\n');
+        let structured_text = serde_json::to_string(sc).unwrap_or_default();
+        source_bytes += structured_text.len() + usize::from(!out.is_empty());
+        // Some servers return the same JSON as text and structuredContent. Keep
+        // the original text bytes and the separately cached typed projection,
+        // without making every page repeat that JSON a second time. Only a
+        // single text block can qualify; mixed/multiple blocks remain lossless.
+        let single_text = result
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| blocks.len() == 1 && blocks[0]["type"] == "text");
+        let duplicate = single_text
+            && (out == structured_text
+                || serde_json::from_str::<Value>(&out)
+                    .ok()
+                    .is_some_and(|text| text == *sc));
+        if !duplicate {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&structured_text);
         }
-        out.push_str(&serde_json::to_string(sc).unwrap_or_default());
     }
-    out
+    (out, source_bytes)
 }
 
 fn value_size(value: &Value) -> usize {
@@ -230,8 +248,8 @@ pub fn shape_result_preserving_prefix(
     // non-text blocks, or its size is dominated by non-body envelope (the text
     // projection captures under half the bytes), shaping would drop data and its
     // "nothing was lost" claim would be false. Pass those through untouched.
-    let body = extract_body(result);
-    if !is_text_representable(result) || body.len() < size / 2 {
+    let (body, source_bytes) = extract_body(result);
+    if !is_text_representable(result) || source_bytes < size / 2 {
         return false;
     }
     let structured = result.get("structuredContent").cloned();
@@ -286,10 +304,9 @@ pub fn shape_result_preserving_prefix(
     let build = |head: &str| -> Value {
         let head_chars = head.chars().count();
         let marker = format!(
-            "\n\n[Toolport shaped this result: it was ~{} KB, larger than the {} KB context \
-             budget. Showing the first {} of {} characters. The rest is held temporarily, call \
-             toolport_fetch_result with {{\"cursor\":\"{}\",\"offset\":{}}} to read it. If that \
-             later reports the cursor expired, just re-run this tool call for a fresh result.]",
+            "\n\n[Toolport shaped this result: ~{} KB exceeds {} KB budget. Showing first {} of {} \
+             characters. Continue with toolport_fetch_result {{\"cursor\":\"{}\",\"offset\":{}}}. \
+             If the cursor expired, re-run the original tool call.]",
             size / 1024,
             budget / 1024,
             head_chars,
@@ -551,6 +568,68 @@ mod tests {
         let mut r = big_text_result(100);
         assert!(!shape_result(&mut r, 1024, None));
         assert_eq!(r["content"][0]["text"].as_str().unwrap().len(), 100);
+    }
+
+    #[test]
+    fn duplicate_json_is_paged_once_without_changing_text_or_typed_projection() {
+        let structured = json!({"rows":[{"text":"é🙂".repeat(3000)}]});
+        for pretty in [false, true] {
+            let text = if pretty {
+                serde_json::to_string_pretty(&structured).unwrap()
+            } else {
+                structured.to_string()
+            };
+            let mut result = json!({"content":[{"type":"text","text":text}], "structuredContent":structured,"isError":false,"extension":{"preserve":true}});
+            crate::integrity::label_untrusted_result_with_notice("github", &mut result, false);
+            let original = serde_json::to_vec(&result).unwrap();
+            let mut under = result.clone();
+            assert!(!shape_result(
+                &mut under,
+                original.len() + 1024,
+                Some("alice")
+            ));
+            assert_eq!(serde_json::to_vec(&under).unwrap(), original);
+            assert!(shape_result(&mut result, 2048, Some("alice")));
+            assert_eq!(result["extension"], json!({"preserve":true}));
+            let cursor = cursor_of(&result);
+            let fetched = fetch_result(&cursor, 0, usize::MAX, Some("alice"), None);
+            assert_eq!(
+                fetched["content"][0]["text"],
+                format!(
+                    "{text}\n\n[Toolport: end of result ({} characters).]",
+                    text.chars().count()
+                )
+            );
+            assert_eq!(
+                fetched["_meta"]["app.toolport/provenance"]["trust"],
+                "untrusted"
+            );
+            let projection = fetch_result(&cursor, 0, 0, Some("alice"), Some("rows"));
+            assert_eq!(
+                serde_json::from_str::<Value>(projection["content"][0]["text"].as_str().unwrap())
+                    .unwrap(),
+                structured["rows"]
+            );
+            assert_eq!(
+                projection["_meta"]["app.toolport/provenance"]["server"],
+                "github"
+            );
+            assert_eq!(
+                fetch_result(&cursor, 0, 100, Some("bob"), None)["isError"],
+                true
+            );
+        }
+    }
+
+    #[test]
+    fn different_or_multiple_text_blocks_keep_both_representations() {
+        for text in ["not JSON", r#"{"value":8}"#] {
+            let result =
+                json!({"content":[{"type":"text","text":text}],"structuredContent":{"value":7}});
+            assert_eq!(extract_body(&result).0, format!("{text}\n{{\"value\":7}}"));
+        }
+        let multiple = json!({"content":[{"type":"text","text":"{\"value\":"},{"type":"text","text":"7}"}],"structuredContent":{"value":7}});
+        assert_eq!(extract_body(&multiple).0, "{\"value\":\n7}\n{\"value\":7}");
     }
 
     #[test]

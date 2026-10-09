@@ -1599,10 +1599,9 @@ fn floor_tool_defs_with_code_mode(code_mode: bool) -> Vec<Value> {
 
 /// UTF-8 byte ceiling for the default lazy-mode floor: the serialized `tools/list`
 /// meta-tool array plus the built-in `initialize` instructions, with Code Mode off.
-/// The goal is at most 600 `tiktoken o200k_base` tokens. Rust tests have no tokenizer,
-/// so this bounds bytes instead: the floor measures about 4.6 bytes/token with
-/// `o200k_base`, so 2,400 bytes is roughly 520 tokens, and even at a conservative
-/// 4 bytes/token it is exactly 600. See the regression test for the exact breakdown.
+/// The byte guard complements the exact `o200k_base` gate in token_budget_regression;
+/// bytes alone cannot establish a token budget for JSON or non-ASCII text.
+/// The default floor goal is at most 550 o200k_base tokens, including 10% headroom.
 const META_TOOL_FLOOR_BYTE_BUDGET: usize = 2_400;
 
 /// The floor, named in the error a client gets when it calls a meta-tool that 2.0
@@ -1826,10 +1825,9 @@ fn help_tool_def(prefix: &str, tool_count: usize) -> Value {
     json!({
         "name": format!("help_{prefix}"),
         "description": format!(
-            "Browse the {tool_count} tool(s) on the \"{prefix}\" server: returns each tool's exact \
-             name, what it does, and its input schema. Pick one and run it with toolport_call_tool \
-             (name = the exact name shown). Pass an optional `query` to filter to a capability \
-             (recommended when a server has many tools)."
+            "Browse {tool_count} tools on \"{prefix}\". Filter with `query`; empty lists tools. \
+             Call toolport_call_tool with `name` set to the exact name shown. \
+             For schemaOmitted, search the exact tool name."
         ),
         "inputSchema": {
             "type": "object",
@@ -2419,6 +2417,38 @@ fn search_catalog_indexed(
         .map(|(position, _)| position)
         .collect();
 
+    // A known exposed name retrieves the full definition from the scoped pool.
+    // Routing preserves case, so prefer an exact match and only fold case when
+    // there is one unambiguous candidate. Collisions stay in the fuzzy menu.
+    let requested = query.trim();
+    if !requested.is_empty() {
+        let named = |position: &usize| cached.get(*position);
+        let exact = pool
+            .iter()
+            .filter_map(named)
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some(requested))
+            .or_else(|| {
+                let mut folded = pool.iter().filter_map(named).filter(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(requested))
+                });
+                let first = folded.next()?;
+                folded.next().is_none().then_some(first)
+            });
+        if let Some(tool) = exact {
+            let mut definition = tool.clone();
+            neutralize_listed_tool(&mut definition);
+            return SearchOutcome {
+                matches: vec![definition],
+                total: 1,
+                low_confidence: false,
+                broadened: 0,
+                direct_returned: 1,
+            };
+        }
+    }
+
     // Select an ordered set of tool refs (ranking happens here; projection below).
     let (selected, total, low_confidence, broadened, direct_returned) = if terms.is_empty() {
         // Empty query: list the pool. With `server` set this enumerates that server.
@@ -2558,57 +2588,39 @@ fn search_catalog_indexed(
         // pure lexical (positive scores only, highest first), identical to before.
         let semantic_ranked = semantic_rerank(sem, query, &lex);
         let used_semantic = semantic_ranked.is_some();
-        let mut ranked: Vec<(f64, &Value)> = semantic_ranked.unwrap_or_else(|| {
+        let ranked: Vec<(f64, &Value)> = semantic_ranked.unwrap_or_else(|| {
             let mut s: Vec<(f64, &Value)> =
                 lex.iter().filter(|(sc, _)| *sc > 0.0).cloned().collect();
             s.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
             s
         });
-        // An agent follows schemaOmitted recovery by searching the exact exposed
-        // name it was given. Make that contract deterministic: an exact name must
-        // lead even when another tool happens to score higher on shared tokens.
-        // This also guarantees project_budgeted keeps the requested tool's schema.
-        let exact_position = ranked.iter().position(|(_, tool)| {
-            tool.get("name")
-                .and_then(Value::as_str)
-                .map(|name| name.eq_ignore_ascii_case(query.trim()))
-                .unwrap_or(false)
-        });
-        if let Some(position) = exact_position.filter(|position| *position > 0) {
-            let exact = ranked.remove(position);
-            ranked.insert(0, exact);
-        }
         let total = ranked.len();
 
-        let low_confidence = if exact_position.is_some() {
-            false
-        } else {
-            match ranked.first() {
-                None => true,
-                Some((top_score, _)) if used_semantic => *top_score < LOW_CONFIDENCE_HYBRID_SCORE,
-                Some((top_score, _)) => {
-                    // Normalize the raw lexical score against an ideal result where
-                    // every meaningful query token hits a tool name. Missing query
-                    // terms still contribute to the denominator, which is exactly the
-                    // weak-evidence case that should broaden.
-                    let ideal_idf: f64 = q_tokens
-                        .iter()
-                        .map(|qt| {
-                            let matched_idf = std::iter::once(qt.as_str())
-                                .chain(synonym_group(qt).iter().copied())
-                                .filter(|candidate| df.contains_key(*candidate))
-                                .map(idf)
-                                .fold(0.0_f64, f64::max);
-                            if matched_idf > 0.0 {
-                                matched_idf
-                            } else {
-                                idf(qt)
-                            }
-                        })
-                        .sum();
-                    let ideal = NAME_W * ideal_idf * (1.0 + NAME_SPECIFICITY_W);
-                    ideal <= f64::EPSILON || *top_score / ideal < LOW_CONFIDENCE_LEXICAL_RATIO
-                }
+        let low_confidence = match ranked.first() {
+            None => true,
+            Some((top_score, _)) if used_semantic => *top_score < LOW_CONFIDENCE_HYBRID_SCORE,
+            Some((top_score, _)) => {
+                // Normalize the raw lexical score against an ideal result where
+                // every meaningful query token hits a tool name. Missing query
+                // terms still contribute to the denominator, which is exactly the
+                // weak-evidence case that should broaden.
+                let ideal_idf: f64 = q_tokens
+                    .iter()
+                    .map(|qt| {
+                        let matched_idf = std::iter::once(qt.as_str())
+                            .chain(synonym_group(qt).iter().copied())
+                            .filter(|candidate| df.contains_key(*candidate))
+                            .map(idf)
+                            .fold(0.0_f64, f64::max);
+                        if matched_idf > 0.0 {
+                            matched_idf
+                        } else {
+                            idf(qt)
+                        }
+                    })
+                    .sum();
+                let ideal = NAME_W * ideal_idf * (1.0 + NAME_SPECIFICITY_W);
+                ideal <= f64::EPSILON || *top_score / ideal < LOW_CONFIDENCE_LEXICAL_RATIO
             }
         };
 
@@ -7092,8 +7104,7 @@ fn handle_request_with_cancel(
                 // Note only clarifies the OMITTED results need a follow-up; the first
                 // result always carries its schema, so it never does.
                 let schema_note = if omitted {
-                    " Results flagged schemaOmitted have no input schema here; to call one, \
-                     search its exact name or pass `server` to get its schema."
+                    " For schemaOmitted, search the exact tool name for its schema."
                 } else {
                     ""
                 };
@@ -7168,9 +7179,8 @@ fn handle_request_with_cancel(
                     // commits instead of re-searching (the v0.3.6 keep-searching nudges
                     // overcorrected and made compliant models thrash).
                     format!(
-                        "Found {total} matching tool(s){scope}. Top match: `{top}`. Its complete \
-                         schema is below; if it fits, call it with toolport_call_tool using name \
-                         \"{top}\". Only search again if none match.{pin_note}{more}{schema_note}"
+                        "Found {total} matching tool(s){scope}. Top match: `{top}` with complete schema. \
+                         If it fits, call toolport_call_tool with name \"{top}\". Only search again if none match.{pin_note}{more}{schema_note}"
                     )
                 };
                 let text = format!(
@@ -33524,7 +33534,8 @@ mod tests {
         assert!(
             bytes <= META_TOOL_FLOOR_BYTE_BUDGET,
             "the lazy meta-tool floor is {bytes} bytes (tools {} + instructions {}); \
-             the budget is {META_TOOL_FLOOR_BYTE_BUDGET} bytes, about 520 o200k tokens",
+             the budget is {META_TOOL_FLOOR_BYTE_BUDGET} bytes; raise the limit deliberately \
+             and record before/after byte and token counts",
             tools_json.len(),
             DISCOVER_INSTRUCTIONS_PREAMBLE.len()
         );
@@ -37317,17 +37328,122 @@ mod tests {
             }),
             json!({
                 "name": "filesystem__read_file",
-                "description": "Read one local file.",
-                "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } } }
+                "description": "Read one local file. ".repeat(40),
+                "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } } },
+                "annotations": { "readOnlyHint": true },
+                "outputSchema": { "type": "string" }
             }),
         ];
-        let (hits, _) = search_catalog(&cat, "filesystem__read_file", None, 5);
+        let (hits, total) = search_catalog(&cat, "filesystem__read_file", None, 5);
+        assert_eq!(
+            total, 1,
+            "exact-name retrieval must not return a fuzzy menu"
+        );
+        assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["name"], "filesystem__read_file");
         assert_eq!(
             hits[0]["inputSchema"]["properties"]["path"]["type"],
             "string"
         );
         assert!(hits[0].get("schemaOmitted").is_none());
+        assert_eq!(
+            hits[0], cat[1],
+            "exact lookup must keep the full definition"
+        );
+        let index = CatalogSearchIndex::build(&cat);
+        let indexed = search_catalog_indexed(
+            &cat,
+            " filesystem__READ_FILE ",
+            Some("filesystem"),
+            25,
+            None,
+            Some(&index),
+        );
+        assert_eq!(indexed.matches, hits);
+        assert!(!indexed.low_confidence);
+        let denied = search_catalog_indexed(
+            &cat,
+            "filesystem__read_file",
+            Some("another"),
+            25,
+            None,
+            Some(&index),
+        );
+        assert!(
+            denied.matches.is_empty(),
+            "exact lookup must honor the server filter"
+        );
+    }
+
+    #[test]
+    fn exact_name_preserves_case_only_collisions() {
+        for (first, second) in [
+            ("x__GetItem", "x__getItem"),
+            ("GitHub__getItem", "github__getItem"),
+        ] {
+            let cat = vec![
+                json!({"name": first, "description": "Get item", "inputSchema": {"type": "object", "required": ["upper"]}}),
+                json!({"name": second, "description": "Get item", "inputSchema": {"type": "object", "required": ["lower"]}}),
+            ];
+            let index = CatalogSearchIndex::build(&cat);
+            for expected in &cat {
+                let outcome = search_catalog_indexed(
+                    &cat,
+                    expected["name"].as_str().unwrap(),
+                    None,
+                    25,
+                    None,
+                    Some(&index),
+                );
+                assert_eq!(outcome.matches, vec![expected.clone()]);
+                assert_eq!(outcome.total, 1);
+                assert!(!outcome.low_confidence);
+            }
+            let query = format!(
+                "{}__getItem",
+                first.split_once("__").unwrap().0.to_uppercase()
+            );
+            let ambiguous = search_catalog_indexed(&cat, &query, None, 25, None, Some(&index));
+            assert_eq!(
+                ambiguous.total, 2,
+                "ambiguous folded names must keep the menu"
+            );
+            assert_eq!(ambiguous.matches.len(), 2);
+        }
+    }
+
+    #[test]
+    fn exact_name_keeps_pinned_prerequisites_and_named_call_guidance() {
+        let _env = DataDirTestEnv::new("exact-name-pinned-prerequisites");
+        let host = dispatch_host(false);
+        let mut reg = Registry::default();
+        reg.set_tool_pinned("x", "prereq", true);
+        let router = routed_router("x", "prereq");
+        let cat = vec![
+            json!({"name": "x__prereq", "description": "Authenticate first", "inputSchema": {"type": "object"}}),
+            json!({"name": "x__getItem", "description": "Get item. ".repeat(100), "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": true}, "outputSchema": {"type": "string"}}),
+        ];
+        let response = handle_request(
+            &host,
+            &search_req("x__getItem"),
+            &reg,
+            &router,
+            &cat,
+            true,
+            None,
+            &SearchGuard::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let hits: Vec<Value> = serde_json::from_str(text.split_once("\n\n").unwrap().1).unwrap();
+        assert_eq!(
+            hits, cat,
+            "exact definition and prerequisite must both stay complete"
+        );
+        assert!(text.contains("pinned prerequisite tool(s) listed first"));
+        assert!(text.contains("call toolport_call_tool with name \"x__getItem\""));
     }
 
     #[test]
@@ -37460,8 +37576,8 @@ mod tests {
         // instead of re-searching. Regression guard for the search-thrash fix.
         assert!(text.contains("Top match:"), "should name the top match");
         assert!(
-            text.contains("call it now") || text.contains("call it"),
-            "should tell the model to call now"
+            text.contains("call toolport_call_tool with name \"stripe__list_charges\""),
+            "should tell the model to call the exact top tool name"
         );
         assert!(
             text.to_lowercase().contains("only search again"),
@@ -39500,6 +39616,8 @@ mod tests {
             }
         }
     }
+
+    include!("token_budget_tests.rs");
 
     #[test]
     fn discovery_surface_token_measurement() {

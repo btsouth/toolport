@@ -36,7 +36,8 @@
     "smoke:browser": "node scripts/browser-smoke.mjs",
     "dev:fixture": "vite --host 127.0.0.1 --open /fixtures/",
     "bench:bundle": "node benchmark/bundle.mjs",
-    "bench:audit": "cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support --example audit-performance"
+    "bench:audit": "cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support --example audit-performance",
+    "bench:tokens": "node benchmark/token-budget.mjs"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.2.9",

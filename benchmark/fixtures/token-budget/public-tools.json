@@ -1,0 +1,246 @@
+[
+  {
+    "name": "slack__slack_list_channels",
+    "description": "List public or pre-defined channels in the workspace with pagination",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "number",
+          "description": "Maximum number of channels to return (default 100, max 200)",
+          "default": 100
+        },
+        "cursor": {
+          "type": "string",
+          "description": "Pagination cursor for next page of results"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "slack__slack_post_message",
+    "description": "Post a new message to a Slack channel",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "description": "The ID of the channel to post to"
+        },
+        "text": {
+          "type": "string",
+          "description": "The message text to post"
+        }
+      },
+      "required": ["channel_id", "text"]
+    },
+    "annotations": {
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "slack__slack_reply_to_thread",
+    "description": "Reply to a specific message thread in Slack",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "description": "The ID of the channel containing the thread"
+        },
+        "thread_ts": {
+          "type": "string",
+          "description": "The timestamp of the parent message in the format '1234567890.123456'. Timestamps in the format without the period can be converted by adding the period such that 6 numbers come after it."
+        },
+        "text": {
+          "type": "string",
+          "description": "The reply text"
+        }
+      },
+      "required": ["channel_id", "thread_ts", "text"]
+    },
+    "annotations": {
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "slack__slack_add_reaction",
+    "description": "Add a reaction emoji to a message",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "description": "The ID of the channel containing the message"
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "The timestamp of the message to react to"
+        },
+        "reaction": {
+          "type": "string",
+          "description": "The name of the emoji reaction (without ::)"
+        }
+      },
+      "required": ["channel_id", "timestamp", "reaction"]
+    },
+    "annotations": {
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "slack__slack_get_channel_history",
+    "description": "Get recent messages from a channel",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "description": "The ID of the channel"
+        },
+        "limit": {
+          "type": "number",
+          "description": "Number of messages to retrieve (default 10)",
+          "default": 10
+        }
+      },
+      "required": ["channel_id"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "slack__slack_get_thread_replies",
+    "description": "Get all replies in a message thread",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "description": "The ID of the channel containing the thread"
+        },
+        "thread_ts": {
+          "type": "string",
+          "description": "The timestamp of the parent message in the format '1234567890.123456'. Timestamps in the format without the period can be converted by adding the period such that 6 numbers come after it."
+        }
+      },
+      "required": ["channel_id", "thread_ts"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "slack__slack_get_users",
+    "description": "Get a list of all users in the workspace with their basic profile information",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "type": "string",
+          "description": "Pagination cursor for next page of results"
+        },
+        "limit": {
+          "type": "number",
+          "description": "Maximum number of users to return (default 100, max 200)",
+          "default": 100
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "slack__slack_get_user_profile",
+    "description": "Get detailed profile information for a specific user",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "user_id": {
+          "type": "string",
+          "description": "The ID of the user"
+        }
+      },
+      "required": ["user_id"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "filesystem__read_text_file",
+    "description": "Read the complete contents of a file from the file system as text. Handles various text encodings and provides detailed error messages if the file cannot be read. Use this tool when you need to examine the contents of a single file. Use the 'head' parameter to read only the first N lines of a file, or the 'tail' parameter to read only the last N lines of a file. Operates on the file as text regardless of extension. Only works within allowed directories.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "head": {
+          "type": "number",
+          "description": "If provided, returns only the first N lines of the file"
+        },
+        "tail": {
+          "type": "number",
+          "description": "If provided, returns only the last N lines of the file"
+        }
+      },
+      "required": ["path"]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "filesystem__list_directory",
+    "description": "Get a detailed listing of all files and directories in a specified path. Results clearly distinguish between files and directories with [FILE] and [DIR] prefixes. This tool is essential for understanding directory structure and finding specific files within a directory. Only works within allowed directories.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": ["path"]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "github__issue_read",
+    "description": "Get information about a specific issue in a GitHub repository.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": ["get", "get_comments", "get_sub_issues", "get_parent", "get_labels"]
+        },
+        "owner": {
+          "type": "string",
+          "description": "The owner of the repository"
+        },
+        "repo": {
+          "type": "string",
+          "description": "The name of the repository"
+        },
+        "issue_number": {
+          "type": "number",
+          "description": "The number of the issue"
+        }
+      },
+      "required": ["method", "owner", "repo", "issue_number"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  }
+]
