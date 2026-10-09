@@ -3239,20 +3239,15 @@ fn compact_search_schema(mut schema: Value) -> Value {
         definitions: &mut serde_json::Map<String, Value>,
         root: bool,
     ) {
-        if let Value::Object(object) = node {
-            if object.contains_key("$ref") || object.contains_key("$id") {
+        if !root && node.is_object() {
+            let text = serde_json::to_string(node).unwrap_or_default();
+            if let Some(name) = names.get(&text) {
+                definitions.entry(name.clone()).or_insert_with(|| node.clone());
+                *node = json!({"$ref":format!("#/$defs/{name}")});
                 return;
             }
-            if !root {
-                let text = serde_json::to_string(node).unwrap_or_default();
-                if let Some(name) = names.get(&text) {
-                    definitions
-                        .entry(name.clone())
-                        .or_insert_with(|| node.clone());
-                    *node = json!({"$ref":format!("#/$defs/{name}")});
-                    return;
-                }
-            }
+        }
+        if let Value::Object(object) = node {
             for (key, child) in object.iter_mut() {
                 // Only traverse schema positions, never enum/default/examples data.
                 match key.as_str() {
@@ -3449,7 +3444,7 @@ fn enabled_summary(
     // Tool counts by server prefix, from the live catalog, gated by the same
     // visible set so a scoped client never sees another tenant's tool counts.
     if !cached.is_empty() {
-        let mut counts: std::collections::std::collections::BTreeMap<String, usize> =
+        let mut counts: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
         // `visible` holds RAW registry ids; a catalog prefix is the sanitized exposed
         // form, so the two are not comparable directly (a `file-system` server owns
