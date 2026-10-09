@@ -6763,7 +6763,14 @@ impl HttpTransport {
             Some(rejected) => crate::remote::newer_credential(owner, rejected),
             None => crate::remote::current_credential(owner),
         }
-        .map_err(|detail| TransportError::Classified(crate::call_failure::CallFailureKind::Auth { target: crate::call_failure::AuthTarget::OAuthRefresh }, detail))?;
+        .map_err(|detail| {
+            TransportError::Classified(
+                crate::call_failure::CallFailureKind::Auth {
+                    target: crate::call_failure::AuthTarget::OAuthRefresh,
+                },
+                detail,
+            )
+        })?;
         if let Some(token) = stored {
             self.publish_refreshed_auth(token);
             *self

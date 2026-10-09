@@ -3425,7 +3425,6 @@ impl Router {
                         e.call_failure().kind,
                         CallFailureKind::Auth {
                             target: crate::call_failure::AuthTarget::Endpoint
-                                | crate::call_failure::AuthTarget::OAuthRefresh
                         }
                     ) {
                         if let Some(supervisor) = &slot.supervisor {
@@ -8110,7 +8109,7 @@ for line in sys.stdin:
                 |_| Err(TransportError::Classified(kind.clone(), "opaque".into())),
             );
             assert_eq!(result.unwrap_err().kind, kind);
-            let endpoint_auth = matches!(target, AuthTarget::Endpoint | AuthTarget::OAuthRefresh);
+            let endpoint_auth = target == AuthTarget::Endpoint;
             assert_eq!(
                 router.servers[0].status().unwrap().needs_auth,
                 endpoint_auth
@@ -8121,6 +8120,15 @@ for line in sys.stdin:
                     router.servers[0].status().unwrap().auth_target,
                     Some(target)
                 );
+            }
+            if target == AuthTarget::OAuthRefresh {
+                // A transient vault/lock failure must leave the next demand free
+                // to reread a saved winner, rather than terminally blocking it.
+                let recovered: Result<Value, CallFailure> = router.call_with_retry_typed(
+                    &router.servers[0], None, false, ReplayPolicy::NoAmbiguousReplay,
+                    SlotAccess::Shared, |_| Ok(json!({"savedWinner":true})),
+                );
+                assert_eq!(recovered.unwrap(), json!({"savedWinner":true}));
             }
 
             assert_eq!(
