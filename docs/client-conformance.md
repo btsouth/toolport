@@ -23,6 +23,9 @@ The captured profiles cover Claude Code, Codex, Cursor, OpenCode, Gemini CLI,
 Qwen Code, Kilo Code and Hermes. Health commands may only initialize or ping, so their
 actual follow-up method sequence is replayed separately from synthetic calls.
 Cursor's health command opened two sessions; the profile represents one session.
+Codex has separate CLI and app-server status captures. A two-client check also
+uses the same request ID in both sessions and verifies isolated responses while
+sharing one daemon and downstream connection.
 
 For each captured profile the suite checks typed results/output schemas,
 notifications, resource reads, prompt retrieval, concurrent work during a long

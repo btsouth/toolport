@@ -246,7 +246,35 @@ async function replay(profile) {
 
 try {
   for (const profile of profiles) await baseline(profile);
-  for (const profile of profiles.filter((p) => p.initialize)) await replay(profile);
+  const captures = profiles
+    .filter((p) => p.initialize)
+    .flatMap((profile) => [
+      profile,
+      ...(profile.variants || []).map((variant) => ({ ...profile, ...variant })),
+    ]);
+  for (const profile of captures) await replay(profile);
+  const codex = profiles.find((p) => p.id === "codex");
+  const claude = profiles.find((p) => p.id === "claude-code");
+  await withFixture(codex, true, async (fixture, first) => {
+    const second = fixture.client(claude);
+    await Promise.all([first.initialize(), second.initialize()]);
+    await Promise.all([catalog(first, "mock__echo"), catalog(second, "mock__echo")]);
+    const replies = await Promise.all([
+      first.call("mock__echo", { text: "codex owned" }, false, "same-id"),
+      second.call("mock__echo", { text: "claude owned" }, false, "same-id"),
+    ]);
+    replies.forEach(success);
+    assert(textOf(replies[0]).includes("codex owned"));
+    assert(textOf(replies[1]).includes("claude owned"));
+    assert.equal((await fixture.descriptors()).length, 1);
+    assert.equal(
+      (await fixture.records()).filter((r) => r.method === "initialize").length,
+      1,
+    );
+  });
+  pass(
+    "two real handshake profiles: same request ID, distinct responses, one daemon and downstream",
+  );
   for (const revision of ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]) {
     const profile = {
       id: "protocol-variant",
@@ -276,7 +304,7 @@ try {
   });
   pass("modern sessionless discovery (synthetic)");
   console.log(
-    `Client conformance: ${checks} assertions passed; ${profiles.length} adapter baselines, ${profiles.filter((p) => p.initialize).length} captured health profiles. Authenticated model/GUI acceptance not implied.`,
+    `Client conformance: ${checks} scenario groups passed; ${profiles.length} adapter baselines, ${captures.length} captured health variants across ${profiles.filter((p) => p.initialize).length} clients. Authenticated model/GUI acceptance not implied.`,
   );
 } catch (error) {
   console.error(`[FAIL] ${error.stack}`);

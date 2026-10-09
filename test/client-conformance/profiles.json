@@ -226,7 +226,38 @@
         "detail": "No generic list-change handler found in pinned source"
       },
       "source": "docs/clients.md",
-      "observedSessionKind": "CLI health command, not model session"
+      "observedSessionKind": "CLI health command, not model session",
+      "variants": [
+        {
+          "kind": "app-server MCP status, no model turn",
+          "initialize": {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+              "protocolVersion": "2025-06-18",
+              "capabilities": {
+                "elicitation": {
+                  "form": {},
+                  "url": {}
+                }
+              },
+              "clientInfo": {
+                "name": "codex-mcp-client",
+                "title": "Codex",
+                "version": "0.159.3"
+              }
+            }
+          },
+          "initialMethods": [
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "resources/list",
+            "resources/templates/list"
+          ]
+        }
+      ]
     },
     {
       "id": "github-copilot-cli",
