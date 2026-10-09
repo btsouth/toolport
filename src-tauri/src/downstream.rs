@@ -826,11 +826,15 @@ pub const STDIO_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// before the caller's stdio read deadline expires.
 pub const SETUP_CATALOG_WAIT_BUDGET: Duration =
     STDIO_READ_TIMEOUT.saturating_sub(Duration::from_secs(5));
-/// Tighter bound for the connect handshake (initialize + tools/list). The batch
+/// Tighter bound for initialize and subsequent catalog refreshes. The batch
 /// probe and every router rebuild connect to all servers and wait on the slowest,
 /// so one hung server should fail in seconds, not stall everything for the full
 /// live-call timeout. Restored to STDIO_READ_TIMEOUT once connected.
 const STDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A first catalog can legitimately take 15 seconds plus schema publication work.
+/// Thirty seconds matches the existing traversal/live-call cap without giving a
+/// hung server an unbounded connection or extending initialize.
+const FIRST_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 /// Budget for the `server/discover` era probe, deliberately far tighter than any
 /// connect timeout.
 ///
@@ -8174,7 +8178,7 @@ impl DownstreamServer {
                 // slowest server. A server that implements `server/discover`
                 // answers it locally and immediately, so it needs none of that
                 // budget.
-                // The post-match `set_read_timeout(STDIO_CONNECT_TIMEOUT)` below
+                // The post-match first-catalog timeout below
                 // restores a normal budget for the rest of the handshake.
                 transport.set_read_timeout(PROBE_TIMEOUT);
 
@@ -8263,12 +8267,15 @@ impl DownstreamServer {
             serde_json::Map::new()
         };
 
-        // `initialize` answered, so any launcher download is done: the rest of the
-        // handshake goes back to the tight budget - a server that comes up but then
-        // hangs on `tools/list` should still fail in seconds.
-        transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        let listed = fetch_paginated_list(&mut *transport, "tools/list", "tools")
-            .map_err(|e| e.to_string())?;
+        // Initialize and first-catalog work have separate bounds. Apply one
+        // deadline across all pages, so pagination cannot multiply the budget.
+        let listed = fetch_paginated_list_with_deadline(
+            &mut *transport,
+            "tools/list",
+            "tools",
+            Some(Instant::now() + FIRST_CATALOG_TIMEOUT),
+        )
+        .map_err(|e| e.to_string())?;
         if let Some(warning) = &listed.warning {
             let msg = format!(
                 "server '{id}' returned a partial tool catalog ({} tool(s)): {warning}",
@@ -9385,6 +9392,15 @@ fn fetch_paginated_list(
     method: &str,
     key: &str,
 ) -> Result<PaginatedList, TransportError> {
+    fetch_paginated_list_with_deadline(transport, method, key, None)
+}
+
+fn fetch_paginated_list_with_deadline(
+    transport: &mut dyn Transport,
+    method: &str,
+    key: &str,
+    deadline: Option<Instant>,
+) -> Result<PaginatedList, TransportError> {
     let mut items = Vec::new();
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
@@ -9403,6 +9419,15 @@ fn fetch_paginated_list(
                     MAX_LIST_DURATION.as_secs()
                 ),
             ));
+        }
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(TransportError::Unavailable(format!(
+                    "first {method} catalog deadline exceeded"
+                )));
+            }
+            transport.set_read_timeout(remaining);
         }
         let params = cursor
             .as_ref()
@@ -9781,6 +9806,84 @@ mod tests {
         let listed = fetch_paginated_list(&mut whole, "tools/list", "tools").unwrap();
         assert_eq!(listed.truncation, None);
         assert!(listed.warning.is_none());
+    }
+
+    #[test]
+    fn first_catalog_has_its_own_bounded_budget_and_does_not_retry_a_hang() {
+        use std::time::Duration;
+        struct BudgetTransport {
+            timeout: Duration,
+            calls: Arc<std::sync::Mutex<Vec<(String, Duration)>>>,
+            catalog_delay: Duration,
+        }
+        impl Transport for BudgetTransport {
+            fn set_read_timeout(&mut self, timeout: Duration) {
+                self.timeout = timeout;
+            }
+            fn request(&mut self, method: &str, _: Value) -> Result<Value, TransportError> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((method.to_string(), self.timeout));
+                match method {
+                    "initialize" => Ok(json!({"capabilities":{}})),
+                    "tools/list" if self.catalog_delay < self.timeout => {
+                        Ok(json!({"tools":[{"name":"slow"}]}))
+                    }
+                    "tools/list" => Err(TransportError::Unavailable(
+                        "first catalog timed out".into(),
+                    )),
+                    _ => unreachable!(),
+                }
+            }
+            fn notify(&mut self, _: &str, _: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+        for delay in [Duration::from_secs(15), Duration::from_secs(31)] {
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let result = DownstreamServer::connect(
+                "slow".into(),
+                Box::new(BudgetTransport {
+                    timeout: Duration::ZERO,
+                    calls: Arc::clone(&calls),
+                    catalog_delay: delay,
+                }),
+            );
+            assert_eq!(result.is_ok(), delay < super::FIRST_CATALOG_TIMEOUT);
+            if let Err(error) = result {
+                assert!(error.contains("first catalog timed out"), "{error}");
+            }
+            let calls = calls.lock().unwrap();
+            assert_eq!(
+                calls.len(),
+                2,
+                "connect must not respawn or retry a hung catalog"
+            );
+            assert_eq!(
+                calls[0],
+                ("initialize".into(), super::STDIO_CONNECT_TIMEOUT)
+            );
+            assert!(calls[1].1 > Duration::from_secs(15));
+            assert!(calls[1].1 <= super::FIRST_CATALOG_TIMEOUT);
+        }
+    }
+
+    #[test]
+    fn first_catalog_deadline_bounds_all_pages() {
+        let mut transport = PaginationTransport::new(vec![Ok(json!({"tools":[]}))]);
+        let error = super::fetch_paginated_list_with_deadline(
+            &mut transport,
+            "tools/list",
+            "tools",
+            Some(std::time::Instant::now()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("catalog deadline exceeded"));
+        assert!(
+            transport.params.is_empty(),
+            "expired budgets must not dispatch another page"
+        );
     }
 
     #[test]

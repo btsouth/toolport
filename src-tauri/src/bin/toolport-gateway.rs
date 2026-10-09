@@ -1448,10 +1448,10 @@ fn status_tool_def() -> Value {
 fn search_tool_def() -> Value {
     json!({
         "name": "toolport_search_tools",
-        "description": "Your gateway to every connected MCP server's tools; use it first for any \
-            external action or data. Each match carries its exact name, description, and input \
-            schema when it fits. Call one with toolport_call_tool. If a schema is omitted \
-            (schemaOmitted), search that tool's exact name to get it.",
+        "description": "Search the live MCP inventory when a tool is not in your list or the catalog changed. \
+            Call this before declaring a capability absent; local keyword filters do not search it. \
+            Matches include exact names and schemas when they fit. Use toolport_call_tool; \
+            for schemaOmitted, search the exact tool name.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1493,7 +1493,7 @@ fn call_tool_def() -> Value {
 }
 
 /// What `server/discover` puts in its built-in instruction text.
-const DISCOVER_INSTRUCTIONS_PREAMBLE: &str = "Toolport aggregates every configured MCP server behind one endpoint. In lazy discovery mode the catalog is reached with toolport_search_tools and toolport_call_tool.";
+const DISCOVER_INSTRUCTIONS_PREAMBLE: &str = "Toolport aggregates configured MCP servers. When advertised, search/help helpers reach the live inventory; call them before declaring a tool absent. Local keyword filters do not search that inventory. Dispatch with toolport_call_tool.";
 
 /// The `instructions` for an `initialize` or `server/discover` result, or `None` to omit
 /// the field (#971). The requesting connection's profile (see
@@ -1826,7 +1826,7 @@ fn help_tool_def(prefix: &str, tool_count: usize) -> Value {
     json!({
         "name": format!("help_{prefix}"),
         "description": format!(
-            "Browse {tool_count} tools on \"{prefix}\". Filter with `query`; empty lists tools. \
+            "Browse {tool_count} tools on \"{prefix}\" before declaring a capability absent. Filter with `query`; empty lists tools. \
              Call toolport_call_tool with `name` set to the exact name shown. \
              For schemaOmitted, search the exact tool name."
         ),
@@ -6404,6 +6404,21 @@ impl GatewayResponse {
 const TOOL_SURFACE_CACHE_VIEWS: usize = 8;
 const TOOL_SURFACE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
+fn full_discovery_fallback(client: Option<&str>) -> bool {
+    clients::discovery_capabilities(client.unwrap_or("")).tools_list_changed == Some(false)
+}
+
+fn full_tool_floor(code_mode: bool, fallback: bool) -> Vec<Value> {
+    let mut tools = vec![status_tool_def(), fetch_result_tool_def()];
+    if fallback {
+        tools.extend([search_tool_def(), call_tool_def()]);
+    }
+    if code_mode {
+        tools.push(run_script_tool_def());
+    }
+    tools
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct ToolSurfaceKey {
     catalog: usize,
@@ -6414,6 +6429,7 @@ struct ToolSurfaceKey {
     allowed: Option<Vec<String>>,
     mode: u8,
     code_mode: bool,
+    full_fallback: bool,
     apps: bool,
     relays_apps: bool,
     app_servers: Vec<String>,
@@ -6535,6 +6551,9 @@ fn cached_tool_surfaces(
         allowed: allowed_key,
         mode: mode.as_u8(),
         code_mode: host.code_mode_enabled(),
+        full_fallback: full_discovery_fallback(
+            active_request_context().connection_identity.as_deref(),
+        ),
         apps,
         relays_apps,
         app_servers,
@@ -6653,14 +6672,7 @@ fn build_tool_surfaces(
         neutralize_listed_tool(&mut tool);
         tool
     };
-    let floor = tool_surface_with_code_mode(
-        key.code_mode,
-        reg,
-        router,
-        &[],
-        allowed,
-        DiscoveryMode::Full,
-    );
+    let floor = full_tool_floor(key.code_mode, key.full_fallback);
     let full_tools = || {
         floor.iter().cloned().chain(
             scoped
@@ -6761,10 +6773,7 @@ fn tool_surface_with_code_mode(
     };
     match mode {
         DiscoveryMode::Full => {
-            let mut tools = vec![status_tool_def(), fetch_result_tool_def()];
-            if code_mode {
-                tools.push(run_script_tool_def());
-            }
+            let mut tools = full_tool_floor(code_mode, false);
             if !relays_mcp_app_html_to_active_client(router, allowed) {
                 scoped.retain(mcp_app_tool_is_model_visible);
             }
@@ -6903,7 +6912,10 @@ fn handle_request_with_cancel(
             } else {
                 drop_blocked_from_cache(cached.shared(), router, reg)
             };
-            let tools = tool_surface(host, reg, router, &catalog, allowed, mode);
+            let mut tools = tool_surface(host, reg, router, &catalog, allowed, mode);
+            if mode == DiscoveryMode::Full && full_discovery_fallback(client) {
+                tools.extend([search_tool_def(), call_tool_def()]);
+            }
             if mode != DiscoveryMode::Full {
                 let full = tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Full);
                 savings::record_catalog(
@@ -29658,7 +29670,7 @@ mod tests {
             Some(DiscoveryMode::Lazy)
         );
         assert_eq!(resolve(&reg, "unknown-client"), Some(DiscoveryMode::Lazy));
-        assert_eq!(resolve(&reg, "claude-code"), Some(DiscoveryMode::Full));
+        assert_eq!(resolve(&reg, "claude-code"), Some(DiscoveryMode::Lazy));
         reg.set_client_discovery("adapter-pid-123", Some("grouped"));
         assert_eq!(
             resolve(&reg, "adapter-pid-123"),
@@ -39324,6 +39336,75 @@ mod tests {
         }
         let catalog = Arc::new(CatalogSnapshot::new(router.shared_tools()));
         (reg, Arc::new(router), catalog)
+    }
+
+    #[test]
+    fn full_discovery_fallback_token_cost_stays_small() {
+        let base = serde_json::to_string(&full_tool_floor(false, false)).unwrap();
+        let fallback = serde_json::to_string(&full_tool_floor(false, true)).unwrap();
+        let tokens = savings::count_tokens(&fallback) - savings::count_tokens(&base);
+        let bytes = fallback.len() - base.len();
+        eprintln!("Full fallback: Codex +{tokens}, Cursor +{tokens} cl100k_base tokens; +{bytes} bytes; refresh clients +0");
+        assert!(tokens <= 600, "two compact recovery helpers cost {tokens} tokens");
+    }
+
+    #[test]
+    fn full_discovery_fallback_is_per_client_cached_and_scoped() {
+        let _env = DataDirTestEnv::new("full-discovery-fallback");
+        let state = http_state(false);
+        let (reg, router, snapshot) = tool_surface_fixture();
+        *state.registry.lock().unwrap() = reg;
+        *state.router.lock().unwrap() = router;
+        *state.cached_tools.lock().unwrap() = snapshot;
+        let allowed = HashSet::from(["alpha".to_string()]);
+        for client in [
+            "adapter:codex",
+            "adapter:cursor",
+            "claude-code",
+            "opencode",
+            "gemini-cli",
+            "cline",
+            "zed",
+            "unknown",
+        ] {
+            let fallback = matches!(client, "adapter:codex" | "adapter:cursor");
+            let first = full_tools_list_for_client(&state, client, Some(&allowed));
+            let second = full_tools_list_for_client(&state, client, Some(&allowed));
+            assert_eq!(first, second);
+            let tools = first["result"]["tools"].as_array().unwrap();
+            for helper in ["toolport_search_tools", "toolport_call_tool"] {
+                assert_eq!(
+                    tools.iter().filter(|t| t["name"] == helper).count(),
+                    usize::from(fallback),
+                    "{client}: {helper}"
+                );
+            }
+            assert!(tools.iter().any(|t| t["name"] == "alpha__read"));
+            assert!(!tools.iter().any(|t| t["name"] == "beta__read"));
+        }
+        assert_eq!(
+            catalog_wait_budget(DiscoveryMode::Full, false, Some("adapter:codex"), false),
+            Duration::from_secs(8)
+        );
+        let run = |name: &str, arguments: Value| {
+            process_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
+            &SearchGuard::default(), Some(&allowed), None, None, None, Some("adapter:codex"), None,
+            DiscoveryMode::Full,
+        ).unwrap()
+        };
+        let search = run("toolport_search_tools", json!({"query":"read"})).to_string();
+        assert!(search.contains("alpha__read"), "{search}");
+        assert!(!search.contains("beta__read"), "{search}");
+        let denied = run(
+            "toolport_call_tool",
+            json!({"name":"beta__read", "arguments":{}}),
+        );
+        assert!(
+            denied["result"]["isError"] == true || denied.get("error").is_some(),
+            "{denied}"
+        );
     }
 
     #[test]

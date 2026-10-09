@@ -30,8 +30,9 @@ export interface DetectedClient {
   id: string;
   name: string;
   usesConnectors: boolean;
-  /** Backend capability evidence; missing or unknown native search resolves to lazy. */
+  /** Backend capability evidence and measured Auto default. */
   discovery?: {
+    autoMode?: "full" | "lazy";
     nativeToolSearch: boolean | null;
     toolsListChanged: boolean | null;
     coldFullListWaitMs?: number;

@@ -513,32 +513,37 @@ describe("ClientDetail legacy bearer migration", () => {
 });
 
 describe("ClientDetail Auto discovery", () => {
-  it.each([true, null])(
-    "shows the capability default before connect (refresh=%s)",
-    (refresh) => {
-      render(
-        <ClientDetail
-          client={client({
-            id: "claude-code",
-            discovery: {
-              nativeToolSearch: true,
-              toolsListChanged: refresh,
-              evidence: "fixture",
-            },
-          })}
-          registry={emptyRegistry()}
-          onRegistryChange={vi.fn()}
-          onChanged={vi.fn()}
-        />,
-      );
-      expect(screen.getByText("Auto (full)")).toBeInTheDocument();
-      expect(
-        screen.getByText(
-          "Full tool list. Client per-tool permission rules need Full mode.",
-        ),
-      ).toBeInTheDocument();
-    },
-  );
+  it.each([
+    ["claude-code", "lazy"],
+    ["codex", "full"],
+    ["cursor", "full"],
+    ["opencode", "lazy"],
+  ] as const)("shows the backend Auto default before connect (%s=%s)", (id, autoMode) => {
+    render(
+      <ClientDetail
+        client={client({
+          id,
+          discovery: {
+            autoMode,
+            nativeToolSearch: true,
+            toolsListChanged: null,
+            evidence: "fixture",
+          },
+        })}
+        registry={emptyRegistry()}
+        onRegistryChange={vi.fn()}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(`Auto (${autoMode})`)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        autoMode === "full"
+          ? "Full tool list. Client per-tool permission rules need Full mode."
+          : "Search, then call tools. Client per-tool permission rules need Full mode.",
+      ),
+    ).toBeInTheDocument();
+  });
   it.each(["grouped", " GROUPED "])(
     "keeps an explicit override instead of Auto (%s)",
     (mode) => {
