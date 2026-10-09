@@ -1065,6 +1065,7 @@ fn the_gateway_forwards_icons_through_tool_aggregation() {
     // failing means the gateway dropped them rather than the fixture omitting them.
     let raw_has_icons = server
         .tools
+        .materialize_all()
         .iter()
         .any(|t| t["name"] == "echo" && t.get("icons").is_some());
     assert!(
