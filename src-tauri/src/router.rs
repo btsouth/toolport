@@ -1888,7 +1888,12 @@ impl Router {
             let exposed = match ov_name {
                 Some(new) => {
                     let cand = sanitize_segment(&new);
-                    if !cand.is_empty() && self.seen.insert(cand.clone()) {
+                    // The gateway owns the toolport_* helper/core namespace.
+                    // Keep the original alias when an override would shadow it.
+                    if !cand.is_empty()
+                        && !cand.starts_with("toolport_")
+                        && self.seen.insert(cand.clone())
+                    {
                         cand
                     } else {
                         base

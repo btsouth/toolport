@@ -1493,7 +1493,16 @@ fn call_tool_def() -> Value {
 }
 
 /// What `server/discover` puts in its built-in instruction text.
-const DISCOVER_INSTRUCTIONS_PREAMBLE: &str = "Toolport aggregates configured MCP servers. When advertised, search/help helpers reach the live inventory; call them before declaring a tool absent. Local keyword filters do not search that inventory. Dispatch with toolport_call_tool.";
+const DISCOVER_INSTRUCTIONS_PREAMBLE: &str = "Toolport aggregates configured MCP servers. When advertised, search/help helpers reach the live inventory; call them before declaring a tool absent. Local keyword filters do not search that inventory.";
+
+fn discovery_instructions(mode: DiscoveryMode, client: Option<&str>) -> String {
+    let dispatch = if mode != DiscoveryMode::Full || full_discovery_fallback(client) {
+        "Dispatch with toolport_call_tool."
+    } else {
+        "Call the advertised tool name directly."
+    };
+    format!("{DISCOVER_INSTRUCTIONS_PREAMBLE} {dispatch}")
+}
 
 /// The `instructions` for an `initialize` or `server/discover` result, or `None` to omit
 /// the field (#971). The requesting connection's profile (see
@@ -6870,7 +6879,7 @@ fn handle_request_with_cancel(
                 "cacheScope": "private"
             });
             if let Some(text) =
-                server_instructions(reg, profile, || DISCOVER_INSTRUCTIONS_PREAMBLE.to_string())
+                server_instructions(reg, profile, || discovery_instructions(mode, client))
             {
                 result["instructions"] = Value::String(text);
             }
@@ -6898,7 +6907,7 @@ fn handle_request_with_cancel(
                 "serverInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") },
             });
             if let Some(text) =
-                server_instructions(reg, profile, || DISCOVER_INSTRUCTIONS_PREAMBLE.to_string())
+                server_instructions(reg, profile, || discovery_instructions(mode, client))
             {
                 result["instructions"] = Value::String(text);
             }
@@ -32216,11 +32225,11 @@ mod tests {
     fn built_in_instructions_are_unchanged_without_configuration() {
         assert_eq!(
             dispatch(&initialize_req())["result"]["instructions"],
-            DISCOVER_INSTRUCTIONS_PREAMBLE
+            discovery_instructions(DiscoveryMode::Lazy, None)
         );
         assert_eq!(
             dispatch(&modern_req(1, "server/discover", json!({})))["result"]["instructions"],
-            DISCOVER_INSTRUCTIONS_PREAMBLE
+            discovery_instructions(DiscoveryMode::Lazy, None)
         );
     }
 
@@ -32241,7 +32250,7 @@ mod tests {
         }
         assert_eq!(
             dispatched_instructions(&reg, Some("infra"), &initialize_req()),
-            Some(json!(DISCOVER_INSTRUCTIONS_PREAMBLE)),
+            Some(json!(discovery_instructions(DiscoveryMode::Full, None))),
             "a profile that sets nothing keeps the built-in text"
         );
 
@@ -32331,7 +32340,7 @@ mod tests {
         );
         assert_eq!(
             initialize("c-all"),
-            Some(json!(DISCOVER_INSTRUCTIONS_PREAMBLE)),
+            Some(json!(discovery_instructions(DiscoveryMode::Full, None))),
             "an unscoped client follows the active profile, which sets nothing"
         );
 
@@ -32404,7 +32413,10 @@ mod tests {
                 .get("instructions")
                 .cloned()
         };
-        assert_eq!(handshake(&state), Some(json!(DISCOVER_INSTRUCTIONS_PREAMBLE)));
+        assert_eq!(
+            handshake(&state),
+            Some(json!(discovery_instructions(DiscoveryMode::Lazy, None)))
+        );
         *state.profile.lock().unwrap() = Some("media".into());
         assert_eq!(handshake(&state), Some(json!("Media only.")));
         *state.profile.lock().unwrap() = Some("postgres".into());
@@ -34210,14 +34222,15 @@ mod tests {
         let tools = floor_tool_defs(&host);
         assert_eq!(tools.len(), 4, "Code Mode off means the floor is the core four");
         let tools_json = serde_json::to_string(&tools).expect("floor tools serialize");
-        let bytes = tools_json.len() + DISCOVER_INSTRUCTIONS_PREAMBLE.len();
+        let instructions = discovery_instructions(DiscoveryMode::Lazy, None);
+        let bytes = tools_json.len() + instructions.len();
         assert!(
             bytes <= META_TOOL_FLOOR_BYTE_BUDGET,
             "the lazy meta-tool floor is {bytes} bytes (tools {} + instructions {}); \
              the budget is {META_TOOL_FLOOR_BYTE_BUDGET} bytes; raise the limit deliberately \
              and record before/after byte and token counts",
             tools_json.len(),
-            DISCOVER_INSTRUCTIONS_PREAMBLE.len()
+            instructions.len()
         );
     }
 
