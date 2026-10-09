@@ -6844,8 +6844,11 @@ fn repoint_stale_gateways_in(
                             .iter()
                             .find(|s| detected_is_gateway(s))
                             .ok_or("Gateway disappeared during identity repair")?;
-                        let mut managed = ManagedEntry::from_gateway_entry(&updated);
+                        let mut managed = managed.get(&client.id).cloned().unwrap_or_else(|| ManagedEntry::from_gateway_entry(&updated));
+                        managed.command = current.to_string();
                         managed.args = server.args.clone();
+                        for key in &server.env_keys { managed.env.entry(key.clone()).or_default(); }
+                        managed.env.insert(crate::brand::CLIENT_ID.into(), client.id.clone());
 
                         Ok(WriteOutcome {
                             path: path.display().to_string(),
@@ -6921,12 +6924,7 @@ fn repoint_other_claude_configs(current: &str, outcome: &mut RepointOutcome) {
             if !gateway_entry_needs_rewrite(GATEWAY_ENTRY_NAME, &stored, current, None) {
                 let def = find_def("claude-code").ok_or("Unknown client")?;
                 backup_secondary_claude_file(&path)?;
-                return backfill_gateway_identity(
-                    &def,
-                    &path,
-                    GATEWAY_ENTRY_NAME,
-                    "claude-code-secondary",
-                );
+                return moved::backfill_identity(def.format, &path, GATEWAY_ENTRY_NAME, "claude-code-secondary");
             }
             secondary_claude_gateway_entry(profile.as_deref()).and_then(|entry| {
                 backup_secondary_claude_file(&path)?;

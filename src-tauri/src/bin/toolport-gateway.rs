@@ -25609,6 +25609,29 @@ mod tests {
     /// aggregates both results and returns ONE value; only that value comes back, and the
     /// call count is reported for savings accounting.
     #[test]
+    fn session_code_mode_audit_correlates_nested_calls_without_source_or_thrown_text() {
+        let _data = DataDirTestEnv::new("f3-code-mode-correlation");
+        let host = dispatch_host(true);
+        let reg = Registry::default();
+        let router = Arc::new(paging_router("x".into()));
+        let req = json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"toolport_run_script", "arguments":{"script":"toolport.call('s__big', {private:'f3-private-argument'}); throw new Error('f3-private-thrown');"}}});
+        let _context = observation::ContextGuard::enter(observation::Context { session_id: Some("opaque-session".into()), client_name: Some("Unknown app (via Cursor)".into()), client_label: Some("kt 1".into()), ..Default::default() });
+        let response = handle_request_with_cancel(&host, &req, &reg, &router, &[], DiscoveryMode::Lazy, None, &SearchGuard::default(), None, None, None, None, Some(&CatalogSearchIndex::build(&[])), Some(&router), None).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        let rows = audit::read_all().unwrap();
+        let run = rows.iter().find(|row| row["tool"] == "run_script").unwrap();
+        let nested = rows.iter().find(|row| row["server"] == "s").unwrap();
+        assert_eq!(run["failureKind"], "script_exception");
+        assert_eq!(run["runId"].as_str().unwrap().len(), 32);
+        assert_eq!(nested["runId"], run["runId"]);
+        assert_eq!(nested["sessionId"], "opaque-session");
+        assert_eq!(nested["clientName"], "Unknown app (via Cursor)");
+        assert!(nested["dispatchMs"].is_u64());
+        let retained = serde_json::to_string(&rows).unwrap();
+        for private in ["f3-private-argument", "f3-private-thrown", "throw new Error", "toolport.call"] { assert!(!retained.contains(private), "{retained}"); }
+    }
+
+    #[test]
     fn run_script_aggregates_downstream_calls() {
         let _data_env = DataDirTestEnv::new("run_script_aggregates_downstream_calls");
         let reg = Registry::default();
@@ -36467,7 +36490,7 @@ mod tests {
             .get("result")
             .is_some());
         broker.join().unwrap();
-        let entries = audit::read_all().unwrap();
+        let entries: Vec<_> = audit::read_all().unwrap().into_iter().filter(|row| row["kind"] == "approval").collect();
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "withdrawn");
         assert_eq!(audit::stats().unwrap()["total"], 0);
@@ -36664,7 +36687,7 @@ mod tests {
             ),
             ModernHitlPoll::Missing
         ));
-        let entries = audit::read_all().unwrap();
+        let entries: Vec<_> = audit::read_all().unwrap().into_iter().filter(|row| row["kind"] == "approval").collect();
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "withdrawn");
         assert_eq!(entries[0]["client"], "p08-client");
