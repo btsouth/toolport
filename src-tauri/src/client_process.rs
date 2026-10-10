@@ -96,8 +96,14 @@ fn is_interpreter(name: &str) -> bool {
             | "powershell"
             | "pwsh"
     ) || stem
-        .strip_prefix("python")
-        .is_some_and(|suffix| suffix.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        .strip_prefix("pythonw")
+        .or_else(|| stem.strip_prefix("python"))
+        .is_some_and(|suffix| {
+            suffix
+                .trim_end_matches('t')
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.')
+        })
 }
 
 fn command_basename(arg: &str) -> Option<String> {
@@ -325,6 +331,8 @@ mod tests {
     fn interpreter_names_and_script_basename_are_private_and_bounded() {
         for name in [
             "python3.14",
+            "python3.14t",
+            "pythonw.exe",
             "python",
             "node",
             "bun",
