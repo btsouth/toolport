@@ -5303,7 +5303,7 @@ mod tests {
                 .unwrap();
             assert_eq!(request.method().as_str(), method);
             assert_eq!(request.url(), path);
-            let header = |name: &str| {
+            let header = |name: &'static str| {
                 request
                     .headers()
                     .iter()
