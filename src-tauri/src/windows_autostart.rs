@@ -134,12 +134,10 @@ pub(crate) fn remove_toolport_entries(names: &[&str]) -> Vec<crate::purge::Lefto
             {
                 return Err("Startup command has different ownership. It was preserved.".into());
             }
-            if let Err(error) = run.delete_value(name) {
-                return Err(error.to_string());
-            }
             match user.open_subkey_with_flags(STARTUP_APPROVED_KEY, KEY_WRITE) {
                 Ok(key) => match key.delete_value(name) {
-                    Ok(()) => {}
+                    run.delete_value(name).map_err(|error| error.to_string())?;
+            Ok(()) => {}
                     Err(error) if error.kind() == ErrorKind::NotFound => {}
                     Err(error) => {
                         leftovers.push(crate::purge::Leftover {

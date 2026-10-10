@@ -1528,12 +1528,6 @@ async fn get_search_traces(limit: usize) -> Result<Vec<serde_json::Value>, Strin
     .map_err(|e| format!("search traces task join failed: {e}"))?
 }
 
-/// Clear legacy and v2 search-trace logs.
-#[tauri::command]
-fn clear_search_traces() -> Result<(), String> {
-    searchtrace::try_clear().map_err(|e| format!("Couldn't clear the search traces: {e}"))
-}
-
 /// Clear all retained local activity in one confirmed action: the audit log, discovery
 /// search traces, live-inspection captures, and the savings tally (including its
 /// carry-forward total). Each is a local, irreversible delete; the logs re-create
@@ -4138,7 +4132,6 @@ pub fn run() {
             get_inspect_log,
             clear_inspect_log,
             get_search_traces,
-            clear_search_traces,
             clear_activity_logs,
             list_tool_identities,
             set_pii_redaction,

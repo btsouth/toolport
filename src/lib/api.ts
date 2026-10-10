@@ -241,11 +241,6 @@ export function getSearchTraces(limit = 100): Promise<SearchTrace[]> {
   return invoke<SearchTrace[]>("get_search_traces", { limit });
 }
 
-/** Clear the search-trace log. */
-export function clearSearchTraces(): Promise<void> {
-  return invoke<void>("clear_search_traces");
-}
-
 /** Clear all retained local activity at once: audit log, discovery traces,
  * live-inspection captures, and the savings tally (incl. its carry-forward total).
  * Local, irreversible deletes; each log re-creates itself on the next event. */
