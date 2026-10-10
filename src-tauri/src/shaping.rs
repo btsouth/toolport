@@ -336,6 +336,10 @@ pub fn shape_result_preserving_prefix(
     if budget == 0 {
         return false;
     }
+    let server = result
+        .pointer("/_meta/app.toolport~1provenance/server")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let size = serde_json::to_string(result).map(|s| s.len()).unwrap_or(0);
     if size <= budget {
         return false;
