@@ -1004,7 +1004,16 @@ it("shows both conflict versions as fields with the server name and highlighted 
     },
   };
   personal.servers = [
-    { id: "docs-http", name: "Toolport docs", transport: "http", args: [], env: [] },
+    {
+      id: "docs-http",
+      name: "Toolport docs",
+      transport: "http",
+      command: null,
+      url: "https://example.com/this",
+      source: null,
+      args: [],
+      env: [],
+    },
   ];
   render(<TeamsView registry={personal} onRegistryChange={vi.fn()} />);
   expect(screen.getByText("Toolport docs changed on both machines")).toBeInTheDocument();
