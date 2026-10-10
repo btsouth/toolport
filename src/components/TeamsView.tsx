@@ -96,18 +96,23 @@ export function TeamsView({
   onReprobe?: () => void;
 }) {
   const team = registry?.team ?? null;
-  const [syncStatus, setSyncStatus] = useState<TeamSyncStatus | null>(null);
+  const teamKey = team ? `${team.serverUrl}:${team.teamId}` : null;
+  const [syncSnapshot, setSyncSnapshot] = useState<{
+    key: string | null;
+    status: TeamSyncStatus | null;
+  } | null>(null);
+  const syncStatus = syncSnapshot?.key === teamKey ? syncSnapshot.status : null;
   useEffect(() => {
     let cancelled = false;
     const refresh = () =>
       teamSyncStatus()
         .then((status) => {
-          if (!cancelled) setSyncStatus(status);
+          if (!cancelled) setSyncSnapshot({ key: teamKey, status });
         })
         .catch(() => {
-          if (!cancelled) setSyncStatus(null);
+          if (!cancelled) setSyncSnapshot({ key: teamKey, status: null });
         });
-    if (team) void refresh();
+    if (teamKey) void refresh();
     const un = listen<TeamSyncStatus>("team-sync-status", () => {
       void refresh();
     });
@@ -115,7 +120,7 @@ export function TeamsView({
       cancelled = true;
       void un.then((f) => f());
     };
-  }, [team?.teamId, team?.serverUrl, team?.lastVersion]);
+  }, [teamKey, team?.lastVersion]);
   const isAdmin = team?.role === "admin";
   const review = (
     team as (NonNullable<Registry["team"]> & { memberReview?: MemberReviewState }) | null
@@ -289,7 +294,10 @@ export function TeamsView({
       try {
         onRegistryChange(await teamSync());
       } finally {
-        setSyncStatus(await teamSyncStatus().catch(() => null));
+        setSyncSnapshot({
+          key: teamKey,
+          status: await teamSyncStatus().catch(() => null),
+        });
       }
       setNotice("Synced with the team.");
     });
