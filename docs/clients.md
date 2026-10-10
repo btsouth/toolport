@@ -31,6 +31,7 @@ below for you, so you never have to edit these by hand.
 | Kiro                    | `~/.kiro/settings/mcp.json`                                                                            | JSON (`mcpServers`)      |
 | Kimi Code               | `$KIMI_CODE_HOME/mcp.json` (default `~/.kimi-code/mcp.json`)                                           | JSON (`mcpServers`)      |
 | ZCode                   | `~/.zcode/cli/config.json`                                                                             | JSON (`mcp.servers`)     |
+| Command Code            | `~/.commandcode/mcp.json`                                                                              | JSON (`mcpServers`)      |
 | Zed                     | `~/.config/zed/settings.json`                                                                          | JSON (`context_servers`) |
 | LM Studio               | `~/.lmstudio/mcp.json`                                                                                 | JSON (`mcpServers`)      |
 | Jan                     | `<data>/Jan/data/mcp_config.json`                                                                      | JSON (`mcpServers`)      |

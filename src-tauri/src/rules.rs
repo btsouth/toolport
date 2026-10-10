@@ -491,10 +491,10 @@ pub fn set_client_enabled(client_id: &str, enabled: bool) -> Result<RulesView, S
 // own owned file, with the same writer and markers as everywhere else.
 //
 // Why files and not clients: at project level nearly every client reads the root `AGENTS.md`
-// (Codex, Cursor, Copilot, Roo, Cline, Kiro, Goose, Devin, Pi, Oh My Pi), Gemini CLI and
-// Antigravity read `GEMINI.md`, and Claude Code and VS Code read `.claude/rules/`. Offering a
-// dozen client checkboxes that collapse onto one file would be theatre; the file IS the
-// decision, and each one names the clients it reaches. Each mapping is cited in
+// (Codex, Cursor, Copilot, Roo, Cline, Kiro, Goose, Devin, Pi, Oh My Pi, Command Code), Gemini
+// CLI and Antigravity read `GEMINI.md`, and Claude Code and VS Code read `.claude/rules/`.
+// Offering a dozen client checkboxes that collapse onto one file would be theatre; the file IS
+// the decision, and each one names the clients it reaches. Each mapping is cited in
 // docs/agent-rules.md. Zed is left out on purpose: it reads only the FIRST of `.rules`,
 // `.cursorrules`, `.windsurfrules`, `.clinerules`, `.github/copilot-instructions.md`,
 // `AGENT.md`, `AGENTS.md`, ..., so whether it would read our block depends on files Toolport
@@ -527,6 +527,7 @@ pub const PROJECT_FILES: &[ProjectFile] = &[
             "goose",
             "pi",
             "omp",
+            "command-code",
         ],
     },
     ProjectFile {
