@@ -3121,6 +3121,7 @@ mod tests {
                 args: vec!["machine A v2".into()],
                 url: None,
                 cwd: None,
+                inherit_env: None,
             },
         )
         .unwrap();

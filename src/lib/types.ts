@@ -479,7 +479,6 @@ export interface KeptV1Safety {
 
 export interface ServerEntry {
   syncExecutionReview?: Record<string, string>;
-  inheritEnv?: boolean;
   syncLocalOnly?: boolean;
   teamOriginalId?: string;
   personalSyncEntry?: boolean;
