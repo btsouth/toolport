@@ -786,8 +786,9 @@ pub fn apply(
                     .filter(|s| {
                         !s.unknown_fields
                             .contains_key("personalSyncCredentialDestination")
+                            && !s.needs_team_enable_review()
                     })
-                    .map(|s| s.id.clone())
+                    .and_then(|s| crate::local_auth::owner_in(reg, &s.id).ok())
             });
         let credential_owner = if let Some(owner) = credential_owner {
             owner

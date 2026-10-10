@@ -52,6 +52,9 @@ pub(crate) fn pin_http_destination(id: &str, url: &str) -> Result<Option<OwnerPi
     let Some(reg) = snapshot()? else {
         return Ok(None);
     };
+    if bindings(&reg)?.contains_key(id) {
+        return Ok(None);
+    }
     let Some(base) = reg
         .unknown_fields
         .get("personalSyncCredentialDestinations")
@@ -85,6 +88,9 @@ pub(crate) fn pin_personal_owner(id: &str) -> Result<Option<OwnerPin>, String> {
     let Some(reg) = snapshot()? else {
         return Ok(None);
     };
+    if bindings(&reg)?.contains_key(id) {
+        return Ok(None);
+    }
     if reg
         .unknown_fields
         .get("personalSyncCredentialDestinations")
