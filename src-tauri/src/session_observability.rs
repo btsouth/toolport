@@ -53,7 +53,7 @@ pub fn display_label(label: &str) -> Option<String> {
     crate::approval::sanitize_client_label(&safe)
 }
 
-/// Retain only registered HTTP IDs and known adapter IDs in observation rows.
+/// Retain registered HTTP IDs and privacy-safe configured adapter IDs.
 pub fn telemetry_principal(client: &str) -> Option<&str> {
     (client.starts_with("client:")
         || client
@@ -107,8 +107,8 @@ impl Drop for DispatchTimer {
 
 pub fn enrich(entry: &mut Value) {
     let ctx = current();
-    // Use the privacy-filtered display identity for every row, including nested calls.
-    if let Some(client) = ctx.client {
+    // Carry the recorded principal into nested calls without changing access identity.
+    if let Some(client) = ctx.client.as_deref().and_then(telemetry_principal) {
         entry["client"] = json!(client);
     } else if entry["client"].as_str().is_some_and(|c| telemetry_principal(c).is_none()) {
         if let Some(object) = entry.as_object_mut() { object.remove("client"); }
@@ -153,6 +153,12 @@ pub fn enrich(entry: &mut Value) {
                 object.remove(field);
             }
         }
+    }
+    if entry["clientName"].as_str().is_none() {
+        // Newly written calls always record attribution, even outside a gateway
+        // request. Missing caller fields remain meaningful on legacy rows only.
+        let name = crate::clients::trusted_client_name(entry["client"].as_str(), None);
+        entry["clientName"] = json!(if name == "Unrecorded client" { "Unknown client" } else { &name });
     }
 }
 
@@ -258,7 +264,7 @@ impl Session {
             id: crate::approval::new_correlation_id(),
             audit_path: crate::audit::audit_path(),
             // Anonymous process IDs and token-derived legacy principals are not retained.
-            client: display_client.and_then(telemetry_principal).map(str::to_string),
+            client: client.and_then(telemetry_principal).map(str::to_string),
             name: display_label(&crate::clients::trusted_client_name(display_client, name))
                 .unwrap_or_else(|| "Unknown client".into()),
             client_type,

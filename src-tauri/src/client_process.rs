@@ -55,7 +55,7 @@ fn walk(mut pid: u32, mut read: impl FnMut(u32) -> Option<(Generation, String)>)
         // Skip the adapter itself; examine its parents, including generic launchers.
         if seen.len() > 1 {
             let name = Path::new(&name).file_name()?.to_str()?;
-            let name = crate::approval::sanitize_client_label(name)?;
+            let name = crate::session_observability::display_label(name)?;
             let name = crate::approval::shorten_client_label(&name, 48);
             let stem = name
                 .to_ascii_lowercase()
@@ -281,7 +281,9 @@ fn process(pid: u32) -> Option<(Generation, String)> {
         found
     }?;
     let after = windows_generation(pid)?;
-    (before == after).then_some((
+    // If command attribution is unavailable, let clientInfo supply a reported
+    // label rather than presenting a generic interpreter as a trusted app.
+    (before == after && !is_interpreter(&found.1)).then_some((
         Generation {
             parent: found.0,
             started: before,

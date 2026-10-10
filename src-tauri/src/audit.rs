@@ -947,6 +947,35 @@ fn csv_cell(value: Option<&Value>) -> String {
 mod tests {
 
     #[test]
+    fn f6_every_new_call_path_records_caller_identity() {
+        let _data = crate::registry::DataDirTestEnv::new("f6-audit-callers");
+        record_timed("fixture", "direct", true, Some(1), None, None);
+        record_internal("search", 1, false, Some("adapter:inbox"), true);
+        record_code_mode(true, 1, None, Some("adapter:inbox"));
+        {
+            let _context = crate::session_observability::ContextGuard::enter(
+                crate::session_observability::Context {
+                    client: Some("adapter:inbox".into()),
+                    client_name: Some("inbox".into()),
+                    ..Default::default()
+                },
+            );
+            record_timed("fixture", "nested", true, Some(1), None, None);
+            record_routed_call(&crate::registry::Registry::default(), "fixture", "routed", true, Some(1), None, None, None, None, None, None);
+        }
+        let rows = read_all().unwrap();
+        assert_eq!(rows.len(), 5);
+        for row in rows {
+            assert_eq!(row["clientName"], if row["tool"] == "direct" { "Unknown client" } else { "inbox" });
+            if row["tool"] != "direct" {
+                assert_eq!(row["client"], "adapter:inbox");
+            }
+        }
+        let legacy = activity_client_name(json!({"ok":true,"tool":"legacy"}));
+        assert!(legacy.get("clientName").is_none());
+    }
+
+    #[test]
     fn p08b_r1_hyphenated_call_and_approval_share_activity_server() {
         let _lock = crate::registry::data_dir_test_lock();
         let dir = std::env::temp_dir().join(format!("toolport-p08b-r1-{}", std::process::id()));

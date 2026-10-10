@@ -15314,6 +15314,9 @@ fn observed_client_name(
     {
         return clients::trusted_client_name(client, None);
     }
+    if client.is_some_and(|c| c.starts_with("client:")) {
+        return clients::trusted_client_name(client, name);
+    }
     let pid = if state.http {
         HTTP_ADAPTER_ATTRIBUTION.with(|current| current.borrow().1)
     } else {

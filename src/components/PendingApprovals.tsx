@@ -6,7 +6,11 @@ import { Button } from "@/components/ui/button";
 import { decideApproval, listPendingApprovals, type ApprovalScope } from "@/lib/api";
 import type { PendingApproval } from "@/lib/types";
 import { openExternal } from "@/lib/openUrl";
-import { trustedClientName, shortenClientLabel, clientIdentityTooltip } from "@/lib/clientIdentity";
+import {
+  trustedClientName,
+  shortenClientLabel,
+  clientIdentityTooltip,
+} from "@/lib/clientIdentity";
 import { toastError } from "@/lib/toast";
 
 /** Fail-closed window (must match approval::DEFAULT_TIMEOUT_SECS on the gateway). A
@@ -186,7 +190,11 @@ export function PendingApprovals() {
             const reason = REASON[a.reason];
             const clientName = trustedClientName(a);
             const reportedLabel =
-              a.clientLabel && a.clientLabel !== clientName && !clientName.endsWith(" (reported)") ? a.clientLabel : null;
+              a.clientLabel &&
+              a.clientLabel !== clientName &&
+              !clientName.endsWith(" (reported)")
+                ? a.clientLabel
+                : null;
             const urlElicitation = a.urlElicitation;
             const piiRelease = a.piiRelease;
             // Count down to the broker's authoritative deadline; fall back to
@@ -223,7 +231,10 @@ export function PendingApprovals() {
                         </>
                       )}
                     </div>
-                    <div className="mt-1 text-xs" title={clientIdentityTooltip(a) ?? a.client ?? undefined}>
+                    <div
+                      className="mt-1 text-xs"
+                      title={clientIdentityTooltip(a) ?? a.client ?? undefined}
+                    >
                       {clientName} wants to run this ·{" "}
                       {a.reason === "destructive"
                         ? "destructive tool"

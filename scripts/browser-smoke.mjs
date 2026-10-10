@@ -424,6 +424,40 @@ try {
   await expect(sessions.getByRole("button")).toHaveCount(0);
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   await page.screenshot({ path: path.join(output, "session-clients.png") });
+  await page.goto(`${baseURL}/fixtures/?sessions&caller-names`);
+  for (const name of ["inbox", "inbox (reported)", "Unrecorded client"]) {
+    await expect(
+      page.getByText(`${name} wants to run this · destructive tool`, { exact: true }),
+    ).toBeVisible();
+  }
+  await expect(
+    page.getByText("Unrecorded client wants to run this · destructive tool"),
+  ).toHaveAttribute("title", /Older Toolport versions did not record callers/);
+  await page.screenshot({ path: path.join(output, "caller-approvals.png") });
+  for (let i = 0; i < 3; i++)
+    await page
+      .getByRole("alertdialog")
+      .first()
+      .getByRole("button", { name: "Deny", exact: true })
+      .click();
+  await page.getByRole("button", { name: "Activity", exact: true }).click();
+  const callerCalls = page.getByRole("button", { name: /Recent calls and approvals/ });
+  if ((await callerCalls.getAttribute("aria-expanded")) === "false")
+    await callerCalls.click();
+  for (const name of ["inbox", "inbox (reported)", "Unrecorded client", "[private]"]) {
+    await expect(page.getByText(`${name} · 1s ago`, { exact: false })).toBeVisible();
+  }
+  await page.screenshot({ path: path.join(output, "caller-activity.png") });
+  await page.getByRole("button", { name: "Clients", exact: true }).click();
+  const callerSessions = page.getByRole("region", { name: "Recent client sessions" });
+  for (const name of ["inbox", "inbox (reported)", "Unrecorded client", "[private]"]) {
+    await expect(callerSessions.getByText(name, { exact: true })).toBeVisible();
+  }
+  await expect(
+    callerSessions.getByText("Unrecorded client", { exact: true }),
+  ).toHaveAttribute("title", /Older Toolport versions did not record callers/);
+  await page.screenshot({ path: path.join(output, "caller-clients.png") });
+  expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   await page.goto(`${baseURL}/fixtures/?logos`);
   await expect(page.getByText("Dark logo fixture")).toBeVisible();
   await page.evaluate(() => document.fonts.ready);

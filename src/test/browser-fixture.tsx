@@ -7,6 +7,7 @@ import { ClientLogo } from "@/components/ClientLogo";
 import { ServerLogo } from "@/components/ServerLogo";
 import type {
   AuditEntry,
+  ClientSession,
   PendingApproval,
   Registry,
   SavingsSummary,
@@ -156,7 +157,8 @@ if (memberReviewFixture) {
 
 const approvalFixture = new URLSearchParams(location.search).has("approvals");
 const sessionFixture = new URLSearchParams(location.search).has("sessions");
-const sessionRows = sessionFixture
+const callerFixture = new URLSearchParams(location.search).has("caller-names");
+const sessionRows: ClientSession[] = sessionFixture
   ? [
       {
         sessionId: "f3-fixture-session",
@@ -237,6 +239,56 @@ if (approvalFixture) {
       clientLabel: index === 5 ? "<b>Other client</b> 2.1" : "Claude Code 2.1",
     })),
   );
+}
+if (callerFixture) {
+  const identities = [
+    { client: "adapter:inbox", clientName: "inbox" },
+    { clientName: "Unknown client", clientLabel: "inbox" },
+    {},
+    { clientName: "[private]" },
+  ];
+  auditRows.splice(
+    0,
+    auditRows.length,
+    ...identities.map((identity, index) => ({
+      ts: Date.now() - 1000,
+      server: "GitHub",
+      tool: `list_issues_${index}`,
+      ok: true,
+      durationMs: 12,
+      ...identity,
+    })),
+  );
+  sessionRows.splice(
+    0,
+    sessionRows.length,
+    ...identities.map((identity, index) => ({
+      sessionId: `caller-fixture-${index}`,
+      clientType: "unknown",
+      gatewayVersion: "2.0.0-preview.6",
+      phase: "close",
+      reason: "client_disconnect",
+      transport: "stdio",
+      toolsListCount: 1,
+      listChangedCount: 0,
+      firstCatalogSize: 4,
+      firstCatalogRevision: 1,
+      catalogRevision: 1,
+      contentChanged: false,
+      clientName: "Unrecorded client",
+      ...identity,
+    })),
+  );
+  pendingApproval = identities.slice(0, 3).map((identity, index) => ({
+    id: `caller-approval-${index}`,
+    server: "team-slack",
+    tool: `delete_issue_${index}`,
+    reason: "destructive",
+    arguments: { issue: 42 },
+    deadlineMs: Date.now() + 120000,
+    client: null,
+    ...identity,
+  }));
 }
 const savingsSummary: SavingsSummary = {
   tokensSaved: 35_000,

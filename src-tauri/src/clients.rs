@@ -1493,10 +1493,11 @@ pub fn known_adapter_name(id: &str) -> Option<String> {
 pub fn trusted_client_name(client: Option<&str>, recorded_name: Option<&str>) -> String {
     if let Some(name) = recorded_name.filter(|name| {
         !name.is_empty()
+            && !matches!(*name, "An AI client" | "Unknown client" | "Unrecorded client")
             && !name.starts_with("adapter-pid-")
             && !client.is_some_and(|c| c.strip_prefix("adapter:") == Some(*name))
     }) {
-        return name.to_string();
+        return crate::session_observability::display_label(name).unwrap_or_else(|| "Unknown client".into());
     }
     if let Some(id) = client.and_then(|client| client.strip_prefix("adapter:")) {
         if let Some(name) = known_adapter_name(id) {
@@ -1511,7 +1512,7 @@ pub fn trusted_client_name(client: Option<&str>, recorded_name: Option<&str>) ->
     if let Some(id) = client.and_then(|client| client.strip_prefix("client:")) {
         if let Ok(registry) = crate::registry::load() {
             if let Some(client) = registry.http_clients.iter().find(|client| client.id == id) {
-                return client.label.clone();
+                return crate::session_observability::display_label(&client.label).unwrap_or_else(|| "Unknown client".into());
             }
         }
     }
@@ -6890,11 +6891,14 @@ fn cleanup_legacy_gateway_copies(current: &Path, dir: &Path, references: Option<
         eprintln!("toolport: skipping legacy gateway cleanup: client references are unknown");
         return;
     };
+    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) { return; }
     // AppImage installs still use their stable copy. Never unlink the resolved gateway.
     let Ok(entries) = std::fs::read_dir(dir) else { return; };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path == current || !is_legacy_gateway_copy(&path) { continue; }
+        if path == current
+            || path.canonicalize().ok().zip(current.canonicalize().ok()).is_some_and(|(p, c)| p == c)
+            || !is_legacy_gateway_copy(&path) { continue; }
         let name = entry.file_name();
         let referenced = references.iter().any(|r| r == &path
             || (!r.is_absolute() && r.file_name() == path.file_name()));
@@ -7954,19 +7958,19 @@ mod tests {
     #[test]
     fn f6_legacy_gateway_cleanup_preserves_foreign_files_and_references() {
         let _lock = crate::registry::data_dir_test_lock();
-        let _env_lock = env_mutation_lock();
+        let _env_lock = env_test_lock();
         let root = std::env::temp_dir().join(format!("toolport-f6-home-{}", std::process::id()));
         let _home = EnvRestore::set("HOME", &root);
         let dir = root.join(".config/Toolport/bin");
         std::fs::create_dir_all(&dir).unwrap();
         let old = b"\x7fELFtoolport-gateway\0TOOLPORT_CLIENT_ID\0tools/call\01.19.0";
-        let current = root.join("installed/toolport-gateway");
+        let current = root.join("installed with 'quotes'/toolport-gateway");
         std::fs::create_dir_all(current.parent().unwrap()).unwrap();
         std::fs::write(&current, b"current gateway").unwrap();
         let unused = dir.join("toolport-gateway");
         let referenced = dir.join("toolport-gateway-1.19.0");
         let foreign = dir.join("conduit-gateway");
-        let wrapper = dir.join("toolport-gateway-wrapper.sh");
+        let wrapper = dir.join("toolport-gateway-1.17.0");
         for path in [&unused, &referenced] { std::fs::write(path, old).unwrap(); }
         std::fs::write(&foreign, b"\x7fELFforeign executable").unwrap();
         std::fs::write(&wrapper, b"#!/bin/sh\nexec user-command\n").unwrap();
@@ -7977,8 +7981,17 @@ mod tests {
         #[cfg(unix)] {
             let shim = std::fs::read_to_string(&referenced).unwrap();
             assert!(shim.starts_with("#!/bin/sh\n# Toolport gateway compatibility shim\nexec '"));
-            assert!(shim.contains(current.to_str().unwrap()));
+            assert!(shim.contains("installed with '"));
             assert!(shim.ends_with("' \"$@\"\n"));
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&current, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+            std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let output = std::process::Command::new(&referenced).args(["one argument", "$literal"]).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"one argument\n$literal\n");
+            let original = std::fs::read(&referenced).unwrap();
+            cleanup_legacy_gateway_copies(&current, &dir, Some(&[]));
+            assert_eq!(std::fs::read(&referenced).unwrap(), original);
         }
         #[cfg(not(unix))] assert_eq!(std::fs::read(&referenced).unwrap(), b"current gateway");
         assert_eq!(std::fs::read(&foreign).unwrap(), b"\x7fELFforeign executable");
