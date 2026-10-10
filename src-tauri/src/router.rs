@@ -4713,9 +4713,20 @@ mod tests {
         let mut raw = original;
         raw["name"] = json!("s__echo");
         assert_eq!(tools.source_values().next().unwrap(), &raw);
-        let mut client = tools[0].clone(); client["inputSchema"] = json!({"type":"object"});
-        assert_ne!(crate::integrity::fingerprint(&client), crate::integrity::fingerprint(&raw));
-        assert_eq!(router.policy_catalog(&tools).source_values().next().unwrap(), &raw);
+        let mut client = tools[0].clone();
+        client["inputSchema"] = json!({"type":"object"});
+        assert_ne!(
+            crate::integrity::fingerprint(&client),
+            crate::integrity::fingerprint(&raw)
+        );
+        assert_eq!(
+            router
+                .policy_catalog(&tools)
+                .source_values()
+                .next()
+                .unwrap(),
+            &raw
+        );
     }
 
     #[test]

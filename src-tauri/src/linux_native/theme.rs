@@ -745,6 +745,14 @@ dropdown popover row:selected {{
   border-color: alpha(@toolport_error, 0.24);
 }}
 
+.toolport-security-status.review {{
+  border-color: alpha(@toolport_accent, 0.24);
+}}
+
+.toolport-security-status-icon.review {{
+  color: @toolport_accent;
+}}
+
 .toolport-security-status-icon {{
   color: @toolport_success;
 }}

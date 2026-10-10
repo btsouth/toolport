@@ -2307,7 +2307,7 @@ fn apply_quarantine_inner_with(
         if !q.contains_key(tool) {
             let server = e.get("server").and_then(Value::as_str).unwrap_or("?");
             let pending = current
-                .values()
+                .source_values()
                 .find(|candidate| candidate.get("name").and_then(Value::as_str) == Some(tool))
                 .map(pin_of)
                 .ok_or_else(|| {
@@ -4077,6 +4077,31 @@ mod tests {
         let mut changed = raw;
         changed["inputSchema"]["properties"]["limit"]["maximum"] = json!("invalid-new");
         assert_eq!(check(None, &vec![changed]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn quarantine_captures_and_accepts_the_raw_definition() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("raw-quarantine");
+        let raw = json!({"name":"srv__update", "description":"New", "inputSchema":{"properties":{"limit":{"maximum":"100"}}}});
+        let mut client = raw.clone();
+        crate::router::normalize_tool_schema(&mut client["inputSchema"]);
+        let catalog = crate::tool_definitions::SharedTools(vec![std::sync::Arc::new(
+            crate::tool_definitions::ToolDefinition::with_arguments(client, raw.clone(), None),
+        )]);
+        let old = pin_of(&json!({"name":"srv__update", "description":"Old"}));
+        let event = changed_event("srv", "srv__update", "high", &old, &pin_of(&raw));
+        assert!(apply_quarantine(None, &catalog, &[event]).unwrap());
+        assert_eq!(
+            load_quarantine(None).unwrap()["srv__update"]["pending_pin"]["fp"],
+            fingerprint(&raw)
+        );
+        assert!(release_definition(None, "srv__update", &fingerprint(&raw)).unwrap());
+        assert_eq!(
+            baselines(None)["srv__update"].fingerprint,
+            fingerprint(&raw)
+        );
+        assert!(check(None, &catalog).unwrap().is_empty());
     }
 
     #[test]

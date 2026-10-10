@@ -342,7 +342,11 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
         .map_err(|error| format!("could not read the registry for tool identities: {error}"))
         .and_then(|registry| {
             for event in &mut snapshot.security_events {
-                if let Some(server) = registry.servers.iter().find(|server| event["server"] == server.id) {
+                if let Some(server) = registry
+                    .servers
+                    .iter()
+                    .find(|server| event["server"] == server.id)
+                {
                     event["server_name"] = serde_json::json!(server.name);
                 }
             }

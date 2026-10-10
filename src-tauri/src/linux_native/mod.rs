@@ -3652,6 +3652,8 @@ impl ActivityPage {
 
     fn set_security_status(&self, important: &[serde_json::Value]) {
         self.security_status.remove_css_class("attention");
+        self.security_status.remove_css_class("review");
+        self.security_status_icon.remove_css_class("review");
         self.security_status_icon.remove_css_class("attention");
         if important.is_empty() {
             self.security_status_title.set_label("Protection active");
@@ -3667,6 +3669,9 @@ impl ActivityPage {
         {
             self.security_status.add_css_class("attention");
             self.security_status_icon.add_css_class("attention");
+        } else {
+            self.security_status.add_css_class("review");
+            self.security_status_icon.add_css_class("review");
         }
         let groups = crate::integrity::group_tool_changes(important);
         let incidents = security_attention_incidents(important);
@@ -4052,7 +4057,6 @@ fn security_event_kind(event: &serde_json::Value) -> &'static str {
     }
 }
 
-
 fn security_dismissal_key(event: &serde_json::Value) -> String {
     let identity = crate::integrity::security_key(event);
     if crate::integrity::event_severity(event) != "high" {
@@ -4140,7 +4144,8 @@ fn remember_activity_expansion(
 fn change_can_be_accepted(event: &serde_json::Value) -> bool {
     event["blocked"] == false
         || (event["blocked"] == true
-            && event["new_fp"].is_string() && event["blocked_profiles"]
+            && event["new_fp"].is_string()
+            && event["blocked_profiles"]
                 .as_array()
                 .is_some_and(|profiles| !profiles.is_empty()))
 }
@@ -4157,24 +4162,31 @@ fn tool_change_group_card(
         .and_then(|event| event["server_name"].as_str())
         .filter(|name| !name.is_empty())
         .unwrap_or(&group.server);
-    let expander = gtk::Expander::new(Some(&format!(
+    let heading = gtk::Button::with_label(&format!(
         "{name}: {}, {}",
         crate::integrity::tool_change_summary(&group.tools),
         relative_activity_time(group.ts)
-    )));
+    ));
+    heading.add_css_class("flat");
+    heading.set_halign(gtk::Align::Fill);
+    heading.set_tooltip_text(Some("Expand to review the changed tools"));
     let tools = gtk::Box::new(gtk::Orientation::Vertical, 8);
     tools.set_margin_top(8);
     for event in &group.tools {
         tools.append(&security_notice_card(event, 1, page.clone()));
     }
-    expander.set_child(Some(&tools));
-    bind_activity_expander(
-        &expander,
-        format!("security:server:{}:{}", group.server, group.ts),
-        page.expanded_activity_rows.clone(),
-        false,
-    );
-    card.append(&expander);
+    let reveal = gtk::Revealer::new();
+    reveal.set_child(Some(&tools));
+    let expansion_key = format!("security:server:{}:{}", group.server, group.ts);
+    let expanded_rows = page.expanded_activity_rows.clone();
+    reveal.set_reveal_child(expanded_rows.borrow().contains(&expansion_key));
+    let reveal_for_toggle = reveal.clone();
+    heading.connect_clicked(move |_| {
+        let expanded = !reveal_for_toggle.reveals_child();
+        reveal_for_toggle.set_reveal_child(expanded);
+        remember_activity_expansion(&mut expanded_rows.borrow_mut(), &expansion_key, expanded);
+    });
+    card.append(&heading);
     let blocked = group
         .tools
         .iter()
@@ -4202,6 +4214,7 @@ fn tool_change_group_card(
         page.accept_security(events.clone());
     });
     card.append(&accept);
+    card.append(&reveal);
     card
 }
 
@@ -10213,7 +10226,8 @@ mod tests {
         assert!(lines.contains(&"Changed parameters: ttl".to_string()));
         assert!(lines.contains(&"Not blocked.".to_string()));
         assert!(change_can_be_accepted(&event));
-        let mut blocked = event; blocked["blocked"] = serde_json::json!(true);
+        let mut blocked = event;
+        blocked["blocked"] = serde_json::json!(true);
         blocked["blocked_profiles"] = serde_json::json!(["work"]);
         assert!(!change_can_be_accepted(&blocked));
         blocked["new_fp"] = serde_json::json!("v2:reviewed");
