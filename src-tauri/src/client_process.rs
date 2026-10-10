@@ -135,10 +135,27 @@ fn interpreter_command(pid: u32) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn interpreter_command(pid: u32) -> Option<String> {
-    // KERN_PROCARGS2 requires a buffer for the process argument block. Discard it
-    // immediately after extracting argv[1]; never parse the remaining arguments.
+    // XNU requires room for the whole argument area, otherwise it can return its
+    // tail (environment strings). Query the kernel limit before reading it.
+    let mut argmax_mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    let mut argmax: libc::c_int = 0;
+    let mut argmax_size = std::mem::size_of_val(&argmax);
+    if unsafe {
+        libc::sysctl(
+            argmax_mib.as_mut_ptr(),
+            2,
+            (&mut argmax as *mut libc::c_int).cast(),
+            &mut argmax_size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || argmax <= 0
+    {
+        return None;
+    }
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; usize::try_from(argmax).ok()?];
     let mut size = buf.len();
     if unsafe {
         libc::sysctl(
@@ -153,15 +170,31 @@ fn interpreter_command(pid: u32) -> Option<String> {
     {
         return None;
     }
-    let args = buf.get(std::mem::size_of::<libc::c_int>()..size)?;
+    let argv = procargs_argv(buf.get(..size)?)?;
+    command_basename(argv.get(1)?)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn procargs_argv(buf: &[u8]) -> Option<Vec<&str>> {
+    let int_size = std::mem::size_of::<i32>();
+    let argc = i32::from_ne_bytes(buf.get(..int_size)?.try_into().ok()?);
+    if argc < 2 {
+        return None;
+    }
+    let mut args = buf.get(int_size..)?;
     let path_end = args.iter().position(|b| *b == 0)?;
-    let argv = &args[path_end..];
-    let start = argv.iter().position(|b| *b != 0)?;
-    let argv = &argv[start..];
-    let first_end = argv.iter().position(|b| *b == 0)?;
-    let second = &argv[first_end + 1..];
-    let end = second.iter().position(|b| *b == 0)?;
-    command_basename(std::str::from_utf8(&second[..end]).ok()?)
+    args = args.get(path_end..)?;
+    args = args.get(args.iter().position(|b| *b != 0)?..)?;
+    if argc as usize > args.len() {
+        return None;
+    }
+    let mut argv = Vec::new();
+    for _ in 0..argc {
+        let end = args.iter().position(|b| *b == 0)?;
+        argv.push(std::str::from_utf8(&args[..end]).ok()?);
+        args = &args[end + 1..];
+    }
+    Some(argv)
 }
 
 #[cfg(target_os = "linux")]
@@ -327,6 +360,28 @@ fn process(_: u32) -> Option<(Generation, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn macos_procargs_respects_argc_and_rejects_truncation() {
+        fn buffer(argc: i32, argv: &[u8]) -> Vec<u8> {
+            let mut buf = argc.to_ne_bytes().to_vec();
+            buf.extend_from_slice(b"/usr/bin/python\0\0\0");
+            buf.extend_from_slice(argv);
+            buf
+        }
+        assert_eq!(procargs_argv(&buffer(1, b"python\0HOME=/Users/x\0")), None);
+        assert_eq!(
+            procargs_argv(&buffer(2, b"python\0/private/inbox.py\0HOME=/Users/x\0")),
+            Some(vec!["python", "/private/inbox.py"])
+        );
+        assert_eq!(
+            procargs_argv(&buffer(2, b"python\0/private/inbox.py")),
+            None
+        );
+        assert_eq!(procargs_argv(&buffer(3, b"python\0inbox.py\0")), None);
+        assert_eq!(procargs_argv(&[2, 0]), None);
+        assert_eq!(procargs_argv(&buffer(-1, b"python\0")), None);
+    }
+
     #[test]
     fn interpreter_names_and_script_basename_are_private_and_bounded() {
         for name in [
