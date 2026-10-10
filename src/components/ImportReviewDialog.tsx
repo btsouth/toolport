@@ -552,7 +552,7 @@ export function isPrivateHostUrl(url: string | null | undefined): boolean {
  * and refuses without an explicit reviewed flag, so a miss here costs a clear error
  * rather than an unreviewed enable. */
 export function needsTeamEnableReview(
-  server: Pick<ServerEntry, "source" | "transport" | "command" | "url"> &
+  server: Pick<ServerEntry, "source" | "transport" | "command" | "url" | "personalSyncEntry" | "teamEnableReview"> &
     Partial<Pick<ServerEntry, "env" | "headerKeys" | "launch">>,
 ): boolean {
   if (
@@ -563,6 +563,7 @@ export function needsTeamEnableReview(
   )
     return true;
   if (!server.source?.startsWith("team:")) return false;
+  if (server.personalSyncEntry) return server.teamEnableReview === true;
   if (server.transport === "stdio" || !!server.command) return true;
   // Anything that is not a plain https:// URL to a dotted public name is treated as
   // needing review: a bare hostname is an intranet name far more often than not, and

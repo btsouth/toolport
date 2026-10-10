@@ -20,11 +20,7 @@ const CATALOG: Duration = Duration::from_secs(60);
 #[test]
 fn a_corrupt_registry_does_not_take_down_a_running_gateway() {
     let scratch = Scratch::new("registry-corrupt");
-    write_registry(
-        scratch.path(),
-        &[mock_entry("x", &[])],
-        &["x"],
-    );
+    write_registry(scratch.path(), &[mock_entry("x", &[])], &["x"]);
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "a");
     assert!(
@@ -49,9 +45,11 @@ fn a_corrupt_registry_does_not_take_down_a_running_gateway() {
         "registry.json.unreadable-sha256-{}",
         conduit_lib::registry::sha256_hex(corrupt)
     );
-    wait_for("the corrupt copy to be quarantined", Duration::from_secs(30), || {
-        scratch.read(&quarantined) == corrupt
-    });
+    wait_for(
+        "the corrupt copy to be quarantined",
+        Duration::from_secs(30),
+        || scratch.read(&quarantined) == corrupt,
+    );
     assert_eq!(
         scratch.read(&quarantined),
         corrupt,
@@ -103,7 +101,8 @@ fn rapid_registry_toggles_do_not_break_a_stable_server() {
         std::thread::sleep(Duration::from_millis(250));
     }
     assert_eq!(
-        failures, 0,
+        failures,
+        0,
         "the stable server failed during registry churn\n{}",
         client.diagnostics()
     );

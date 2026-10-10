@@ -874,6 +874,9 @@ impl ServerEntry {
         if self.unknown_fields.get("teamEnableReview") == Some(&serde_json::Value::Bool(true)) {
             return true;
         }
+        if self.unknown_fields.get("personalSyncEntry") == Some(&serde_json::Value::Bool(true)) {
+            return false;
+        }
         if self.transport == "stdio" || self.command.is_some() {
             return true;
         }

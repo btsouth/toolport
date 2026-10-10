@@ -592,7 +592,13 @@ impl RegistrySnapshot {
             .map(|server| {
                 let enabled = registry.server_enabled(&server.id);
                 ServerView {
-                    origin_label: if server.source.as_deref().unwrap_or("").starts_with("team:") {
+                    origin_label: if crate::personal_sync::is_personal(&registry) {
+                        if crate::personal_sync::keep_local(server) {
+                            "This machine only".into()
+                        } else {
+                            "Synced".into()
+                        }
+                    } else if server.source.as_deref().unwrap_or("").starts_with("team:") {
                         format!(
                             "Team · {}",
                             registry
@@ -1046,10 +1052,10 @@ mod tests {
             .unknown_fields
             .insert("teamRouteRemoved".into(), serde_json::json!(true));
         registry.servers.push(personal);
-        assert!(
-            RegistrySnapshot::from_registry(registry.clone()).servers[0].team_route_removed
-        );
-        registry.set_global_server_enabled("personal", true).unwrap();
+        assert!(RegistrySnapshot::from_registry(registry.clone()).servers[0].team_route_removed);
+        registry
+            .set_global_server_enabled("personal", true)
+            .unwrap();
         assert!(!RegistrySnapshot::from_registry(registry).servers[0].team_route_removed);
     }
 

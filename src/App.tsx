@@ -1121,7 +1121,7 @@ function App() {
             ? secretReferenceReview(confirmEnableTeam).join("\n") +
               "\n" +
               (confirmEnableTeam.transport === "stdio" || confirmEnableTeam.command
-                ? `This runs a local command on your machine: ${[confirmEnableTeam.command, ...(confirmEnableTeam.args ?? [])].join(" ")}. Only enable it if you trust your team and recognize this command.`
+                ? `This runs a local command on your machine: ${[confirmEnableTeam.command, ...(confirmEnableTeam.args ?? [])].join(" ")}. Only enable it if you recognize and trust this command.`
                 : `This connects Toolport to ${confirmEnableTeam.url ?? ""}, using its saved authentication. Verify the destination before enabling it.`)
             : undefined
         }

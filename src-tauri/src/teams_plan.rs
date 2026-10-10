@@ -9,7 +9,7 @@
 //! two ever drift apart. Change the TypeScript first, then this.
 
 /// People included on the Free plan before a plan is required.
-pub const FREE_SEATS: u32 = 2;
+pub const FREE_SEATS: u32 = 1;
 /// People included in the Team plan before per-person pricing applies.
 pub const TEAM_SEATS: u32 = 10;
 /// Monthly price of the Team plan, flat, covering [`TEAM_SEATS`] people.
@@ -25,7 +25,11 @@ pub const TRIAL_DAYS: u32 = 14;
 
 /// The free tier, worded as the pricing page words it.
 pub fn free_line() -> String {
-    format!("Free for {FREE_SEATS} people. It does not expire and needs no card.")
+    format!("Free: {FREE_SEATS} person, 1 device. No card required.")
+}
+
+pub fn pro_line() -> String {
+    "Pro is $5/month or $48/year for one person on unlimited devices. Try it free for 14 days, no card.".into()
 }
 
 /// The paid tier. Says what the money buys, because seats alone do not explain

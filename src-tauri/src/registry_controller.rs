@@ -2859,6 +2859,16 @@ pub fn apply_server_enabled(
             }
         }
     }
+    if enabled && reviewed && crate::personal_sync::is_personal(registry) {
+        if let Some(server) = registry.servers.iter_mut().find(|s| s.id == server_id) {
+            server.unknown_fields.remove("teamEnableReview");
+            let identity =
+                crate::personal_sync::command_identity(&crate::personal_sync::export(server));
+            server
+                .unknown_fields
+                .insert("syncCommandConsent".into(), identity);
+        }
+    }
     if registry.version >= 3 {
         // Teams restores consent by access-set membership during definition sync.
         // Record a reviewed enable in its existing local context without changing

@@ -36,7 +36,7 @@ impl TeamsPage {
         header.set_show_back_button(true);
         header.set_title_widget(Some(
             &gtk::Label::builder()
-                .label("Teams")
+                .label("Sync")
                 .css_classes(["title"])
                 .build(),
         ));
@@ -54,7 +54,7 @@ impl TeamsPage {
         let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         title_row.append(
             &gtk::Label::builder()
-                .label("Toolport Teams")
+                .label("Sync")
                 .halign(gtk::Align::Start)
                 .css_classes(["title-2"])
                 .build(),
@@ -64,7 +64,7 @@ impl TeamsPage {
         // not quote is how two surfaces end up making two different claims.
         title_row.append(
             &gtk::Label::builder()
-                .label(format!("Free for {} people", crate::teams_plan::FREE_SEATS))
+                .label("Free: 1 person, 1 device")
                 .valign(gtk::Align::Center)
                 .css_classes(["toolport-badge", "success", "caption"])
                 .build(),
@@ -72,7 +72,7 @@ impl TeamsPage {
         page.append(&title_row);
         page.append(
             &gtk::Label::builder()
-                .label("Share one governed server set, and the rules that go with it, across your team.")
+                .label("Set up once. Your servers follow you to every machine. Secret values and approvals stay on this machine.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
@@ -242,7 +242,9 @@ impl TeamsPage {
         }
         if let Some((notice, is_error)) = notice {
             self.set_status(&notice, is_error);
-            if !is_error { self.feedback.add_css_class("success"); }
+            if !is_error {
+                self.feedback.add_css_class("success");
+            }
             if let Some(team) = registry.team.clone() {
                 self.render_connected(registry, team);
             } else {
@@ -326,7 +328,7 @@ impl TeamsPage {
         self.content.append(&cards);
     }
 
-    /// The three-step version, because "Team server" and "Invite code" mean
+    /// The three-step version, because "Sync service URL" and "Manual code" mean
     /// nothing to someone who has not been told how a team gets made.
     fn render_how_it_works(&self) {
         let group = gtk::Box::new(gtk::Orientation::Vertical, 9);
@@ -374,129 +376,48 @@ impl TeamsPage {
     }
 
     fn render_join(&self) {
-        self.render_value_props();
-        self.render_how_it_works();
-
+        let sign_in = gtk::Button::with_label("Sign in to sync");
+        sign_in.add_css_class("suggested-action");
+        sign_in.connect_clicked(|_| {
+            let _ =
+                crate::oauth::open_web_url("https://teams.toolport.app/?intent=pro&from=app-sync");
+        });
+        self.content.append(&sign_in);
+        self.content.append(
+            &gtk::Label::builder()
+                .label(crate::teams_plan::pro_line())
+                .wrap(true)
+                .xalign(0.0)
+                .build(),
+        );
         let group = gtk::Box::new(gtk::Orientation::Vertical, 10);
         group.add_css_class("toolport-settings-group");
-        group.add_css_class("toolport-padded-group");
-        group.append(&super::section_heading(
-            "Join a team",
-            "Your administrator gives you the server address and an invite code.",
-        ));
-        let server_url = gtk::Entry::builder()
-            .placeholder_text("https://teams.example.com")
+        group.append(&super::section_heading("Use a manual code", "If your browser cannot open Toolport, copy the manual code shown after approving this device."));
+        let url = gtk::Entry::builder()
             .text(crate::teams::HOSTED_TEAMS_URL)
             .build();
-        let invite = gtk::PasswordEntry::builder()
-            .placeholder_text("Invite or join-link code")
+        let code = gtk::PasswordEntry::builder()
+            .placeholder_text("Manual code")
             .show_peek_icon(true)
             .build();
-        let member = gtk::Entry::builder()
+        let name = gtk::Entry::builder()
             .placeholder_text("Your name (optional)")
             .build();
-        group.append(&field("Team server", &server_url));
-        group.append(&field("Invite code", &invite));
-        group.append(&field("Member name", &member));
-        let join_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        join_actions.set_halign(gtk::Align::End);
-        if self.pending.borrow().is_some() {
-            // A waiting join request must be abandonable: the admin may never
-            // answer, and the form is unusable until the request is cleared.
-            let cancel = gtk::Button::with_label("Cancel request");
-            cancel.add_css_class("toolport-secondary-action");
-            let page_for_cancel = self.clone();
-            cancel.connect_clicked(move |_| {
-                *page_for_cancel.pending.borrow_mut() = None;
-                page_for_cancel.cancel_join_poll();
-                page_for_cancel.refresh();
-            });
-            join_actions.append(&cancel);
-        }
-        let connect = gtk::Button::with_label(if self.pending.borrow().is_some() {
-            "Check approval"
-        } else {
-            "Connect"
-        });
-        connect.add_css_class("suggested-action");
+        group.append(&field("Sync service URL", &url));
+        group.append(&field("Manual code", &code));
+        group.append(&field("Your name", &name));
+        let button = gtk::Button::with_label("Sign in with code");
         let page = self.clone();
-        connect.connect_clicked(move |button| {
-            if page.pending.borrow().is_some() {
-                page.poll_join(button.clone());
-            } else {
-                page.connect_team(
-                    server_url.text().to_string(),
-                    invite.text().to_string(),
-                    member.text().to_string(),
-                    button.clone(),
-                );
-            }
+        button.connect_clicked(move |b| {
+            page.connect_team(
+                url.text().to_string(),
+                code.text().to_string(),
+                name.text().to_string(),
+                b.clone(),
+            )
         });
-        join_actions.append(&connect);
-        group.append(&join_actions);
+        group.append(&button);
         self.content.append(&group);
-
-        // The acquisition and exit paths the shipping tab offers alongside the
-        // join form. All external, all through the validated opener. Creating a
-        // team is the path for someone with no invite code, so it is a button
-        // rather than one of four identical links.
-        let create_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        create_row.append(
-            &gtk::Label::builder()
-                .label("No team yet?")
-                .halign(gtk::Align::Start)
-                .valign(gtk::Align::Center)
-                .css_classes(["toolport-muted"])
-                .build(),
-        );
-        // The plan lines the React shell renders, so both shells describe the
-        // tiers identically.
-        self.content.append(
-            &gtk::Label::builder()
-                .label(crate::teams_plan::free_line())
-                .halign(gtk::Align::Fill)
-                .xalign(0.0)
-                .wrap(true)
-                .hexpand(true)
-                .css_classes(["toolport-muted", "caption"])
-                .build(),
-        );
-        self.content.append(
-            &gtk::Label::builder()
-                .label(crate::teams_plan::paid_line())
-                .halign(gtk::Align::Fill)
-                .xalign(0.0)
-                .wrap(true)
-                .hexpand(true)
-                .css_classes(["toolport-muted", "caption"])
-                .build(),
-        );
-
-        let create = gtk::Button::with_label("Create a free team");
-        create.add_css_class("toolport-secondary-action");
-        create.set_valign(gtk::Align::Center);
-        create.connect_clicked(move |_| {
-            let _ = crate::oauth::open_web_url(
-                "https://teams.toolport.app/?intent=create-team&from=app-teams-tab",
-            );
-        });
-        create_row.append(&create);
-        self.content.append(&create_row);
-
-        let links = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        for (label, url) in [
-            ("How Teams works", "https://toolport.app/teams"),
-            ("Pricing", "https://toolport.app/teams#pricing"),
-            ("Self-host", "https://toolport.app/teams#selfhost"),
-        ] {
-            let link = gtk::Button::with_label(label);
-            link.add_css_class("flat");
-            link.connect_clicked(move |_| {
-                let _ = crate::oauth::open_web_url(url);
-            });
-            links.append(&link);
-        }
-        self.content.append(&links);
     }
 
     fn render_connected(
@@ -504,6 +425,10 @@ impl TeamsPage {
         registry: crate::registry::Registry,
         team: crate::registry::TeamConnection,
     ) {
+        if crate::personal_sync::is_personal(&registry) {
+            self.render_personal(registry, team);
+            return;
+        }
         let summary = gtk::Box::new(gtk::Orientation::Vertical, 8);
         summary.add_css_class("toolport-card");
         summary.append(
@@ -631,6 +556,115 @@ impl TeamsPage {
             render_instructions_status(&instructions, status);
             instructions.set_visible(true);
         });
+    }
+
+    fn render_personal(
+        &self,
+        registry: crate::registry::Registry,
+        team: crate::registry::TeamConnection,
+    ) {
+        let status = team
+            .unknown_fields
+            .get("accountStatus")
+            .cloned()
+            .unwrap_or_default();
+        let sync = crate::personal_sync::state(&registry).unwrap_or_default();
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        card.add_css_class("toolport-card");
+        card.append(
+            &gtk::Label::builder()
+                .label("Your account")
+                .xalign(0.0)
+                .css_classes(["heading"])
+                .build(),
+        );
+        for text in crate::personal_sync::status_lines(&status, sync.last_synced_at) {
+            card.append(
+                &gtk::Label::builder()
+                    .label(text)
+                    .wrap(true)
+                    .xalign(0.0)
+                    .build(),
+            );
+        }
+        if let Some(error) = &sync.error {
+            self.set_status(error, true);
+        }
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let button = gtk::Button::with_label("Sync now");
+        let page = self.clone();
+        button.connect_clicked(move |b| page.sync(b.clone()));
+        actions.append(&button);
+        let button = gtk::Button::with_label("Your account");
+        let origin = team.server_url.clone();
+        button.connect_clicked(move |_| {
+            let _ = crate::oauth::open_web_url(&origin);
+        });
+        actions.append(&button);
+        let button = gtk::Button::with_label("Sign out");
+        let page = self.clone();
+        button.connect_clicked(move |b| page.confirm_leave(b.clone()));
+        actions.append(&button);
+        card.append(&actions);
+        self.content.append(&card);
+        for (id, remote) in &sync.conflicts {
+            let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            row.add_css_class("toolport-card");
+            row.append(
+                &gtk::Label::builder()
+                    .label(format!(
+                        "{id} changed on both machines. Choose which version to keep."
+                    ))
+                    .wrap(true)
+                    .xalign(0.0)
+                    .build(),
+            );
+            row.append(
+                &gtk::Label::builder()
+                    .label(serde_json::to_string_pretty(remote).unwrap_or_default())
+                    .selectable(true)
+                    .wrap(true)
+                    .xalign(0.0)
+                    .build(),
+            );
+            for (keep, label) in [
+                (true, "Keep this machine's version"),
+                (false, "Use synced version"),
+            ] {
+                let button = gtk::Button::with_label(label);
+                let id = id.clone();
+                let expected = remote.clone();
+                let page = self.clone();
+                button.connect_clicked(move |_| {
+                    let id = id.clone();
+                    let expected = expected.clone();
+                    let page = page.clone();
+                    gtk::glib::spawn_future_local(async move {
+                        let result = gtk::gio::spawn_blocking(move || {
+                            crate::personal_sync::resolve_conflict(&id, &expected, keep)?;
+                            crate::teams::sync_now()
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(r)) => page.absorb_sync_result(r),
+                            Ok(Err(e)) => page.show_error(&e),
+                            Err(_) => page.show_error("Could not resolve sync conflict"),
+                        }
+                    });
+                });
+                row.append(&button);
+            }
+            self.content.append(&row);
+        }
+        self.content.append(&gtk::Label::builder().label("Changes in Servers sync automatically. Use Sync settings for values that are the same on every machine or a setup kept only here.").wrap(true).xalign(0.0).build());
+        for server in registry
+            .servers
+            .iter()
+            .filter(|s| s.source.as_deref() == Some(&format!("team:{}", team.team_id)))
+        {
+            self.content
+                .append(&review_server_row(server.clone(), self.clone()));
+        }
     }
 
     fn connect_team(&self, url: String, code: String, name: String, button: gtk::Button) {
@@ -789,7 +823,8 @@ impl TeamsPage {
             }
             crate::teams::SyncResult::Ok { applied, .. } => {
                 let outcome = applied.map(|(_, outcome)| outcome).unwrap_or_default();
-                *self.sync_notice.borrow_mut() = team_review_line(outcome.review, outcome.blocked).map(|message| (message, true));
+                *self.sync_notice.borrow_mut() = team_review_line(outcome.review, outcome.blocked)
+                    .map(|message| (message, true));
             }
         }
         self.refresh();
@@ -1225,6 +1260,7 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
     enable.set_sensitive(!already_enabled && !held);
     enable.add_css_class("toolport-secondary-action");
     let server_name = server.name.clone();
+    let server_id = server.id.clone();
     let reviewed_entry = server.clone();
     enable.connect_clicked(move |button| {
         let Some(parent) = page.app.active_window() else {
@@ -1252,7 +1288,7 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
                 gtk::glib::spawn_future_local(async move {
                     let result = gtk::gio::spawn_blocking(move || {
                         let registry = crate::registry::load()?;
-                        crate::registry_controller::set_server_enabled_after_reference_review(&registry.active_profile_id(), &reviewed_entry)
+                        crate::personal_sync::enable_reviewed(&registry.active_profile_id(), &reviewed_entry)
                     })
                     .await;
                     match result {
@@ -1274,7 +1310,11 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
 /// how it relates to the team.
 fn share_choice_label(name: &str, keys: Option<String>, hint: Option<&str>) -> gtk::Box {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    let title = gtk::Label::builder().label(name).xalign(0.0).wrap(true).build();
+    let title = gtk::Label::builder()
+        .label(name)
+        .xalign(0.0)
+        .wrap(true)
+        .build();
     column.append(&title);
     for detail in keys.as_deref().into_iter().chain(hint) {
         let line = gtk::Label::builder()
@@ -1665,7 +1705,8 @@ mod tests {
     fn member_review_native_keeps_remaining_decisions_open() {
         adw::init().unwrap();
         let _lock = crate::registry::data_dir_test_lock();
-        let scratch = std::env::temp_dir().join(format!("toolport-native-queue-{}", std::process::id()));
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-native-queue-{}", std::process::id()));
         std::fs::create_dir_all(&scratch).unwrap();
         let _data = crate::registry::DataDirOverride::set(&scratch);
         let mut reg = crate::registry::Registry::default();
@@ -1702,8 +1743,12 @@ mod tests {
                 timeout_state.set(true)
             });
         let context = gtk::glib::MainContext::default();
-        while page.busy.get() && !timed_out.get() { context.iteration(true); }
-        if !timed_out.get() { timeout.remove(); }
+        while page.busy.get() && !timed_out.get() {
+            context.iteration(true);
+        }
+        if !timed_out.get() {
+            timeout.remove();
+        }
         assert!(!timed_out.get(), "native member decision did not finish");
         assert!(dialog.is_visible(), "remaining decisions must stay open");
         let mut text = String::new();
@@ -1807,7 +1852,10 @@ mod tests {
             same_name,
             selection("Vercel (Full API)", "Already shared", HandoffOutcome::Attention, "This team copy already has its own local credentials. Keep its existing setup and enable it separately. Your personal server stays on in this profile."),
         ]);
-        let parent = gtk::Window::builder().default_width(1000).default_height(760).build();
+        let parent = gtk::Window::builder()
+            .default_width(1000)
+            .default_height(760)
+            .build();
         parent.present();
         let dialog = share_preview_dialog(&parent, &preview);
         let mut text = String::new();
@@ -1840,7 +1888,10 @@ mod tests {
         );
         let mut text = String::new();
         collect(picker.upcast_ref(), &mut text);
-        assert_eq!(text, "Linear\nShared. The Team copy is in use in this profile.\n");
+        assert_eq!(
+            text,
+            "Linear\nShared. The Team copy is in use in this profile.\n"
+        );
         parent.close();
     }
 

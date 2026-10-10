@@ -8125,7 +8125,10 @@ for line in sys.stdin:
         let mut guarded = router_with_catalogs(&[("atlassian", 3)]);
         let catalog = previous.aggregated_tools();
         guarded.adopt_restored_routes(&previous, &catalog);
-        assert_eq!(guarded.route_of("atlassian__t39"), Some(("atlassian", "t39")));
+        assert_eq!(
+            guarded.route_of("atlassian__t39"),
+            Some(("atlassian", "t39"))
+        );
         // Refresh path: next = live clone, rebuilt, published, then adopted again
         // with previous_router = the guarded live router.
         let prior_live = guarded.clone();
@@ -9890,7 +9893,10 @@ for line in sys.stdin:
         let inner = router.servers[0].inner.lock().unwrap();
         assert!(router.raw_catalogs().is_none());
         drop(inner);
-        assert_eq!(router.raw_catalogs().unwrap()["s"].materialize(0)["name"], "echo");
+        assert_eq!(
+            router.raw_catalogs().unwrap()["s"].materialize(0)["name"],
+            "echo"
+        );
     }
 
     #[test]
@@ -9906,7 +9912,12 @@ for line in sys.stdin:
             .unavailable()
             .contains("has not connected yet"));
         let (last_attempt, retry_at) = {
-            let state = router.servers[0].supervisor.as_ref().unwrap().lock().unwrap();
+            let state = router.servers[0]
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap();
             (state.last_attempt, state.next_attempt)
         };
         assert!(!router.servers[0].start_at(true, last_attempt));

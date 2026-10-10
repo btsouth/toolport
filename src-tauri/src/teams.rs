@@ -389,11 +389,23 @@ pub fn fetch_me(server_url: &str, team_id: &str, token: &str) -> Result<Membersh
 /// An older service keeps the governed flow; never infer ownership from role.
 pub fn fetch_account_status(conn: &TeamConnection, token: &str) -> Result<Option<Value>, String> {
     require_secure_team_url(&conn.server_url)?;
-    let url = format!("{}/teams/{}/account/status", base(&conn.server_url), conn.team_id);
-    match agent(&conn.server_url).get(&url).set("authorization", &format!("Bearer {token}")).call() {
+    let url = format!(
+        "{}/teams/{}/account/status",
+        base(&conn.server_url),
+        conn.team_id
+    );
+    match agent(&conn.server_url)
+        .get(&url)
+        .set("authorization", &format!("Bearer {token}"))
+        .call()
+    {
         Ok(resp) => {
-            let value: Value = require_no_redirect(resp)?.into_json().map_err(|e| e.to_string())?;
-            if !value["plan"].is_string() || !value["canReceiveConfig"].is_boolean() { return Err("Account status response is incomplete".into()); }
+            let value: Value = require_no_redirect(resp)?
+                .into_json()
+                .map_err(|e| e.to_string())?;
+            if !value["plan"].is_string() || !value["canReceiveConfig"].is_boolean() {
+                return Err("Account status response is incomplete".into());
+            }
             Ok(Some(value))
         }
         Err(ureq::Error::Status(404, _)) => Ok(None),
@@ -1146,18 +1158,25 @@ fn finish_connect(
     if let Some(status) = fetch_account_status(&conn, &joined.member_token)? {
         conn.unknown_fields.insert("accountStatus".into(), status);
     }
-    let personal = conn.role == "admin" && conn.unknown_fields.get("accountStatus").is_some_and(|s| s["personalSync"] == true);
+    let personal = conn.role == "admin"
+        && conn
+            .unknown_fields
+            .get("accountStatus")
+            .is_some_and(|s| s["personalSync"] == true);
     let pulled = if personal {
-        let (version, config) = fetch_config_for_update(server_url, &joined.team_id, &joined.member_token)?;
+        let (version, config) =
+            fetch_config_for_update(server_url, &joined.team_id, &joined.member_token)?;
         Some((version, config, None))
-    } else { pull_config(
-        &base(server_url),
-        &joined.team_id,
-        &joined.member_token,
-        0,
-        None,
-        0,
-    )? };
+    } else {
+        pull_config(
+            &base(server_url),
+            &joined.team_id,
+            &joined.member_token,
+            0,
+            None,
+            0,
+        )?
+    };
     if let Ok(MembershipCheck::Active {
         team_name,
         account_linked,
@@ -1176,11 +1195,17 @@ fn finish_connect(
     // Load-modify-save the fresh registry under the cross-process lock, so a concurrent write
     // during the join window's pull isn't reverted (SOU-23).
     let (reg, outcome) = crate::registry::update(|reg| {
-        if let Some(previous) = reg.team.as_ref().map(|t| t.team_id.clone()) { remove_team(reg, &previous); }
+        if let Some(previous) = reg.team.as_ref().map(|t| t.team_id.clone()) {
+            remove_team(reg, &previous);
+        }
         reg.team = Some(conn);
         let mut outcome = MergeOutcome::default();
         if let Some((version, cfg, etag)) = pulled {
-            outcome = if crate::personal_sync::is_personal(reg) { crate::personal_sync::apply(reg, &cfg, version)? } else { stage_team_config(reg, &joined.team_id, &cfg, version, &labels)? };
+            outcome = if crate::personal_sync::is_personal(reg) {
+                crate::personal_sync::apply(reg, &cfg, version)?
+            } else {
+                stage_team_config(reg, &joined.team_id, &cfg, version, &labels)?
+            };
             if let Some(t) = reg.team.as_mut() {
                 t.last_version = version;
                 t.last_etag = etag;
@@ -1305,18 +1330,32 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
     };
     let role_changed = role != conn.role;
     let status = fetch_account_status(&conn, &token)?;
-    let (fresh, _) = crate::personal_sync::remote_update(|| crate::registry::update(|reg| {
-        if let Some(t) = reg.team.as_mut().filter(|t| t.team_id == conn.team_id && t.reporting_device_id == conn.reporting_device_id) {
-            t.role = role.clone(); t.team_name = team_name.clone(); t.account_linked = account_linked;
-            t.unknown_fields.insert("accountStatus".into(), status.clone().unwrap_or(Value::Null));
-        }
-        Ok(())
-    }))?;
+    let (fresh, _) = crate::personal_sync::remote_update(|| {
+        crate::registry::update(|reg| {
+            if let Some(t) = reg.team.as_mut().filter(|t| {
+                t.team_id == conn.team_id && t.reporting_device_id == conn.reporting_device_id
+            }) {
+                t.role = role.clone();
+                t.team_name = team_name.clone();
+                t.account_linked = account_linked;
+                t.unknown_fields.insert(
+                    "accountStatus".into(),
+                    status.clone().unwrap_or(Value::Null),
+                );
+            }
+            Ok(())
+        })
+    })?;
     if let Some(status) = &status {
-        if status["canReceiveConfig"] == false { return Err(status["reason"].as_str().unwrap_or("Sync is unavailable on this device. Open Your account to choose your active device.").into()); }
+        if status["canReceiveConfig"] == false {
+            return Err(status["reason"].as_str().unwrap_or("Sync is unavailable on this device. Open Your account to choose your active device.").into());
+        }
     }
     if crate::personal_sync::is_personal(&fresh) {
-        return crate::personal_sync::sync(fresh.team.as_ref().ok_or("Sign in to sync first")?, &token);
+        return crate::personal_sync::sync(
+            fresh.team.as_ref().ok_or("Sign in to sync first")?,
+            &token,
+        );
     }
 
     let pulled = pull_config(
@@ -2830,7 +2869,12 @@ fn share_selections(
     selected: &Value,
     published: &Value,
 ) -> Result<Vec<ShareSelectionPreview>, String> {
-    let team_id = reg.team.as_ref().ok_or("not connected to a team")?.team_id.clone();
+    let team_id = reg
+        .team
+        .as_ref()
+        .ok_or("not connected to a team")?
+        .team_id
+        .clone();
     let remote = server_index(remote)?;
     let published_servers = server_index(&published["servers"])?;
     let selected = server_index(selected)?;
@@ -2960,14 +3004,17 @@ pub fn push_selected(
         let applied = crate::registry::load()?;
         let _authentication = lock_handoff_authentication(&applied, ids)?;
         let (_, staged) = crate::registry::update(|current| {
-            if current.team.as_ref().map(|t| &t.managed_server_ids) != applied.team.as_ref().map(|t| &t.managed_server_ids) {
+            if current.team.as_ref().map(|t| &t.managed_server_ids)
+                != applied.team.as_ref().map(|t| &t.managed_server_ids)
+            {
                 return Err("Team server identities changed. Review local setup again.".into());
             }
             finish_publisher_share(current, &reg, ids, version)
         })?;
         handoffs = staged;
         Ok::<_, String>(())
-    })().err();
+    })()
+    .err();
     let summary = publish_summary(version, published, local_setup_error.as_deref(), &handoffs);
     Ok(PublishResult {
         version,
@@ -3529,7 +3576,9 @@ fn seed_member_review(reg: &Registry, team_id: &str, config: &Value, review: &mu
             saved["launch"] = json!(launch.without_values());
         }
         for env in saved["env"].as_array_mut().into_iter().flatten() {
-            if let Some(object) = env.as_object_mut() { object.remove("value"); }
+            if let Some(object) = env.as_object_mut() {
+                object.remove("value");
+            }
         }
         if let Some(object) = saved.as_object_mut() {
             object.remove(HELD_CHANGE_FIELD);
@@ -5992,11 +6041,27 @@ mod tests {
     #[test]
     fn pair_target_matching_never_reuses_another_team_or_origin() {
         let mut reg = publisher_registry();
-        assert!(pair_target_is_current(&reg, "https://teams.example.test", "publisher-test"));
-        assert!(!pair_target_is_current(&reg, "https://other.example.test", "publisher-test"));
-        assert!(!pair_target_is_current(&reg, "https://teams.example.test", "other"));
+        assert!(pair_target_is_current(
+            &reg,
+            "https://teams.example.test",
+            "publisher-test"
+        ));
+        assert!(!pair_target_is_current(
+            &reg,
+            "https://other.example.test",
+            "publisher-test"
+        ));
+        assert!(!pair_target_is_current(
+            &reg,
+            "https://teams.example.test",
+            "other"
+        ));
         reg.team = None;
-        assert!(!pair_target_is_current(&reg, "https://teams.example.test", "publisher-test"));
+        assert!(!pair_target_is_current(
+            &reg,
+            "https://teams.example.test",
+            "publisher-test"
+        ));
     }
 
     fn publisher_registry() -> Registry {
@@ -6099,7 +6164,9 @@ mod tests {
                     // the working personal route.
                     let handoffs = result.unwrap();
                     assert_eq!(handoffs[0].outcome, HandoffOutcome::Attention);
-                    assert!(handoffs[0].message.ends_with("Your personal server stays on in this profile."));
+                    assert!(handoffs[0]
+                        .message
+                        .ends_with("Your personal server stays on in this profile."));
                 } else {
                     assert!(result.is_err(), "{field}");
                 }
@@ -7025,7 +7092,10 @@ mod tests {
 
         // Org dropping the policy releases both to the member's own (off), no permanent lock.
         apply_team_config(&mut r, "t1", &json!({ "servers": [] }));
-        assert!(r.content_defense_effective(), "labeling stays on after the team lock releases");
+        assert!(
+            r.content_defense_effective(),
+            "labeling stays on after the team lock releases"
+        );
         assert!(
             !r.quarantine_on_drift_effective(),
             "drift-quarantine released"
@@ -8483,7 +8553,8 @@ mod tests {
             ids: &[&str],
         ) -> (Registry, Value, Vec<LocalHandoff>) {
             let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
-            let merged = additive_server_set(remote, &selected_export(before, &ids).unwrap()).unwrap();
+            let merged =
+                additive_server_set(remote, &selected_export(before, &ids).unwrap()).unwrap();
             let mut r = synced(before, &merged, 2);
             let handoffs = finish_publisher_share(&mut r, before, &ids, 2).unwrap();
             (r, merged, handoffs)
@@ -8601,20 +8672,29 @@ mod tests {
                 assert_eq!(already[0].local.outcome, HandoffOutcome::Switched);
                 assert!(already[0].notes.is_empty());
 
-                let remote = json!([{"id":"mine","name":"Mine","transport":"stdio","command":"old"}]);
+                let remote =
+                    json!([{"id":"mine","name":"Mine","transport":"stdio","command":"old"}]);
                 let update = preview(&synced(&personal, &remote, 1), &remote, &["mine"]);
                 assert_eq!(update[0].team_change, "Update");
                 assert_eq!(update[0].local.outcome, HandoffOutcome::Switched);
 
-                let remote = json!([{"id":"mine-portal","name":" mine ","transport":"stdio","command":"x"}]);
+                let remote =
+                    json!([{"id":"mine-portal","name":" mine ","transport":"stdio","command":"x"}]);
                 let before = synced(&personal, &remote, 1);
                 let new = preview(&before, &remote, &["mine"]);
                 assert_eq!(new[0].team_change, "New");
                 assert_eq!(new[0].notes.len(), 1);
-                assert!(new[0].notes[0].contains("(ID mine-portal)"), "{:?}", new[0].notes);
+                assert!(
+                    new[0].notes[0].contains("(ID mine-portal)"),
+                    "{:?}",
+                    new[0].notes
+                );
                 let (after, _, _) = share(&before, &remote, &["mine"]);
                 assert!(
-                    after.servers.iter().any(|s| saved_team_original_id(s) == Some("mine-portal")),
+                    after
+                        .servers
+                        .iter()
+                        .any(|s| saved_team_original_id(s) == Some("mine-portal")),
                     "a same-name definition is never merged away"
                 );
 
@@ -8650,7 +8730,10 @@ mod tests {
                 let predicted = preview(&before, &remote, &["mine"]);
                 assert_eq!(predicted[0].local.outcome, HandoffOutcome::Attention);
                 assert!(predicted[0].local.message.contains("own local credentials"));
-                assert!(predicted[0].local.message.ends_with("Your personal server stays on in this profile."));
+                assert!(predicted[0]
+                    .local
+                    .message
+                    .ends_with("Your personal server stays on in this profile."));
                 assert!(!predicted[0].local.message.contains("independent-synthetic"));
 
                 let (r, _, handoffs) = share(&before, &remote, &["mine"]);
@@ -8659,7 +8742,10 @@ mod tests {
                 let profile = r.active_profile_id();
                 assert!(r.is_enabled(&profile, "mine"));
                 assert!(!r.is_enabled(&profile, &managed));
-                assert_eq!(crate::secrets::get_secret(&managed, crate::secrets::HTTP_AUTH_KEY).as_deref(), Some("independent-synthetic"));
+                assert_eq!(
+                    crate::secrets::get_secret(&managed, crate::secrets::HTTP_AUTH_KEY).as_deref(),
+                    Some("independent-synthetic")
+                );
                 crate::secrets::delete_secret(&managed, crate::secrets::HTTP_AUTH_KEY).unwrap();
             });
         }
@@ -8670,7 +8756,12 @@ mod tests {
                 let mut two = publisher_registry();
                 let profile = two.active_profile_id();
                 two.servers.push(stdio("other", "Other", "y"));
-                two.profiles.iter_mut().find(|p| p.id == profile).unwrap().enabled_server_ids.push("other".into());
+                two.profiles
+                    .iter_mut()
+                    .find(|p| p.id == profile)
+                    .unwrap()
+                    .enabled_server_ids
+                    .push("other".into());
                 let remote = team_server_export(&two);
                 let before = synced(&two, &remote, 1);
                 let other = team_copy(&before, "other");
@@ -8684,8 +8775,17 @@ mod tests {
 
                 let (r, _, handoffs) = share(&before, &remote, &["mine", "other"]);
 
-                let outcomes: Vec<_> = handoffs.iter().map(|h| (h.id.as_str(), h.outcome)).collect();
-                assert_eq!(outcomes, [("mine", HandoffOutcome::Switched), ("other", HandoffOutcome::Attention)]);
+                let outcomes: Vec<_> = handoffs
+                    .iter()
+                    .map(|h| (h.id.as_str(), h.outcome))
+                    .collect();
+                assert_eq!(
+                    outcomes,
+                    [
+                        ("mine", HandoffOutcome::Switched),
+                        ("other", HandoffOutcome::Attention)
+                    ]
+                );
                 let mine = team_copy(&r, "mine");
                 assert!(r.is_enabled(&profile, &mine) && !r.is_enabled(&profile, "mine"));
                 assert!(r.is_enabled(&profile, "other") && !r.is_enabled(&profile, &other));
@@ -8706,7 +8806,13 @@ mod tests {
                         crate::local_auth::bound_copy_enabled(&edited, &profile, "mine"),
                         "the first share handed off"
                     );
-                    edited.servers.iter_mut().find(|s| s.id == "mine").unwrap().args.push("--new".into());
+                    edited
+                        .servers
+                        .iter_mut()
+                        .find(|s| s.id == "mine")
+                        .unwrap()
+                        .args
+                        .push("--new".into());
 
                     let predicted = preview(&edited, &merged, &["mine"]);
                     assert_eq!(predicted[0].team_change, "Update");
@@ -8718,7 +8824,12 @@ mod tests {
                     );
 
                     let (r, _, handoffs) = share(&edited, &merged, &["mine"]);
-                    assert_eq!(handoffs[0].outcome, HandoffOutcome::Kept, "{:?}", handoffs[0]);
+                    assert_eq!(
+                        handoffs[0].outcome,
+                        HandoffOutcome::Kept,
+                        "{:?}",
+                        handoffs[0]
+                    );
                     let copy = team_copy(&r, "mine");
                     assert!(r.is_enabled(&profile, &copy), "the Team copy stays in use");
                     assert!(!r.is_enabled(&profile, "mine"));
@@ -8742,7 +8853,12 @@ mod tests {
                 let predicted = preview(&personal, &json!([]), &["mine"]);
                 assert_eq!(predicted[0].local.outcome, HandoffOutcome::Switched);
                 let (r, published, handoffs) = share(&personal, &json!([]), &["mine"]);
-                assert_eq!(handoffs[0].outcome, HandoffOutcome::Switched, "{:?}", handoffs[0]);
+                assert_eq!(
+                    handoffs[0].outcome,
+                    HandoffOutcome::Switched,
+                    "{:?}",
+                    handoffs[0]
+                );
                 let copy = team_copy(&r, "mine");
                 assert!(r.is_enabled(&profile, &copy) && !r.is_enabled(&profile, "mine"));
                 assert_eq!(crate::local_auth::owner_in(&r, &copy).unwrap(), "mine");
@@ -8790,22 +8906,37 @@ mod tests {
             crate::secrets::tests::with_isolated_vault(|| {
                 let (mut edited, merged) = handed_off();
                 let profile = edited.active_profile_id();
-                edited.servers.iter_mut().find(|s| s.id == "mine").unwrap().args = vec!["--new".into()];
+                edited
+                    .servers
+                    .iter_mut()
+                    .find(|s| s.id == "mine")
+                    .unwrap()
+                    .args = vec!["--new".into()];
                 let ids = vec!["mine".to_string()];
-                let published = additive_server_set(&merged, &selected_export(&edited, &ids).unwrap()).unwrap();
+                let published =
+                    additive_server_set(&merged, &selected_export(&edited, &ids).unwrap()).unwrap();
                 let mut r = synced(&edited, &published, 2);
                 let copy = team_copy(&r, "mine");
                 // Something the owner typed into the Team copy on its own.
-                r.servers.iter_mut().find(|s| s.id == copy).unwrap().env = vec![serde_json::from_value(
-                    json!({"key":"REGION","value":"independent","secret":false}),
-                ).unwrap()];
+                r.servers.iter_mut().find(|s| s.id == copy).unwrap().env =
+                    vec![serde_json::from_value(
+                        json!({"key":"REGION","value":"independent","secret":false}),
+                    )
+                    .unwrap()];
 
                 let handoffs = finish_publisher_share(&mut r, &edited, &ids, 2).unwrap();
 
                 assert_eq!(handoffs[0].outcome, HandoffOutcome::Attention);
-                assert!(handoffs[0].message.ends_with("Your personal server is back on in this profile."));
+                assert!(handoffs[0]
+                    .message
+                    .ends_with("Your personal server is back on in this profile."));
                 assert!(r.is_enabled(&profile, "mine"));
-                assert_eq!(r.servers.iter().find(|s| s.id == copy).unwrap().env[0].value.as_deref(), Some("independent"));
+                assert_eq!(
+                    r.servers.iter().find(|s| s.id == copy).unwrap().env[0]
+                        .value
+                        .as_deref(),
+                    Some("independent")
+                );
             });
         }
 
@@ -8821,17 +8952,35 @@ mod tests {
                         "a deleted definition leaves no mapping behind"
                     );
                     let mut changed = deleted.clone();
-                    changed.servers.iter_mut().find(|s| s.id == "mine").unwrap().args = vec![format!("--round-{round}")];
+                    changed
+                        .servers
+                        .iter_mut()
+                        .find(|s| s.id == "mine")
+                        .unwrap()
+                        .args = vec![format!("--round-{round}")];
                     let (r, _, handoffs) = share(&changed, &json!([]), &["mine"]);
-                    assert_eq!(handoffs[0].outcome, HandoffOutcome::Switched, "round {round}: {:?}", handoffs[0]);
+                    assert_eq!(
+                        handoffs[0].outcome,
+                        HandoffOutcome::Switched,
+                        "round {round}: {:?}",
+                        handoffs[0]
+                    );
                     assert_eq!(r.team.as_ref().unwrap().managed_server_ids.len(), 1);
                 }
                 // A leftover mapping from an older client never decides the handoff.
                 let remote = team_server_export(&personal);
                 let mut r = synced(&personal, &remote, 2);
-                r.team.as_mut().unwrap().managed_server_ids.insert("team_mine-stale".into(), "mine".into());
+                r.team
+                    .as_mut()
+                    .unwrap()
+                    .managed_server_ids
+                    .insert("team_mine-stale".into(), "mine".into());
                 assert_eq!(team_copy(&r, "mine"), member_id(&r, "mine"));
-                assert_eq!(finish_publisher_share(&mut r, &personal, &["mine".into()], 2).unwrap()[0].outcome, HandoffOutcome::Switched);
+                assert_eq!(
+                    finish_publisher_share(&mut r, &personal, &["mine".into()], 2).unwrap()[0]
+                        .outcome,
+                    HandoffOutcome::Switched
+                );
             });
         }
 
@@ -8851,8 +9000,11 @@ mod tests {
                 assert_eq!(selections[0].team_change, "Already shared");
                 assert_eq!(selections[0].local.outcome, HandoffOutcome::Switched);
 
-                personal.servers[0].env.push(serde_json::from_value(json!({"key":"REGION","secret":false})).unwrap());
-                let compared = build_push_preview(1, &stored, &team_server_export(&personal)).unwrap();
+                personal.servers[0]
+                    .env
+                    .push(serde_json::from_value(json!({"key":"REGION","secret":false})).unwrap());
+                let compared =
+                    build_push_preview(1, &stored, &team_server_export(&personal)).unwrap();
                 assert_eq!(compared.changed, ["Mine"], "a new key is a real change");
             });
         }
@@ -8861,7 +9013,8 @@ mod tests {
         fn the_share_picker_hint_uses_the_last_sync() {
             crate::secrets::tests::with_isolated_vault(|| {
                 let personal = publisher_registry();
-                let mine = |r: &Registry| r.servers.iter().find(|s| s.id == "mine").unwrap().clone();
+                let mine =
+                    |r: &Registry| r.servers.iter().find(|s| s.id == "mine").unwrap().clone();
                 assert_eq!(personal_share_hint(&personal, &mine(&personal)), None);
 
                 let remote = team_server_export(&personal);
@@ -8875,7 +9028,8 @@ mod tests {
                     personal_share_hint(&handed, &mine(&handed)),
                     Some("Shared. The Team copy is in use in this profile.")
                 );
-                let remote = json!([{"id":"mine-portal","name":"MINE","transport":"stdio","command":"x"}]);
+                let remote =
+                    json!([{"id":"mine-portal","name":"MINE","transport":"stdio","command":"x"}]);
                 let other = synced(&personal, &remote, 1);
                 assert_eq!(
                     personal_share_hint(&other, &mine(&other)),
@@ -8910,7 +9064,10 @@ mod tests {
             };
             assert!(result.needs_attention());
             assert!(!PublishResult::whole_set(5).needs_attention());
-            assert_eq!(PublishResult::whole_set(5).summary, "Shared with your team (version 5).");
+            assert_eq!(
+                PublishResult::whole_set(5).summary,
+                "Shared with your team (version 5)."
+            );
         }
     }
 }
@@ -9013,8 +9170,7 @@ mod member_review_tests {
         assert_eq!(merged[0]["disabled"], true);
         assert_eq!(merged[0]["note"], remote[0]["note"]);
         assert_eq!(merged[0]["url"], edited[0]["url"]);
-        stage_team_config(&mut reg, "review-team", &json!({"servers":merged}), 3, &[])
-            .unwrap();
+        stage_team_config(&mut reg, "review-team", &json!({"servers":merged}), 3, &[]).unwrap();
         assert!(reg
             .servers
             .iter()
@@ -9493,11 +9649,17 @@ mod member_review_tests {
         apply_team_config(&mut reg, "review-team", &cfg);
         cfg["servers"][0]["args"] = json!(["--token", "changed-secret"]);
         stage_team_config(&mut reg, "review-team", &cfg, 2, &[]).unwrap();
-        let server = reg.servers.iter().find(|s| saved_team_original_id(s) == Some("stdio")).unwrap();
+        let server = reg
+            .servers
+            .iter()
+            .find(|s| saved_team_original_id(s) == Some("stdio"))
+            .unwrap();
         assert_eq!(server.args, ["--token", "saved-secret"]);
         assert!(server_change_held(&reg, &server.id));
         let review = member_review(&reg).unwrap();
-        assert!(!json!(review.pending["server:stdio"].fields).to_string().contains("saved-secret"));
+        assert!(!json!(review.pending["server:stdio"].fields)
+            .to_string()
+            .contains("saved-secret"));
     }
 
     #[test]

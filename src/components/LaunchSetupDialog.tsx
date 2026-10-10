@@ -1,4 +1,5 @@
 import { SecretReferenceField } from "@/components/SecretReferenceField";
+import { invoke } from "@tauri-apps/api/core";
 import { useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
@@ -30,6 +31,7 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
   const [values, setValues] = useState<Record<string, string>>({});
   const inputs = server.launch?.inputs ?? [];
   const [references, setReferences] = useState<Record<string, string | undefined>>({});
+  const [portable, setPortable] = useState<Record<string, boolean>>({});
 
   function onOpenChange(next: boolean) {
     if (next) {
@@ -38,6 +40,7 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
           inputs.filter((i) => i.source).map((i) => [i.key, i.source!.ref]),
         ),
       );
+      setPortable(Object.fromEntries(inputs.map((i) => [i.key, i.portable === true])));
       setValues(
         Object.fromEntries(
           inputs.map((input) => [input.key, input.secret ? "" : (input.value ?? "")]),
@@ -59,6 +62,17 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
           if (value) result = await setLaunchSecret(server.id, input.key, value);
         } else if (value !== (input.value ?? "")) {
           result = await setLaunchInputValue(server.id, input.key, value || null);
+        }
+        if (
+          !input.secret &&
+          (portable[input.key] === true) !== (input.portable === true)
+        ) {
+          result = await invoke<Registry>("personal_sync_portable", {
+            serverId: server.id,
+            kind: "input",
+            key: input.key,
+            enabled: portable[input.key] === true,
+          });
         }
       }
       if (result) {
@@ -129,6 +143,18 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
                     }))
                   }
                 />
+              )}
+              {!input.secret && (
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={portable[input.key] === true}
+                    onChange={(e) =>
+                      setPortable((p) => ({ ...p, [input.key]: e.target.checked }))
+                    }
+                  />{" "}
+                  Same on every machine
+                </label>
               )}
             </div>
           ))}

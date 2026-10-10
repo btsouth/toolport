@@ -110,13 +110,14 @@ export function ServerDialog({
   // Env vars (API keys etc.). Values are vaulted in the OS keychain, never stored
   // in the registry, so existing secrets show as declared keys with empty values.
   const [envRows, setEnvRows] = useState<
-    { key: string; value: string; secret?: boolean; source?: { ref: string } }[]
+    { key: string; value: string; secret?: boolean; portable?: boolean; source?: { ref: string } }[]
   >(
     initial?.env.map((e) => ({
       key: e.key,
       value: e.secret ? "" : (e.value ?? ""),
       secret: e.secret,
       source: e.source,
+      portable: e.portable,
     })) ?? [],
   );
   const [launch, setLaunch] = useState<LaunchConfig | null>(initial?.launch ?? null);
@@ -190,6 +191,7 @@ export function ServerDialog({
           value: e.secret ? "" : (e.value ?? ""),
           secret: e.secret,
           source: e.source,
+          portable: e.portable,
         })) ?? [],
       );
       setLaunch(initial?.launch ?? null);
@@ -319,6 +321,7 @@ export function ServerDialog({
             : null,
         secret: r.source ? true : r.secret !== false,
         ...(r.source ? { source: r.source } : {}),
+        portable: !r.source && r.secret === false && r.portable === true,
       })),
       url: isStdio ? null : form.url.trim() || null,
       source: bindingCleared ? "manual" : (initial?.source ?? "manual"),
@@ -877,6 +880,22 @@ export function ServerDialog({
                   />
                   Keychain
                 </label>
+                {row.secret === false && (
+                  <label className="flex shrink-0 items-center gap-1 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={row.portable === true}
+                      onChange={(e) =>
+                        setEnvRows((rows) =>
+                          rows.map((r, j) =>
+                            j === i ? { ...r, portable: e.target.checked } : r,
+                          ),
+                        )
+                      }
+                    />{" "}
+                    Same on every machine
+                  </label>
+                )}
                 <Button
                   size="icon"
                   variant="ghost"

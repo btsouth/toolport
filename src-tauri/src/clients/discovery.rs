@@ -202,7 +202,12 @@ mod tests {
         let mut registry = crate::registry::Registry::default();
         registry.set_client_discovery("claude-code", Some("full"));
         let before = serde_json::to_value(&registry).unwrap();
-        for id in ["codex", "client:codex", "adapter:codex", "adapter:client:codex"] {
+        for id in [
+            "codex",
+            "client:codex",
+            "adapter:codex",
+            "adapter:client:codex",
+        ] {
             let caps = super::super::discovery_capabilities(id);
             assert_eq!(caps.cold_full_list_wait_ms, 8_000, "{id}");
             assert_eq!(caps.tools_list_changed, Some(false), "{id}");

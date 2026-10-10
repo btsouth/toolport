@@ -440,6 +440,7 @@ export interface HeaderKey {
 }
 export interface EnvVar {
   source?: SecretReference;
+  portable?: boolean;
   key: string;
   value: string | null;
   secret: boolean;
@@ -447,6 +448,7 @@ export interface EnvVar {
 
 export interface LaunchInput {
   source?: SecretReference;
+  portable?: boolean;
   key: string;
   label: string;
   secret: boolean;
@@ -476,6 +478,10 @@ export interface KeptV1Safety {
 }
 
 export interface ServerEntry {
+  syncLocalOnly?: boolean;
+  teamOriginalId?: string;
+  personalSyncEntry?: boolean;
+  teamEnableReview?: boolean;
   enabled?: boolean;
   id: string;
   name: string;
@@ -698,6 +704,8 @@ export interface HttpClient {
 
 /** A joined Toolport Teams server (the shared config-sync layer). */
 export interface TeamConnection {
+  accountStatus?: import("./personalSync").AccountStatus | null;
+  personalSyncState?: import("./personalSync").PersonalSyncState;
   managedServerIds?: Record<string, string>;
   serverUrl: string;
   teamId: string;

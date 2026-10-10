@@ -1859,6 +1859,7 @@ fn cwd_validation_error(dir: &str, expanded: &Path, empty_variables: &[String]) 
             "; expanded empty environment variables: {variables}"
         ));
     }
+    message.push_str(". Create the directory on this machine or update the working directory in Servers, then retry.");
     message
 }
 
@@ -5349,7 +5350,17 @@ impl StdioTransport {
         #[cfg(windows)]
         let job = WindowsJob::new()?;
         let mut child =
-            spawn_server(cmd).map_err(|e| format!("failed to spawn '{command}': {e}"))?;
+            spawn_server(cmd).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    let install = match command.rsplit(['/', '\\']).next().unwrap_or(command) {
+                        "npx" | "npx.cmd" => "Install Node.js (which includes npx)",
+                        "uvx" => "Install uv (which includes uvx)",
+                        "docker" => "Install Docker and start its service",
+                        _ => "Install this executable or correct its path in Servers",
+                    };
+                    format!("Executable '{command}' was not found on this machine. {install}, then restart your MCP client and retry.")
+                } else { format!("failed to spawn '{command}': {e}") }
+            })?;
         #[cfg(windows)]
         if let Err(error) = job.assign(&child).and_then(|_| WindowsJob::resume(&child)) {
             let _ = child.kill();

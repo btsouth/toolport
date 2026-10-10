@@ -1,3 +1,4 @@
+import { isPersonalSync } from "@/lib/personalSync";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -596,8 +597,12 @@ export function AppSidebar({
             quarantinedCount,
             quarantineStale,
           )}
-          {paired &&
-            navItem(Users, "Team", view === "teams", () => onSelectView("teams"))}
+          {navItem(
+            Users,
+            paired ? (isPersonalSync(registry) ? "Sync" : "Team") : "Sign in to sync",
+            view === "teams",
+            () => onSelectView("teams"),
+          )}
         </nav>
 
         {savings && (savings.tokenizedLoads ?? 0) > 0 && (

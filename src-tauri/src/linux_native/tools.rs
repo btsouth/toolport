@@ -404,14 +404,16 @@ fn tool_row(
     let enabled_badge = state_badge(if enabled { "Enabled" } else { "Disabled" });
     badges.insert(&enabled_badge, -1);
     badges.insert(
-        &state_badge(match tool
-            .get("toolportQuarantine")
-            .and_then(serde_json::Value::as_str)
-        {
-            Some("quarantined") => "Quarantined",
-            Some("clear") => "Not quarantined",
-            _ => "Quarantine unknown",
-        }),
+        &state_badge(
+            match tool
+                .get("toolportQuarantine")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("quarantined") => "Quarantined",
+                Some("clear") => "Not quarantined",
+                _ => "Quarantine unknown",
+            },
+        ),
         -1,
     );
     title.append(&badges);

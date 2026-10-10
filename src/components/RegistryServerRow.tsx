@@ -1,4 +1,7 @@
 import { referenceProvider } from "@/lib/secretRefs";
+import { toastError } from "@/lib/toast";
+import { isPersonalSync } from "@/lib/personalSync";
+import { invoke } from "@tauri-apps/api/core";
 import { lazy, Suspense, useEffect, useState } from "react";
 import {
   ChevronDown,
@@ -125,7 +128,8 @@ export function RegistryServerRow({
   // Team-synced servers are tagged `team:<id>`. An admin manages them centrally, so a
   // member sees a Team badge and can't edit/remove them locally (a local change would
   // just re-sync away), but still authenticates them (keys stay on their own machine).
-  const isTeam = server.source?.startsWith("team:") ?? false;
+  const personalSync = isPersonalSync(registry);
+  const isTeam = (server.source?.startsWith("team:") ?? false) && !personalSync;
 
   const label =
     status === "needs-auth"
@@ -196,7 +200,11 @@ export function RegistryServerRow({
           </span>
         ) : (
           <span className="hidden max-w-40 shrink-0 truncate rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground md:inline">
-            Personal
+            {personalSync
+              ? server.syncLocalOnly
+                ? "This machine only"
+                : "Synced"
+              : "Personal"}
             {server.source?.startsWith("imported:")
               ? ` · ${server.source.replace("imported:", "from ")}`
               : ""}
@@ -393,6 +401,31 @@ export function RegistryServerRow({
                   />
                 )}
 
+                {personalSync && (
+                  <label className="inline-flex items-center gap-2 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={server.syncLocalOnly === true}
+                      onChange={async (e) => {
+                        try {
+                          const r = await invoke<Registry>("personal_sync_local_only", {
+                            serverId: server.id,
+                            localOnly: e.target.checked,
+                          });
+                          onRegistryChange(r);
+                        } catch (error) {
+                          toastError(String(error));
+                        }
+                      }}
+                    />{" "}
+                    Keep on this machine only
+                  </label>
+                )}
+                {personalSync && (
+                  <span className="text-xs text-muted-foreground">
+                    {server.syncLocalOnly ? "This machine only" : "Synced"}
+                  </span>
+                )}
                 {isTeam ? (
                   <span className="inline-flex items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground">
                     <Users className="size-3.5" aria-hidden="true" />

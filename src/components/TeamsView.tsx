@@ -1,4 +1,6 @@
 import { secretReferenceReview } from "@/lib/secretRefs";
+import { PersonalSyncView } from "./PersonalSyncView";
+import { isPersonalSync } from "@/lib/personalSync";
 import { TeamSharePreview } from "./TeamSharePreview";
 import { teamShareAction } from "@/lib/teamShare";
 import { useEffect, useState } from "react";
@@ -534,6 +536,9 @@ export function TeamsView({
     );
   }
 
+  if (!team || isPersonalSync(registry)) {
+    return <PersonalSyncView registry={registry} onRegistryChange={onRegistryChange} />;
+  }
   return (
     // The connected view is a single column of cards and stays narrow. The
     // disconnected one runs two lanes side by side, which needs the extra width to

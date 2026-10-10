@@ -521,7 +521,12 @@ fn build_window(
         // Team joins the sidebar the moment the registry says this install is
         // paired, without a relaunch.
         if let state::RegistryState::Ready(ready) = &snapshot {
-            team_button.set_visible(ready.paired);
+            team_button.set_visible(true);
+            team_button.set_label(if ready.paired {
+                "Sync"
+            } else {
+                "Sign in to sync"
+            });
         }
         server_page.render(snapshot);
         if let Some(notice) = startup_notice.borrow_mut().take() {
@@ -753,7 +758,7 @@ const NAV_SECTIONS: &[(&str, &str, &str)] = &[
     ("clients", "Clients", "computer-symbolic"),
     ("activity", "Activity", "view-list-symbolic"),
     ("settings", "Settings", "emblem-system-symbolic"),
-    ("teams", "Team", "system-users-symbolic"),
+    ("teams", "Sign in to sync", "system-users-symbolic"),
     ("catalog", "Catalog", "system-software-install-symbolic"),
 ];
 
@@ -763,9 +768,9 @@ const NAV_SHORTCUTS: &[&str] = &["servers", "clients", "activity", "settings"];
 
 /// Whether `target` is drawn as a sidebar row. Team is hidden on an unpaired
 /// install; the dropped top-level views stay reachable by action only.
-fn is_sidebar_row(target: &str, paired: bool) -> bool {
+fn is_sidebar_row(target: &str, _paired: bool) -> bool {
     match target {
-        "teams" => paired,
+        "teams" => true,
         "catalog" => false,
         _ => true,
     }
@@ -7423,6 +7428,11 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
         open_server_editor(Some(server_for_edit.clone()), page_for_edit.clone())
     });
     actions.append(&edit);
+    let settings = action_menu_button("Sync settings", "emblem-synchronizing-symbolic");
+    let sync_id = server.id.clone();
+    let sync_page = page.clone();
+    settings.connect_clicked(move |_| open_sync_settings(&sync_id, &sync_page));
+    actions.append(&settings);
 
     let duplicate = action_menu_button("Duplicate", "edit-copy-symbolic");
     duplicate.set_tooltip_text(Some(
@@ -9305,6 +9315,86 @@ fn launch_editor_value(
         input.unknown_fields.remove("source");
         (input, value.to_string())
     }
+}
+
+fn open_sync_settings(server_id: &str, page: &ServerPage) {
+    let Ok(reg) = crate::registry::load() else {
+        return;
+    };
+    let Some(server) = reg.servers.iter().find(|s| s.id == server_id) else {
+        return;
+    };
+    let Some(parent) = page.app.active_window() else {
+        return;
+    };
+    #[allow(deprecated)]
+    let dialog = adw::MessageDialog::new(Some(&parent), Some("Sync settings"), Some("Only values marked nonsecret can be the same on every machine. Secret values and approvals always stay on this machine."));
+    let fields = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let local = gtk::CheckButton::with_label("Keep on this machine only");
+    local.set_active(crate::personal_sync::keep_local(server));
+    local.set_sensitive(crate::personal_sync::is_personal(&reg));
+    fields.append(&local);
+    let mut portable = Vec::new();
+    for (kind, key, label, secret, unknown) in server
+        .env
+        .iter()
+        .map(|i| ("env", &i.key, &i.key, i.secret, &i.unknown_fields))
+        .chain(
+            server
+                .launch
+                .iter()
+                .flat_map(|l| &l.inputs)
+                .map(|i| ("input", &i.key, &i.label, i.secret, &i.unknown_fields)),
+        )
+    {
+        if secret || unknown.contains_key("source") {
+            continue;
+        }
+        let check = gtk::CheckButton::with_label(&format!("{label}: same on every machine"));
+        check.set_active(unknown.get("portable") == Some(&serde_json::json!(true)));
+        fields.append(&check);
+        portable.push((kind.to_string(), key.clone(), check));
+    }
+    dialog.set_extra_child(Some(&fields));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("save", "Save");
+    dialog.set_default_response(Some("save"));
+    dialog.set_close_response("cancel");
+    let id = server_id.to_string();
+    let page = page.clone();
+    let personal = crate::personal_sync::is_personal(&reg);
+    dialog.connect_response(None, move |_, response| {
+        if response != "save" {
+            return;
+        }
+        let id = id.clone();
+        let page = page.clone();
+        let local = local.is_active();
+        let marks: Vec<_> = portable
+            .iter()
+            .map(|(k, key, c)| (k.clone(), key.clone(), c.is_active()))
+            .collect();
+        gtk::glib::spawn_future_local(async move {
+            let result = gtk::gio::spawn_blocking(move || {
+                if personal {
+                    crate::personal_sync::set_local_only(&id, local)?;
+                }
+                for (kind, key, enabled) in marks {
+                    crate::personal_sync::set_portable(&id, &kind, &key, enabled)?;
+                }
+                crate::registry::load()
+            })
+            .await;
+            match result {
+                Ok(Ok(reg)) => page.render(state::RegistryState::Ready(
+                    state::RegistrySnapshot::from_registry(reg),
+                )),
+                Ok(Err(e)) => page.restore_after_error(&e),
+                Err(_) => page.restore_after_error("Could not save sync settings"),
+            }
+        });
+    });
+    dialog.present();
 }
 
 fn save_launch_entries(
