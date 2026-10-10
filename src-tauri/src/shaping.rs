@@ -30,8 +30,9 @@ const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 /// entries (by insertion time) are evicted first.
 const MAX_CACHE_ENTRIES: usize = 64;
 
-/// Cap on retained body and structured JSON bytes. Evict oldest until a new body
-/// fits, or the cache is empty (then one over-cap body is kept rather than dropping the result
+/// Cap on estimated retained bytes, including parsed JSON allocations. Evict
+/// oldest until a new body fits, or the
+/// cache is empty (then one over-cap body is kept rather than dropping the result
 /// the caller just produced).
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -61,7 +62,7 @@ pub fn budget() -> (usize, Option<String>) {
 struct Cached {
     server: Option<String>,
     body: String,
-    structured: Option<Structured>,
+    structured: Option<Value>,
     /// Estimated retained allocations, computed once at insertion.
     size: usize,
     /// The client the result belongs to (a registered HTTP client's label), or None
@@ -94,12 +95,12 @@ fn sweep(store: &mut SessionStore<Cached>) {
 
 /// Called by the daemon's existing maintenance tick. Reads never extend the
 /// insertion-based TTL. Trim outside the cache lock and off the request path.
-pub fn maintain_cache() {
+pub fn maintain_cache(idle_transition: bool) {
     {
         let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
         sweep(&mut store);
     }
-    if TRIM_PENDING.swap(false, Ordering::Relaxed) {
+    if TRIM_PENDING.swap(false, Ordering::Relaxed) || idle_transition {
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         // SAFETY: glibc's allocator synchronizes trimming with other allocations.
         unsafe {
@@ -108,110 +109,48 @@ pub fn maintain_cache() {
     }
 }
 
-// Keep canonical structured JSON only when the original text cannot supply it.
-enum Structured {
-    Body { offset: usize, canonical: bool },
-    Json(String),
+// glibc chunks need alignment and a header; other allocators are conservatively
+// charged the same overhead. Capacity matters even when the buffer is short.
+fn allocation_size(capacity: usize) -> usize {
+    if capacity == 0 {
+        0
+    } else {
+        capacity.saturating_add(15) / 16 * 16 + 16
+    }
 }
 
-impl Structured {
-    fn new(body: &str, value: Option<&Value>) -> Option<Self> {
-        value.map(|value| {
-            let json = value.to_string();
-            if json == body {
-                Self::Body {
-                    offset: 0,
-                    canonical: true,
-                }
+fn value_heap_size(value: &Value) -> usize {
+    match value {
+        Value::String(s) => allocation_size(s.capacity()),
+        Value::Array(a) => {
+            allocation_size(a.capacity() * std::mem::size_of::<Value>())
+                + a.iter().map(value_heap_size).sum::<usize>()
+        }
+        Value::Object(o) => {
+            // std's B-tree nodes reserve eleven slots, even for a tiny object.
+            // Non-root nodes have at least five keys. Charge the upper node count
+            // and internal-node edges, not just the occupied key/value slots.
+            let nodes = if o.len() <= 11 {
+                usize::from(!o.is_empty())
             } else {
-                Self::Json(json)
-            }
-        })
-    }
-
-    fn json<'a>(&'a self, body: &'a str) -> &'a str {
-        match self {
-            Self::Body { offset, .. } => &body[*offset..],
-            Self::Json(json) => json,
+                (o.len() - 1) / 5 + 1
+            };
+            let node_bytes = 11 * (std::mem::size_of::<String>() + std::mem::size_of::<Value>())
+                + 16
+                + 12 * std::mem::size_of::<usize>();
+            nodes * allocation_size(node_bytes)
+                + o.iter()
+                    .map(|(key, value)| allocation_size(key.capacity()) + value_heap_size(value))
+                    .sum::<usize>()
         }
+        _ => 0,
     }
 }
 
-fn retained_size(body: &String, structured: Option<&Structured>) -> usize {
+fn retained_size(body: &String, structured: Option<&Value>) -> usize {
     std::mem::size_of::<Cached>()
-        + body.capacity()
-        + match structured {
-            Some(Structured::Json(json)) => json.capacity(),
-            _ => 0,
-        }
-}
-
-// Stop at the selected subtree rather than parsing the rest of a large array.
-// The input was serialized from a Value or checked equal to that Value, so it
-// is already validated JSON. A private early-return error carries the borrowed
-// result through serde.
-fn project_json<'a>(json: &'a str, path: &str) -> Option<&'a str> {
-    use serde::de::{DeserializeSeed, Error, IgnoredAny, MapAccess, SeqAccess, Visitor};
-    use serde::Deserialize;
-
-    struct Select<'p, 'out, 'de> {
-        path: std::str::Split<'p, char>,
-        found: &'out mut Option<&'de serde_json::value::RawValue>,
-    }
-    impl<'de> DeserializeSeed<'de> for Select<'_, '_, 'de> {
-        type Value = ();
-        fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
-            if self.path.clone().next().is_none() {
-                *self.found = Some(<&serde_json::value::RawValue>::deserialize(deserializer)?);
-                return Err(D::Error::custom("selected projection"));
-            }
-            deserializer.deserialize_any(self)
-        }
-    }
-    impl<'de> Visitor<'de> for Select<'_, '_, 'de> {
-        type Value = ();
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("an object or array")
-        }
-        fn visit_map<M: MapAccess<'de>>(mut self, mut map: M) -> Result<(), M::Error> {
-            let segment = self.path.next().expect("a nonempty projection path");
-            while let Some(key) = map.next_key::<String>()? {
-                if key == segment {
-                    return map.next_value_seed(Select {
-                        path: self.path,
-                        found: self.found,
-                    });
-                }
-                map.next_value::<IgnoredAny>()?;
-            }
-            Ok(())
-        }
-        fn visit_seq<S: SeqAccess<'de>>(mut self, mut seq: S) -> Result<(), S::Error> {
-            let index = self
-                .path
-                .next()
-                .expect("a nonempty projection path")
-                .parse::<usize>()
-                .map_err(S::Error::custom)?;
-            for _ in 0..index {
-                if seq.next_element::<IgnoredAny>()?.is_none() {
-                    return Ok(());
-                }
-            }
-            seq.next_element_seed(Select {
-                path: self.path,
-                found: self.found,
-            })?;
-            Ok(())
-        }
-    }
-    let mut found = None;
-    let _ = Select {
-        path: path.split('.'),
-        found: &mut found,
-    }
-    .deserialize(&mut serde_json::Deserializer::from_str(json));
-    found.map(serde_json::value::RawValue::get)
+        + allocation_size(body.capacity())
+        + structured.map(value_heap_size).unwrap_or(0)
 }
 
 /// Bound memory: evict oldest until the entry count and total bytes leave room for
@@ -233,7 +172,7 @@ fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) {
 /// Concatenate the model-facing text of an MCP tool result's content blocks, then
 /// fold in `structuredContent` so nothing is lost when the structured payload is
 /// the bloat.
-fn extract_body(result: &Value) -> (String, usize, Option<Structured>) {
+fn extract_body(result: &Value) -> (String, usize) {
     let mut out = String::new();
     if let Some(blocks) = result.get("content").and_then(|c| c.as_array()) {
         for b in blocks {
@@ -246,12 +185,11 @@ fn extract_body(result: &Value) -> (String, usize, Option<Structured>) {
         }
     }
     let mut source_bytes = out.len();
-    let mut structured = None;
     if let Some(sc) = result.get("structuredContent") {
         let structured_text = serde_json::to_string(sc).unwrap_or_default();
         source_bytes += structured_text.len() + usize::from(!out.is_empty());
         // Some servers return the same JSON as text and structuredContent. Keep
-        // the original text bytes and derive typed projections from those bytes,
+        // the original text bytes and the separately cached typed projection,
         // without making every page repeat that JSON a second time. Only a
         // single text block can qualify; mixed/multiple blocks remain lossless.
         let single_text = result
@@ -263,24 +201,14 @@ fn extract_body(result: &Value) -> (String, usize, Option<Structured>) {
                 || serde_json::from_str::<Value>(&out)
                     .ok()
                     .is_some_and(|text| text == *sc));
-        structured = Some(if duplicate {
-            Structured::Body {
-                offset: 0,
-                canonical: out == structured_text,
-            }
-        } else {
+        if !duplicate {
             if !out.is_empty() {
                 out.push('\n');
             }
-            let offset = out.len();
             out.push_str(&structured_text);
-            Structured::Body {
-                offset,
-                canonical: true,
-            }
-        });
+        }
     }
-    (out, source_bytes, structured)
+    (out, source_bytes)
 }
 
 fn value_size(value: &Value) -> usize {
@@ -289,6 +217,23 @@ fn value_size(value: &Value) -> usize {
 
 fn text_result(text: String, is_error: bool) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
+}
+
+fn project<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+
+    for segment in path.split('.') {
+        if let Some(object) = current.as_object() {
+            current = object.get(segment)?;
+        } else if let Some(array) = current.as_array() {
+            let index = segment.parse::<usize>().ok()?;
+            current = array.get(index)?;
+        } else {
+            return None;
+        }
+    }
+
+    Some(current)
 }
 
 /// The longest char-boundary prefix of `s` whose UTF-8 length is at most
@@ -368,10 +313,11 @@ pub fn shape_result_preserving_prefix(
     // non-text blocks, or its size is dominated by non-body envelope (the text
     // projection captures under half the bytes), shaping would drop data and its
     // "nothing was lost" claim would be false. Pass those through untouched.
-    let (body, source_bytes, structured) = extract_body(result);
+    let (body, source_bytes) = extract_body(result);
     if !is_text_representable(result) || source_bytes < size / 2 {
         return false;
     }
+    let structured = result.get("structuredContent").cloned();
 
     let total = body.chars().count();
     // Envelope fields carried across (see below) are part of the shaped result, so
@@ -513,7 +459,6 @@ pub fn shape_result_preserving_prefix(
 /// without inflating the result it rides on.
 pub fn stash_payload(body: String, structured: Option<Value>, owner: Option<&str>) -> String {
     let cursor = next_cursor();
-    let structured = Structured::new(&body, structured.as_ref());
     let size = retained_size(&body, structured.as_ref());
     let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
     sweep(&mut store);
@@ -574,7 +519,7 @@ pub fn fetch_result(
             }
         };
 
-        let value = match project_json(structured.json(&c.body), path) {
+        let value = match project(structured, path) {
             Some(value) => value,
             None => {
                 return text_result(
@@ -584,22 +529,7 @@ pub fn fetch_result(
             }
         };
 
-        let text = if matches!(
-            structured,
-            Structured::Body {
-                canonical: false,
-                ..
-            }
-        ) {
-            // The text may be pretty-printed or use another object-key order.
-            // Canonicalize only the selected subtree, preserving projection bytes.
-            serde_json::from_str::<Value>(value)
-                .map(|value| value.to_string())
-                .unwrap_or_default()
-        } else {
-            value.to_string()
-        };
-        let mut result = text_result(text, false);
+        let mut result = text_result(serde_json::to_string(value).unwrap_or_default(), false);
         if let Some(server) = &c.server {
             crate::integrity::label_untrusted_result(server, &mut result);
         }
@@ -1276,42 +1206,15 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_structured_json_retains_one_representation() {
-        let value = json!({"rows": (0..1000).map(|_| json!({"a": 1, "b": 2})).collect::<Vec<_>>()});
-        let body = value.to_string();
-        let structured = Structured::new(&body, Some(&value));
-        assert!(matches!(structured, Some(Structured::Body { .. })));
-        assert_eq!(
-            retained_size(&body, structured.as_ref()),
-            std::mem::size_of::<Cached>() + body.capacity()
-        );
-        let distinct = Structured::new("different text", Some(&value));
-        let distinct_body = "different text".to_string();
-        assert!(
-            retained_size(&distinct_body, distinct.as_ref())
-                >= distinct_body.len() + value_size(&value)
-        );
-    }
-
-    #[test]
-    fn distinct_structured_json_uses_the_existing_body_suffix() {
-        let value = json!({"rows": [1, 2, 3]});
-        let result = json!({"content": [{"type": "text", "text": "different text"}], "structuredContent": value});
-        let (body, _, structured) = extract_body(&result);
-        let structured = structured.unwrap();
-        assert!(matches!(
-            structured,
-            Structured::Body {
-                canonical: true,
-                ..
-            }
-        ));
-        assert_eq!(body, format!("different text\n{value}"));
-        assert_eq!(structured.json(&body), value.to_string());
-        assert_eq!(
-            retained_size(&body, Some(&structured)),
-            std::mem::size_of::<Cached>() + body.capacity()
-        );
+    fn small_json_members_charge_tree_allocations() {
+        let structured =
+            json!({"rows": (0..1000).map(|_| json!({"a": 1, "b": 2})).collect::<Vec<_>>()});
+        let size = retained_size(&String::new(), Some(&structured));
+        assert!(size > value_size(&structured) * 5);
+        let mut store = SessionStore::new(CACHE_TTL, MAX_CACHE_ENTRIES);
+        store.insert("first", cached_entry(MAX_CACHE_BYTES - size + 1));
+        evict_to_fit(&mut store, size);
+        assert!(store.is_empty(), "parsed allocations must trigger eviction");
     }
 
     #[test]
@@ -1330,33 +1233,6 @@ mod tests {
             store.is_empty(),
             "the retained buffer must trigger eviction"
         );
-    }
-
-    #[test]
-    fn raw_projections_match_value_serialization() {
-        let value = json!({"": 7, "rows": [{"escaped\"": "é🙂\n\\", "empty": [], "nested": {"number": -1.5}}, 4, null, true]});
-        let body = value.to_string();
-        for (path, expected) in [
-            ("", Some(json!(7))),
-            ("rows.0", Some(value["rows"][0].clone())),
-            ("rows.0.escaped\"", Some(json!("é🙂\n\\"))),
-            ("rows.0.empty", Some(json!([]))),
-            ("rows.0.nested.number", Some(json!(-1.5))),
-            ("rows.1", Some(json!(4))),
-            ("rows.2", Some(Value::Null)),
-            ("rows.3", Some(json!(true))),
-            ("rows.4", None),
-            ("rows.1.child", None),
-            ("missing", None),
-            ("rows.-1", None),
-            ("rows.18446744073709551616", None),
-        ] {
-            assert_eq!(
-                project_json(&body, path).map(str::to_string),
-                expected.map(|v| v.to_string()),
-                "{path}"
-            );
-        }
     }
 
     #[test]

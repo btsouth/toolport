@@ -18790,10 +18790,13 @@ fn spawn_daemon_idle_watchdog(
 ) {
     let poll = Duration::from_millis(200).min(grace);
     let mut cache_tick = Instant::now();
+    let mut was_idle = false;
     std::thread::spawn(move || loop {
         std::thread::sleep(poll);
         if cache_tick.elapsed() >= Duration::from_secs(30) {
-            conduit_lib::shaping::maintain_cache();
+            let idle = host.idle_for() >= Duration::from_secs(30);
+            conduit_lib::shaping::maintain_cache(idle && !was_idle);
+            was_idle = idle;
             cache_tick = Instant::now();
         }
         if inflight.load(Ordering::Relaxed) > 0 {
