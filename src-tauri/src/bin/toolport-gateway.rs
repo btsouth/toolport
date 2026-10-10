@@ -10741,14 +10741,24 @@ fn tool_cache_path(profile: Option<&str>) -> Option<PathBuf> {
 // Version 1 has no per-server launch identity; version 2 may contain gateway-owned aliases.
 const TOOL_CACHE_VERSION: u64 = 3;
 
+fn cached_field(mut cache: Value, field: &str) -> Option<Value> {
+    if cache.get("version")?.as_u64()? != TOOL_CACHE_VERSION {
+        return None;
+    }
+    cache.get_mut(field).map(Value::take)
+}
+
 fn load_tool_cache(profile: Option<&str>) -> Vec<Value> {
     let mut tools = tool_cache_path(profile)
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         // Only honor a cache written by this catalog version; a bare-array (pre-version)
         // or older-version file has no matching tag and is dropped, forcing a rebuild.
-        .filter(|v| v.get("version").and_then(Value::as_u64) == Some(TOOL_CACHE_VERSION))
-        .and_then(|v| v.get("tools").and_then(Value::as_array).cloned())
+        .and_then(|cache| cached_field(cache, "tools"))
+        .and_then(|tools| match tools {
+            Value::Array(tools) => Some(tools),
+            _ => None,
+        })
         .unwrap_or_default();
     for tool in &mut tools {
         if let Some(schema) = tool.get_mut("inputSchema") {
@@ -10766,8 +10776,8 @@ fn load_server_catalogs(profile: Option<&str>) -> HashMap<String, Value> {
     server_catalog_path(profile)
         .and_then(|path| std::fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .filter(|value| value["version"] == TOOL_CACHE_VERSION)
-        .and_then(|value| serde_json::from_value(value["servers"].clone()).ok())
+        .and_then(|cache| cached_field(cache, "servers"))
+        .and_then(|servers| serde_json::from_value(servers).ok())
         .unwrap_or_default()
 }
 
@@ -22980,6 +22990,29 @@ mod tests {
                 "legacy alias {name} must be rebuilt"
             );
         }
+    }
+
+    #[test]
+    fn persisted_catalog_fields_move_their_nested_allocations() {
+        for field in ["tools", "servers"] {
+            let expected =
+                json!({"nested":[{"description":"large cached definition".repeat(4096)}]});
+            let cache = json!({"version":TOOL_CACHE_VERSION, field:expected});
+            let pointer = cache[field]["nested"][0]["description"]
+                .as_str()
+                .unwrap()
+                .as_ptr();
+            let taken = cached_field(cache, field).unwrap();
+            assert_eq!(taken, expected);
+            assert_eq!(
+                taken["nested"][0]["description"].as_str().unwrap().as_ptr(),
+                pointer
+            );
+        }
+        for version in [json!(null), json!(2), json!(4), json!("3")] {
+            assert!(cached_field(json!({"version":version,"tools":[]}), "tools").is_none());
+        }
+        assert!(cached_field(json!({"version":TOOL_CACHE_VERSION}), "tools").is_none());
     }
 
     #[test]
