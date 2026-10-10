@@ -1,13 +1,43 @@
 # Linux system packages
 
-Toolport 2.0 ships the GTK shell as `toolport` for Ubuntu 24.04+, Debian 13,
-Fedora, and Arch. Debian and RPM packages share one release build from Ubuntu
+Toolport 2.0 ships the GTK shell as `toolport` for Ubuntu 24.04+, Debian 13+,
+Fedora 40+ (with the libraries below), and current Arch. Debian and RPM packages share one release build from Ubuntu
 24.04 x86_64, packaged with pinned nFPM and one
 [`nfpm.yaml`](../packaging/linux/native/nfpm.yaml). Runtime dependencies are
 listed for that build's GTK 4.14, libadwaita 1.5, GLib 2.80 and glibc 2.39 floor.
 Arch offers the native PKGBUILD and AUR `toolport-bin`, which repackages the GTK
 deb with Arch dependencies. The Tauri AppImage is still built on Ubuntu 22.04
 for older distributions and keeps its in-app updater.
+
+## Install
+
+```sh
+curl -fsSL https://toolport.app/install.sh | bash
+```
+
+On Ubuntu 24.04+ and Debian 13+ this installs the GTK `.deb` with apt. Ubuntu
+22.04 and Debian 12 automatically get the Tauri AppImage with a short explanation.
+Ubuntu derivatives use their reported Ubuntu base version; other Debian
+derivatives use apt's available library versions. If compatibility cannot be
+established, the installer chooses AppImage. Current Arch and its derivatives
+keep the signed pacman repository route.
+
+The installer uses AppImage on RPM distributions. To install GTK manually, the
+RPM requires GTK 4.14+, libadwaita 1.5+, GLib 2.80+ and glibc 2.39+, as available
+on Fedora 40+. Older Fedora and RHEL 9 use AppImage; other RPM systems must meet
+all four library floors before using the RPM. There is no automatic RPM install.
+
+To inspect the installer's selection without network access or changes, download
+it from [the pinned installer URL](https://toolport.app/install.sh), then run
+`bash install.sh --print-plan`.
+
+For a manual portable install, download `Toolport_<version>_amd64.AppImage` from
+[Releases](https://github.com/btsouth/toolport/releases), run
+`chmod +x Toolport*.AppImage`, then run the file. The installer places this build
+at `~/.local/bin/toolport` (or `$XDG_BIN_HOME/toolport`) and adds a desktop entry.
+If the AppImage reports missing FUSE support, install `libfuse2` on Ubuntu 22.04
+or Debian 12. This is the Tauri shell with its in-app updater. GTK packages use system package updates or
+manual downloads and do not check for updates in the app.
 
 The `.deb` keeps the 1.x Tauri package name `toolport`. Its higher 2.0 version
 causes an ordinary apt upgrade to replace 1.x without `Conflicts` or `Replaces`
