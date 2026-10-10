@@ -82,7 +82,9 @@ pub(crate) fn remove() -> Result<Vec<Leftover>, String> {
         };
     }
     let result = remove_owned(
-        unsafe { std::slice::from_raw_parts(entries, count as usize) },
+        unsafe { std::slice::from_raw_parts(entries, count as usize) }
+            .iter()
+            .copied(),
         |entry| {
             let entry = unsafe { &**entry };
             let target = unsafe { string(entry.TargetName) };
