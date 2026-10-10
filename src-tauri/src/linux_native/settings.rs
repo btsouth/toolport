@@ -1810,9 +1810,7 @@ fn read_quarantined_tools() -> Result<Vec<QuarantinedTool>, String> {
         .collect())
 }
 
-/// The one-line security stance, mirroring the shipping card: a hard gate
-/// (human approval, destructive deny, or injection block) reads as guarded;
-/// softer measures alone read as partial; nothing reads as open.
+/// Describe the effective policy, including the team's enforced level.
 fn posture_summary(settings: &crate::registry_controller::EssentialSettings) -> (String, bool) {
     use crate::registry::SafetyLevel;
     let (mut line, guarded) = match settings.safety_level {
@@ -2476,6 +2474,7 @@ mod tests {
     #[test]
     fn posture_describes_the_effective_level_without_an_alarm_for_off() {
         let mut settings = crate::registry_controller::EssentialSettings::default();
+        settings.safety_level = crate::registry::SafetyLevel::Off;
         let (line, guarded) = posture_summary(&settings);
         assert!(line.starts_with("Safety is set to Off."));
         assert!(line.contains("Server sign-in and client permissions"));
