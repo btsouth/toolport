@@ -956,3 +956,21 @@ it("shows an offline result with the last successful sync, and sign-in for a tea
   expect(screen.getByRole("button", { name: "Sign in" })).toBeVisible();
   expect(screen.queryByText(/None declared/)).not.toBeInTheDocument();
 });
+
+it("does not show another team's successful sync time after switching teams", async () => {
+  api.teamSyncStatus.mockResolvedValueOnce({
+    state: "synced",
+    lastSuccessMs: 1791504000000,
+  });
+  const view = render(<TeamsView registry={registry} onRegistryChange={vi.fn()} />);
+  await screen.findByText("Last sync succeeded");
+  api.teamSyncStatus.mockRejectedValueOnce(new Error("status unavailable"));
+  view.rerender(
+    <TeamsView
+      registry={{ ...registry, team: { ...registry.team!, teamId: "other-team" } }}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  expect(screen.queryByText("Last sync succeeded")).not.toBeInTheDocument();
+  await screen.findByText("Last successful sync: not recorded yet");
+});
