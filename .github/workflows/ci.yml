@@ -18,7 +18,7 @@ permissions:
 jobs:
   windows-installer:
     name: Windows NSIS bundle validation
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -38,13 +38,13 @@ jobs:
       - run: npm ci
       # Same bundle command as Release; artifacts stay in CI and are not published.
       - name: Build the real NSIS installer
-        run: npx tauri build --config src-tauri/tauri.bundle.conf.json --bundles nsis -- --bin conduit
+        run: npx tauri build --config src-tauri/tauri.bundle.conf.json --bundles nsis,msi -- --bin conduit
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       - name: Check shipped contents
         shell: bash
-        run: node .github/scripts/package-contents.mjs src-tauri/target/release/bundle/nsis/*-setup.exe
+        run: node .github/scripts/package-contents.mjs src-tauri/target/release/bundle/nsis/*-setup.exe src-tauri/target/release/bundle/msi/*.msi
       - name: Exercise the real installer and uninstaller
         shell: pwsh
         run: python scripts/test-windows-installer.py
@@ -55,6 +55,38 @@ jobs:
           path: |
             src-tauri/target/release/bundle/nsis/*-setup.exe*
             .verify/windows-installer/**
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-payload:
+    name: macOS app payload validation
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+          key: macos-payload
+          cache-bin: "false"
+          save-if: false
+      - run: npm ci
+      - name: Build the app without release signing or publishing
+        run: npx tauri build --config src-tauri/tauri.bundle.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --bundles app -- --bin conduit
+      - name: Check every app bundle file
+        run: node .github/scripts/package-contents.mjs src-tauri/target/release/bundle/macos/*.app
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-payload
+          path: src-tauri/target/release/bundle/macos/*.app
           if-no-files-found: error
           retention-days: 7
 

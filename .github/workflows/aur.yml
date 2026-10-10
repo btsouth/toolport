@@ -145,6 +145,7 @@ jobs:
             done
             grep -q "^usr/share/applications/" contents.txt || { echo "::error::no .desktop file in $pkg"; exit 1; }
           '
+          node .github/scripts/package-contents.mjs aur/*.pkg.tar.zst
           # Line order in .SRCINFO carries no meaning, so compare sorted: this is
           # asking "does the renderer say the same thing makepkg would", not
           # "did it emit the bytes in the same sequence".

@@ -1,5 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { assertManifest } from "./package-manifest.mjs";
 import process from "node:process";
 import console from "node:console";
 import { pathToFileURL } from "node:url";
@@ -76,6 +78,30 @@ export function listContents(file) {
   if (file.endsWith(".rpm")) return run("rpm", ["-qlp", file]).split(/\r?\n/);
   if (/\.(?:tar\.gz|pkg\.tar\.zst)$/.test(file))
     return run("tar", ["-tf", file]).split(/\r?\n/);
+  if (file.endsWith(".app")) {
+    const entries = [];
+    const walk = (directory) => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const path = join(directory, entry.name);
+        entries.push(path);
+        if (entry.isDirectory()) walk(path);
+      }
+    };
+    if (!statSync(file).isDirectory()) throw new Error("App bundle is not a directory");
+    walk(file);
+    return entries;
+  }
+  if (file.endsWith(".msi")) {
+    return JSON.parse(
+      run("powershell", [
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        ".github/scripts/list-msi.ps1",
+        file,
+      ]),
+    );
+  }
   if (file.endsWith(".exe"))
     return run("7z", ["l", "-slt", file])
       .split(/\r?\n/)
@@ -94,7 +120,9 @@ export function listContents(file) {
     const mount = `${process.env.RUNNER_TEMP}/toolport-payload-${process.pid}`;
     run("hdiutil", ["attach", "-readonly", "-nobrowse", "-mountpoint", mount, file]);
     try {
-      return run("find", [mount, "-type", "f"]).split(/\r?\n/);
+      return run("find", [mount, "-type", "f"])
+        .split(/\r?\n/)
+        .map((path) => path.slice(mount.length + 1));
     } finally {
       run("hdiutil", ["detach", mount]);
     }
@@ -109,6 +137,20 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       throw new Error(`Gateway missing: ${file}`);
     console.log(`${file}\n${paths.join("\n")}`);
     assertContents(paths, { nsisInstaller: file.endsWith(".exe") });
-    console.log(`PASS: ${file} contains only intended app binaries`);
+    const kind = file.endsWith(".exe")
+      ? "nsis"
+      : file.endsWith(".msi")
+        ? "msi"
+        : file.endsWith(".AppImage")
+          ? "appimage"
+          : /\.(?:app|dmg|tar\.gz)$/.test(file)
+            ? "mac"
+            : file.endsWith(".pkg.tar.zst")
+              ? "pacman"
+              : paths.some((path) => path.endsWith("/toolport-gtk"))
+                ? "native"
+                : "tauri-deb";
+    assertManifest(paths, kind);
+    console.log(`PASS: ${file} matches the ${kind} payload manifest`);
   }
 }

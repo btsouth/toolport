@@ -167,3 +167,35 @@ test("AppImage offset skips runtime magic and rejects truncated filesystems", ()
   bytes.writeBigUInt64LE(1024n, offset + 40);
   assert.equal(appImageOffset(bytes), -1);
 });
+
+test("complete payload manifests reject extra resources and require both binaries", async () => {
+  const { assertManifest } = await import("./package-manifest.mjs");
+  for (const [kind, files] of [
+    ["native", ["./usr/bin/toolport-gtk", "./usr/bin/toolport-gateway"]],
+    ["pacman", ["usr/bin/toolport-gtk", "usr/bin/toolport-gateway", ".PKGINFO"]],
+    [
+      "mac",
+      [
+        "Toolport.app/Contents/MacOS/conduit",
+        "Toolport.app/Contents/MacOS/toolport-gateway",
+      ],
+    ],
+    ["nsis", ["conduit.exe", "toolport-gateway.exe"]],
+    ["msi", ["conduit.exe", "toolport-gateway.exe"]],
+    [
+      "appimage",
+      ["squashfs-root/usr/bin/conduit", "squashfs-root/usr/bin/toolport-gateway"],
+    ],
+  ]) {
+    assertManifest(files, kind);
+    assert.throws(() => assertManifest(files.slice(0, 1), kind), /Missing intended/);
+    assert.throws(
+      () => assertManifest([...files, "unexpected-notes.txt"], kind),
+      /Unexpected/,
+    );
+    assert.throws(
+      () => assertManifest([...files, "mock-mcp-server"], kind),
+      /Test artifact/,
+    );
+  }
+});
