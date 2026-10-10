@@ -135,6 +135,7 @@ export function ServerDialog({
       ]) ?? [],
     ),
   );
+  const [localOnly, setLocalOnly] = useState(initial?.syncLocalOnly === true);
   const [bindingCleared, setBindingCleared] = useState(false);
   const [touched, setTouched] = useState<Set<string>>(() => new Set());
   const [pasteReview, setPasteReview] = useState<ParsedSnippetServer[] | null>(null);
@@ -178,6 +179,7 @@ export function ServerDialog({
     }
     if (next) {
       setPartialEdit(null);
+      setLocalOnly(initial?.syncLocalOnly === true);
       setForm({
         name: initial?.name ?? "",
         transport: (initial?.transport ?? "stdio") as Transport,
@@ -297,6 +299,7 @@ export function ServerDialog({
       ...(editing ? initial : undefined),
       id: currentEditId ?? "",
       enabled: initial?.enabled ?? false,
+      syncLocalOnly: localOnly,
       name: form.name.trim(),
       transport: form.transport,
       command: isStdio ? form.command.trim() || null : null,
@@ -580,6 +583,16 @@ export function ServerDialog({
 
         <div className="flex flex-col gap-4 py-2">
           <div className="flex flex-col gap-2">
+            {!editing && (
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={localOnly}
+                  onChange={(e) => setLocalOnly(e.target.checked)}
+                />
+                This machine only
+              </label>
+            )}
             <Label htmlFor="srv-name">Name</Label>
             <Input
               id="srv-name"

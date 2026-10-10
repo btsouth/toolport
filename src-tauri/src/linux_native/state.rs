@@ -596,6 +596,18 @@ impl RegistrySnapshot {
                     origin_label: if crate::personal_sync::is_personal(&registry) {
                         if crate::personal_sync::keep_local(server) {
                             "This machine only".into()
+                        } else if crate::personal_sync::state(&registry).is_ok_and(|st| {
+                            st.conflicts.contains_key(
+                                server
+                                    .unknown_fields
+                                    .get("teamOriginalId")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or(&server.id),
+                            )
+                        }) {
+                            "Sync conflict".into()
+                        } else if server.needs_team_enable_review() {
+                            "Needs review".into()
                         } else {
                             "Synced".into()
                         }
@@ -656,7 +668,13 @@ impl RegistrySnapshot {
                             crate::secret_refs::headers(server)
                                 .unwrap_or_default()
                                 .into_iter()
-                                .map(|h| if h.source.is_some() { h.key } else { h.env.unwrap_or(h.key) }),
+                                .map(|h| {
+                                    if h.source.is_some() {
+                                        h.key
+                                    } else {
+                                        h.env.unwrap_or(h.key)
+                                    }
+                                }),
                         )
                         .collect(),
                     client_credentials: server.client_credentials.as_ref().map(|credentials| {
@@ -701,7 +719,8 @@ impl RegistrySnapshot {
 fn probe_fingerprint(server: &crate::registry::ServerEntry) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    serde_json::to_string(server)
+    serde_json::to_value(server)
+        .map(|v| v.to_string())
         .unwrap_or_default()
         .hash(&mut hasher);
     hasher.finish()
@@ -1054,10 +1073,10 @@ mod tests {
             .unknown_fields
             .insert("teamRouteRemoved".into(), serde_json::json!(true));
         registry.servers.push(personal);
-        assert!(
-            RegistrySnapshot::from_registry(registry.clone()).servers[0].team_route_removed
-        );
-        registry.set_global_server_enabled("personal", true).unwrap();
+        assert!(RegistrySnapshot::from_registry(registry.clone()).servers[0].team_route_removed);
+        registry
+            .set_global_server_enabled("personal", true)
+            .unwrap();
         assert!(!RegistrySnapshot::from_registry(registry).servers[0].team_route_removed);
     }
 

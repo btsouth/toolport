@@ -39,7 +39,7 @@ export function accountStatusText(status: AccountStatus, now = Date.now()): stri
     lines.push(
       status.freeSyncGraceEndsAt > now
         ? `Every device keeps syncing until ${new Date(status.freeSyncGraceEndsAt).toLocaleString()}`
-        : "Sync grace period ended. Choose your active Free device in Your account.",
+        : "Sync grace period ended.",
     );
   if (!status.canReceiveConfig)
     lines.push(
@@ -47,5 +47,11 @@ export function accountStatusText(status: AccountStatus, now = Date.now()): stri
         "This device cannot receive your setup. Choose your active device in Your account.",
     );
   return lines;
+}
+export function syncSignInUrl(origin: string): string {
+  const url = new URL(origin.trim());
+  url.search = "intent=pro&from=app-sync";
+  url.hash = "";
+  return url.toString();
 }
 export const SYNC_SIGN_IN_URL = "https://teams.toolport.app/?intent=pro&from=app-sync";

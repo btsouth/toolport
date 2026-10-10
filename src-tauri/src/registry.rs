@@ -866,7 +866,8 @@ impl ServerEntry {
             return true;
         }
         if self.unknown_fields.get("personalSyncEntry") == Some(&serde_json::Value::Bool(true)) {
-            return self.unknown_fields.get("teamEnableReview") == Some(&serde_json::Value::Bool(true));
+            return self.unknown_fields.get("teamEnableReview")
+                == Some(&serde_json::Value::Bool(true));
         }
         let Some(src) = self.source.as_deref() else {
             return false;
@@ -2228,6 +2229,8 @@ impl Registry {
 
     pub fn access_upgrade_notice_pending(&self) -> bool {
         self.version >= 3
+            && self.unknown_fields.get("accessUpgradeNoticePending")
+                == Some(&serde_json::Value::Bool(true))
             && self.unknown_fields.get("accessUpgradeNoticeDismissed")
                 != Some(&serde_json::Value::Bool(true))
     }
@@ -4464,8 +4467,16 @@ pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
     validate_server_launches(registry)?;
     let mut registry = registry.clone();
     registry.sync_legacy_safety_mirror();
-    let json = serde_json::to_string_pretty(&registry).map_err(|e| e.to_string())?;
+    if let Some(state) = registry
+        .team
+        .as_mut()
+        .and_then(|t| t.unknown_fields.get_mut("personalSyncState"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        state.remove("lastSyncedAt");
+    }
     let value = serde_json::to_value(&registry).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
     write_registry_document(path, &json, &value)
 }
 
@@ -4561,7 +4572,9 @@ fn write_registry_document(
 }
 
 pub fn load() -> Result<Registry, String> {
-    load_resolved()
+    let mut registry = load_resolved()?;
+    crate::personal_sync::attach_status(&mut registry);
+    Ok(registry)
 }
 
 pub fn save(registry: &Registry) -> Result<(), String> {
@@ -6822,7 +6835,6 @@ pub(crate) mod tests {
             }
             std::fs::rename(from, to)
         }
-
     }
 
     fn atomic_temp_files(path: &Path) -> Vec<PathBuf> {

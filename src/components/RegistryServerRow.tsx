@@ -203,7 +203,13 @@ export function RegistryServerRow({
             {personalSync
               ? server.syncLocalOnly
                 ? "This machine only"
-                : "Synced"
+                : registry?.team?.personalSyncState?.conflicts?.[
+                      server.teamOriginalId ?? server.id
+                    ]
+                  ? "Sync conflict"
+                  : server.teamEnableReview === true
+                    ? "Needs review"
+                    : "Synced"
               : "Personal"}
             {server.source?.startsWith("imported:")
               ? ` · ${server.source.replace("imported:", "from ")}`
@@ -419,6 +425,9 @@ export function RegistryServerRow({
                       }}
                     />{" "}
                     Keep on this machine only
+                    <span className="text-xs text-muted-foreground">
+                      Copies already on your other machines stay there.
+                    </span>
                   </label>
                 )}
                 {personalSync && (

@@ -159,23 +159,29 @@ impl TeamsPage {
                     Ok(Err(error)) => {
                         failures.set(failures.get().saturating_add(1));
                         *next_allowed.borrow_mut() = std::time::Instant::now()
-                            + std::time::Duration::from_secs(crate::teams::retry_delay_seconds(
-                                failures.get(),
-                            ));
+                            + std::time::Duration::from_secs(
+                                crate::registry::load()
+                                    .map(|r| crate::teams::sync_retry_seconds(&r, failures.get()))
+                                    .unwrap_or_else(|_| {
+                                        crate::teams::retry_delay_seconds(failures.get())
+                                    }),
+                            );
                         if page.root.is_mapped() {
-                            page.render_sync_failure(&error);
+                            page.refresh();
                         }
                     }
                     Err(_) => {
                         failures.set(failures.get().saturating_add(1));
                         *next_allowed.borrow_mut() = std::time::Instant::now()
-                            + std::time::Duration::from_secs(crate::teams::retry_delay_seconds(
-                                failures.get(),
-                            ));
-                        if page.root.is_mapped() {
-                            page.show_error(
-                                "team sync stopped unexpectedly; retrying automatically",
+                            + std::time::Duration::from_secs(
+                                crate::registry::load()
+                                    .map(|r| crate::teams::sync_retry_seconds(&r, failures.get()))
+                                    .unwrap_or_else(|_| {
+                                        crate::teams::retry_delay_seconds(failures.get())
+                                    }),
                             );
+                        if page.root.is_mapped() {
+                            page.show_error("Sync stopped unexpectedly; retrying automatically");
                         }
                     }
                 }
@@ -219,11 +225,30 @@ impl TeamsPage {
             .set_label(if personal { "Sync" } else { "Teams" });
         self.heading
             .set_label(if personal { "Sync" } else { "Teams" });
-        self.plan_badge.set_visible(registry.team.is_none());
+        self.plan_badge.set_visible(false);
         self.intro.set_label(if personal { "Set up once. Your servers follow you to every machine. Secret values and approvals stay on this machine." } else { "One shared server set, governed by your team. Credentials stay on each machine." });
         let notice = self.sync_notice.borrow_mut().take();
+        let mut display = serde_json::to_value(&registry).unwrap_or_default();
+        if let Some(st) = display
+            .pointer_mut("/team/personalSyncState")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            st.remove("lastSyncedAt");
+        }
         let render_state = (
-            serde_json::to_string(&registry).unwrap_or_default(),
+            format!(
+                "{}{:?}",
+                display,
+                registry
+                    .team
+                    .as_ref()
+                    .map(|t| crate::personal_sync::status_lines(
+                        &t.unknown_fields["accountStatus"],
+                        crate::personal_sync::state(&registry)
+                            .ok()
+                            .and_then(|s| s.last_synced_at)
+                    ))
+            ),
             self.pending.borrow().is_some(),
         );
         if notice.is_none() && self.rendered_state.borrow().as_ref() == Some(&render_state) {
@@ -235,7 +260,7 @@ impl TeamsPage {
                 return;
             }
             if registry.team.is_some() {
-                self.render_sync_status();
+                self.show_sync_status(&registry);
             } else if self.pending.borrow().is_some() {
                 self.set_status("Waiting for invitation approval.", false);
                 self.feedback.remove_css_class("success");
@@ -251,7 +276,9 @@ impl TeamsPage {
         }
         if let Some((notice, is_error)) = notice {
             self.set_status(&notice, is_error);
-            if !is_error { self.feedback.add_css_class("success"); }
+            if !is_error {
+                self.feedback.add_css_class("success");
+            }
             if let Some(team) = registry.team.clone() {
                 self.render_connected(registry, team);
             } else {
@@ -260,7 +287,7 @@ impl TeamsPage {
             return;
         }
         if let Some(team) = registry.team.clone() {
-            self.render_sync_status();
+            self.show_sync_status(&registry);
             self.render_connected(registry, team);
         } else {
             self.feedback.remove_css_class("success");
@@ -276,6 +303,16 @@ impl TeamsPage {
         }
     }
 
+    fn show_sync_status(&self, registry: &crate::registry::Registry) {
+        if !crate::personal_sync::is_personal(registry) { self.render_sync_status(); return; }
+        let (message, healthy) = crate::personal_sync::banner(registry);
+        self.set_status(&message, false);
+        if healthy {
+            self.feedback.add_css_class("success");
+        } else {
+            self.feedback.remove_css_class("success");
+        }
+    }
     fn render_join(&self) {
         if self.pending.borrow().is_some() {
             let cancel = gtk::Button::with_label("Cancel request");
@@ -289,10 +326,7 @@ impl TeamsPage {
         }
         let sign_in = gtk::Button::with_label("Sign in to sync");
         sign_in.add_css_class("suggested-action");
-        sign_in.connect_clicked(|_| {
-            let _ =
-                crate::oauth::open_web_url("https://teams.toolport.app/?intent=pro&from=app-sync");
-        });
+
         self.content.append(&sign_in);
         self.content.append(
             &gtk::Label::builder()
@@ -307,6 +341,12 @@ impl TeamsPage {
         let url = gtk::Entry::builder()
             .text(crate::teams::HOSTED_TEAMS_URL)
             .build();
+        let url_for_sign_in = url.clone();
+        sign_in.connect_clicked(move |_| {
+            if let Ok(origin) = crate::teams::sync_sign_in_url(url_for_sign_in.text().as_str()) {
+                let _ = crate::oauth::open_web_url(&origin);
+            }
+        });
         let code = gtk::PasswordEntry::builder()
             .placeholder_text("Manual code")
             .show_peek_icon(true)
@@ -336,8 +376,18 @@ impl TeamsPage {
         registry: crate::registry::Registry,
         team: crate::registry::TeamConnection,
     ) {
-        if let Some(error) = team.unknown_fields.get("accountStatusError").and_then(serde_json::Value::as_str) {
-            self.content.append(&gtk::Label::builder().label(error).wrap(true).xalign(0.0).build());
+        if let Some(error) = team
+            .unknown_fields
+            .get("accountStatusError")
+            .and_then(serde_json::Value::as_str)
+        {
+            self.content.append(
+                &gtk::Label::builder()
+                    .label(error)
+                    .wrap(true)
+                    .xalign(0.0)
+                    .build(),
+            );
         }
         if crate::personal_sync::is_personal(&registry) {
             self.render_personal(registry, team);
@@ -525,52 +575,86 @@ impl TeamsPage {
             let choices = gtk::Box::new(gtk::Orientation::Vertical, 8);
             choices.add_css_class("toolport-card");
             choices.append(&gtk::Label::builder().label("Choose local servers to sync. Your account now has one person. Existing local servers stay on this machine unless selected.").wrap(true).xalign(0.0).build());
-            for server in registry.servers.iter().filter(|s| !s.source.as_deref().unwrap_or("").starts_with("team:")) {
-                let choice = gtk::CheckButton::with_label(&crate::personal_sync::visible_text(&server.name));
+            for server in registry
+                .servers
+                .iter()
+                .filter(|s| !s.source.as_deref().unwrap_or("").starts_with("team:"))
+            {
+                let choice =
+                    gtk::CheckButton::with_label(&crate::personal_sync::visible_text(&server.name));
                 choice.set_active(!crate::personal_sync::keep_local(server));
                 let id = server.id.clone();
                 let page = self.clone();
                 choice.connect_toggled(move |button| {
-                    let id = id.clone(); let page = page.clone(); let local = !button.is_active();
+                    let id = id.clone();
+                    let page = page.clone();
+                    let local = !button.is_active();
                     gtk::glib::spawn_future_local(async move {
-                        match gtk::gio::spawn_blocking(move || crate::personal_sync::set_local_only(&id, local)).await {
-                            Ok(Ok(_)) => page.refresh(), Ok(Err(e)) => page.show_error(&e), Err(_) => page.show_error("Could not save sync choice"),
+                        match gtk::gio::spawn_blocking(move || {
+                            crate::personal_sync::set_local_only(&id, local)
+                        })
+                        .await
+                        {
+                            Ok(Ok(_)) => page.refresh(),
+                            Ok(Err(e)) => page.show_error(&e),
+                            Err(_) => page.show_error("Could not save sync choice"),
                         }
                     });
                 });
                 choices.append(&choice);
             }
-            let done = gtk::Button::with_label("Done"); let page = self.clone();
-            done.connect_clicked(move |_| { let page = page.clone(); gtk::glib::spawn_future_local(async move {
-                match gtk::gio::spawn_blocking(crate::personal_sync::finish_local_selection).await {
-                    Ok(Ok(_)) => page.refresh(), Ok(Err(e)) => page.show_error(&e), Err(_) => page.show_error("Could not finish sync selection"),
-                }
-            }); });
-            choices.append(&done); self.content.append(&choices);
+            let done = gtk::Button::with_label("Done");
+            let page = self.clone();
+            done.connect_clicked(move |_| {
+                let page = page.clone();
+                gtk::glib::spawn_future_local(async move {
+                    match gtk::gio::spawn_blocking(crate::personal_sync::finish_local_selection)
+                        .await
+                    {
+                        Ok(Ok(_)) => page.refresh(),
+                        Ok(Err(e)) => page.show_error(&e),
+                        Err(_) => page.show_error("Could not finish sync selection"),
+                    }
+                });
+            });
+            choices.append(&done);
+            self.content.append(&choices);
         }
         for (id, error) in &sync.publish_errors {
-            self.content.append(&gtk::Label::builder().label(format!("{}: {error}", crate::personal_sync::visible_text(id))).wrap(true).xalign(0.0).build());
-        }
-        for (id, remote) in &sync.conflicts {
-            let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
-            row.add_css_class("toolport-card");
-            row.append(
+            self.content.append(
                 &gtk::Label::builder()
                     .label(format!(
-                        "{id} changed on both machines. Choose which version to keep."
+                        "{}: {error}",
+                        crate::personal_sync::visible_text(id)
                     ))
                     .wrap(true)
                     .xalign(0.0)
                     .build(),
             );
+        }
+        for (id, remote) in &sync.conflicts {
+            let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            row.add_css_class("toolport-card");
+            let local = sync.pending.get(id).and_then(|m| m.after.as_ref());
+            let name = registry
+                .servers
+                .iter()
+                .find(|s| sync.pending.get(id).is_some_and(|m| m.local_id == s.id))
+                .map(|s| s.name.as_str())
+                .or_else(|| remote["name"].as_str())
+                .unwrap_or(id);
             row.append(
                 &gtk::Label::builder()
-                    .label(serde_json::to_string_pretty(remote).unwrap_or_default())
-                    .selectable(true)
+                    .label(format!(
+                        "{} changed on both machines. Choose which version to keep.",
+                        crate::personal_sync::visible_text(name)
+                    ))
                     .wrap(true)
                     .xalign(0.0)
+                    .css_classes(["heading"])
                     .build(),
             );
+            row.append(&conflict_content(local, remote));
             for (keep, label) in [
                 (true, "Keep this machine's version"),
                 (false, "Use synced version"),
@@ -732,7 +816,7 @@ impl TeamsPage {
 
     fn sync(&self, button: gtk::Button) {
         button.set_sensitive(false);
-        self.feedback.set_label("Syncing team configuration…");
+        self.feedback.set_label("Syncing configuration…");
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(crate::teams::sync_now).await;
@@ -763,7 +847,8 @@ impl TeamsPage {
             }
             crate::teams::SyncResult::Ok { applied, .. } => {
                 let outcome = applied.map(|(_, outcome)| outcome).unwrap_or_default();
-                *self.sync_notice.borrow_mut() = team_review_line(outcome.review, outcome.blocked).map(|message| (message, true));
+                *self.sync_notice.borrow_mut() = team_review_line(outcome.review, outcome.blocked)
+                    .map(|message| (message, true));
             }
         }
         self.refresh();
@@ -1090,6 +1175,43 @@ fn field(label: &str, input: &impl IsA<gtk::Widget>) -> gtk::Box {
     root
 }
 
+fn conflict_content(local: Option<&serde_json::Value>, remote: &serde_json::Value) -> gtk::Box {
+    let grid = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    let left = crate::personal_sync::conflict_fields(local);
+    let right = crate::personal_sync::conflict_fields(Some(remote));
+    let keys: std::collections::BTreeSet<_> = left.keys().chain(right.keys()).collect();
+    for (title, fields) in [("This machine", &left), ("Other machine", &right)] {
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        column.set_hexpand(true);
+        column.append(
+            &gtk::Label::builder()
+                .label(title)
+                .xalign(0.0)
+                .css_classes(["heading"])
+                .build(),
+        );
+        for key in &keys {
+            let changed = left.get(*key) != right.get(*key);
+            let label = gtk::Label::builder()
+                .label(format!(
+                    "{}{key}: {}",
+                    if changed { "CHANGED: " } else { "" },
+                    fields.get(*key).map(String::as_str).unwrap_or("Not set")
+                ))
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::Word)
+                .selectable(true)
+                .xalign(0.0)
+                .build();
+            if changed {
+                label.add_css_class("warning");
+            }
+            column.append(&label);
+        }
+        grid.append(&column);
+    }
+    grid
+}
 fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> gtk::Box {
     if let Ok(registry) = crate::registry::load() {
         if registry.is_enabled(&registry.active_profile_id(), &server.id) {
@@ -1121,6 +1243,7 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
     copy.append(
         &gtk::Label::builder()
             .label(&target)
+            .wrap_mode(gtk::pango::WrapMode::Word)
             .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
@@ -1165,11 +1288,20 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
     }
     let already_enabled =
         crate::registry::load().is_ok_and(|r| r.is_enabled(&r.active_profile_id(), &server.id));
-    let enable = gtk::Button::with_label(if already_enabled {
-        "Enabled in this profile"
-    } else {
-        "Review and enable"
-    });
+    if already_enabled || !server.needs_team_enable_review() {
+        row.append(
+            &gtk::Label::builder()
+                .label(if already_enabled {
+                    "Enabled in this profile"
+                } else {
+                    "Turned off"
+                })
+                .css_classes(["toolport-muted"])
+                .build(),
+        );
+        return row;
+    }
+    let enable = gtk::Button::with_label("Review and enable");
     enable.set_valign(gtk::Align::Center);
     let held = server.unknown_fields.get("teamHeldChange") == Some(&serde_json::json!(true));
     if held {
@@ -1187,8 +1319,12 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
         let dialog = adw::MessageDialog::new(
             Some(&parent),
             Some(&format!("Enable {server_name}?")),
-            Some(&format!("{target}\n\nEnable only after verifying this definition and saved authentication. Credentials remain local.")),
+            Some("Enable only after verifying this definition and saved authentication. Credentials remain local."),
         );
+        dialog.set_size_request(620, -1);
+        let detail = gtk::Label::builder().label(&target).wrap(true).wrap_mode(gtk::pango::WrapMode::Word).selectable(true).xalign(0.0).build();
+        let scroll = gtk::ScrolledWindow::builder().min_content_height(180).max_content_height(400).propagate_natural_height(true).child(&detail).build();
+        dialog.set_extra_child(Some(&scroll));
         dialog.add_response("cancel", "Keep disabled");
         dialog.add_response("enable", "Enable");
         dialog.set_close_response("cancel");
@@ -1227,7 +1363,11 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
 /// how it relates to the team.
 fn share_choice_label(name: &str, keys: Option<String>, hint: Option<&str>) -> gtk::Box {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    let title = gtk::Label::builder().label(name).xalign(0.0).wrap(true).build();
+    let title = gtk::Label::builder()
+        .label(name)
+        .xalign(0.0)
+        .wrap(true)
+        .build();
     column.append(&title);
     for detail in keys.as_deref().into_iter().chain(hint) {
         let line = gtk::Label::builder()
@@ -1631,7 +1771,8 @@ mod tests {
     fn member_review_native_keeps_remaining_decisions_open() {
         adw::init().unwrap();
         let _lock = crate::registry::data_dir_test_lock();
-        let scratch = std::env::temp_dir().join(format!("toolport-native-queue-{}", std::process::id()));
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-native-queue-{}", std::process::id()));
         std::fs::create_dir_all(&scratch).unwrap();
         let _data = crate::registry::DataDirOverride::set(&scratch);
         let mut reg = crate::registry::Registry::default();
@@ -1668,8 +1809,12 @@ mod tests {
                 timeout_state.set(true)
             });
         let context = gtk::glib::MainContext::default();
-        while page.busy.get() && !timed_out.get() { context.iteration(true); }
-        if !timed_out.get() { timeout.remove(); }
+        while page.busy.get() && !timed_out.get() {
+            context.iteration(true);
+        }
+        if !timed_out.get() {
+            timeout.remove();
+        }
         assert!(!timed_out.get(), "native member decision did not finish");
         assert!(dialog.is_visible(), "remaining decisions must stay open");
         let mut text = String::new();
@@ -1733,10 +1878,23 @@ mod tests {
 
     #[test]
     fn the_confirm_action_matches_what_the_share_will_do() {
-        let switch = selection("Linear", "Already shared", HandoffOutcome::Switched, "switches");
+        let switch = selection(
+            "Linear",
+            "Already shared",
+            HandoffOutcome::Switched,
+            "switches",
+        );
         let kept = selection("Linear", "Already shared", HandoffOutcome::Kept, "keeps");
-        let blocked = selection("Vercel", "Already shared", HandoffOutcome::Attention, "needs setup");
-        assert_eq!(share_action(&selection_preview(vec![switch.clone(), blocked.clone()])), Some("Use Team copies"));
+        let blocked = selection(
+            "Vercel",
+            "Already shared",
+            HandoffOutcome::Attention,
+            "needs setup",
+        );
+        assert_eq!(
+            share_action(&selection_preview(vec![switch.clone(), blocked.clone()])),
+            Some("Use Team copies")
+        );
         assert_eq!(share_action(&selection_preview(vec![kept, blocked])), None);
         let mut update = selection_preview(vec![switch]);
         update.changed = vec!["Linear".into()];
@@ -1760,7 +1918,10 @@ mod tests {
             same_name,
             selection("Vercel (Full API)", "Already shared", HandoffOutcome::Attention, "This team copy already has its own local credentials. Keep its existing setup and enable it separately. Your personal server stays on in this profile."),
         ]);
-        let parent = gtk::Window::builder().default_width(1000).default_height(760).build();
+        let parent = gtk::Window::builder()
+            .default_width(1000)
+            .default_height(760)
+            .build();
         parent.present();
         let dialog = share_preview_dialog(&parent, &preview);
         let mut text = String::new();
@@ -1786,10 +1947,17 @@ mod tests {
         }
         dialog.close();
 
-        let picker = share_choice_label("Linear", None, Some("Shared. The Team copy is in use in this profile."));
+        let picker = share_choice_label(
+            "Linear",
+            None,
+            Some("Shared. The Team copy is in use in this profile."),
+        );
         let mut text = String::new();
         collect(picker.upcast_ref(), &mut text);
-        assert_eq!(text, "Linear\nShared. The Team copy is in use in this profile.\n");
+        assert_eq!(
+            text,
+            "Linear\nShared. The Team copy is in use in this profile.\n"
+        );
         parent.close();
     }
 

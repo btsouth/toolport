@@ -9,13 +9,88 @@ import {
   getRegistry,
 } from "@/lib/api";
 import { HOSTED_TEAMS_URL, teamUrlError } from "@/lib/teamUrl";
-import { accountStatusText, SYNC_SIGN_IN_URL } from "@/lib/personalSync";
+import { accountStatusText, syncSignInUrl } from "@/lib/personalSync";
 import { PRO_LINE, TEAMS_FREE_LINE } from "@/lib/teamsPlan";
 import { openExternal } from "@/lib/openUrl";
+import { visibleExecutionText as visibleText } from "@/lib/executionReview";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Callout } from "./Callout";
 
+function conflictFields(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object") return { Server: "Removed" };
+  const v = value as Record<string, unknown>;
+  const fields: Record<string, string> = {};
+  for (const [key, label] of Object.entries({
+    name: "Name",
+    transport: "Transport",
+    command: "Command",
+    cwd: "Working directory",
+    url: "URL",
+    disabled: "Disabled",
+    requestTimeoutMs: "Request timeout",
+    initializeTimeoutMs: "Startup timeout",
+    disabledTools: "Disabled tools",
+  })) {
+    if (v[key] != null) fields[label] = visibleText(String(v[key]));
+  }
+  if (Array.isArray(v.args))
+    v.args.forEach((arg, i) => {
+      fields[`Argument ${i + 1}`] = visibleText(String(arg));
+    });
+  for (const [label, rows] of [
+    ["Environment", v.env],
+    ["Launch input", (v.launch as { inputs?: unknown[] } | undefined)?.inputs],
+    ["Header", v.headerKeys],
+  ] as const) {
+    if (Array.isArray(rows))
+      for (const row of rows as {
+        key: string;
+        value?: unknown;
+        secret?: boolean;
+        source?: { ref: string };
+      }[])
+        fields[`${label}: ${visibleText(row.key)}`] = row.secret
+          ? "<masked secret>"
+          : row.source
+            ? `Reference: ${visibleText(row.source.ref)}`
+            : visibleText(String(row.value ?? "Not set"));
+  }
+  return fields;
+}
+function ConflictVersions({ local, remote }: { local: unknown; remote: unknown }) {
+  const left = conflictFields(local),
+    right = conflictFields(remote);
+  const keys = [...new Set([...Object.keys(left), ...Object.keys(right)])];
+  return (
+    <div className="grid gap-4 sm:grid-cols-2">
+      {[
+        ["This machine", left],
+        ["Other machine", right],
+      ].map(([title, fields]) => (
+        <div key={String(title)}>
+          <h4 className="font-medium">{String(title)}</h4>
+          <dl className="text-sm">
+            {keys.map((key) => (
+              <div
+                key={key}
+                className={left[key] !== right[key] ? "bg-amber-500/10" : ""}
+              >
+                <dt>
+                  {left[key] !== right[key] ? "CHANGED: " : ""}
+                  {key}
+                </dt>
+                <dd className="whitespace-pre-wrap">
+                  {(fields as Record<string, string>)[key] ?? "Not set"}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      ))}
+    </div>
+  );
+}
 export function PersonalSyncView({
   registry,
   onRegistryChange,
@@ -85,7 +160,13 @@ export function PersonalSyncView({
       {!team ? (
         <>
           <Button
-            onClick={() => void run(() => openExternal(SYNC_SIGN_IN_URL))}
+            onClick={() =>
+              void run(() => {
+                const invalid = teamUrlError(url);
+                if (invalid) throw new Error(invalid);
+                return openExternal(syncSignInUrl(url));
+              })
+            }
             disabled={busy}
           >
             Sign in to sync
@@ -262,9 +343,7 @@ export function PersonalSyncView({
                 Choose which version to keep. Your local version is saved until you
                 choose.
               </p>
-              <pre className="max-h-48 overflow-auto text-xs">
-                {JSON.stringify(remote, null, 2)}
-              </pre>
+              <ConflictVersions local={sync?.pending?.[id]?.after} remote={remote} />
               {[true, false].map((keepMine) => (
                 <Button
                   key={String(keepMine)}

@@ -79,7 +79,14 @@ pub(super) fn request(hooks: PairingHooks, origin: &str, pair: PairFn) {
         pending: RefCell::new(None),
     });
     CURRENT.with(|current| *current.borrow_mut() = Some(Rc::clone(&attempt)));
-    let dialog = adw::MessageDialog::new(Some(&parent), Some("Sign in to sync?"), Some(&format!("Control plane: {origin}\n\nOnly continue if you trust this origin. Your browser will show your account and the setup before approval. Signing in replaces this installation's current sync connection.")));
+    let dialog = adw::MessageDialog::new(
+        Some(&parent),
+        Some("Sign in to sync?"),
+        Some(&crate::teams::pairing_confirm_copy(
+            origin,
+            crate::registry::load().is_ok_and(|r| r.team.is_some()),
+        )),
+    );
     dialog.set_size_request(520, -1);
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("connect", "Continue to browser");

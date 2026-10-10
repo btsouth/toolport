@@ -12,14 +12,18 @@ const HANDOVER_LIMIT: Duration = Duration::from_secs(5);
 struct Executable {
     device: u64,
     inode: u64,
+    build_stamp: Option<u64>,
 }
 
 impl Executable {
     fn read(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
-        let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+        let metadata = std::fs::metadata(path.as_ref()).map_err(|error| error.to_string())?;
+        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        let build_stamp = read_build_stamp(&bytes);
         Ok(Self {
             device: metadata.dev(),
             inode: metadata.ino(),
+            build_stamp,
         })
     }
 }
@@ -29,9 +33,44 @@ fn needs_handover(current: &Executable, running: &Executable, uid: u32) -> Resul
     if uid != unsafe { libc::geteuid() } {
         return Err("The running Toolport belongs to another user.".into());
     }
-    Ok(current != running)
+    Ok(current.device != running.device || current.inode != running.inode).map(|different| {
+        different
+            && current
+                .build_stamp
+                .zip(running.build_stamp)
+                .is_some_and(|(new, old)| new > old)
+    })
 }
 
+fn read_build_stamp(bytes: &[u8]) -> Option<u64> {
+    let marker = b"TOOLPORT_BUILD_STAMP:";
+    bytes
+        .windows(marker.len())
+        .enumerate()
+        .filter(|(_, w)| *w == marker)
+        .filter_map(|(at, _)| {
+            let digits: Vec<_> = bytes[at + marker.len()..]
+                .iter()
+                .copied()
+                .take_while(u8::is_ascii_digit)
+                .collect();
+            std::str::from_utf8(&digits).ok()?.parse().ok()
+        })
+        .max()
+}
+pub(super) fn information(args: &[String]) -> Option<String> {
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        return Some(format!(
+            "Toolport {}\n{}",
+            env!("CARGO_PKG_VERSION"),
+            env!("TOOLPORT_BUILD_STAMP")
+        ));
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return Some("Usage: toolport-gtk [--hidden] [toolport://URL]\n  --hidden    Start in the tray\n  --version   Print the version and exit\n  --help      Print this help and exit".into());
+    }
+    None
+}
 fn remaining(deadline: Instant) -> Result<i32, String> {
     let remaining = deadline
         .saturating_duration_since(Instant::now())
@@ -246,6 +285,7 @@ mod tests {
         let image = Executable {
             device: 1,
             inode: 2,
+            build_stamp: Some(1),
         };
         assert_eq!(
             needs_handover(&image, &image, unsafe { libc::geteuid() }),
@@ -254,14 +294,16 @@ mod tests {
     }
 
     #[test]
-    fn replaced_executable_hands_over_even_at_same_path_and_version() {
+    fn newer_build_hands_over_even_at_same_path_and_version() {
         let current = Executable {
             device: 1,
             inode: 3,
+            build_stamp: Some(2),
         };
         let deleted = Executable {
             device: 1,
             inode: 2,
+            build_stamp: Some(1),
         };
         assert_eq!(
             needs_handover(&current, &deleted, unsafe { libc::geteuid() }),
@@ -270,22 +312,52 @@ mod tests {
         let other_device = Executable {
             device: 2,
             inode: 3,
+            build_stamp: Some(2),
         };
         assert_eq!(
             needs_handover(&current, &other_device, unsafe { libc::geteuid() }),
-            Ok(true)
+            Ok(false)
         );
     }
 
+    #[test]
+    fn help_version_and_older_or_unknown_builds_never_handover() {
+        for flag in ["--help", "-h", "--version", "-V"] {
+            assert!(information(&["toolport-gtk".into(), flag.into()]).is_some());
+        }
+        assert!(information(&["toolport-gtk".into(), "--hidden".into()]).is_none());
+        assert_eq!(
+            read_build_stamp(b"text TOOLPORT_BUILD_STAMP:123 end"),
+            Some(123)
+        );
+        let current = Executable {
+            device: 1,
+            inode: 3,
+            build_stamp: Some(2),
+        };
+        for stamp in [None, Some(2), Some(3)] {
+            let running = Executable {
+                device: 1,
+                inode: 2,
+                build_stamp: stamp,
+            };
+            assert_eq!(
+                needs_handover(&current, &running, unsafe { libc::geteuid() }),
+                Ok(false)
+            );
+        }
+    }
     #[test]
     fn another_user_is_never_retired() {
         let current = Executable {
             device: 1,
             inode: 3,
+            build_stamp: Some(2),
         };
         let old = Executable {
             device: 1,
             inode: 2,
+            build_stamp: Some(1),
         };
         assert!(
             needs_handover(&current, &old, unsafe { libc::geteuid() }.wrapping_add(1)).is_err()

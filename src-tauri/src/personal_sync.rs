@@ -39,6 +39,7 @@ pub struct SyncState {
     pub publishing: BTreeMap<String, Mutation>,
     pub publish_errors: BTreeMap<String, String>,
     pub choose_local_servers: bool,
+    #[serde(skip_serializing)]
     pub last_synced_at: Option<i64>,
     pub error: Option<String>,
     pub initialized: bool,
@@ -52,13 +53,39 @@ pub fn is_personal(reg: &Registry) -> bool {
     })
 }
 pub fn state(reg: &Registry) -> Result<SyncState, String> {
-    reg.team
+    let mut state: SyncState = reg
+        .team
         .as_ref()
         .and_then(|t| t.unknown_fields.get(STATE))
         .map(|v| {
             serde_json::from_value(v.clone()).map_err(|e| format!("Could not read sync state: {e}"))
         })
-        .unwrap_or_else(|| Ok(SyncState::default()))
+        .unwrap_or_else(|| Ok(SyncState::default()))?;
+    if let Some(team) = &reg.team {
+        if let Some(path) = status_path() {
+            if let Ok(value) = std::fs::read(&path).and_then(|bytes| {
+                serde_json::from_slice::<Value>(&bytes).map_err(std::io::Error::other)
+            }) {
+                if value["connection"] == connection_key(team) {
+                    state.last_synced_at = value["lastSyncedAt"].as_i64().or(state.last_synced_at);
+                }
+            }
+        }
+    }
+    Ok(state)
+}
+fn status_path() -> Option<std::path::PathBuf> {
+    crate::registry::resolved_path().map(|p| p.with_extension("personal-sync-status.json"))
+}
+fn connection_key(team: &crate::registry::TeamConnection) -> Value {
+    json!([team.server_url, team.team_id, team.reporting_device_id])
+}
+fn mark_synced(team: &crate::registry::TeamConnection, at: i64) -> Result<(), String> {
+    let path = status_path().ok_or("Could not resolve sync status path")?;
+    crate::registry::atomic_write(
+        &path,
+        &json!({"connection":connection_key(team),"lastSyncedAt":at}).to_string(),
+    )
 }
 fn save(reg: &mut Registry, state: &SyncState) -> Result<(), String> {
     let mut state = state.clone();
@@ -74,6 +101,19 @@ fn save(reg: &mut Registry, state: &SyncState) -> Result<(), String> {
         );
     }
     Ok(())
+}
+pub fn attach_status(reg: &mut Registry) {
+    let at = state(reg).ok().and_then(|st| st.last_synced_at);
+    if let Some(st) = reg
+        .team
+        .as_mut()
+        .and_then(|t| t.unknown_fields.get_mut(STATE))
+        .and_then(Value::as_object_mut)
+    {
+        if let Some(at) = at {
+            st.insert("lastSyncedAt".into(), json!(at));
+        }
+    }
 }
 pub fn conflict_version(value: &Value) -> String {
     use sha2::{Digest, Sha256};
@@ -149,6 +189,9 @@ pub fn risky_sync_env(key: &str) -> bool {
         .contains(&key.as_str())
 }
 fn publish_error(value: &Value) -> Option<String> {
+    if value["url"].as_str().is_some_and(credential_url) {
+        return Some("This URL contains credentials. Use local authentication or keep this server on this machine only. The URL has not been changed.".into());
+    }
     if env_references(value) {
         return Some("env: references cannot sync. Choose a password manager reference or keep this server on this machine only.".into());
     }
@@ -185,7 +228,15 @@ pub fn execution_review_fields(server: &ServerEntry) -> BTreeMap<String, String>
     };
     let mut fields = BTreeMap::from([
         ("Command".into(), show(&v["command"])),
-        ("Arguments".into(), show(&v["args"])),
+        (
+            "Arguments".into(),
+            server
+                .args
+                .iter()
+                .enumerate()
+                .map(|(i, arg)| format!("\n  {}. {}", i + 1, visible_text(arg)))
+                .collect::<String>(),
+        ),
         (
             "Working directory".into(),
             server
@@ -277,6 +328,28 @@ fn env_references(value: &Value) -> bool {
         _ => false,
     }
 }
+fn credential_url(text: &str) -> bool {
+    url::Url::parse(text).is_ok_and(|u| {
+        !u.username().is_empty()
+            || u.password().is_some()
+            || u.query_pairs().any(|(key, _)| {
+                matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "token"
+                        | "access_token"
+                        | "api_key"
+                        | "apikey"
+                        | "api-key"
+                        | "password"
+                        | "secret"
+                        | "key"
+                        | "auth"
+                        | "authorization"
+                        | "signature"
+                )
+            })
+    })
+}
 fn portable(value: &Value) -> bool {
     value["secret"] == false && value["portable"] == true && reference(value).is_none()
 }
@@ -319,7 +392,7 @@ pub fn export(s: &ServerEntry) -> Value {
             if secret && arg != "<launch-input>" {
                 "<redacted>".to_string()
             } else {
-                crate::sharing_controller::redact_share_url(arg)
+                arg.clone()
             }
         })
         .collect();
@@ -354,9 +427,6 @@ pub fn export(s: &ServerEntry) -> Value {
     };
     v["disabled"] = json!(!intended_enabled);
     v["args"] = json!(args);
-    if let Some(url) = &s.url {
-        v["url"] = json!(crate::sharing_controller::redact_share_url(url));
-    }
     v["env"] = json!(s
         .env
         .iter()
@@ -1404,7 +1474,7 @@ pub(crate) fn sync(
             save(r, &st)?;
             let out = apply(r, &latest.1, latest.0)?;
             let mut st = state(r)?;
-            st.last_synced_at = Some(now());
+            mark_synced(r.team.as_ref().ok_or("Sign in to sync first")?, now())?;
             st.error = None;
             save(r, &st)?;
             Ok(Some((latest.0, out)))
@@ -1456,6 +1526,125 @@ fn current(r: &Registry, c: &crate::registry::TeamConnection) -> bool {
                 && t.reporting_device_id == c.reporting_device_id
         })
 }
+pub fn pending_review_count(reg: &Registry) -> usize {
+    reg.servers
+        .iter()
+        .filter(|s| s.needs_team_enable_review() && !keep_local(s))
+        .count()
+}
+pub fn banner(reg: &Registry) -> (String, bool) {
+    let st = state(reg).unwrap_or_default();
+    if let Some(error) = &st.error {
+        return (error.clone(), false);
+    }
+    if let Some(error) = reg
+        .team
+        .as_ref()
+        .and_then(|t| t.unknown_fields.get("accountStatusError"))
+        .and_then(Value::as_str)
+    {
+        return (error.into(), false);
+    }
+    if reg
+        .team
+        .as_ref()
+        .is_some_and(|t| t.unknown_fields["accountStatus"]["canReceiveConfig"] == false)
+    {
+        return (
+            "Sync paused. Choose your active device in Your account.".into(),
+            false,
+        );
+    }
+    if !st.conflicts.is_empty() {
+        return (
+            "Changes need your choice. Resolve the conflicts below.".into(),
+            false,
+        );
+    }
+    if !st.publish_errors.is_empty() {
+        return (
+            "Some servers could not sync. Review the details below.".into(),
+            false,
+        );
+    }
+    let review = pending_review_count(reg);
+    if review > 0 {
+        return (
+            format!(
+                "{review} {} waiting for review on this machine.",
+                if review == 1 {
+                    "server is"
+                } else {
+                    "servers are"
+                }
+            ),
+            false,
+        );
+    }
+    if !st.initialized || st.last_synced_at.is_none() {
+        return ("Waiting for first sync.".into(), false);
+    }
+    if !st.pending.is_empty() {
+        return ("Changes waiting to sync.".into(), false);
+    }
+    ("Sync is up to date.".into(), true)
+}
+pub fn conflict_fields(value: Option<&Value>) -> BTreeMap<String, String> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return BTreeMap::from([("Server".into(), "Removed".into())]);
+    };
+    let text = |v: &Value| {
+        v.as_str()
+            .map(visible_text)
+            .unwrap_or_else(|| visible_text(&v.to_string()))
+    };
+    let mut fields = BTreeMap::new();
+    for (key, label) in [
+        ("name", "Name"),
+        ("transport", "Transport"),
+        ("command", "Command"),
+        ("cwd", "Working directory"),
+        ("url", "URL"),
+        ("disabled", "Disabled"),
+        ("requestTimeoutMs", "Request timeout"),
+        ("initializeTimeoutMs", "Startup timeout"),
+        ("disabledTools", "Disabled tools"),
+    ] {
+        if let Some(v) = value.get(key).filter(|v| !v.is_null()) {
+            fields.insert(label.into(), text(v));
+        }
+    }
+    for (i, v) in value["args"].as_array().into_iter().flatten().enumerate() {
+        fields.insert(format!("Argument {}", i + 1), text(v));
+    }
+    for (path, label) in [
+        ("/env", "Environment"),
+        ("/launch/inputs", "Launch input"),
+        ("/headerKeys", "Header"),
+    ] {
+        for v in value
+            .pointer(path)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            fields.insert(
+                format!("{label}: {}", text(&v["key"])),
+                if v["secret"] == true {
+                    "<masked secret>".into()
+                } else if let Some(r) = reference(v) {
+                    format!("Reference: {}", visible_text(r))
+                } else {
+                    text(&v["value"])
+                },
+            );
+        }
+    }
+    if let Some(bindings) = value.pointer("/launch/bindings") {
+        fields.insert("Launch bindings".into(), text(bindings));
+    }
+    fields
+}
 pub fn status_lines(status: &Value, last_synced: Option<i64>) -> Vec<String> {
     status_lines_at(status, last_synced, now())
 }
@@ -1475,7 +1664,7 @@ fn status_lines_at(status: &Value, last_synced: Option<i64>, now: i64) -> Vec<St
         lines.push(if end > now {
             format!("Every device keeps syncing for {} more days", days(end))
         } else {
-            "Sync grace period ended. Choose your active Free device in Your account.".into()
+            "Sync grace period ended.".into()
         });
     }
     if status["canReceiveConfig"] == false {
@@ -1483,7 +1672,13 @@ fn status_lines_at(status: &Value, last_synced: Option<i64>, now: i64) -> Vec<St
     }
     lines.push(match last_synced {
         Some(t) if now - t < 60_000 => "Last synced just now".into(),
-        Some(t) => format!("Last synced {} minutes ago", (now - t).max(0) / 60_000),
+        Some(t) => {
+            let minutes = (now - t).max(0) / 60_000;
+            format!(
+                "Last synced {minutes} {} ago",
+                if minutes == 1 { "minute" } else { "minutes" }
+            )
+        }
         None => "Waiting for first sync".into(),
     });
     lines
@@ -1505,6 +1700,200 @@ pub fn record_error(error: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordinary_user_values_survive_export_and_two_machine_roundtrips() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-values");
+        let mut a = machine();
+        let mut s: ServerEntry = serde_json::from_value(json!({"id":"label","name":"Label","transport":"stdio","command":"echo","args":["--label","machine A v2"],"env":[]})).unwrap();
+        s.enabled = true;
+        let url = "https://gitmcp.io/btsouth/Toolport2026";
+        let h: ServerEntry = serde_json::from_value(
+            json!({"id":"docs-http","name":"Toolport docs","transport":"http","url":url,"env":[]}),
+        )
+        .unwrap();
+        a.servers = vec![s.clone(), h];
+        let wire = config(a.servers.iter().map(export).collect());
+        assert_eq!(
+            wire["servers"][0]["args"],
+            json!(["--label", "machine A v2"])
+        );
+        assert_eq!(wire["servers"][1]["url"], url);
+        apply(&mut a, &wire, 1).unwrap();
+        crate::registry::save(&a).unwrap();
+        let mut b = machine();
+        apply(&mut b, &wire, 1).unwrap();
+        let from_b = config(b.servers.iter().map(export).collect());
+        apply(&mut a, &from_b, 2).unwrap();
+        crate::registry::save(&a).unwrap();
+        let a = crate::registry::load().unwrap();
+        for r in [&a, &b] {
+            assert_eq!(
+                r.servers.iter().find(|s| s.name == "Label").unwrap().args,
+                s.args
+            );
+            assert_eq!(
+                r.servers
+                    .iter()
+                    .find(|s| s.name == "Toolport docs")
+                    .unwrap()
+                    .url
+                    .as_deref(),
+                Some(url)
+            );
+            assert!(!json!(r).to_string().contains("YOUR_API_KEY"));
+        }
+    }
+    #[test]
+    fn credential_url_is_refused_without_modification_and_named_args_stay_local() {
+        let url = "https://service.example/mcp?api_key=realSecret2026";
+        let mut s: ServerEntry = serde_json::from_value(json!({"id":"a","name":"A","transport":"http","url":url,"args":["--token","realSecret2026"],"env":[]})).unwrap();
+        let exported = export(&s);
+        assert_eq!(exported["url"], url);
+        assert!(publish_error(&exported)
+            .unwrap()
+            .contains("has not been changed"));
+        let old = s.clone();
+        s.args = serde_json::from_value(exported["args"].clone()).unwrap();
+        restore_local(&mut s, &old);
+        assert_eq!(s.args, old.args);
+        assert_eq!(s.url, old.url);
+    }
+    #[test]
+    fn idle_polls_keep_registry_bytes_mtime_and_backup_journal() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-idle");
+        let mut r = machine();
+        let wire = config(vec![http("docs")]);
+        apply(&mut r, &wire, 1).unwrap();
+        crate::registry::save(&r).unwrap();
+        let path = crate::registry::resolved_path().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let backups = || {
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains(".bak"))
+                .map(|e| (e.file_name(), std::fs::read(e.path()).unwrap()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = backups();
+        for at in 1..=10 {
+            remote_update(|| {
+                crate::registry::update(|r| {
+                    apply(r, &wire, 1)?;
+                    mark_synced(r.team.as_ref().unwrap(), at)?;
+                    Ok(())
+                })
+            })
+            .unwrap();
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(backups(), before);
+        assert_eq!(
+            state(&crate::registry::load().unwrap())
+                .unwrap()
+                .last_synced_at,
+            Some(10)
+        );
+        assert!(!String::from_utf8(bytes).unwrap().contains("lastSyncedAt"));
+        let mut other = machine();
+        other.team.as_mut().unwrap().reporting_device_id = "other".into();
+        assert_eq!(state(&other).unwrap().last_synced_at, None);
+    }
+    #[test]
+    fn status_never_claims_green_while_first_sync_review_or_conflict_is_pending() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-banner");
+        let mut r = machine();
+        assert_eq!(banner(&r), ("Waiting for first sync.".into(), false));
+        let mut st = SyncState {
+            initialized: true,
+            ..SyncState::default()
+        };
+        save(&mut r, &st).unwrap();
+        mark_synced(r.team.as_ref().unwrap(), 1).unwrap();
+        assert!(banner(&r).1);
+        st.conflicts.insert("docs".into(), http("docs"));
+        save(&mut r, &st).unwrap();
+        assert!(!banner(&r).1);
+        assert!(banner(&r).0.contains("choice"));
+        st.conflicts.clear();
+        save(&mut r, &st).unwrap();
+        let mut s: ServerEntry = serde_json::from_value(http("docs")).unwrap();
+        s.require_team_enable_review();
+        r.servers.push(s);
+        assert_eq!(
+            banner(&r),
+            (
+                "1 server is waiting for review on this machine.".into(),
+                false
+            )
+        );
+        let status = json!({"plan":"free","freeSyncGraceEndsAt":0,"canReceiveConfig":false,"reason":"Choose your device in Your account."});
+        let lines = status_lines_at(&status, Some(0), 60_000);
+        assert_eq!(lines.iter().filter(|s| s.contains("Choose")).count(), 1);
+        assert!(lines.contains(&"Last synced 1 minute ago".into()));
+        assert_eq!(crate::teams::sync_retry_seconds(&r, 4), 60);
+        r.team.as_mut().unwrap().unknown_fields["accountStatus"]["canReceiveConfig"] = json!(false);
+        assert_eq!(crate::teams::sync_retry_seconds(&r, 4), 3);
+        r.team.as_mut().unwrap().unknown_fields["accountStatus"]["canReceiveConfig"] = json!(true);
+        r.servers.clear();
+        assert!(banner(&r).1);
+    }
+    #[test]
+    fn new_local_only_server_never_enters_the_sync_journal() {
+        let mut before = machine();
+        apply(&mut before, &config(vec![]), 1).unwrap();
+        let mut after = before.clone();
+        crate::registry_controller::apply_add_server(
+            &mut after,
+            crate::registry_controller::ServerFields {
+                sync_local_only: true,
+                name: "Private".into(),
+                transport: "stdio".into(),
+                command: Some("echo".into()),
+                args: vec!["machine A v2".into()],
+                url: None,
+                cwd: None,
+            },
+        )
+        .unwrap();
+        record(&before, &mut after).unwrap();
+        assert!(keep_local(&after.servers[0]));
+        assert!(state(&after).unwrap().pending.is_empty());
+    }
+    #[test]
+    fn conflicts_show_names_both_values_and_visible_controls() {
+        let mut a = http("docs-http");
+        a["name"] = json!("Toolport docs");
+        a["url"] = json!("https://example.com/this");
+        let mut b = a.clone();
+        b["url"] = json!("https://example.com/other");
+        b["args"] = json!(["line\nnext"]);
+        let left = conflict_fields(Some(&a));
+        let right = conflict_fields(Some(&b));
+        assert_eq!(left["Name"], "Toolport docs");
+        assert_ne!(left["URL"], right["URL"]);
+        assert_eq!(right["Argument 1"], "line\u{000A}next");
+    }
+    #[test]
+    fn personal_pairing_copy_and_custom_origin_are_accurate() {
+        let fresh = crate::teams::pairing_confirm_copy("https://sync.example.com", false);
+        assert!(fresh.contains("Sync service:"));
+        assert!(!fresh.contains("replaces"));
+        assert!(!fresh.contains("Control plane"));
+        assert!(
+            crate::teams::pairing_confirm_copy("https://sync.example.com", true)
+                .contains("replaces")
+        );
+        assert_eq!(
+            crate::teams::sync_sign_in_url("http://127.0.0.1:18787").unwrap(),
+            "http://127.0.0.1:18787/?intent=pro&from=app-sync"
+        );
+    }
     fn machine() -> Registry {
         let mut r = Registry::default();
         r.team=Some(serde_json::from_value(json!({"serverUrl":"https://example.com","teamId":"solo","role":"admin","reportingDeviceId":"fixture","accountStatus":{"personalSync":true,"plan":"pro","canReceiveConfig":true}})).unwrap());

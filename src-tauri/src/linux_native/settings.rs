@@ -103,7 +103,7 @@ impl SettingsPage {
         );
         page.append(
             &gtk::Label::builder()
-                .label("These settings are shared with the gateway and the current Toolport app. Team-enforced protections stay locked on.")
+                .label("These settings apply to Toolport and its gateway. Protections required by a connected team stay locked on.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)

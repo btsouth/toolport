@@ -168,6 +168,7 @@ pub(crate) fn acquire_auth_owner_lock(owner: &str) -> Result<AuthMutationLock, S
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerFields {
+    pub sync_local_only: bool,
     pub name: String,
     pub transport: String,
     pub command: Option<String>,
@@ -388,7 +389,11 @@ fn entry_from_fields(fields: ServerFields) -> Result<ServerEntry, String> {
         request_timeout_ms: None,
         initialize_timeout_ms: None,
         launch: None,
-        unknown_fields: serde_json::Map::new(),
+        unknown_fields: if fields.sync_local_only {
+            serde_json::Map::from_iter([("syncLocalOnly".into(), serde_json::json!(true))])
+        } else {
+            serde_json::Map::new()
+        },
     })
 }
 
@@ -877,6 +882,7 @@ pub fn add_snippet_servers_inputs(
             continue;
         }
         let entry = entry_from_fields(ServerFields {
+            sync_local_only: false,
             name: server.name,
             transport: server.transport,
             command: server.command,
@@ -2442,8 +2448,16 @@ fn client_credentials_edit_owner(reg: &Registry, id: &str) -> Result<String, Str
     let owner = crate::local_auth::owner_in(reg, id)?;
     // A managed alias still edits its personal original. A random personal-sync
     // vault owner or URL-specific namespace is the server's own authentication.
-    if reg.unknown_fields.get("localTeamAuthentication").and_then(|v| v.get(id)).is_some() && owner != id {
-        return Err("Edit the personal original to change the shared local sign-in configuration.".into());
+    if reg
+        .unknown_fields
+        .get("localTeamAuthentication")
+        .and_then(|v| v.get(id))
+        .is_some()
+        && owner != id
+    {
+        return Err(
+            "Edit the personal original to change the shared local sign-in configuration.".into(),
+        );
     }
     Ok(owner)
 }
@@ -2562,9 +2576,23 @@ pub fn apply_secret_declaration(
         .iter_mut()
         .find(|server| server.id == server_id)
         .ok_or_else(|| format!("No server with id '{server_id}'"))?;
-    if let Some(overrides) = server.unknown_fields.get_mut("memberSecretRefs").and_then(serde_json::Value::as_object_mut) { overrides.remove(&format!("env:{key}")); overrides.remove(&format!("header:{key}")); }
-    if let Some(header) = server.unknown_fields.get_mut("headerKeys").and_then(serde_json::Value::as_array_mut).and_then(|hs| hs.iter_mut().find(|h| h["key"] == key)) {
-        if let Some(object) = header.as_object_mut() { object.remove("source"); }
+    if let Some(overrides) = server
+        .unknown_fields
+        .get_mut("memberSecretRefs")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        overrides.remove(&format!("env:{key}"));
+        overrides.remove(&format!("header:{key}"));
+    }
+    if let Some(header) = server
+        .unknown_fields
+        .get_mut("headerKeys")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|hs| hs.iter_mut().find(|h| h["key"] == key))
+    {
+        if let Some(object) = header.as_object_mut() {
+            object.remove("source");
+        }
         registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
         return Ok(());
     }
@@ -2595,7 +2623,14 @@ pub fn apply_secret_removal(
         .iter_mut()
         .find(|server| server.id == server_id)
         .ok_or_else(|| format!("No server with id '{server_id}'"))?;
-    if let Some(overrides) = server.unknown_fields.get_mut("memberSecretRefs").and_then(serde_json::Value::as_object_mut) { overrides.remove(&format!("env:{key}")); overrides.remove(&format!("header:{key}")); }
+    if let Some(overrides) = server
+        .unknown_fields
+        .get_mut("memberSecretRefs")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        overrides.remove(&format!("env:{key}"));
+        overrides.remove(&format!("header:{key}"));
+    }
     server.env.retain(|entry| entry.key != key);
     registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
     Ok(())
@@ -2823,7 +2858,13 @@ pub fn apply_launch_secret_generation(
         .iter_mut()
         .find(|server| server.id == server_id)
         .ok_or_else(|| format!("No server with id '{server_id}'"))?;
-    if let Some(overrides) = server.unknown_fields.get_mut("memberSecretRefs").and_then(serde_json::Value::as_object_mut) { overrides.remove(&format!("input:{key}")); }
+    if let Some(overrides) = server
+        .unknown_fields
+        .get_mut("memberSecretRefs")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        overrides.remove(&format!("input:{key}"));
+    }
     if !server.launch.as_ref().is_some_and(|launch| {
         launch
             .inputs
@@ -2832,7 +2873,13 @@ pub fn apply_launch_secret_generation(
     }) {
         return Err("not a declared secret launch input".into());
     }
-    if let Some(input) = server.launch.as_mut().and_then(|l| l.inputs.iter_mut().find(|i| i.key == key)) { input.unknown_fields.remove("source"); }
+    if let Some(input) = server
+        .launch
+        .as_mut()
+        .and_then(|l| l.inputs.iter_mut().find(|i| i.key == key))
+    {
+        input.unknown_fields.remove("source");
+    }
     registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
     Ok(())
 }
@@ -2890,7 +2937,9 @@ pub fn apply_server_enabled(
             let identity =
                 crate::personal_sync::command_identity(&crate::personal_sync::export(server));
             let fields = crate::personal_sync::execution_review_fields(server);
-            server.unknown_fields.insert("syncExecutionReview".into(), serde_json::json!(fields));
+            server
+                .unknown_fields
+                .insert("syncExecutionReview".into(), serde_json::json!(fields));
             server
                 .unknown_fields
                 .insert("syncCommandConsent".into(), identity);
@@ -3081,13 +3130,25 @@ mod tests {
             clear_client_credentials(&id).unwrap();
             assert!(!has_client_secret(&id).unwrap());
             set_client_credentials(&id, "client", Some("first-secret".into()), None, None).unwrap();
-            crate::personal_sync::remote_update(|| registry::update(|r| { r.servers[0].url = Some("https://second.example/mcp".into()); Ok(()) })).unwrap();
+            crate::personal_sync::remote_update(|| {
+                registry::update(|r| {
+                    r.servers[0].url = Some("https://second.example/mcp".into());
+                    Ok(())
+                })
+            })
+            .unwrap();
             assert!(!has_client_secret(&id).unwrap());
             set_client_credentials(&id, "other", Some("second-secret".into()), None, None).unwrap();
             assert!(has_client_secret(&id).unwrap());
             clear_client_credentials(&id).unwrap();
             assert!(!has_client_secret(&id).unwrap());
-            crate::personal_sync::remote_update(|| registry::update(|r| { r.servers[0].url = Some("https://first.example/mcp".into()); Ok(()) })).unwrap();
+            crate::personal_sync::remote_update(|| {
+                registry::update(|r| {
+                    r.servers[0].url = Some("https://first.example/mcp".into());
+                    Ok(())
+                })
+            })
+            .unwrap();
             assert!(has_client_secret(&id).unwrap());
         });
     }
@@ -4245,6 +4306,7 @@ mod tests {
 
     fn fields(name: &str, transport: &str) -> ServerFields {
         ServerFields {
+            sync_local_only: false,
             name: name.into(),
             transport: transport.into(),
             command: (transport == "stdio").then(|| "npx".into()),
@@ -4539,6 +4601,7 @@ mod tests {
         });
         registry.servers.push(existing);
         let same = ServerFields {
+            sync_local_only: false,
             name: "Renamed".into(),
             transport: "stdio".into(),
             command: Some("npx".into()),
@@ -4581,6 +4644,7 @@ mod tests {
                 registry,
                 "one",
                 ServerFields {
+                    sync_local_only: false,
                     name: "Broken".into(),
                     transport: "http".into(),
                     command: None,
@@ -5441,8 +5505,22 @@ pub fn apply_secret_reference(
         .find(|s| s.id == server_id)
         .ok_or("Server not found")?;
     crate::secret_refs::check_policy(server, reference).map_err(|e| e.to_string())?;
-    let location = if server.launch.iter().flat_map(|l| &l.inputs).any(|i| i.key == key) { "input" }
-        else if crate::secret_refs::headers(server).map_err(|e| e.to_string())?.iter().any(|h| h.key == key) { "header" } else { "env" };
+    let location = if server
+        .launch
+        .iter()
+        .flat_map(|l| &l.inputs)
+        .any(|i| i.key == key)
+    {
+        "input"
+    } else if crate::secret_refs::headers(server)
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|h| h.key == key)
+    {
+        "header"
+    } else {
+        "env"
+    };
     if let Some(input) = server
         .launch
         .as_mut()
@@ -5478,7 +5556,10 @@ pub fn apply_secret_reference(
     }
     crate::secret_refs::validate_server(server).map_err(|e| e.to_string())?;
     if crate::secret_refs::is_shared(server) {
-        let overrides = server.unknown_fields.entry("memberSecretRefs").or_insert_with(|| serde_json::json!({}));
+        let overrides = server
+            .unknown_fields
+            .entry("memberSecretRefs")
+            .or_insert_with(|| serde_json::json!({}));
         overrides[format!("{location}:{key}")] = serde_json::json!(reference);
     }
     reg.secrets_generation = reg.secrets_generation.wrapping_add(1);

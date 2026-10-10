@@ -12,8 +12,8 @@ mod onboarding;
 mod package_updates;
 mod pairing;
 mod settings;
-mod single_instance;
 mod setup;
+mod single_instance;
 mod state;
 mod teams;
 mod theme;
@@ -36,6 +36,11 @@ const APP_ID: &str = "com.tsout.Toolport";
 const LEGACY_PREVIEW_APP_ID: &str = "com.tsout.Toolport.NativePreview";
 
 pub fn run() {
+    let raw_args = std::env::args().collect::<Vec<_>>();
+    if let Some(text) = single_instance::information(&raw_args) {
+        println!("{text}");
+        return;
+    }
     let launch_hidden = std::env::args_os().any(|arg| arg == "--hidden");
     let args = std::env::args()
         .filter(|arg| arg != "--hidden")
@@ -120,7 +125,12 @@ pub fn run() {
     let bridge_for_open = bridge.clone();
     let notice_for_open = startup_notice.clone();
     app.connect_open(move |app, files, _hint| {
-        if files.iter().any(|file| crate::teams::parse_pair_link(file.uri().as_str()).is_some()) { let _ = onboarding::mark_complete(); }
+        if files
+            .iter()
+            .any(|file| crate::teams::parse_pair_link(file.uri().as_str()).is_some())
+        {
+            let _ = onboarding::mark_complete();
+        }
         build_window(
             app,
             theme::ThemeController::new(),
@@ -517,13 +527,22 @@ fn build_window(
         // paired, without a relaunch.
         if let state::RegistryState::Ready(ready) = &snapshot {
             team_button.set_visible(true);
-            team_button.set_label(if !ready.paired {
+            let label = if !ready.paired {
                 "Sign in to sync"
             } else if ready.personal_sync {
                 "Sync"
             } else {
                 "Team"
-            });
+            };
+            let count = ready.servers.iter().filter(|s| s.requires_review).count();
+            set_nav_label(
+                &team_button,
+                &if count > 0 {
+                    format!("{label} ({count})")
+                } else {
+                    label.into()
+                },
+            );
         }
         server_page.render(snapshot);
         if let Some(notice) = startup_notice.borrow_mut().take() {
@@ -1611,10 +1630,11 @@ impl ServerPage {
     }
 
     fn render(&self, state: state::RegistryState) {
-        self.hide_feedback();
-
         match state {
             state::RegistryState::Ready(snapshot) => {
+                if self.last_snapshot.borrow().as_ref() == Some(&snapshot) {
+                    return;
+                }
                 *self.last_snapshot.borrow_mut() = Some(snapshot.clone());
                 self.server_count
                     .set_label(&snapshot.servers.len().to_string());
@@ -1673,13 +1693,47 @@ impl ServerPage {
     }
 
     fn render_server_list(&self, snapshot: &state::RegistrySnapshot) {
-        self.clear_server_list();
-        self.health_rows.borrow_mut().retain(|_, rows| {
-            rows.retain(|row| row.label.root().is_some());
-            !rows.is_empty()
+        if let Some(popover) = open_popover(self.list.upcast_ref()) {
+            if popover.widget_name() != "toolport-deferred-refresh" {
+                popover.set_widget_name("toolport-deferred-refresh");
+                let page = self.clone();
+                popover.connect_closed(move |p| {
+                    let _ = p;
+                    let snapshot = page.last_snapshot.borrow().clone();
+                    if let Some(snapshot) = snapshot {
+                        page.render_server_list(&snapshot);
+                    }
+                });
+            }
+            return;
+        }
+        let previous = self.rows.borrow().clone();
+        let focused = self
+            .app
+            .active_window()
+            .and_then(|w| gtk::prelude::RootExt::focus(&w));
+        let focused_row = focused.as_ref().and_then(|focus| {
+            previous
+                .iter()
+                .find(|(_, row)| focus.is_ancestor(row) || focus == row.upcast_ref::<gtk::Widget>())
+                .map(|(server, _)| server.id.clone())
         });
+        // Remove headings only; unchanged cards retain focus and widget identity.
+        let mut child = self.list.first_child();
+        while let Some(w) = child {
+            child = w.next_sibling();
+            if !previous
+                .iter()
+                .any(|(_, row)| row.upcast_ref::<gtk::Widget>() == &w)
+            {
+                self.list.remove(&w);
+            }
+        }
+        self.no_matches.borrow_mut().take();
+        self.off_heading.borrow_mut().take();
         self.section_title.set_label("Servers");
         if snapshot.servers.is_empty() {
+            self.clear_server_list();
             self.posture.set_visible(false);
             self.list.append(&state_card(
                 "network-server-symbolic",
@@ -1695,8 +1749,18 @@ impl ServerPage {
         let (on, off) = server_groups(&snapshot.servers);
         let mut rows = Vec::with_capacity(on.len() + off.len());
         for server in on {
-            let card = server_card(server, &snapshot.active_profile_id, self.clone());
-            self.list.append(&card);
+            let card = previous
+                .iter()
+                .find(|(old, _)| old == server)
+                .map(|(_, card)| card.clone())
+                .unwrap_or_else(|| server_card(server, &snapshot.active_profile_id, self.clone()));
+            if card.parent().is_none() {
+                self.list.append(&card);
+            }
+            if self.list.last_child().as_ref() != Some(card.upcast_ref::<gtk::Widget>()) {
+                self.list
+                    .reorder_child_after(&card, self.list.last_child().as_ref());
+            }
             rows.push((server.clone(), card));
         }
         if !off.is_empty() {
@@ -1705,11 +1769,34 @@ impl ServerPage {
             *self.off_heading.borrow_mut() = Some(heading);
         }
         for server in off {
-            let card = server_card(server, &snapshot.active_profile_id, self.clone());
+            let card = previous
+                .iter()
+                .find(|(old, _)| old == server)
+                .map(|(_, card)| card.clone())
+                .unwrap_or_else(|| server_card(server, &snapshot.active_profile_id, self.clone()));
             card.add_css_class("toolport-card-off");
-            self.list.append(&card);
+            if card.parent().is_none() {
+                self.list.append(&card);
+            }
+            if self.list.last_child().as_ref() != Some(card.upcast_ref::<gtk::Widget>()) {
+                self.list
+                    .reorder_child_after(&card, self.list.last_child().as_ref());
+            }
             rows.push((server.clone(), card));
         }
+        for (_, card) in &previous {
+            if !rows.iter().any(|(_, current)| current == card) {
+                self.list.remove(card);
+            }
+        }
+        if let Some(id) = focused_row {
+            if focused.as_ref().is_some_and(|w| w.root().is_none()) {
+                if let Some((_, card)) = rows.iter().find(|(s, _)| s.id == id) {
+                    card.child_focus(gtk::DirectionType::TabForward);
+                }
+            }
+        }
+        self.health_rows.borrow_mut().retain(|_, rows| { rows.retain(|row| row.label.root().is_some()); !rows.is_empty() });
         *self.rows.borrow_mut() = rows;
         let no_matches = state_card(
             "edit-find-symbolic",
@@ -1899,7 +1986,7 @@ impl ServerPage {
         let feedback_timer = self.feedback_timer.clone();
         let timer =
             gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(4), move || {
-                feedback.set_visible(false);
+                feedback.set_visible(true);
                 feedback.set_label("");
                 feedback_timer.borrow_mut().take();
             });
@@ -1908,7 +1995,7 @@ impl ServerPage {
 
     fn hide_feedback(&self) {
         self.cancel_feedback_timer();
-        self.feedback.set_visible(false);
+        self.feedback.set_visible(true);
         self.feedback.set_label("");
     }
 
@@ -2082,14 +2169,33 @@ impl ClientPage {
         });
     }
 
-    fn show_import_review(&self, candidates: Vec<crate::registry_controller::ClientImportCandidate>) {
-        let Some(parent) = self.root.root().and_downcast::<gtk::Window>() else { return; };
-        let items = candidates.into_iter().map(|candidate| crate::registry_controller::SetupItem {
-            key: candidate.key, name: candidate.name, transport: candidate.transport,
-            command: candidate.command, args: candidate.args, url: candidate.url,
-            env_keys: candidate.credentials.iter().map(|env| env.key.clone()).collect(),
-            credentials: candidate.credentials, unsupported: candidate.unsupported, updates: Vec::new(), is_new: true,
-        }).collect();
+    fn show_import_review(
+        &self,
+        candidates: Vec<crate::registry_controller::ClientImportCandidate>,
+    ) {
+        let Some(parent) = self.root.root().and_downcast::<gtk::Window>() else {
+            return;
+        };
+        let items = candidates
+            .into_iter()
+            .map(|candidate| crate::registry_controller::SetupItem {
+                key: candidate.key,
+                name: candidate.name,
+                transport: candidate.transport,
+                command: candidate.command,
+                args: candidate.args,
+                url: candidate.url,
+                env_keys: candidate
+                    .credentials
+                    .iter()
+                    .map(|env| env.key.clone())
+                    .collect(),
+                credentials: candidate.credentials,
+                unsupported: candidate.unsupported,
+                updates: Vec::new(),
+                is_new: true,
+            })
+            .collect();
         let page = self.clone();
         setup::review(&parent, "Review servers to import", items,
             "Review each command and URL. Values are saved using your keychain choices. Missing inputs stay off.",
@@ -2527,10 +2633,7 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             let client_for_connect = client.clone();
             let page_for_connect = page.clone();
             connect.connect_clicked(move |_| {
-                confirm_client_migrate(
-                    &client_for_connect,
-                    page_for_connect.clone(),
-                );
+                confirm_client_migrate(&client_for_connect, page_for_connect.clone());
             });
             actions.append(&connect);
         }
@@ -2565,7 +2668,10 @@ fn confirm_client_migrate(client: &state::ClientView, page: ClientPage) {
         client.id.clone(),
         client.scope_id.clone(),
         client.gateway_state == state::ClientGatewayState::Customized,
-        { let page = page.clone(); move || page.refresh() },
+        {
+            let page = page.clone();
+            move || page.refresh()
+        },
         Some(page.credential_page.clone()),
     );
 }
@@ -2667,10 +2773,7 @@ fn connected_client_actions_menu(client: state::ClientView, page: ClientPage) ->
         let menu_for_migrate = menu.clone();
         migrate.connect_clicked(move |_| {
             menu_for_migrate.popdown();
-            confirm_client_migrate(
-                &client_for_migrate,
-                page_for_migrate.clone(),
-            );
+            confirm_client_migrate(&client_for_migrate, page_for_migrate.clone());
         });
         content.append(&migrate);
         content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
@@ -2856,7 +2959,12 @@ fn run_client_mutation(
                         "Disconnected {client_name} from Toolport. Restart {client_name} to apply it."
                     )
                 };
-                page.refresh_with_confirmation(std::iter::once(message).chain(result.outcome.warnings).collect::<Vec<_>>().join(" "));
+                page.refresh_with_confirmation(
+                    std::iter::once(message)
+                        .chain(result.outcome.warnings)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
             }
             Ok(Err(error)) => page.show_error(&format!("{client_name}: {error}")),
             Err(_) => page.show_error(&format!("{client_name}: the operation stopped")),
@@ -5627,7 +5735,10 @@ fn approval_card(
     {
         card.append(
             &gtk::Label::builder()
-                .label(format!("Reports itself as: {}", crate::approval::shorten_client_label(label, 60)))
+                .label(format!(
+                    "Reports itself as: {}",
+                    crate::approval::shorten_client_label(label, 60)
+                ))
                 .tooltip_text(label)
                 .xalign(0.0)
                 .wrap(true)
@@ -5926,7 +6037,7 @@ fn build_content(
         .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
-        .visible(false)
+        .height_request(48)
         .css_classes(["toolport-feedback"])
         .build();
     page.append(&feedback);
@@ -5947,7 +6058,8 @@ fn build_content(
     }
     page.append(&summary);
     let short = adw::Breakpoint::new(
-        adw::BreakpointCondition::parse("max-height: 450px").expect("static short-window condition"),
+        adw::BreakpointCondition::parse("max-height: 450px")
+            .expect("static short-window condition"),
     );
     short.add_setter(&intro, "visible", Some(&false.to_value()));
     short.add_setter(&description, "visible", Some(&false.to_value()));
@@ -6103,26 +6215,47 @@ fn build_content(
 
 fn open_shared_setup(url: &str, page: ServerPage) {
     if let Some((origin, team)) = crate::teams::parse_pair_link(url) {
-        if crate::registry::load().is_ok_and(|reg| crate::teams::pair_target_is_current(&reg, &origin, &team)) {
-            if let Some(action) = page.app.lookup_action("show-teams") { action.activate(None); }
-            if let Some(window) = page.app.active_window() { window.present(); }
+        if crate::registry::load()
+            .is_ok_and(|reg| crate::teams::pair_target_is_current(&reg, &origin, &team))
+        {
+            if let Some(action) = page.app.lookup_action("show-teams") {
+                action.activate(None);
+            }
+            if let Some(window) = page.app.active_window() {
+                window.present();
+            }
             return;
         }
-        for window in page.app.windows() { if window.title().as_deref() == Some("Toolport setup") { window.close(); } }
-        let (parent_app, connected_app, feedback) = (page.app.clone(), page.app.clone(), page.clone());
+        for window in page.app.windows() {
+            if window.title().as_deref() == Some("Toolport setup") {
+                window.close();
+            }
+        }
+        let (parent_app, connected_app, feedback) =
+            (page.app.clone(), page.app.clone(), page.clone());
         let hooks = pairing::PairingHooks {
             parent: Box::new(move || parent_app.active_window()),
             feedback: Box::new(move |message, error| feedback.show_feedback(message, error)),
             connected: Box::new(move || {
-                if let Some(action) = connected_app.lookup_action("show-teams") { action.activate(None); }
-                if let Some(window) = connected_app.active_window() { window.present(); }
+                if let Some(action) = connected_app.lookup_action("show-teams") {
+                    action.activate(None);
+                }
+                if let Some(window) = connected_app.active_window() {
+                    window.present();
+                }
             }),
-            open_url: Box::new(|url| { let _ = crate::oauth::open_web_url(url); }),
+            open_url: Box::new(|url| {
+                let _ = crate::oauth::open_web_url(url);
+            }),
         };
         let pair_origin = origin.clone();
-        pairing::request(hooks, &origin, Box::new(move |cancel, show| {
-            crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
-        }));
+        pairing::request(
+            hooks,
+            &origin,
+            Box::new(move |cancel, show| {
+                crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
+            }),
+        );
         return;
     }
     let Some(id) = crate::sharing_controller::parse_share_url(url) else {
@@ -6786,6 +6919,31 @@ fn run_profile_mutation(
     });
 }
 
+fn set_nav_label(button: &gtk::Button, text: &str) {
+    if let Some(label) = button
+        .child()
+        .and_then(|row| row.first_child())
+        .and_then(|icon| icon.next_sibling())
+        .and_then(|w| w.downcast::<gtk::Label>().ok())
+    {
+        label.set_label(text);
+    }
+}
+fn open_popover(widget: &gtk::Widget) -> Option<gtk::Popover> {
+    if let Ok(menu) = widget.clone().downcast::<gtk::MenuButton>() {
+        if let Some(popover) = menu.popover().filter(|p| p.is_visible()) {
+            return Some(popover);
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(w) = child {
+        if let Some(p) = open_popover(&w) {
+            return Some(p);
+        }
+        child = w.next_sibling();
+    }
+    None
+}
 fn server_matches_query(server: &state::ServerView, query: &str) -> bool {
     let query = query.trim().to_lowercase();
     query.is_empty()
@@ -7227,7 +7385,10 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
     }
 
     if server.requires_review {
-        let personal = matches!(server.origin_label.as_str(), "Synced" | "This machine only");
+        let personal = matches!(
+            server.origin_label.as_str(),
+            "Synced" | "This machine only" | "Sync conflict" | "Needs review"
+        );
         let badge = gtk::Label::new(Some(if personal {
             "Review in Sync"
         } else {
@@ -8602,6 +8763,13 @@ fn open_server_editor_prefilled(
         .build();
     form.append(&feedback);
 
+    let local_only = gtk::CheckButton::with_label("This machine only");
+    local_only.set_visible(
+        !editing && crate::registry::load().is_ok_and(|r| crate::personal_sync::is_personal(&r)),
+    );
+    local_only.set_tooltip_text(Some("Keep this new server on this machine from the start."));
+    form.append(&local_only);
+
     // Pasted env values wait here until the add commits; the entry itself never
     // carries secret values, they go straight to the keychain on save.
     let snippet_env: std::rc::Rc<std::cell::RefCell<Vec<(String, Option<String>)>>> =
@@ -9137,8 +9305,9 @@ fn open_server_editor_prefilled(
         save.set_sensitive(false);
         feedback.set_visible(false);
         let server_id = server_id.clone();
-        let fields =
+        let mut fields =
             collect_server_fields(&name, &transport, &command, &args, &url, &cwd, &inherit_env);
+        fields.sync_local_only = local_only.is_active();
         let binding_changed =
             fields.command != original_command_for_save || fields.args != original_args_for_save;
         let launch_values = launch_for_save
@@ -9290,6 +9459,7 @@ fn open_sync_settings(server_id: &str, page: &ServerPage) {
     local.set_active(crate::personal_sync::keep_local(server));
     local.set_sensitive(crate::personal_sync::is_personal(&reg));
     fields.append(&local);
+    fields.append(&gtk::Label::builder().label("Stops future sync for this server on this machine. Copies already on your other machines stay there.").wrap(true).xalign(0.0).build());
     let mut portable = Vec::new();
     for (kind, key, label, secret, unknown) in server
         .env
@@ -9455,6 +9625,7 @@ fn collect_server_fields(
     inherit_env: &gtk::Switch,
 ) -> crate::registry_controller::ServerFields {
     crate::registry_controller::ServerFields {
+        sync_local_only: false,
         name: name.text().to_string(),
         transport: match transport.selected() {
             1 => "http",
@@ -9546,6 +9717,21 @@ fn update_editor_transport(
     url.set_visible(!stdio);
 }
 
+fn remove_server_copy(server_id: &str) -> String {
+    let syncs = crate::registry::load().is_ok_and(|r| {
+        crate::personal_sync::is_personal(&r)
+            && r.servers
+                .iter()
+                .find(|s| s.id == server_id)
+                .is_some_and(|s| !crate::personal_sync::keep_local(s))
+    });
+    if syncs {
+        "This removes the server from every profile and your other machines. This cannot be undone."
+    } else {
+        "This removes the server from every profile on this machine. This cannot be undone."
+    }
+    .into()
+}
 fn confirm_remove_server(server_id: &str, server_name: &str, page: ServerPage) {
     let Some(parent) = page.app.active_window() else {
         return;
@@ -9554,7 +9740,7 @@ fn confirm_remove_server(server_id: &str, server_name: &str, page: ServerPage) {
     let dialog = adw::MessageDialog::new(
         Some(&parent),
         Some(&format!("Remove {server_name}?")),
-        Some("This removes the server from every profile. This cannot be undone."),
+        Some(&remove_server_copy(server_id)),
     );
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("remove", "Remove");
@@ -10299,11 +10485,38 @@ mod tests {
     #[test]
     fn p08b_r1_hyphenated_activity_filter_uses_one_server() {
         let _env = crate::registry::DataDirTestEnv::new("p08b-r1-gtk-filter");
-        crate::audit::record_routed_call(&crate::registry::Registry::default(), "team-slack", "read", true, Some(850), None, Some("adapter:claude-code"), None, None, None, None);
-        crate::audit::record_decision("team-slack", "delete", Some("adapter:claude-code"), None, "destructive", "denied", &serde_json::json!({}), Some(1500));
+        crate::audit::record_routed_call(
+            &crate::registry::Registry::default(),
+            "team-slack",
+            "read",
+            true,
+            Some(850),
+            None,
+            Some("adapter:claude-code"),
+            None,
+            None,
+            None,
+            None,
+        );
+        crate::audit::record_decision(
+            "team-slack",
+            "delete",
+            Some("adapter:claude-code"),
+            None,
+            "destructive",
+            "denied",
+            &serde_json::json!({}),
+            Some(1500),
+        );
         let snapshot = state::load_activity_snapshot().unwrap();
-        assert_eq!(activity_server_filter_options(&snapshot.recent), vec!["All servers", "team_slack"]);
-        assert_eq!(filter_calls(&snapshot.recent, Some("team_slack"), false).len(), snapshot.recent.len());
+        assert_eq!(
+            activity_server_filter_options(&snapshot.recent),
+            vec!["All servers", "team_slack"]
+        );
+        assert_eq!(
+            filter_calls(&snapshot.recent, Some("team_slack"), false).len(),
+            snapshot.recent.len()
+        );
     }
 
     #[test]
