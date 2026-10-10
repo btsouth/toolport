@@ -2880,6 +2880,7 @@ struct ActivityPage {
     savings_value: gtk::Label,
     savings_unit: gtk::Label,
     savings_detail: gtk::Label,
+    savings_summary: gtk::Label,
     expanded_stat_servers: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
     server_stat_order: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
     expanded_activity_rows: ActivityExpansionState,
@@ -2979,7 +2980,7 @@ impl ActivityPage {
         summary.set_selection_mode(gtk::SelectionMode::None);
         let mut values = Vec::new();
         for (value, label) in [
-            ("–", "Retained calls"),
+            ("–", "Calls saved"),
             ("–", "Success rate"),
             ("–", "Average latency"),
             ("–", "Catalog tokens avoided"),
@@ -3059,7 +3060,10 @@ impl ActivityPage {
             .wrap(true)
             .css_classes(["toolport-muted", "caption"])
             .build();
-        savings_banner.append(&savings_detail);
+        let savings_summary = gtk::Label::builder().xalign(0.0).wrap(true).css_classes(["toolport-muted", "caption"]).build();
+        savings_banner.append(&savings_summary);
+        let savings_counting = gtk::Expander::builder().label("How this is counted").expanded(false).child(&savings_detail).build();
+        savings_banner.append(&savings_counting);
         performance.append(&savings_banner);
 
         performance.append(
@@ -3224,6 +3228,7 @@ impl ActivityPage {
             savings_value,
             savings_unit,
             savings_detail,
+            savings_summary,
             expanded_stat_servers: std::rc::Rc::new(std::cell::RefCell::new(
                 std::collections::HashSet::new(),
             )),
@@ -3403,7 +3408,7 @@ impl ActivityPage {
                 activity_section_changed(
                     previous.map(|snapshot| snapshot.search_traces.as_slice()),
                     &snapshot.search_traces,
-                ),
+                ) || previous.is_some_and(|previous| previous.recent.iter().any(|row| row.internal && row.tool == "search") != snapshot.recent.iter().any(|row| row.internal && row.tool == "search")),
                 activity_section_changed(
                     previous.map(|snapshot| snapshot.inspect_calls.as_slice()),
                     &snapshot.inspect_calls,
@@ -3442,7 +3447,7 @@ impl ActivityPage {
         self.tokens_saved
             .set_label(&format_saved_tokens(snapshot.tokens_saved));
         self.tokens_saved.set_tooltip_text(Some(
-            "cl100k_base tokenizer; net of discovery responses and extra catalog exposure; counted once per session and scoped catalog hash (sessionless HTTP: per listener/client). Historical estimates excluded; not model billing.",
+            "Estimated locally from tool descriptions and search results. Older estimates are excluded; not a billing figure.",
         ));
         self.feedback.set_label("");
         self.feedback.remove_css_class("error");
@@ -3533,7 +3538,7 @@ impl ActivityPage {
         if traces_changed {
             if snapshot.search_traces.is_empty() {
                 self.search_list.append(&empty_activity_label(
-                    "No lazy-discovery searches retained.",
+                    if snapshot.recent.iter().any(|row| row.internal && row.tool == "search") { "Recent activity includes tool searches; detailed search records are no longer available." } else { "Nothing searched yet." },
                 ));
             } else {
                 for trace in &snapshot.search_traces {
@@ -3744,6 +3749,7 @@ impl ActivityPage {
         }
         self.savings_banner.set_visible(true);
         let has_catalog = snapshot.savings_tokenized_loads > 0;
+        self.savings_summary.set_label(if has_catalog { "Tool descriptions your AI clients didn't have to load. Estimated locally; not a billing figure." } else { "Text returned by tool searches, measured on this computer." });
         self.savings_title
             .set_label(savings_title(snapshot.savings_tokenized_loads));
         let (primary, unit) = savings_primary_display(
@@ -3764,7 +3770,7 @@ impl ActivityPage {
         };
         if snapshot.savings_latest_catalog_ts > 0 {
             detail.push_str(&format!(
-                "\nLatest load: {} / {} tools full → {} / {} tools exposed.",
+                "\nLatest load: {} / {} tools available → {} / {} tools loaded.",
                 format_byte_count(snapshot.savings_latest_full_bytes),
                 snapshot.savings_latest_full_tools,
                 format_byte_count(snapshot.savings_latest_exposed_bytes),
@@ -3772,18 +3778,18 @@ impl ActivityPage {
             ));
         }
         if snapshot.savings_measured_loads > 0 {
-            detail.push_str(&format!("\n{} full · {} exposed · {} avoided (exact serialized UTF-8 bytes across {} measured loads)",
+            detail.push_str(&format!("\n{} available · {} loaded · {} avoided across {} measured loads",
                 format_byte_count(snapshot.savings_full_bytes),
                 format_byte_count(snapshot.savings_exposed_bytes),
                 format_byte_count(snapshot.savings_avoided_bytes),
                 snapshot.savings_measured_loads));
             detail.push_str(&format!(
-                " · {} full/load",
+                " · {} available per load",
                 format_byte_count(snapshot.savings_full_bytes / snapshot.savings_measured_loads)
             ));
             if snapshot.savings_extra_bytes > 0 {
                 detail.push_str(&format!(
-                    "\n{} extra exposure on small catalogs.",
+                    "\n{} extra descriptions loaded for small catalogs.",
                     format_byte_count(snapshot.savings_extra_bytes)
                 ));
             }
@@ -3802,8 +3808,8 @@ impl ActivityPage {
             ));
         }
         if has_catalog {
-            detail.push_str("\nCounts tool-definition text with cl100k_base, after discovery text. Does not measure model usage or billing.");
-            self.savings_value.set_tooltip_text(Some("cl100k_base tokenizer; net of discovery responses and extra catalog exposure; counted once per session and scoped full/exposed catalog hash (sessionless HTTP: per listener/client). Historical estimates excluded. Client transformations and caching mean this is not model billing."));
+            detail.push_str("\nDescriptions are counted locally once per client session and catalog version, minus search results and extra descriptions loaded. This is not a billing figure.");
+            self.savings_value.set_tooltip_text(Some("Estimated locally; not a billing figure. Older estimates are excluded."));
         } else {
             detail.push_str(
                 "\nExact text bytes at Toolport's MCP boundary; model token usage may differ.",
@@ -3811,7 +3817,7 @@ impl ActivityPage {
         }
         if snapshot.savings_old_v2_tokens > 0 {
             detail.push_str(&format!(
-                "\nHistorical bytes/4: ≈{} estimated tokens, excluded.",
+                "\nOlder size-based estimate: ≈{} estimated tokens, excluded.",
                 state::format_token_count(snapshot.savings_old_v2_tokens)
             ));
         }
@@ -3871,7 +3877,7 @@ impl ActivityPage {
             match_count.min(RECENT_CALL_PREVIEW_LIMIT)
         };
         self.filter_count.set_label(&format!(
-            "{} tool calls retained · showing {visible_count} of the latest {} events{}",
+            "{} calls saved on this computer. Showing {visible_count} of the latest {}{}.",
             grouped_number(snapshot.call_count as u64),
             snapshot.recent.len(),
             if match_count != snapshot.recent.len() {
@@ -4716,7 +4722,7 @@ fn savings_share_line(tokens_saved: i64, loads: u64, searches: u64, bytes: u64) 
     if loads == 0 {
         return format!("Toolport recorded {searches} discovery searches returning {} of text at its MCP boundary. toolport.app", format_byte_count(bytes));
     }
-    format!("Toolport recorded {}{} catalog tokens avoided after discovery text. Counted with cl100k_base once per session and catalog hash, not model billing. toolport.app", if tokens_saved < 0 { "-" } else { "" }, state::format_token_count(tokens_saved.unsigned_abs()))
+    format!("Toolport recorded {}{} catalog tokens avoided after discovery text. Estimated locally; not a billing figure. toolport.app", if tokens_saved < 0 { "-" } else { "" }, state::format_token_count(tokens_saved.unsigned_abs()))
 }
 
 fn format_byte_count(bytes: u64) -> String {
@@ -9487,6 +9493,73 @@ mod tests {
     }
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn activity_polish_visual_fixture() {
+        use super::*;
+        let data = crate::registry::DataDirTestEnv::new("activity-polish-visual");
+        adw::init().unwrap();
+        let app = adw::Application::builder().application_id("com.tsout.Toolport.PolishFixture").build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        std::fs::write(data.dir.join("audit.jsonl"), format!("{}\n{}\n", serde_json::json!({"ts":now,"kind":"internal","server":"toolport","tool":"search","ok":true,"client":"adapter:codex","clientName":"Codex","durationMs":5}), serde_json::json!({"ts":now-60000,"server":"GitHub","tool":"list_issues","ok":true,"client":"adapter:codex","clientName":"Codex","durationMs":12,"piiReplaced":1}))).unwrap();
+        let activity = ActivityPage::new(&app);
+        let mut snapshot = state::load_activity_snapshot().unwrap();
+        snapshot.tokens_saved = 35100;
+        snapshot.savings_tokenized_loads = 12;
+        snapshot.savings_measured_loads = 12;
+        snapshot.savings_peak_catalog = 75;
+        snapshot.savings_full_bytes = 180000;
+        snapshot.savings_exposed_bytes = 15600;
+        snapshot.savings_avoided_bytes = 164400;
+        snapshot.savings_since_ts = now-86400000;
+        activity.render(snapshot);
+        let counting = activity.savings_detail.parent().unwrap().downcast::<gtk::Expander>().unwrap();
+        assert!(!counting.is_expanded());
+        assert!(!activity.savings_detail.text().contains("cl100k"));
+        assert!(!activity.savings_detail.text().contains("bytes/4"));
+        let server_page = ServerPage {
+            app: app.clone(), server_count: gtk::Label::new(None), enabled_count: gtk::Label::new(None),
+            profile_count: gtk::Label::new(None), section_title: gtk::Label::new(None), posture: gtk::Label::new(None),
+            search: gtk::SearchEntry::new(), feedback: gtk::Label::new(None), list: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            last_snapshot: Default::default(), feedback_timer: Default::default(), health_rows: Default::default(),
+            rows: Default::default(), no_matches: Default::default(), off_heading: Default::default(), health: Default::default(),
+        };
+        let clients = ClientPage::new(&app, server_page);
+        clients.render(state::ClientSnapshot { clients: Vec::new(), profiles: Vec::new(), sessions_error: false, sessions: vec![serde_json::json!({"clientName":"Codex","clientType":"codex","sessionCount":5,"callsToday":60,"lastActiveMs":now-180000,"firstCatalogSize":1711})] });
+        let approvals = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        approvals.set_margin_top(20); approvals.set_margin_bottom(20); approvals.set_margin_start(20); approvals.set_margin_end(20);
+        approvals.append(&gtk::Label::builder().label("Action required").xalign(0.0).css_classes(["title-2"]).build());
+        let broker = crate::approval_broker::start_native();
+        let approval_page = ApprovalPage::new(&app, broker);
+        for (index, name) in ["inbox", "inbox (reported)", "Unrecorded client"].into_iter().enumerate() {
+            let view = crate::approval_broker::PendingView {
+                id: format!("polish-{index}"), client: None, client_name: name.into(), client_label: None,
+                server: "GitHub".into(), tool: "delete_issue".into(), tool_fingerprint: None,
+                reason: crate::approval::ApprovalReason::Destructive, arguments: serde_json::json!({"issue":42}),
+                url_elicitation: None, pii_release: None, deadline_ms: now+120000,
+            };
+            let (card, _) = approval_card(view, approval_page.clone());
+            approvals.append(&card);
+        }
+        let approval_scroll = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).child(&approvals).build();
+        let stack = gtk::Stack::new();
+        stack.add_titled(&clients.root, Some("clients"), "Clients");
+        stack.add_titled(&activity.root, Some("activity"), "Activity");
+        stack.add_titled(&approval_scroll, Some("approvals"), "Approvals");
+        stack.set_vexpand(true);
+        let switcher = gtk::StackSwitcher::builder().stack(&stack).halign(gtk::Align::Center).build();
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.append(&switcher); root.append(&stack);
+        let window = adw::ApplicationWindow::builder().application(&app).title("Toolport polish fixture").default_width(1280).default_height(800).content(&root).build();
+        let theme = theme::ThemeController::new(); theme.attach(&window);
+        window.present();
+        let main_loop = gtk::glib::MainLoop::new(None, false);
+        let stop = main_loop.clone();
+        gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(180), move || stop.quit());
+        main_loop.run();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn session_identity_visual_fixture() {
         use super::*;
         let _data = crate::registry::DataDirTestEnv::new("f3-gtk-identity");
@@ -10208,7 +10281,7 @@ mod tests {
         assert_eq!(savings_detail_line(1, 3, None), "1 catalog load");
         assert_eq!(
             savings_share_line(41_100, 12, 0, 0),
-            "Toolport recorded 41.1k catalog tokens avoided after discovery text. Counted with cl100k_base once per session and catalog hash, not model billing. toolport.app"
+            "Toolport recorded 41.1k catalog tokens avoided after discovery text. Estimated locally; not a billing figure. toolport.app"
         );
         assert_eq!(savings_share_line(0, 0, 3, 12_340), "Toolport recorded 3 discovery searches returning 12.3 KB of text at its MCP boundary. toolport.app");
     }
