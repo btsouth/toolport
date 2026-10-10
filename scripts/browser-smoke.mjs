@@ -90,9 +90,7 @@ try {
   await page.screenshot({ path: path.join(output, "server-tools.png") });
   await page.getByRole("button", { name: "Activity", exact: true }).click();
   await expect(page.getByText("Protection active.", { exact: true })).toBeVisible();
-  await expect(
-    page.getByText("Tool definitions kept out of your agent's context"),
-  ).toBeVisible();
+  await expect(page.getByText("Catalog text avoided")).toBeVisible();
   await expect(
     page.getByRole("main").getByText("35.0k catalog tokens avoided"),
   ).toBeVisible();
