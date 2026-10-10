@@ -4280,7 +4280,9 @@ fn protocol_lane_policy_refusals_explain_the_reason_and_fix() {
             }
         };
         registry::save_to(&path, &reg).unwrap();
-        let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+        let mut client = spawn_adapter(&dir, &AdapterOptions {
+            profile: Some(&profile_id), ..AdapterOptions::default()
+        });
         client.initialize(&format!("protocol-{case}"));
         client.wait_for_tool("__read_item", Duration::from_secs(30));
         for result in [
@@ -4451,4 +4453,38 @@ fn protocol_lane_long_aliases_route_and_survive_reorder_restart_and_old_policy()
         );
     }
     assert_eq!(text_of(&client.call_tool(&aliases[&twin], json!({}))), twin);
+}
+
+#[test]
+fn protocol_lane_long_destructive_names_keep_approval_and_team_source() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (_fixture, dir) = Fixture::new("protocol-long-approval");
+    let original = format!("{}_delete", "account_".repeat(12));
+    let mut tool = protocol_lane_tool(&original, true);
+    tool.as_object_mut().unwrap().remove("annotations");
+    let aliases = conduit_lib::router::Router::server_tool_aliases("files", &[tool.clone()], Default::default());
+    write_registry(&dir, vec![protocol_lane_server(&dir, "files", &[tool])], vec![]);
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).unwrap();
+    reg.set_safety_level(registry::SafetyLevel::Off);
+    reg.team_min_safety_level = registry::SafetyLevel::Ask;
+    registry::save_to(&path, &reg).unwrap();
+    let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+    client.initialize("protocol-long-approval");
+    let alias = &aliases[&original];
+    client.wait_for_tool_where("long alias", |name| name == alias, Duration::from_secs(30));
+    protocol_lane_error(&client.call_tool(alias, json!({})), "approval service was unreachable");
+    assert_eq!(transcript_method_count(&dir.join("transcript-files.jsonl"), "tools/call"), 0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let rows = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
+        if let Some(row) = rows.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).find(|row| row["decision"] == "requested") {
+            assert_eq!(row["safetyLevel"], "ask");
+            assert_eq!(row["safetySource"], "team_floor");
+            assert_eq!(row["gatewayVersion"], env!("CARGO_PKG_VERSION"));
+            break;
+        }
+        assert!(Instant::now() < deadline, "no team approval snapshot: {rows}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }

@@ -3892,7 +3892,7 @@ fn tool_is_destructive_fail_closed(name: &str, cached: &dyn ToolCatalog, router:
         tools
             .iter()
             .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
-            .map(is_destructive)
+            .map(|tool| is_destructive(&router.policy_definition(tool)))
     };
     if let Some(d) = lookup(cached) {
         return d;
