@@ -1336,6 +1336,23 @@ pub fn connect_remote_with_handler(
     progress: Option<ProgressSink>,
     change_dirty: Option<Arc<AtomicU8>>,
 ) -> Result<DownstreamServer, String> {
+    connect_remote_classified(
+        server,
+        server_handler,
+        resource_updated,
+        progress,
+        change_dirty,
+    )
+    .map_err(|error| error.to_string())
+}
+
+pub fn connect_remote_classified(
+    server: &ServerEntry,
+    server_handler: Option<ServerRequestHandler>,
+    resource_updated: Option<ResourceUpdatedSink>,
+    progress: Option<ProgressSink>,
+    change_dirty: Option<Arc<AtomicU8>>,
+) -> Result<DownstreamServer, crate::call_failure::CallFailure> {
     let (resolved, header_values) =
         crate::secret_refs::resolve_connection(server).map_err(|e| e.to_string())?;
     let server = &resolved;
@@ -1350,17 +1367,20 @@ pub fn connect_remote_with_handler(
             change_dirty,
         )
         .map_err(|error| {
-            if is_auth_error(&error) {
+            if is_auth_error(&error.detail) {
                 crate::secret_refs::invalidate_server(server);
             }
-            safe_imported_error(server, error)
+            crate::call_failure::CallFailure::new(
+                error.kind,
+                safe_imported_error(server, error.detail),
+            )
         });
     }
     let url = secrets::get_vault_secret_result(&server.id, secrets::IMPORTED_URL_KEY)
-        .map_err(|_| "Keychain unavailable. Unlock it and retry.")?
-        .ok_or("Missing imported endpoint. Import its native definition again.")?;
+        .map_err(|_| "Keychain unavailable. Unlock it and retry.".to_string())?
+        .ok_or_else(|| "Missing imported endpoint. Import its native definition again.".to_string())?;
     if server.url.as_deref() != Some(&crate::import_credentials::shown_url(&url)) {
-        return Err("The endpoint changed. Review and import its credentials again.".into());
+        return Err("The endpoint changed. Review and import its credentials again.".to_string().into());
     }
     let mut resolved = server.clone();
     resolved.url = Some(url);
@@ -1372,7 +1392,12 @@ pub fn connect_remote_with_handler(
         progress,
         change_dirty,
     )
-    .map_err(|error| safe_imported_error(&resolved, error))
+    .map_err(|error| {
+        crate::call_failure::CallFailure::new(
+            error.kind,
+            safe_imported_error(&resolved, error.detail),
+        )
+    })
 }
 
 /// Keep provider errors from echoing a credential-bearing endpoint after connect.
@@ -1739,7 +1764,7 @@ fn connect_remote_inner(
     resource_updated: Option<ResourceUpdatedSink>,
     progress: Option<ProgressSink>,
     change_dirty: Option<Arc<AtomicU8>>,
-) -> Result<DownstreamServer, String> {
+) -> Result<DownstreamServer, crate::call_failure::CallFailure> {
     guard_connect_target(server)?;
     let legacy_bearer = crate::secret_refs::take_legacy_bearer(server, &mut header_values);
     let mut server_with_headers = server.clone();
@@ -1856,14 +1881,18 @@ fn connect_remote_inner(
     transport.set_resource_updated_sink(protect_resource_updates(server, resource_updated.clone()));
     transport.set_progress_sink(protect_progress(server, progress.clone()));
     transport.set_change_sink(change_dirty.clone());
-    match DownstreamServer::connect(server_id.to_string(), reviewed_transport(server, transport))
-        .map_err(|e| safe_imported_error(server, e))
-    {
+    match DownstreamServer::connect_classified(
+        server_id.to_string(),
+        reviewed_transport(server, transport),
+    )
+    .map_err(|e| {
+        crate::call_failure::CallFailure::new(e.kind, safe_imported_error(server, e.detail))
+    }) {
         Ok(mut ds) => {
             ds.set_call_timeout(request_timeout);
             Ok(ds)
         }
-        Err(e) if is_auth_error(&e) && !crate::secret_refs::has_references(server) => {
+        Err(e) if is_auth_error(&e.detail) && !crate::secret_refs::has_references(server) => {
             // The transport already gets one forced refresh per token on a 401/403.
             // If it spent one during this connect, the vault now holds a token that
             // has ALREADY been rejected, so minting yet another cannot help - and
@@ -1896,7 +1925,8 @@ fn connect_remote_inner(
                             "{vault_error} (the server rejected the credential Toolport sent, and \
                              without the vault there is no way to tell whether it had already been \
                              renewed, so no further token exchange was attempted)"
-                        ));
+                        )
+                        .into());
                     }
                 }
             };
@@ -1920,7 +1950,7 @@ fn connect_remote_inner(
                     transport.set_resource_updated_sink(resource_updated);
                     transport.set_progress_sink(progress);
                     transport.set_change_sink(change_dirty);
-                    DownstreamServer::connect(
+                    DownstreamServer::connect_classified(
                         server_id.to_string(),
                         reviewed_transport(server, transport),
                     )
@@ -1930,7 +1960,7 @@ fn connect_remote_inner(
                     })
                 }
                 Err(refresh_error) if is_refresh_storage_or_lock_error(&refresh_error) => {
-                    Err(refresh_error)
+                    Err(refresh_error.into())
                 }
                 Err(_) => Err(e),
             }

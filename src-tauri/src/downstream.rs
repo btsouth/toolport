@@ -8210,7 +8210,15 @@ impl DownstreamServer {
     /// so the health probe (which connects to every server in one batch) stays
     /// tools-only and fast and can't stall on a slow or hanging resources/prompts
     /// endpoint. The gateway calls `load_resources_prompts` to populate them.
-    pub fn connect(id: String, mut transport: Box<dyn Transport>) -> Result<Self, String> {
+    pub fn connect(id: String, transport: Box<dyn Transport>) -> Result<Self, String> {
+        Self::connect_classified(id, transport).map_err(|error| error.to_string())
+    }
+
+    /// Preserve transport categories for health and recovery UI.
+    pub fn connect_classified(
+        id: String,
+        mut transport: Box<dyn Transport>,
+    ) -> Result<Self, crate::call_failure::CallFailure> {
         transport.set_server_id(&id);
         // Fail the handshake fast so one unresponsive server can't stall the whole
         // batch probe / router rebuild for the full live-call timeout. The transport
@@ -8251,16 +8259,16 @@ impl DownstreamServer {
                 let caps = init.get("capabilities").cloned();
                 transport
                     .notify("notifications/initialized", json!({}))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.call_failure())?;
                 (Era::Legacy { version }, caps)
             }
             // A dead or unresponsive server is not a modern server. Probing it
             // again would just double the wait before reporting the same failure.
-            Err(err) if err.is_health_failure() => return Err(err.to_string()),
+            Err(err) if err.is_health_failure() => return Err(err.call_failure()),
             // Authentication is independent of the protocol era. Probing after
             // an explicit rejection can only replace the actionable error with a
             // secondary protocol failure (#914).
-            Err(err) if err.is_auth_failure() => return Err(err.to_string()),
+            Err(err) if err.is_auth_failure() => return Err(err.call_failure()),
             Err(init_err) => {
                 // The server answered, but refused `initialize`. A modern server
                 // has no such method. Confirm with `server/discover`, which every
@@ -8311,25 +8319,24 @@ impl DownstreamServer {
                                 transport.set_protocol_meta(Some(protocol_meta_for(version)));
                                 transport
                                     .request("server/discover", json!({}))
-                                    .map_err(|e| e.to_string())?
+                                    .map_err(|e| e.call_failure())?
                             }
                             None => {
                                 return Err(format!(
                                     "server speaks MCP {offered:?}; Toolport speaks \
                                      {MODERN_PROTOCOL_VERSION} and cannot negotiate a \
                                      common version ({probe_err})"
-                                ))
+                                )
+                                .into())
                             }
                         }
                     }
-                    // Anything else (an unrecognized error, or silence) identifies
-                    // a legacy server, so the `initialize` refusal is the
-                    // actionable error. Carry the probe failure too: if discover
-                    // timed out rather than being refused, reporting only the
-                    // initialize error hides that connect paid a read timeout.
+                    // Preserve the probe's actionable category while retaining
+                    // the initialize refusal as handshake context.
                     Err(probe_err) => {
-                        return Err(format!(
-                            "{init_err} (server/discover probe also failed: {probe_err})"
+                        return Err(crate::call_failure::CallFailure::new(
+                            probe_err.call_failure().kind,
+                            format!("{init_err} (server/discover probe also failed: {probe_err})"),
                         ))
                     }
                 };
@@ -8373,7 +8380,7 @@ impl DownstreamServer {
             "tools",
             Some(Instant::now() + FIRST_CATALOG_TIMEOUT),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.call_failure())?;
         if let Some(warning) = &listed.warning {
             let msg = format!(
                 "server '{id}' returned a partial tool catalog ({} tool(s)): {warning}",
@@ -8399,7 +8406,8 @@ impl DownstreamServer {
                 "incomplete tool catalog for '{id}' ({} tool(s) before traversal stopped): {}",
                 listed.items.len(),
                 listed.warning.unwrap_or_default()
-            ));
+            )
+            .into());
         }
         let modern_http = matches!(era, Era::Modern { .. }) && transport.supports_request_headers();
         let tools = if modern_http {
@@ -8428,7 +8436,7 @@ impl DownstreamServer {
                     resources_list_changed: caps_resources,
                     resource_subscriptions: Vec::new(),
                 })
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.call_failure())?;
         }
 
         Ok(DownstreamServer {
@@ -9618,6 +9626,40 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn classified_connect_preserves_auth_and_timeout_categories() {
+        use crate::call_failure::CallFailureKind as K;
+        struct Reject(K);
+        impl Transport for Reject {
+            fn request(&mut self, _: &str, _: Value) -> Result<Value, TransportError> {
+                Err(TransportError::Classified(
+                    self.0.clone(),
+                    "untrusted detail".into(),
+                ))
+            }
+            fn notify(&mut self, _: &str, _: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+        for kind in [
+            K::Auth {
+                target: crate::call_failure::AuthTarget::Endpoint,
+            },
+            K::Timeout { after_send: false },
+            K::Unavailable { after_send: false },
+        ] {
+            let failure = match DownstreamServer::connect_classified(
+                "fixture".into(),
+                Box::new(Reject(kind.clone())),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("connection should fail"),
+            };
+            assert_eq!(failure.kind, kind);
+            assert_eq!(failure.detail, "untrusted detail");
+        }
+    }
 
     #[test]
     fn reviewed_debug_trace_redacts_endpoint_errors() {
@@ -15826,6 +15868,68 @@ for line in sys.stdin:
                 .any(|e| *e == expected),
             "the retry must re-stamp between the two sends, got {events:?}"
         );
+    }
+
+    #[test]
+    fn failed_discover_preserves_actionable_failure_after_initialize_refusal() {
+        use crate::call_failure::{AuthTarget, CallFailureKind as K};
+        use std::collections::VecDeque;
+        struct Probe {
+            responses: VecDeque<Result<Value, TransportError>>,
+            methods: Vec<String>,
+        }
+        impl Transport for Probe {
+            fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+                let expected = if self.methods.is_empty() {
+                    "initialize"
+                } else {
+                    "server/discover"
+                };
+                assert_eq!(method, expected);
+                self.methods.push(method.into());
+                self.responses.pop_front().expect("a response per request")
+            }
+            fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+                panic!("a failed handshake must not send notifications")
+            }
+        }
+        for (probe_error, expected) in [
+            (
+                TransportError::Classified(
+                    K::Timeout { after_send: true },
+                    "discover timed out".into(),
+                ),
+                K::Timeout { after_send: true },
+            ),
+            (
+                TransportError::Unavailable("discover unavailable".into()),
+                K::Unavailable { after_send: true },
+            ),
+            (
+                TransportError::Rpc(json!({"code": 403, "message": "access denied"})),
+                K::Auth {
+                    target: AuthTarget::Scope,
+                },
+            ),
+        ] {
+            let transport = Probe {
+                responses: VecDeque::from(vec![
+                    Err(TransportError::Rpc(
+                        json!({"code": -32601, "message": "no initialize"}),
+                    )),
+                    Err(probe_error),
+                ]),
+                methods: Vec::new(),
+            };
+            let failure =
+                match DownstreamServer::connect_classified("mock".into(), Box::new(transport)) {
+                    Err(failure) => failure,
+                    Ok(_) => panic!("failed discover cannot connect"),
+                };
+            assert_eq!(failure.kind, expected);
+            assert!(failure.detail.contains("no initialize"));
+            assert!(failure.detail.contains("server/discover probe also failed"));
+        }
     }
 
     #[test]

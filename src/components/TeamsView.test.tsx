@@ -12,6 +12,9 @@ const api = vi.hoisted(() => ({
   teamAccountLink: vi.fn(),
   teamJoinPoll: vi.fn(),
   teamSync: vi.fn(),
+  teamSyncStatus: vi
+    .fn()
+    .mockResolvedValue({ state: "not_checked", lastSuccessMs: null }),
   teamDisconnect: vi.fn(),
   teamPushPreview: vi.fn(),
   teamPush: vi.fn(),
@@ -710,7 +713,7 @@ describe("TeamsView disconnected pitch", () => {
     // has been answered. A member should never see marketing for the thing they joined,
     // and that covers every piece of it: headings, prices, buttons and pain tiles alike.
     expectNoPitch();
-    expect(screen.getByText("Connected")).toBeInTheDocument();
+    expect(screen.getByText("Linked to team")).toBeInTheDocument();
   });
 
   it("shows no pitch before the registry has loaded", () => {
@@ -911,4 +914,63 @@ it("shows a 202 proposal with an Open action instead of a webview link", async (
   expect(invoke).toHaveBeenCalledWith("team_open_confirmation", {
     url: "https://teams.toolport.app/#changes=t/p",
   });
+});
+
+it("shows an offline result with the last successful sync, and sign-in for a team 401", async () => {
+  api.teamSyncStatus.mockResolvedValueOnce({
+    state: "offline",
+    lastSuccessMs: 1791504000000,
+  });
+  const server = {
+    ...registry.servers[0],
+    id: "team-linear",
+    name: "Team Linear",
+    source: "team:team-1",
+    transport: "http" as const,
+    command: null,
+    url: "https://linear.example/mcp",
+    enabled: true,
+  };
+  render(
+    <TeamsView
+      registry={{ ...registry, version: 3, servers: [server] }}
+      onRegistryChange={vi.fn()}
+      health={{
+        [server.id]: {
+          serverId: server.id,
+          ok: false,
+          toolCount: 0,
+          authRequired: true,
+          authTarget: "endpoint",
+          error: "HTTP 401",
+          failure: { kind: "auth", target: "endpoint" },
+        },
+      }}
+    />,
+  );
+  await screen.findByText("Offline: cannot reach the team server");
+  expect(screen.getByText(/Last successful sync:/)).toHaveTextContent(
+    new Date(1791504000000).toLocaleString(),
+  );
+  expect(screen.getByText("Needs sign-in")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Sign in" })).toBeVisible();
+  expect(screen.queryByText(/None declared/)).not.toBeInTheDocument();
+});
+
+it("does not show another team's successful sync time after switching teams", async () => {
+  api.teamSyncStatus.mockResolvedValueOnce({
+    state: "synced",
+    lastSuccessMs: 1791504000000,
+  });
+  const view = render(<TeamsView registry={registry} onRegistryChange={vi.fn()} />);
+  await screen.findByText("Last sync succeeded");
+  api.teamSyncStatus.mockRejectedValueOnce(new Error("status unavailable"));
+  view.rerender(
+    <TeamsView
+      registry={{ ...registry, team: { ...registry.team!, teamId: "other-team" } }}
+      onRegistryChange={vi.fn()}
+    />,
+  );
+  expect(screen.queryByText("Last sync succeeded")).not.toBeInTheDocument();
+  await screen.findByText("Last successful sync: not recorded yet");
 });

@@ -124,19 +124,19 @@ function PinnedPrerequisites({
     <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
       <div className="flex items-center gap-2 text-xs">
         <Pin className="size-3.5 shrink-0 text-info" />
-        <span className="font-medium">Pinned prerequisites</span>
+        <span className="font-medium">Tools always included</span>
         <span className="rounded-full bg-muted px-1.5 py-0.5 text-muted-foreground">
           {pins.length}
         </span>
         <span className="ml-auto text-muted-foreground">
-          always surfaced in search, with full schema
+          included in every tool search
         </span>
       </div>
       {pins.length === 0 ? (
         <p className="mt-2 max-w-2xl text-xs text-muted-foreground">
-          None yet. Pin a load-bearing tool (auth, list-before-act, or one whose
-          description doesn&apos;t match your keywords) from its card in the server’s
-          Tools tab, so lazy discovery never hides it.
+          None yet. In Servers, open a server's Tools tab and pin tools your agent needs
+          every time, such as sign-in or a required lookup. They will be included even
+          when they do not match the search.
         </p>
       ) : (
         <ul className="mt-2 space-y-1">
@@ -570,13 +570,15 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     ];
   const memberLevel =
     registry?.safetyLevel ??
-    (registry?.denyDestructive ||
-    registry?.quarantineOnDrift ||
-    registry?.blockOnInjection
-      ? "strict"
-      : registry?.humanApproval || registry?.confirmDestructive
-        ? "ask"
-        : "off");
+    (registry && registry.version >= 2
+      ? "ask"
+      : registry?.denyDestructive ||
+          registry?.quarantineOnDrift ||
+          registry?.blockOnInjection
+        ? "strict"
+        : registry?.humanApproval || registry?.confirmDestructive
+          ? "ask"
+          : "off");
   const effectiveLevel =
     safetyLevels[
       Math.max(safetyLevels.indexOf(memberLevel), safetyLevels.indexOf(teamFloor))
@@ -839,12 +841,16 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     settingKey: SettingKey,
     extra?: {
       switchDisabled?: boolean;
+      tooltip?: string;
       hint?: string;
       hintTone?: "muted" | "destructive";
       onRetry?: () => void;
     },
   ) => (
-    <label className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm">
+    <label
+      title={extra?.tooltip}
+      className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm"
+    >
       <Icon className={`size-4 shrink-0 ${on ? accent : "text-muted-foreground"}`} />
       <span className="flex min-w-0 flex-1 flex-col leading-tight">
         <span className="font-medium">{title}</span>
@@ -1011,12 +1017,12 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           Layers,
           lazyDiscovery,
           "text-info",
-          "Lazy discovery",
-          "Default for anonymous connections. Choose Auto or an override in Clients.",
+          "Find tools as needed",
+          "Agents search for the tools they need instead of loading the full list. This is the default for connections without saved client settings. Choose a different behavior in Clients.",
           apply("lazy-discovery", setLazyDiscovery),
           "lazy-discovery",
         )}
-        {/* Pinned prerequisites is a refinement of lazy discovery (the tools it must never
+        {/* Tools always included is a refinement of lazy discovery (the tools it must never
             hide), not a peer feature, so nest it under the Lazy discovery toggle with an
             indent + left rail. It has no meaning when lazy discovery is off, so it collapses
             away entirely then. */}
@@ -1067,10 +1073,19 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           </select>
         </label>
         <p className="text-xs text-muted-foreground">
-          Off runs without approval or blocking. Ask holds destructive calls for human
-          approval. Strict hides destructive tools, quarantines risky drift, blocks
-          high-confidence injection and asks before untrusted calls. Labeling and
-          integrity recording stay on.
+          Ask pauses destructive calls for your approval. Strict also hides destructive
+          tools, pauses risky tool changes, blocks high-confidence injection and asks
+          before untrusted calls. Tool labeling and change history stay on at every level.
+        </p>
+        <p
+          role="status"
+          className="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground"
+        >
+          {effectiveLevel === "off"
+            ? "Safety is set to Off. Toolport does not ask before destructive calls. Server sign-in and client permissions may still ask for approval."
+            : effectiveLevel === "ask"
+              ? "Safety is set to Ask. Destructive calls need your approval before they run."
+              : "Safety is set to Strict. Destructive tools are hidden and untrusted calls need your approval."}
         </p>
         {teamFloor !== "off" && (
           <p className="text-xs">
@@ -1307,9 +1322,13 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             codeMode,
             "text-info",
             "Code mode",
-            "Off by default: enable agents to run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects access scope and human approval. Not a security boundary; turn off to hide toolport_run_script. TOOLPORT_CODE_MODE=1 still forces it on.",
+            "Let agents combine several tool calls in one script to reduce back-and-forth. Each call follows your access and approval settings. Scripts run in a restricted environment, but this does not replace those settings.",
             apply("code-mode", setCodeMode),
             "code-mode",
+            {
+              tooltip:
+                "A gateway started with TOOLPORT_CODE_MODE=1 can keep scripts available even when this setting is off.",
+            },
           )}
 
           {toggle(

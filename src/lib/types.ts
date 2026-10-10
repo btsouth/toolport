@@ -221,7 +221,21 @@ export interface ProbeResult {
   error: string | null;
   /** Failure looks like missing credentials (remote 401/403, or unvaulted secret). */
   authRequired: boolean;
-  authTarget?: "endpoint" | "service_credential" | null;
+  authTarget?: "endpoint" | "service_credential" | "scope" | "oauth_refresh" | null;
+  failure?: {
+    kind:
+      | "auth"
+      | "timeout"
+      | "unavailable"
+      | "server_error"
+      | "quota"
+      | "cancelled"
+      | "internal"
+      | "invalid_input"
+      | "not_found"
+      | "conflict";
+    target?: string;
+  } | null;
 }
 
 /** A tool as advertised by a downstream MCP server (raw `tools/list` entry). */

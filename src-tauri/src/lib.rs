@@ -58,6 +58,7 @@ pub mod shaping;
 pub mod sharing_controller;
 pub mod stdio_adapter;
 pub mod team_activity;
+pub mod team_sync_status;
 pub mod teams;
 pub mod teams_plan;
 pub mod telemetry;

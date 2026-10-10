@@ -195,6 +195,24 @@ try {
   expect(fixture.missing).toEqual([]);
   expect(errors).toEqual([]);
   await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto(`${baseURL}/fixtures/?pages-truth`);
+  await expect(page.getByText("Needs sign-in", { exact: true })).toBeVisible();
+  await expect(page.getByText("Unreachable", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry", exact: true })).toHaveCount(2);
+  await page.getByRole("button", { name: "View log", exact: true }).first().click();
+  await expect(page.getByRole("tab", { name: "Overview", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(page.getByRole("combobox", { name: "Safety" })).toHaveValue("off");
+  await expect(page.getByText(/Safety is set to Off/)).toBeVisible();
+  await expect(page.getByText("Find tools as needed", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  await expect(
+    page.getByText("Offline: cannot reach the team server", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText(/Last successful sync:/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Sign in", exact: true })).toBeVisible();
+  await expect(page.getByText(/None declared/)).toHaveCount(0);
+
   await page.goto(`${baseURL}/fixtures/?teams-review`);
   await page.getByRole("button", { name: "Review team changes", exact: true }).click();
   const memberReview = page.getByRole("dialog");

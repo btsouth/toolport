@@ -852,7 +852,12 @@ function App() {
                   </Button>
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
-                      <Button variant="ghost" size="icon" aria-label="More actions">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label="More actions"
+                        title="Import and server actions"
+                      >
                         <MoreHorizontal className="size-4" />
                       </Button>
                     </DropdownMenuTrigger>
@@ -976,6 +981,8 @@ function App() {
                     <TeamsView
                       registry={registry}
                       onRegistryChange={applyRegistryChange}
+                      health={health}
+                      onReprobe={() => void reprobeAfterMutation().catch(() => {})}
                     />
                   ) : view === "settings" ? (
                     <SettingsView

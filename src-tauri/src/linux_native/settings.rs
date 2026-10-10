@@ -175,27 +175,28 @@ impl SettingsPage {
         let capabilities = gtk::Box::new(gtk::Orientation::Vertical, 0);
         capabilities.add_css_class("toolport-settings-group");
         let (lazy_row, lazy_discovery) = setting_switch_row(
-            "Lazy discovery",
-            "Default for anonymous connections. Choose Auto or an override in Clients.",
+            "Find tools as needed",
+            "Agents search for tools as needed instead of loading the full list. This is the default for connections without saved client settings. Choose a different behavior in Clients.",
         );
         capabilities.append(&lazy_row);
         let (code_row, code_mode) = setting_switch_row(
             "Code mode",
-            "Off by default. Enable agents to combine scoped tool calls in one sandboxed server-side script. TOOLPORT_CODE_MODE=1 forces it on.",
+            "Let agents combine several tool calls in one script to reduce back-and-forth. Each call follows your access and approval settings. Scripts run in a restricted environment, but this does not replace those settings.",
         );
+        code_row.set_tooltip_text(Some("A gateway started with TOOLPORT_CODE_MODE=1 can keep scripts available even when this setting is off."));
         page.append(&capabilities);
 
         let pinned_section = gtk::Box::new(gtk::Orientation::Vertical, 8);
         pinned_section.append(
             &gtk::Label::builder()
-                .label("Pinned prerequisites")
+                .label("Tools always included")
                 .halign(gtk::Align::Start)
                 .css_classes(["heading"])
                 .build(),
         );
         pinned_section.append(
             &gtk::Label::builder()
-                .label("Tools pinned in Server > Tools always surface in lazy discovery with their full schema.")
+                .label("Tools pinned in Servers > Tools are included in every tool search, even when they do not match the search.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
@@ -1002,7 +1003,7 @@ impl SettingsPage {
             self.pinned_list.remove(&child);
         }
         if pins.is_empty() {
-            self.pinned_list.append(&empty_state("No prerequisites are pinned. Pin a load-bearing tool from Server > Tools when lazy discovery must always surface it."));
+            self.pinned_list.append(&empty_state("None yet. In Servers, open a server's Tools tab and pin tools your agent needs every time, such as sign-in or a required lookup."));
             return;
         }
         for pin in pins {
@@ -1667,8 +1668,9 @@ impl SettingsPage {
         self.posture.set_label(&line);
         self.posture.remove_css_class("success");
         self.posture.remove_css_class("error");
-        self.posture
-            .add_css_class(if guarded { "success" } else { "error" });
+        if guarded {
+            self.posture.add_css_class("success");
+        }
         self.posture.set_visible(true);
         self.updating.set(true);
         set_switch(&self.lazy_discovery, settings.lazy_discovery);
@@ -1809,34 +1811,20 @@ fn read_quarantined_tools() -> Result<Vec<QuarantinedTool>, String> {
         .collect())
 }
 
-/// The one-line security stance, mirroring the shipping card: a hard gate
-/// (human approval, destructive deny, or injection block) reads as guarded;
-/// softer measures alone read as partial; nothing reads as open.
+/// Describe the effective policy, including the team's enforced level.
 fn posture_summary(settings: &crate::registry_controller::EssentialSettings) -> (String, bool) {
-    let active: Vec<&str> = [
-        (settings.human_approval, "human approval on"),
-        (settings.deny_destructive, "destructive tools denied"),
-        (settings.confirm_destructive, "destructive calls ask first"),
-        (settings.quarantine_on_drift, "changed tools paused"),
-        (settings.block_on_injection, "injection-like output blocked"),
-    ]
-    .into_iter()
-    .filter_map(|(on, label)| on.then_some(label))
-    .collect();
-    let gated = settings.human_approval || settings.deny_destructive || settings.block_on_injection;
-    if active.is_empty() {
-        return (
-            "Approval gates are off. Tool calls run without a Toolport approval or blocking gate."
-                .to_string(),
-            false,
+    use crate::registry::SafetyLevel;
+    let (mut line, guarded) = match settings.safety_level {
+        SafetyLevel::Off => ("Safety is set to Off. Toolport does not ask before destructive calls. Server sign-in and client permissions may still ask for approval.".to_string(), false),
+        SafetyLevel::Ask => ("Safety is set to Ask. Destructive calls need your approval before they run.".to_string(), true),
+        SafetyLevel::Strict => ("Safety is set to Strict. Destructive tools are hidden and untrusted calls need your approval.".to_string(), true),
+    };
+    if settings.quarantine_on_drift_forced || settings.block_on_injection_forced {
+        line.push_str(
+            " Your team also requires protection against risky tool changes or injection.",
         );
     }
-    let label = if gated {
-        "Guardrails active"
-    } else {
-        "Some guardrails active"
-    };
-    (format!("{label}. Active: {}.", active.join(", ")), gated)
+    (line, guarded)
 }
 
 /// Which profile scopes a re-approve-all pass must clear, in first-seen order.
@@ -2485,25 +2473,25 @@ mod tests {
     }
 
     #[test]
-    fn posture_reads_guarded_partial_or_open_by_gate_strength() {
+    fn posture_describes_the_effective_level_without_an_alarm_for_off() {
         let mut settings = crate::registry_controller::EssentialSettings::default();
+        settings.safety_level = crate::registry::SafetyLevel::Off;
         let (line, guarded) = posture_summary(&settings);
-        assert!(line.starts_with("Approval gates are off."));
+        assert!(line.starts_with("Safety is set to Off."));
+        assert!(line.contains("Server sign-in and client permissions"));
         assert!(!guarded);
+        // A leftover 1.x mirror is not an effective policy.
         settings.confirm_destructive = true;
-        let (line, guarded) = posture_summary(&settings);
-        assert_eq!(
-            line,
-            "Some guardrails active. Active: destructive calls ask first."
-        );
-        assert!(!guarded);
-        settings.human_approval = true;
-        let (line, guarded) = posture_summary(&settings);
-        assert_eq!(
-            line,
-            "Guardrails active. Active: human approval on, destructive calls ask first."
-        );
-        assert!(guarded);
+        assert_eq!(posture_summary(&settings).0, line);
+        settings.safety_level = crate::registry::SafetyLevel::Ask;
+        assert!(posture_summary(&settings)
+            .0
+            .contains("Destructive calls need your approval"));
+        assert!(posture_summary(&settings).1);
+        settings.quarantine_on_drift_forced = true;
+        assert!(posture_summary(&settings)
+            .0
+            .contains("Your team also requires"));
     }
 
     #[test]

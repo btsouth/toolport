@@ -1,7 +1,17 @@
 import { referenceProvider } from "@/lib/secretRefs";
 import { lazy, Suspense, useEffect, useState } from "react";
-import { ChevronDown, Copy, KeyRound, LogIn, Pencil, Trash2, Users } from "lucide-react";
+import {
+  ChevronDown,
+  Copy,
+  RefreshCw,
+  KeyRound,
+  LogIn,
+  Pencil,
+  Trash2,
+  Users,
+} from "lucide-react";
 import { isDownloadLauncher } from "@/lib/launcher";
+import { serverFailureLabel } from "@/lib/serverHealth";
 import { errorHeadline, shortenUrls } from "@/lib/errors";
 import { toast } from "sonner";
 import type { ProbeResult, Registry, ServerEntry } from "@/lib/types";
@@ -119,15 +129,11 @@ export function RegistryServerRow({
 
   const label =
     status === "needs-auth"
-      ? health?.authTarget === "service_credential"
-        ? "Service credential required"
-        : health?.authTarget === "endpoint"
-          ? "MCP endpoint auth required"
-          : "Authentication required"
+      ? serverFailureLabel(health!)
       : status === "connected"
         ? `Ready · ${health?.toolCount ?? 0} tool${health?.toolCount === 1 ? "" : "s"}`
         : status === "error"
-          ? "Error"
+          ? serverFailureLabel(health!)
           : status === "checking"
             ? initializing
               ? launcher
@@ -205,7 +211,7 @@ export function RegistryServerRow({
                 ? launcher
                   ? "Installing the server package"
                   : "Server initializing"
-                : status === "needs-auth"
+                : status === "needs-auth" || status === "error"
                   ? label
                   : status === "connected"
                     ? label.replace(" · ", ", ")
@@ -237,8 +243,40 @@ export function RegistryServerRow({
             <StatusLabel status={status} label={label} error={health?.error ?? null} />
           )}
 
+          {health && !health.ok && health.error && (
+            <span className="flex gap-1">
+              {status === "error" && onReprobe && (
+                <button
+                  type="button"
+                  title={`Retry ${server.name} connection`}
+                  className={ACTION}
+                  disabled={busy}
+                  onClick={(e) => {
+                    stop(e);
+                    onReprobe();
+                  }}
+                >
+                  <RefreshCw className="size-3.5" aria-hidden="true" />
+                  Retry
+                </button>
+              )}
+              <button
+                type="button"
+                title="View the connection error and server output"
+                className={ACTION}
+                onClick={(e) => {
+                  stop(e);
+                  setExpanded(true);
+                  setDetailTab("overview");
+                }}
+              >
+                View log
+              </button>
+            </span>
+          )}
           <button
             type="button"
+            title={expanded ? "Hide server details" : "Show server details"}
             onClick={(e) => {
               e.stopPropagation();
               setExpanded((v) => !v);
@@ -303,7 +341,7 @@ export function RegistryServerRow({
                   {target}
                 </code>
               )}
-              {status === "error" && health?.error && (
+              {health && !health.ok && health.error && (
                 <div className="flex flex-col gap-1">
                   {/* Lead with a readable headline so the useful signal (exit status,
                   EADDRINUSE, a 401) isn't buried under a stack trace + a giant

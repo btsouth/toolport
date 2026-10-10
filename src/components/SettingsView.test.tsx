@@ -593,3 +593,47 @@ describe("Remove Toolport from all clients", () => {
     expect(disconnectAllClients).toHaveBeenCalledTimes(1);
   });
 });
+
+it.each([
+  [3, undefined, "ask"],
+  [3, "off", "off"],
+  [1, undefined, "off"],
+] as const)(
+  "matches backend defaults for registry v%s and safety %s",
+  (version, safetyLevel, expected) => {
+    render(
+      <ThemeProvider>
+        <SettingsView
+          registry={{ ...registry, version, safetyLevel }}
+          onRegistryChange={vi.fn()}
+        />
+      </ThemeProvider>,
+    );
+    expect(screen.getByRole("combobox", { name: "Safety" })).toHaveValue(expected);
+    expect(
+      screen.getByText(
+        new RegExp(`Safety is set to ${expected === "ask" ? "Ask" : "Off"}`),
+      ),
+    ).toBeInTheDocument();
+  },
+);
+
+it("shows a team's Ask minimum even when the member chose Off", () => {
+  render(
+    <ThemeProvider>
+      <SettingsView
+        registry={{
+          ...registry,
+          version: 3,
+          safetyLevel: "off",
+          teamMinSafetyLevel: "ask",
+        }}
+        onRegistryChange={vi.fn()}
+      />
+    </ThemeProvider>,
+  );
+  expect(screen.getByRole("combobox", { name: "Safety" })).toHaveValue("ask");
+  expect(
+    screen.getByText(/Destructive calls need your approval before they run/),
+  ).toBeInTheDocument();
+});

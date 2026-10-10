@@ -1999,7 +1999,11 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
                     failures = 0;
                     3
                 }
-                Ok(true) => match teams::sync_wait(25) {
+                Ok(true) => match {
+                    let result = teams::sync_wait(25);
+                    let _ = handle.emit("team-sync-status", crate::team_sync_status::current());
+                    result
+                } {
                     Ok(result) => {
                         failures = 0;
                         if stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -2085,6 +2089,12 @@ async fn team_instructions_status() -> Option<teams::InstructionsStatusView> {
         .await
         .ok()
         .flatten()
+}
+
+#[tauri::command]
+async fn team_sync_status() -> crate::team_sync_status::SyncStatus {
+    tauri::async_runtime::spawn_blocking(crate::team_sync_status::current)
+        .await.unwrap_or_default()
 }
 
 // --- Agent hook sensor (SBS-822), retired -------------------------------------
@@ -4119,6 +4129,7 @@ pub fn run() {
             team_sync_wait,
             main_window_visible,
             team_instructions_status,
+            team_sync_status,
             team_disconnect,
             team_push_preview,
             team_pair_state,

@@ -1123,7 +1123,7 @@ pub enum SyncResult {
 }
 
 pub fn sync_now() -> Result<SyncResult, String> {
-    sync_inner(0)
+    sync_recorded(0)
 }
 
 /// Long-polling variant of [`sync_now`]: the config pull parks on the server for up to
@@ -1131,7 +1131,7 @@ pub fn sync_now() -> Result<SyncResult, String> {
 /// edit enforces in about a second. The membership heartbeat still runs first each cycle,
 /// so removal and role changes are caught at least once per cycle. The caller loops.
 pub fn sync_wait(wait_secs: u64) -> Result<SyncResult, String> {
-    sync_inner(wait_secs)
+    sync_recorded(wait_secs)
 }
 
 /// Bounded retry pacing for native lifecycle owners; independent of window visibility.
@@ -1145,7 +1145,7 @@ pub fn retry_delay_seconds(failures: u32) -> u64 {
 
 static SYNC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
+fn sync_recorded(wait_secs: u64) -> Result<SyncResult, String> {
     let _sync = SYNC_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1160,6 +1160,25 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         }
         Ok(())
     })?;
+    let conn = crate::registry::load()?.team;
+    let result = sync_inner(wait_secs);
+    if let Some(conn) = conn {
+        // The status receipt is private local metadata. Keep the network failure
+        // visible even if its receipt cannot be saved.
+        if let Err(status_error) = crate::team_sync_status::record(
+            &conn,
+            result.as_ref().map(|_| ()).map_err(|e| e.as_str()),
+        ) {
+            return Err(match result {
+                Err(sync_error) => format!("{sync_error}. Sync status could not be saved: {status_error}"),
+                Ok(_) => format!("Sync completed, but its status could not be saved: {status_error}"),
+            });
+        }
+    }
+    result
+}
+
+fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
     // Snapshot only what the network calls need; do NOT hold this copy to save later.
     let conn = {
         let reg = crate::registry::load()?;
