@@ -1704,7 +1704,7 @@ mod tests {
     fn missing_sync_sign_in_gives_account_guidance_without_claiming_success() {
         crate::secrets::tests::with_isolated_vault(|| {
             crate::registry::save(&machine()).unwrap();
-            let error = crate::teams::sync_now().unwrap_err();
+            let error = crate::teams::sync_now().err().expect("missing sign-in must fail");
             assert!(error.contains("Sign in again"));
             assert!(!error.contains("team token"));
             let reg = crate::registry::load().unwrap();
