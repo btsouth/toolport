@@ -218,10 +218,24 @@ fn migrate_source_pins(
     if !pins.values().any(|pin| !pin.raw) {
         return pins;
     }
-    let cache = profile_file(profile, "tool-cache-v2-", "tool-cache.json")
-        .map(|path| path.with_extension("servers.json"))
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let cache_path = |profile| {
+        profile_file(profile, "tool-cache-v2-", "tool-cache.json")
+            .map(|path| path.with_extension("servers.json"))
+    };
+    let cache = cache_path(profile).and_then(|path| {
+        // Older gateways only wrote the union cache. Its definitions still need to
+        // prove the profile's own fingerprint; missing evidence never grants trust.
+        let bytes = match std::fs::read(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && profile.is_some() => {
+                std::fs::read(cache_path(None)?)
+            }
+            result => result,
+        };
+        bytes
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    });
+    let registry = crate::registry::load().ok();
     for tool in current.source_values() {
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
             continue;
@@ -234,42 +248,70 @@ fn migrate_source_pins(
             old.parameters = Some(input_parameters(tool));
             continue;
         }
-        let Some((server, original)) = name.split_once("__") else {
-            continue;
-        };
-        let Some(tools) = cache
+        let Some(servers) = cache
             .as_ref()
-            .and_then(|cache| cache["servers"][server]["tools"].as_array())
+            .and_then(|cache| cache["servers"].as_object())
         else {
             continue;
         };
-        let mut candidates = tools.iter().filter(|tool| {
-            tool["name"]
-                .as_str()
-                .is_some_and(|name| crate::router::sanitize_segment(name) == original)
-        });
-        let Some(cached) = candidates.next() else {
-            continue;
-        };
-        // Colliding or overridden aliases cannot establish a unique source baseline.
-        if candidates.next().is_some() {
+        let mut candidates = Vec::new();
+        for (id, server) in servers {
+            let prefix = crate::router::sanitize_segment(id);
+            // Sanitization is lossy. A matching hash cannot disambiguate identities.
+            if servers
+                .keys()
+                .filter(|id| crate::router::sanitize_segment(id) == prefix)
+                .count()
+                != 1
+            {
+                continue;
+            }
+            for cached in server["tools"].as_array().into_iter().flatten() {
+                let Some(original) = cached["name"].as_str() else {
+                    continue;
+                };
+                let override_ = registry
+                    .as_ref()
+                    .and_then(|registry| registry.tool_overrides.get(id))
+                    .and_then(|overrides| overrides.get(original));
+                let base = format!("{prefix}__{}", crate::router::sanitize_segment(original));
+                let renamed = override_
+                    .and_then(|override_| override_.name.as_deref())
+                    .map(crate::router::sanitize_segment);
+                if base == name || renamed.as_deref() == Some(name) {
+                    candidates.push((cached, override_));
+                }
+            }
+        }
+        if candidates.len() != 1 {
             continue;
         }
+        let (cached, override_) = candidates[0];
         let mut source = cached.clone();
         source["name"] = json!(name);
-        let mut projected = source.clone();
-        if let Some(schema) = projected.get_mut("inputSchema") {
-            crate::router::normalize_tool_schema(schema);
-            crate::router::inline_refs(schema);
-        }
-        let mut refs_only = source.clone();
-        if let Some(schema) = refs_only.get_mut("inputSchema") {
-            crate::router::inline_refs(schema);
-        }
-        if old.fp != fingerprint(&source)
-            && old.fp != fingerprint(&projected)
-            && old.fp != fingerprint(&refs_only)
-        {
+        let verified = [false, true].into_iter().any(|with_override| {
+            let mut projection = source.clone();
+            if with_override {
+                if let Some(description) =
+                    override_.and_then(|override_| override_.description.as_ref())
+                {
+                    projection["description"] = json!(description);
+                }
+            }
+            let raw_fp = fingerprint(&projection);
+            let mut refs_only = projection.clone();
+            if let Some(schema) = refs_only.get_mut("inputSchema") {
+                crate::router::inline_refs(schema);
+            }
+            if let Some(schema) = projection.get_mut("inputSchema") {
+                crate::router::normalize_tool_schema(schema);
+                crate::router::inline_refs(schema);
+            }
+            old.fp == raw_fp
+                || old.fp == fingerprint(&refs_only)
+                || old.fp == fingerprint(&projection)
+        });
+        if !verified {
             continue;
         }
         *old = Pin {
@@ -4116,6 +4158,79 @@ mod tests {
             check(None, &vec![changed]).unwrap()[0]["changed_fields"],
             json!(["description"])
         );
+    }
+
+    #[test]
+    fn source_migration_resolves_dashed_ids_renames_overrides_and_union_cache() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("migration-aliases");
+        let mut registry = crate::registry::Registry::default();
+        registry.set_tool_override(
+            "cloudflare-full-api".into(),
+            "update".into(),
+            crate::registry::ToolOverride {
+                name: Some("my_update".into()),
+                description: Some("Local description".into()),
+                ..Default::default()
+            },
+        );
+        crate::registry::save(&registry).unwrap();
+        let cached = json!({"name":"update", "description":"Upstream", "inputSchema":{"properties":{"ttl":{"maximum":"100"}}}});
+        let cache = profile_file(None, "tool-cache-v2-", "tool-cache.json")
+            .unwrap()
+            .with_extension("servers.json");
+        std::fs::write(
+            &cache,
+            json!({"servers":{"cloudflare-full-api":{"tools":[cached.clone()]}}}).to_string(),
+        )
+        .unwrap();
+        // Each case has its own legacy trust root, including the profile whose cache is absent.
+        for (profile, name, description) in [
+            (None, "cloudflare_full_api__update", "Upstream"),
+            (None, "my_update", "Upstream"),
+            (None, "my_update", "Local description"),
+            (
+                Some("profile-without-cache"),
+                "my_update",
+                "Local description",
+            ),
+        ] {
+            let mut source = cached.clone();
+            source["name"] = json!(name);
+            let mut client = source.clone();
+            client["description"] = json!(description);
+            crate::router::normalize_tool_schema(&mut client["inputSchema"]);
+            let mut legacy = pin_of(&client);
+            legacy.raw = false;
+            let pins = BTreeMap::from([(name.to_string(), legacy)]);
+            let migrated = migrate_source_pins(profile, pins.clone(), &vec![source.clone()]);
+            assert!(migrated[name].raw, "{profile:?} {name} {description}");
+            assert_eq!(migrated[name].fp, fingerprint(&source));
+            let mut changed = source;
+            changed["description"] = json!("Changed upstream");
+            assert_ne!(
+                migrate_source_pins(profile, pins, &vec![changed.clone()])[name].fp,
+                fingerprint(&changed)
+            );
+        }
+        // Two real ids sharing a namespace cannot prove which raw definition was pinned.
+        std::fs::write(
+            &cache,
+            json!({"servers":{
+                "cloudflare-full-api":{"tools":[cached.clone()]},
+                "cloudflare_full_api":{"tools":[cached.clone()]}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let mut source = cached;
+        source["name"] = json!("cloudflare_full_api__update");
+        let mut projected = source.clone();
+        crate::router::normalize_tool_schema(&mut projected["inputSchema"]);
+        let mut legacy = pin_of(&projected);
+        legacy.raw = false;
+        let pins = BTreeMap::from([("cloudflare_full_api__update".to_string(), legacy)]);
+        assert!(!migrate_source_pins(None, pins, &vec![source])["cloudflare_full_api__update"].raw);
     }
 
     #[test]
