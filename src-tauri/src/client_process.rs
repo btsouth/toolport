@@ -1,6 +1,6 @@
 //! Best-effort local process attribution, never an authorization principal.
-//! Only basenames survive the bounded parent walk. Interpreters read argv[1] only;
-//! no other arguments, environment or cwd are retained.
+//! Only safe names survive the bounded parent walk. Interpreter arguments are
+//! inspected with a fixed cap; no arguments, environment or cwd are retained.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -107,34 +107,64 @@ fn is_interpreter(name: &str) -> bool {
 }
 
 fn command_basename(arg: &str) -> Option<String> {
-    // Options and inline programs are not script names. Never search later args.
-    if arg.is_empty() || arg.starts_with('-') {
+    // Options, launch verbs and inline programs are not script names.
+    if arg.is_empty() || arg.starts_with('-') || matches!(arg, "run" | "exec" | "x") {
         return None;
     }
     let basename = arg.rsplit(['/', '\\']).next()?;
+    let stem = basename.rsplit_once('.').map_or(basename, |(stem, _)| stem);
+    if matches!(stem, "index" | "main" | "cli" | "server" | "__main__") {
+        let mut parents = arg.rsplit(['/', '\\']).skip(1).take(3);
+        let parent = parents
+            .find(|part| !matches!(*part, "" | "." | ".." | "bin" | "src" | "dist" | "lib"))?;
+        let safe = crate::session_observability::display_label(parent)?;
+        return (safe == parent && !is_interpreter(parent)).then_some(safe);
+    }
     crate::session_observability::display_label(basename)
         .map(|name| crate::approval::shorten_client_label(&name, 48))
 }
 
-#[cfg(target_os = "linux")]
-fn interpreter_command(pid: u32) -> Option<String> {
-    use std::io::{BufRead, Read};
-    // Stop after argv[1], with a fixed cap even for maliciously long arguments.
-    let file = std::fs::File::open(format!("/proc/{pid}/cmdline")).ok()?;
-    let mut reader = std::io::BufReader::new(file.take(4096));
-    let mut arg = Vec::new();
-    for _ in 0..2 {
-        arg.clear();
-        reader.read_until(0, &mut arg).ok()?;
-        if arg.pop()? != 0 {
+fn interpreter_script<'a>(name: &str, mut args: impl Iterator<Item = &'a str>) -> Option<String> {
+    let stem = name.trim_end_matches(".exe").to_ascii_lowercase();
+    let shell = matches!(
+        stem.as_str(),
+        "sh" | "bash" | "dash" | "zsh" | "fish" | "cmd" | "pwsh" | "powershell"
+    );
+    for arg in args.by_ref().take(32) {
+        // Do not mistake an inline command or a module/option value for a script.
+        if shell
+            && (arg.eq_ignore_ascii_case("/c")
+                || arg.eq_ignore_ascii_case("/k")
+                || arg.eq_ignore_ascii_case("-command")
+                || arg.eq_ignore_ascii_case("-encodedcommand")
+                || (arg.starts_with('-') && arg.trim_start_matches('-').contains('c')))
+            || (stem.starts_with("python") && matches!(arg, "-m" | "-c"))
+            || matches!(arg, "-e" | "--eval" | "-p" | "--print")
+        {
             return None;
         }
+        if arg.starts_with('-') || matches!(arg, "run" | "exec" | "x") || is_interpreter(arg) {
+            continue;
+        }
+        return command_basename(arg);
     }
-    command_basename(std::str::from_utf8(&arg).ok()?)
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn interpreter_command(pid: u32, name: &str) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(format!("/proc/{pid}/cmdline")).ok()?;
+    let mut buf = Vec::new();
+    file.take(4096).read_to_end(&mut buf).ok()?;
+    // Ignore the final fragment when the cap cuts through an argument.
+    let end = buf.iter().rposition(|b| *b == 0)?;
+    let argv = std::str::from_utf8(&buf[..end]).ok()?;
+    interpreter_script(name, argv.split('\0').skip(1))
 }
 
 #[cfg(target_os = "macos")]
-fn interpreter_command(pid: u32) -> Option<String> {
+fn interpreter_command(pid: u32, name: &str) -> Option<String> {
     // XNU requires room for the whole argument area, otherwise it can return its
     // tail (environment strings). Query the kernel limit before reading it.
     let mut argmax_mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
@@ -171,7 +201,7 @@ fn interpreter_command(pid: u32) -> Option<String> {
         return None;
     }
     let argv = procargs_argv(buf.get(..size)?)?;
-    command_basename(argv.get(1)?)
+    interpreter_script(name, argv.into_iter().skip(1))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -211,7 +241,7 @@ fn process(pid: u32) -> Option<(Generation, String)> {
                         .map(|n| n.trim().to_string())
                 })?;
             if is_interpreter(&name) {
-                interpreter_command(pid)
+                Some(interpreter_command(pid, &name).unwrap_or(name))
             } else {
                 Some(name)
             }
@@ -251,7 +281,7 @@ fn process(pid: u32) -> Option<(Generation, String)> {
                 .ok()?;
             let name = Path::new(path).file_name()?.to_str()?.to_string();
             if is_interpreter(&name) {
-                interpreter_command(pid)
+                Some(interpreter_command(pid, &name).unwrap_or(name))
             } else {
                 Some(name)
             }
@@ -320,9 +350,8 @@ fn process(pid: u32) -> Option<(Generation, String)> {
         found
     }?;
     let after = windows_generation(pid)?;
-    // If command attribution is unavailable, let clientInfo supply a reported
-    // label rather than presenting a generic interpreter as a trusted app.
-    (before == after && !is_interpreter(&found.1)).then_some((
+    // Keep launchers in the chain so the walk can reach their owning app.
+    (before == after).then_some((
         Generation {
             parent: found.0,
             started: before,
@@ -360,6 +389,73 @@ fn process(_: u32) -> Option<(Generation, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interpreter_wrappers_keep_walking_and_scripts_get_safe_names() {
+        let cases: &[(&str, &[&str], Option<&str>)] = &[
+            ("sh", &["-c", "secret inline command"], None),
+            ("bash", &["-lc", "secret inline command"], None),
+            ("zsh", &["-l", "-c", "secret inline command"], None),
+            ("python", &["-m", "x"], None),
+            ("node", &["--flag", "x.js"], Some("x.js")),
+            ("npx", &["-y", "pkg"], Some("pkg")),
+            ("cmd.exe", &["/c", "npx"], None),
+            (
+                "uv",
+                &["run", "python", "/private/inbox.py"],
+                Some("inbox.py"),
+            ),
+            ("bun", &["run", "/private/inbox.js"], Some("inbox.js")),
+            (
+                "deno",
+                &["run", "--allow-read", "/private/inbox.ts"],
+                Some("inbox.ts"),
+            ),
+            ("uv", &["exec", "x", "/private/inbox.py"], Some("inbox.py")),
+            ("node", &["/private/pkg/index.js"], Some("pkg")),
+            ("node", &["/private/pkg/bin/cli.js"], Some("pkg")),
+            ("python", &["/private/pkg/main.py"], Some("pkg")),
+            ("node", &["/private/pkg/server.js"], Some("pkg")),
+            ("python", &["/private/pkg/__main__.py"], Some("pkg")),
+            ("node", &["index.js"], None),
+            (
+                "node",
+                &["/private/sk-live-abcdefghijk123456789/index.js"],
+                None,
+            ),
+            ("node", &["/private/https:secret/cli.js"], None),
+            ("node", &["--eval", "secret inline command"], None),
+        ];
+        for &(interpreter, args, expected) in cases {
+            let script = interpreter_script(interpreter, args.iter().copied());
+            assert_eq!(script.as_deref(), expected, "{interpreter} {args:?}");
+            let name = script.unwrap_or_else(|| interpreter.into());
+            assert_eq!(
+                walk(10, |pid| Some((
+                    Generation {
+                        parent: if pid == 10 {
+                            9
+                        } else if pid == 9 {
+                            8
+                        } else {
+                            1
+                        },
+                        started: pid as u64
+                    },
+                    if pid == 10 {
+                        "toolport-gateway".into()
+                    } else if pid == 9 {
+                        name.clone()
+                    } else {
+                        "Cursor".into()
+                    },
+                )))
+                .as_deref(),
+                Some(expected.unwrap_or("Cursor")),
+                "{interpreter} {args:?}"
+            );
+        }
+    }
+
     #[test]
     fn macos_procargs_respects_argc_and_rejects_truncation() {
         fn buffer(argc: i32, argv: &[u8]) -> Vec<u8> {
