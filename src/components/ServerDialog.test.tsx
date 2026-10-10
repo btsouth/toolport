@@ -530,3 +530,17 @@ describe("ServerDialog", () => {
     expect(screen.queryByText(/Connected\. Found/)).not.toBeInTheDocument();
   });
 });
+
+it("marks a new server local-only in its first saved definition", async () => {
+  const user = userEvent.setup();
+  api.addServer.mockResolvedValue(savedRegistry("demo"));
+  render(<ServerDialog autoOpen onSaved={vi.fn()} />);
+  await fillServer(user, "echo");
+  await user.click(screen.getByRole("checkbox", { name: "This machine only" }));
+  await user.click(screen.getByRole("button", { name: "Add" }));
+  await waitFor(() =>
+    expect(api.addServer).toHaveBeenCalledWith(
+      expect.objectContaining({ syncLocalOnly: true }),
+    ),
+  );
+});

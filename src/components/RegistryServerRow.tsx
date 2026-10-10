@@ -478,7 +478,11 @@ export function RegistryServerRow({
                         </button>
                       }
                       title={`Remove ${server.name}?`}
-                      description="This deletes the server from Toolport. Any saved secrets stay in your keychain."
+                      description={
+                        personalSync && !server.syncLocalOnly
+                          ? "This removes the server from Toolport and your other machines. Any saved secrets stay in your keychain."
+                          : "This deletes the server from Toolport on this machine. Any saved secrets stay in your keychain."
+                      }
                       confirmLabel="Remove"
                       destructive
                       onConfirm={onRemove}

@@ -1529,7 +1529,7 @@ fn current(r: &Registry, c: &crate::registry::TeamConnection) -> bool {
 pub fn pending_review_count(reg: &Registry) -> usize {
     reg.servers
         .iter()
-        .filter(|s| s.needs_team_enable_review() && !keep_local(s))
+        .filter(|s| !reg.server_enabled(&s.id) && s.needs_team_enable_review() && !keep_local(s))
         .count()
 }
 pub fn banner(reg: &Registry) -> (String, bool) {
@@ -1824,6 +1824,7 @@ mod tests {
         save(&mut r, &st).unwrap();
         let mut s: ServerEntry = serde_json::from_value(http("docs")).unwrap();
         s.require_team_enable_review();
+        s.unknown_fields.insert("personalSyncEntry".into(), json!(true));
         r.servers.push(s);
         assert_eq!(
             banner(&r),
@@ -1877,7 +1878,7 @@ mod tests {
         let right = conflict_fields(Some(&b));
         assert_eq!(left["Name"], "Toolport docs");
         assert_ne!(left["URL"], right["URL"]);
-        assert_eq!(right["Argument 1"], "line\u{000A}next");
+        assert_eq!(right["Argument 1"], r"line\u{000A}next");
     }
     #[test]
     fn personal_pairing_copy_and_custom_origin_are_accurate() {

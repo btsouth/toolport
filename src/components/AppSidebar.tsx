@@ -602,6 +602,8 @@ export function AppSidebar({
             paired ? (isPersonalSync(registry) ? "Sync" : "Team") : "Sign in to sync",
             view === "teams",
             () => onSelectView("teams"),
+            registry?.servers.filter((s) => s.teamEnableReview === true && !s.enabled)
+              .length ?? 0,
           )}
         </nav>
 

@@ -1716,7 +1716,7 @@ impl ServerPage {
             previous
                 .iter()
                 .find(|(_, row)| focus.is_ancestor(row) || focus == row.upcast_ref::<gtk::Widget>())
-                .map(|(server, _)| server.id.clone())
+                .map(|(server, row)| (server.id.clone(), focus_path(focus, row.upcast_ref())))
         });
         // Remove headings only; unchanged cards retain focus and widget identity.
         let mut child = self.list.first_child();
@@ -1789,10 +1789,10 @@ impl ServerPage {
                 self.list.remove(card);
             }
         }
-        if let Some(id) = focused_row {
+        if let Some((id, path)) = focused_row {
             if focused.as_ref().is_some_and(|w| w.root().is_none()) {
                 if let Some((_, card)) = rows.iter().find(|(s, _)| s.id == id) {
-                    card.child_focus(gtk::DirectionType::TabForward);
+                    if let Some(widget) = follow_focus_path(card.upcast_ref(), &path) { widget.grab_focus(); }
                 }
             }
         }
@@ -6919,6 +6919,19 @@ fn run_profile_mutation(
     });
 }
 
+fn focus_path(widget: &gtk::Widget, root: &gtk::Widget) -> Vec<usize> {
+    let mut current = widget.clone(); let mut path = Vec::new();
+    while &current != root {
+        let Some(parent) = current.parent() else { break; };
+        let mut child = parent.first_child(); let mut index = 0;
+        while let Some(w) = child { if w == current { break; } child = w.next_sibling(); index += 1; }
+        path.push(index); current = parent;
+    }
+    path.reverse(); path
+}
+fn follow_focus_path(root: &gtk::Widget, path: &[usize]) -> Option<gtk::Widget> {
+    let mut current = root.clone(); for index in path { let mut child = current.first_child()?; for _ in 0..*index { child = child.next_sibling()?; } current = child; } Some(current)
+}
 fn set_nav_label(button: &gtk::Button, text: &str) {
     if let Some(label) = button
         .child()
@@ -9814,6 +9827,44 @@ fn state_card(icon_name: &str, title: &str, body: &str, error: bool) -> gtk::Box
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn personal_sync_rows_keep_menu_focus_icon_and_notice_space() {
+        adw::init().unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("gtk-personal-sync-rows");
+        let app = adw::Application::builder().flags(gtk::gio::ApplicationFlags::NON_UNIQUE).build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let (root, page, _) = super::build_content(&app, crate::approval_broker::start_native());
+        let window = adw::ApplicationWindow::builder().application(&app).content(&root).build();
+        let mut reg = crate::registry::Registry::default();
+        reg.team = Some(serde_json::from_value(serde_json::json!({"teamId":"solo","role":"admin","serverUrl":"http://127.0.0.1:1","reportingDeviceId":"fixture","accountStatus":{"personalSync":true,"plan":"pro","canReceiveConfig":true}})).unwrap());
+        reg.servers = ["A", "B"].into_iter().map(|name| serde_json::from_value(serde_json::json!({"id":name,"name":name,"transport":"http","url":"https://example.com/mcp","env":[],"enabled":false})).unwrap()).collect();
+        crate::registry::save(&reg).unwrap();
+        page.render(super::state::RegistryState::Ready(super::state::RegistrySnapshot::from_registry(reg.clone())));
+        window.present();
+        let context = gtk::glib::MainContext::default();
+        while context.pending() { context.iteration(false); }
+        let card = page.rows.borrow()[0].1.clone();
+        let mut queue = vec![card.clone().upcast::<gtk::Widget>()];
+        let menu = loop { let w = queue.pop().expect("server menu"); if let Ok(menu) = w.clone().downcast::<gtk::MenuButton>() { break menu; } let mut child = w.first_child(); while let Some(w) = child { child = w.next_sibling(); queue.push(w); } };
+        menu.popup(); while context.pending() { context.iteration(false); }
+        let popover = menu.popover().unwrap(); assert!(popover.is_visible());
+        page.render(super::state::RegistryState::Ready(super::state::RegistrySnapshot::from_registry(reg.clone())));
+        assert_eq!(page.rows.borrow()[0].1, card); assert!(popover.is_visible());
+        reg.servers[1].name = "B changed".into();
+        page.render(super::state::RegistryState::Ready(super::state::RegistrySnapshot::from_registry(reg.clone())));
+        assert!(popover.is_visible()); assert_eq!(page.rows.borrow()[0].1, card);
+        menu.popdown(); while context.pending() { context.iteration(false); }
+        assert_eq!(page.rows.borrow()[1].0.name, "B changed");
+        menu.grab_focus(); reg.servers[0].name = "A changed".into();
+        page.render(super::state::RegistryState::Ready(super::state::RegistrySnapshot::from_registry(reg)));
+        assert!(gtk::prelude::RootExt::focus(&window).is_some_and(|w| w.is_ancestor(&page.rows.borrow()[0].1)));
+        let nav = gtk::Button::new(); let children = gtk::Box::new(gtk::Orientation::Horizontal, 4); let icon = gtk::Image::from_icon_name("system-users-symbolic"); let label = gtk::Label::new(Some("Sign in to sync")); children.append(&icon); children.append(&label); nav.set_child(Some(&children));
+        super::set_nav_label(&nav, "Sync (1)"); assert_eq!(label.label(), "Sync (1)"); assert_eq!(children.first_child(), Some(icon.upcast()));
+        page.show_confirmation("Saved"); let height = page.feedback.height_request(); page.hide_feedback(); assert!(page.feedback.is_visible()); assert_eq!(page.feedback.height_request(),height); assert!(height >= 48);
+        window.close();
+    }
+
     #[test]
     fn returning_to_keychain_with_blank_launch_input_clears_reference() {
         let input:crate::registry::LaunchInput=serde_json::from_value(serde_json::json!({"key":"TOKEN","label":"Token","secret":true,"required":true,"source":{"ref":"op://v/i/key"}})).unwrap();

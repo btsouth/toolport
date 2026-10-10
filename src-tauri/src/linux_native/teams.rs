@@ -1684,6 +1684,25 @@ fn connect_member_decisions(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn personal_sync_conflicts_and_disabled_rows_are_readable() {
+        adw::init().unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("gtk-personal-conflicts");
+        let app = adw::Application::builder().flags(gtk::gio::ApplicationFlags::NON_UNIQUE).build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let (_, servers, _) = super::super::build_content(&app, crate::approval_broker::start_native());
+        let page = super::TeamsPage::new(&app, servers);
+        let mut reg = crate::registry::Registry::default();
+        reg.team = Some(serde_json::from_value(serde_json::json!({"teamId":"solo","role":"admin","serverUrl":"http://127.0.0.1:1","accountStatus":{"personalSync":true,"plan":"pro","canReceiveConfig":true},"personalSyncState":{"initialized":true,"pending":{"docs-http":{"localId":"docs-http","after":{"name":"Toolport docs","url":"https://example.com/this"}}},"conflicts":{"docs-http":{"name":"Toolport docs","url":"https://gitmcp.io/btsouth/Toolport2026"}}}})).unwrap());
+        let server: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({"id":"docs-http","name":"Toolport docs","transport":"http","url":"https://example.com/this","env":[],"enabled":false,"source":"team:solo","personalSyncEntry":true})).unwrap();
+        reg.servers.push(server.clone()); crate::registry::save(&reg).unwrap();
+        page.render(reg);
+        let mut text = String::new(); collect(page.root.upcast_ref(), &mut text);
+        assert!(text.contains("Toolport docs changed on both machines")); assert!(text.contains("This machine")); assert!(text.contains("Other machine")); assert!(text.contains("CHANGED: URL:"));
+        assert!(!text.contains("Sync is up to date")); assert!(!text.contains("Review and enable")); assert!(text.contains("Turned off")); assert!(!page.plan_badge.is_visible());
+    }
+
     use super::share_preview_dialog;
     use super::team_review_line;
     use super::{share_action, share_choice_label};

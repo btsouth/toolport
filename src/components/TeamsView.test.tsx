@@ -727,9 +727,7 @@ describe("Sync setup", () => {
     expect(screen.getByText("Connected")).toBeInTheDocument();
   });
   it("keeps multi-person governance and the unloaded view", () => {
-    render(
-      <TeamsView registry={registry} onRegistryChange={vi.fn()} />,
-    );
+    render(<TeamsView registry={registry} onRegistryChange={vi.fn()} />);
     expectNoPitch();
     expect(screen.getByText("Linked to team")).toBeInTheDocument();
   });
@@ -972,4 +970,58 @@ it("does not show another team's successful sync time after switching teams", as
   );
   expect(screen.queryByText("Last sync succeeded")).not.toBeInTheDocument();
   await screen.findByText("Last successful sync: not recorded yet");
+});
+
+it("shows both conflict versions as fields with the server name and highlighted differences", () => {
+  const personal = structuredClone(registry);
+  personal.team!.accountStatus = {
+    personalSync: true,
+    plan: "pro",
+    trialActive: false,
+    trialEndsAt: null,
+    freeSyncGraceEndsAt: null,
+    deviceId: "device",
+    canReceiveConfig: true,
+    reason: null,
+  };
+  personal.team!.personalSyncState = {
+    conflicts: {
+      "docs-http": {
+        name: "Toolport docs",
+        url: "https://gitmcp.io/btsouth/Toolport2026",
+        args: ["machine B v2"],
+      },
+    },
+    pending: {
+      "docs-http": {
+        localId: "docs-http",
+        after: {
+          name: "Toolport docs",
+          url: "https://example.com/this",
+          args: ["machine A v2"],
+        },
+      },
+    },
+  };
+  personal.servers = [
+    { id: "docs-http", name: "Toolport docs", transport: "http", args: [], env: [] },
+  ];
+  render(<TeamsView registry={personal} onRegistryChange={vi.fn()} />);
+  expect(screen.getByText("Toolport docs changed on both machines")).toBeInTheDocument();
+  expect(screen.getByText("This machine")).toBeInTheDocument();
+  expect(screen.getByText("Other machine")).toBeInTheDocument();
+  expect(screen.getByText("machine A v2")).toBeInTheDocument();
+  expect(screen.getByText("machine B v2")).toBeInTheDocument();
+  expect(screen.getAllByText("CHANGED: URL")).toHaveLength(2);
+});
+it("uses the chosen sync service for browser sign-in", async () => {
+  render(<TeamsView registry={{ ...registry, team: null }} onRegistryChange={vi.fn()} />);
+  await userEvent.click(screen.getByText("Use a manual code"));
+  const url = screen.getByLabelText("Sync service URL");
+  await userEvent.clear(url);
+  await userEvent.type(url, "https://sync.example.com");
+  await userEvent.click(screen.getByRole("button", { name: "Sign in to sync" }));
+  expect(openExternal).toHaveBeenCalledWith(
+    "https://sync.example.com/?intent=pro&from=app-sync",
+  );
 });
