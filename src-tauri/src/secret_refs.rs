@@ -1838,8 +1838,12 @@ mod review_regressions {
                         .unwrap()
                 })
                 .collect();
-            for child in children {
-                let output = child.wait_with_output().unwrap();
+            // Reap every writer before reporting a failure or removing its directory.
+            let outputs: Vec<_> = children
+                .into_iter()
+                .map(|child| child.wait_with_output().unwrap())
+                .collect();
+            for output in outputs {
                 assert!(
                     output.status.success(),
                     "approval writer failed in round {round}: {}\n{}\n{}",
