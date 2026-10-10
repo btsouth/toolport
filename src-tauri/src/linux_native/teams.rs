@@ -537,7 +537,7 @@ impl TeamsPage {
                 .css_classes(["heading"])
                 .build(),
         );
-        for text in crate::personal_sync::status_lines(&status, sync.last_synced_at) {
+        for text in crate::personal_sync::account_display_lines(&registry) {
             card.append(
                 &gtk::Label::builder()
                     .label(text)
@@ -545,6 +545,9 @@ impl TeamsPage {
                     .xalign(0.0)
                     .build(),
             );
+        }
+        for warning in sync.warnings.values() {
+            card.append(&gtk::Label::builder().label(warning).wrap(true).xalign(0.0).css_classes(["warning"]).build());
         }
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let button = gtk::Button::with_label("Sync now");
@@ -1186,8 +1189,7 @@ fn conflict_content(local: Option<&serde_json::Value>, remote: &serde_json::Valu
             let changed = left.get(*key) != right.get(*key);
             let label = gtk::Label::builder()
                 .label(format!(
-                    "{}{key}: {}",
-                    if changed { "CHANGED: " } else { "" },
+                    "{key}: {}",
                     fields.get(*key).map(String::as_str).unwrap_or("Not set")
                 ))
                 .wrap(true)
@@ -1203,6 +1205,31 @@ fn conflict_content(local: Option<&serde_json::Value>, remote: &serde_json::Valu
         grid.append(&column);
     }
     grid
+}
+pub(super) fn execution_review_content(server: &crate::registry::ServerEntry) -> gtk::Box {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let previous = server.unknown_fields.get("syncExecutionReview");
+    for text in crate::personal_sync::execution_review_lines(server) {
+        let label = gtk::Label::builder().label(&text).wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar).selectable(true).xalign(0.0).build();
+        if previous.is_some() && text != "New server" { label.add_css_class("warning"); }
+        if text == "New server" { label.add_css_class("heading"); }
+        content.append(&label);
+    }
+    if previous.is_some() {
+        let full = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        for (key, value) in crate::personal_sync::execution_review_fields(server) {
+            full.append(&gtk::Label::builder().label(crate::personal_sync::review_field_line(&key, &value))
+                .wrap(true).wrap_mode(gtk::pango::WrapMode::WordChar).selectable(true).xalign(0.0).build());
+        }
+        content.append(&gtk::Expander::builder().label("Show full definition").child(&full).build());
+    }
+    content
+}
+pub(super) fn execution_review_scroll(server: &crate::registry::ServerEntry) -> gtk::ScrolledWindow {
+    gtk::ScrolledWindow::builder().min_content_height(120).max_content_height(340)
+        .hscrollbar_policy(gtk::PolicyType::Never).vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true).child(&execution_review_content(server)).build()
 }
 fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> gtk::Box {
     if let Ok(registry) = crate::registry::load() {
@@ -1232,16 +1259,7 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
             .build(),
     );
     let target = crate::personal_sync::execution_review_lines(&server).join("\n");
-    copy.append(
-        &gtk::Label::builder()
-            .label(&target)
-            .wrap_mode(gtk::pango::WrapMode::Word)
-            .halign(gtk::Align::Fill)
-            .xalign(0.0)
-            .wrap(true)
-            .css_classes(["toolport-muted"])
-            .build(),
-    );
+    copy.append(&execution_review_content(&server));
     row.append(&copy);
     let original = crate::registry::load().ok().and_then(|r| {
         let id = r.team.as_ref()?.managed_server_ids.get(&server.id)?;
@@ -1314,8 +1332,7 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
             Some("Enable only after verifying this definition and saved authentication. Credentials remain local."),
         );
         dialog.set_size_request(620, -1);
-        let detail = gtk::Label::builder().label(&target).wrap(true).wrap_mode(gtk::pango::WrapMode::Word).selectable(true).xalign(0.0).build();
-        let scroll = gtk::ScrolledWindow::builder().min_content_height(180).max_content_height(400).propagate_natural_height(true).child(&detail).build();
+        let scroll = execution_review_scroll(&reviewed_entry);
         dialog.set_extra_child(Some(&scroll));
         dialog.add_response("cancel", "Keep disabled");
         dialog.add_response("enable", "Enable");
@@ -1678,6 +1695,29 @@ fn connect_member_decisions(
 mod tests {
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn personal_review_widgets_have_plain_fields_full_definition_and_scroll() {
+        adw::init().unwrap();
+        let mut server: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({
+            "id":"review","name":"Review","transport":"stdio","command":"echo","args":["old"],"env":[]
+        })).unwrap();
+        let previous = crate::personal_sync::execution_review_fields(&server);
+        server.unknown_fields.insert("syncExecutionReview".into(), serde_json::json!(previous));
+        server.args = vec!["new".into()];
+        let scroll = super::execution_review_scroll(&server);
+        assert_eq!(scroll.hscrollbar_policy(), gtk::PolicyType::Never);
+        assert_eq!(scroll.vscrollbar_policy(), gtk::PolicyType::Automatic);
+        assert_eq!(scroll.max_content_height(), 340);
+        let content = scroll.child().unwrap().downcast::<gtk::Box>().unwrap();
+        let label = content.first_child().unwrap().downcast::<gtk::Label>().unwrap();
+        assert!(label.label().contains("new")); assert!(label.has_css_class("warning"));
+        let expander = content.last_child().unwrap().downcast::<gtk::Expander>().unwrap();
+        assert_eq!(expander.label().as_deref(), Some("Show full definition")); assert!(!expander.is_expanded());
+        let mut text = String::new(); collect(expander.child().unwrap().upcast_ref(), &mut text);
+        assert!(text.contains("Command: echo")); assert!(text.contains("Uses this machine's environment: no"));
+        assert!(!text.contains("URL:")); assert!(!text.contains("null")); assert!(!text.contains("CHANGED"));
+    }
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn personal_sync_conflicts_and_disabled_rows_are_readable() {
         adw::init().unwrap();
         let _data = crate::registry::DataDirTestEnv::new("gtk-personal-conflicts");
@@ -1693,7 +1733,7 @@ mod tests {
         page.render(reg);
         assert!(!page.feedback.has_css_class("success"));
         let mut text = String::new(); collect(page.root.upcast_ref(), &mut text);
-        assert!(text.contains("Toolport docs changed on both machines")); assert!(text.contains("This machine")); assert!(text.contains("Other machine")); assert!(text.contains("CHANGED: URL:"));
+        assert!(text.contains("Toolport docs changed on both machines")); assert!(text.contains("This machine")); assert!(text.contains("Other machine")); assert!(text.contains("URL:"));
         assert!(!text.contains("Sync is up to date")); assert!(!text.contains("Review and enable")); assert!(text.contains("Turned off")); assert!(!page.plan_badge.is_visible());
     }
 
@@ -1708,13 +1748,13 @@ mod tests {
     fn personal_execution_review_includes_setup_values_and_visible_controls() {
         let server: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({"id":"review","name":"Review","transport":"stdio","command":"npx\u{202e}","args":["-y","package"],"cwd":"/work\u{200b}","inheritEnv":false,"env":[{"key":"REGION","secret":false,"value":"west"},{"key":"TOKEN","secret":true,"value":"hidden"}],"launch":{"inputs":[{"key":"project","label":"Project","secret":false,"value":"folder"}],"bindings":[{"index":1,"parts":[{"kind":"input","key":"project"}]}]}})).unwrap();
         let text = crate::personal_sync::execution_review_lines(&server).join("\n");
-        assert!(text.contains("Environment [0] REGION: west"));
-        assert!(text.contains("Environment [1] TOKEN: <masked secret>"));
-        assert!(text.contains("Launch input [0] project: folder"));
-        assert!(text.contains("Launch bindings:"));
-        assert!(text.contains("Working directory: /work\\u{200B}"));
+        assert!(text.contains("Environment: REGION = west"));
+        assert!(text.contains("Environment: TOKEN = <masked secret>"));
+        assert!(text.contains("Input: project = folder"));
+        assert!(text.contains("Argument values:"));
+        assert!(text.contains("Working folder: /work\\u{200B}"));
         assert!(text.contains("Command: npx\\u{202E}"));
-        assert!(text.contains("inheritEnv: false"));
+        assert!(text.contains("Uses this machine's environment: no"));
         assert!(!text.contains("hidden"));
     }
     #[test]

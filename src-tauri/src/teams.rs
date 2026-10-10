@@ -420,14 +420,26 @@ fn apply_account_status(
 ) -> Result<(), String> {
     if let Some(t) = &mut reg.team {
         match result {
-            Ok(value) => {
-                t.unknown_fields
-                    .insert("accountStatus".into(), value.unwrap_or(Value::Null));
+            Ok(Some(value)) => {
+                t.unknown_fields.insert("accountStatus".into(), value);
                 t.unknown_fields.remove("accountStatusError");
+                t.unknown_fields.remove("accountStatusMissingCount");
+            }
+            Ok(None) => {
+                let count = t.unknown_fields.get("accountStatusMissingCount")
+                    .and_then(Value::as_u64).unwrap_or(0).saturating_add(1).min(2);
+                t.unknown_fields.insert("accountStatusMissingCount".into(), json!(count));
+                if count >= 2 || !was_personal {
+                    t.unknown_fields.insert("accountStatus".into(), Value::Null);
+                    t.unknown_fields.remove("accountStatusError");
+                } else {
+                    t.unknown_fields.insert("accountStatusError".into(), json!("Account status is temporarily unavailable. Retrying sync."));
+                }
             }
             // A legacy device token or a transient service failure must not
             // prevent governed sync or invent a mode transition.
             Err(error) => {
+                t.unknown_fields.remove("accountStatusMissingCount");
                 t.unknown_fields
                     .insert("accountStatusError".into(), json!(error));
             }
@@ -1326,7 +1338,7 @@ pub fn sync_retry_seconds(reg: &Registry, failures: u32) -> u64 {
             .as_ref()
             .is_some_and(|t| t.unknown_fields["accountStatus"]["canReceiveConfig"] == false)
     {
-        3
+        60 * (1u64 << failures.saturating_sub(1).min(4))
     } else {
         retry_delay_seconds(failures)
     }
@@ -5252,6 +5264,29 @@ pub fn remove_team(reg: &mut Registry, team_id: &str) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn account_status_mode_flips_preserve_unpublished_personal_journal() {
+        let _data = crate::registry::DataDirTestEnv::new("account-mode-journal");
+        let mut reg = Registry::default();
+        reg.team = Some(serde_json::from_value(json!({"serverUrl":"https://example.com","teamId":"solo","role":"admin","accountStatus":{"personalSync":true,"plan":"pro","canReceiveConfig":true},"personalSyncState":{"initialized":true,"pending":{"s":{"localId":"s","after":{"id":"s","name":"Unpublished"}}}}})).unwrap());
+        reg.servers.push(serde_json::from_value(json!({"id":"s","name":"Unpublished","transport":"http","url":"https://example.com/mcp","args":[],"env":[],"enabled":true,"source":"team:solo"})).unwrap());
+        reg.profiles[0].enabled_server_ids.push("s".into());
+        let original = crate::personal_sync::state(&reg).unwrap().pending;
+        apply_account_status(&mut reg, Ok(None), true).unwrap();
+        assert!(crate::personal_sync::is_personal(&reg));
+        apply_account_status(&mut reg, Ok(Some(json!({"personalSync":true}))), true).unwrap();
+        apply_account_status(&mut reg, Ok(None), true).unwrap();
+        assert!(crate::personal_sync::is_personal(&reg));
+        apply_account_status(&mut reg, Ok(None), true).unwrap();
+        assert!(!crate::personal_sync::is_personal(&reg));
+        reg.servers[0].name = "Governed replacement".into();
+        reg.profiles[0].enabled_server_ids.clear();
+        apply_account_status(&mut reg, Ok(Some(json!({"personalSync":true}))), false).unwrap();
+        assert_eq!(reg.servers[0].name, "Unpublished");
+        assert!(reg.profiles[0].enabled_server_ids.contains(&"s".into()));
+        assert_eq!(crate::personal_sync::state(&reg).unwrap().pending, original);
+        assert!(!crate::personal_sync::state(&reg).unwrap().choose_local_servers);
+    }
+    #[test]
     fn account_status_errors_keep_governed_and_personal_sync_modes() {
         let _data = crate::registry::DataDirTestEnv::new("account-status-fallback");
         for code in [401, 403, 500, 503] {
@@ -5283,6 +5318,8 @@ mod tests {
                 .unknown_fields
                 .insert("accountStatus".into(), json!({"personalSync":true}));
             apply_account_status(&mut reg, Err(error), true).unwrap();
+            assert!(crate::personal_sync::is_personal(&reg));
+            apply_account_status(&mut reg, Ok(None), true).unwrap();
             assert!(crate::personal_sync::is_personal(&reg));
             apply_account_status(&mut reg, Ok(None), true).unwrap();
             assert!(!crate::personal_sync::is_personal(&reg));

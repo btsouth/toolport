@@ -7437,8 +7437,10 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
             let dialog = adw::MessageDialog::new(
                 Some(&parent),
                 Some("Approve references and enable?"),
-                Some(&crate::personal_sync::execution_review_lines(&entry).join("\n")),
+                Some("Review the definition and saved authentication. Enable only a setup you trust."),
             );
+            dialog.set_size_request(620, -1);
+            dialog.set_extra_child(Some(&teams::execution_review_scroll(&entry)));
             dialog.add_response("cancel", "Cancel");
             dialog.add_response("enable", "Enable");
             dialog.set_default_response(Some("cancel"));

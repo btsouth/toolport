@@ -16,6 +16,8 @@ export interface PersonalSyncState {
   conflicts?: Record<string, unknown>;
   conflictVersions?: Record<string, string>;
   publishErrors?: Record<string, string>;
+  warnings?: Record<string, string>;
+  signInRequired?: boolean;
   chooseLocalServers?: boolean;
 }
 export function isPersonalSync(registry: Registry | null | undefined): boolean {

@@ -76,10 +76,7 @@ function ConflictVersions({ local, remote }: { local: unknown; remote: unknown }
                 key={key}
                 className={left[key] !== right[key] ? "bg-amber-500/10" : ""}
               >
-                <dt>
-                  {left[key] !== right[key] ? "CHANGED: " : ""}
-                  {key}
-                </dt>
+                <dt>{key}</dt>
                 <dd className="whitespace-pre-wrap">
                   {(fields as Record<string, string>)[key] ?? "Not set"}
                 </dd>
@@ -157,6 +154,11 @@ export function PersonalSyncView({
           <p role="alert">{error || sync?.error || team?.accountStatusError}</p>
         </Callout>
       )}
+      {Object.entries(sync?.warnings ?? {}).map(([id, warning]) => (
+        <Callout key={id} variant="warning">
+          <p role="alert">{warning}</p>
+        </Callout>
+      ))}
       {!team ? (
         <>
           <Button
@@ -226,7 +228,12 @@ export function PersonalSyncView({
         <>
           <section className="space-y-3 rounded-lg border p-4" aria-label="Your account">
             <h3 className="font-medium">Your account</h3>
-            {status ? (
+            {sync?.signInRequired ? (
+              <p>
+                Saved account plan: {status?.plan ?? "unknown"}. Sign in to confirm your
+                account and resume sync.
+              </p>
+            ) : status ? (
               accountStatusText(status).map((line) => (
                 <p key={line} className="text-sm">
                   {line}
@@ -235,11 +242,13 @@ export function PersonalSyncView({
             ) : (
               <p>Account status unavailable. Retry sync.</p>
             )}
-            <p className="text-sm">
-              {sync?.lastSyncedAt
-                ? `Last synced ${new Date(sync.lastSyncedAt).toLocaleString()}`
-                : "Waiting for first sync"}
-            </p>
+            {!sync?.signInRequired && (
+              <p className="text-sm">
+                {sync?.lastSyncedAt
+                  ? `Last synced ${new Date(sync.lastSyncedAt).toLocaleString()}`
+                  : "Waiting for first sync"}
+              </p>
+            )}
             {!!Object.keys(sync?.pending ?? {}).length && (
               <p className="text-sm">Changes waiting to sync</p>
             )}

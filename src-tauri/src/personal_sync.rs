@@ -38,10 +38,12 @@ pub struct SyncState {
     pub conflict_versions: BTreeMap<String, String>,
     pub publishing: BTreeMap<String, Mutation>,
     pub publish_errors: BTreeMap<String, String>,
+    pub warnings: BTreeMap<String, String>,
     pub choose_local_servers: bool,
     #[serde(skip_serializing)]
     pub last_synced_at: Option<i64>,
     pub error: Option<String>,
+    pub sign_in_required: bool,
     pub initialized: bool,
 }
 pub fn is_personal(reg: &Registry) -> bool {
@@ -127,7 +129,32 @@ pub fn conflict_version(value: &Value) -> String {
 /// opt-in when a governed team becomes personal, including a later transition.
 pub(crate) fn mode_changed(reg: &mut Registry, was_personal: bool) -> Result<(), String> {
     if is_personal(reg) && !was_personal {
-        let mut st = SyncState::default();
+        let mut st = state(reg)?;
+        if st.initialized {
+            if let Some(saved) = reg.unknown_fields.remove("personalSyncSuspendedRows") {
+                if let Some(rows) = saved.as_array() {
+                    for row in rows {
+                        let entry: ServerEntry = serde_json::from_value(row["server"].clone())
+                            .map_err(|e| e.to_string())?;
+                        if !st.pending.values().any(|m| m.local_id == entry.id) {
+                            continue;
+                        }
+                        reg.servers.retain(|s| s.id != entry.id);
+                        for profile in &mut reg.profiles {
+                            profile.enabled_server_ids.retain(|id| id != &entry.id);
+                            if row["profiles"]
+                                .as_array()
+                                .is_some_and(|ids| ids.contains(&json!(profile.id)))
+                            {
+                                profile.enabled_server_ids.push(entry.id.clone());
+                            }
+                        }
+                        reg.servers.push(entry);
+                    }
+                }
+            }
+            return Ok(());
+        }
         for s in &mut reg.servers {
             if !s.source.as_deref().unwrap_or("").starts_with("team:")
                 && !crate::clients::is_gateway_server(s)
@@ -138,6 +165,13 @@ pub(crate) fn mode_changed(reg: &mut Registry, was_personal: bool) -> Result<(),
         }
         save(reg, &st)?;
     } else if was_personal && !is_personal(reg) {
+        // The governed pull may replace rows, but cannot erase unpublished
+        // personal edits if the status endpoint later returns to personal mode.
+        let st = state(reg)?;
+        let rows: Vec<_> = reg.servers.iter().filter(|s| st.pending.values().any(|m| m.local_id == s.id))
+            .map(|s| json!({"server":s,"profiles":reg.profiles.iter().filter(|p| p.enabled_server_ids.contains(&s.id)).map(|p| &p.id).collect::<Vec<_>>()})).collect();
+        reg.unknown_fields
+            .insert("personalSyncSuspendedRows".into(), json!(rows));
         // Force a governed pull even when the cloud version did not change.
         if let Some(t) = &mut reg.team {
             t.last_etag = Some("\"mode-transition\"".into());
@@ -162,7 +196,8 @@ pub fn finish_local_selection() -> Result<Registry, String> {
 /// secret-reference source. Local launchers retain the normal spawn screening.
 pub fn risky_sync_env(key: &str) -> bool {
     let key = key.trim().to_ascii_uppercase();
-    key.starts_with("DYLD_")
+    key.starts_with("GIT_CONFIG_")
+        || key.starts_with("DYLD_")
         || key.starts_with("NPM_CONFIG_")
         || [
             "PATH",
@@ -173,6 +208,25 @@ pub fn risky_sync_env(key: &str) -> bool {
             "NODE_PATH",
             "PYTHONPATH",
             "PYTHONSTARTUP",
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
+            "JDK_JAVA_OPTIONS",
+            "PERL5OPT",
+            "PERL5LIB",
+            "RUBYOPT",
+            "RUBYLIB",
+            "PYTHONHOME",
+            "UV_INDEX",
+            "PIP_CONFIG_FILE",
+            "NODE_EXTRA_CA_CERTS",
+            "LD_DEBUG",
+            "LD_PROFILE",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_COUNT",
+            "GIT_EXEC_PATH",
+            "PYTHONUSERBASE",
+            "PYTHONINSPECT",
             "PIP_INDEX_URL",
             "PIP_EXTRA_INDEX_URL",
             "UV_INDEX_URL",
@@ -245,50 +299,93 @@ pub fn execution_review_fields(server: &ServerEntry) -> BTreeMap<String, String>
             visible_text(&v.to_string())
         }
     };
-    let mut fields = BTreeMap::from([
-        ("Command".into(), show(&v["command"])),
-        (
-            "Arguments".into(),
-            server
-                .args
-                .iter()
-                .enumerate()
-                .map(|(i, arg)| format!("\n  {}. {}", i + 1, visible_text(arg)))
-                .collect::<String>(),
-        ),
-        (
-            "Working directory".into(),
-            server
-                .cwd
-                .as_deref()
-                .map(visible_text)
-                .unwrap_or("Client default".into()),
-        ),
-        ("Transport".into(), show(&v["transport"])),
-        ("URL".into(), show(&v["url"])),
-        ("inheritEnv".into(), server.inherit_env.to_string()),
-        ("Launch bindings".into(), show(&v["launch"]["bindings"])),
-    ]);
-    for (label, path) in [("Environment", "/env"), ("Launch input", "/launch/inputs")] {
-        for (index, row) in v
+    let mut fields = BTreeMap::new();
+    if server.transport == "stdio" {
+        if let Some(command) = &server.command {
+            fields.insert("Command".into(), visible_text(command));
+        }
+        if !server.args.is_empty() {
+            fields.insert(
+                "Arguments".into(),
+                server
+                    .args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, arg)| format!("\n  {}. {}", i + 1, visible_text(arg)))
+                    .collect(),
+            );
+        }
+        if let Some(cwd) = &server.cwd {
+            fields.insert("Working folder".into(), visible_text(cwd));
+        }
+        fields.insert(
+            "Uses this machine's environment".into(),
+            if server.inherit_env { "yes" } else { "no" }.into(),
+        );
+        if let Some(launch) = &server.launch {
+            if !launch.bindings.is_empty() {
+                fields.insert(
+                    "Argument values".into(),
+                    launch
+                        .bindings
+                        .iter()
+                        .map(|binding| {
+                            let parts = binding
+                                .parts
+                                .iter()
+                                .map(|part| match part {
+                                    crate::registry::ArgPart::Literal { value, .. } => {
+                                        visible_text(value)
+                                    }
+                                    crate::registry::ArgPart::Input { key, .. } => {
+                                        format!("{{{}}}", visible_text(key))
+                                    }
+                                })
+                                .collect::<String>();
+                            format!("Argument {} = {parts}", binding.index + 1)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+        }
+    } else if let Some(url) = &server.url {
+        fields.insert("URL".into(), visible_text(url));
+    }
+    for (label, path) in [
+        ("Environment", "/env"),
+        ("Input", "/launch/inputs"),
+        ("Header", "/headerKeys"),
+    ] {
+        for row in v
             .pointer(path)
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .enumerate()
         {
-            let value = if row["secret"] == true {
+            let reference = row["source"]["ref"].as_str();
+            let value = if label == "Header" && row["env"].is_string() {
+                format!("Uses environment: {}", show(&row["env"]))
+            } else if let Some(reference) = reference {
+                format!("Password manager: {}", visible_text(reference))
+            } else if row["secret"] == true {
                 "<masked secret>".into()
+            } else if let Some(value) = row.get("value").filter(|v| !v.is_null()) {
+                show(value)
             } else {
-                show(&row["value"])
+                "Set on this machine".into()
             };
-            fields.insert(
-                format!("{label} [{index}] {}", show(&row["key"])),
-                format!("{value}; reference: {}", show(&row["source"]["ref"])),
-            );
+            fields.insert(format!("{label}: {}", show(&row["key"])), value);
         }
     }
     fields
+}
+pub fn review_field_line(key: &str, value: &str) -> String {
+    if key.starts_with("Environment:") || key.starts_with("Input:") || key.starts_with("Header:") {
+        format!("{key} = {value}")
+    } else {
+        format!("{key}: {value}")
+    }
 }
 pub fn execution_review_lines(server: &ServerEntry) -> Vec<String> {
     let previous = server
@@ -296,24 +393,20 @@ pub fn execution_review_lines(server: &ServerEntry) -> Vec<String> {
         .get("syncExecutionReview")
         .and_then(Value::as_object);
     let fields = execution_review_fields(server);
-    let mut lines: Vec<_> = fields
-        .iter()
-        .map(|(key, value)| {
-            let changed =
-                previous.is_none_or(|p| p.get(key).and_then(Value::as_str) != Some(value));
-            format!("{}{key}: {value}", if changed { "CHANGED: " } else { "" })
-        })
-        .collect();
-    if let Some(previous) = previous {
-        for key in previous.keys().filter(|key| !fields.contains_key(*key)) {
-            lines.push(format!("CHANGED: {key}: removed"));
+    let mut lines = Vec::new();
+    if previous.is_none() {
+        lines.push("New server".into());
+    }
+    for (key, value) in &fields {
+        if previous.is_none_or(|p| p.get(key).and_then(Value::as_str) != Some(value)) {
+            lines.push(review_field_line(key, value));
         }
     }
-    lines.extend(
-        crate::secret_refs::review_lines(server)
-            .iter()
-            .map(|line| visible_text(line)),
-    );
+    if let Some(previous) = previous {
+        for key in previous.keys().filter(|key| !fields.contains_key(*key)) {
+            lines.push(review_field_line(key, "Removed"));
+        }
+    }
     lines
 }
 fn now() -> i64 {
@@ -478,7 +571,12 @@ pub fn export(s: &ServerEntry) -> Value {
         .zip(credential_arg_mask(&s.args))
         .map(|(arg, secret)| {
             if secret && arg != "<launch-input>" {
-                "<redacted>".to_string()
+                arg.split_once('=')
+                    .filter(|(name, _)| name.starts_with('-'))
+                    .map_or_else(
+                        || "<redacted>".to_string(),
+                        |(name, _)| format!("{name}=<redacted>"),
+                    )
             } else {
                 arg.clone()
             }
@@ -685,6 +783,28 @@ pub(crate) fn record(before: &Registry, reg: &mut Registry) -> Result<(), String
         return Ok(());
     }
     let mut st = state(reg)?;
+    for server in &mut reg.servers {
+        if server.enabled
+            && before
+                .servers
+                .iter()
+                .any(|s| s.id == server.id && !s.enabled)
+        {
+            if let Some(ids) = server
+                .unknown_fields
+                .remove("personalSyncProfiles")
+                .and_then(|v| v.as_array().cloned())
+            {
+                for profile in &mut reg.profiles {
+                    if ids.contains(&json!(profile.id))
+                        && !profile.enabled_server_ids.contains(&server.id)
+                    {
+                        profile.enabled_server_ids.push(server.id.clone());
+                    }
+                }
+            }
+        }
+    }
     let mut linked: HashSet<String> = reg
         .servers
         .iter()
@@ -749,7 +869,20 @@ pub(crate) fn record(before: &Registry, reg: &mut Registry) -> Result<(), String
             .get(id)
             .map(|m| m.before.clone())
             .unwrap_or_else(|| st.baseline.get(id).cloned());
-        let initial_conflict = st.pending.get(id).is_some_and(|m| m.initial_conflict);
+        let opted_in = before
+            .servers
+            .iter()
+            .any(|s| original(s) == id.as_str() && keep_local(s));
+        let initial_conflict = st.pending.get(id).is_some_and(|m| m.initial_conflict)
+            || (opted_in
+                && st.baseline.contains_key(id)
+                && !same(st.baseline.get(id), after.as_ref()));
+        if initial_conflict {
+            st.conflicts.insert(
+                id.clone(),
+                st.baseline.get(id).cloned().unwrap_or(Value::Null),
+            );
+        }
         let local_id = b.get(id).or_else(|| a.get(id)).unwrap().0.clone();
         if same(base.as_ref(), after.as_ref()) && !st.publishing.contains_key(id) {
             st.pending.remove(id);
@@ -856,12 +989,51 @@ pub(crate) fn restore_local(entry: &mut ServerEntry, old: &ServerEntry) {
                                          // Preserve masked arguments on their originating machine; masking is a wire
                                          // boundary, not permission to erase the owner's installed setup.
     let old_wire = export(old);
+    // A masked value is identified by its flag, never by a shifted position.
+    // Older peers masked whole name=value args; unchanged legacy layouts are
+    // safe, while ambiguous edits retain the complete installed invocation.
+    let incoming = entry.args.clone();
+    let wire: Vec<String> = serde_json::from_value(old_wire["args"].clone()).unwrap_or_default();
+    let mut ambiguous = false;
     for (index, arg) in entry.args.iter_mut().enumerate() {
-        if arg == "<redacted>" || old_wire["args"][index].as_str() == Some(arg.as_str()) {
-            if let Some(local) = old.args.get(index) {
-                *arg = local.clone();
-            }
+        if !arg.contains("<redacted>") {
+            continue;
         }
+        let flag = incoming
+            .get(index.wrapping_sub(1))
+            .filter(|v| v.starts_with('-') && !v.contains('='));
+        let prefix = arg.split_once('=').map(|(key, _)| key);
+        let candidates: Vec<_> = wire
+            .iter()
+            .enumerate()
+            .filter(|(i, masked)| {
+                if !masked.contains("<redacted>") {
+                    return false;
+                }
+                if let Some(prefix) = prefix {
+                    return old.args[*i]
+                        .split_once('=')
+                        .is_some_and(|(key, _)| key == prefix);
+                }
+                if let Some(flag) = flag {
+                    return old.args.get(i.wrapping_sub(1)) == Some(flag);
+                }
+                incoming == wire && *i == index
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if candidates.len() == 1 {
+            *arg = old.args[candidates[0]].clone();
+        } else {
+            ambiguous = true;
+        }
+    }
+    if ambiguous || entry.args.iter().any(|v| v.contains("<redacted>")) {
+        entry.args = old.args.clone();
+        entry.launch = old.launch.clone();
+        entry
+            .unknown_fields
+            .insert("personalSyncArgsReview".into(), json!(true));
     }
     if let (Some(installed), Some(previous)) = (&mut entry.launch, &old.launch) {
         for binding in &mut installed.bindings {
@@ -973,6 +1145,21 @@ pub fn apply(
         .clone();
     let tag = format!("team:{team_id}");
     let mut outcome = crate::teams::MergeOutcome::default();
+    let own_approved: HashSet<String> = st
+        .publishing
+        .iter()
+        .filter(|(id, sent)| {
+            same(remote.get(*id), sent.after.as_ref())
+                && st.pending.get(*id) == Some(*sent)
+                && reg.servers.iter().any(|s| {
+                    s.id == sent.local_id
+                        && !s.needs_team_enable_review()
+                        && same(Some(&export(s)), sent.after.as_ref())
+                        && crate::secret_refs::check_approval(s).is_ok()
+                })
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
     acknowledge(reg, &mut st, &remote);
     if !st.initialized {
         crate::local_auth::adopt_personal_sync_routes(reg)?;
@@ -1069,6 +1256,17 @@ pub fn apply(
         {
             crate::local_auth::revoke_personal_route(reg, &team_id, &mutation.local_id);
             if let Some(server) = reg.servers.iter_mut().find(|s| s.id == mutation.local_id) {
+                let memberships: Vec<_> = reg
+                    .profiles
+                    .iter()
+                    .filter(|p| p.enabled_server_ids.contains(&server.id))
+                    .map(|p| p.id.clone())
+                    .collect();
+                if !memberships.is_empty() {
+                    server
+                        .unknown_fields
+                        .insert("personalSyncProfiles".into(), json!(memberships));
+                }
                 server.enabled = false;
             }
             for profile in &mut reg.profiles {
@@ -1101,6 +1299,29 @@ pub fn apply(
         }
     }
     for (id, value) in &remote {
+        let risky: Vec<_> = value["env"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e["key"].as_str())
+            .filter(|key| risky_sync_env(key))
+            .map(visible_text)
+            .collect();
+        if !risky.is_empty() {
+            let name = visible_text(value["name"].as_str().unwrap_or(id));
+            let warning = format!("A synced change tried to set {} on {name}. Toolport ignored it. If you didn't make this change, sign out of other devices and change your password.", risky.join(", "));
+            if st.warnings.get(id) != Some(&warning) {
+                crate::audit::record_timed(
+                    id,
+                    "sync_environment_refused",
+                    false,
+                    None,
+                    Some(&warning),
+                    Some("personal-sync"),
+                );
+                st.warnings.insert(id.clone(), warning);
+            }
+        }
         if st.pending.contains_key(id)
             || reg
                 .servers
@@ -1161,8 +1382,30 @@ pub fn apply(
             .cloned();
         if let Some(old) = &old {
             entry.id = old.id.clone();
+            let classified = entry.unknown_fields.clone();
+            entry.unknown_fields = old.unknown_fields.clone();
+            // These are derived from the received definition, never retained
+            // from a prior route. All other extensions are machine-local.
+            for key in [
+                "headerKeys",
+                "teamEnableReview",
+                "teamRouteRemoved",
+                "teamHeldChange",
+                "personalSyncArgsReview",
+                "personalSyncRemoteRefs",
+            ] {
+                entry.unknown_fields.remove(key);
+            }
+            if old.url != entry.url {
+                entry.unknown_fields.remove("importedUrlKey");
+            }
+            entry.unknown_fields.extend(classified);
             restore_local(&mut entry, old);
         } else {
+            if entry.args.iter().any(|arg| arg.contains("<redacted>")) {
+                outcome.blocked += 1;
+                continue;
+            }
             entry.id = crate::registry::unique_id(
                 id,
                 &reg.servers.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
@@ -1241,6 +1484,9 @@ pub fn apply(
         let changed = execution_changed(installed.as_ref(), value);
         // Use the upstream approval sidecar, bound to the exact reference and
         // destination. Wire metadata is never evidence of local approval.
+        if own_approved.contains(id) {
+            crate::secret_refs::approve_server(&entry).map_err(|e| e.to_string())?;
+        }
         let references_need_approval = crate::secret_refs::check_approval(&entry).is_err();
         let command_approved = old
             .as_ref()
@@ -1256,7 +1502,8 @@ pub fn apply(
             && old
                 .as_ref()
                 .is_none_or(|s| s.url != entry.url || s.needs_team_enable_review());
-        let review = private_url_review
+        let review = entry.unknown_fields.get("personalSyncArgsReview") == Some(&json!(true))
+            || private_url_review
             || (changed && !command_approved)
             || references_need_approval
             || old
@@ -1285,27 +1532,40 @@ pub fn apply(
             entry.unknown_fields.remove("teamEnableReview");
             outcome.applied += 1;
         }
-        // Preserve local approval/override markers. They are never exported.
-        if let Some(old) = &old {
-            for key in ["memberSecretRefs", "syncExecutionReview"] {
-                if let Some(v) = old.unknown_fields.get(key) {
-                    entry.unknown_fields.insert(key.into(), v.clone());
-                }
-            }
+        // Profile membership is local. Save memberships while a remote disable
+        // or review holds a row off, and restore those exact profiles later.
+        let memberships: Vec<String> = reg
+            .profiles
+            .iter()
+            .filter(|p| p.enabled_server_ids.contains(&entry.id))
+            .map(|p| p.id.clone())
+            .collect();
+        if !entry.enabled && !memberships.is_empty() {
+            entry
+                .unknown_fields
+                .insert("personalSyncProfiles".into(), json!(memberships));
         }
         reg.servers.retain(|s| s.id != entry.id);
-        for p in &mut reg.profiles {
-            if review || !entry.enabled {
-                p.enabled_server_ids.retain(|s| s != &entry.id);
+        let restore_profiles = entry
+            .unknown_fields
+            .get("personalSyncProfiles")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let active = reg.active_profile_id();
+        for profile in &mut reg.profiles {
+            if !entry.enabled {
+                profile.enabled_server_ids.retain(|s| s != &entry.id);
+            } else if (old.is_none() && profile.id == active)
+                || restore_profiles.contains(&json!(profile.id))
+            {
+                if !profile.enabled_server_ids.contains(&entry.id) {
+                    profile.enabled_server_ids.push(entry.id.clone());
+                }
             }
         }
         if entry.enabled {
-            let active = reg.active_profile_id();
-            if let Some(p) = reg.profiles.iter_mut().find(|p| p.id == active) {
-                if !p.enabled_server_ids.contains(&entry.id) {
-                    p.enabled_server_ids.push(entry.id.clone());
-                }
-            }
+            entry.unknown_fields.remove("personalSyncProfiles");
         }
         if let Some(t) = &mut reg.team {
             t.managed_server_ids.insert(entry.id.clone(), id.clone());
@@ -1477,71 +1737,26 @@ pub(crate) fn sync(
             applied: None,
         });
     }
-    let queued = state(&reg)?.pending;
-    let mut publish_errors = BTreeMap::new();
-    let ready: BTreeMap<_, _> = queued
-        .into_iter()
-        .filter(|(_, m)| now() - m.at >= 750)
-        .collect();
-    // A refused definition remains queued, but cannot stall other servers or
-    // the final receive/apply step.
-    let ready: BTreeMap<_, _> = ready
-        .into_iter()
-        .filter(|(id, m)| {
-            if let Some(error) = m.after.as_ref().and_then(publish_error) {
-                publish_errors.insert(id.clone(), error);
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
-    remote_update(|| {
-        crate::registry::update(|r| {
-            if current(r, conn) {
-                let mut st = state(r)?;
-                st.publish_errors = publish_errors.clone();
-                save(r, &st)?;
-            }
-            Ok(())
-        })
-    })?;
     for attempt in 0..2 {
-        let (merged, conflicts) = merge(&latest.1, &ready)?;
-        remote_update(|| {
+        // Snapshot the journal and mark the exact publication under the same
+        // mutation lock. An undo after this point is recorded as a newer edit.
+        let (_, prepared) = remote_update(|| {
             crate::registry::update(|r| {
-                if current(r, conn) {
-                    let mut st = state(r)?;
-                    st.conflicts = conflicts.clone();
-                    save(r, &st)?;
+                if !current(r, conn) {
+                    return Ok(None);
                 }
-                Ok(())
+                let mut st = state(r)?;
+                let merged = prepare_publication(&mut st, &latest.1)?;
+                save(r, &st)?;
+                Ok(Some(merged))
             })
         })?;
+        let Some(merged) = prepared else {
+            break;
+        };
         if merged == latest.1 {
             break;
         }
-        if !current(&crate::registry::load()?, conn) {
-            return Ok(crate::teams::SyncResult::Ok {
-                role: conn.role.clone(),
-                role_changed: false,
-                applied: None,
-            });
-        }
-        remote_update(|| {
-            crate::registry::update(|r| {
-                if current(r, conn) {
-                    let mut st = state(r)?;
-                    st.publishing = ready
-                        .iter()
-                        .filter(|(id, _)| !conflicts.contains_key(*id))
-                        .map(|(id, m)| (id.clone(), m.clone()))
-                        .collect();
-                    save(r, &st)?;
-                }
-                Ok(())
-            })
-        })?;
         match crate::teams::push_personal_config(
             &conn.server_url,
             &conn.team_id,
@@ -1565,24 +1780,16 @@ pub(crate) fn sync(
             Err(e) => return Err(e),
         }
     }
-    let remote = index(&latest.1)?;
     let (_, outcome) = remote_update(|| {
         crate::registry::update(|r| {
             if !current(r, conn) {
                 return Ok(None);
             }
-            let mut st = state(r)?;
-            for (id, m) in &ready {
-                if same(remote.get(id), m.after.as_ref()) {
-                    st.publishing.insert(id.clone(), m.clone());
-                }
-            }
-            acknowledge(r, &mut st, &remote);
-            save(r, &st)?;
             let out = apply(r, &latest.1, latest.0)?;
             let mut st = state(r)?;
             mark_synced(r.team.as_ref().ok_or("Sign in to sync first")?, now())?;
             st.error = None;
+            st.sign_in_required = false;
             save(r, &st)?;
             Ok(Some((latest.0, out)))
         })
@@ -1592,6 +1799,34 @@ pub(crate) fn sync(
         role_changed: false,
         applied: outcome,
     })
+}
+fn prepare_publication(st: &mut SyncState, remote: &Value) -> Result<Value, String> {
+    let mut errors = BTreeMap::new();
+    let ready: BTreeMap<_, _> = st
+        .pending
+        .iter()
+        .filter(|(_, m)| now() - m.at >= 750)
+        .filter(|(id, m)| {
+            if let Some(error) = m.after.as_ref().and_then(publish_error) {
+                errors.insert((*id).clone(), error);
+                false
+            } else {
+                true
+            }
+        })
+        .map(|(id, m)| (id.clone(), m.clone()))
+        .collect();
+    let (merged, conflicts) = merge(remote, &ready)?;
+    st.publish_errors = errors;
+    st.conflicts = conflicts.clone();
+    // Retain unacknowledged publications from a lost reply until apply repairs
+    // them. New ready mutations supersede only their own in-flight entry.
+    for (id, m) in ready {
+        if !conflicts.contains_key(&id) {
+            st.publishing.insert(id, m);
+        }
+    }
+    Ok(merged)
 }
 /// A successful older publication becomes the ancestor of newer edits. This
 /// also repairs a lost PUT response on the next pull without self-conflicting.
@@ -1752,6 +1987,22 @@ pub fn conflict_fields(value: Option<&Value>) -> BTreeMap<String, String> {
     }
     fields
 }
+pub fn account_display_lines(reg: &Registry) -> Vec<String> {
+    let st = state(reg).unwrap_or_default();
+    let status = reg
+        .team
+        .as_ref()
+        .and_then(|t| t.unknown_fields.get("accountStatus"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    if st.sign_in_required {
+        return vec![format!(
+            "Saved account plan: {}. Sign in to confirm your account and resume sync.",
+            status["plan"].as_str().unwrap_or("unknown")
+        )];
+    }
+    status_lines(&status, st.last_synced_at)
+}
 pub fn status_lines(status: &Value, last_synced: Option<i64>) -> Vec<String> {
     status_lines_at(status, last_synced, now())
 }
@@ -1797,6 +2048,8 @@ pub fn record_error(error: Option<&str>) {
             if r.team.is_some() {
                 let mut st = state(r)?;
                 st.error = error.map(str::to_string);
+                st.sign_in_required = error
+                    .is_some_and(|e| e.starts_with("Sync sign-in is missing from this machine."));
                 save(r, &st)?;
             }
             Ok(())
@@ -1807,6 +2060,227 @@ pub fn record_error(error: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn imported_local_extensions_survive_polls_and_destination_changes() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-imported-fields");
+        let mut r = machine();
+        let mut row = local(http("imported"));
+        row.enabled = true;
+        row.source = Some("imported:cursor".into());
+        row.unknown_fields.extend(
+            serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+                "importedUrlKey":"url-token", "futureLocalField":{"keep":true},
+                "memberSecretRefs":{}, "syncExecutionReview":{}, "localCredentialHint":"keep"
+            }))
+            .unwrap(),
+        );
+        let local_fields = row.unknown_fields.clone();
+        r.servers.push(row);
+        let wire = config(r.servers.iter().map(export).collect());
+        for version in 1..=3 {
+            apply(&mut r, &wire, version).unwrap();
+        }
+        for (key, value) in local_fields {
+            assert_eq!(r.servers[0].unknown_fields[&key], value, "{key}");
+        }
+        assert!(!export(&r.servers[0]).to_string().contains("url-token"));
+        let mut changed = wire;
+        changed["servers"][0]["url"] = json!("https://example.org/mcp");
+        apply(&mut r, &changed, 4).unwrap();
+        assert!(!r.servers[0].unknown_fields.contains_key("importedUrlKey"));
+        assert_eq!(
+            r.servers[0].unknown_fields["futureLocalField"],
+            json!({"keep":true})
+        );
+    }
+    #[test]
+    fn own_publication_carries_reference_approval_without_approving_received_changes() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-own-reference");
+        let mut r = machine();
+        apply(&mut r, &config(vec![]), 0).unwrap();
+        let before = r.clone();
+        let mut row = command("ref");
+        row["env"] =
+            json!([{"key":"TOKEN","secret":true,"source":{"ref":"op://Private/Item/key"}}]);
+        let mut server = local(row);
+        server.enabled = true;
+        server.source = Some("manual".into());
+        crate::secret_refs::approve_server(&server).unwrap();
+        r.servers.push(server);
+        record(&before, &mut r).unwrap();
+        let mut st = state(&r).unwrap();
+        st.pending.get_mut("ref").unwrap().at = 0;
+        let wire = prepare_publication(&mut st, &config(vec![])).unwrap();
+        save(&mut r, &st).unwrap();
+        apply(&mut r, &wire, 1).unwrap();
+        assert!(r.servers[0].enabled);
+        assert_ne!(
+            r.servers[0].unknown_fields.get("teamEnableReview"),
+            Some(&json!(true))
+        );
+        assert!(crate::secret_refs::check_approval(&r.servers[0]).is_ok());
+        let mut changed = wire;
+        changed["servers"][0]["env"][0]["source"]["ref"] = json!("op://Other/Item/key");
+        apply(&mut r, &changed, 2).unwrap();
+        assert!(r.servers[0].needs_team_enable_review());
+        assert!(crate::secret_refs::check_approval(&r.servers[0]).is_err());
+    }
+    #[test]
+    fn shifted_masked_arguments_follow_flags_and_ambiguous_edits_stay_local() {
+        let old = local(
+            json!({"id":"args","name":"Args","transport":"stdio","command":"fixture","args":["--x","--token","secret"],"env":[]}),
+        );
+        for args in [
+            json!(["--token", "<redacted>"]),
+            json!(["--new", "value", "--x", "--token", "<redacted>"]),
+        ] {
+            let mut received = old.clone();
+            received.args = serde_json::from_value(args).unwrap();
+            restore_local(&mut received, &old);
+            assert_eq!(received.args.last().unwrap(), "secret");
+            assert!(!received.args.iter().any(|a| a.contains("<redacted>")));
+        }
+        let mut ambiguous = old.clone();
+        ambiguous.args = vec!["--unknown".into(), "<redacted>".into()];
+        restore_local(&mut ambiguous, &old);
+        assert_eq!(ambiguous.args, old.args);
+        assert_eq!(ambiguous.unknown_fields["personalSyncArgsReview"], true);
+        let old = local(
+            json!({"id":"prefix","name":"Prefix","transport":"stdio","command":"fixture","args":["--token=secret"],"env":[]}),
+        );
+        let mut received = old.clone();
+        assert_eq!(export(&old)["args"], json!(["--token=<redacted>"]));
+        received.args = vec!["--new".into(), "--token=<redacted>".into()];
+        restore_local(&mut received, &old);
+        assert_eq!(received.args, vec!["--new", "--token=secret"]);
+    }
+    #[test]
+    fn opt_in_requires_choice_when_remote_advanced_while_local_only() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-opt-in-conflict");
+        let mut r = machine();
+        let wire = config(vec![http("a")]);
+        apply(&mut r, &wire, 0).unwrap();
+        let before = r.clone();
+        r.servers[0]
+            .unknown_fields
+            .insert("syncLocalOnly".into(), json!(true));
+        record(&before, &mut r).unwrap();
+        let mut newer = wire.clone();
+        newer["servers"][0]["name"] = json!("Remote edit");
+        apply(&mut r, &newer, 1).unwrap();
+        crate::registry::save(&r).unwrap();
+        let id = r.servers[0].id.clone();
+        r = set_local_only(&id, false).unwrap();
+        let st = state(&r).unwrap();
+        assert!(st.pending["a"].initial_conflict);
+        assert_eq!(st.conflicts["a"]["name"], "Remote edit");
+        assert_eq!(merge(&newer, &st.pending).unwrap().0, newer);
+    }
+    #[test]
+    fn publication_lock_captures_undo_before_or_after_snapshot() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-publication-snapshot");
+        let mut r = machine();
+        let wire = config(vec![http("a")]);
+        apply(&mut r, &wire, 0).unwrap();
+        let original = r.clone();
+        r.servers[0].name = "Edit".into();
+        record(&original, &mut r).unwrap();
+        let before = r.clone();
+        r.servers[0].name = "a".into();
+        record(&before, &mut r).unwrap();
+        let mut st = state(&r).unwrap();
+        assert_eq!(prepare_publication(&mut st, &wire).unwrap(), wire);
+        assert!(st.publishing.is_empty());
+        r.servers[0].name = "Edit".into();
+        record(&original, &mut r).unwrap();
+        let mut st = state(&r).unwrap();
+        st.pending.get_mut("a").unwrap().at = 0;
+        let published = prepare_publication(&mut st, &wire).unwrap();
+        save(&mut r, &st).unwrap();
+        let before = r.clone();
+        r.servers[0].name = "a".into();
+        record(&before, &mut r).unwrap();
+        assert!(state(&r).unwrap().pending.contains_key("a"));
+        apply(&mut r, &published, 1).unwrap();
+        let st = state(&r).unwrap();
+        assert_eq!(st.pending["a"].after.as_ref().unwrap()["name"], "a");
+        assert_eq!(st.pending["a"].before.as_ref().unwrap()["name"], "Edit");
+    }
+    #[test]
+    fn polls_respect_profile_removal_and_restore_every_profile_after_remote_disable() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-profiles");
+        let mut r = machine();
+        let wire = config(vec![http("a")]);
+        apply(&mut r, &wire, 0).unwrap();
+        let id = r.servers[0].id.clone();
+        r.profiles[0].enabled_server_ids.clear();
+        apply(&mut r, &wire, 1).unwrap();
+        assert!(r.profiles[0].enabled_server_ids.is_empty());
+        r.profiles[0].enabled_server_ids.push(id.clone());
+        let mut other = r.profiles[0].clone();
+        other.id = "other".into();
+        r.profiles.push(other);
+        let mut disabled = wire.clone();
+        disabled["servers"][0]["disabled"] = json!(true);
+        apply(&mut r, &disabled, 2).unwrap();
+        assert!(r.profiles.iter().all(|p| p.enabled_server_ids.is_empty()));
+        apply(&mut r, &wire, 3).unwrap();
+        assert!(r
+            .profiles
+            .iter()
+            .all(|p| p.enabled_server_ids.contains(&id)));
+    }
+    #[test]
+    fn refused_environment_warns_once_without_logging_values() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-warning");
+        let mut r = machine();
+        let mut attack = command("mock");
+        attack["name"] = json!("Mock Tools");
+        attack["env"] =
+            json!([{"key":"npm_config_registry","value":"DO_NOT_LOG_THIS","portable":true}]);
+        for version in 1..=2 {
+            assert_eq!(
+                apply(&mut r, &config(vec![attack.clone()]), version)
+                    .unwrap()
+                    .blocked,
+                1
+            );
+        }
+        let warning = state(&r).unwrap().warnings["mock"].clone();
+        assert!(warning.contains("npm_config_registry on Mock Tools"));
+        assert!(warning.contains("change your password"));
+        crate::telemetry::flush();
+        let log = std::fs::read_to_string(crate::audit::audit_path().unwrap()).unwrap();
+        assert_eq!(log.lines().count(), 1);
+        assert!(log.contains("sync_environment_refused"));
+        assert!(!log.contains("DO_NOT_LOG_THIS"));
+        for key in [
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
+            "PERL5OPT",
+            "RUBYOPT",
+            "PYTHONHOME",
+            "UV_INDEX",
+            "PIP_CONFIG_FILE",
+            "NODE_EXTRA_CA_CERTS",
+        ] {
+            assert!(risky_sync_env(key), "{key}");
+        }
+    }
+    #[test]
+    fn review_omits_irrelevant_empty_fields_and_labels_new_servers() {
+        let server = local(http("http"));
+        let fields = execution_review_fields(&server);
+        assert_eq!(fields.len(), 1);
+        assert!(fields.contains_key("URL"));
+        assert_eq!(execution_review_lines(&server)[0], "New server");
+        let server = local(command("stdio"));
+        let text = execution_review_lines(&server).join("\n");
+        assert!(!text.contains("null"));
+        assert!(!text.contains("CHANGED"));
+        assert!(!text.contains("URL:"));
+        assert!(text.contains("Uses this machine's environment: no"));
+    }
     #[test]
     fn broad_argument_hints_warn_without_rewriting_values_or_legacy_local_args() {
         let _data = crate::registry::DataDirTestEnv::new("solo-argument-hints");
@@ -1856,6 +2330,8 @@ mod tests {
             let reg = crate::registry::load().unwrap();
             let (message, healthy) = banner(&reg);
             assert_eq!(message, error);
+            assert!(state(&reg).unwrap().sign_in_required);
+            assert!(account_display_lines(&reg)[0].contains("Saved account plan: pro"));
             assert!(!healthy);
         });
     }
@@ -1999,7 +2475,7 @@ mod tests {
         assert!(lines.contains(&"Last synced 1 minute ago".into()));
         assert_eq!(crate::teams::sync_retry_seconds(&r, 4), 60);
         r.team.as_mut().unwrap().unknown_fields["accountStatus"]["canReceiveConfig"] = json!(false);
-        assert_eq!(crate::teams::sync_retry_seconds(&r, 4), 3);
+        assert_eq!(crate::teams::sync_retry_seconds(&r, 4), 480);
         r.team.as_mut().unwrap().unknown_fields["accountStatus"]["canReceiveConfig"] = json!(true);
         r.servers.clear();
         assert!(banner(&r).1);
@@ -2089,6 +2565,25 @@ mod tests {
             "NPM_CONFIG_REGISTRY",
             "PYTHONPATH",
             "PYTHONSTARTUP",
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
+            "JDK_JAVA_OPTIONS",
+            "PERL5OPT",
+            "PERL5LIB",
+            "RUBYOPT",
+            "RUBYLIB",
+            "PYTHONHOME",
+            "UV_INDEX",
+            "PIP_CONFIG_FILE",
+            "NODE_EXTRA_CA_CERTS",
+            "LD_DEBUG",
+            "LD_PROFILE",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_COUNT",
+            "GIT_EXEC_PATH",
+            "PYTHONUSERBASE",
+            "PYTHONINSPECT",
             "PIP_INDEX_URL",
             "PIP_EXTRA_INDEX_URL",
             "UV_INDEX_URL",
@@ -2131,21 +2626,25 @@ mod tests {
             .insert("syncExecutionReview".into(), json!(fields));
         server.env[0].value = Some("east".into());
         let text = execution_review_lines(&server).join("\n");
-        assert!(text.contains("CHANGED: Environment [0] REGION: east"));
-        assert!(text.contains("Environment [1] TOKEN: <masked secret>"));
-        assert!(text.contains("Launch input [0] project: /work"));
-        assert!(text.contains("Launch input [1] auth: <masked secret>"));
-        assert!(text.contains("Launch bindings:"));
-        assert!(text.contains("inheritEnv: true"));
-        assert!(text.contains("npx\\u{202E}"));
-        assert!(text.contains("/work\\u{000A}\\u{200B}"));
-        assert!(!text.contains("secret-value"));
-        assert!(!text.contains("input-secret"));
-        assert!(!text.contains("CHANGED: Command"));
+        assert_eq!(text, "Environment: REGION = east");
+        let full = execution_review_fields(&server)
+            .into_iter()
+            .map(|(k, v)| review_field_line(&k, &v))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(full.contains("Environment: TOKEN = <masked secret>"));
+        assert!(full.contains("Input: project = /work"));
+        assert!(full.contains("Input: auth = <masked secret>"));
+        assert!(full.contains("Argument values:"));
+        assert!(full.contains("Uses this machine's environment: yes"));
+        assert!(full.contains("npx\\u{202E}"));
+        assert!(full.contains("/work\\u{000A}\\u{200B}"));
+        assert!(!full.contains("secret-value"));
+        assert!(!full.contains("input-secret"));
         server.env.clear();
         assert!(execution_review_lines(&server)
             .iter()
-            .any(|line| line == "CHANGED: Environment [0] REGION: removed"));
+            .any(|line| line == "Environment: REGION = Removed"));
     }
     #[test]
     fn acknowledgement_rebases_newer_edits_including_disable_and_lost_response() {
@@ -2259,6 +2758,11 @@ mod tests {
         let mut row = command("exec");
         row["args"] = json!(["--token", "<redacted>"]);
         row["env"] = json!([{"key":"REGION","secret":false}]);
+        let mut installed = row.clone();
+        installed["args"][1] = json!("local-argument-secret");
+        let mut installed = local(installed);
+        installed.enabled = true;
+        r.servers.push(installed);
         apply(&mut r, &config(vec![row.clone(), http("remote")]), 1).unwrap();
         let s = r.servers.iter_mut().find(|s| s.command.is_some()).unwrap();
         s.args[1] = "local-argument-secret".into();

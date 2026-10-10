@@ -1,4 +1,9 @@
-import { executionReviewLines, visibleExecutionText } from "@/lib/executionReview";
+import {
+  executionReviewLines,
+  executionReviewFields,
+  executionReviewFieldLine,
+  visibleExecutionText,
+} from "@/lib/executionReview";
 import { isPersonalSync } from "@/lib/personalSync";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
@@ -1135,22 +1140,29 @@ function App() {
         description={
           confirmEnableTeam ? (
             <div className="max-h-[60vh] space-y-2 overflow-auto break-all font-mono text-xs">
-              <p>
-                Review every execution input. CHANGED fields differ from the last approved
-                version. Enable only a setup you trust.
-              </p>
+              <p>Review the highlighted changes. Enable only a setup you trust.</p>
               {executionReviewLines(confirmEnableTeam).map((line, i) => (
                 <p
                   key={i}
                   className={
-                    line.startsWith("CHANGED:")
-                      ? "font-semibold text-foreground"
+                    line !== "New server"
+                      ? "rounded bg-amber-500/10 p-1 text-foreground"
                       : undefined
                   }
                 >
                   {line}
                 </p>
               ))}
+              {confirmEnableTeam.syncExecutionReview && (
+                <details>
+                  <summary>Show full definition</summary>
+                  {Object.entries(executionReviewFields(confirmEnableTeam)).map(
+                    ([key, value]) => (
+                      <p key={key}>{executionReviewFieldLine(key, value)}</p>
+                    ),
+                  )}
+                </details>
+              )}
             </div>
           ) : undefined
         }

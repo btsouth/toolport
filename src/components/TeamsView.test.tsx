@@ -1021,7 +1021,7 @@ it("shows both conflict versions as fields with the server name and highlighted 
   expect(screen.getByText("Other machine")).toBeInTheDocument();
   expect(screen.getByText("machine A v2")).toBeInTheDocument();
   expect(screen.getByText("machine B v2")).toBeInTheDocument();
-  expect(screen.getAllByText("CHANGED: URL")).toHaveLength(2);
+  expect(screen.getAllByText("URL")).toHaveLength(2);
 });
 it("uses the chosen sync service for browser sign-in", async () => {
   render(<TeamsView registry={{ ...registry, team: null }} onRegistryChange={vi.fn()} />);
@@ -1033,4 +1033,30 @@ it("uses the chosen sync service for browser sign-in", async () => {
   expect(openExternal).toHaveBeenCalledWith(
     "https://sync.example.com/?intent=pro&from=app-sync",
   );
+});
+
+it("shows refused environment warnings and treats a missing sign-in plan as saved", () => {
+  const personal = structuredClone(registry);
+  personal.team!.role = "admin";
+  personal.team!.accountStatus = {
+    personalSync: true,
+    plan: "pro",
+    trialActive: false,
+    trialEndsAt: null,
+    freeSyncGraceEndsAt: null,
+    deviceId: "d",
+    canReceiveConfig: true,
+    reason: null,
+  };
+  personal.team!.personalSyncState = {
+    signInRequired: true,
+    error: "Sync sign-in is missing from this machine. Sign in again.",
+    warnings: {
+      mock: "A synced change tried to set npm_config_registry on Mock Tools. Toolport ignored it.",
+    },
+  };
+  render(<TeamsView registry={personal} onRegistryChange={vi.fn()} />);
+  expect(screen.getByText(/Saved account plan: pro/)).toBeInTheDocument();
+  expect(screen.queryByText("Pro · unlimited devices")).not.toBeInTheDocument();
+  expect(screen.getByText(/npm_config_registry on Mock Tools/)).toBeInTheDocument();
 });

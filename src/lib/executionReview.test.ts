@@ -45,20 +45,18 @@ describe("execution review", () => {
       ],
     };
     const lines = executionReviewLines(attack);
-    expect(lines).toContain(
-      "CHANGED: Environment [2] npm_config_registry: https://evil/; reference: null",
-    );
-    expect(lines.find((line) => line.includes("Command:"))).toBe("Command: npx");
+    expect(lines).toContain("Environment: npm_config_registry = https://evil/");
+    expect(lines.some((line) => line.includes("Command:"))).toBe(false);
   });
   it("shows every execution field, names masked inputs, and removed fields", () => {
     const lines = executionReviewLines(server).join("\n");
-    expect(lines).toContain("Environment [0] REGION: west");
-    expect(lines).toContain("Environment [1] TOKEN: <masked secret>");
-    expect(lines).toContain("Launch input [0] project: work");
-    expect(lines).toContain("Launch input [1] auth: <masked secret>");
-    expect(lines).toContain("Working directory: /work");
-    expect(lines).toContain("inheritEnv: false");
-    expect(lines).toContain("Launch bindings:");
+    expect(lines).toContain("Environment: REGION = west");
+    expect(lines).toContain("Environment: TOKEN = <masked secret>");
+    expect(lines).toContain("Input: project = work");
+    expect(lines).toContain("Input: auth = <masked secret>");
+    expect(lines).toContain("Working folder: /work");
+    expect(lines).toContain("Uses this machine's environment: no");
+    expect(lines).toContain("Argument values:");
     expect(lines).not.toContain("hidden");
     expect(
       executionReviewLines({
@@ -66,7 +64,27 @@ describe("execution review", () => {
         env: [],
         syncExecutionReview: executionReviewFields(server),
       }),
-    ).toContain("CHANGED: Environment [0] REGION: removed");
+    ).toContain("Environment: REGION = Removed");
+  });
+  it("shows new servers without irrelevant fields and offers only changes for updates", () => {
+    const http = {
+      ...server,
+      transport: "http" as const,
+      url: "https://example.com",
+      command: null,
+      env: [],
+      launch: undefined,
+    };
+    expect(executionReviewLines(http)).toEqual([
+      "New server",
+      "URL: https://example.com",
+    ]);
+    expect(
+      executionReviewLines({
+        ...server,
+        syncExecutionReview: executionReviewFields(server),
+      }),
+    ).toEqual([]);
   });
   it("renders controls, bidi and zero-width characters visibly", () => {
     expect(visibleExecutionText("node\n\t\u202e\u200b\ufeff")).toBe(
