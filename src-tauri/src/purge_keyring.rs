@@ -163,21 +163,21 @@ pub(crate) fn remove() -> Result<Vec<Leftover>, String> {
             unsafe { CFType::wrap_under_get_rule(raw) }
         }
         let query = CFDictionary::from_CFType_pairs(&[
-            (k(kSecClass), k(kSecClassGenericPassword)),
+            (k(kSecClass.cast()), k(kSecClassGenericPassword.cast())),
             (
-                k(kSecAttrService),
+                k(kSecAttrService.cast()),
                 CFString::new(super::SERVICE).as_CFType(),
             ),
             (
-                k(kSecAttrAccessGroup),
+                k(kSecAttrAccessGroup.cast()),
                 CFString::new(super::platform::SHARED_ACCESS_GROUP).as_CFType(),
             ),
             (
-                k(kSecUseDataProtectionKeychain),
+                k(kSecUseDataProtectionKeychain.cast()),
                 CFBoolean::true_value().as_CFType(),
             ),
         ]);
-        let status = SecItemDelete(query.as_concrete_TypeRef());
+        let status = SecItemDelete(query.as_concrete_TypeRef().cast());
         if status != 0 && status != -25300 {
             leftovers.push(Leftover {
                 path: format!(

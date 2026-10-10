@@ -136,6 +136,7 @@ jobs:
             sudo -u builder makepkg --printsrcinfo > /out/.SRCINFO
             namcap PKGBUILD || true
             pkg=$(ls -1 *.pkg.tar.*)
+            cp "$pkg" /out/
             echo "built $pkg"
             bsdtar -tf "$pkg" | tee contents.txt
             unexpected=$(grep -E "^usr/bin/[^/]+$" contents.txt | grep -Ev "^usr/bin/(toolport-gtk|toolport-gateway|toolport|conduit)$" || true)
@@ -145,7 +146,7 @@ jobs:
             done
             grep -q "^usr/share/applications/" contents.txt || { echo "::error::no .desktop file in $pkg"; exit 1; }
           '
-          node .github/scripts/package-contents.mjs aur/*.pkg.tar.zst
+          node .github/scripts/package-contents.mjs srcinfo-out/*.pkg.tar.zst
           # Line order in .SRCINFO carries no meaning, so compare sorted: this is
           # asking "does the renderer say the same thing makepkg would", not
           # "did it emit the bytes in the same sequence".
