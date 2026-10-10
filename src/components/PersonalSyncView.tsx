@@ -127,11 +127,13 @@ export function PersonalSyncView({
                   const invalid = teamUrlError(url);
                   if (invalid) throw new Error(invalid);
                   const result = await teamConnect(url, code.trim());
+                  if (result.status === "pending" && result.requestToken) {
+                    setPending({ url, token: result.requestToken });
+                    return;
+                  }
                   if (result.status !== "connected")
-                    throw new Error(
-                      "This invitation is waiting for approval. Complete it in your browser.",
-                    );
-                  onRegistryChange(await getRegistry());
+                    throw new Error("Could not sign in. Get a new manual code.");
+                  onRegistryChange(result.registry ?? (await getRegistry()));
                 })
               }
             >

@@ -424,7 +424,7 @@ describe("TeamsView shared-server update", () => {
           "team-tool",
           true,
           true,
-          expect.objectContaining({ id: "team-tool" }),
+          withReviewServer.servers.find((s) => s.id === "team-tool"),
         ),
       );
     },

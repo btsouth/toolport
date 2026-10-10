@@ -143,7 +143,7 @@ pub fn export(s: &ServerEntry) -> Value {
             if secret && arg != "<launch-input>" {
                 "<redacted>".to_string()
             } else {
-                arg.clone()
+                crate::sharing_controller::redact_share_url(arg)
             }
         })
         .collect();
@@ -171,7 +171,7 @@ pub fn export(s: &ServerEntry) -> Value {
     v["disabled"] = json!(!s.enabled);
     v["args"] = json!(args);
     if let Some(url) = &s.url {
-        v["url"] = json!(crate::redact_url_userinfo(url));
+        v["url"] = json!(crate::sharing_controller::redact_share_url(url));
     }
     v["env"] = json!(s
         .env
@@ -664,7 +664,12 @@ pub fn set_local_only(server_id: &str, local_only: bool) -> Result<Registry, Str
         server
             .unknown_fields
             .insert("syncLocalOnly".into(), json!(local_only));
-        if local_only && server.source.as_deref().is_some_and(|s|s.starts_with("team:")) {
+        if local_only
+            && server
+                .source
+                .as_deref()
+                .is_some_and(|s| s.starts_with("team:"))
+        {
             // Preserve shared provenance: opting out must never launder a
             // received command or key reference into trusted local input.
             server.source = Some("shared".into());
