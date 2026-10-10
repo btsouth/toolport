@@ -4307,7 +4307,7 @@ fn protocol_lane_policy_refusals_explain_the_reason_and_fix() {
         let (name, reason, fix) = match case {
             "strict" => {
                 reg.set_safety_level(registry::SafetyLevel::Strict);
-                ("files__delete_item", "Strict safety", "Toolport > Safety")
+                ("files__delete_item", "Strict safety", "Toolport > Settings")
             }
             "team" => {
                 reg.set_safety_level(registry::SafetyLevel::Off);
@@ -4361,7 +4361,7 @@ fn protocol_lane_policy_refusals_explain_the_reason_and_fix() {
                 (
                     "files__delete_item",
                     "quarantined after a tool change",
-                    "Toolport > Activity",
+                    "Toolport > Settings > Quarantined tools",
                 )
             }
         };

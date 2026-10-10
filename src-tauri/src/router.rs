@@ -200,17 +200,22 @@ fn blocked_tool_message(name: &str, reason: &str) -> String {
     let (why, where_to) = match reason {
         "outside this client's tool scope" => ("turned off for this client", "Clients"),
         "disabled" => ("turned off", "Servers"),
-        "on a server that is turned off" => ("on a server that is turned off", "Clients"),
+        "on a server that is turned off" => ("on a server that is turned off", "Servers"),
         "blocked by the destructive-tool policy" => {
-            ("destructive and blocked by Strict safety", "Safety")
+            ("destructive and blocked by Strict safety", "Settings")
         }
         "quarantined after a high-risk change; re-approve to restore" => (
             "quarantined after a tool change",
-            "Activity to review and approve it",
+            "Settings > Quarantined tools",
         ),
-        _ => (reason, "Safety"),
+        _ => (reason, "Settings"),
     };
-    format!("Blocked by Toolport: {name} is {why}. Change it in Toolport > {where_to}.")
+    let action = if where_to == "Settings > Quarantined tools" {
+        "Review it"
+    } else {
+        "Change it"
+    };
+    format!("Blocked by Toolport: {name} is {why}. {action} in Toolport > {where_to}.")
 }
 
 fn alias_distance(a: &str, b: &str) -> usize {
@@ -6833,6 +6838,19 @@ for line in sys.stdin:
             router.no_route_message("s__private_export").as_bytes(),
             unknown.as_bytes()
         );
+    }
+
+    #[test]
+    fn refusal_recovery_paths_match_settings_and_servers() {
+        for (reason, expected) in [
+            ("blocked by the destructive-tool policy", "Blocked by Toolport: files__delete is destructive and blocked by Strict safety. Change it in Toolport > Settings."),
+            ("quarantined after a high-risk change; re-approve to restore", "Blocked by Toolport: files__delete is quarantined after a tool change. Review it in Toolport > Settings > Quarantined tools."),
+            ("on a server that is turned off", "Blocked by Toolport: files__delete is on a server that is turned off. Change it in Toolport > Servers."),
+            ("disabled", "Blocked by Toolport: files__delete is turned off. Change it in Toolport > Servers."),
+            ("outside this client's tool scope", "Blocked by Toolport: files__delete is turned off for this client. Change it in Toolport > Clients."),
+        ] {
+            assert_eq!(blocked_tool_message("files__delete", reason), expected);
+        }
     }
 
     #[test]
