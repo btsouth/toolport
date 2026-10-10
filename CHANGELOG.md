@@ -6,6 +6,8 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+- Command Code is a supported client. Toolport finds it, connects it through
+  `~/.commandcode/mcp.json`, and imports the servers already set up there.
 - Tool results reach your AI clients exactly as the server sent them. Toolport no
   longer adds a notice block, a generic failure line, or a wrapper around flagged
   text, so clients that parse results keep working. Injection findings still show in
