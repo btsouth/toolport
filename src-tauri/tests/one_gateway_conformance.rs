@@ -4382,19 +4382,31 @@ fn protocol_lane_unknown_on_loaded_owner_does_not_wait_for_other_catalogs() {
     slow.args.push("--start-delay-ms=20000".into());
     write_registry(
         &dir,
-        vec![protocol_lane_server(&dir, "files", &[protocol_lane_tool("read_item", false)]), slow],
+        vec![
+            protocol_lane_server(&dir, "files", &[protocol_lane_tool("read_item", false)]),
+            slow,
+        ],
         vec![],
     );
     let mut client = spawn_adapter(&dir, &AdapterOptions::default());
     client.initialize("protocol-loaded-owner");
     client.wait_for_tool("files__read_item", Duration::from_secs(30));
-    assert_eq!(transcript_method_count(&dir.join("transcript-slow.jsonl"), "tools/list"), 0);
+    assert_eq!(
+        transcript_method_count(&dir.join("transcript-slow.jsonl"), "tools/list"),
+        0
+    );
     let started = Instant::now();
     protocol_lane_error(
-        &client.call_tool("toolport_call_tool", json!({"name":"files__read_itm","arguments":{}})),
+        &client.call_tool(
+            "toolport_call_tool",
+            json!({"name":"files__read_itm","arguments":{}}),
+        ),
         "Unknown tool: files__read_itm",
     );
-    assert!(started.elapsed() < Duration::from_millis(1500), "loaded owner waited for another server");
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "loaded owner waited for another server"
+    );
 }
 
 #[test]
