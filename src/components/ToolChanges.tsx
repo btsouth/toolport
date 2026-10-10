@@ -138,7 +138,7 @@ export function ToolChanges({
                   {blocked
                     ? `${blocked} ${blocked === 1 ? "tool is" : "tools are"} blocked. Review the changes or accept them.`
                     : unknown
-                      ? "Blocking status unavailable. Refresh to check."
+                      ? "Blocking status unavailable. Review in Settings > Quarantined tools."
                       : "Not blocked. Review the changes or accept them."}
                 </p>
                 <button
@@ -197,7 +197,7 @@ export function ToolChanges({
                             ? "Blocked until you accept the changes."
                             : event.blocked === false
                               ? "Not blocked."
-                              : "Blocking status unavailable. Refresh to check."}
+                              : "Blocking status unavailable. Review in Settings > Quarantined tools."}
                         </p>
                         {event.signatures !== undefined && (
                           <p className="text-destructive">

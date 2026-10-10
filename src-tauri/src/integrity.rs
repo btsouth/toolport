@@ -3935,6 +3935,20 @@ fn review_events_uncached(limit: usize) -> std::io::Result<Vec<Value>> {
     for event in &mut events {
         match &quarantines {
             Ok(records) => {
+                // Older findings and quarantines did not capture fingerprints or
+                // profile identity. A possible active block is not safe to dismiss.
+                let unknown = records.iter().any(|record| {
+                    let profile = record["profile"].as_str();
+                    let event_profile = event["profile"].as_str();
+                    record["tool"].as_str().is_some()
+                        && record["tool"] == event["tool"]
+                        && (profile == event_profile || profile.is_none() || event_profile.is_none())
+                        && (event["new_fp"].as_str().is_none()
+                            || record["pending_pin"]["fp"]
+                                .as_str()
+                                .or_else(|| record["definition_fp"].as_str())
+                                .is_none())
+                });
                 let profiles: Vec<&str> = records
                     .iter()
                     .filter(|record| {
@@ -3951,13 +3965,17 @@ fn review_events_uncached(limit: usize) -> std::io::Result<Vec<Value>> {
                     })
                     .filter_map(|record| record["profile"].as_str())
                     .collect();
-                event["blocked"] = json!(
-                    !profiles.is_empty()
-                        || (event["type"] == "pins_load_failed"
-                            && records.iter().any(|record| record["change"] == "tamper"
-                                && record["profile"].as_str().unwrap_or("")
-                                    == event["profile"].as_str().unwrap_or("")))
-                );
+                event["blocked"] = if unknown {
+                    Value::Null
+                } else {
+                    json!(
+                        !profiles.is_empty()
+                            || (event["type"] == "pins_load_failed"
+                                && records.iter().any(|record| record["change"] == "tamper"
+                                    && record["profile"].as_str().unwrap_or("")
+                                        == event["profile"].as_str().unwrap_or("")))
+                    )
+                };
                 event["blocked_profiles"] = json!(profiles);
             }
             Err(_) => {
@@ -4695,6 +4713,7 @@ mod tests {
         );
         assert_eq!(review_events_uncached(2000).unwrap()[0]["blocked"], false);
     }
+
     #[test]
     fn review_cache_skips_unchanged_reads_and_invalidates_all_inputs() {
         let _data_dir_lock = crate::registry::data_dir_test_lock();

@@ -3710,7 +3710,7 @@ impl ActivityPage {
         {
             "Some tools are blocked. Review the changes or accept them.".to_string()
         } else if important.iter().any(|event| event["blocked"].is_null()) {
-            "Blocking status unavailable. Refresh to check.".to_string()
+            "Blocking status unavailable. Review in Settings > Quarantined tools.".to_string()
         } else {
             "Not blocked. Review the changes or accept them.".to_string()
         });
@@ -4248,7 +4248,7 @@ fn tool_change_group_card(
     let status = if blocked > 0 {
         format!("{blocked} tools are blocked. Review the changes or accept them.")
     } else if unknown {
-        "Blocking status unavailable. Refresh to check.".to_string()
+        "Blocking status unavailable. Review in Settings > Quarantined tools.".to_string()
     } else {
         "Not blocked. Review the changes or accept them.".to_string()
     };
@@ -4498,7 +4498,7 @@ fn security_review_lines(event: &serde_json::Value) -> Vec<String> {
             match event["blocked"].as_bool() {
                 Some(true) => "Blocked until you accept the changes.",
                 Some(false) => "Not blocked.",
-                None => "Blocking status unavailable. Refresh to check.",
+                None => "Blocking status unavailable. Review in Settings > Quarantined tools.",
             }
             .to_string(),
         );
@@ -10273,7 +10273,7 @@ mod tests {
                 "Changed field: Safety hints",
                 "readOnlyHint: true to false",
                 "Parameter details were not saved for this older change.",
-                "Blocking status unavailable. Refresh to check.",
+                "Blocking status unavailable. Review in Settings > Quarantined tools.",
             ]
         );
     }
@@ -10337,6 +10337,7 @@ mod tests {
                 .any(|line| line.contains("Settings > Quarantined tools")));
         }
     }
+
     #[test]
     fn poison_flagged_drift_requires_per_tool_review_and_shows_signatures() {
         let event = serde_json::json!({"type":"tool_drift", "server":"srv", "tool":"srv__update", "ts":100, "blocked":true, "blocked_profiles":["work"], "new_fp":"v2:reviewed", "signatures":["instruction_override"]});
@@ -10369,7 +10370,7 @@ mod tests {
                 "This tool changed since it was last accepted.",
                 "This older event does not contain field-level change details.",
                 "Parameter details were not saved for this older change.",
-                "Blocking status unavailable. Refresh to check.",
+                "Blocking status unavailable. Review in Settings > Quarantined tools.",
             ]
         );
     }
