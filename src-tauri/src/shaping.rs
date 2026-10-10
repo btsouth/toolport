@@ -316,8 +316,8 @@ fn is_text_representable(result: &Value) -> bool {
     }
 }
 
-/// If `result` serializes to more than `budget` bytes, cache its full body, replace
-/// it with a truncated head and retention notice, and return `true` (shaped).
+/// If `result` serializes to more than `budget` bytes, attempt to retain its body,
+/// replace it with a truncated head and retention notice, and return `true` (shaped).
 /// A `budget` of 0 disables shaping. The full body stays fetchable via
 /// [`fetch_result`] while retained within the memory cap and insertion TTL.
 pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> bool {
@@ -1233,6 +1233,20 @@ mod tests {
     #[test]
     fn over_cap_payload_reports_no_cursor() {
         assert!(stash_payload(String::with_capacity(MAX_CACHE_BYTES), None, None).is_none());
+    }
+
+    #[test]
+    fn over_cap_stash_retains_text_without_structured_projections() {
+        let structured = Value::String(String::with_capacity(MAX_CACHE_BYTES));
+        let cursor = stash_payload("retained text".into(), Some(structured), None).unwrap();
+        assert_eq!(
+            fetch_result(&cursor, 0, 100, None, None),
+            text_result(
+                "retained text\n\n[Toolport: end of result (13 characters).]".into(),
+                false
+            )
+        );
+        assert_eq!(fetch_result(&cursor, 0, 100, None, Some("")), text_result("[Toolport: projections aren't available for this very large result. Page the text or narrow the call.]".into(), true));
     }
 
     #[test]
