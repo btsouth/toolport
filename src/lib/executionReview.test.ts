@@ -21,8 +21,14 @@ const server: ServerEntry = {
   ],
   launch: {
     inputs: [
-      { key: "project", label: "Project", secret: false, value: "work" },
-      { key: "auth", label: "Auth", secret: true, value: "hidden-input" },
+      { key: "project", label: "Project", required: false, secret: false, value: "work" },
+      {
+        key: "auth",
+        label: "Auth",
+        required: false,
+        secret: true,
+        value: "hidden-input",
+      },
     ],
     bindings: [{ index: 1, parts: [{ kind: "input", key: "project" }] }],
   },
