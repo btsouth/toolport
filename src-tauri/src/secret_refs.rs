@@ -1829,14 +1829,22 @@ mod review_regressions {
                     ])
                     .env("TOOLPORT_APPROVAL_TEST_PATH", &path)
                     .env("TOOLPORT_APPROVAL_TEST_ID", format!("writer-{id}"))
-                    .stdout(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
                     .spawn()
                     .unwrap()
             })
             .collect();
         drop(lock);
-        for child in &mut children {
-            assert!(child.wait().unwrap().success());
+        for child in children.drain(..) {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "approval writer failed: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         let entries = approvals(&path);
         assert_eq!(entries.len(), 6);
