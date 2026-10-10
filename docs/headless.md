@@ -1,14 +1,37 @@
 # Headless / container gateway
 
-**Gateway-only compile:** CI and headless builds use
-`cargo build --no-default-features --bin toolport-gateway` to skip the Tauri
-desktop shell and WebKit dependencies. The default feature set (`desktop`) is
-for the full app.
+Run `toolport-gateway` without installing or launching either desktop shell.
+Use it on a server, in Docker, or with sandboxed coding agents and Open WebUI.
+HTTP and stdio use the same gateway binary. Desktop approval prompts require a
+running desktop app; unattended servers should choose their safety policy
+explicitly (see below).
 
-Run `toolport-gateway` without the desktop app, for Docker hosts, sandboxed
-coding agents, and Open WebUI. The desktop app stays the local-first product
-(client config writers, HITL approvals, OAuth UX). This path is the same binary
-with HTTP enabled.
+## Install the gateway only (Linux, from source)
+
+Use stable Rust and Git. On Debian/Ubuntu, install the build dependencies:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libssl-dev libdbus-1-dev git ca-certificates openssl
+```
+
+From a checkout of the release you want to run (use tag `v2.0.0` once published):
+
+```bash
+git clone https://github.com/btsouth/toolport.git
+cd toolport
+git checkout v2.0.0
+cargo build --locked --release --manifest-path src-tauri/Cargo.toml \
+  --no-default-features --features search-static --bin toolport-gateway
+install -Dm755 src-tauri/target/release/toolport-gateway "$HOME/.local/bin/toolport-gateway"
+```
+
+`search-static` is required by the gateway target in 2.0. Disabling default
+features skips Tauri, GTK and WebKit; Node and npm are not needed to build the
+gateway. If you set `CARGO_TARGET_DIR`, install the binary from that directory's
+`release/` instead. Install any runtimes your stdio servers need separately.
+The desktop install scripts install the app, so use this build or the
+[container image](#docker) for a gateway-only host.
 
 ## What you get
 
@@ -38,18 +61,27 @@ Auth is the same bearer token as today (`TOOLPORT_HTTP_TOKEN` or a registered
 
 ## Quick start (binary)
 
+Create a private data folder and a registry using the [minimal example](#minimal-registryjson)
+below. The folder also stores logs, caches and gateway state.
+
 ```bash
-export TOOLPORT_HTTP_HOST=0.0.0.0
+export TOOLPORT_DATA_DIR="$HOME/.local/share/toolport-gateway"
+install -d -m700 "$TOOLPORT_DATA_DIR"
+export TOOLPORT_REGISTRY="$TOOLPORT_DATA_DIR/registry.json"
+# Save your registry.json here before starting the gateway.
+export TOOLPORT_HTTP_HOST=127.0.0.1
 export TOOLPORT_HTTP_TOKEN="$(openssl rand -hex 24)"
-export TOOLPORT_REGISTRY=/path/to/registry.json
 # optional: encrypted vault
 # export TOOLPORT_SECRET_KEY=...
 
-toolport-gateway --http 8765
+"$HOME/.local/bin/toolport-gateway" --http 8765
 ```
 
-Point Open WebUI at `http://host:8765` with the bearer token as the API key.
-Point an MCP client at `http://host:8765/mcp` (streamable-HTTP).
+The command runs in the foreground. Set `TOOLPORT_HTTP_HOST=0.0.0.0` to accept
+network connections and follow the [production checklist](#production-checklist).
+Point Open WebUI at `http://host:8765` with the bearer token as its API key,
+or an MCP client at `http://host:8765/mcp`. Without `--http`, the binary serves
+MCP on stdio for a client that launches it; no desktop app is required.
 
 ### Prometheus metrics (opt-in)
 
@@ -124,7 +156,8 @@ volume so the runtime user (uid 10001) owns `/data`:
 cp data/registry.json.example data/registry.json
 cp docker-compose.example.yml docker-compose.yml
 # create .env with at least TOOLPORT_HTTP_TOKEN=...
-docker compose up -d
+docker compose pull
+docker compose up -d --no-build
 # seed the registry into the volume; the gateway picks it up on its next reload
 docker compose cp data/registry.json toolport-gateway:/data/registry.json
 docker compose exec --user root toolport-gateway chown 10001:10001 /data/registry.json
@@ -172,7 +205,7 @@ docker build -f Dockerfile.source -t toolport-gateway .
 Or use the runtime Dockerfile after building the binary on the host:
 
 ```bash
-cargo build --release --bin toolport-gateway --manifest-path src-tauri/Cargo.toml --no-default-features
+cargo build --locked --release --bin toolport-gateway --manifest-path src-tauri/Cargo.toml --no-default-features --features search-static
 cp src-tauri/target/release/toolport-gateway toolport-gateway-bin
 docker build -t toolport-gateway .
 ```
@@ -207,36 +240,40 @@ TOOLPORT_SECRET_STRIPE_SECRET_KEY=sk_live_...
 ## Minimal `registry.json`
 
 Start from [`data/registry.json.example`](../data/registry.json.example) (remote
-MCP server: works in a minimal container with no extra runtime). Or copy a full
+MCP server: replace its placeholder URL; no extra runtime is needed). Or copy a full
 `registry.json` from a machine that already runs the desktop app.
 
-A valid headless registry needs `profiles` and `activeProfileId`, not just
-`servers`:
+The repository example uses the legacy v1 schema and is migrated on first load.
+For a new 2.0 host, use schema v3 with `profiles` (the stored access sets), explicit
+server enablement and an explicit safety choice. Replace the example URL with your
+server's MCP endpoint:
 
 ```json
 {
-  "version": 1,
+  "version": 3,
+  "safetyLevel": "off",
+  "codeMode": false,
   "servers": [
     {
-      "id": "stripe",
-      "name": "Stripe",
-      "transport": "stdio",
-      "command": "npx",
-      "args": ["-y", "@stripe/mcp"],
-      "env": [{ "key": "STRIPE_SECRET_KEY", "secret": true }],
+      "id": "example-remote",
+      "name": "Example Remote MCP",
+      "transport": "http",
+      "url": "https://mcp.example.com/mcp",
+      "enabled": true,
+      "args": [],
+      "env": [],
       "source": "manual"
     }
   ],
-  "profiles": [
-    {
-      "id": "default",
-      "name": "Default",
-      "enabledServerIds": ["stripe"]
-    }
-  ],
-  "activeProfileId": "default"
+  "profiles": []
 }
 ```
+
+`"safetyLevel": "off"` allows calls without human approval, including destructive
+calls. New 2.0 installs otherwise default to Ask: destructive calls fail closed
+without the desktop approval broker. Choose Off only when that is your intended
+policy; team minimum safety still applies. A 1.x registry keeps its old Safety
+and Code Mode settings; see the [upgrade guide](upgrading-to-2.md).
 
 Stdio servers inside the container need their runtimes (`node`/`npx`, `uv`,
 etc.) installed in the image or reached via another container on the same
@@ -272,8 +309,9 @@ Use this before exposing a headless gateway beyond a trusted host or LAN.
 - [ ] **`.env` permissions**: mode `600`, never commit, rotate if leaked.
 - [ ] **Registry on a volume**: persist `/data/registry.json`; back up before
       upgrades. A corrupt file is quarantined, not silently wiped (#224).
-- [ ] **Disable HITL**: set `humanApproval: false` in the registry (and leave
-      team-forced approval off). Without the desktop app's approval broker,
+- [ ] **Choose unattended safety**: use `"safetyLevel": "off"` only if calls
+      should run without human approval, and account for any team minimum safety.
+      Without the desktop app's approval broker,
       gated tools **fail closed** with "approval service unreachable".
 
 ### Container hygiene
@@ -393,8 +431,8 @@ headless and Docker configs do not break on upgrade.
 - **Client config writers** (Cursor/Claude local JSON) still need the desktop
   app or a one-time manual URL in the client config, which is what sandboxed
   setups usually want anyway.
-- **Code Mode** (`toolport_run_script`) is **off by default**. The 2.0 upgrade
-  turns it off for existing registries too. Enable it under Advanced in Settings, with `"codeMode": true`,
+- **Code Mode** (`toolport_run_script`) is **off by default**. Upgrades keep the
+  1.x choice. Enable it under Advanced in Settings, with `"codeMode": true`,
   or with `TOOLPORT_CODE_MODE=1`. It is not a security boundary:
   agents supply JS that can call many tools in one round-trip; each call still
   hits the same scope and approval gates. Shared multi-tenant gateways that do

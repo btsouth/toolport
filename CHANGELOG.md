@@ -6,14 +6,62 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
-- Command Code is a supported client. Toolport finds it, connects it through
-  `~/.commandcode/mcp.json`, and imports the servers already set up there.
-- Tool results reach your AI clients exactly as the server sent them. Toolport no
-  longer adds a notice block, a generic failure line, or a wrapper around flagged
-  text, so clients that parse results keep working. Injection findings still show in
-  Activity, and Strict mode still blocks high-confidence ones.
-- After upgrading to client access sets, use Stop old gateways and restart any apps
-  still running a 1.x gateway so they use the new access controls.
+## [2.0.0]
+
+Sync your personal setup across machines with Pro, use password manager references,
+and find tools with local semantic search and a compact menu.
+Linux system packages now use the native GTK app; the AppImage stays available.
+Your 1.x Safety and Code Mode settings are kept. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/next/2.0/docs/upgrading-to-2.md) before upgrading.
+
+### Added
+
+- Personal sync across your machines with Pro.
+- [Password manager references](https://github.com/btsouth/toolport/blob/next/2.0/docs/secret-references.md)
+  for server credentials. Sync references, then sign in and approve them locally.
+- Local semantic tool search without an external endpoint. Search shows 10
+  candidates by default; agents can request up to 50.
+- Per-client server access and discovery settings, review before connecting,
+  and an option to restore original client configs when disconnecting.
+- Command Code support.
+
+### Changed
+
+- 1.x Safety, Code Mode, discovery choices and server environment settings carry
+  over. New installs start with Safety Ask and Code Mode off; new local servers
+  receive basic environment variables plus the ones you set.
+- Tool results reach clients exactly as the server sent them. Injection findings
+  still appear in Activity; blocking stops flagged results instead of wrapping them.
+  Long tool names are shortened to each client's limit.
+- The sidebar is Servers, Clients, Activity and Settings. Catalog browsing is in
+  Servers; Playground is in each server's Tools tab. Number shortcuts follow the
+  new sidebar. Restart clients still using an old gateway after upgrading.
+- Windows installs and updates ask you to close MCP clients first.
+- Linux `.deb` and `.rpm` packages use GTK. The deb needs Ubuntu 24.04+ or
+  Debian 13+; older distros, including Ubuntu 22.04 and Debian 12, use the
+  AppImage. AUR `toolport-bin` also becomes GTK. GTK has no in-app update check;
+  update through your package channel or install a newer package.
+
+### Removed
+
+- Agent rules, agent permissions and their guard hook, agent activity hooks,
+  routines, agent control and confirm, `conduit_*` tool aliases, Collections and
+  stacks, the global profile switcher, and the picker for new Shared HTTP
+  connections. Existing Shared HTTP connections keep working.
+- If you used the removed agent features, a notice on each installation names
+  them and links to going back to 1.24. Rules, routines and permission rules are
+  saved in `<Toolport data folder>/exports/`; existing client files are left as
+  they were. Choose **I need this** to open a feature request.
+
+### Staying on 1.24 or rolling back
+
+- Install the latest 1.24.x release to keep using removed features. 1.24.x gets
+  security fixes for three months after 2.0.0.
+- On Arch/Omarchy, use `/usr/share/toolport/toolport-preview-rollback.sh` with
+  `--package` pointing to your saved 1.24 package. Elsewhere, quit Toolport and
+  its clients, restore `registry.json.v1-<time>.bak`, and reinstall 1.24.
+  [Rollback steps](https://github.com/btsouth/toolport/blob/next/2.0/docs/upgrading-to-2.md#go-back-to-124)
+  explain the data folder and backup. Changes made in 2.0 are not in that backup.
 
 ## [1.24.0] - 2026-10-06
 
@@ -881,7 +929,7 @@ makepkg -si` builds the identical package with no AUR account). The AppImage
   `apply_instructions_to` only recorded a target when `write_target` returned
   `Applied`. Error, TooLong (a Devin Desktop char-cap miss) and BlockedOverride then
   hit `remove_recorded`, which stripped the working v1 block, persisted the new
-  content watermark, and left later syncs with nothing to retry — coverage of
+  content watermark, and left later syncs with nothing to retry; coverage of
   the missing file against too-long v2 is `TooLong`, not `Stale`. Last-good now
   stays on disk and in the recorded set when a rewrite is refused; a real
   removal (org cleared, client gone, path moved) still cleans up. (SBS-917)
@@ -1460,8 +1508,8 @@ If we missed you, open an issue.
 
 Two features ship for the first time. PII pseudonymization replaces personal data in
 tool results with tokens before the model sees them, restoring the real values only
-for the server that provided them. OAuth client credentials let a headless server —
-one nobody can click a browser sign-in for — get a real token. Both are off or opt-in
+for the server that provided them. OAuth client credentials let a headless server
+(one nobody can click a browser sign-in for) get a real token. Both are off or opt-in
 by default.
 
 Several things that were only safe within one process are now safe across processes:
@@ -1488,7 +1536,7 @@ release. See Changed below before rolling it out.
   command at startup, so stopping the process is not enough. Settings and a launch
   notification list which apps need restarting, each entry clears itself, and Settings
   now reports processes it could not stop. (SOU-435)
-- **Keyboard shortcuts.** `Ctrl/Cmd+1`–`6` switch view, `/` or `Ctrl/Cmd+F` focuses
+- **Keyboard shortcuts.** `Ctrl/Cmd+1`-`6` switch view, `/` or `Ctrl/Cmd+F` focuses
   search, `Ctrl/Cmd+N` adds a server, `Ctrl/Cmd+R` refreshes, `?` lists them.
   (SBS-143)
 - **The window reopens where you left it** instead of resetting to a fixed centered
@@ -1564,7 +1612,7 @@ release. See Changed below before rolling it out.
 - Connect, rescope, disconnect and migrate leave a restart reminder in the panel
   rather than only a toast that fades, with wording matched to the action. (SBS-336)
 - The "Stop old gateways" panel no longer reads as though it contradicts itself. It
-  could report nothing running directly above a list of apps still launching one —
+  could report nothing running directly above a list of apps still launching one;
   both true, since a client spawns the gateway on its next tool call. It now says so,
   and each row shows the process id so near-identical entries can be told apart.
 - The Activity list no longer comes up short when the audit log holds an unreadable
@@ -1848,7 +1896,7 @@ Existing registries that already store `"codeMode": false` stay off. (SOU-397)
 
 **Code mode parallel calls and typed stubs.** Scripts get `callAsync` / `Promise.all`
 with bounded host parallelism, scoped `servers.*` typed stubs, full intermediate
-results and `fetchResult` handoff. (#480–#483 / SOU-348)
+results and `fetchResult` handoff. (#480-#483 / SOU-348)
 
 ### Added
 
@@ -1860,7 +1908,7 @@ bridge. Tokens are vaulted; ownership records never store bearers. (SOU-407)
 
 **Native MCP resource subscriptions.** Subscribe/unsubscribe and `resources/updated`
 fanout (with producer verification), resource templates + completions, paginated
-catalogs preserved. (#474–#479, #484)
+catalogs preserved. (#474-#479, #484)
 
 ### Fixed
 
@@ -1977,7 +2025,7 @@ Connect; Connect pins profile and Activity attribution.
 **Invalid discovery / HTTP / budget env values warn** instead of failing quietly.
 (#453)
 
-**CI runs Rust integration tests**; notarytool submit is time-bounded. (#454, #441)
+**CI runs Rust integration tests**: notarytool submit is time-bounded. (#454, #441)
 
 ### Docs
 
@@ -2426,7 +2474,7 @@ line. (#226, #228)
 
 ### Fixed
 
-- **Windows NSIS install with locked gateway** — `NSIS_HOOK_PREINSTALL` runs
+- **Windows NSIS install with locked gateway**: `NSIS_HOOK_PREINSTALL` runs
   `taskkill` on `toolport-gateway.exe` / `conduit-gateway.exe` before file copy.
   1.6.1 only stopped gateways during in-app update from an already-updated app, so
   manual installs and upgrades from 1.6.0 still failed when Cursor held the gateway.
@@ -2440,7 +2488,7 @@ spawned gateway processes before install.
 
 ### Fixed
 
-- **Windows auto-update with locked gateway** — MCP configs point at a versioned
+- **Windows auto-update with locked gateway**: MCP configs point at a versioned
   `toolport-gateway-{version}.exe` under `%APPDATA%\\Roaming\\Conduit\\bin` instead of
   the install-dir copy; before updating, Toolport stops only spawned gateway processes so
   NSIS can replace locked binaries without closing Cursor or other agents. (#244)
@@ -2453,42 +2501,42 @@ support, Teams usage rollups, and registry safety fixes.
 
 ### Added
 
-- **Headless / container gateway** — run without the desktop app: `POST /mcp`
+- **Headless / container gateway**: run without the desktop app: `POST /mcp`
   streamable-HTTP, env-file secrets (`CONDUIT_SECRET_KEY`), Docker +
   `docker-compose.example.yml`. See `docs/headless.md`. (#214)
-- **MCP listen stream** — `GET /mcp` SSE for server→client JSON-RPC (30s keepalive when
+- **MCP listen stream**: `GET /mcp` SSE for server→client JSON-RPC (30s keepalive when
   idle). (#216)
-- **MCP server-initiated RPC passthrough (#167)** — when the upstream client declares
+- **MCP server-initiated RPC passthrough (#167)**: when the upstream client declares
   `roots`, `sampling`, or `elicitation` at `initialize`, downstream servers can call
   `roots/list`, `sampling/createMessage`, and `elicitation/create`; the gateway forwards
   over stdio or HTTP MCP (inline during SSE `POST` responses). (#217, #218, #219)
-- **Prebuilt gateway image on GHCR** — `ghcr.io/btsouth/toolport-gateway:latest`
+- **Prebuilt gateway image on GHCR**: `ghcr.io/btsouth/toolport-gateway:latest`
   (CI-built binary + slim runtime; ~3 min builds vs ~8 min). (#222, #223, #225)
-- **AnythingLLM client** — connect from the Clients view. (#213)
-- **Teams per-server usage rollups** — members report tool-call counts to the team
+- **AnythingLLM client**: connect from the Clients view. (#213)
+- **Teams per-server usage rollups**: members report tool-call counts to the team
   dashboard (counts/estimates only; tool names stay local). (#221)
 
 ### Fixed
 
-- **npx/uvx cold-start false errors** — download launchers (`npx -y`, `uvx`, `pnpm dlx`,
+- **npx/uvx cold-start false errors**: download launchers (`npx -y`, `uvx`, `pnpm dlx`,
   …) get a 120s first-`initialize` budget (10s for everything else), **"Installing…"**
   UI while downloading, and background pre-warm on add. (#237)
-- **SSE streaming for inline server-initiated RPC** — HTTP downstream no longer buffers
+- **SSE streaming for inline server-initiated RPC**: HTTP downstream no longer buffers
   the full body before forwarding JSON-RPC to the upstream client. (#220)
-- **Registry preserved on read failure** — a corrupt or unreadable `registry.json` is
+- **Registry preserved on read failure**: a corrupt or unreadable `registry.json` is
   quarantined and restored from `.bak` instead of silently reset. (#224)
 
 ### Changed
 
-- **Gateway-only compile** — `cargo build --no-default-features --bin toolport-gateway`
+- **Gateway-only compile**: `cargo build --no-default-features --bin toolport-gateway`
   skips Tauri/WebKit for headless/CI builds; desktop default unchanged. (#225)
 
 ### Documentation
 
-- **Headless production checklist and security guidance** — deploy checklist, inherited
+- **Headless production checklist and security guidance**: deploy checklist, inherited
   vs new security surface, and audit recommendations in `docs/headless.md`. (#242)
-- **Release notes draft** — `docs/release-notes/v1.6.0.md`; updated `docs/RELEASING.md`.
-- **Headless smoke tests** — `scripts/smoke-headless.ps1` (auth, MCP handshake, HITL
+- **Release notes draft**: `docs/release-notes/v1.6.0.md`; updated `docs/RELEASING.md`.
+- **Headless smoke tests**: `scripts/smoke-headless.ps1` (auth, MCP handshake, HITL
   fail-closed).
 
 ## [1.5.3] - 2026-07-08
