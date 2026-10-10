@@ -609,6 +609,7 @@ export interface Registry {
   defaultAccessProfileId?: string | null;
   defaultAccessContextId?: string | null;
   defaultAccessLegacyPolicy?: boolean;
+  accessUpgradeNoticePending?: boolean;
   accessUpgradeNoticeDismissed?: boolean;
   /** Folder -> profile auto-routing mappings. Absent/empty = no folder routing. */
   folderProfiles?: FolderProfile[];

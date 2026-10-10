@@ -382,10 +382,10 @@ mod tests {
         ));
         std::fs::create_dir(&temp).unwrap();
         let path = temp.join("shell");
-        std::fs::write(&path, b"old").unwrap();
+        std::fs::write(&path, b"TOOLPORT_BUILD_STAMP:1").unwrap();
         let old = std::fs::File::open(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, b"new").unwrap();
+        std::fs::write(&path, b"TOOLPORT_BUILD_STAMP:2").unwrap();
         let deleted = Executable::read(format!("/proc/self/fd/{}", old.as_raw_fd())).unwrap();
         assert!(
             needs_handover(&Executable::read(&path).unwrap(), &deleted, unsafe {

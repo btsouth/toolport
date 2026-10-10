@@ -724,7 +724,7 @@ describe("Sync setup", () => {
     governed.team!.accountStatusError = "Account status returned 403";
     render(<TeamsView registry={governed} onRegistryChange={vi.fn()} />);
     expect(screen.getByText("Account status returned 403")).toBeInTheDocument();
-    expect(screen.getByText("Connected")).toBeInTheDocument();
+    expect(screen.getByText("Linked to team")).toBeInTheDocument();
   });
   it("keeps multi-person governance and the unloaded view", () => {
     render(<TeamsView registry={registry} onRegistryChange={vi.fn()} />);

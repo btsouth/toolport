@@ -1534,6 +1534,16 @@ pub fn pending_review_count(reg: &Registry) -> usize {
 }
 pub fn banner(reg: &Registry) -> (String, bool) {
     let st = state(reg).unwrap_or_default();
+    if reg
+        .team
+        .as_ref()
+        .is_some_and(|t| t.unknown_fields["accountStatus"]["canReceiveConfig"] == false)
+    {
+        return (
+            "Sync paused. Review this device in Your account.".into(),
+            false,
+        );
+    }
     if let Some(error) = &st.error {
         return (error.clone(), false);
     }
@@ -1544,16 +1554,6 @@ pub fn banner(reg: &Registry) -> (String, bool) {
         .and_then(Value::as_str)
     {
         return (error.into(), false);
-    }
-    if reg
-        .team
-        .as_ref()
-        .is_some_and(|t| t.unknown_fields["accountStatus"]["canReceiveConfig"] == false)
-    {
-        return (
-            "Sync paused. Choose your active device in Your account.".into(),
-            false,
-        );
     }
     if !st.conflicts.is_empty() {
         return (

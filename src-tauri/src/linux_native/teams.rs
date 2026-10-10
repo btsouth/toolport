@@ -252,13 +252,6 @@ impl TeamsPage {
             self.pending.borrow().is_some(),
         );
         if notice.is_none() && self.rendered_state.borrow().as_ref() == Some(&render_state) {
-            if let Some(error) = crate::personal_sync::state(&registry)
-                .ok()
-                .and_then(|s| s.error)
-            {
-                self.set_status(&error, true);
-                return;
-            }
             if registry.team.is_some() {
                 self.show_sync_status(&registry);
             } else if self.pending.borrow().is_some() {
@@ -550,9 +543,6 @@ impl TeamsPage {
                     .xalign(0.0)
                     .build(),
             );
-        }
-        if let Some(error) = &sync.error {
-            self.set_status(error, true);
         }
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let button = gtk::Button::with_label("Sync now");

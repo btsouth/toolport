@@ -12,7 +12,12 @@ export function AccessUpgradeNotice({
 }) {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState("");
-  if (!registry || registry.version < 3 || registry.accessUpgradeNoticeDismissed)
+  if (
+    !registry ||
+    registry.version < 3 ||
+    !registry.accessUpgradeNoticePending ||
+    registry.accessUpgradeNoticeDismissed
+  )
     return null;
   return (
     <div
