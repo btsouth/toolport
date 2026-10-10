@@ -1064,7 +1064,7 @@ fn team_review_line(review: usize, blocked: usize) -> Option<String> {
     }
     if blocked > 0 {
         parts.push(format!(
-            "{blocked} {} blocked as unsafe (link-local or cloud-metadata URLs).",
+            "{blocked} {} Blocked because of unsafe definitions or references. env: references are local only, including personal Pro sync. Use a password manager reference instead.",
             if blocked == 1 { "was" } else { "were" }
         ));
     }
@@ -1869,7 +1869,7 @@ mod tests {
         assert_eq!(
             team_review_line(2, 1).unwrap(),
             "2 team changes are waiting for your review. Held servers stay off; review queued changes above. \
-             1 was blocked as unsafe (link-local or cloud-metadata URLs)."
+             1 was Blocked because of unsafe definitions or references. env: references are local only, including personal Pro sync. Use a password manager reference instead."
         );
     }
 }

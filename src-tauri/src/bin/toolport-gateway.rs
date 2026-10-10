@@ -8649,7 +8649,9 @@ fn build_router_incremental(
         let root = root.map(str::to_string);
         let subs = resource_subs.clone();
         let updated = resource_updated.clone();
+        let reads = conduit_lib::secret_refs::ConnectionReads::new(previous_router.is_some());
         let connect: Connect = Arc::new(move || {
+            reads.before_connect(&server);
             let mut ds = connect_one_result(
                 &server,
                 &dirty,
@@ -11609,6 +11611,9 @@ impl RootLaunchPool {
             .filter(|(id, spec)| effective_specs.get(*id) != Some(*spec))
             .map(|(id, _)| id.clone())
             .collect();
+        for server in self.specs.iter().filter(|server| changed.contains(&server.id)) {
+            conduit_lib::secret_refs::invalidate_server(server);
+        }
         self.effective_specs = effective_specs;
         let keys: Vec<_> = self
             .launches
@@ -12162,6 +12167,9 @@ impl HostState {
             if active_keys.contains(&key) {
                 retained_launches.insert(key, launch);
             } else {
+                if let Some(server) = reg.servers.iter().find(|server| server.id == key.server) {
+                    conduit_lib::secret_refs::invalidate_server(server);
+                }
                 launch.active.store(false, Ordering::SeqCst);
                 launch.slot.retire();
                 retired_launches.push(launch);
@@ -12572,6 +12580,7 @@ impl HostState {
             let handler = Arc::clone(&self.server_handler);
             let server_id = server.id.clone();
             let reconnect_active = Arc::clone(&active);
+            let reads = conduit_lib::secret_refs::ConnectionReads::new(initial.is_some());
             let connect: Connect = Arc::new(move || {
                 if !reconnect_active.load(Ordering::SeqCst) {
                     return Err(ConnectFailure {
@@ -12580,6 +12589,7 @@ impl HostState {
                         auth_target: None,
                     });
                 }
+                reads.before_connect(&spec);
                 let mut ds = connect_one_result(
                     &spec,
                     &dirty,
@@ -24305,6 +24315,49 @@ mod tests {
         assert_eq!(effective_server_spec(&metadata, None, 0), configured_spec);
         metadata.launch.as_mut().unwrap().inputs[0].value = Some("/two".into());
         assert_ne!(effective_server_spec(&metadata, None, 0), configured_spec);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rooted_launch_replacement_and_idle_reaping_clear_reference_cache() {
+        let _env = DataDirTestEnv::new("root-reference-cache");
+        let reference = "op://v/rooted-restart/key";
+        let mut server = stub_server("root-ref", "Root ref");
+        server.cwd = Some("${ROOT}".into());
+        server.env.push(serde_json::from_value(json!({"key":"TOKEN","secret":true,"source":{"ref":reference}})).unwrap());
+        let cached = |value| conduit_lib::secret_refs::test_cached_value(reference, value);
+        let mut pool = RootLaunchPool::default();
+        pool.refresh_specs(vec![server.clone()], 0);
+        assert_eq!(cached("old"), "old");
+        pool.refresh_specs(vec![server.clone()], 0);
+        assert_eq!(cached("unchanged"), "old", "unchanged startup specs reuse their read");
+        let mut changed = server.clone();
+        changed.args.push("--changed".into());
+        pool.refresh_specs(vec![changed], 0);
+        assert_eq!(cached("replacement"), "replacement");
+        // A user disabling the server also retires its rooted launch.
+        pool.refresh_specs(Vec::new(), 0);
+        assert_eq!(cached("reenabled"), "reenabled");
+
+        let state = http_state(false);
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        let mut reg = Registry::default();
+        reg.servers.push(server.clone());
+        reg.set_server_enabled("default", &server.id, true).unwrap();
+        *state.registry.lock().unwrap() = reg.clone();
+        let root = _env.dir.display().to_string();
+        let key = root_launch_keys(&[server.clone()], &root, 0).remove(0);
+        let view = readonly_router(&server.id, "Root cache");
+        state.root_launch_pool.lock().unwrap().launches.insert(key, RootLaunch {
+            slot: view.server_slot(&server.id).unwrap(),
+            subscriptions: Arc::new(Mutex::new(ResourceSubscriptionTable::default())),
+            subscription_key: (server.id.clone(), root),
+            active: Arc::new(AtomicBool::new(true)),
+        });
+        state.reap_root_launches();
+        assert!(state.root_launch_pool.lock().unwrap().launches.is_empty());
+        assert_eq!(cached("after-idle"), "after-idle");
+        conduit_lib::secret_refs::invalidate(reference);
     }
 
     #[test]

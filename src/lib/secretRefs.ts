@@ -61,6 +61,6 @@ export function secretReferenceReview(server: import("./types").ServerEntry): st
     .filter((u) => u.ref)
     .map(
       (u) =>
-        `${referenceProvider(u.ref)?.name ?? "Password manager"} entry ${u.ref} will be sent to ${destination} (${u.field})`,
+        `${referenceProvider(u.ref)?.name ?? "Password manager"} entry ${JSON.stringify(u.ref)} will be sent to ${destination} (${u.field})`,
     );
 }

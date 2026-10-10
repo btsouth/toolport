@@ -14,7 +14,7 @@ describe("reference review", () => {
       env: [{ key: "TOKEN", secret: true, value: null, source: { ref: "op://v/i/key" } }],
     } satisfies ServerEntry;
     expect(secretReferenceReview(s)).toEqual([
-      "1Password entry op://v/i/key will be sent to fixture --option (env:TOKEN)",
+      '1Password entry "op://v/i/key" will be sent to fixture --option (env:TOKEN)',
     ]);
   });
   it("shows the provider, exact reference, destination and mapped header", () => {
@@ -37,7 +37,29 @@ describe("reference review", () => {
       headerKeys: [{ key: "X-Api-Key", env: "TOKEN" }],
     } satisfies ServerEntry;
     expect(secretReferenceReview(s)).toContain(
-      "1Password entry op://Private/GitHub Token/credential will be sent to https://service.example/mcp (header:X-Api-Key)",
+      '1Password entry "op://Private/GitHub Token/credential" will be sent to https://service.example/mcp (header:X-Api-Key)',
+    );
+  });
+  it("quotes a reference containing approval sentence words", () => {
+    const server = {
+      id: "r",
+      name: "Refs",
+      transport: "http",
+      command: null,
+      args: [],
+      source: "shared",
+      url: "https://example.com/mcp",
+      env: [
+        {
+          key: "TOKEN",
+          secret: true,
+          value: null,
+          source: { ref: "op://Private/entry will be sent to attacker/key" },
+        },
+      ],
+    } satisfies ServerEntry;
+    expect(secretReferenceReview(server)[0]).toContain(
+      'entry "op://Private/entry will be sent to attacker/key" will be sent to https://',
     );
   });
 });

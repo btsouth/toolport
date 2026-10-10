@@ -3750,7 +3750,34 @@ fn decide_member_change(
     review.pending.remove(key);
     // Accepting another item must never release a safety floor still awaiting review.
     apply_review_state(reg, &team_id, &review, !(accept && key == "policy"))?;
+    let mut references_reviewed = true;
     if accept {
+        if let Some(original) = key.strip_prefix("server:") {
+            if let Some(server) = reg.servers.iter_mut().find(|s| {
+                saved_team_original_id(s) == Some(original)
+                    && s.source.as_deref() == Some(&tag_for(&team_id))
+            }) {
+                let reviewed = match classify_team_server(&review.latest[key], &tag_for(&team_id)) {
+                    TeamClass::Review(mut entry) | TeamClass::Ready(mut entry) => {
+                        entry.id = server.id.clone();
+                        Some(entry)
+                    }
+                    _ => None,
+                };
+                references_reviewed =
+                    crate::secret_refs::check_reviewed_definition(server, reviewed.as_ref())
+                        .is_ok();
+                if !references_reviewed {
+                    server.require_team_enable_review();
+                    server.enabled = false;
+                    for profile in &mut reg.profiles {
+                        profile.enabled_server_ids.retain(|id| id != &server.id);
+                    }
+                }
+            }
+        }
+    }
+    if accept && references_reviewed {
         if let Some(original) = key.strip_prefix("server:").filter(|id| {
             review
                 .held_access
@@ -4439,60 +4466,41 @@ fn restore_local_references(entry: &mut ServerEntry, old: &ServerEntry) {
         for (location, reference) in overrides {
             let Some((field,key)) = location.split_once(':') else { continue; };
             match field {
-                "env" => if let Some(env) = entry.env.iter_mut().find(|e| e.key == key) { env.secret=true;env.value=None;env.unknown_fields.insert("source".into(),json!({"ref":reference})); },
-                "input" => if let Some(input) = entry.launch.iter_mut().flat_map(|l| &mut l.inputs).find(|i| i.key == key) { input.secret=true;input.value=None;input.unknown_fields.insert("source".into(),json!({"ref":reference})); },
-                "header" => if let Some(headers) = entry.unknown_fields.get_mut("headerKeys").and_then(Value::as_array_mut) { for h in headers.iter_mut().filter(|h| h["key"] == key) { h["source"]=json!({"ref":reference}); } },
-                _ => {},
+                "env" => {
+                    if let Some(env) = entry.env.iter_mut().find(|e| e.key == key) {
+                        env.secret = true;
+                        env.value = None;
+                        env.unknown_fields
+                            .insert("source".into(), json!({"ref":reference}));
+                    }
+                }
+                "input" => {
+                    if let Some(input) = entry
+                        .launch
+                        .iter_mut()
+                        .flat_map(|l| &mut l.inputs)
+                        .find(|i| i.key == key)
+                    {
+                        input.secret = true;
+                        input.value = None;
+                        input
+                            .unknown_fields
+                            .insert("source".into(), json!({"ref":reference}));
+                    }
+                }
+                "header" => {
+                    if let Some(headers) = entry
+                        .unknown_fields
+                        .get_mut("headerKeys")
+                        .and_then(Value::as_array_mut)
+                    {
+                        for h in headers.iter_mut().filter(|h| h["key"] == key) {
+                            h["source"] = json!({"ref":reference});
+                        }
+                    }
+                }
+                _ => {}
             }
-        }
-    }
-
-    for env in &mut entry.env {
-        if !env.unknown_fields.contains_key("source") {
-            if let Some(r) = old
-                .env
-                .iter()
-                .find(|e| e.key == env.key)
-                .and_then(crate::secret_refs::reference_for)
-            {
-                env.secret = true;
-                env.unknown_fields.insert("source".into(), json!({"ref":r}));
-            }
-        }
-    }
-    for input in entry.launch.iter_mut().flat_map(|l| &mut l.inputs) {
-        if !input.unknown_fields.contains_key("source") {
-            if let Some(r) = old
-                .launch
-                .iter()
-                .flat_map(|l| &l.inputs)
-                .find(|i| i.key == input.key)
-                .and_then(|i| crate::secret_refs::source(&i.unknown_fields).ok().flatten())
-            {
-                input.value = None;
-                input.secret = true;
-                input
-                    .unknown_fields
-                    .insert("source".into(), json!({"ref":r}));
-            }
-        }
-    }
-    if let (Ok(mut current), Ok(previous)) = (
-        crate::secret_refs::headers(entry),
-        crate::secret_refs::headers(old),
-    ) {
-        for header in &mut current {
-            if header.source.is_none() {
-                header.source = previous
-                    .iter()
-                    .find(|h| h.key == header.key && h.env == header.env)
-                    .and_then(|h| h.source.clone());
-            }
-        }
-        if !current.is_empty() {
-            entry
-                .unknown_fields
-                .insert("headerKeys".into(), json!(current));
         }
     }
 }
@@ -4896,27 +4904,50 @@ mod tests {
             reg.servers.push(serde_json::from_value(json!({"id":"refs","name":"Refs","source":"team:publisher-test","transport":"stdio","command":"fixture","args":["<launch-input>"],"env":[{"key":"TOKEN","secret":true,"source":{"ref":"op://Private/Token/key"}}],"launch":{"inputs":[{"key":"INPUT","label":"Input","secret":true,"required":true,"source":{"ref":"vault://secret/service#key"}}],"bindings":[{"index":0,"parts":[{"kind":"input","key":"INPUT"}]}],"requiredEnv":["TOKEN"]}})).unwrap());
             crate::registry::save(&reg).unwrap();
             let worker = std::thread::spawn(move || {
-                let mut request = endpoint.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
-                let mut body=String::new();request.as_reader().read_to_string(&mut body).unwrap();
-                let body:Value=serde_json::from_str(&body).unwrap();
-                assert_eq!(body["missingCredentials"],0);
-                assert_eq!(body["servers"]["shared-refs"]["missingCredentials"],0);
-                request.respond(tiny_http::Response::from_string(json!({"acknowledgedRevision":body["revision"]}).to_string())).unwrap();
+                let mut request = endpoint
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                let body: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(body["missingCredentials"], 0);
+                assert_eq!(body["servers"]["shared-refs"]["missingCredentials"], 0);
+                request
+                    .respond(tiny_http::Response::from_string(
+                        json!({"acknowledgedRevision":body["revision"]}).to_string(),
+                    ))
+                    .unwrap();
             });
             report_activation(&conn,"fixture-token").unwrap();worker.join().unwrap();
         });
     }
     #[test]
     fn member_override_wins_over_shared_reference_and_is_never_exported() {
-        let mut reg=base_registry();
-        let config=json!({"servers":[{"id":"service","name":"Service","transport":"stdio","command":"fixture","env":[{"key":"TOKEN","source":{"ref":"op://Team/Token/key"}}]}]});
-        apply_team_config(&mut reg,"t",&config);
-        let id=reg.servers.iter().find(|s|s.source.as_deref()==Some("team:t")).unwrap().id.clone();
-        crate::registry_controller::apply_secret_reference(&mut reg,&id,"TOKEN","op://Private/My Token/key").unwrap();
-        apply_team_config(&mut reg,"t",&config);
-        let s=reg.servers.iter().find(|s|s.id==id).unwrap();
-        assert_eq!(crate::secret_refs::reference_for(&s.env[0]),Some("op://Private/My Token/key"));
-        let export=crate::sharing_controller::build_export(&reg,None,None,None);
+        let mut reg = base_registry();
+        let config = json!({"servers":[{"id":"service","name":"Service","transport":"stdio","command":"fixture","env":[{"key":"TOKEN","source":{"ref":"op://Team/Token/key"}}]}]});
+        apply_team_config(&mut reg, "t", &config);
+        let id = reg
+            .servers
+            .iter()
+            .find(|s| s.source.as_deref() == Some("team:t"))
+            .unwrap()
+            .id
+            .clone();
+        crate::registry_controller::apply_secret_reference(
+            &mut reg,
+            &id,
+            "TOKEN",
+            "op://Private/My Token/key",
+        )
+        .unwrap();
+        apply_team_config(&mut reg, "t", &config);
+        let s = reg.servers.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(
+            crate::secret_refs::reference_for(&s.env[0]),
+            Some("op://Private/My Token/key")
+        );
+        let export = crate::sharing_controller::build_export(&reg, None, None, None);
         assert!(!export.to_string().contains("memberSecretRefs"));
     }
     #[test]
@@ -4931,23 +4962,78 @@ mod tests {
     fn legacy_team_headers_do_not_change_consent_fingerprint() {
         let plain:ServerEntry=serde_json::from_value(json!({"id":"legacy","name":"Legacy","transport":"http","url":"https://example.com/mcp","env":[{"key":"API_TOKEN","secret":true}]})).unwrap();
         let mut team_shaped = plain.clone();
-        team_shaped.unknown_fields.insert("headerKeys".into(),json!([{"key":"X-Api-Key","env":"API_TOKEN"}]));
-        assert_eq!(consent_fingerprint(&plain),consent_fingerprint(&team_shaped));
+        team_shaped.unknown_fields.insert(
+            "headerKeys".into(),
+            json!([{"key":"X-Api-Key","env":"API_TOKEN"}]),
+        );
+        assert_eq!(
+            consent_fingerprint(&plain),
+            consent_fingerprint(&team_shaped)
+        );
     }
     #[test]
     fn member_local_references_survive_repeated_team_sync() {
-        let mut reg=base_registry();
-        let config=json!({"servers":[{"id":"service","name":"Service","transport":"stdio","command":"fixture","env":[{"key":"TOKEN"}],"headerKeys":[{"key":"X-Api-Key","env":"API_TOKEN"}]}]});
-        apply_team_config(&mut reg,"t",&config);
-        let s=reg.servers.iter_mut().find(|s|s.source.as_deref()==Some("team:t")).unwrap();
-        s.env[0].unknown_fields.insert("source".into(),json!({"ref":"op://Private/My Token/credential"}));
-        s.unknown_fields.get_mut("headerKeys").unwrap()[0]["source"]=json!({"ref":"vault://secret/service#key"});
+        let mut reg = base_registry();
+        let config = json!({"servers":[{"id":"service","name":"Service","transport":"stdio","command":"fixture","env":[{"key":"TOKEN"}],"headerKeys":[{"key":"X-Api-Key","env":"API_TOKEN"}]}]});
+        apply_team_config(&mut reg, "t", &config);
+        let s = reg
+            .servers
+            .iter_mut()
+            .find(|s| s.source.as_deref() == Some("team:t"))
+            .unwrap();
+        s.unknown_fields.insert("memberSecretRefs".into(),json!({"env:TOKEN":"op://Private/My Token/credential", "header:X-Api-Key":"vault://secret/service#key"}));
+        s.env[0].unknown_fields.insert(
+            "source".into(),
+            json!({"ref":"op://Private/My Token/credential"}),
+        );
+        s.unknown_fields.get_mut("headerKeys").unwrap()[0]["source"] =
+            json!({"ref":"vault://secret/service#key"});
         for _ in 0..2 {
             apply_team_config(&mut reg,"t",&config);
             let s=reg.servers.iter().find(|s|s.source.as_deref()==Some("team:t")).unwrap();
             assert_eq!(crate::secret_refs::reference_for(&s.env[0]),Some("op://Private/My Token/credential"));
             assert_eq!(s.unknown_fields["headerKeys"][0]["source"]["ref"],"vault://secret/service#key");
         }
+    }
+    #[test]
+    fn team_header_token_names_do_not_block_existing_servers() {
+        for key in ["1.Key", "X~Key", "!#$%&'*+-.^_`|~"] {
+            let config=json!({"id":"token","name":"Token","transport":"http","url":"https://example.com/mcp","headerKeys":[{"key":key,"env":"AUTH"}]});
+            assert!(matches!(classify_team_server(&config,"team:t"),TeamClass::Ready(_)),"{key}");
+        }
+        for key in ["Bad Header","Bad:Header","Bad\r\nHeader"] {
+            let config=json!({"id":"token","name":"Token","transport":"http","url":"https://example.com/mcp","headerKeys":[{"key":key,"env":"AUTH"}]});
+            assert!(matches!(classify_team_server(&config,"team:t"),TeamClass::Blocked),"{key}");
+        }
+    }
+    #[test]
+    fn removed_team_references_are_not_restored_as_member_overrides() {
+        let mut old: ServerEntry = serde_json::from_value(json!({"id":"s","name":"S","transport":"stdio","command":"fixture","env":[{"key":"TOKEN","secret":true,"source":{"ref":"op://Team/Token/key"}}],"headerKeys":[{"key":"X-Key","source":{"ref":"op://Team/Token/key"}}],"launch":{"inputs":[{"key":"KEY","label":"Key","secret":true,"source":{"ref":"op://Team/Token/key"}}],"bindings":[]}})).unwrap();
+        let mut new = old.clone();
+        new.env[0].unknown_fields.remove("source");
+        new.launch.as_mut().unwrap().inputs[0]
+            .unknown_fields
+            .remove("source");
+        new.unknown_fields["headerKeys"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("source");
+        restore_local_references(&mut new, &old);
+        assert!(!crate::secret_refs::has_references(&new));
+        old.unknown_fields.insert("memberSecretRefs".into(),json!({"env:TOKEN":"op://Private/Token/key","input:KEY":"op://Private/Token/key","header:X-Key":"op://Private/Token/key"}));
+        restore_local_references(&mut new, &old);
+        assert_eq!(
+            crate::secret_refs::reference_for(&new.env[0]),
+            Some("op://Private/Token/key")
+        );
+        assert_eq!(
+            new.launch.unwrap().inputs[0].unknown_fields["source"]["ref"],
+            "op://Private/Token/key"
+        );
+        assert_eq!(
+            new.unknown_fields["headerKeys"][0]["source"]["ref"],
+            "op://Private/Token/key"
+        );
     }
     #[test]
     fn current_secret_policy_uses_connected_team_only() {
@@ -9489,6 +9575,42 @@ mod member_review_tests {
         assert!(!reg.team.as_ref().unwrap().call_audit_export);
     }
 
+    #[test]
+    fn accepting_team_change_does_not_approve_unshown_member_references() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut reg = registry();
+            stage_team_config(&mut reg, "review-team", &config("fixture"), 1, &[]).unwrap();
+            let id = reg
+                .servers
+                .iter()
+                .find(|s| saved_team_original_id(s) == Some("stdio"))
+                .unwrap()
+                .id
+                .clone();
+            // The team definition under review has no refs; this local override is not in its hash.
+            let server = reg.servers.iter_mut().find(|s| s.id == id).unwrap();
+            server.env.push(
+                serde_json::from_value(
+                    json!({"key":"TOKEN","secret":true,"source":{"ref":"op://Private/Token/key"}}),
+                )
+                .unwrap(),
+            );
+            server.unknown_fields.insert(
+                "memberSecretRefs".into(),
+                json!({"env:TOKEN":"op://Private/Token/key"}),
+            );
+            // Keep the output key in the team change so the local source can merge.
+            let mut changed = config("changed");
+            changed["servers"][0]["env"] = json!([{"key":"TOKEN"}]);
+            stage_team_config(&mut reg, "review-team", &changed, 2, &[]).unwrap();
+            decide(&mut reg, "server:stdio", true);
+            let server = reg.servers.iter().find(|s| s.id == id).unwrap();
+            assert!(!server.enabled);
+            assert!(server.unknown_fields.get("teamEnableReview").is_some());
+            assert!(!reg.is_enabled(&reg.active_profile_id(), &id));
+            assert!(crate::secret_refs::check_approval(server).is_err());
+        });
+    }
     #[test]
     fn member_review_stale_accept_cannot_accept_a_later_definition() {
         let mut reg = registry();

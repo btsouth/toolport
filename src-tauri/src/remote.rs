@@ -1336,12 +1336,14 @@ pub fn connect_remote_with_handler(
     progress: Option<ProgressSink>,
     change_dirty: Option<Arc<AtomicU8>>,
 ) -> Result<DownstreamServer, String> {
-    let resolved = crate::secret_refs::resolve_server(server).map_err(|e| e.to_string())?;
+    let (resolved, header_values) =
+        crate::secret_refs::resolve_connection(server).map_err(|e| e.to_string())?;
     let server = &resolved;
     let imported = crate::import_credentials::has_imported_url(server);
     if !imported {
         return connect_remote_inner(
             server,
+            header_values,
             server_handler,
             resource_updated,
             progress,
@@ -1364,6 +1366,7 @@ pub fn connect_remote_with_handler(
     resolved.url = Some(url);
     connect_remote_inner(
         &resolved,
+        header_values,
         server_handler,
         resource_updated,
         progress,
@@ -1731,13 +1734,14 @@ fn has_imported_credentials(server: &ServerEntry) -> bool {
 
 fn connect_remote_inner(
     server: &ServerEntry,
+    mut header_values: Vec<(String, String)>,
     server_handler: Option<ServerRequestHandler>,
     resource_updated: Option<ResourceUpdatedSink>,
     progress: Option<ProgressSink>,
     change_dirty: Option<Arc<AtomicU8>>,
 ) -> Result<DownstreamServer, String> {
     guard_connect_target(server)?;
-    let header_values = crate::secret_refs::resolve_headers(server).map_err(|e| e.to_string())?;
+    let legacy_bearer = crate::secret_refs::take_legacy_bearer(server, &mut header_values);
     let mut server_with_headers = server.clone();
     for (key, value) in &header_values {
         server_with_headers.env.push(crate::registry::EnvVar {
@@ -1816,8 +1820,11 @@ fn connect_remote_inner(
             Some(fresh) => Some(fresh),
             None => match current_credential(server_id)? {
                 Some(token) => Some(token),
-                None => first_vaulted_secret(server)
-                    .map_err(|e| format!("could not read the vaulted auth token: {e}"))?,
+                None => match legacy_bearer {
+                    Some(token) => Some(token),
+                    None => first_vaulted_secret(server)
+                        .map_err(|e| format!("could not read the vaulted auth token: {e}"))?,
+                },
             },
         }
         // Remember exactly what we hand the transport. The transport force-refreshes
@@ -1937,28 +1944,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_authorization_sends_bearer_or_nothing_without_oauth() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            let mut server = remote_server(&endpoint.url, None);
+            server.unknown_fields.insert("headerKeys".into(), serde_json::json!([{"key":"Authorization","env":"AUTH"}]));
+            for (saved, expected) in [(None,""),(Some("bare-token"),"Bearer bare-token"),(Some("Bearer x"),"Bearer x")] {
+                if let Some(value)=saved {secrets::set_secret(&server.id,"AUTH",value).unwrap();}
+                let mut connection=connect_remote(&server).unwrap();
+                assert_eq!(connection.call("fixture",serde_json::json!({})).unwrap()["authorization"],expected);
+            }
+            assert_eq!(endpoint.count(),0);
+        });
+    }
+    #[test]
+    fn legacy_authorization_keeps_oauth_and_allows_oauth_only_members() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            let mut state = load_state("rotation").unwrap().unwrap();
+            state.expires_at = Some(now_epoch_seconds() + 3600);
+            secrets::set_secret(
+                "rotation",
+                STATE_KEY,
+                &serde_json::to_string(&state).unwrap(),
+            )
+            .unwrap();
+            let mut server = remote_server(&endpoint.url, None);
+            server.id = "rotation".into();
+            server.unknown_fields.insert(
+                "headerKeys".into(),
+                serde_json::json!([{"key":"Authorization","env":"AUTH"}]),
+            );
+            for saved in [None, Some("bare-token"), Some("Bearer x")] {
+                if let Some(value) = saved {
+                    secrets::set_secret("rotation", "AUTH", value).unwrap();
+                }
+                let mut connection = connect_remote(&server).unwrap();
+                assert_eq!(
+                    connection.call("fixture", serde_json::json!({})).unwrap()["authorization"],
+                    "Bearer token-0"
+                );
+            }
+            assert_eq!(endpoint.count(), 0);
+        });
+    }
+    #[test]
     fn legacy_team_headers_keep_oauth_bearer_and_refresh_callback() {
         secrets::tests::with_isolated_vault(|| {
-            let endpoint=RotatingEndpoint::new();endpoint.seed();
-            let mut state=load_state("rotation").unwrap().unwrap();state.expires_at=Some(now_epoch_seconds()+3600);
-            secrets::set_secret("rotation",STATE_KEY,&serde_json::to_string(&state).unwrap()).unwrap();
-            let mut server=remote_server(&endpoint.url,None);server.id="rotation".into();
-            server.unknown_fields.insert("headerKeys".into(),serde_json::json!([{"key":"X-Api-Key","env":"API_HEADER"}]));
-            secrets::set_secret("rotation","API_HEADER","header-fixture").unwrap();
-            let mut connection=connect_remote(&server).unwrap();
-            let result=connection.call("fixture",serde_json::json!({})).unwrap();
-            assert_eq!(result["authorization"],"Bearer token-0");
-            assert_eq!(endpoint.count(),0);
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            let mut state = load_state("rotation").unwrap().unwrap();
+            state.expires_at = Some(now_epoch_seconds() + 3600);
+            secrets::set_secret(
+                "rotation",
+                STATE_KEY,
+                &serde_json::to_string(&state).unwrap(),
+            )
+            .unwrap();
+            let mut server = remote_server(&endpoint.url, None);
+            server.id = "rotation".into();
+            server.unknown_fields.insert(
+                "headerKeys".into(),
+                serde_json::json!([{"key":"X-Api-Key","env":"API_HEADER"}]),
+            );
+            secrets::set_secret("rotation", "API_HEADER", "header-fixture").unwrap();
+            let mut connection = connect_remote(&server).unwrap();
+            let result = connection.call("fixture", serde_json::json!({})).unwrap();
+            assert_eq!(result["authorization"], "Bearer token-0");
+            assert_eq!(endpoint.count(), 0);
         });
     }
     #[test]
     fn legacy_headers_do_not_skip_client_credentials_state_validation() {
         secrets::tests::with_isolated_vault(|| {
-            let mut server=remote_server("https://example.com/mcp",None);
-            server.client_credentials=Some(crate::registry::ClientCredentials {client_id:"client".into(), ..Default::default()});
-            server.unknown_fields.insert("headerKeys".into(),serde_json::json!([{"key":"X-Api-Key","env":"API_HEADER"}]));
-            secrets::set_secret(&server.id,"API_HEADER","header-fixture").unwrap();
-            let result=secrets::tests::with_failed_read(CC_STATE_KEY,||connect_remote(&server));
+            let mut server = remote_server("https://example.com/mcp", None);
+            server.client_credentials = Some(crate::registry::ClientCredentials {
+                client_id: "client".into(),
+                ..Default::default()
+            });
+            server.unknown_fields.insert(
+                "headerKeys".into(),
+                serde_json::json!([{"key":"X-Api-Key","env":"API_HEADER"}]),
+            );
+            secrets::set_secret(&server.id, "API_HEADER", "header-fixture").unwrap();
+            let result = secrets::tests::with_failed_read(CC_STATE_KEY, || connect_remote(&server));
             assert!(result.err().unwrap().contains("client-credentials state"));
         });
     }

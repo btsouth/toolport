@@ -166,7 +166,7 @@ export function TeamsView({
         );
       if (blocked > 0)
         parts.push(
-          `${blocked} ${blocked === 1 ? "was" : "were"} blocked as unsafe (link-local or cloud-metadata URLs).`,
+          `${blocked} ${blocked === 1 ? "was" : "were"} Blocked because of unsafe definitions or references. env: references are local only, including personal Pro sync. Use a password manager reference instead.`,
         );
       setSkipNote(parts.join(" "));
     });

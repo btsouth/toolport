@@ -15,7 +15,9 @@ approval before resolution. Review shows the provider, exact reference, output
 name and destination URL or command. Approval stays on that machine and is
 invalidated when the reference or destination changes. Environment references
 are only allowed for locally created servers; they cannot be synced or imported
-from a shared setup. Member-local password manager references survive team sync.
+from a shared setup. This includes your own personal Pro sync: an `env:` server
+is **Blocked** on your other machines. Use a password manager reference instead.
+Member-local password manager references survive team sync.
 
 | Provider                   | Reference format                                                                 | Fixed CLI read                                                                                              | Official documentation                                                                                                   |
 | -------------------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
@@ -56,7 +58,9 @@ project root. Provider stdout/stderr are bounded and never included in errors.
 Missing installation, locked/sign-in state, missing entry, timeout, malformed
 output and other failures have distinct states. A server resolves references
 concurrently with at most four active reads. Identical in-flight references share
-one result across servers and project roots. Successful values remain in memory
-for the gateway process lifetime; auth rejection clears the affected references.
-Restarting the gateway reads them again. A later retry also rereads a failed CLI
+one result across servers and project roots. The gateway reuses successful values
+for at most 15 minutes, then rereads them on the next use. A user restart or
+supervisor reconnect clears that server's references, as does remote auth rejection. The first
+connection shares one read across env, launch inputs and headers.
+Restarting the gateway also reads them again. A later retry rereads a failed CLI
 lookup. Test does not use this gateway cache.

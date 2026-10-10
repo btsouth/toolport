@@ -6454,8 +6454,7 @@ impl HttpTransport {
 
     pub fn set_credential_headers(&mut self, headers: Vec<(String, String)>) -> Result<(), String> {
         for (name, value) in &headers {
-            if name.is_empty()
-                || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            if !crate::secret_refs::header_name(name)
                 || value.chars().any(char::is_control)
                 || [
                     "host",
