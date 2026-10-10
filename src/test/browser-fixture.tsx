@@ -675,7 +675,7 @@ mockIPC(
       case "list_pending_approvals":
         return pendingApproval;
       case "decide_approval":
-        pendingApproval = [];
+        pendingApproval = pendingApproval.filter((approval) => approval.id !== args.id);
         return null;
       case "clients_needing_restart":
       case "list_allowed_tools":
