@@ -66,7 +66,7 @@ pub(crate) fn bind(
 pub(crate) fn owner_in(reg: &Registry, id: &str) -> Result<String, String> {
     let entries = bindings(reg)?;
     let Some(binding) = entries.get(id) else {
-        return Ok(id.into());
+        return Ok(personal_http_owner(reg, id));
     };
     let valid = reg.team.as_ref().is_some_and(|team| {
         team.team_id == binding.team_id
@@ -90,6 +90,33 @@ pub(crate) fn owner_in(reg: &Registry, id: &str) -> Result<String, String> {
         return Err("This shared server's local authentication binding changed. Review its setup before signing in again.".into());
     }
     Ok(binding.personal_id.clone())
+}
+
+pub(crate) fn personal_credential_destination(server: &ServerEntry) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&server.url).expect("URL serialization"))
+    )
+}
+
+fn personal_http_owner(reg: &Registry, id: &str) -> String {
+    let Some(server) = reg.servers.iter().find(|s| s.id == id && s.url.is_some()) else {
+        return id.into();
+    };
+    let Some(base) = server
+        .unknown_fields
+        .get("personalSyncCredentialDestination")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return id.into();
+    };
+    let destination = personal_credential_destination(server);
+    if base == destination {
+        id.into()
+    } else {
+        format!("{id}-sync-{destination}")
+    }
 }
 
 /// Explicitly reviewing a changed definition drops its old local binding.

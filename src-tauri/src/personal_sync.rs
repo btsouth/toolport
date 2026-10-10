@@ -773,6 +773,21 @@ pub fn apply(
                 &reg.servers.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
             );
         }
+        // Preserve existing sign-in only for its exact HTTP destination. New
+        // destinations get an empty local vault namespace, never copied tokens.
+        let credential_destination = old
+            .as_ref()
+            .and_then(|s| s.unknown_fields.get("personalSyncCredentialDestination"))
+            .cloned()
+            .unwrap_or_else(|| {
+                json!(crate::local_auth::personal_credential_destination(
+                    old.as_ref().unwrap_or(&entry)
+                ))
+            });
+        entry.unknown_fields.insert(
+            "personalSyncCredentialDestination".into(),
+            credential_destination,
+        );
         if value["disabled"] == true {
             if let Some(old) = &old {
                 crate::local_auth::revoke_personal_route(reg, &team_id, &old.id);
@@ -1359,6 +1374,55 @@ mod tests {
         changed["servers"][0]["requestTimeoutMs"] = json!(5000);
         assert_eq!(apply(&mut r, &changed, 2).unwrap().review, 0);
         assert!(r.servers[0].enabled);
+    }
+    #[test]
+    fn http_url_changes_apply_without_reusing_the_previous_destinations_vault() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut b = machine();
+            let original = config(vec![http("docs")]);
+            apply(&mut b, &original, 1).unwrap();
+            let id = b.servers[0].id.clone();
+            let owner = crate::local_auth::owner_in(&b, &id).unwrap();
+            assert_eq!(owner, id);
+            crate::registry::save(&b).unwrap();
+            crate::secrets::set_secret(&id, crate::secrets::HTTP_AUTH_KEY, "synthetic-old-token")
+                .unwrap();
+            let mut changed = original.clone();
+            changed["servers"][0]["url"] = json!("https://changed.example/mcp");
+            assert_eq!(apply(&mut b, &changed, 2).unwrap().review, 0);
+            assert_eq!(b.servers[0].id, id);
+            assert!(b.servers[0].enabled);
+            let new_owner = crate::local_auth::owner_in(&b, &id).unwrap();
+            assert_ne!(new_owner, owner);
+            crate::registry::save(&b).unwrap();
+            assert_eq!(
+                crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY).unwrap(),
+                None
+            );
+            crate::secrets::set_secret(&id, crate::secrets::HTTP_AUTH_KEY, "synthetic-new-token")
+                .unwrap();
+            apply(&mut b, &changed, 2).unwrap();
+            assert_eq!(crate::local_auth::owner_in(&b, &id).unwrap(), new_owner);
+            crate::registry::save(&b).unwrap();
+            assert_eq!(
+                crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY)
+                    .unwrap()
+                    .as_deref(),
+                Some("synthetic-new-token")
+            );
+            assert!(export(&b.servers[0])
+                .get("personalSyncCredentialDestination")
+                .is_none());
+            apply(&mut b, &original, 3).unwrap();
+            assert_eq!(crate::local_auth::owner_in(&b, &id).unwrap(), owner);
+            crate::registry::save(&b).unwrap();
+            assert_eq!(
+                crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY)
+                    .unwrap()
+                    .as_deref(),
+                Some("synthetic-old-token")
+            );
+        });
     }
     #[test]
     fn adopted_legacy_copy_uses_one_existing_credential_identity() {
