@@ -1054,10 +1054,10 @@ mod tests {
             .unknown_fields
             .insert("teamRouteRemoved".into(), serde_json::json!(true));
         registry.servers.push(personal);
-        assert!(RegistrySnapshot::from_registry(registry.clone()).servers[0].team_route_removed);
-        registry
-            .set_global_server_enabled("personal", true)
-            .unwrap();
+        assert!(
+            RegistrySnapshot::from_registry(registry.clone()).servers[0].team_route_removed
+        );
+        registry.set_global_server_enabled("personal", true).unwrap();
         assert!(!RegistrySnapshot::from_registry(registry).servers[0].team_route_removed);
     }
 

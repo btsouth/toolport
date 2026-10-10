@@ -120,12 +120,7 @@ pub fn run() {
     let bridge_for_open = bridge.clone();
     let notice_for_open = startup_notice.clone();
     app.connect_open(move |app, files, _hint| {
-        if files
-            .iter()
-            .any(|file| crate::teams::parse_pair_link(file.uri().as_str()).is_some())
-        {
-            let _ = onboarding::mark_complete();
-        }
+        if files.iter().any(|file| crate::teams::parse_pair_link(file.uri().as_str()).is_some()) { let _ = onboarding::mark_complete(); }
         build_window(
             app,
             theme::ThemeController::new(),
@@ -2580,10 +2575,7 @@ fn confirm_client_migrate(client: &state::ClientView, page: ClientPage) {
         client.id.clone(),
         client.scope_id.clone(),
         client.gateway_state == state::ClientGatewayState::Customized,
-        {
-            let page = page.clone();
-            move || page.refresh()
-        },
+        { let page = page.clone(); move || page.refresh() },
         Some(page.credential_page.clone()),
     );
 }
@@ -5647,10 +5639,7 @@ fn approval_card(
     {
         card.append(
             &gtk::Label::builder()
-                .label(format!(
-                    "Reports itself as: {}",
-                    crate::approval::shorten_client_label(label, 60)
-                ))
+                .label(format!("Reports itself as: {}", crate::approval::shorten_client_label(label, 60)))
                 .tooltip_text(label)
                 .xalign(0.0)
                 .wrap(true)
@@ -5970,8 +5959,7 @@ fn build_content(
     }
     page.append(&summary);
     let short = adw::Breakpoint::new(
-        adw::BreakpointCondition::parse("max-height: 450px")
-            .expect("static short-window condition"),
+        adw::BreakpointCondition::parse("max-height: 450px").expect("static short-window condition"),
     );
     short.add_setter(&intro, "visible", Some(&false.to_value()));
     short.add_setter(&description, "visible", Some(&false.to_value()));
@@ -6127,38 +6115,21 @@ fn build_content(
 
 fn open_shared_setup(url: &str, page: ServerPage) {
     if let Some((origin, team)) = crate::teams::parse_pair_link(url) {
-        if crate::registry::load()
-            .is_ok_and(|reg| crate::teams::pair_target_is_current(&reg, &origin, &team))
-        {
-            if let Some(action) = page.app.lookup_action("show-teams") {
-                action.activate(None);
-            }
-            if let Some(window) = page.app.active_window() {
-                window.present();
-            }
+        if crate::registry::load().is_ok_and(|reg| crate::teams::pair_target_is_current(&reg, &origin, &team)) {
+            if let Some(action) = page.app.lookup_action("show-teams") { action.activate(None); }
+            if let Some(window) = page.app.active_window() { window.present(); }
             return;
         }
-        for window in page.app.windows() {
-            if window.title().as_deref() == Some("Toolport setup") {
-                window.close();
-            }
-        }
-        let (parent_app, connected_app, feedback) =
-            (page.app.clone(), page.app.clone(), page.clone());
+        for window in page.app.windows() { if window.title().as_deref() == Some("Toolport setup") { window.close(); } }
+        let (parent_app, connected_app, feedback) = (page.app.clone(), page.app.clone(), page.clone());
         let hooks = pairing::PairingHooks {
             parent: Box::new(move || parent_app.active_window()),
             feedback: Box::new(move |message, error| feedback.show_feedback(message, error)),
             connected: Box::new(move || {
-                if let Some(action) = connected_app.lookup_action("show-teams") {
-                    action.activate(None);
-                }
-                if let Some(window) = connected_app.active_window() {
-                    window.present();
-                }
+                if let Some(action) = connected_app.lookup_action("show-teams") { action.activate(None); }
+                if let Some(window) = connected_app.active_window() { window.present(); }
             }),
-            open_url: Box::new(|url| {
-                let _ = crate::oauth::open_web_url(url);
-            }),
+            open_url: Box::new(|url| { let _ = crate::oauth::open_web_url(url); }),
         };
         let pair_origin = origin.clone();
         pairing::request(
@@ -10363,14 +10334,8 @@ mod tests {
             Some(1500),
         );
         let snapshot = state::load_activity_snapshot().unwrap();
-        assert_eq!(
-            activity_server_filter_options(&snapshot.recent),
-            vec!["All servers", "team_slack"]
-        );
-        assert_eq!(
-            filter_calls(&snapshot.recent, Some("team_slack"), false).len(),
-            snapshot.recent.len()
-        );
+        assert_eq!(activity_server_filter_options(&snapshot.recent), vec!["All servers", "team_slack"]);
+        assert_eq!(filter_calls(&snapshot.recent, Some("team_slack"), false).len(), snapshot.recent.len());
     }
 
     #[test]

@@ -248,8 +248,7 @@ fn parse_server_snippet(text: String) -> Result<Vec<clients::ParsedSnippetServer
             MAX_SNIPPET_BYTES / 1024,
         ));
     }
-    clients::parse_snippet(&text)
-        .map_err(|_| "Could not read the pasted config. Check its syntax and retry.".into())
+    clients::parse_snippet(&text).map_err(|_| "Could not read the pasted config. Check its syntax and retry.".into())
 }
 
 #[tauri::command]
@@ -2042,9 +2041,7 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
                 }
             };
             for _ in 0..delay {
-                if stop.load(std::sync::atomic::Ordering::Acquire) {
-                    break;
-                }
+                if stop.load(std::sync::atomic::Ordering::Acquire) { break; }
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
@@ -2148,9 +2145,7 @@ fn personal_sync_resolve_conflict(
 
 #[tauri::command]
 async fn team_account_link() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(teams::account_link)
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(teams::account_link).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -3694,7 +3689,7 @@ fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
         cancel
     };
     let pending = TeamPairGuard(std::sync::Arc::clone(&cancel));
-    let handle = app.clone();
+    let handle=app.clone();
     app.dialog().message(format!("Control plane: {origin}\nOnly continue if you trust this origin. Your browser will show the named team and account before approval. Connecting replaces this installation's current team connection."))
         .title("Connect Toolport to Teams?").buttons(MessageDialogButtons::OkCancel).show(move |approved| {
             if !approved { drop(pending); return; }
@@ -3720,10 +3715,7 @@ fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
 #[tauri::command]
 fn team_pair_state() -> Option<TeamPairEvent> {
     team_pairing().as_ref().and_then(|current| {
-        current.check.clone().map(|check| TeamPairEvent {
-            check: Some(check),
-            ..TeamPairEvent::new("pending")
-        })
+        current.check.clone().map(|check| TeamPairEvent { check: Some(check), ..TeamPairEvent::new("pending") })
     })
 }
 
@@ -3731,9 +3723,7 @@ fn team_pair_state() -> Option<TeamPairEvent> {
 #[tauri::command]
 fn team_pair_cancel() {
     if let Some(current) = team_pairing().as_ref() {
-        current
-            .cancel
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        current.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

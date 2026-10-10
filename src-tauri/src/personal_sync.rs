@@ -168,7 +168,15 @@ pub fn export(s: &ServerEntry) -> Value {
         .contains(&k.as_str())
     });
     v["id"] = json!(original(s));
-    v["disabled"] = json!(!s.enabled);
+    let intended_enabled = if s.needs_team_enable_review() {
+        s.unknown_fields
+            .get("personalSyncDesiredEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(s.enabled)
+    } else {
+        s.enabled
+    };
+    v["disabled"] = json!(!intended_enabled);
     v["args"] = json!(args);
     if let Some(url) = &s.url {
         v["url"] = json!(crate::sharing_controller::redact_share_url(url));
@@ -424,6 +432,16 @@ fn execution_changed(before: Option<&Value>, after: &Value) -> bool {
 }
 fn restore_local(entry: &mut ServerEntry, old: &ServerEntry) {
     entry.inherit_env = old.inherit_env; // Never import ambient-env consent.
+                                         // Preserve masked arguments on their originating machine; masking is a wire
+                                         // boundary, not permission to erase the owner's installed setup.
+    let old_wire = export(old);
+    for (index, arg) in entry.args.iter_mut().enumerate() {
+        if old_wire["args"][index].as_str() == Some(arg.as_str()) {
+            if let Some(local) = old.args.get(index) {
+                *arg = local.clone();
+            }
+        }
+    }
     if let Some(overrides) = old
         .unknown_fields
         .get("memberSecretRefs")
@@ -687,6 +705,10 @@ pub fn apply(
                 .unknown_fields
                 .insert("syncCommandConsent".into(), consent.clone());
         }
+        entry.unknown_fields.insert(
+            "personalSyncDesiredEnabled".into(),
+            json!(value["disabled"] != true),
+        );
         entry.enabled = value["disabled"] != true && !review;
         if review {
             entry.require_team_enable_review();
@@ -1070,6 +1092,21 @@ mod tests {
         assert_eq!(apply(&mut b, &changed, 2).unwrap().review, 1);
         assert!(!b.servers[0].enabled);
         assert!(check_review(&b, &b.servers[0], Some(&reviewed)).is_err());
+    }
+    #[test]
+    fn review_hold_is_local_and_does_not_publish_disable() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-held-edit");
+        let mut r = machine();
+        let cloud = config(vec![command("tool")]);
+        apply(&mut r, &cloud, 1).unwrap();
+        let before = r.clone();
+        r.servers[0].name = "Renamed".into();
+        record(&before, &mut r).unwrap();
+        assert_eq!(
+            state(&r).unwrap().pending["tool"].after.as_ref().unwrap()["disabled"],
+            false
+        );
+        assert!(!r.servers[0].enabled);
     }
     #[test]
     fn metadata_edits_do_not_reopen_command_review() {

@@ -17108,12 +17108,9 @@ for line in sys.stdin:
         handle.join().unwrap();
 
         assert!(error.to_string().contains("HTTP 401"));
-        assert_eq!(
-            error.call_failure().kind,
-            crate::call_failure::CallFailureKind::Auth {
-                target: crate::call_failure::AuthTarget::Scope,
-            }
-        );
+        assert_eq!(error.call_failure().kind, crate::call_failure::CallFailureKind::Auth {
+            target: crate::call_failure::AuthTarget::Scope,
+        });
         assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
     }
 

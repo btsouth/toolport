@@ -2859,6 +2859,11 @@ pub fn apply_server_enabled(
             }
         }
     }
+    if crate::personal_sync::is_personal(registry) {
+        if let Some(server) = registry.servers.iter_mut().find(|s| s.id == server_id) {
+            server.unknown_fields.insert("personalSyncDesiredEnabled".into(), serde_json::json!(enabled));
+        }
+    }
     if enabled && reviewed && crate::personal_sync::is_personal(registry) {
         if let Some(server) = registry.servers.iter_mut().find(|s| s.id == server_id) {
             server.unknown_fields.remove("teamEnableReview");
