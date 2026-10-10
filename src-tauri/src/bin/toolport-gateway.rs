@@ -20883,8 +20883,12 @@ fn main() {
         was_idle = idle;
         #[cfg(feature = "test-support")]
         if let Some(path) = &probe {
-            if conduit_lib::shaping::cache_maintenance_probe_complete() {
-                let _ = std::fs::write(path, "expired and trim consumed");
+            // Publish by rename so the test never reads a created-but-empty marker.
+            if !path.exists() && conduit_lib::shaping::cache_maintenance_probe_complete() {
+                let staged = path.with_extension("tmp");
+                if std::fs::write(&staged, "expired and trim consumed").is_ok() {
+                    let _ = std::fs::rename(&staged, path);
+                }
             }
         }
     });
