@@ -424,6 +424,45 @@ describe("ServerDialog", () => {
     expect(screen.queryByText("Edit server")).not.toBeInTheDocument();
   });
 
+  it("leaves a new plain value's sync choice to the default unless changed", async () => {
+    api.addServer.mockResolvedValueOnce(savedRegistry("demo"));
+    const user = userEvent.setup();
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await fillServer(user, "npx");
+    for (let i = 0; i < 3; i += 1) {
+      await user.click(screen.getByRole("button", { name: "Add variable" }));
+    }
+    const keyInputs = screen.getAllByPlaceholderText("ENV_NAME");
+    for (const [i, [key, value]] of [
+      ["REGION", "west"],
+      ["NOTES_DIR", "/home/me/notes"],
+      ["NODE_OPTIONS", "--max-old-space-size=4096"],
+    ].entries()) {
+      await user.type(keyInputs[i], key);
+      await user.click(screen.getByRole("checkbox", { name: `Keep ${key} in keychain` }));
+      await user.type(screen.getAllByPlaceholderText("value")[i], value);
+    }
+    const sync = screen.getAllByRole("checkbox", { name: "Same on every machine" });
+    expect(sync.map((box) => (box as HTMLInputElement).checked)).toEqual([
+      true,
+      false,
+      false,
+    ]);
+    expect(sync[2]).toBeDisabled();
+    await user.click(sync[1]);
+
+    await user.click(screen.getByRole("button", { name: "Add" }));
+
+    await waitFor(() => expect(api.addServer).toHaveBeenCalledTimes(1));
+    const env = api.addServer.mock.calls[0][0].env;
+    expect(env).toEqual([
+      { key: "REGION", value: "west", secret: false },
+      { key: "NOTES_DIR", value: "/home/me/notes", secret: false, portable: true },
+      { key: "NODE_OPTIONS", value: "--max-old-space-size=4096", secret: false },
+    ]);
+  });
+
   it("keeps an edited in-flight test busy and discards its result", async () => {
     const request = deferred<ProbeResult>();
     api.testServer.mockReturnValueOnce(request.promise);

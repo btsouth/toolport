@@ -9158,6 +9158,25 @@ fn open_server_editor_prefilled(
     connection.append(&test);
     form.append(&connection);
 
+    // Plain values can only be edited once the server exists; a new server
+    // takes them from a pasted config.
+    let plain_env = editing.then(|| {
+        let personal = page
+            .last_snapshot
+            .borrow()
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.personal_sync);
+        let (section, rows) = plain_env_section(
+            server
+                .as_ref()
+                .map(|server| server.plain_env.as_slice())
+                .unwrap_or_default(),
+            personal,
+        );
+        form.append(&section);
+        (section, rows)
+    });
+
     let credentials = gtk::Label::builder()
         .label(if editing {
             "Existing credentials, tool settings, and newer configuration fields are preserved. Use the server card's Credentials action to add or replace secret values."
@@ -9302,6 +9321,10 @@ fn open_server_editor_prefilled(
     let args_row_for_transport = args_row.clone();
     let cwd_row_for_transport = cwd_row.clone();
     let url_row_for_transport = url_row.clone();
+    let env_section = plain_env.as_ref().map(|(section, _)| section.clone());
+    if let Some(section) = &env_section {
+        section.set_visible(transport.selected() == 0);
+    }
     transport.connect_selected_notify(move |transport| {
         update_editor_transport(
             transport.selected(),
@@ -9309,8 +9332,12 @@ fn open_server_editor_prefilled(
             &args_row_for_transport,
             &cwd_row_for_transport,
             &url_row_for_transport,
-        )
+        );
+        if let Some(section) = &env_section {
+            section.set_visible(transport.selected() == 0);
+        }
     });
+    let plain_env = plain_env.map(|(_, rows)| rows);
 
     let clamp = adw::Clamp::builder()
         .maximum_size(680)
@@ -9334,6 +9361,7 @@ fn open_server_editor_prefilled(
     let launch_definition_for_test = original_launch.clone();
     let original_command_for_test = original_command.clone();
     let original_args_for_test = original_args.clone();
+    let plain_env_for_test = plain_env.clone();
     test.connect_clicked(move |button| {
         button.set_sensitive(false);
         feedback_for_test.set_label("Testing connection…");
@@ -9366,6 +9394,7 @@ fn open_server_editor_prefilled(
             })
             .collect::<Vec<_>>();
         let launch_definition = launch_definition_for_test.clone();
+        let env_edits = plain_env_for_test.as_ref().map(collect_plain_env);
         let server_id = server_id_for_test.clone();
         let feedback = feedback_for_test.clone();
         let button = button.clone();
@@ -9375,6 +9404,9 @@ fn open_server_editor_prefilled(
                     server_id.as_deref(),
                     fields,
                 )?;
+                if let Some(edits) = env_edits {
+                    crate::registry_controller::apply_plain_env(&mut entry, edits)?;
+                }
                 if !binding_changed {
                     if entry.launch.is_none() {
                         entry.launch = launch_definition;
@@ -9467,6 +9499,7 @@ fn open_server_editor_prefilled(
         let launch_definition = original_launch_for_save.clone();
         let display_name = fields.name.trim().to_string();
         let env = snippet_env.borrow().clone();
+        let env_edits = plain_env.as_ref().map(collect_plain_env);
         let page = page.clone();
         let save = save.clone();
         let feedback = feedback.clone();
@@ -9484,7 +9517,9 @@ fn open_server_editor_prefilled(
                 match server_id {
                     Some(server_id) => {
                         let mut registry =
-                            crate::registry_controller::update_server_fields(&server_id, fields)?;
+                            crate::registry_controller::update_server_fields_and_env(
+                                &server_id, fields, env_edits,
+                            )?;
                         if !binding_changed {
                             registry = save_launch_entries(&server_id, &launch_values, registry)?;
                         }
@@ -9841,6 +9876,154 @@ fn section_heading(title: &str, subtitle: &str) -> gtk::Box {
             .build(),
     );
     heading
+}
+
+/// One editable plain environment value in Edit server.
+#[derive(Clone)]
+struct PlainEnvRow {
+    row: gtk::Box,
+    key: gtk::Entry,
+    value: gtk::Entry,
+    local: Option<gtk::CheckButton>,
+    /// Set once the user flips "This machine only"; until then the box follows
+    /// the saved choice, or sync's default for a new name.
+    touched: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+type PlainEnvRows = std::rc::Rc<std::cell::RefCell<Vec<PlainEnvRow>>>;
+
+fn plain_env_section(values: &[state::PlainEnvView], personal: bool) -> (gtk::Box, PlainEnvRows) {
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    section.add_css_class("toolport-form-section");
+    section.append(&section_heading(
+        "Environment",
+        "Plain settings the command reads, such as a region or a feature flag. Keys and tokens belong in Credentials.",
+    ));
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    section.append(&list);
+    let rows: PlainEnvRows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    for saved in values {
+        add_plain_env_row(&list, &rows, Some(saved.clone()), personal);
+    }
+    let add = gtk::Button::with_label("Add value");
+    add.add_css_class("toolport-secondary-action");
+    add.set_halign(gtk::Align::Start);
+    let list_for_add = list.clone();
+    let rows_for_add = rows.clone();
+    add.connect_clicked(move |_| {
+        let key = add_plain_env_row(&list_for_add, &rows_for_add, None, personal);
+        key.grab_focus();
+    });
+    section.append(&add);
+    (section, rows)
+}
+
+fn add_plain_env_row(
+    list: &gtk::Box,
+    rows: &PlainEnvRows,
+    saved: Option<state::PlainEnvView>,
+    personal: bool,
+) -> gtk::Entry {
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let key = gtk::Entry::builder()
+        .text(saved.as_ref().map(|s| s.key.as_str()).unwrap_or(""))
+        .placeholder_text("NAME")
+        .width_chars(16)
+        .css_classes(["toolport-input", "monospace"])
+        .build();
+    let value = gtk::Entry::builder()
+        .text(saved.as_ref().map(|s| s.value.as_str()).unwrap_or(""))
+        .placeholder_text("Value")
+        .hexpand(true)
+        .css_classes(["toolport-input"])
+        .build();
+    let remove = gtk::Button::builder()
+        .icon_name("user-trash-symbolic")
+        .tooltip_text("Remove this value")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat", "toolport-destructive-icon"])
+        .build();
+    line.append(&key);
+    line.append(&value);
+    line.append(&remove);
+    row.append(&line);
+    let touched = std::rc::Rc::new(std::cell::Cell::new(false));
+    let local = personal.then(|| {
+        let check = gtk::CheckButton::with_label("This machine only");
+        row.append(&check);
+        let setting = std::rc::Rc::new(std::cell::Cell::new(false));
+        let refresh = {
+            let (key, value, check, touched, setting) =
+                (key.clone(), value.clone(), check.clone(), touched.clone(), setting.clone());
+            move || {
+                let name = key.text();
+                let name = name.trim();
+                let risky = crate::personal_sync::risky_sync_env(name);
+                let active = if risky {
+                    true
+                } else if touched.get() {
+                    check.is_active()
+                } else {
+                    match &saved {
+                        Some(saved) if saved.key == name => saved.portable != Some(true),
+                        _ => crate::personal_sync::looks_machine_local(name, &value.text()),
+                    }
+                };
+                setting.set(true);
+                check.set_active(active);
+                setting.set(false);
+                check.set_sensitive(!risky);
+                check.set_tooltip_text(Some(if risky {
+                    "This variable changes how programs run, so it always stays on this machine."
+                } else {
+                    "Keep this value off your other machines."
+                }));
+            }
+        };
+        refresh();
+        let refresh = std::rc::Rc::new(refresh);
+        let on_key = refresh.clone();
+        key.connect_changed(move |_| on_key());
+        value.connect_changed(move |_| refresh());
+        let touched = touched.clone();
+        check.connect_toggled(move |_| {
+            if !setting.get() {
+                touched.set(true);
+            }
+        });
+        check
+    });
+    list.append(&row);
+    rows.borrow_mut().push(PlainEnvRow {
+        row: row.clone(),
+        key: key.clone(),
+        value,
+        local,
+        touched,
+    });
+    let list = list.clone();
+    let rows_for_remove = rows.clone();
+    remove.connect_clicked(move |_| {
+        list.remove(&row);
+        rows_for_remove.borrow_mut().retain(|r| r.row != row);
+    });
+    key
+}
+
+fn collect_plain_env(rows: &PlainEnvRows) -> Vec<crate::registry_controller::PlainEnvEdit> {
+    rows.borrow()
+        .iter()
+        .map(|row| crate::registry_controller::PlainEnvEdit {
+            key: row.key.text().to_string(),
+            value: row.value.text().to_string(),
+            local_only: row
+                .local
+                .as_ref()
+                .filter(|_| row.touched.get())
+                .map(gtk::CheckButton::is_active),
+        })
+        .collect()
 }
 
 fn update_editor_transport(
@@ -11436,6 +11619,7 @@ mod tests {
             cwd: None,
             inherit_env: false,
             secret_keys: Vec::new(),
+            plain_env: Vec::new(),
             secret_references: Default::default(),
             client_credentials: None,
             enabled: true,

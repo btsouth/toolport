@@ -955,6 +955,105 @@ pub fn update_server_fields(server_id: &str, fields: ServerFields) -> Result<Reg
     Ok(registry)
 }
 
+/// A plain (nonsecret) environment value as edited in a server editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainEnvEdit {
+    pub key: String,
+    pub value: String,
+    /// Set only when the user chose. Otherwise personal sync's own default
+    /// decides, so an untouched old value keeps its current behavior.
+    pub local_only: Option<bool>,
+}
+
+/// Replaces the server's plain environment values with `edits`. Secret and
+/// password manager entries are left alone; they are edited in Credentials.
+/// Existing plain entries keep their newer fields when their key stays.
+pub fn apply_plain_env(server: &mut ServerEntry, edits: Vec<PlainEnvEdit>) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut plain = Vec::new();
+    for edit in edits {
+        let key = edit.key.trim().to_string();
+        if key.is_empty() && edit.value.trim().is_empty() {
+            continue;
+        }
+        if key.is_empty() {
+            return Err("give each environment value a name".into());
+        }
+        if key.contains(|c: char| c == '=' || c == '\0' || c.is_whitespace()) {
+            return Err(format!("{key} is not a valid environment variable name"));
+        }
+        if !seen.insert(key.clone()) {
+            return Err(format!("{key} is listed more than once"));
+        }
+        if server.env.iter().any(|e| e.key == key && is_vaulted(e)) {
+            return Err(format!(
+                "{key} is a stored credential. Change it in Credentials."
+            ));
+        }
+        let mut entry = server
+            .env
+            .iter()
+            .find(|e| e.key == key && !is_vaulted(e))
+            .cloned()
+            .unwrap_or(crate::registry::EnvVar {
+                key: key.clone(),
+                value: None,
+                secret: false,
+                unknown_fields: serde_json::Map::new(),
+            });
+        entry.value = (!edit.value.is_empty()).then_some(edit.value);
+        if let Some(local_only) = edit.local_only {
+            if !local_only && crate::personal_sync::risky_sync_env(&key) {
+                return Err(format!(
+                    "{key} changes how programs run, so it stays on this machine."
+                ));
+            }
+            entry
+                .unknown_fields
+                .insert("portable".into(), serde_json::json!(!local_only));
+        }
+        plain.push(entry);
+    }
+    // Keep existing entries where they were so an unchanged list stays equal.
+    let mut env = Vec::with_capacity(server.env.len() + plain.len());
+    for existing in std::mem::take(&mut server.env) {
+        if is_vaulted(&existing) {
+            env.push(existing);
+        } else if let Some(at) = plain.iter().position(|e| e.key == existing.key) {
+            env.push(plain.remove(at));
+        }
+    }
+    env.extend(plain);
+    server.env = env;
+    Ok(())
+}
+
+fn is_vaulted(entry: &crate::registry::EnvVar) -> bool {
+    entry.secret || entry.unknown_fields.contains_key("source")
+}
+
+/// Saves the editor's fields and, when given, its plain environment values in
+/// one registry write.
+pub fn update_server_fields_and_env(
+    server_id: &str,
+    fields: ServerFields,
+    env: Option<Vec<PlainEnvEdit>>,
+) -> Result<Registry, String> {
+    let (registry, ()) = registry::update(|registry| {
+        apply_update_server_fields(registry, server_id, fields)?;
+        if let Some(env) = env {
+            let server = registry
+                .servers
+                .iter_mut()
+                .find(|server| server.id == server_id)
+                .ok_or_else(|| format!("No server with id '{server_id}'"))?;
+            apply_plain_env(server, env)?;
+        }
+        Ok(())
+    })?;
+    Ok(registry)
+}
+
 pub fn server_entry_for_probe(
     server_id: Option<&str>,
     fields: ServerFields,
@@ -4299,6 +4398,79 @@ mod tests {
                 "error should name the server: {error}"
             );
         }
+    }
+
+    #[test]
+    fn plain_env_edits_keep_credentials_order_and_unchosen_sync_flags() {
+        let mut entry = server("plain");
+        entry.env = serde_json::from_value(serde_json::json!([
+            {"key":"TOKEN","secret":true},
+            {"key":"REGION","secret":false,"value":"west","portable":true,"extra":1},
+            {"key":"OLD","secret":false,"value":"x"},
+            {"key":"OP","secret":true,"source":{"ref":"op://v/i/f"}}
+        ]))
+        .unwrap();
+        let edit = |key: &str, value: &str, local_only| PlainEnvEdit {
+            key: key.into(),
+            value: value.into(),
+            local_only,
+        };
+        apply_plain_env(
+            &mut entry,
+            vec![
+                edit(" REGION ", "east", None),
+                edit("MODE", "fast", Some(true)),
+                edit("", "", None),
+            ],
+        )
+        .unwrap();
+        let env = serde_json::to_value(&entry.env).unwrap();
+        assert_eq!(
+            env,
+            serde_json::json!([
+                {"key":"TOKEN","secret":true},
+                {"key":"REGION","secret":false,"value":"east","portable":true,"extra":1},
+                {"key":"OP","secret":true,"source":{"ref":"op://v/i/f"}},
+                {"key":"MODE","secret":false,"value":"fast","portable":false}
+            ])
+        );
+        // Saving the same list again changes nothing.
+        let before = entry.env.clone();
+        apply_plain_env(
+            &mut entry,
+            vec![edit("REGION", "east", None), edit("MODE", "fast", None)],
+        )
+        .unwrap();
+        assert_eq!(entry.env, before);
+    }
+
+    #[test]
+    fn plain_env_edits_refuse_bad_names_credentials_and_portable_overrides() {
+        let mut entry = server("plain");
+        entry.env = serde_json::from_value(serde_json::json!([{"key":"TOKEN","secret":true}]))
+            .unwrap();
+        let before = entry.env.clone();
+        for (key, local_only) in [
+            ("BAD NAME", None),
+            ("A=B", None),
+            ("TOKEN", None),
+            ("NODE_OPTIONS", Some(false)),
+        ] {
+            let edits = vec![PlainEnvEdit {
+                key: key.into(),
+                value: "v".into(),
+                local_only,
+            }];
+            assert!(apply_plain_env(&mut entry, edits).is_err(), "{key} accepted");
+        }
+        let dup = |key: &str| PlainEnvEdit {
+            key: key.into(),
+            value: "v".into(),
+            local_only: None,
+        };
+        assert!(apply_plain_env(&mut entry, vec![dup("X"), dup("X")]).is_err());
+        assert!(apply_plain_env(&mut entry, vec![dup("")]).is_err());
+        assert_eq!(entry.env, before);
     }
 
     fn server(id: &str) -> ServerEntry {

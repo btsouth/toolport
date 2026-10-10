@@ -636,6 +636,7 @@ fn configure_self_hosted(entry: &crate::catalog::CatalogEntry, hint: &str, page:
         inherit_env: false,
         secret_references: Default::default(),
         secret_keys: entry.env_keys.clone(),
+        plain_env: Vec::new(),
         client_credentials: None,
         enabled: false,
         requires_review: false,

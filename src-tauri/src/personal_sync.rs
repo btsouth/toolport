@@ -205,63 +205,67 @@ pub fn finish_local_selection() -> Result<Registry, String> {
 /// secret-reference source. Local launchers retain the normal spawn screening.
 pub fn risky_sync_env(key: &str) -> bool {
     let key = key.trim().to_ascii_uppercase();
-    key.starts_with("GIT_CONFIG_")
-        || key.starts_with("DYLD_")
-        || key.starts_with("NPM_CONFIG_")
-        || key.starts_with("UV_INDEX")
-        || key.starts_with("UV_PYTHON")
-        || [
-            "PATH",
-            "LD_PRELOAD",
-            "LD_LIBRARY_PATH",
-            "LD_AUDIT",
-            "NODE_OPTIONS",
-            "NODE_PATH",
-            "PYTHONPATH",
-            "PYTHONSTARTUP",
-            "JAVA_TOOL_OPTIONS",
-            "_JAVA_OPTIONS",
-            "JDK_JAVA_OPTIONS",
-            "PERL5OPT",
-            "PERL5LIB",
-            "RUBYOPT",
-            "RUBYLIB",
-            "PYTHONHOME",
-            "UV_INDEX",
-            "PIP_CONFIG_FILE",
-            "NODE_EXTRA_CA_CERTS",
-            "LD_DEBUG",
-            "LD_PROFILE",
-            "GIT_CONFIG_SYSTEM",
-            "GIT_CONFIG_GLOBAL",
-            "GIT_CONFIG_COUNT",
-            "GIT_EXEC_PATH",
-            "PYTHONUSERBASE",
-            "PYTHONINSPECT",
-            "PIP_INDEX_URL",
-            "PIP_EXTRA_INDEX_URL",
-            "UV_INDEX_URL",
-            "UV_EXTRA_INDEX_URL",
-            "UV_DEFAULT_INDEX",
-            "GIT_SSH",
-            "GIT_SSH_COMMAND",
-            "GIT_ASKPASS",
-            "GIT_PROXY_COMMAND",
-            "SSH_ASKPASS",
-            "SSH_ASKPASS_REQUIRE",
-            "PIP_FIND_LINKS",
-            "PIP_TRUSTED_HOST",
-            "UV_FIND_LINKS",
-            "UV_INSECURE_HOST",
-            "DOCKER_HOST",
-            "RUSTC_WRAPPER",
-            "BASH_ENV",
-            "ENV",
-            "ZDOTDIR",
-            "GCONV_PATH",
-        ]
-        .contains(&key.as_str())
+    RISKY_SYNC_ENV_PREFIXES.iter().any(|p| key.starts_with(p))
+        || RISKY_SYNC_ENV.contains(&key.as_str())
 }
+/// Mirrored in `src/lib/personalSync.ts`; a test keeps the two equal.
+pub(crate) const RISKY_SYNC_ENV_PREFIXES: &[&str] = &[
+    "GIT_CONFIG_",
+    "DYLD_",
+    "NPM_CONFIG_",
+    "UV_INDEX",
+    "UV_PYTHON",
+];
+pub(crate) const RISKY_SYNC_ENV: &[&str] = &[
+    "PATH",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "PERL5OPT",
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB",
+    "PYTHONHOME",
+    "UV_INDEX",
+    "PIP_CONFIG_FILE",
+    "NODE_EXTRA_CA_CERTS",
+    "LD_DEBUG",
+    "LD_PROFILE",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_COUNT",
+    "GIT_EXEC_PATH",
+    "PYTHONUSERBASE",
+    "PYTHONINSPECT",
+    "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
+    "UV_INDEX_URL",
+    "UV_EXTRA_INDEX_URL",
+    "UV_DEFAULT_INDEX",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_ASKPASS",
+    "GIT_PROXY_COMMAND",
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "PIP_FIND_LINKS",
+    "PIP_TRUSTED_HOST",
+    "UV_FIND_LINKS",
+    "UV_INSECURE_HOST",
+    "DOCKER_HOST",
+    "RUSTC_WRAPPER",
+    "BASH_ENV",
+    "ENV",
+    "ZDOTDIR",
+    "GCONV_PATH",
+];
 fn publish_error(value: &Value) -> Option<String> {
     if value["url"].as_str().is_some_and(credential_url) {
         return Some("This URL contains credentials. Use local authentication or keep this server on this machine only. The URL has not been changed.".into());
@@ -621,7 +625,7 @@ fn now() -> i64 {
 }
 /// A plain value that probably belongs to this machine or is a credential
 /// someone did not mark secret. These default to staying local.
-fn looks_machine_local(key: &str, value: &str) -> bool {
+pub(crate) fn looks_machine_local(key: &str, value: &str) -> bool {
     let v = value.trim();
     let path = v.starts_with('/')
         || v.starts_with('~')
@@ -2390,6 +2394,22 @@ pub fn record_error(error: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn risky_env_lists_match_the_renderer_copy() {
+        let ts = include_str!("../../src/lib/personalSync.ts");
+        let list = |start: &str| -> Vec<String> {
+            let body = &ts[ts.find(start).expect(start) + start.len()..];
+            body[..body.find(']').unwrap()]
+                .split('"')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(list("const RISKY_SYNC_ENV_PREFIXES = ["), RISKY_SYNC_ENV_PREFIXES);
+        assert_eq!(list("const RISKY_SYNC_ENV = new Set(["), RISKY_SYNC_ENV);
+    }
+
     #[test]
     fn imported_local_extensions_survive_polls_and_destination_changes() {
         let _data = crate::registry::DataDirTestEnv::new("sync-imported-fields");

@@ -539,6 +539,8 @@ pub(super) struct ServerView {
     pub(super) cwd: Option<String>,
     pub(super) inherit_env: bool,
     pub(super) secret_keys: Vec<String>,
+    /// Nonsecret environment values, editable in Edit server.
+    pub(super) plain_env: Vec<PlainEnvView>,
     pub(super) secret_references: std::collections::BTreeMap<String, String>,
     pub(super) client_credentials: Option<ClientCredentialsView>,
     pub(super) enabled: bool,
@@ -546,6 +548,14 @@ pub(super) struct ServerView {
     pub(super) team_route_removed: bool,
     /// Changes whenever anything a probe reads from the registry entry does.
     pub(super) probe_fingerprint: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PlainEnvView {
+    pub(super) key: String,
+    pub(super) value: String,
+    /// The saved sync choice, if any. `None` means sync's default applies.
+    pub(super) portable: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -678,6 +688,19 @@ impl RegistrySnapshot {
                                     }
                                 }),
                         )
+                        .collect(),
+                    plain_env: server
+                        .env
+                        .iter()
+                        .filter(|e| !e.secret && !e.unknown_fields.contains_key("source"))
+                        .map(|e| PlainEnvView {
+                            key: e.key.clone(),
+                            value: e.value.clone().unwrap_or_default(),
+                            portable: e
+                                .unknown_fields
+                                .get("portable")
+                                .and_then(serde_json::Value::as_bool),
+                        })
                         .collect(),
                     client_credentials: server.client_credentials.as_ref().map(|credentials| {
                         ClientCredentialsView {
@@ -1036,6 +1059,7 @@ mod tests {
                     cwd: None,
                     inherit_env: false,
                     secret_keys: vec!["TOKEN".into()],
+                    plain_env: Vec::new(),
                     secret_references: Default::default(),
                     client_credentials: None,
                     enabled: false,
@@ -1056,6 +1080,7 @@ mod tests {
                     cwd: None,
                     inherit_env: false,
                     secret_keys: Vec::new(),
+                    plain_env: Vec::new(),
                     secret_references: Default::default(),
                     client_credentials: None,
                     enabled: true,

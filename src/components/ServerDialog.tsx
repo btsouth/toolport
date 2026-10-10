@@ -26,6 +26,7 @@ import {
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
 import { formatArgs, parseArgs } from "@/lib/args";
 import { isDownloadLauncher } from "@/lib/launcher";
+import { riskySyncEnv, syncsByDefault } from "@/lib/personalSync";
 import type {
   LaunchConfig,
   Registry,
@@ -82,6 +83,19 @@ type TestState =
 type TestResult = Extract<TestState, { status: "ok" | "fail" }>;
 
 const IDLE_TEST: TestState = { status: "idle", message: "" };
+
+/** What "Same on every machine" shows for a plain value. A saved or chosen
+ * answer wins. A name the server did not have yet gets sync's default; an old
+ * value nobody marked stays on this machine. */
+export function envRowSyncs(
+  row: { key: string; value: string; portable?: boolean },
+  saved: { key: string }[],
+): boolean {
+  if (riskySyncEnv(row.key)) return false;
+  if (row.portable !== undefined) return row.portable;
+  const key = row.key.trim();
+  return !saved.some((e) => e.key === key) && syncsByDefault(key, row.value);
+}
 
 export function ServerDialog({
   trigger,
@@ -330,7 +344,11 @@ export function ServerDialog({
             : null,
         secret: r.source ? true : r.secret !== false,
         ...(r.source ? { source: r.source } : {}),
-        portable: !r.source && r.secret === false && r.portable === true,
+        // Left out unless saved or chosen, so sync's default for a new
+        // value applies (the box shows that default).
+        ...(!r.source && r.secret === false && r.portable !== undefined
+          ? { portable: r.portable && !riskySyncEnv(r.key) }
+          : {}),
       })),
       url: isStdio ? null : form.url.trim() || null,
       source: bindingCleared ? "manual" : (initial?.source ?? "manual"),
@@ -900,10 +918,18 @@ export function ServerDialog({
                   Keychain
                 </label>
                 {row.secret === false && (
-                  <label className="flex shrink-0 items-center gap-1 text-xs">
+                  <label
+                    className="flex shrink-0 items-center gap-1 text-xs"
+                    title={
+                      riskySyncEnv(row.key)
+                        ? "This variable changes how programs run, so it always stays on this machine."
+                        : undefined
+                    }
+                  >
                     <input
                       type="checkbox"
-                      checked={row.portable === true}
+                      disabled={riskySyncEnv(row.key)}
+                      checked={envRowSyncs(row, editing ? (initial?.env ?? []) : [])}
                       onChange={(e) =>
                         setEnvRows((rows) =>
                           rows.map((r, j) =>
