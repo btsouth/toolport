@@ -31,8 +31,7 @@ const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_CACHE_ENTRIES: usize = 64;
 
 /// Cap on retained body and structured JSON bytes. Evict oldest until a new body
-/// fits, or the
-/// cache is empty (then one over-cap body is kept rather than dropping the result
+/// fits, or the cache is empty (then one over-cap body is kept rather than dropping the result
 /// the caller just produced).
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -111,7 +110,7 @@ pub fn maintain_cache() {
 
 // Keep canonical structured JSON only when the original text cannot supply it.
 enum Structured {
-    Body { canonical: bool },
+    Body { offset: usize, canonical: bool },
     Json(String),
 }
 
@@ -121,7 +120,8 @@ impl Structured {
             let json = value.to_string();
             if json == body {
                 Self::Body {
-                    canonical: json == body,
+                    offset: 0,
+                    canonical: true,
                 }
             } else {
                 Self::Json(json)
@@ -131,7 +131,7 @@ impl Structured {
 
     fn json<'a>(&'a self, body: &'a str) -> &'a str {
         match self {
-            Self::Body { .. } => body,
+            Self::Body { offset, .. } => &body[*offset..],
             Self::Json(json) => json,
         }
     }
@@ -260,14 +260,19 @@ fn extract_body(result: &Value) -> (String, usize, Option<Structured>) {
                     .is_some_and(|text| text == *sc));
         structured = Some(if duplicate {
             Structured::Body {
+                offset: 0,
                 canonical: out == structured_text,
             }
         } else {
             if !out.is_empty() {
                 out.push('\n');
             }
+            let offset = out.len();
             out.push_str(&structured_text);
-            Structured::Json(structured_text)
+            Structured::Body {
+                offset,
+                canonical: true,
+            }
         });
     }
     (out, source_bytes, structured)
@@ -574,7 +579,13 @@ pub fn fetch_result(
             }
         };
 
-        let text = if matches!(structured, Structured::Body { canonical: false }) {
+        let text = if matches!(
+            structured,
+            Structured::Body {
+                canonical: false,
+                ..
+            }
+        ) {
             // The text may be pretty-printed or use another object-key order.
             // Canonicalize only the selected subtree, preserving projection bytes.
             serde_json::from_str::<Value>(value)
@@ -1274,6 +1285,27 @@ mod tests {
         assert!(
             retained_size(&distinct_body, distinct.as_ref())
                 >= distinct_body.len() + value_size(&value)
+        );
+    }
+
+    #[test]
+    fn distinct_structured_json_uses_the_existing_body_suffix() {
+        let value = json!({"rows": [1, 2, 3]});
+        let result = json!({"content": [{"type": "text", "text": "different text"}], "structuredContent": value});
+        let (body, _, structured) = extract_body(&result);
+        let structured = structured.unwrap();
+        assert!(matches!(
+            structured,
+            Structured::Body {
+                canonical: true,
+                ..
+            }
+        ));
+        assert_eq!(body, format!("different text\n{value}"));
+        assert_eq!(structured.json(&body), value.to_string());
+        assert_eq!(
+            retained_size(&body, Some(&structured)),
+            std::mem::size_of::<Cached>() + body.capacity()
         );
     }
 
