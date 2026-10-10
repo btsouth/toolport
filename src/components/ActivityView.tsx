@@ -1,4 +1,4 @@
-import { activityClientName } from "@/lib/clientIdentity";
+import { activityClientName, clientIdentityTooltip } from "@/lib/clientIdentity";
 import { useWindowVisible } from "@/lib/windowVisible";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -825,6 +825,7 @@ function CallRow({ e }: { e: AuditEntry }) {
             className="mt-1 truncate text-xs text-muted-foreground"
             title={[
               meta,
+              clientIdentityTooltip(e),
               e.client && `Client: ${e.client}`,
               e.sessionId && `Session: ${e.sessionId}`,
               e.runId && `Run: ${e.runId}`,

@@ -1,5 +1,6 @@
 //! Best-effort local process attribution, never an authorization principal.
-//! Only basenames survive the bounded parent walk. No argv, environment or cwd reads.
+//! Only basenames survive the bounded parent walk. Interpreters read argv[1] only;
+//! no other arguments, environment or cwd are retained.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -60,30 +61,101 @@ fn walk(mut pid: u32, mut read: impl FnMut(u32) -> Option<(Generation, String)>)
                 .to_ascii_lowercase()
                 .trim_end_matches(".exe")
                 .to_string();
-            if !matches!(
-                stem.as_str(),
-                "node"
-                    | "nodejs"
-                    | "bash"
-                    | "sh"
-                    | "zsh"
-                    | "fish"
-                    | "env"
-                    | "cmd"
-                    | "powershell"
-                    | "pwsh"
-                    | "python"
-                    | "python3"
-                    | "toolport-gateway"
-                    | "conduit-gateway"
-            ) {
+            if !is_interpreter(&stem)
+                && !matches!(stem.as_str(), "toolport-gateway" | "conduit-gateway")
+            {
                 return Some(name);
             }
-            fallback.get_or_insert(name);
+            if !is_interpreter(&stem) {
+                fallback.get_or_insert(name);
+            }
         }
         pid = generation.parent;
     }
     fallback
+}
+
+fn is_interpreter(name: &str) -> bool {
+    let stem = name.trim_end_matches(".exe").to_ascii_lowercase();
+    matches!(
+        stem.as_str(),
+        "node"
+            | "nodejs"
+            | "bun"
+            | "deno"
+            | "bash"
+            | "sh"
+            | "dash"
+            | "zsh"
+            | "fish"
+            | "env"
+            | "npx"
+            | "uv"
+            | "uvx"
+            | "cmd"
+            | "powershell"
+            | "pwsh"
+    ) || stem
+        .strip_prefix("python")
+        .is_some_and(|suffix| suffix.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
+fn command_basename(arg: &str) -> Option<String> {
+    // Options and inline programs are not script names. Never search later args.
+    if arg.is_empty() || arg.starts_with('-') {
+        return None;
+    }
+    let basename = arg.rsplit(['/', '\\']).next()?;
+    crate::session_observability::display_label(basename)
+        .map(|name| crate::approval::shorten_client_label(&name, 48))
+}
+
+#[cfg(target_os = "linux")]
+fn interpreter_command(pid: u32) -> Option<String> {
+    use std::io::{BufRead, Read};
+    // Stop after argv[1], with a fixed cap even for maliciously long arguments.
+    let file = std::fs::File::open(format!("/proc/{pid}/cmdline")).ok()?;
+    let mut reader = std::io::BufReader::new(file.take(4096));
+    let mut arg = Vec::new();
+    for _ in 0..2 {
+        arg.clear();
+        reader.read_until(0, &mut arg).ok()?;
+        if arg.pop()? != 0 {
+            return None;
+        }
+    }
+    command_basename(std::str::from_utf8(&arg).ok()?)
+}
+
+#[cfg(target_os = "macos")]
+fn interpreter_command(pid: u32) -> Option<String> {
+    // KERN_PROCARGS2 requires a buffer for the process argument block. Discard it
+    // immediately after extracting argv[1]; never parse the remaining arguments.
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut buf = vec![0u8; 4096];
+    let mut size = buf.len();
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    let args = buf.get(std::mem::size_of::<libc::c_int>()..size)?;
+    let path_end = args.iter().position(|b| *b == 0)?;
+    let argv = &args[path_end..];
+    let start = argv.iter().position(|b| *b != 0)?;
+    let argv = &argv[start..];
+    let first_end = argv.iter().position(|b| *b == 0)?;
+    let second = &argv[first_end + 1..];
+    let end = second.iter().position(|b| *b == 0)?;
+    command_basename(std::str::from_utf8(&second[..end]).ok()?)
 }
 
 #[cfg(target_os = "linux")]
@@ -91,14 +163,19 @@ fn process(pid: u32) -> Option<(Generation, String)> {
     stable_process(
         || linux_generation(pid),
         || {
-            std::fs::read_link(format!("/proc/{pid}/exe"))
+            let name = std::fs::read_link(format!("/proc/{pid}/exe"))
                 .ok()
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                 .or_else(|| {
                     std::fs::read_to_string(format!("/proc/{pid}/comm"))
                         .ok()
                         .map(|n| n.trim().to_string())
-                })
+                })?;
+            if is_interpreter(&name) {
+                interpreter_command(pid)
+            } else {
+                Some(name)
+            }
         },
     )
 }
@@ -133,7 +210,12 @@ fn process(pid: u32) -> Option<(Generation, String)> {
                 .ok()?
                 .to_str()
                 .ok()?;
-            Some(Path::new(path).file_name()?.to_str()?.to_string())
+            let name = Path::new(path).file_name()?.to_str()?.to_string();
+            if is_interpreter(&name) {
+                interpreter_command(pid)
+            } else {
+                Some(name)
+            }
         },
     )
 }
@@ -237,6 +319,48 @@ fn process(_: u32) -> Option<(Generation, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interpreter_names_and_script_basename_are_private_and_bounded() {
+        for name in [
+            "python3.14",
+            "python",
+            "node",
+            "bun",
+            "deno",
+            "bash",
+            "sh",
+            "zsh",
+            "fish",
+            "env",
+            "npx",
+            "uv",
+            "uvx",
+            "pwsh.exe",
+        ] {
+            assert!(is_interpreter(name), "{name}");
+        }
+        assert!(!is_interpreter("Cursor"));
+        assert_eq!(
+            command_basename("/private/customer/scripts/inbox"),
+            Some("inbox".into())
+        );
+        assert_eq!(
+            command_basename(r"C:\private\inbox.py"),
+            Some("inbox.py".into())
+        );
+        for arg in ["-c", "--eval", ""] {
+            assert_eq!(command_basename(arg), None);
+        }
+        assert_eq!(
+            command_basename("/private/sk-live-abcdefghijk123456789"),
+            Some("[redacted]".into())
+        );
+        assert_eq!(
+            command_basename("/private/https:secret"),
+            Some("[private]".into())
+        );
+    }
+
     #[test]
     fn one_parent_walk_per_lifetime_including_failures() {
         for result in [Some("Cursor".to_string()), None] {
@@ -377,7 +501,7 @@ mod tests {
                 ))
             })
             .as_deref(),
-            Some("node")
+            None
         );
         assert_eq!(reads, MAX_PARENTS);
         assert_eq!(walk(10, |_| None), None);

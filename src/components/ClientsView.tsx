@@ -1,3 +1,4 @@
+import { trustedClientName, clientIdentityTooltip } from "@/lib/clientIdentity";
 import { getClientSessions } from "@/lib/api";
 import type { ClientSession } from "@/lib/types";
 import { useEffect, useState } from "react";
@@ -177,10 +178,10 @@ export function ClientsView({
                 key={session.sessionId}
                 className="border-b border-border/60 px-3.5 py-2.5 last:border-b-0"
               >
-                <p className="truncate text-sm font-medium" title={session.sessionId}>
-                  {session.clientName}
+                <p className="truncate text-sm font-medium" title={clientIdentityTooltip(session) ?? session.sessionId}>
+                  {trustedClientName(session)}
                 </p>
-                {session.clientLabel && (
+                {session.clientLabel && !trustedClientName(session).endsWith(" (reported)") && (
                   <p className="truncate text-xs text-muted-foreground" dir="auto">
                     Reports itself as: {session.clientLabel}
                   </p>

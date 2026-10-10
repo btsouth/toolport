@@ -6,6 +6,7 @@ use std::time::Instant;
 
 #[derive(Clone, Default)]
 pub struct Context {
+    pub client: Option<String>,
     pub session_id: Option<String>,
     pub client_name: Option<String>,
     pub client_label: Option<String>,
@@ -57,7 +58,7 @@ pub fn telemetry_principal(client: &str) -> Option<&str> {
     (client.starts_with("client:")
         || client
             .strip_prefix("adapter:")
-            .is_some_and(|id| crate::clients::known_adapter_name(id).is_some()))
+            .is_some_and(|id| !id.starts_with("adapter-pid-") && display_client_id(id) == id))
     .then_some(client)
 }
 
@@ -106,15 +107,11 @@ impl Drop for DispatchTimer {
 
 pub fn enrich(entry: &mut Value) {
     let ctx = current();
-    if entry.get("runId").is_some() || ctx.run_id.is_some() {
-        if entry["client"]
-            .as_str()
-            .is_some_and(|c| telemetry_principal(c).is_none())
-        {
-            if let Some(object) = entry.as_object_mut() {
-                object.remove("client");
-            }
-        }
+    // Use the privacy-filtered display identity for every row, including nested calls.
+    if let Some(client) = ctx.client {
+        entry["client"] = json!(client);
+    } else if entry["client"].as_str().is_some_and(|c| telemetry_principal(c).is_none()) {
+        if let Some(object) = entry.as_object_mut() { object.remove("client"); }
     }
     if let Some(ms) = ctx.dispatch_ms {
         entry["dispatchMs"] = json!(ms);
@@ -261,9 +258,9 @@ impl Session {
             id: crate::approval::new_correlation_id(),
             audit_path: crate::audit::audit_path(),
             // Anonymous process IDs and token-derived legacy principals are not retained.
-            client: client.and_then(telemetry_principal).map(str::to_string),
+            client: display_client.and_then(telemetry_principal).map(str::to_string),
             name: display_label(&crate::clients::trusted_client_name(display_client, name))
-                .unwrap_or_else(|| "An AI client".into()),
+                .unwrap_or_else(|| "Unknown client".into()),
             client_type,
             label: label.and_then(display_label),
             transport,
@@ -278,6 +275,7 @@ impl Session {
     }
     pub fn context(&self) -> Context {
         Context {
+            client: self.client.clone(),
             session_id: Some(self.id.clone()),
             client_name: Some(self.name.clone()),
             client_label: self.label.clone(),

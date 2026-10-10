@@ -110,7 +110,7 @@ impl ActivitySnapshot {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("Unknown tool")
                         .to_string(),
-                    client: Some(crate::clients::trusted_client_name(
+                    client: (entry.get("client").is_some() || entry.get("clientName").is_some()).then(|| crate::clients::trusted_client_name(
                         entry.get("client").and_then(serde_json::Value::as_str),
                         entry.get("clientName").and_then(serde_json::Value::as_str),
                     )),

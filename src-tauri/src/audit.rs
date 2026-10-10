@@ -617,6 +617,9 @@ pub fn activity_client_name(mut entry: Value) -> Value {
     if !entry.is_object() {
         return entry;
     }
+    if entry.get("client").is_none() && entry.get("clientName").is_none() {
+        return entry;
+    }
     entry["clientName"] = json!(crate::clients::trusted_client_name(
         entry.get("client").and_then(Value::as_str),
         entry.get("clientName").and_then(Value::as_str),

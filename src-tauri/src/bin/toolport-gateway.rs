@@ -15310,7 +15310,7 @@ fn observed_client_name(
 ) -> String {
     if client
         .and_then(|c| c.strip_prefix("adapter:"))
-        .is_some_and(|id| clients::known_adapter_name(id).is_some())
+        .is_some_and(|id| !id.starts_with("adapter-pid-"))
     {
         return clients::trusted_client_name(client, None);
     }
@@ -15322,8 +15322,7 @@ fn observed_client_name(
     holder
         .zip(pid)
         .and_then(|(session, pid)| session.parent_app.resolve(pid))
-        .map(|name| format!("Unknown app (via {name})"))
-        .unwrap_or_else(|| clients::trusted_client_name(client, name))
+        .unwrap_or_else(|| if client.is_none() && name.is_none() { "Unknown client".into() } else { clients::trusted_client_name(client, name) })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -25794,7 +25793,7 @@ mod tests {
         let reg = Registry::default();
         let router = Arc::new(paging_router("x".into()));
         let req = json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"toolport_run_script", "arguments":{"script":"toolport.call('s__big', {private:'f3-private-argument'}); throw new Error('f3-private-thrown');"}}});
-        let _context = observation::ContextGuard::enter(observation::Context { session_id: Some("opaque-session".into()), client_name: Some("Unknown app (via Cursor)".into()), client_label: Some("kt 1".into()), ..Default::default() });
+        let _context = observation::ContextGuard::enter(observation::Context { client: Some("adapter:inbox".into()), session_id: Some("opaque-session".into()), client_name: Some("Unknown app (via Cursor)".into()), client_label: Some("kt 1".into()), ..Default::default() });
         let response = handle_request_with_cancel(&host, &req, &reg, &router, &[], DiscoveryMode::Lazy, None, &SearchGuard::default(), None, None, None, None, Some(&CatalogSearchIndex::build(&[])), Some(&router), None).unwrap();
         assert_eq!(response["result"]["isError"], true);
         let rows = audit::read_all().unwrap();
@@ -25806,6 +25805,11 @@ mod tests {
         assert_eq!(nested["sessionId"], "opaque-session");
         assert_eq!(nested["clientName"], "Unknown app (via Cursor)");
         assert!(nested["dispatchMs"].is_u64());
+        for row in rows.iter().filter(|row| row["kind"] != "session") {
+            assert_eq!(row["client"], "adapter:inbox");
+            assert!(row["clientName"].is_string());
+            assert!(row["clientLabel"].is_string());
+        }
         let retained = serde_json::to_string(&rows).unwrap();
         for private in ["f3-private-argument", "f3-private-thrown", "throw new Error", "toolport.call"] { assert!(!retained.contains(private), "{retained}"); }
     }
@@ -28888,7 +28892,7 @@ mod tests {
             let (_, caller) = resolve_adapter_caller(&reg, id, None, None);
             assert_eq!(caller.session_owner.identity, format!("adapter:{id}"));
             assert_eq!(caller.profile, Some(profile));
-            assert_eq!(caller.audit_label.as_deref(), Some("An AI client"));
+            assert_eq!(caller.audit_label.as_deref(), Some("Unknown client"));
             assert_eq!(conduit_lib::session_observability::display_client_id(id), "[private]");
             assert!(conduit_lib::session_observability::telemetry_principal(&caller.session_owner.identity).is_none());
         }

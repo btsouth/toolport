@@ -2107,8 +2107,8 @@ impl ClientPage {
             for session in sessions {
                 let card = gtk::Box::new(gtk::Orientation::Vertical, 3);
                 card.add_css_class("toolport-card");
-                card.append(&gtk::Label::builder().label(session["clientName"].as_str().unwrap_or("An AI client")).halign(gtk::Align::Start).wrap(true).css_classes(["heading"]).build());
-                if let Some(label) = session["clientLabel"].as_str() { card.append(&gtk::Label::builder().label(format!("Reports itself as: {label}")).halign(gtk::Align::Start).wrap(true).css_classes(["toolport-muted"]).build()); }
+                card.append(&gtk::Label::builder().label(crate::clients::display_caller_name(session["clientName"].as_str(), session["clientLabel"].as_str())).halign(gtk::Align::Start).wrap(true).css_classes(["heading"]).build());
+                if let Some(label) = session["clientLabel"].as_str().filter(|_| !crate::clients::display_caller_name(session["clientName"].as_str(), session["clientLabel"].as_str()).ends_with(" (reported)")) { card.append(&gtk::Label::builder().label(format!("Reports itself as: {label}")).halign(gtk::Align::Start).wrap(true).css_classes(["toolport-muted"]).build()); }
                 let first = session["firstCatalogSize"].as_u64().map(|n| format!("{n} tools at first list")).unwrap_or_else(|| "No catalog delivered".into());
                 card.append(&gtk::Label::builder().label(format!("{} · {} tool lists · {} list changes delivered · {first} · {}", if session["phase"] == "close" { "Closed" } else { "Last observed" }, session["toolsListCount"].as_u64().unwrap_or(0), session["listChangedCount"].as_u64().unwrap_or(0), if session["contentChanged"] == true { "Catalog changed" } else { "Catalog unchanged" })).halign(gtk::Align::Start).wrap(true).css_classes(["toolport-muted"]).build());
                 self.list.append(&card);
@@ -4764,7 +4764,7 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     copy.append(
         &gtk::Label::builder()
             .label(detail.join(" · "))
-            .tooltip_text(format!("{}{}", activity.client_id.as_deref().unwrap_or(""), activity.run_id.as_ref().map(|id| format!("\nRun: {id}")).unwrap_or_default()))
+            .tooltip_text(format!("{}{}", if activity_client_name(activity) == "Unrecorded client" { crate::clients::UNRECORDED_CLIENT_TOOLTIP } else { activity.client_id.as_deref().unwrap_or("") }, activity.run_id.as_ref().map(|id| format!("\nRun: {id}")).unwrap_or_default()))
             .halign(gtk::Align::Fill)
             .xalign(0.0)
             .single_line_mode(true)
@@ -4876,7 +4876,8 @@ fn format_duration(ms: u64) -> String {
 }
 
 fn activity_client_name(activity: &state::ActivityView) -> String {
-    let name = activity.client.as_deref().unwrap_or("An AI client");
+    let name = crate::clients::display_caller_name(activity.client.as_deref(), activity.client_label.as_deref());
+    if name.ends_with(" (reported)") { return name; }
     match activity
         .client_label
         .as_deref()
@@ -5439,11 +5440,10 @@ fn approval_card(
     title_row.append(&deadline);
     card.append(&title_row);
 
-    let requester =
-        crate::clients::trusted_client_name(view.client.as_deref(), Some(&view.client_name));
+    let requester = crate::clients::display_caller_name(Some(&view.client_name), view.client_label.as_deref());
     card.append(
         &gtk::Label::builder()
-            .tooltip_text(view.client.as_deref().unwrap_or(""))
+            .tooltip_text(if requester == "Unrecorded client" { crate::clients::UNRECORDED_CLIENT_TOOLTIP } else { view.client.as_deref().unwrap_or("") })
             .label(format!(
                 "{requester} wants to run this · {}",
                 approval_reason(view.reason)
@@ -5458,7 +5458,7 @@ fn approval_card(
     if let Some(label) = view
         .client_label
         .as_deref()
-        .filter(|label| *label != requester)
+        .filter(|label| *label != requester && !requester.ends_with(" (reported)"))
     {
         card.append(
             &gtk::Label::builder()
@@ -10754,6 +10754,11 @@ mod p10c_r1_presentation_tests {
             activity_client_name(&row),
             "Claude Code (reports \"Someone else\")"
         );
+        row.client = None;
+        assert_eq!(activity_client_name(&row), "Someone else (reported)");
+        row.client_label = None;
+        assert_eq!(activity_client_name(&row), "Unrecorded client");
+        assert!(crate::clients::UNRECORDED_CLIENT_TOOLTIP.contains("Older Toolport"));
         assert_eq!(
             activity_server_filter_options(&[row.clone(), row]),
             vec!["All servers", "team_slack"]

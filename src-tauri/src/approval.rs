@@ -1275,7 +1275,7 @@ mod p08b_revision_tests {
         registry.http_clients.push(crate::registry::HttpClient { id: "real".into(), label: "My assistant".into(), token_sha256: "unused".into(), profile: String::new(), unknown_fields: Default::default() });
         crate::registry::save(&registry).unwrap();
         assert_eq!(crate::clients::trusted_client_name(Some("client:real"), None), "My assistant");
-        assert_eq!(crate::clients::trusted_client_name(Some("client:unknown"), None), "An AI client");
+        assert_eq!(crate::clients::trusted_client_name(Some("client:unknown"), None), "Unknown client");
     }
 
     #[test]
@@ -1286,7 +1286,7 @@ mod p08b_revision_tests {
         );
         assert_eq!(
             crate::clients::trusted_client_name(Some("adapter:unknown"), None),
-            "An AI client"
+            "unknown"
         );
         assert_eq!(
             crate::clients::trusted_client_name(Some("adapter:claude-code"), Some("Recorded name")),

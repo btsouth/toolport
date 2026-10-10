@@ -1478,7 +1478,7 @@ fn scan_roo_code_plugins() -> Vec<McpServer> {
         .unwrap_or_default()
 }
 
-/// Resolve display identity only from Toolport-owned names, never clientInfo.
+/// Resolve display identity from configured names, never clientInfo.
 /// Recorded friendly names remain authoritative for historical Activity rows.
 pub fn known_adapter_name(id: &str) -> Option<String> {
     if id == "claude-code-secondary" {
@@ -1502,6 +1502,11 @@ pub fn trusted_client_name(client: Option<&str>, recorded_name: Option<&str>) ->
         if let Some(name) = known_adapter_name(id) {
             return name;
         }
+        if !id.starts_with("adapter-pid-") {
+            if let Some(name) = crate::session_observability::display_label(id) {
+                return name;
+            }
+        }
     }
     if let Some(id) = client.and_then(|client| client.strip_prefix("client:")) {
         if let Ok(registry) = crate::registry::load() {
@@ -1510,7 +1515,18 @@ pub fn trusted_client_name(client: Option<&str>, recorded_name: Option<&str>) ->
             }
         }
     }
-    "An AI client".to_string()
+    if client.is_some() { "Unknown client" } else { "Unrecorded client" }.to_string()
+}
+
+pub const UNRECORDED_CLIENT_TOOLTIP: &str =
+    "Older Toolport versions did not record callers for these rows.";
+
+pub fn display_caller_name(name: Option<&str>, label: Option<&str>) -> String {
+    match name.filter(|n| !n.is_empty() && !matches!(*n, "An AI client" | "Unknown client" | "Unrecorded client")) {
+        Some(name) => name.to_string(),
+        None => label.filter(|l| !l.is_empty()).map(|l| format!("{l} (reported)"))
+            .unwrap_or_else(|| name.filter(|n| *n == "Unknown client").unwrap_or("Unrecorded client").to_string()),
+    }
 }
 
 /// Scope-selecting identity is independent from display-only attribution.
@@ -6824,7 +6840,75 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
     let mut outcome = repoint_stale_gateways_in(&current, detect_clients(), managed);
     repoint_other_claude_configs(&current, &mut outcome);
     log_repoint_outcome(&current, &outcome);
+    if let Some(dir) = crate::registry::conduit_dir().map(|d| d.join("bin")) {
+        cleanup_legacy_gateway_copies(Path::new(&current), &dir, referenced_gateway_paths().as_deref());
+    }
     outcome
+}
+
+/// 1.x AppImage copies (stable_gateway_copy) and Windows published images used
+/// this private bin directory. A matching name alone is not ownership: preserve
+/// symlinks, scripts and foreign executables, including user-written wrappers.
+fn is_legacy_gateway_copy(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return false; };
+    let stem = name.trim_end_matches(".exe");
+    if !matches!(stem, "toolport-gateway" | "conduit-gateway")
+        && !(stem.starts_with("toolport-gateway-1.") || stem.starts_with("conduit-gateway-1.")) {
+        return false;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return false; };
+    if !meta.is_file() || meta.len() > 128 * 1024 * 1024 { return false; }
+    let Ok(bytes) = std::fs::read(path) else { return false; };
+    let native = bytes.starts_with(b"\x7fELF") || bytes.starts_with(b"MZ")
+        || bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe]) || bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe]);
+    native && [b"toolport-gateway".as_slice(), b"TOOLPORT_CLIENT_ID", b"tools/call"]
+        .iter().all(|marker| bytes.windows(marker.len()).any(|w| w == *marker))
+}
+
+fn refresh_legacy_gateway(current: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(unix)] {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let command = current.to_str().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "gateway path is not UTF-8"))?.replace('\'', "'\"'\"'");
+        let text = format!("#!/bin/sh\n# Toolport gateway compatibility shim\nexec '{command}' \"$@\"\n");
+        let tmp = dest.with_extension(format!("{}.tmp", crate::approval::new_correlation_id()));
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, dest)
+        })();
+        if result.is_err() { let _ = std::fs::remove_file(tmp); }
+        result
+    }
+    #[cfg(not(unix))] { replace_gateway_copy(current, dest) }
+}
+
+fn cleanup_legacy_gateway_copies(current: &Path, dir: &Path, references: Option<&[PathBuf]>) {
+    let Some(references) = references else {
+        eprintln!("toolport: skipping legacy gateway cleanup: client references are unknown");
+        return;
+    };
+    // AppImage installs still use their stable copy. Never unlink the resolved gateway.
+    let Ok(entries) = std::fs::read_dir(dir) else { return; };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == current || !is_legacy_gateway_copy(&path) { continue; }
+        let name = entry.file_name();
+        let referenced = references.iter().any(|r| r == &path
+            || (!r.is_absolute() && r.file_name() == path.file_name()));
+        let result = if referenced {
+            // Keep cached/customized paths usable without leaving 1.x code behind.
+            refresh_legacy_gateway(current, &path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => eprintln!("toolport: {} legacy gateway {}", if referenced { "refreshed referenced" } else { "removed unused" }, name.to_string_lossy()),
+            Err(error) => eprintln!("toolport: could not clean legacy gateway {}: {error}", name.to_string_lossy()),
+        }
+    }
 }
 
 fn repoint_stale_gateways_in(
@@ -7865,6 +7949,62 @@ mod tests {
             launch: None,
             unknown_fields: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn f6_legacy_gateway_cleanup_preserves_foreign_files_and_references() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let _env_lock = env_mutation_lock();
+        let root = std::env::temp_dir().join(format!("toolport-f6-home-{}", std::process::id()));
+        let _home = EnvRestore::set("HOME", &root);
+        let dir = root.join(".config/Toolport/bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = b"\x7fELFtoolport-gateway\0TOOLPORT_CLIENT_ID\0tools/call\01.19.0";
+        let current = root.join("installed/toolport-gateway");
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&current, b"current gateway").unwrap();
+        let unused = dir.join("toolport-gateway");
+        let referenced = dir.join("toolport-gateway-1.19.0");
+        let foreign = dir.join("conduit-gateway");
+        let wrapper = dir.join("toolport-gateway-wrapper.sh");
+        for path in [&unused, &referenced] { std::fs::write(path, old).unwrap(); }
+        std::fs::write(&foreign, b"\x7fELFforeign executable").unwrap();
+        std::fs::write(&wrapper, b"#!/bin/sh\nexec user-command\n").unwrap();
+        cleanup_legacy_gateway_copies(&current, &dir, None);
+        assert!(unused.exists());
+        cleanup_legacy_gateway_copies(&current, &dir, Some(std::slice::from_ref(&referenced)));
+        assert!(!unused.exists());
+        #[cfg(unix)] {
+            let shim = std::fs::read_to_string(&referenced).unwrap();
+            assert!(shim.starts_with("#!/bin/sh\n# Toolport gateway compatibility shim\nexec '"));
+            assert!(shim.contains(current.to_str().unwrap()));
+            assert!(shim.ends_with("' \"$@\"\n"));
+        }
+        #[cfg(not(unix))] assert_eq!(std::fs::read(&referenced).unwrap(), b"current gateway");
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"\x7fELFforeign executable");
+        assert_eq!(std::fs::read(&wrapper).unwrap(), b"#!/bin/sh\nexec user-command\n");
+        // The installed/stable destination and symlinks are never removed.
+        std::fs::write(&unused, old).unwrap();
+        cleanup_legacy_gateway_copies(&unused, &dir, Some(&[]));
+        assert!(unused.exists());
+        #[cfg(unix)] {
+            let link = dir.join("toolport-gateway-1.18.0");
+            std::os::unix::fs::symlink(&unused, &link).unwrap();
+            cleanup_legacy_gateway_copies(&unused, &dir, Some(&[]));
+            assert!(std::fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn f6_configured_names_are_display_only_and_private() {
+        assert_eq!(trusted_client_name(Some("adapter:inbox"), None), "inbox");
+        assert_eq!(trusted_client_name(Some("adapter:/private/customer.env"), None), "[private]");
+        assert_eq!(trusted_client_name(Some("adapter:sk-live-abcdefghijk123456789"), None), "[redacted]");
+        assert_eq!(display_caller_name(Some("Unknown client"), Some("inbox 1")), "inbox 1 (reported)");
+        assert_eq!(display_caller_name(None, None), "Unrecorded client");
+        let reg = crate::registry::Registry::default();
+        assert_eq!(resolve_launch_profile(&reg, Some("inbox"), &None), resolve_launch_profile(&reg, None, &None));
     }
 
     #[test]
