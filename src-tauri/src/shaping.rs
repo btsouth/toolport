@@ -130,7 +130,7 @@ fn value_heap_size(value: &Value) -> usize {
             // std's B-tree nodes reserve eleven slots, even for a tiny object.
             // Non-root nodes have at least five keys. Charge the upper node count
             // and internal-node edges, not just the occupied key/value slots.
-            let nodes = if o.len() <= 11 {
+            let nodes = if o.len() < 11 {
                 usize::from(!o.is_empty())
             } else {
                 (o.len() - 1) / 5 + 1
@@ -1203,6 +1203,17 @@ mod tests {
             "recorded size must cover the body and the stashed structuredContent"
         );
         assert!(entry.size >= 8_000, "recorded size was {}", entry.size);
+    }
+
+    #[test]
+    fn tiny_objects_charge_the_reserved_btree_node() {
+        let value = json!({"a": 1});
+        assert!(
+            value_heap_size(&value)
+                >= 11 * (std::mem::size_of::<String>() + std::mem::size_of::<Value>())
+        );
+        let empty = json!({});
+        assert_eq!(value_heap_size(&empty), 0);
     }
 
     #[test]
