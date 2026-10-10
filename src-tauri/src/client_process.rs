@@ -165,28 +165,25 @@ fn interpreter_command(pid: u32, name: &str) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn interpreter_command(pid: u32, name: &str) -> Option<String> {
-    // XNU requires room for the whole argument area, otherwise it can return its
-    // tail (environment strings). Query the kernel limit before reading it.
-    let mut argmax_mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
-    let mut argmax: libc::c_int = 0;
-    let mut argmax_size = std::mem::size_of_val(&argmax);
+    // Probe the complete argument area, including the leading argc integer.
+    // An undersized buffer can return its tail (environment strings).
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size = 0usize;
     if unsafe {
         libc::sysctl(
-            argmax_mib.as_mut_ptr(),
-            2,
-            (&mut argmax as *mut libc::c_int).cast(),
-            &mut argmax_size,
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
             std::ptr::null_mut(),
             0,
         )
     } != 0
-        || argmax <= 0
+        || size < std::mem::size_of::<libc::c_int>()
     {
         return None;
     }
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
-    let mut buf = vec![0u8; usize::try_from(argmax).ok()?];
-    let mut size = buf.len();
+    let mut buf = vec![0u8; size];
     if unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
@@ -474,6 +471,10 @@ mod tests {
             None
         );
         assert_eq!(procargs_argv(&buffer(3, b"python\0inbox.py\0")), None);
+        let mut large = buffer(2, b"python\0inbox.py\0HOME=");
+        large.extend_from_slice(&[b'x'; 8192]);
+        large.push(0);
+        assert_eq!(procargs_argv(&large), Some(vec!["python", "inbox.py"]));
         assert_eq!(procargs_argv(&[2, 0]), None);
         assert_eq!(procargs_argv(&buffer(-1, b"python\0")), None);
     }
