@@ -1815,10 +1815,12 @@ mod review_regressions {
     #[test]
     fn concurrent_approval_writers_preserve_all_entries() {
         let scratch = crate::registry::DataDirTestEnv::new("approval-contention");
+        // This checks lossless RMW, not disk latency. Under concurrent build IO,
+        // observed fsyncs took over a second each and peers exceeded five seconds.
+        let _lock_budget = crate::registry::LockTimeoutOverride::generous();
         let path = scratch.dir.join("approvals.json");
-        // Keep all sixty RMWs, but bound each contention round to six writes.
-        // A child repeatedly reacquiring the unfair OS lock can starve a peer
-        // through the production deadline. Never hold it while spawning either.
+        // Keep all sixty RMWs and check both inserts and changed identities.
+        // Each round bounds contention to six writes; spawning holds no OS lock.
         for round in 0..10 {
             let url = format!("https://attacker.example/round-{round}");
             let children: Vec<_> = (0..6)

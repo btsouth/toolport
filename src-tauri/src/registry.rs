@@ -293,9 +293,15 @@ pub(crate) fn append_lines_with_outcome(
             hook();
         }
         let content = String::from_utf8_lossy(&bytes);
+        let tail = trimmed_tail(&content, keep_lines);
+        // Large lines can cross the byte threshold before the line window fills.
+        // Rewriting that unchanged tail adds two fsyncs to every later batch.
+        if tail.as_bytes() == bytes {
+            return Ok(());
+        }
         // A failed rotation keeps the appended history intact, but must be
         // reported so telemetry health does not claim complete persistence.
-        atomic_write(path, &trimmed_tail(&content, keep_lines))
+        atomic_write(path, &tail)
             .map_err(crate::telemetry::AppendError::after_append)?;
     }
     Ok(())
@@ -8308,6 +8314,33 @@ pub(crate) mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn append_line_locked_keeps_the_inode_when_the_tail_is_unchanged() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-append-noop-{}-{}",
+            std::process::id(),
+            ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("log.jsonl");
+        std::fs::write(&path, "one\n").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+
+        for line in ["two", "three"] {
+            append_line_locked(&path, line, 1, 4, None).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().ino(),
+                inode,
+                "a no-op trim must not replace and fsync the log"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nthree\n");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
