@@ -175,7 +175,14 @@ fn bounded_alias(name: &str, identity: &impl serde::Serialize) -> String {
     }
     let hash = content_digest(identity);
     let suffix: String = hash[..6].iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("{}_{}", &name[..51], suffix)
+    let prefix = if let Some((server, tool)) = name.split_once("__") {
+        let server = &server[..server.len().min(24)];
+        let tool = &tool[..tool.len().min(51 - server.len() - 2)];
+        format!("{server}__{tool}")
+    } else {
+        name[..51].to_string()
+    };
+    format!("{prefix}_{suffix}")
 }
 
 fn blocked_tool_message(name: &str, reason: &str) -> String {
@@ -183,7 +190,9 @@ fn blocked_tool_message(name: &str, reason: &str) -> String {
         "outside this client's tool scope" => ("turned off for this client", "Clients"),
         "disabled" => ("turned off", "Servers"),
         "on a server that is turned off" => ("on a server that is turned off", "Clients"),
-        "blocked by the destructive-tool policy" => ("destructive and blocked by Strict safety", "Safety"),
+        "blocked by the destructive-tool policy" => {
+            ("destructive and blocked by Strict safety", "Safety")
+        }
         "quarantined after a high-risk change; re-approve to restore" => (
             "quarantined after a tool change",
             "Activity to review and approve it",
@@ -1904,6 +1913,15 @@ impl Router {
                 self.routes
                     .get(*candidate)
                     .is_some_and(|(server, _)| visible(server))
+                    && self
+                        .tools
+                        .iter()
+                        .find(|tool| tool["name"] == *candidate)
+                        .is_none_or(|tool| match tool.pointer("/_meta/ui/visibility") {
+                            None => true,
+                            Some(Value::Array(audiences)) => audiences.iter().any(|a| a == "model"),
+                            Some(_) => false,
+                        })
             });
         if let Some(real) = client_prefixed {
             return format!(
