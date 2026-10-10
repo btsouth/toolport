@@ -3246,6 +3246,10 @@ const BACKUP_GENERATIONS: usize = 5;
 /// `<registry>.bak` (no trailing timestamp) and the `.unreadable-*` quarantine
 /// files, which use a different prefix.
 fn backup_generations(path: &Path) -> Vec<PathBuf> {
+    backup_candidates(path, true)
+}
+
+fn backup_candidates(path: &Path, regular_only: bool) -> Vec<PathBuf> {
     let (Some(dir), Some(base)) = (path.parent(), path.file_name().and_then(|f| f.to_str())) else {
         return Vec::new();
     };
@@ -3255,7 +3259,7 @@ fn backup_generations(path: &Path) -> Vec<PathBuf> {
     };
     let mut gens: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter(|e| !regular_only || e.file_type().is_ok_and(|kind| kind.is_file()))
         .map(|e| e.path())
         .filter(|p| {
             p.file_name()
@@ -3287,7 +3291,7 @@ fn next_backup_sequence(path: &Path) -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let latest = backup_generations(path)
+    let latest = backup_candidates(path, false)
         .into_iter()
         .filter_map(|generation| {
             generation
@@ -3303,15 +3307,65 @@ fn next_backup_sequence(path: &Path) -> u128 {
     now.max(latest.saturating_add(1))
 }
 
-fn write_backup_generation(path: &Path, content: &str, sequence: u128) {
-    let mut name = path.as_os_str().to_owned();
-    name.push(format!(".bak.{sequence}"));
-    if atomic_write(&PathBuf::from(name), content).is_err() {
+fn write_backup_generation(path: &Path, content: &str, mut sequence: u128) {
+    // Publish a complete snapshot without replacing any occupied name. Unlike
+    // atomic_write, journal publication must never follow a destination symlink.
+    let temp_sequence = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = PathBuf::from(format!(
+        "{}.{}.{}.conduit-tmp",
+        path.display(),
+        std::process::id(),
+        temp_sequence
+    ));
+    let mut cleanup = TempFileCleanup::new(tmp.clone());
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    else {
+        return;
+    };
+    cleanup.arm();
+    let ops = FsAtomicWriteOps;
+    if ops.set_owner_only(&file).is_err()
+        || ops.write_all(&mut file, content.as_bytes()).is_err()
+        || ops.sync_all(&file).is_err()
+    {
         return;
     }
-    let mut gens = backup_generations(path);
-    while gens.len() > BACKUP_GENERATIONS {
-        let _ = std::fs::remove_file(gens.remove(0));
+    drop(file);
+    // A concurrent writer may claim the sequence after allocation. Bound retries
+    // and fail closed on inspection or publication errors other than occupancy.
+    for _ in 0..32 {
+        let mut name = path.as_os_str().to_owned();
+        name.push(format!(".bak.{sequence}"));
+        let dest = PathBuf::from(name);
+        match std::fs::symlink_metadata(&dest) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::hard_link(&tmp, &dest) {
+                    Ok(()) => {
+                        if let Some(dir) = path.parent() {
+                            if let Ok(dir) = std::fs::File::open(dir) {
+                                let _ = dir.sync_all();
+                            }
+                        }
+                        let mut gens = backup_generations(path);
+                        while gens.len() > BACKUP_GENERATIONS {
+                            let _ = std::fs::remove_file(gens.remove(0));
+                        }
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) => return,
+                }
+            }
+            Err(_) => return,
+        }
+        let Some(next) = sequence.checked_add(1) else {
+            return;
+        };
+        sequence = next;
     }
 }
 
@@ -6594,7 +6648,6 @@ pub(crate) mod tests {
             }
             std::fs::rename(from, to)
         }
-
     }
 
     fn atomic_temp_files(path: &Path) -> Vec<PathBuf> {
@@ -7781,6 +7834,62 @@ pub(crate) mod tests {
         }
         #[cfg(unix)]
         assert!(dir.join("registry.json.bak.1").is_symlink());
+    }
+
+    #[test]
+    fn journal_allocation_preserves_occupied_names() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("journal-occupied-names");
+        let path = dir.join("registry.json");
+        let n = now_ms() + 60_000;
+        let generation = |sequence| dir.join(format!("registry.json.bak.{sequence}"));
+        std::fs::write(generation(n), "good registry").unwrap();
+        let target = dir.join("user-named-copy.json");
+        std::fs::write(&target, "user copy").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, generation(n + 1)).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, generation(n + 1)).unwrap();
+        std::fs::create_dir(generation(n + 2)).unwrap();
+        std::fs::write(generation(n + 3), "foreign file").unwrap();
+        assert_eq!(next_backup_sequence(&path), n + 4);
+        // Also exercise a destination claimed after allocation, including a link.
+        write_backup_generation(&path, "previous registry", n + 1);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "user copy");
+        assert!(generation(n + 1).is_symlink());
+        assert!(generation(n + 2).is_dir());
+        assert_eq!(
+            std::fs::read_to_string(generation(n + 3)).unwrap(),
+            "foreign file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(generation(n + 4)).unwrap(),
+            "previous registry"
+        );
+    }
+
+    #[test]
+    fn journal_concurrent_publication_keeps_both_snapshots() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("journal-concurrent");
+        let path = dir.join("registry.json");
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for content in ["first", "second"] {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    write_backup_generation(path, content, 100);
+                });
+            }
+        });
+        let mut contents: Vec<_> = backup_generations(&path)
+            .iter()
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .collect();
+        contents.sort();
+        assert_eq!(contents, ["first", "second"]);
     }
 
     #[test]
