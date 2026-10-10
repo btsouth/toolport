@@ -566,13 +566,15 @@ impl TeamsPage {
             let page = self.clone();
             let origin = team.server_url.clone();
             match label {
-                // Missing sign-in reuses the browser sign-in instead of a sync
-                // that cannot succeed.
+                // Missing sign-in pairs this machine again, the same approval
+                // flow as the first sign-in, instead of opening the dashboard.
                 "Sign in" => {
                     button.add_css_class("suggested-action");
+                    let team_id = team.team_id.clone();
                     button.connect_clicked(move |_| {
-                        if let Ok(url) = crate::teams::sync_sign_in_url(&origin) {
-                            let _ = crate::oauth::open_web_url(&url);
+                        match crate::teams::reconnect_link(&origin, &team_id) {
+                            Ok(link) => super::open_shared_setup(&link, page.server_page.clone()),
+                            Err(error) => page.show_error(&error),
                         }
                     });
                 }

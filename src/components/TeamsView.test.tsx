@@ -21,6 +21,7 @@ const api = vi.hoisted(() => ({
   getRegistry: vi.fn(),
   teamInstructionsStatus: vi.fn().mockResolvedValue(null),
   setServerEnabled: vi.fn(),
+  reconnectSync: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@/lib/api", () => api);
@@ -1046,7 +1047,7 @@ it("uses the chosen sync service for browser sign-in", async () => {
   );
 });
 
-it("shows refused environment warnings and treats a missing sign-in plan as saved", () => {
+it("shows refused environment warnings and treats a missing sign-in plan as saved", async () => {
   const personal = structuredClone(registry);
   personal.team!.role = "admin";
   personal.team!.accountStatus = {
@@ -1073,9 +1074,8 @@ it("shows refused environment warnings and treats a missing sign-in plan as save
   expect(screen.queryByRole("button", { name: "Sync now" })).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
   openExternal.mockClear();
-  openExternal.mockResolvedValue(undefined);
   fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
-  expect(openExternal).toHaveBeenCalledWith(
-    expect.stringContaining("intent=pro&from=app-sync"),
-  );
+  // Pairs this machine again instead of opening the website dashboard.
+  await waitFor(() => expect(api.reconnectSync).toHaveBeenCalled());
+  expect(openExternal).not.toHaveBeenCalled();
 });

@@ -2125,6 +2125,14 @@ fn personal_sync_local_only(
     crate::personal_sync::set_local_only(&server_id, local_only)?;
     reload_into_state(state.inner())
 }
+/// Pair this machine again with its own account after its sign-in went missing.
+#[tauri::command]
+fn reconnect_sync(app: AppHandle) -> Result<(), String> {
+    let reg = registry::load()?;
+    let team = reg.team.ok_or("This machine is not signed in to sync")?;
+    deliver_team_pair(&app, team.server_url, team.team_id);
+    Ok(())
+}
 #[tauri::command]
 fn personal_sync_portable(
     state: State<RegistryState>,
@@ -3674,7 +3682,12 @@ impl TeamPairEvent {
 
 fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
     show_main_window(app);
-    if registry::load().is_ok_and(|reg| teams::pair_target_is_current(&reg, &origin, &team)) {
+    // Already connected here, unless this machine lost its sign-in: then
+    // pairing again is exactly how it reconnects.
+    if registry::load().is_ok_and(|reg| {
+        teams::pair_target_is_current(&reg, &origin, &team)
+            && !crate::personal_sync::state(&reg).is_ok_and(|st| st.sign_in_required)
+    }) {
         let _ = app.emit("show-teams", ());
         return;
     }
@@ -4223,6 +4236,7 @@ pub fn run() {
             set_client_discovery,
             personal_sync_local_only,
             personal_sync_portable,
+            reconnect_sync,
             personal_sync_resolve_conflict,
             personal_sync_finish_selection,
             team_connect,

@@ -452,6 +452,11 @@ export function teamJoinPoll(
 }
 
 /** Pull the latest team config and re-merge it (no-op if unchanged). */
+/** Pair this machine again with its own sync account after its sign-in went missing. */
+export function reconnectSync(): Promise<void> {
+  return invoke<void>("reconnect_sync");
+}
+
 export function teamSync(): Promise<Registry> {
   return invoke<Registry>("team_sync");
 }

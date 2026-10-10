@@ -7,6 +7,7 @@ import {
   teamSync,
   teamJoinPoll,
   getRegistry,
+  reconnectSync,
 } from "@/lib/api";
 import { HOSTED_TEAMS_URL, teamUrlError } from "@/lib/teamUrl";
 import { accountStatusText, planName, syncSignInUrl } from "@/lib/personalSync";
@@ -271,12 +272,7 @@ export function PersonalSyncView({
               {sync?.signInRequired ? (
                 // Sync cannot succeed without sign-in. Sign out stays: it clears
                 // the saved account and its token.
-                <Button
-                  disabled={busy}
-                  onClick={() =>
-                    void run(() => openExternal(syncSignInUrl(team.serverUrl)))
-                  }
-                >
+                <Button disabled={busy} onClick={() => void run(() => reconnectSync())}>
                   Sign in
                 </Button>
               ) : (

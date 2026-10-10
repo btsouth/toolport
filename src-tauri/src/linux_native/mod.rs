@@ -6229,9 +6229,12 @@ fn build_content(
 
 fn open_shared_setup(url: &str, page: ServerPage) {
     if let Some((origin, team)) = crate::teams::parse_pair_link(url) {
-        if crate::registry::load()
-            .is_ok_and(|reg| crate::teams::pair_target_is_current(&reg, &origin, &team))
-        {
+        // Already connected here, unless this machine lost its sign-in: then
+        // pairing again is exactly how it reconnects.
+        if crate::registry::load().is_ok_and(|reg| {
+            crate::teams::pair_target_is_current(&reg, &origin, &team)
+                && !crate::personal_sync::state(&reg).is_ok_and(|st| st.sign_in_required)
+        }) {
             if let Some(action) = page.app.lookup_action("show-teams") {
                 action.activate(None);
             }
@@ -7417,18 +7420,27 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
             server.origin_label.as_str(),
             "Synced" | "This machine only" | "Sync conflict" | "Needs review"
         );
-        let badge = gtk::Label::new(Some(if personal {
+        // It looks like a link, so it acts like one: open the page where the
+        // review happens.
+        let badge = gtk::Button::with_label(if personal {
             "Review in Sync"
         } else {
             "Review in Teams"
-        }));
+        });
         badge.add_css_class("toolport-badge");
+        badge.add_css_class("flat");
         badge.set_valign(gtk::Align::Center);
         badge.set_halign(gtk::Align::Start);
         badge.add_css_class("review");
         badge.set_tooltip_text(Some(
             "Review the exact command and credential references before enabling this server",
         ));
+        let app = page.app.clone();
+        badge.connect_clicked(move |_| {
+            if let Some(action) = app.lookup_action("show-teams") {
+                action.activate(None);
+            }
+        });
         card.append(&badge);
         let review = gtk::Button::with_label("Review references");
         review.set_visible(!server.secret_references.is_empty());

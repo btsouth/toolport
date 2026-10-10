@@ -117,6 +117,15 @@ pub fn attach_status(reg: &mut Registry) {
         }
     }
 }
+/// A reconnected machine has its sign-in back.
+pub(crate) fn clear_sign_in_required(reg: &mut Registry) -> Result<(), String> {
+    let mut st = state(reg)?;
+    if st.sign_in_required {
+        st.sign_in_required = false;
+        save(reg, &st)?;
+    }
+    Ok(())
+}
 pub fn conflict_version(value: &Value) -> String {
     use sha2::{Digest, Sha256};
     format!(

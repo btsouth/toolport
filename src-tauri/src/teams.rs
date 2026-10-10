@@ -1206,6 +1206,27 @@ fn complete_join(
         })
 }
 
+/// Carry this machine's own bookkeeping into a reconnected session. The fresh
+/// connection's role, token-derived status and names win; a stale status error
+/// from the lost session does not carry over.
+fn keep_local_bookkeeping(conn: &mut TeamConnection, previous: TeamConnection) {
+    conn.managed_server_ids = previous.managed_server_ids;
+    conn.reporting_device_id = previous.reporting_device_id;
+    conn.usage_reported = previous.usage_reported;
+    conn.last_version = previous.last_version;
+    conn.last_etag = previous.last_etag;
+    conn.team_instructions_content = previous.team_instructions_content;
+    conn.team_instructions_version = previous.team_instructions_version;
+    conn.team_instructions_targets = previous.team_instructions_targets;
+    conn.call_audit_export_cursor = previous.call_audit_export_cursor;
+    conn.call_audit_export = previous.call_audit_export;
+    for (key, value) in previous.unknown_fields {
+        if key != "accountStatusError" {
+            conn.unknown_fields.entry(key).or_insert(value);
+        }
+    }
+}
+
 fn finish_connect(
     server_url: &str,
     member_name: Option<&str>,
@@ -1292,11 +1313,23 @@ fn finish_connect(
     // Load-modify-save the fresh registry under the cross-process lock, so a concurrent write
     // during the join window's pull isn't reverted (SOU-23).
     let (reg, outcome) = crate::registry::update(|reg| {
-        if let Some(previous) = reg.team.as_ref().map(|t| t.team_id.clone()) {
+        // Signing in again to the same account on the same service reconnects
+        // this machine. Its servers, approvals and sync bookkeeping stay; only
+        // a different account or service starts over.
+        let reconnect = reg.team.as_ref().is_some_and(|previous| {
+            previous.team_id == conn.team_id && base(&previous.server_url) == conn.server_url
+        });
+        let was_personal = reconnect && crate::personal_sync::is_personal(reg);
+        if reconnect {
+            keep_local_bookkeeping(&mut conn, reg.team.take().expect("checked above"));
+        } else if let Some(previous) = reg.team.as_ref().map(|t| t.team_id.clone()) {
             remove_team(reg, &previous);
         }
         reg.team = Some(conn);
-        crate::personal_sync::mode_changed(reg, false)?;
+        crate::personal_sync::mode_changed(reg, was_personal)?;
+        if reconnect {
+            crate::personal_sync::clear_sign_in_required(reg)?;
+        }
         let mut outcome = MergeOutcome::default();
         if let Some((version, cfg, etag)) = pulled {
             outcome = if crate::personal_sync::is_personal(reg) {
@@ -1362,6 +1395,15 @@ pub fn sync_retry_seconds(reg: &Registry, failures: u32) -> u64 {
     } else {
         retry_delay_seconds(failures)
     }
+}
+/// The app-side pairing link for reconnecting this machine to its own account.
+pub fn reconnect_link(origin: &str, team: &str) -> Result<String, String> {
+    require_secure_team_url(origin)?;
+    let mut url = url::Url::parse("toolport://teams/connect").map_err(|e| e.to_string())?;
+    url.query_pairs_mut()
+        .append_pair("origin", origin.trim().trim_end_matches('/'))
+        .append_pair("team", team);
+    Ok(url.to_string())
 }
 pub fn sync_sign_in_url(origin: &str) -> Result<String, String> {
     require_secure_team_url(origin)?;
@@ -5287,6 +5329,32 @@ pub fn remove_team(reg: &mut Registry, team_id: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reconnecting_keeps_this_machines_servers_and_sync_state() {
+        let previous: TeamConnection = serde_json::from_value(json!({
+            "serverUrl":"https://sync.example.com","teamId":"solo","role":"admin",
+            "reportingDeviceId":"device-1","lastVersion":7,
+            "managedServerIds":{"docs":"docs-local"},
+            "accountStatus":{"personalSync":true,"plan":"pro"},
+            "accountStatusError":"sign-in missing",
+            "personalSyncState":{"signInRequired":true}
+        }))
+        .unwrap();
+        let mut conn: TeamConnection = serde_json::from_value(json!({
+            "serverUrl":"https://sync.example.com","teamId":"solo","role":"admin",
+            "reportingDeviceId":"device-2","lastVersion":0,
+            "accountStatus":{"personalSync":true,"plan":"pro","trialActive":false}
+        }))
+        .unwrap();
+        keep_local_bookkeeping(&mut conn, previous);
+        assert_eq!(conn.reporting_device_id, "device-1");
+        assert_eq!(conn.last_version, 7);
+        assert_eq!(conn.managed_server_ids["docs"], "docs-local");
+        assert_eq!(conn.unknown_fields["accountStatus"]["trialActive"], false);
+        assert!(!conn.unknown_fields.contains_key("accountStatusError"));
+        assert!(conn.unknown_fields.contains_key("personalSyncState"));
+    }
+
     fn personal_http_fixture(
         method: &'static str,
         path: &'static str,
