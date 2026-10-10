@@ -996,8 +996,6 @@ export function addSnippetServers(
 export function getClientSessions(): Promise<ClientSession[]> {
   return invoke<ClientSession[]>("get_client_sessions");
 }
-export function setSecretReference(serverId: string, key: string, reference: string): Promise<Registry> {
-}
 export function setSecretReference(
   serverId: string,
   key: string,
