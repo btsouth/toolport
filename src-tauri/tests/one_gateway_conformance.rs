@@ -4537,6 +4537,8 @@ fn protocol_lane_long_server_aliases_keep_both_identity_parts_and_cached_routes(
         |name| name == alias,
         Duration::from_secs(30),
     );
+    let found = first.call_tool("toolport_search_tools", json!({"query":"","server":server}));
+    assert!(text_of(&found).contains(alias), "raw server selector lost its bounded alias: {found}");
     assert_eq!(text_of(&first.call_tool(alias, json!({}))), "read_item");
     drop(first);
     kill_daemons(&dir);

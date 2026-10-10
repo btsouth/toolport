@@ -4638,47 +4638,54 @@ fn execute_call(
     {
         return json!({"content": [{"type": "text", "text": STALE_LIVE_VIEW}], "isError": true});
     }
-    // Resolve existence before the approval gate. A cold name can demand only
-    // its visible owner, and catalog publication stays within the first-list budget.
+    // Resolve existence before approval. A bounded namespace may identify several
+    // cold owners; only visible candidates can start, and only an exact route runs.
     let mut fresh = clone_live_router(live_router);
     let view = fresh.as_deref().unwrap_or(router);
     let owners = unique_prefix_owners(reg);
-    if let Some(owner) = owner_of_exposed_tool(Some(view), &owners, name) {
-        let in_scope = allowed.is_none_or(|set| server_in_allowed_scope(&owner, set));
-        if !in_scope && view.tool_owner(name).is_some() {
+    let visible = |id: &str| allowed.is_none_or(|set| server_in_allowed_scope(id, set));
+    let candidates = if let Some(owner) = owner_of_exposed_tool(Some(view), &owners, name) {
+        if !visible(&owner) && view.tool_owner(name).is_some() {
             return json!({"content": [{"type": "text", "text": format!(
                 "Blocked by Toolport: {name} is turned off for this client. Change it in Toolport > Clients."
             )}], "isError": true});
         }
-        if in_scope && view.authorize(DispatchTarget::Tool(name)).is_ok() {
-            view.prepare_lazy_use(&owner);
-            view.kick_pending(name, |id| id == owner);
-            if view.route_of(name).is_none() && fresh.is_some() {
-                let deadline = Instant::now() + FIRST_CATALOG_WAIT;
-                let mut seen = started_supervisors();
-                loop {
-                    let view = fresh.as_deref().unwrap_or(router);
-                    let loading = view.any_discovering(|id| id == owner)
-                        || view.any_publishing_first_catalog(|id| id == owner)
-                        || view.kick_pending(name, |id| id == owner).is_some();
-                    if view.route_of(name).is_some()
-                        || view.is_blocked(name)
-                        || !loading
-                        || Instant::now() >= deadline
-                        || cancel
-                            .as_ref()
-                            .is_some_and(downstream::CancelContext::is_cancelled)
-                    {
-                        break;
-                    }
-                    seen = wait_for_started_supervisor(
-                        seen,
-                        deadline.min(Instant::now() + Duration::from_millis(25)),
-                    );
-                    fresh = clone_live_router(live_router);
+        vec![owner]
+    } else {
+        reg.servers.iter().filter_map(|server| {
+            let prefix = sanitize_segment(&server.id);
+            (prefix.len() > 24 && name.starts_with(&format!("{}__", &prefix[..24])))
+                .then(|| server.id.clone())
+        }).collect()
+    };
+    let candidates: Vec<_> = candidates.into_iter().filter(|id| {
+        visible(id) && view.authorize(DispatchTarget::Server(id)).is_ok()
+    }).collect();
+    if view.authorize(DispatchTarget::Tool(name)).is_ok() {
+        for owner in &candidates {
+            view.prepare_lazy_use(owner);
+            view.kick_pending(owner, |id| id == owner);
+        }
+        if view.route_of(name).is_none() && fresh.is_some() {
+            let deadline = Instant::now() + FIRST_CATALOG_WAIT;
+            let mut seen = started_supervisors();
+            loop {
+                let view = fresh.as_deref().unwrap_or(router);
+                let loading = view.any_discovering(visible)
+                    || view.any_publishing_first_catalog(visible)
+                    || candidates.iter().any(|owner| view.kick_pending(owner, |id| id == owner)
+                        .is_some_and(|status| status.connecting));
+                if view.route_of(name).is_some() || view.is_blocked(name)
+                    || !loading || Instant::now() >= deadline
+                    || cancel.as_ref().is_some_and(downstream::CancelContext::is_cancelled)
+                {
+                    break;
                 }
+                seen = wait_for_started_supervisor(seen,
+                    deadline.min(Instant::now() + Duration::from_millis(25)));
                 fresh = clone_live_router(live_router);
             }
+            fresh = clone_live_router(live_router);
         }
     }
     let router = fresh.as_deref().unwrap_or(router);
@@ -4701,7 +4708,12 @@ fn execute_call(
         }
     }
     if router.route_of(name).is_none() {
-        let message = router.no_route_message_within(name, visible);
+        let mut message = router.no_route_message_within(name, visible);
+        if message.starts_with("Unknown tool:")
+            && (router.any_discovering(visible) || router.any_publishing_first_catalog(visible))
+        {
+            message = "Servers are still connecting. Retry shortly or check toolport_status.".into();
+        }
         return json!({"content": [{"type": "text", "text": message}], "isError": true});
     }
     let mut confirmed = false;
@@ -7497,13 +7509,22 @@ fn handle_request_with_cancel(
                 // must never appear in its results even for an Apps-capable
                 // host. Such tools are exposed separately for the host/view.
                 let owners = unique_prefix_owners(reg);
+                // A bounded alias no longer contains the full server id. Resolve
+                // explicit server selectors through ownership before ranking.
+                let server_owner = server.and_then(|selector| {
+                    reg.servers.iter().find(|entry| entry.id == selector)
+                        .map(|entry| entry.id.as_str())
+                        .or_else(|| owners.get(&selector.to_lowercase()).map(String::as_str))
+                });
                 let visible = |tool: &Value| {
                     mcp_app_tool_is_model_visible(tool)
                         && tool
                             .get("name")
                             .and_then(Value::as_str)
                             .is_some_and(|name| {
-                                allowed.is_none_or(|allowed| {
+                                server_owner.is_none_or(|owner| {
+                                    owner_of_exposed_tool(Some(router), &owners, name).as_deref() == Some(owner)
+                                }) && allowed.is_none_or(|allowed| {
                                     tool_in_scope(name, allowed, &|name| {
                                         owner_of_exposed_tool(Some(router), &owners, name)
                                     })
@@ -7534,7 +7555,7 @@ fn handle_request_with_cancel(
                 let outcome = search_catalog_filtered(
                     base,
                     query,
-                    server,
+                    server.filter(|_| server_owner.is_none()),
                     limit,
                     Some(&sem_cfg),
                     search_index,
