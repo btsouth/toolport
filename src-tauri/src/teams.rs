@@ -396,19 +396,23 @@ pub fn fetch_account_status(conn: &TeamConnection, token: &str) -> Result<Option
     );
     match agent(&conn.server_url)
         .get(&url)
-        .set("authorization", &format!("Bearer {token}"))
+        .set_header("authorization", &format!("Bearer {token}"))
         .call()
+        .retain_status_body()
     {
         Ok(resp) => {
             let value: Value = require_no_redirect(resp)?
-                .into_json()
+                .into_body()
+                .with_config()
+                .limit(u64::MAX)
+                .read_json()
                 .map_err(|e| e.to_string())?;
             if !value["plan"].is_string() || !value["canReceiveConfig"].is_boolean() {
                 return Err("Account status response is incomplete".into());
             }
             Ok(Some(value))
         }
-        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(crate::http_client::Error::Status(404, _)) => Ok(None),
         Err(e) => Err(stringify(e)),
     }
 }
@@ -426,14 +430,23 @@ fn apply_account_status(
                 t.unknown_fields.remove("accountStatusMissingCount");
             }
             Ok(None) => {
-                let count = t.unknown_fields.get("accountStatusMissingCount")
-                    .and_then(Value::as_u64).unwrap_or(0).saturating_add(1).min(2);
-                t.unknown_fields.insert("accountStatusMissingCount".into(), json!(count));
+                let count = t
+                    .unknown_fields
+                    .get("accountStatusMissingCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .saturating_add(1)
+                    .min(2);
+                t.unknown_fields
+                    .insert("accountStatusMissingCount".into(), json!(count));
                 if count >= 2 || !was_personal {
                     t.unknown_fields.insert("accountStatus".into(), Value::Null);
                     t.unknown_fields.remove("accountStatusError");
                 } else {
-                    t.unknown_fields.insert("accountStatusError".into(), json!("Account status is temporarily unavailable. Retrying sync."));
+                    t.unknown_fields.insert(
+                        "accountStatusError".into(),
+                        json!("Account status is temporarily unavailable. Retrying sync."),
+                    );
                 }
             }
             // A legacy device token or a transient service failure must not
@@ -478,8 +491,12 @@ fn fetch_config_mode(
 ) -> Result<(i64, Value), String> {
     require_secure_team_url(server_url)?;
     let url = format!("{}/teams/{}/config?manage=1", base(server_url), team_id);
-    let mut request = agent(server_url).get(&url).set_header("authorization", &format!("Bearer {token}"));
-    if personal { request = request.set_header("x-toolport-personal-sync", "1"); }
+    let mut request = agent(server_url)
+        .get(&url)
+        .set_header("authorization", &format!("Bearer {token}"));
+    if personal {
+        request = request.set_header("x-toolport-personal-sync", "1");
+    }
     match request.call().retain_status_body() {
         Ok(resp) => {
             let resp = require_no_redirect(resp)?;
@@ -896,10 +913,13 @@ fn push_config_mode(
     require_secure_team_url(server_url)?;
     let url = format!("{}/teams/{}/config", base(server_url), team_id);
     let body = push_body(config, base_version);
-    let mut request = agent(server_url).put(&url).set_header("authorization", &format!("Bearer {token}"));
-    if personal { request = request.set_header("x-toolport-personal-sync", "1"); }
-    let resp = match request.send_json(body).retain_status_body()
-    {
+    let mut request = agent(server_url)
+        .put(&url)
+        .set_header("authorization", &format!("Bearer {token}"));
+    if personal {
+        request = request.set_header("x-toolport-personal-sync", "1");
+    }
+    let resp = match request.send_json(body).retain_status_body() {
         Ok(resp) => require_no_redirect(resp)?,
         Err(crate::http_client::Error::Status(status, resp)) => {
             if let Some(message) = push_status_message(status) {
@@ -1388,8 +1408,12 @@ fn sync_recorded(wait_secs: u64) -> Result<SyncResult, String> {
             result.as_ref().map(|_| ()).map_err(|e| e.as_str()),
         ) {
             return Err(match result {
-                Err(sync_error) => format!("{sync_error}. Sync status could not be saved: {status_error}"),
-                Ok(_) => format!("Sync completed, but its status could not be saved: {status_error}"),
+                Err(sync_error) => {
+                    format!("{sync_error}. Sync status could not be saved: {status_error}")
+                }
+                Ok(_) => {
+                    format!("Sync completed, but its status could not be saved: {status_error}")
+                }
             });
         }
     }
@@ -5263,6 +5287,123 @@ pub fn remove_team(reg: &mut Registry, team_id: &str) {
 
 #[cfg(test)]
 mod tests {
+    fn personal_http_fixture(
+        method: &'static str,
+        path: &'static str,
+        personal: bool,
+        status: u16,
+        body: Value,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let endpoint = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", endpoint.server_addr());
+        let worker = std::thread::spawn(move || {
+            let mut request = endpoint
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.method().as_str(), method);
+            assert_eq!(request.url(), path);
+            let header = |name: &str| {
+                request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv(name))
+                    .map(|h| h.value.as_str())
+            };
+            assert_eq!(header("authorization"), Some("Bearer fixture-token"));
+            assert_eq!(header("x-toolport-personal-sync"), personal.then_some("1"));
+            if method == "PUT" {
+                let sent: Value = serde_json::from_reader(request.as_reader()).unwrap();
+                assert_eq!(sent, json!({"base_version":7,"config":{"servers":[]}}));
+            }
+            request
+                .respond(
+                    tiny_http::Response::from_string(body.to_string()).with_status_code(status),
+                )
+                .unwrap();
+        });
+        (origin, worker)
+    }
+
+    #[test]
+    fn personal_http_account_status_keeps_legacy_and_error_semantics() {
+        for status in [200, 302, 404, 401, 403, 500] {
+            let body = json!({"plan":"pro","canReceiveConfig":true,"personalSync":true,"error":"fixture failure"});
+            let (origin, worker) = personal_http_fixture(
+                "GET",
+                "/teams/solo/account/status",
+                false,
+                status,
+                body.clone(),
+            );
+            let conn =
+                serde_json::from_value(json!({"serverUrl":origin,"teamId":"solo","role":"admin"}))
+                    .unwrap();
+            let result = fetch_account_status(&conn, "fixture-token");
+            worker.join().unwrap();
+            match status {
+                200 => assert_eq!(result.unwrap(), Some(body)),
+                404 => assert_eq!(result.unwrap(), None),
+                302 => assert!(result.unwrap_err().contains("does not follow redirects")),
+                _ => assert_eq!(
+                    result.unwrap_err(),
+                    format!("server returned {status}: {body}")
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn personal_http_config_get_keeps_personal_header_and_status_body() {
+        for status in [200, 302, 404, 401, 403, 500] {
+            let body = json!({"version":7,"config":{"servers":[]},"error":"fixture failure"});
+            let (origin, worker) = personal_http_fixture(
+                "GET",
+                "/teams/solo/config?manage=1",
+                true,
+                status,
+                body.clone(),
+            );
+            let result = fetch_personal_config(&origin, "solo", "fixture-token");
+            worker.join().unwrap();
+            match status {
+                200 => assert_eq!(result.unwrap(), (7, json!({"servers":[]}))),
+                404 => assert_eq!(result.unwrap(), (0, json!({"servers":[]}))),
+                302 => assert!(result.unwrap_err().contains("does not follow redirects")),
+                _ => assert_eq!(
+                    result.unwrap_err(),
+                    format!("server returned {status}: {body}")
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn personal_http_config_put_keeps_conflict_and_service_errors() {
+        for status in [200, 302, 401, 403, 409, 500] {
+            let body = if status == 403 {
+                json!({"error":"not an admin session"})
+            } else {
+                json!({"version":8,"error":"fixture failure"})
+            };
+            let (origin, worker) =
+                personal_http_fixture("PUT", "/teams/solo/config", true, status, body.clone());
+            let result =
+                push_personal_config(&origin, "solo", "fixture-token", &json!({"servers":[]}), 7);
+            worker.join().unwrap();
+            match status {
+                200 => assert!(matches!(result, Ok(PushOutcome::Published(8)))),
+                302 => assert!(result.unwrap_err().contains("does not follow redirects")),
+                403 => assert_eq!(result.unwrap_err(), "Finish this in the Teams dashboard"),
+                409 => assert_eq!(result.unwrap_err(), STALE_PUSH_MESSAGE),
+                _ => assert_eq!(
+                    result.unwrap_err(),
+                    format!("server returned {status}: {body}")
+                ),
+            }
+        }
+    }
+
     #[test]
     fn account_status_mode_flips_preserve_unpublished_personal_journal() {
         let _data = crate::registry::DataDirTestEnv::new("account-mode-journal");
@@ -5284,7 +5425,11 @@ mod tests {
         assert_eq!(reg.servers[0].name, "Unpublished");
         assert!(reg.profiles[0].enabled_server_ids.contains(&"s".into()));
         assert_eq!(crate::personal_sync::state(&reg).unwrap().pending, original);
-        assert!(!crate::personal_sync::state(&reg).unwrap().choose_local_servers);
+        assert!(
+            !crate::personal_sync::state(&reg)
+                .unwrap()
+                .choose_local_servers
+        );
     }
     #[test]
     fn account_status_errors_keep_governed_and_personal_sync_modes() {
