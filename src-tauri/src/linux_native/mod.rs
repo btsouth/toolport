@@ -2980,7 +2980,7 @@ impl ActivityPage {
         summary.set_selection_mode(gtk::SelectionMode::None);
         let mut values = Vec::new();
         for (value, label) in [
-            ("–", "Calls saved"),
+            ("–", "Calls recorded"),
             ("–", "Success rate"),
             ("–", "Average latency"),
             ("–", "Catalog tokens avoided"),
@@ -4695,7 +4695,7 @@ fn activity_count_summary(total: usize, visible: usize, recent: usize, filtered:
     } else {
         format!("Showing {visible} of the latest {recent}.")
     };
-    format!("{} {} saved on this computer. {shown}", grouped_number(total as u64), if total == 1 { "call" } else { "calls" })
+    format!("{} {} recorded on this computer. {shown}", grouped_number(total as u64), if total == 1 { "call" } else { "calls" })
 }
 
 fn format_saved_tokens(tokens_saved: i64) -> String {
@@ -10264,10 +10264,10 @@ mod tests {
 
     #[test]
     fn saved_call_summary_uses_plain_counts() {
-        assert_eq!(activity_count_summary(1, 2, 2, false), "1 call saved on this computer. Showing the latest 2.");
-        assert_eq!(activity_count_summary(5225, 5, 5, false), "5,225 calls saved on this computer. Showing the latest 5.");
-        assert_eq!(activity_count_summary(5225, 10, 100, false), "5,225 calls saved on this computer. Showing 10 of the latest 100.");
-        assert_eq!(activity_count_summary(5225, 2, 5, true), "5,225 calls saved on this computer. Showing 2 matching rows from the latest 5.");
+        assert_eq!(activity_count_summary(1, 2, 2, false), "1 call recorded on this computer. Showing the latest 2.");
+        assert_eq!(activity_count_summary(5225, 5, 5, false), "5,225 calls recorded on this computer. Showing the latest 5.");
+        assert_eq!(activity_count_summary(5225, 10, 100, false), "5,225 calls recorded on this computer. Showing 10 of the latest 100.");
+        assert_eq!(activity_count_summary(5225, 2, 5, true), "5,225 calls recorded on this computer. Showing 2 matching rows from the latest 5.");
     }
 
     #[test]

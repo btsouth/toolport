@@ -114,11 +114,22 @@ fn command_basename(arg: &str) -> Option<String> {
     let basename = arg.rsplit(['/', '\\']).next()?;
     let stem = basename.rsplit_once('.').map_or(basename, |(stem, _)| stem);
     if matches!(stem, "index" | "main" | "cli" | "server" | "__main__") {
-        let mut parents = arg.rsplit(['/', '\\']).skip(1).take(3);
-        let parent = parents
-            .find(|part| !matches!(*part, "" | "." | ".." | "bin" | "src" | "dist" | "lib"))?;
-        let safe = crate::session_observability::display_label(parent)?;
-        return (safe == parent && !is_interpreter(parent)).then_some(safe);
+        // Only installed package paths can supply a generic entry point's name.
+        // Arbitrary parent directories can identify users or private projects.
+        let parts: Vec<_> = arg.split(['/', '\\']).collect();
+        let package_root = parts
+            .iter()
+            .rposition(|part| matches!(*part, "node_modules" | "site-packages"))?;
+        let mut package = *parts.get(package_root + 1)?;
+        if package.starts_with('@') && parts[package_root] == "node_modules" {
+            package = *parts.get(package_root + 2)?;
+        }
+        if matches!(package, "" | "." | "..") || package == basename {
+            return None;
+        }
+        let safe = crate::session_observability::display_label(package)?;
+        return (safe == package && !is_interpreter(package))
+            .then(|| crate::approval::shorten_client_label(&safe, 48));
     }
     crate::session_observability::display_label(basename)
         .map(|name| crate::approval::shorten_client_label(&name, 48))
@@ -130,7 +141,8 @@ fn interpreter_script<'a>(name: &str, mut args: impl Iterator<Item = &'a str>) -
         stem.as_str(),
         "sh" | "bash" | "dash" | "zsh" | "fish" | "cmd" | "pwsh" | "powershell"
     );
-    for arg in args.by_ref().take(32) {
+    let mut args = args.by_ref().take(32);
+    while let Some(arg) = args.next() {
         // Do not mistake an inline command or a module/option value for a script.
         if shell
             && (arg.eq_ignore_ascii_case("/c")
@@ -143,7 +155,28 @@ fn interpreter_script<'a>(name: &str, mut args: impl Iterator<Item = &'a str>) -
         {
             return None;
         }
-        if arg.starts_with('-') || matches!(arg, "run" | "exec" | "x") || is_interpreter(arg) {
+        if arg == "--" {
+            return command_basename(args.next()?);
+        }
+        if matches!(
+            arg,
+            "-X" | "-W" | "-r" | "--require" | "--from" | "--with" | "--directory" | "--index-url"
+        ) {
+            args.next()?;
+            continue;
+        }
+        if arg.starts_with('-') {
+            let known_flag = (stem == "npx" && matches!(arg, "-y" | "--yes"))
+                || (stem == "deno" && arg == "--allow-read")
+                || (shell && arg == "-l");
+            if !known_flag {
+                return None;
+            }
+            continue;
+        }
+        if matches!(stem.as_str(), "uv" | "uvx" | "bun" | "deno" | "npx")
+            && (matches!(arg, "run" | "exec" | "x") || is_interpreter(arg))
+        {
             continue;
         }
         return command_basename(arg);
@@ -393,7 +426,7 @@ mod tests {
             ("bash", &["-lc", "secret inline command"], None),
             ("zsh", &["-l", "-c", "secret inline command"], None),
             ("python", &["-m", "x"], None),
-            ("node", &["--flag", "x.js"], Some("x.js")),
+            ("node", &["--flag", "x.js"], None),
             ("npx", &["-y", "pkg"], Some("pkg")),
             ("cmd.exe", &["/c", "npx"], None),
             (
@@ -408,11 +441,11 @@ mod tests {
                 Some("inbox.ts"),
             ),
             ("uv", &["exec", "x", "/private/inbox.py"], Some("inbox.py")),
-            ("node", &["/private/pkg/index.js"], Some("pkg")),
-            ("node", &["/private/pkg/bin/cli.js"], Some("pkg")),
-            ("python", &["/private/pkg/main.py"], Some("pkg")),
-            ("node", &["/private/pkg/server.js"], Some("pkg")),
-            ("python", &["/private/pkg/__main__.py"], Some("pkg")),
+            ("node", &["/private/pkg/index.js"], None),
+            ("node", &["/private/pkg/bin/cli.js"], None),
+            ("python", &["/private/pkg/main.py"], None),
+            ("node", &["/private/pkg/server.js"], None),
+            ("python", &["/private/pkg/__main__.py"], None),
             ("node", &["index.js"], None),
             (
                 "node",
@@ -451,6 +484,86 @@ mod tests {
                 "{interpreter} {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn generic_entry_points_only_use_installed_package_names() {
+        for path in [
+            "/home/brandon/server.py",
+            "/Users/x/Projects/acme-corp/main.py",
+            "/home/u/acme/index.js",
+            "/home/u/acme/bin/cli.js",
+            "/home/u/acme/__main__.py",
+        ] {
+            assert_eq!(command_basename(path), None, "{path}");
+        }
+        for path in [
+            "/home/u/node_modules/acme/bin/cli.js",
+            "/home/u/node_modules/@scope/acme/dist/index.js",
+            "/home/u/site-packages/acme/__main__.py",
+            r"C:\Users\u\site-packages\acme\main.py",
+        ] {
+            assert_eq!(command_basename(path).as_deref(), Some("acme"), "{path}");
+        }
+        for path in [
+            "/home/u/node_modules/index.js",
+            "/home/u/site-packages/../main.py",
+            "/home/u/node_modules/sk-live-abcdefghijk123456789/index.js",
+        ] {
+            assert_eq!(command_basename(path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn interpreter_options_do_not_become_caller_names() {
+        let cases: &[(&str, &[&str], Option<&str>)] = &[
+            ("python", &["-X", "utf8", "app.py"], Some("app.py")),
+            ("python", &["-W", "ignore", "app.py"], Some("app.py")),
+            (
+                "uv",
+                &["run", "--directory", "/home/u/acme-client", "server.py"],
+                None,
+            ),
+            (
+                "node",
+                &["--require", "./hook.js", "app.js"],
+                Some("app.js"),
+            ),
+            ("node", &["-r", "./hook.js", "app.js"], Some("app.js")),
+            (
+                "uvx",
+                &[
+                    "--from",
+                    "pkg",
+                    "--with",
+                    "dep",
+                    "--index-url",
+                    "https://private",
+                    "app",
+                ],
+                Some("app"),
+            ),
+            ("node", &["--unknown", "private-value", "app.js"], None),
+            ("node", &["--require=./hook.js", "app.js"], None),
+            ("python", &["-Xutf8", "app.py"], None),
+            ("python", &["-X"], None),
+            ("python", &["-m", "private.module"], None),
+            ("python", &["server.py", "app.py"], None),
+            ("node", &["--", "app.js"], Some("app.js")),
+        ];
+        for &(name, args, expected) in cases {
+            assert_eq!(
+                interpreter_script(name, args.iter().copied()).as_deref(),
+                expected,
+                "{name} {args:?}"
+            );
+        }
+        let args = ["-X", "utf8"]
+            .into_iter()
+            .cycle()
+            .take(32)
+            .chain(["app.py"]);
+        assert_eq!(interpreter_script("python", args), None);
     }
 
     #[test]

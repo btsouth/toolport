@@ -980,7 +980,7 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
           <div className="text-2xl font-semibold tabular-nums">
             {stats.total.toLocaleString()}
           </div>
-          <div className="text-xs text-muted-foreground">calls saved</div>
+          <div className="text-xs text-muted-foreground">calls recorded</div>
         </div>
         <div
           className={`rounded-lg border p-3 ${stats.errors > 0 ? "border-destructive/40 bg-destructive/[0.04]" : ""}`}
@@ -2118,7 +2118,7 @@ export function ActivityView({
 
       <p className="mb-2 text-xs text-muted-foreground">
         {stats
-          ? `${stats.total.toLocaleString()} ${stats.total === 1 ? "call" : "calls"} saved on this computer. `
+          ? `${stats.total.toLocaleString()} ${stats.total === 1 ? "call" : "calls"} recorded on this computer. `
           : ""}
         {logOpen
           ? visible.length === entries.length

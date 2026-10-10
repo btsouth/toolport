@@ -99,8 +99,8 @@ it("p10c shows approval outcomes without treating them as call errors", async ()
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   await user.click(await screen.findByRole("button", { name: /recent calls/i }));
-  expect(screen.getByText("calls saved").parentElement).toHaveTextContent(
-    /2\s*calls saved/,
+  expect(screen.getByText("calls recorded").parentElement).toHaveTextContent(
+    /2\s*calls recorded/,
   );
   expect(screen.getByText("errors (50%)").parentElement).toHaveTextContent(/1\s*errors/);
   for (const [, label] of outcomes) expect(screen.getByText(label)).toBeInTheDocument();
@@ -120,7 +120,7 @@ it("p10c shows an approval-only history even when no tools ran", async () => {
   await user.click(await screen.findByRole("button", { name: /recent calls/i }));
   expect(screen.getByText("Withdrawn")).toBeInTheDocument();
   expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
-  expect(screen.queryByText("calls saved")).not.toBeInTheDocument();
+  expect(screen.queryByText("calls recorded")).not.toBeInTheDocument();
 });
 
 it("pauses Activity polling while hidden and resumes when visible", async () => {
@@ -367,7 +367,7 @@ describe("ActivityView recent calls", () => {
       "title",
       expect.stringContaining("before reaching the model"),
     );
-    expect(screen.getByText(/5,225 calls saved/)).toHaveTextContent(
+    expect(screen.getByText(/5,225 calls recorded/)).toHaveTextContent(
       "Showing the latest 1.",
     );
     expect(screen.getByRole("button", { name: "Export" })).toHaveAttribute("title");
