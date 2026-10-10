@@ -1115,6 +1115,9 @@ pub(crate) fn sync(
                 latest =
                     crate::teams::fetch_personal_config(&conn.server_url, &conn.team_id, token)?;
             }
+            Err(e) if e == crate::teams::STALE_PUSH_MESSAGE => {
+                return Err("Your setup changed again while syncing. Changes are saved on this machine and will retry.".into());
+            }
             Err(e) => return Err(e),
         }
     }
