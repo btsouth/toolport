@@ -133,7 +133,7 @@ describe("team enable review dialog", () => {
       await screen.findByRole("switch", { name: "Toggle Team tool" }),
     );
     const dialog = within(await screen.findByRole("dialog"));
-    expect(dialog.getByText("Command: npx\\u{202E}")).toBeInTheDocument();
+    expect(await dialog.findByText("Command: npx\\u{202E}")).toBeInTheDocument();
     expect(
       dialog.getByText("Working folder: /work\\u{000A}\\u{200B}"),
     ).toBeInTheDocument();
@@ -160,6 +160,7 @@ describe("team enable review dialog", () => {
       await screen.findByRole("switch", { name: "Toggle Team tool" }),
     );
     const dialog = within(await screen.findByRole("dialog"));
+    await dialog.findByText("Show full definition");
     expect(
       dialog
         .getAllByText('Arguments: ["-y","new-tool"]')

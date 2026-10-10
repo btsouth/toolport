@@ -124,6 +124,7 @@ function App() {
   // than a couple of servers, so one menu click can't silently kill a big set.
   const [confirmDisableAll, setConfirmDisableAll] = useState(false);
   const [confirmEnableTeam, setConfirmEnableTeam] = useState<ServerEntry | null>(null);
+  const [readyEnableReview, setReadyEnableReview] = useState<ServerEntry | null>(null);
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
   const [toolsServerId, setToolsServerId] = useState<string | null>(null);
   const [view, setView] = useState<View>("servers");
@@ -1136,14 +1137,20 @@ function App() {
         description={
           confirmEnableTeam ? (
             <Suspense fallback={<p>Loading definition...</p>}>
-              <ExecutionReview server={confirmEnableTeam} />
+              <ExecutionReview
+                server={confirmEnableTeam}
+                onReady={setReadyEnableReview}
+              />
             </Suspense>
           ) : undefined
         }
         contentClassName="sm:max-w-2xl"
         confirmLabel="Enable"
+        confirmDisabled={readyEnableReview !== confirmEnableTeam}
         onConfirm={() => {
           if (!confirmEnableTeam) return;
+          if (readyEnableReview !== confirmEnableTeam)
+            throw new Error("Wait for the definition to load before enabling.");
           // Re-check the definition against the one that was reviewed. Team sync runs
           // on a timer, so a push landing while this dialog is open would otherwise
           // enable a command or URL the member never saw - the confirmation carried

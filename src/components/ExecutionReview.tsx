@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import type { ServerEntry } from "@/lib/types";
 import {
   executionReviewLines,
@@ -5,7 +6,14 @@ import {
   executionReviewFieldLine,
 } from "@/lib/executionReview";
 
-export default function ExecutionReview({ server }: { server: ServerEntry }) {
+export default function ExecutionReview({
+  server,
+  onReady,
+}: {
+  server: ServerEntry;
+  onReady: (server: ServerEntry) => void;
+}) {
+  useEffect(() => onReady(server), [server, onReady]);
   return (
     <div className="max-h-[60vh] space-y-2 overflow-auto break-all font-mono text-xs">
       <p>Review the highlighted changes. Enable only a setup you trust.</p>
