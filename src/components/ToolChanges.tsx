@@ -87,6 +87,7 @@ export function ToolChanges({
             group.server;
           const canAccept =
             !unknown &&
+            !group.tools.some((tool) => tool.signatures !== undefined) &&
             group.tools.every(
               (tool) => !tool.blocked || (tool.blocked_profiles?.length && tool.new_fp),
             );
@@ -136,6 +137,11 @@ export function ToolChanges({
                   Accept all for this server
                 </button>
               </div>
+              {group.tools.some((tool) => tool.signatures !== undefined) && (
+                <p className="mt-2 text-xs text-destructive">
+                  Suspicious content found. Review and accept each tool separately.
+                </p>
+              )}
               {open && (
                 <div className="mt-3 space-y-2">
                   {group.tools.map((event) => (
@@ -181,6 +187,12 @@ export function ToolChanges({
                               ? "Not blocked."
                               : "Blocking status unavailable. Refresh to check."}
                         </p>
+                        {event.signatures !== undefined && (
+                          <p className="text-destructive">
+                            Suspicious content. Matched signals:{" "}
+                            {event.signatures.join(", ") || "details unavailable"}.
+                          </p>
+                        )}
                         <button
                           disabled={
                             busy ||

@@ -3856,7 +3856,45 @@ pub fn review_events(limit: usize) -> std::io::Result<Vec<Value>> {
             }
         }
     }
+    attach_drift_poison_signatures(&mut events);
     Ok(events)
+}
+
+/// Preserve poison findings on the drift row even when a shell hides or dismisses
+/// the separate poison list. A package refresh can interleave drift and poison rows.
+fn attach_drift_poison_signatures(events: &mut [Value]) {
+    for group in group_tool_changes(events) {
+        let start = group
+            .tools
+            .iter()
+            .filter_map(|event| event["ts"].as_u64())
+            .min()
+            .unwrap_or(group.ts);
+        for tool in group.tools {
+            let matches: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    event["type"] == "tool_poison_flag"
+                        && event["tool"] == tool["tool"]
+                        && event["server"] == tool["server"]
+                        && event["ts"].as_u64().unwrap_or(0) >= start
+                })
+                .collect();
+            if matches.is_empty() {
+                continue;
+            }
+            let signatures: BTreeSet<_> = matches
+                .iter()
+                .flat_map(|event| event["signatures"].as_array().into_iter().flatten())
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+            if let Some(event) = events.iter_mut().find(|event| **event == tool) {
+                // Presence (even with no retained signatures) requires per-tool review.
+                event["signatures"] = json!(signatures);
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -4335,6 +4373,26 @@ mod tests {
         assert_eq!(review_events(2000).unwrap()[0]["blocked"], true);
         std::fs::write(quarantine_path(None).unwrap(), "{broken").unwrap();
         assert!(review_events(2000).unwrap()[0]["blocked"].is_null());
+    }
+
+    #[test]
+    fn drift_rows_retain_poison_signatures_from_the_same_or_later_refresh() {
+        let drift = json!({"type":"tool_drift", "server":"srv", "tool":"srv__update", "ts":100});
+        let mut events = vec![
+            drift.clone(),
+            json!({"type":"tool_drift", "server":"srv", "tool":"srv__read", "ts":102}),
+            json!({"type":"tool_poison_flag", "server":"srv", "tool":"srv__update", "ts":101, "signatures":["instruction_override"]}),
+            json!({"type":"tool_poison_flag", "server":"srv", "tool":"srv__read", "ts":99, "signatures":["old_signal"]}),
+        ];
+        attach_drift_poison_signatures(&mut events);
+        assert_eq!(events[0]["signatures"], json!(["instruction_override"]));
+        assert!(events[1].get("signatures").is_none());
+        let mut later = vec![
+            drift,
+            json!({"type":"tool_poison_flag", "server":"srv", "tool":"srv__update", "ts":200}),
+        ];
+        attach_drift_poison_signatures(&mut later);
+        assert_eq!(later[0]["signatures"], json!([]));
     }
 
     #[test]

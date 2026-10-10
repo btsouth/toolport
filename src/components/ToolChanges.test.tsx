@@ -62,6 +62,29 @@ describe("server tool changes", () => {
     expect(release).toHaveBeenCalledTimes(4);
     expect(release).toHaveBeenCalledWith("work", events[0].tool, "v2:reviewed");
   });
+  it("requires per-tool review for poison flagged changes and shows matched signals", async () => {
+    release.mockClear();
+    const events = [
+      {
+        ...securityFixture()[0],
+        blocked: true,
+        blocked_profiles: ["work"],
+        new_fp: "v2:reviewed",
+        signatures: ["instruction_override"],
+      },
+    ];
+    const accept = vi.fn();
+    render(<ToolChanges events={events} registry={registry} onAccept={accept} />);
+    expect(
+      screen.getByRole("button", { name: "Accept all for this server" }),
+    ).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: /Cloudflare \(Full API\):/ }));
+    expect(screen.getByText(/Matched signals: instruction_override/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Accept this tool" }));
+    await waitFor(() =>
+      expect(release).toHaveBeenCalledWith("work", events[0].tool, "v2:reviewed"),
+    );
+  });
   it("keeps unknown blocking state visible and disables acceptance", () => {
     render(
       <ToolChanges

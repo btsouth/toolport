@@ -4152,6 +4152,13 @@ fn change_can_be_accepted(event: &serde_json::Value) -> bool {
                 .is_some_and(|profiles| !profiles.is_empty()))
 }
 
+fn group_can_be_accepted(group: &crate::integrity::ToolChangeGroup) -> bool {
+    group
+        .tools
+        .iter()
+        .all(|event| event.get("signatures").is_none() && change_can_be_accepted(event))
+}
+
 fn tool_change_group_card(
     group: &crate::integrity::ToolChangeGroup,
     page: ActivityPage,
@@ -4232,7 +4239,16 @@ fn tool_change_group_card(
     card.append(&label);
     let accept = gtk::Button::with_label("Accept all for this server");
     accept.set_halign(gtk::Align::Start);
-    accept.set_sensitive(group.tools.iter().all(change_can_be_accepted));
+    accept.set_sensitive(group_can_be_accepted(group));
+    if group
+        .tools
+        .iter()
+        .any(|event| event.get("signatures").is_some())
+    {
+        card.append(&empty_activity_label(
+            "Suspicious content found. Review and accept each tool separately.",
+        ));
+    }
     let events = group.tools.clone();
     accept.connect_clicked(move |button| {
         button.set_sensitive(false);
@@ -10259,6 +10275,22 @@ mod tests {
         assert!(change_can_be_accepted(&blocked));
         blocked["blocked"] = serde_json::Value::Null;
         assert!(!change_can_be_accepted(&blocked));
+    }
+
+    #[test]
+    fn poison_flagged_drift_requires_per_tool_review_and_shows_signatures() {
+        let event = serde_json::json!({"type":"tool_drift", "server":"srv", "tool":"srv__update", "ts":100, "blocked":true, "blocked_profiles":["work"], "new_fp":"v2:reviewed", "signatures":["instruction_override"]});
+        let group = crate::integrity::group_tool_changes(&[event.clone()]).remove(0);
+        assert!(!group_can_be_accepted(&group));
+        assert!(change_can_be_accepted(&event));
+        assert!(security_review_lines(&event)
+            .iter()
+            .any(|line| line == "Matched signals: instruction override"));
+        let mut no_details = event;
+        no_details["signatures"] = serde_json::json!([]);
+        assert!(!group_can_be_accepted(
+            &crate::integrity::group_tool_changes(&[no_details]).remove(0)
+        ));
     }
 
     #[test]
