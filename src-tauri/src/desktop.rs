@@ -3656,8 +3656,8 @@ fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
     };
     let pending = TeamPairGuard(std::sync::Arc::clone(&cancel));
     let handle=app.clone();
-    app.dialog().message(format!("Control plane: {origin}\nOnly continue if you trust this origin. Your browser will show the named team and account before approval. Connecting replaces this installation's current team connection."))
-        .title("Connect Toolport to Teams?").buttons(MessageDialogButtons::OkCancel).show(move |approved| {
+    app.dialog().message(format!("Control plane: {origin}\nOnly continue if you trust this origin. Your browser will show your account and the setup before approval. Signing in replaces this installation's current sync connection."))
+        .title("Sign in to sync?").buttons(MessageDialogButtons::OkCancel).show(move |approved| {
             if !approved { drop(pending); return; }
             std::thread::spawn(move || {
                 let result=teams::pair_device(&origin,&team,&cancel,|url,check| {
