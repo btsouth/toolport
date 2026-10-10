@@ -3626,6 +3626,27 @@ mod tests {
         assert!(lines.iter().any(|s| s == "Last synced just now"));
     }
     #[test]
+    fn reference_saved_in_credentials_is_published() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-credentials-ref");
+        let mut r = machine();
+        let mut row = command("refs");
+        row["env"] = json!([{"key":"TOKEN","secret":true}]);
+        apply(&mut r, &config(vec![row]), 0).unwrap();
+        let before = r.clone();
+        let id = r.servers[0].id.clone();
+        crate::registry_controller::apply_secret_reference(
+            &mut r,
+            &id,
+            "TOKEN",
+            "op://Private/Item/key",
+        )
+        .unwrap();
+        record(&before, &mut r).unwrap();
+        let st = state(&r).unwrap();
+        let after = st.pending["refs"].after.as_ref().unwrap();
+        assert_eq!(after["env"][0]["source"]["ref"], "op://Private/Item/key");
+    }
+    #[test]
     fn review_hold_is_local_and_does_not_publish_disable() {
         let _data = crate::registry::DataDirTestEnv::new("solo-held-edit");
         let mut r = machine();

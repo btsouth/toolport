@@ -5518,6 +5518,7 @@ pub fn apply_secret_reference(
     reference: &str,
 ) -> Result<(), String> {
     let key = normalize_secret_key(key)?;
+    let personal = crate::personal_sync::is_personal(reg);
     let server = reg
         .servers
         .iter_mut()
@@ -5574,7 +5575,17 @@ pub fn apply_secret_reference(
             .insert("source".into(), serde_json::json!({"ref": reference}));
     }
     crate::secret_refs::validate_server(server).map_err(|e| e.to_string())?;
-    if crate::secret_refs::is_shared(server) {
+    if personal {
+        // Every machine on a personal account is the owner's, so the reference
+        // is the synced definition, not a local override that export holds back.
+        if let Some(overrides) = server
+            .unknown_fields
+            .get_mut("memberSecretRefs")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            overrides.remove(&format!("{location}:{key}"));
+        }
+    } else if crate::secret_refs::is_shared(server) {
         let overrides = server
             .unknown_fields
             .entry("memberSecretRefs")
