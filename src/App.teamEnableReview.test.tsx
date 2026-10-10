@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
 import type { Registry } from "@/lib/types";
@@ -87,6 +87,80 @@ beforeEach(() => {
 });
 
 describe("team enable review dialog", () => {
+  it("shows all personal execution inputs as escaped text with masked secrets", async () => {
+    const registry = registryWith(["-y", "old-tool"]);
+    registry.team!.role = "admin";
+    registry.team!.accountStatus = {
+      personalSync: true,
+      plan: "pro",
+      trialActive: false,
+      trialEndsAt: null,
+      freeSyncGraceEndsAt: null,
+      deviceId: "device",
+      canReceiveConfig: true,
+      reason: null,
+    };
+    const server = registry.servers[0];
+    server.command = "npx\u{202e}";
+    server.cwd = "/work\n\u{200b}";
+    server.inheritEnv = false;
+    server.env = [
+      { key: "REGION", secret: false, value: "west" },
+      { key: "TOKEN", secret: true, value: "hidden-env-secret" },
+    ];
+    server.launch = {
+      inputs: [
+        {
+          key: "project",
+          label: "Project",
+          required: false,
+          secret: false,
+          value: "<img src=x onerror=evil()>",
+        },
+        {
+          key: "auth",
+          label: "Auth",
+          required: false,
+          secret: true,
+          value: "hidden-input-secret",
+        },
+      ],
+      bindings: [{ index: 1, parts: [{ kind: "input", key: "project" }] }],
+    };
+    getRegistry.mockResolvedValue(registry);
+    render(<App />);
+    await userEvent.click(
+      await screen.findByRole("switch", { name: "Toggle Team tool" }),
+    );
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByText("CHANGED: Command: npx\\u{202E}")).toBeInTheDocument();
+    expect(
+      dialog.getByText("CHANGED: Working directory: /work\\u{000A}\\u{200B}"),
+    ).toBeInTheDocument();
+    expect(dialog.getByText("CHANGED: inheritEnv: false")).toBeInTheDocument();
+    expect(
+      dialog.getByText("CHANGED: Environment [0] REGION: west; reference: null"),
+    ).toBeInTheDocument();
+    expect(
+      dialog.getByText(
+        "CHANGED: Environment [1] TOKEN: <masked secret>; reference: null",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      dialog.getByText(
+        "CHANGED: Launch input [0] project: <img src=x onerror=evil()>; reference: null",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      dialog.getByText(
+        "CHANGED: Launch input [1] auth: <masked secret>; reference: null",
+      ),
+    ).toBeInTheDocument();
+    expect(dialog.getByText(/CHANGED: Launch bindings:/)).toBeInTheDocument();
+    expect(screen.getByRole("dialog").querySelector("img")).toBeNull();
+    expect(screen.getByRole("dialog")).not.toHaveTextContent("hidden-env-secret");
+    expect(screen.getByRole("dialog")).not.toHaveTextContent("hidden-input-secret");
+  });
   // CodeRev on SBS-786: a team push landing while the confirm is open swaps the
   // definition. The handler re-opens review on the live entry, but a normal
   // return let ConfirmDialog close and null it out, so the promised in-place
@@ -98,7 +172,10 @@ describe("team enable review dialog", () => {
       render(<App />);
       const toggle = await screen.findByRole("switch", { name: "Toggle Team tool" });
       await userEvent.click(toggle);
-      expect(await screen.findByText(/npx \["-y","old-tool"\]/)).toBeInTheDocument();
+      expect(await screen.findByText("CHANGED: Command: npx")).toBeInTheDocument();
+      expect(
+        screen.getByText('CHANGED: Arguments: ["-y","old-tool"]'),
+      ).toBeInTheDocument();
 
       // The push lands while the member is reading the dialog.
       await act(async () => {
@@ -113,7 +190,9 @@ describe("team enable review dialog", () => {
       expect(setServerEnabled).not.toHaveBeenCalled();
       expect(screen.getByRole("dialog")).toBeInTheDocument();
       await waitFor(() =>
-        expect(screen.getByText(/npx \["-y","new-tool"\]/)).toBeInTheDocument(),
+        expect(
+          screen.getByText('CHANGED: Arguments: ["-y","new-tool"]'),
+        ).toBeInTheDocument(),
       );
     },
   );
