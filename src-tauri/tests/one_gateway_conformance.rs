@@ -4410,6 +4410,66 @@ fn protocol_lane_unknown_on_loaded_owner_does_not_wait_for_other_catalogs() {
 }
 
 #[test]
+fn protocol_lane_cached_routes_refresh_safety_before_approval() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (_fixture, dir) = Fixture::new("protocol-cached-safety");
+    write_registry(
+        &dir,
+        vec![protocol_lane_server(
+            &dir,
+            "files",
+            &[protocol_lane_tool("read_item", false)],
+        )],
+        vec![],
+    );
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).unwrap();
+    reg.set_safety_level(registry::SafetyLevel::Ask);
+    registry::save_to(&path, &reg).unwrap();
+    let mut first = spawn_adapter(&dir, &AdapterOptions::default());
+    first.initialize("protocol-cached-safety");
+    first.wait_for_tool("files__read_item", Duration::from_secs(30));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let cached = std::fs::read(dir.join("tool-cache.servers.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        if cached.is_some_and(|cache| {
+            cache["servers"]["files"]["tools"]
+                .as_array()
+                .is_some_and(|tools| {
+                    tools.iter().any(|tool| {
+                        tool["name"] == "read_item"
+                            && tool["annotations"]["destructiveHint"] == false
+                    })
+                })
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "read-only catalog was not persisted"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    drop(first);
+    kill_daemons(&dir);
+    // The launch identity stays unchanged, so restart restores the old read-only
+    // catalog. Current metadata must be loaded before deciding whether to approve.
+    protocol_lane_server(&dir, "files", &[protocol_lane_tool("read_item", true)]);
+    let mut second = spawn_adapter(&dir, &AdapterOptions::default());
+    second.initialize("protocol-cached-safety-restart");
+    protocol_lane_error(
+        &second.call_tool("files__read_item", json!({})),
+        "approval service was unreachable",
+    );
+    assert_eq!(
+        transcript_method_count(&dir.join("transcript-files.jsonl"), "tools/call"),
+        0
+    );
+}
+
+#[test]
 fn protocol_lane_long_aliases_route_and_survive_reorder_restart_and_old_policy() {
     let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let _data_lock = registry::data_dir_test_lock();

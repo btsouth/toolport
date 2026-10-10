@@ -4673,7 +4673,16 @@ fn execute_call(
             view.prepare_lazy_use(owner);
             view.kick_pending(owner, |id| id == owner);
         }
-        if view.route_of(name).is_none() && fresh.is_some() {
+        if view.route_of(name).is_some() {
+            // A cached route proves identity, not current safety metadata. Keep
+            // the existing readiness wait before classifying a known call.
+            for owner in &candidates {
+                if let Err(message) = view.wait_for_server(owner, cancel.as_ref(), false) {
+                    return json!({"content": [{"type": "text", "text": format!("Toolport: {message}")}], "isError": true});
+                }
+            }
+            fresh = clone_live_router(live_router);
+        } else if fresh.is_some() {
             let deadline = Instant::now() + FIRST_CATALOG_WAIT;
             let mut seen = started_supervisors();
             loop {
