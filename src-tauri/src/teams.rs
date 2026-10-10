@@ -426,14 +426,17 @@ pub(crate) fn fetch_config_for_update(
     team_id: &str,
     token: &str,
 ) -> Result<(i64, Value), String> {
+    fetch_config_mode(server_url, team_id, token, false)
+}
+pub(crate) fn fetch_personal_config(server_url: &str, team_id: &str, token: &str) -> Result<(i64, Value), String> {
+    fetch_config_mode(server_url, team_id, token, true)
+}
+fn fetch_config_mode(server_url: &str, team_id: &str, token: &str, personal: bool) -> Result<(i64, Value), String> {
     require_secure_team_url(server_url)?;
     let url = format!("{}/teams/{}/config?manage=1", base(server_url), team_id);
-    match agent(server_url)
-        .get(&url)
-        .set_header("authorization", &format!("Bearer {token}"))
-        .call()
-        .retain_status_body()
-    {
+    let mut request = agent(server_url).get(&url).set_header("authorization", &format!("Bearer {token}"));
+    if personal { request = request.set_header("x-toolport-personal-sync", "1"); }
+    match request.call().retain_status_body() {
         Ok(resp) => {
             let resp = require_no_redirect(resp)?;
             let v: Value = resp
@@ -827,14 +830,18 @@ pub fn push_config(
     config: &Value,
     base_version: i64,
 ) -> Result<PushOutcome, String> {
+    push_config_mode(server_url, team_id, token, config, base_version, false)
+}
+pub(crate) fn push_personal_config(server_url: &str, team_id: &str, token: &str, config: &Value, base_version: i64) -> Result<PushOutcome, String> {
+    push_config_mode(server_url, team_id, token, config, base_version, true)
+}
+fn push_config_mode(server_url: &str, team_id: &str, token: &str, config: &Value, base_version: i64, personal: bool) -> Result<PushOutcome, String> {
     require_secure_team_url(server_url)?;
     let url = format!("{}/teams/{}/config", base(server_url), team_id);
     let body = push_body(config, base_version);
-    let resp = match agent(server_url)
-        .put(&url)
-        .set_header("authorization", &format!("Bearer {token}"))
-        .send_json(body)
-        .retain_status_body()
+    let mut request = agent(server_url).put(&url).set_header("authorization", &format!("Bearer {token}"));
+    if personal { request = request.set_header("x-toolport-personal-sync", "1"); }
+    let resp = match request.send_json(body).retain_status_body()
     {
         Ok(resp) => require_no_redirect(resp)?,
         Err(crate::http_client::Error::Status(status, resp)) => {
@@ -1166,7 +1173,7 @@ fn finish_connect(
     let delivery_blocked = conn.unknown_fields.get("accountStatus").is_some_and(|s|s["canReceiveConfig"]==false);
     let pulled = if delivery_blocked { None } else if personal {
         let (version, config) =
-            fetch_config_for_update(server_url, &joined.team_id, &joined.member_token)?;
+            fetch_personal_config(server_url, &joined.team_id, &joined.member_token)?;
         Some((version, config, None))
     } else {
         pull_config(
@@ -1345,6 +1352,9 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
             Ok(())
         })
     })?;
+    if !fresh.team.as_ref().is_some_and(|t| t.team_id == conn.team_id && t.server_url == conn.server_url && t.reporting_device_id == conn.reporting_device_id) {
+        return Ok(SyncResult::Ok { role, role_changed, applied: None });
+    }
     if let Some(status) = &status {
         if status["canReceiveConfig"] == false {
             return Err(status["reason"].as_str().unwrap_or("Sync is unavailable on this device. Open Your account to choose your active device.").into());

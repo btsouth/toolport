@@ -877,7 +877,7 @@ pub(crate) fn sync(
     conn: &crate::registry::TeamConnection,
     token: &str,
 ) -> Result<crate::teams::SyncResult, String> {
-    let mut latest = crate::teams::fetch_config_for_update(&conn.server_url, &conn.team_id, token)?;
+    let mut latest = crate::teams::fetch_personal_config(&conn.server_url, &conn.team_id, token)?;
     let (reg, _) = remote_update(|| {
         crate::registry::update(|r| {
             if !current(r, conn) {
@@ -921,16 +921,16 @@ pub(crate) fn sync(
                 applied: None,
             });
         }
-        match crate::teams::push_config(&conn.server_url, &conn.team_id, token, &merged, latest.0) {
+        match crate::teams::push_personal_config(&conn.server_url, &conn.team_id, token, &merged, latest.0) {
             Ok(crate::teams::PushOutcome::Published(_)) => {
                 latest =
-                    crate::teams::fetch_config_for_update(&conn.server_url, &conn.team_id, token)?;
+                    crate::teams::fetch_personal_config(&conn.server_url, &conn.team_id, token)?;
                 break;
             }
             Ok(_) => return Err("Finish the sync approval in Your account.".into()),
             Err(e) if e == crate::teams::STALE_PUSH_MESSAGE && attempt == 0 => {
                 latest =
-                    crate::teams::fetch_config_for_update(&conn.server_url, &conn.team_id, token)?;
+                    crate::teams::fetch_personal_config(&conn.server_url, &conn.team_id, token)?;
             }
             Err(e) => return Err(e),
         }
