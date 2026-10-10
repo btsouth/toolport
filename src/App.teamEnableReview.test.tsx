@@ -163,7 +163,7 @@ describe("team enable review dialog", () => {
     await dialog.findByText("Show full definition");
     expect(
       dialog
-        .getAllByText('Arguments: ["-y","new-tool"]')
+        .getAllByText(/^Arguments:\s+1\. -y\s+2\. new-tool$/)
         .find((node) => !node.closest("details")),
     ).toHaveClass("bg-amber-500/10");
     expect(dialog.getByText("Show full definition")).toBeInTheDocument();
@@ -186,7 +186,9 @@ describe("team enable review dialog", () => {
       const toggle = await screen.findByRole("switch", { name: "Toggle Team tool" });
       await userEvent.click(toggle);
       expect(await screen.findByText("Command: npx")).toBeInTheDocument();
-      expect(screen.getByText('Arguments: ["-y","old-tool"]')).toBeInTheDocument();
+      expect(
+        screen.getByText(/^Arguments:\s+1\. -y\s+2\. old-tool$/),
+      ).toBeInTheDocument();
 
       // The push lands while the member is reading the dialog.
       await act(async () => {
@@ -201,7 +203,9 @@ describe("team enable review dialog", () => {
       expect(setServerEnabled).not.toHaveBeenCalled();
       expect(screen.getByRole("dialog")).toBeInTheDocument();
       await waitFor(() =>
-        expect(screen.getByText('Arguments: ["-y","new-tool"]')).toBeInTheDocument(),
+        expect(
+          screen.getByText(/^Arguments:\s+1\. -y\s+2\. new-tool$/),
+        ).toBeInTheDocument(),
       );
     },
   );
