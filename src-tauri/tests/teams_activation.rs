@@ -1,5 +1,6 @@
 //! Synthetic A0 release gate. Run only inside Omabox with the isolated local Teams
 //! server on port 18788. Uses real gateway routing and required receipt transport.
+use conduit_lib::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 use conduit_lib::{registry, teams};
 use serde_json::{json, Value};
 use std::process::Command;
@@ -51,11 +52,16 @@ fn managed_call_reaches_teams_with_raw_identity() {
     let created: Value = if let Some(value) = supplied.as_ref() {
         value.clone()
     } else {
-        ureq::post(&format!("{api}/teams"))
-            .set("authorization", "Bearer activation-synthetic-bootstrap")
+        conduit_lib::http_client::agent()
+            .post(&format!("{api}/teams"))
+            .set_header("authorization", "Bearer activation-synthetic-bootstrap")
             .send_json(json!({"name":"A0 synthetic identity"}))
+            .retain_status_body()
             .unwrap()
-            .into_json()
+            .into_body()
+            .with_config()
+            .limit(u64::MAX)
+            .read_json()
             .unwrap()
     };
     let team = created["team_id"].as_str().unwrap();
@@ -71,16 +77,21 @@ for line in sys.stdin:
  else:v={}
  print(json.dumps({'jsonrpc':'2.0','id':i,'result':v}),flush=True)
 "#).unwrap();
-    ureq::put(&format!("{api}/teams/{team}/config")).set("authorization", &auth)
-        .send_json(json!({"base_version":0,"config":{"servers":[{"id":"audit-echo", "name":"Synthetic echo", "transport":"stdio", "command":"python3", "args":[fixture]}]}})).unwrap();
+    conduit_lib::http_client::agent().put(&format!("{api}/teams/{team}/config")).set_header("authorization", &auth)
+        .send_json(json!({"base_version":0,"config":{"servers":[{"id":"audit-echo", "name":"Synthetic echo", "transport":"stdio", "command":"python3", "args":[fixture]}]}})).retain_status_body().unwrap();
     let invite: Value = if let Some(value) = supplied.as_ref() {
         json!({"invite_code":value["connectCode"]})
     } else {
-        ureq::post(&format!("{api}/teams/{team}/invites"))
-            .set("authorization", &auth)
+        conduit_lib::http_client::agent()
+            .post(&format!("{api}/teams/{team}/invites"))
+            .set_header("authorization", &auth)
             .send_json(json!({"role":"member"}))
+            .retain_status_body()
             .unwrap()
-            .into_json()
+            .into_body()
+            .with_config()
+            .limit(u64::MAX)
+            .read_json()
             .unwrap()
     };
     teams::connect(
@@ -152,11 +163,16 @@ finally:p.terminate();p.wait(timeout=10)
         String::from_utf8_lossy(&output.stderr)
     );
     teams::sync_now().unwrap();
-    let evidence: Value = ureq::get(&format!("{api}/teams/{team}/activation"))
-        .set("authorization", &auth)
+    let evidence: Value = conduit_lib::http_client::agent()
+        .get(&format!("{api}/teams/{team}/activation"))
+        .set_header("authorization", &auth)
         .call()
+        .retain_status_body()
         .unwrap()
-        .into_json()
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
         .unwrap();
     let row = &evidence["devices"][0];
     assert!(row["firstSuccessAt"].is_i64(), "{evidence}");
@@ -164,11 +180,16 @@ finally:p.terminate();p.wait(timeout=10)
     assert_eq!(counter["successes"], 1);
     assert_eq!(counter["failures"], 1);
     teams::sync_now().unwrap();
-    let retried: Value = ureq::get(&format!("{api}/teams/{team}/activation"))
-        .set("authorization", &auth)
+    let retried: Value = conduit_lib::http_client::agent()
+        .get(&format!("{api}/teams/{team}/activation"))
+        .set_header("authorization", &auth)
         .call()
+        .retain_status_body()
         .unwrap()
-        .into_json()
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
         .unwrap();
     assert_eq!(
         retried["devices"][0]["firstSuccessAt"],
@@ -205,15 +226,20 @@ fn portal_member_connect_keeps_the_authenticated_seat() {
     assert_eq!(connection.account_linked, Some(true));
     assert_eq!(connection.team_name.as_deref(), Some("Activation Acme"));
     let token = teams::load_token().unwrap().unwrap();
-    let me: Value = ureq::get(&format!(
-        "http://127.0.0.1:18788/teams/{}/me",
-        connection.team_id
-    ))
-    .set("authorization", &format!("Bearer {token}"))
-    .call()
-    .unwrap()
-    .into_json()
-    .unwrap();
+    let me: Value = conduit_lib::http_client::agent()
+        .get(&format!(
+            "http://127.0.0.1:18788/teams/{}/me",
+            connection.team_id
+        ))
+        .set_header("authorization", &format!("Bearer {token}"))
+        .call()
+        .retain_status_body()
+        .unwrap()
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
+        .unwrap();
     assert_eq!(me["member_id"], fixture["memberId"]);
 }
 
@@ -226,24 +252,36 @@ fn selected_share_is_additive_conflict_safe_and_locally_usable() {
     std::fs::create_dir_all(&dir).unwrap();
     let _override = registry::DataDirOverride::set(&dir);
     let api = "http://127.0.0.1:18788";
-    let created: Value = ureq::post(&format!("{api}/teams"))
-        .set("authorization", "Bearer activation-synthetic-bootstrap")
+    let created: Value = conduit_lib::http_client::agent()
+        .post(&format!("{api}/teams"))
+        .set_header("authorization", "Bearer activation-synthetic-bootstrap")
         .send_json(json!({"name":"A3 selected share"}))
+        .retain_status_body()
         .unwrap()
-        .into_json()
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
         .unwrap();
     let team = created["team_id"].as_str().unwrap();
     let auth = format!("Bearer {}", created["admin_token"].as_str().unwrap());
     let remote = json!({"id":"unrelated", "name":"Other team server", "transport":"http", "url":"https://example.test/mcp"});
-    ureq::put(&format!("{api}/teams/{team}/config"))
-        .set("authorization", &auth)
+    conduit_lib::http_client::agent()
+        .put(&format!("{api}/teams/{team}/config"))
+        .set_header("authorization", &auth)
         .send_json(json!({"base_version":0,"config":{"servers":[remote],"denyDestructive":true}}))
+        .retain_status_body()
         .unwrap();
-    let invite: Value = ureq::post(&format!("{api}/teams/{team}/invites"))
-        .set("authorization", &auth)
+    let invite: Value = conduit_lib::http_client::agent()
+        .post(&format!("{api}/teams/{team}/invites"))
+        .set_header("authorization", &auth)
         .send_json(json!({"role":"admin"}))
+        .retain_status_body()
         .unwrap()
-        .into_json()
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
         .unwrap();
     registry::update(|r| {
         r.servers.push(serde_json::from_value(json!({"id":"selected-one","name":"Selected one","enabled":true,"transport":"stdio","command":"python3","args":["/home/sbx/activation-mcp.py"],"cwd":"/home/sbx","env":[{"key":"SYNTHETIC_KEY","secret":true}]})).unwrap());
@@ -283,11 +321,16 @@ fn selected_share_is_additive_conflict_safe_and_locally_usable() {
             .unwrap_err()
             .contains("changed")
     );
-    let config: Value = ureq::get(&format!("{api}/teams/{team}/config"))
-        .set("authorization", &auth)
+    let config: Value = conduit_lib::http_client::agent()
+        .get(&format!("{api}/teams/{team}/config"))
+        .set_header("authorization", &auth)
         .call()
+        .retain_status_body()
         .unwrap()
-        .into_json()
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
         .unwrap();
     assert!(config["config"]["servers"]
         .as_array()
@@ -354,16 +397,49 @@ try:
  assert 'Synthetic success' in json.dumps(result),result
 finally:p.terminate();p.wait(timeout=10)
 "#;
-    let output = Command::new("python3").args(["-c", client, &std::env::var("ACTIVATION_GATEWAY").expect("set the candidate gateway path")])
-        .env("TOOLPORT_DATA_DIR", &dir).output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let output = Command::new("python3")
+        .args([
+            "-c",
+            client,
+            &std::env::var("ACTIVATION_GATEWAY").expect("set the candidate gateway path"),
+        ])
+        .env("TOOLPORT_DATA_DIR", &dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     teams::sync_now().unwrap();
-    let activation: Value = ureq::get(&format!("{api}/teams/{team}/activation"))
-        .set("authorization", &auth).call().unwrap().into_json().unwrap();
-    assert!(activation["devices"].as_array().unwrap().iter().any(|device|
-        device["firstSuccessAt"].is_i64()
-        && device["receipt"]["counters"]["selected-one"]["successes"].as_u64().unwrap_or(0) > 0), "the managed success must reach Teams");
-    std::fs::write("/home/sbx/publisher-ready.json", serde_json::to_vec_pretty(&r).unwrap()).unwrap();
+    let activation: Value = conduit_lib::http_client::agent()
+        .get(&format!("{api}/teams/{team}/activation"))
+        .set_header("authorization", &auth)
+        .call()
+        .retain_status_body()
+        .unwrap()
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
+        .unwrap();
+    assert!(
+        activation["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|device| device["firstSuccessAt"].is_i64()
+                && device["receipt"]["counters"]["selected-one"]["successes"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    > 0),
+        "the managed success must reach Teams"
+    );
+    std::fs::write(
+        "/home/sbx/publisher-ready.json",
+        serde_json::to_vec_pretty(&r).unwrap(),
+    )
+    .unwrap();
     registry::update(|r| {
         r.servers
             .iter_mut()

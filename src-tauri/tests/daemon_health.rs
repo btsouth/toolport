@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Daemon health under load and when wedged, end to end.
 //!
 //! - A daemon whose request workers are all busy still answers its identity
@@ -12,8 +13,7 @@
 //! Real processes throughout: the gateway binary in its daemon, adapter and HTTP
 //! roles, and `mock-mcp-server` downstream, each against a scratch data
 //! directory. Unix only: the wedge is a SIGSTOP.
-
-#![cfg(unix)]
+use conduit_lib::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 mod discovery_support;
 
@@ -402,24 +402,29 @@ fn post_mcp(
     token: &str,
     session: Option<&str>,
     body: &Value,
-) -> Result<ureq::Response, ureq::Error> {
-    let mut request = ureq::post(&format!("http://{endpoint}/mcp"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Content-Type", "application/json")
-        .set("Accept", "application/json, text/event-stream")
-        .timeout(Duration::from_secs(60));
+) -> Result<ureq::http::Response<ureq::Body>, conduit_lib::http_client::Error> {
+    let mut request = conduit_lib::http_client::agent()
+        .post(&format!("http://{endpoint}/mcp"))
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .set_header("Content-Type", "application/json")
+        .set_header("Accept", "application/json, text/event-stream")
+        .config()
+        .timeout_global(Some(Duration::from_secs(60)))
+        .build();
     if let Some(session) = session {
-        request = request.set("Mcp-Session-Id", session);
+        request = request.set_header("Mcp-Session-Id", session);
     }
-    request.send_json(body.clone())
+    request.send_json(body.clone()).retain_status_body()
 }
 
-fn body_json(response: ureq::Response) -> Value {
+fn body_json(response: ureq::http::Response<ureq::Body>) -> Value {
     let sse = response
-        .header("Content-Type")
+        .headers()
+        .get("Content-Type")
+        .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .contains("text/event-stream");
-    let body = response.into_string().expect("body");
+    let body = response.into_body().read_to_string().expect("body");
     if sse {
         body.lines()
             .filter_map(|line| line.strip_prefix("data:"))
@@ -469,7 +474,9 @@ fn a_saturated_daemon_still_answers_its_probe_and_is_never_duplicated() {
     )
     .expect("initialize");
     let session = initialize
-        .header("Mcp-Session-Id")
+        .headers()
+        .get("Mcp-Session-Id")
+        .and_then(|value| value.to_str().ok())
         .expect("session id")
         .to_string();
     // Wait for the catalog so the slow calls below reach the server.
@@ -517,8 +524,8 @@ fn a_saturated_daemon_still_answers_its_probe_and_is_never_duplicated() {
                     &json!({ "jsonrpc": "2.0", "id": 10 + index, "method": "tools/call",
                              "params": { "name": "mock__echo", "arguments": { "text": "slow" } } }),
                 );
-                if let Err(ureq::Error::Status(503, response)) = result {
-                    assert_eq!(response.header("Retry-After"), Some("1"));
+                if let Err(conduit_lib::http_client::Error::Status(503, response)) = result {
+                    assert_eq!(response.headers().get("Retry-After").and_then(|value| value.to_str().ok()), Some("1"));
                     shed.fetch_add(1, Ordering::SeqCst);
                 }
             })
@@ -527,14 +534,18 @@ fn a_saturated_daemon_still_answers_its_probe_and_is_never_duplicated() {
     std::thread::sleep(Duration::from_millis(700));
 
     let started = Instant::now();
-    let identity = ureq::get(&format!(
-        "http://{endpoint}{}",
-        conduit_lib::daemon::IDENTITY_PATH
-    ))
-    .set("Authorization", &format!("Bearer {token}"))
-    .timeout(Duration::from_secs(2))
-    .call()
-    .map_err(|error| error.to_string());
+    let identity = conduit_lib::http_client::agent()
+        .get(&format!(
+            "http://{endpoint}{}",
+            conduit_lib::daemon::IDENTITY_PATH
+        ))
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .config()
+        .timeout_global(Some(Duration::from_secs(2)))
+        .build()
+        .call()
+        .retain_status_body()
+        .map_err(|error| error.to_string());
     assert!(
         identity.is_ok(),
         "a saturated daemon must answer its probe: {identity:?}\n{}",
@@ -709,10 +720,14 @@ fn spawn_http(fixture: &Fixture, cap: Option<&str>) -> (ChildGuard, u16) {
     // Wait for a whole answer, so no readiness connection still holds a slot.
     let deadline = Instant::now() + RESPONSE_TIMEOUT;
     loop {
-        let answered = ureq::get(&format!("http://127.0.0.1:{port}/"))
-            .timeout(Duration::from_secs(5))
-            .call();
-        if !matches!(answered, Err(ureq::Error::Transport(_))) {
+        let answered = conduit_lib::http_client::agent()
+            .get(&format!("http://127.0.0.1:{port}/"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build()
+            .call()
+            .retain_status_body();
+        if !matches!(answered, Err(conduit_lib::http_client::Error::Transport(_))) {
             break;
         }
         assert!(Instant::now() < deadline, "HTTP gateway never answered");
@@ -735,16 +750,20 @@ fn the_http_bridge_takes_a_burst_and_sheds_only_past_its_cap() {
             std::thread::spawn(move || {
                 barrier.wait();
                 let initialize = || {
-                    ureq::post(&format!("http://127.0.0.1:{port}/mcp"))
-                        .set("Authorization", "Bearer health-token")
-                        .set("Content-Type", "application/json")
-                        .set("Accept", "application/json, text/event-stream")
-                        .timeout(Duration::from_secs(60))
+                    conduit_lib::http_client::agent()
+                        .post(&format!("http://127.0.0.1:{port}/mcp"))
+                        .set_header("Authorization", "Bearer health-token")
+                        .set_header("Content-Type", "application/json")
+                        .set_header("Accept", "application/json, text/event-stream")
+                        .config()
+                        .timeout_global(Some(Duration::from_secs(60)))
+                        .build()
                         .send_json(json!({
                             "jsonrpc": "2.0", "id": index, "method": "initialize",
                             "params": { "protocolVersion": "2025-06-18", "capabilities": {},
                                         "clientInfo": { "name": "burst", "version": "1" } }
                         }))
+                        .retain_status_body()
                 };
                 // A loaded CI runner's loopback stack can drop or reset a few of
                 // 300 simultaneous connects before the gateway ever sees them. A
@@ -754,9 +773,11 @@ fn the_http_bridge_takes_a_burst_and_sheds_only_past_its_cap() {
                 let mut transport_errors = Vec::new();
                 for _ in 0..2 {
                     match initialize() {
-                        Ok(response) => return (response.status(), transport_errors),
-                        Err(ureq::Error::Status(code, _)) => return (code, transport_errors),
-                        Err(ureq::Error::Transport(error)) => {
+                        Ok(response) => return (response.status().as_u16(), transport_errors),
+                        Err(conduit_lib::http_client::Error::Status(code, _)) => {
+                            return (code, transport_errors)
+                        }
+                        Err(conduit_lib::http_client::Error::Transport(error)) => {
                             transport_errors.push(error.to_string());
                         }
                     }
@@ -827,13 +848,17 @@ fn the_http_bridge_takes_a_burst_and_sheds_only_past_its_cap() {
     drop(held);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let response = ureq::get(&format!("http://127.0.0.1:{capped_port}/"))
-            .set("Authorization", "Bearer health-token")
-            .timeout(Duration::from_secs(5))
-            .call();
+        let response = conduit_lib::http_client::agent()
+            .get(&format!("http://127.0.0.1:{capped_port}/"))
+            .set_header("Authorization", "Bearer health-token")
+            .config()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build()
+            .call()
+            .retain_status_body();
         match response {
             Ok(response) => {
-                assert_eq!(response.status(), 200);
+                assert_eq!(response.status().as_u16(), 200);
                 break;
             }
             Err(error) => {
