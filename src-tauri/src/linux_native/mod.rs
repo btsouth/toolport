@@ -9524,7 +9524,7 @@ mod tests {
         assert!(!activity.savings_detail.text().contains("bytes/4"));
         let server_page = ServerPage {
             app: app.clone(), server_count: gtk::Label::new(None), enabled_count: gtk::Label::new(None),
-            profile_count: gtk::Label::new(None), section_title: gtk::Label::new(None), posture: gtk::Label::new(None),
+            section_title: gtk::Label::new(None), posture: gtk::Label::new(None),
             search: gtk::SearchEntry::new(), feedback: gtk::Label::new(None), list: gtk::Box::new(gtk::Orientation::Vertical, 0),
             last_snapshot: Default::default(), feedback_timer: Default::default(), health_rows: Default::default(),
             rows: Default::default(), no_matches: Default::default(), off_heading: Default::default(), health: Default::default(),
@@ -10263,7 +10263,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_call_summary_uses_plain_counts() {
+    fn recorded_call_summary_uses_plain_counts() {
         assert_eq!(activity_count_summary(1, 2, 2, false), "1 call recorded on this computer. Showing the latest 2.");
         assert_eq!(activity_count_summary(5225, 5, 5, false), "5,225 calls recorded on this computer. Showing the latest 5.");
         assert_eq!(activity_count_summary(5225, 10, 100, false), "5,225 calls recorded on this computer. Showing 10 of the latest 100.");
