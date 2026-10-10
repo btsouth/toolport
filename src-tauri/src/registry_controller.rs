@@ -205,6 +205,7 @@ pub struct EssentialSettings {
     pub block_on_injection_forced: bool,
     pub pii_redaction: bool,
     pub pii_redaction_forced: bool,
+    pub kept_v1_safety: registry::KeptV1Safety,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +247,7 @@ impl EssentialSettings {
             block_on_injection_forced: registry.team_forced_block_on_injection,
             pii_redaction: registry.pii_redaction_effective(),
             pii_redaction_forced: registry.team_forced_pii_redaction,
+            kept_v1_safety: registry.kept(),
         }
     }
 }

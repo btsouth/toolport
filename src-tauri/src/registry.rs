@@ -1124,6 +1124,27 @@ impl KeptV1Safety {
             || self.quarantine_on_drift
             || self.block_on_injection
     }
+
+    /// What each kept protection does, for Settings. The React shell keeps the
+    /// same wording in `src/lib/keptSafety.ts`.
+    pub fn summary(self) -> Option<String> {
+        let parts: Vec<&str> = [
+            (self.hold_untrusted, "asks before calls from shared or registry servers"),
+            (self.deny_destructive, "hides destructive tools"),
+            (self.quarantine_on_drift, "pauses tools whose definitions change"),
+            (self.block_on_injection, "blocks results that look like prompt injection"),
+        ]
+        .into_iter()
+        .filter_map(|(on, text)| on.then_some(text))
+        .collect();
+        let list = match parts.as_slice() {
+            [] => return None,
+            [one] => (*one).to_string(),
+            [first, second] => format!("{first} and {second}"),
+            [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+        };
+        Some(format!("Kept from 1.x: Toolport also {list}."))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2507,7 +2528,8 @@ impl Registry {
 
     /// 1.x protections outside the level: saved by the migration, or read
     /// straight from the toggles of a v1 registry that has not migrated yet.
-    fn kept(&self) -> KeptV1Safety {
+    /// 1.x protections still applied on top of the level.
+    pub fn kept(&self) -> KeptV1Safety {
         if self.version < 2 && self.safety_level.is_none() {
             return KeptV1Safety {
                 hold_untrusted: self.human_approval,
@@ -8918,6 +8940,21 @@ mod safety_level_tests {
             r.team_min_safety_level,
             SafetyLevel::Off,
             "absent floor has no effect"
+        );
+    }
+
+    #[test]
+    fn kept_v1_protections_are_summarized_for_settings() {
+        assert_eq!(KeptV1Safety::default().summary(), None);
+        let one = KeptV1Safety { hold_untrusted: true, ..Default::default() };
+        assert_eq!(
+            one.summary().unwrap(),
+            "Kept from 1.x: Toolport also asks before calls from shared or registry servers."
+        );
+        let two = KeptV1Safety { hold_untrusted: true, block_on_injection: true, ..Default::default() };
+        assert_eq!(
+            two.summary().unwrap(),
+            "Kept from 1.x: Toolport also asks before calls from shared or registry servers and blocks results that look like prompt injection."
         );
     }
 

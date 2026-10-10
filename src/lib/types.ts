@@ -468,6 +468,13 @@ export interface LaunchConfig {
   revision?: number | null;
 }
 
+export interface KeptV1Safety {
+  holdUntrusted?: boolean;
+  denyDestructive?: boolean;
+  quarantineOnDrift?: boolean;
+  blockOnInjection?: boolean;
+}
+
 export interface ServerEntry {
   enabled?: boolean;
   id: string;
@@ -608,6 +615,8 @@ export interface Registry {
   teamForcedDenyDestructive?: boolean;
   teamForcedQuarantineOnDrift?: boolean;
   teamForcedBlockOnInjection?: boolean;
+  /** 1.x protections the upgrade kept on top of the level, until a level is picked. */
+  keptV1Safety?: KeptV1Safety;
   /** Retained legacy switch for registries without a safety level. */
   denyDestructive?: boolean;
   /** Per-call confirmation: intercept destructive tools with a preview + token. */
