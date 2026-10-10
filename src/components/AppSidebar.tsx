@@ -382,6 +382,12 @@ function UpdateNotes({
               {systemPackageUpdateAdvice(systemPackage)}
             </p>
           )}
+          {!systemPackage && (
+            <p className="text-sm text-muted-foreground">
+              Toolport connections may restart during installation; restart your
+              MCP client if it disconnects.
+            </p>
+          )}
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={() => onOpenChange(false)}>
               {installing ? "Hide" : "Later"}

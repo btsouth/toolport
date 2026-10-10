@@ -116,16 +116,15 @@ def main():
         os.environ["TOOLPORT_NO_KEYRING"] = "1"
         children = []
         try:
-            # A fresh passive deferral has a client but no application to reopen.
+            # A fresh passive install must replace a locked gateway without reopening.
             shutil.copy2(ROOT / "src-tauri/binaries/toolport-gateway-x86_64-pc-windows-msvc.exe", gateway)
             client = start_client(gateway)
             children.append(client)
-            installer_run(installer, f"/S /P /D={install}", "fresh-passive-busy", 1)
-            assert client.poll() is None and not app.exists()
+            installer_run(installer, f"/S /P /D={install}", "fresh-passive-busy")
+            assert client.wait(timeout=10) is not None
+            assert all((install / name).is_file() for name in
+                       ("conduit.exe", "toolport-gateway.exe", "uninstall.exe"))
             assert not app_pids(app)
-            client.kill()
-            client.wait(timeout=10)
-            gateway.unlink()
 
             installer_run(installer, f"/S /D={install}", "fresh-silent-install")
             assert all((install / name).is_file() for name in
@@ -134,16 +133,18 @@ def main():
             path, original, connected = seed_client(root, data, gateway)
             client = start_client(gateway)
             children.append(client)
-            before = hashlib.sha256(app.read_bytes()).hexdigest()
-            installer_run(installer, f"/S /UPDATE /D={install}", "busy-update-defers", 1)
-            assert client.poll() is None, "Installer killed an active MCP session"
-            assert hashlib.sha256(app.read_bytes()).hexdigest() == before
+            installer_run(installer, f"/S /UPDATE /D={install}", "busy-update-succeeds")
+            assert client.wait(timeout=10) is not None, "Locked gateway was not stopped"
+            assert all((install / name).is_file() for name in
+                       ("conduit.exe", "toolport-gateway.exe", "uninstall.exe"))
             assert path.read_bytes() == connected
-            wait_for(lambda: app_pids(app), "deferred update reopens app")
-            print("PASS: busy update preserves client session/config and reopens existing app", flush=True)
-            stop_app(app)
-            client.kill()
-            client.wait(timeout=10)
+            assert not app_pids(app), "Successful silent update without /R must not reopen"
+            # Configs still point to a usable replacement, not a missing/locked image.
+            replacement = start_client(gateway)
+            children.append(replacement)
+            replacement.kill()
+            replacement.wait(timeout=10)
+            print("PASS: busy update replaces gateway, preserves config and accepts a new client", flush=True)
 
             daemon = start_gateway(gateway, ["--daemon"])
             children.append(daemon)
