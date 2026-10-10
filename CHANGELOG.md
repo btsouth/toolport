@@ -6,6 +6,12 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Added
+
+- Command Code is a supported client. Toolport finds it, connects it through
+  `~/.commandcode/mcp.json`, imports the servers already set up there, and keeps
+  agent rules in `~/.commandcode/AGENTS.md` and project `AGENTS.md` files.
+
 ## [1.24.0] - 2026-10-06
 
 ### Added

@@ -303,6 +303,7 @@ fn resolve_client_config_path(
         "kiro" => home.join(".kiro").join("settings").join("mcp.json"),
         "kimi-code" => home.join(".kimi-code").join("mcp.json"),
         "zcode" => home.join(".zcode").join("cli").join("config.json"),
+        "command-code" => home.join(".commandcode").join("mcp.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
         "jan" => data.join("Jan").join("data").join("mcp_config.json"),
         "zed" => match platform {
@@ -806,6 +807,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "kiro" => home.join(".kiro").join("settings").join("mcp.json"),
         "kimi-code" => home.join(".kimi-code").join("mcp.json"),
         "zcode" => home.join(".zcode").join("cli").join("config.json"),
+        "command-code" => home.join(".commandcode").join("mcp.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
         "jan" => data.join("Jan").join("data").join("mcp_config.json"),
         "zed" => config.join("zed").join("settings.json"),
@@ -917,6 +919,7 @@ fn resolve_rules_target(
         },
         "pi" => block(home.join(".pi").join("agent").join("AGENTS.md")),
         "omp" => block(home.join(".omp").join("agent").join("AGENTS.md")),
+        "command-code" => block(home.join(".commandcode").join("AGENTS.md")),
         "zed" => match platform {
             Platform::Windows => block(config.join("Zed").join("AGENTS.md")),
             Platform::MacOs | Platform::Linux => {
@@ -1611,6 +1614,18 @@ fn defs() -> Vec<ClientDef> {
             format: Format::JsonZCodeMcp,
             uses_connectors: false,
             path: || client_config_path("zcode"),
+            plugin_scan: None,
+        },
+        ClientDef {
+            id: "command-code",
+            name: "Command Code",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            // Command Code's user-scope MCP config: `~/.commandcode/mcp.json` (`mcpServers`).
+            // It also merges a project `.mcp.json` and a per-project local file over it; we
+            // manage the user one so the gateway is available everywhere. Bare `command` and
+            // `url` entries read as stdio and http, and `type` is accepted for `transport`.
+            path: || client_config_path("command-code"),
             plugin_scan: None,
         },
         ClientDef {
@@ -10129,6 +10144,7 @@ command = "npx"
             "witsy",
             "junie",
             "devin-cli",
+            "command-code",
         ] {
             let d = defs()
                 .into_iter()
@@ -10272,6 +10288,21 @@ command = "npx"
         assert!(!definition.uses_connectors);
         assert!((definition.path)().is_some());
         assert!(!client_uses_mcp_remote_bridge("kimi-code"));
+    }
+
+    #[test]
+    fn command_code_paths_are_under_its_home_dir() {
+        for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
+            let home = mock_home(platform);
+            assert_eq!(
+                resolve_client_config_path("command-code", &home, platform),
+                Some(home.join(".commandcode").join("mcp.json")),
+                "command-code MCP path on {platform:?}"
+            );
+            let rules = team_rules_target("command-code", &home, platform).expect("supported");
+            assert_eq!(rules.path, home.join(".commandcode").join("AGENTS.md"));
+            assert_eq!(rules.strategy, crate::instructions::Strategy::SentinelBlock);
+        }
     }
 
     #[test]
@@ -11211,6 +11242,7 @@ rules:
             "zed",
             "pi",
             "omp",
+            "command-code",
         ] {
             let team = resolve_rules_target(client, &home, p, Scope::Team).expect("supported");
             let personal =
