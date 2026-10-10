@@ -837,9 +837,10 @@ it("uses one server filter and one identity, time and wait meta line", async () 
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   await user.click(await screen.findByRole("button", { name: /recent calls/i }));
-  expect(
-    screen.getByText('Claude Code (reports "Claude Code 2.1") · 2m ago · waited 1.5 s'),
-  ).toHaveAttribute("title", expect.stringContaining("adapter:claude-code"));
+  expect(screen.getByText("Claude Code · 2m ago · waited 1.5 s")).toHaveAttribute(
+    "title",
+    expect.stringContaining("adapter:claude-code"),
+  );
   expect(screen.queryByText("adapter:claude-code")).not.toBeInTheDocument();
   await user.click(screen.getByRole("combobox"));
   expect(screen.getAllByRole("option", { name: /^team_slack$/ })).toHaveLength(1);
