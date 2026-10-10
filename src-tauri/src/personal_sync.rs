@@ -800,11 +800,22 @@ pub fn apply(
         // Bind by explicit identity first, then by a unique display name. Recreating
         // the same named server does not produce a second cloud definition.
         let mut linked = HashSet::new();
+        // Reserve explicit identities before display-name matching, regardless
+        // of local row order. A sibling must never steal an existing binding.
+        let mut owners = BTreeMap::new();
+        for local in reg.servers.iter().filter(|s| eligible(s)) {
+            if remote.contains_key(original(local)) {
+                owners
+                    .entry(original(local).to_string())
+                    .or_insert_with(|| local.id.clone());
+            }
+        }
         for local in reg.servers.iter_mut().filter(|s| {
             eligible(s) && s.unknown_fields.get("teamRouteRemoved") != Some(&json!(true))
         }) {
             let matches: Vec<_> = remote
                 .iter()
+                .filter(|(id, _)| owners.get(*id).is_none_or(|owner| owner == &local.id))
                 .filter(|(id, v)| {
                     id.as_str() == original(local)
                         || v["name"]
@@ -1573,7 +1584,7 @@ mod tests {
     #[test]
     fn acknowledgement_rebases_newer_edits_including_disable_and_lost_response() {
         let _data = crate::registry::DataDirTestEnv::new("sync-ack-rebase");
-        for disable in [false, true] {
+        for (disable, undo) in [(false, false), (true, false), (false, true)] {
             let mut r = machine();
             apply(&mut r, &config(vec![http("a")]), 0).unwrap();
             let before = r.clone();
@@ -1588,7 +1599,7 @@ mod tests {
             st.publishing.insert("a".into(), sent.clone());
             save(&mut r, &st).unwrap();
             let before = r.clone();
-            r.servers[0].name = "Second".into();
+            r.servers[0].name = if undo { "a" } else { "Second" }.into();
             r.servers[0].enabled = true;
             record(&before, &mut r).unwrap();
             // No explicit HTTP acknowledgement: the pull repairs a lost response.
@@ -1597,7 +1608,7 @@ mod tests {
             let st = state(&r).unwrap();
             assert!(st.publishing.is_empty());
             assert_eq!(st.pending["a"].before, sent.after);
-            assert_eq!(r.servers[0].name, "Second");
+            assert_eq!(r.servers[0].name, if undo { "a" } else { "Second" });
             assert!(r.servers[0].enabled);
             assert!(merge(&cloud, &st.pending).unwrap().1.is_empty());
         }
@@ -1741,6 +1752,44 @@ mod tests {
             r.servers.iter().filter(|s| original(s) == "cloud").count(),
             1
         );
+    }
+    #[test]
+    fn first_sync_reserves_existing_cloud_identity_before_name_matching() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-reserved-identity");
+        let mut r = machine();
+        let mut sibling = local(http("private"));
+        sibling.name = "cloud".into();
+        let mut bound = local(http("bound"));
+        bound.name = "cloud".into();
+        bound
+            .unknown_fields
+            .insert("teamOriginalId".into(), json!("cloud"));
+        r.servers = vec![sibling, bound];
+        apply(&mut r, &config(vec![http("cloud")]), 1).unwrap();
+        assert_eq!(
+            original(r.servers.iter().find(|s| s.id == "bound").unwrap()),
+            "cloud"
+        );
+        assert_eq!(
+            original(r.servers.iter().find(|s| s.id == "private").unwrap()),
+            "private"
+        );
+        assert_eq!(definitions(&r).len(), 2);
+    }
+    #[test]
+    fn full_review_rejects_inputs_or_inheritance_changed_while_open() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-reviewed-inputs");
+        let mut r = machine();
+        let mut row = command("review");
+        row["env"] = json!([{"key":"REGION","secret":false,"portable":true,"value":"west"}]);
+        apply(&mut r, &config(vec![row]), 1).unwrap();
+        let reviewed = r.servers[0].clone();
+        assert!(check_review(&r, &r.servers[0], Some(&reviewed)).is_ok());
+        r.servers[0].env[0].value = Some("east".into());
+        assert!(check_review(&r, &r.servers[0], Some(&reviewed)).is_err());
+        r.servers[0] = reviewed.clone();
+        r.servers[0].inherit_env = true;
+        assert!(check_review(&r, &r.servers[0], Some(&reviewed)).is_err());
     }
     #[test]
     fn conflict_choice_uses_an_opaque_version_even_if_js_normalizes_numbers() {

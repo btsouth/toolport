@@ -648,6 +648,84 @@ describe("Sync setup", () => {
       screen.queryByRole("button", { name: /Share selected/ }),
     ).not.toBeInTheDocument();
   });
+  it("shows per-server publish errors and asks which local servers to sync", async () => {
+    const personal = structuredClone(registry);
+    personal.team!.accountStatus = {
+      personalSync: true,
+      plan: "pro",
+      trialActive: false,
+      trialEndsAt: null,
+      freeSyncGraceEndsAt: null,
+      deviceId: "device",
+      canReceiveConfig: true,
+      reason: null,
+    };
+    personal.servers = [
+      {
+        id: "local",
+        name: "Private local",
+        transport: "http",
+        command: null,
+        args: [],
+        env: [],
+        url: "https://example.com/mcp",
+        source: "manual",
+        syncLocalOnly: true,
+      },
+    ];
+    personal.team!.personalSyncState = {
+      chooseLocalServers: true,
+      pending: { local: { localId: "local", after: {} } },
+      publishErrors: { local: "env: references cannot sync" },
+    };
+    invoke.mockResolvedValue(personal);
+    render(<TeamsView registry={personal} onRegistryChange={vi.fn()} />);
+    expect(screen.getByLabelText("Choose local servers to sync")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Private local" })).not.toBeChecked();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Private local: env: references cannot sync",
+    );
+    await userEvent.click(screen.getByRole("checkbox", { name: "Private local" }));
+    expect(invoke).toHaveBeenCalledWith("personal_sync_local_only", {
+      serverId: "local",
+      localOnly: false,
+    });
+  });
+  it("sends the opaque conflict version instead of the displayed JSON", async () => {
+    const personal = structuredClone(registry);
+    personal.team!.accountStatus = {
+      personalSync: true,
+      plan: "pro",
+      trialActive: false,
+      trialEndsAt: null,
+      freeSyncGraceEndsAt: null,
+      deviceId: "device",
+      canReceiveConfig: true,
+      reason: null,
+    };
+    personal.team!.personalSyncState = {
+      conflicts: { local: { requestTimeoutMs: 1 } },
+      conflictVersions: { local: "opaque-version" },
+    };
+    invoke.mockResolvedValue(personal);
+    api.getRegistry.mockResolvedValue(personal);
+    render(<TeamsView registry={personal} onRegistryChange={vi.fn()} />);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Keep this machine's version" }),
+    );
+    expect(invoke).toHaveBeenCalledWith("personal_sync_resolve_conflict", {
+      id: "local",
+      expected: "opaque-version",
+      keepMine: true,
+    });
+  });
+  it("surfaces account status failures while keeping the governed view", () => {
+    const governed = structuredClone(registry);
+    governed.team!.accountStatusError = "Account status returned 403";
+    render(<TeamsView registry={governed} onRegistryChange={vi.fn()} />);
+    expect(screen.getByText("Account status returned 403")).toBeInTheDocument();
+    expect(screen.getByText("Connected")).toBeInTheDocument();
+  });
   it("keeps multi-person governance and the unloaded view", () => {
     render(
       <TeamsView registry={registry} onRegistryChange={vi.fn()} />,
