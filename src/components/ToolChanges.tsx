@@ -39,7 +39,7 @@ function ago(ts: number) {
 function toolName(event: SecurityEvent) {
   const name = (event.tool || "Unknown tool")
     .replace(`${event.server}__`, "")
-    .replaceAll("_", " ");
+    .replace(/_/g, " ");
   return name.charAt(0).toUpperCase() + name.slice(1);
 }
 

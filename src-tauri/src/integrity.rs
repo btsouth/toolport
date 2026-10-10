@@ -221,13 +221,24 @@ fn migrate_source_pins(
         let Some((server, original)) = name.split_once("__") else {
             continue;
         };
-        let Some(cached) = cache
+        let Some(tools) = cache
             .as_ref()
             .and_then(|cache| cache["servers"][server]["tools"].as_array())
-            .and_then(|tools| tools.iter().find(|tool| tool["name"] == original))
         else {
             continue;
         };
+        let mut candidates = tools.iter().filter(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| crate::router::sanitize_segment(name) == original)
+        });
+        let Some(cached) = candidates.next() else {
+            continue;
+        };
+        // Colliding or overridden aliases cannot establish a unique source baseline.
+        if candidates.next().is_some() {
+            continue;
+        }
         let mut source = cached.clone();
         source["name"] = json!(name);
         let mut projected = source.clone();
