@@ -238,3 +238,21 @@ describe("secret argument names", () => {
     );
   });
 });
+
+it("names only the arguments that changed", () => {
+  const before = {
+    ...server,
+    command: "npx",
+    args: ["--mode", "fast", "--verbose"],
+    env: [],
+    launch: undefined,
+  } as ServerEntry;
+  const after = {
+    ...before,
+    args: ["--mode", "slow", "--verbose"],
+    syncExecutionReview: executionReviewFields(before),
+  } as ServerEntry;
+  const text = executionReviewLines(after).join("\n");
+  expect(text).toContain("Arguments changed:\n  2. slow (was fast)");
+  expect(text).not.toContain("--verbose");
+});

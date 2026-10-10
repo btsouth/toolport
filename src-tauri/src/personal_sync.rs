@@ -520,6 +520,26 @@ pub fn execution_review_lines(server: &ServerEntry) -> Vec<String> {
         .map(|line| review_display(server, line))
         .collect()
 }
+/// Only the argument positions that changed, so one edited flag does not mark
+/// the whole command line as new.
+fn changed_arguments(old: &str, new: &str) -> String {
+    let items = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter_map(|line| line.trim().split_once(". ").map(|(_, arg)| arg.to_string()))
+            .collect()
+    };
+    let (old, new) = (items(old), items(new));
+    let mut out = String::from("Arguments changed:");
+    for i in 0..old.len().max(new.len()) {
+        match (old.get(i), new.get(i)) {
+            (Some(a), Some(b)) if a != b => out.push_str(&format!("\n  {}. {b} (was {a})", i + 1)),
+            (None, Some(b)) => out.push_str(&format!("\n  {}. {b} (added)", i + 1)),
+            (Some(a), None) => out.push_str(&format!("\n  {}. removed (was {a})", i + 1)),
+            _ => {}
+        }
+    }
+    out
+}
 fn execution_review_raw_lines(server: &ServerEntry) -> Vec<String> {
     let previous = server
         .unknown_fields
@@ -533,7 +553,10 @@ fn execution_review_raw_lines(server: &ServerEntry) -> Vec<String> {
     }
     for (key, value) in &fields {
         if previous.as_ref().is_none_or(|p| p.get(key) != Some(value)) {
-            lines.push(review_field_line(key, value));
+            match previous.as_ref().and_then(|p| p.get(key)) {
+                Some(old) if key == "Arguments" => lines.push(changed_arguments(old, value)),
+                _ => lines.push(review_field_line(key, value)),
+            }
         }
     }
     if let Some(previous) = &previous {
@@ -3711,6 +3734,19 @@ mod tests {
         assert!(lines.iter().any(|s| s.contains("2 more days")));
         assert!(lines.iter().any(|s| s == "Choose this device"));
         assert!(lines.iter().any(|s| s == "Last synced just now"));
+    }
+    #[test]
+    fn review_names_only_the_arguments_that_changed() {
+        let mut server = local(json!({"id":"a","name":"a","transport":"stdio","command":"npx","args":["--mode","fast","--verbose"],"env":[]}));
+        let approved = execution_review_fields(&server);
+        server
+            .unknown_fields
+            .insert("syncExecutionReview".into(), json!(approved));
+        server.args[1] = "slow".into();
+        let text = execution_review_lines(&server).join("\n");
+        assert!(text.contains("Arguments changed:\n  2. slow (was fast)"), "{text}");
+        assert!(!text.contains("--verbose"), "{text}");
+        assert!(!text.contains("1. --mode"), "{text}");
     }
     #[test]
     fn new_plain_values_sync_unless_they_look_machine_local() {

@@ -168,6 +168,27 @@ export function reviewDisplay(server: ServerEntry, line: string): string {
 export function executionReviewLines(server: ServerEntry): string[] {
   return executionReviewRawLines(server).map((line) => reviewDisplay(server, line));
 }
+/** Only the argument positions that changed, so one edited flag does not mark
+ * the whole command line as new. Mirrors `personal_sync::changed_arguments`. */
+function changedArguments(before: string, after: string): string {
+  const items = (text: string) =>
+    text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.includes(". "))
+      .map((line) => line.slice(line.indexOf(". ") + 2));
+  const [a, b] = [items(before), items(after)];
+  let out = "Arguments changed:";
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if (a[i] !== undefined && b[i] !== undefined && a[i] !== b[i])
+      out += `\n  ${i + 1}. ${b[i]} (was ${a[i]})`;
+    else if (a[i] === undefined && b[i] !== undefined)
+      out += `\n  ${i + 1}. ${b[i]} (added)`;
+    else if (a[i] !== undefined && b[i] === undefined)
+      out += `\n  ${i + 1}. removed (was ${a[i]})`;
+  }
+  return out;
+}
 function executionReviewRawLines(server: ServerEntry): string[] {
   const fields = executionReviewFields(server);
   const previous = server.syncExecutionReview
@@ -176,7 +197,11 @@ function executionReviewRawLines(server: ServerEntry): string[] {
   const lines = Object.entries(fields)
     .sort(([a], [b]) => a.localeCompare(b))
     .filter(([key, value]) => !previous || previous[key] !== value)
-    .map(([key, value]) => executionReviewFieldLine(key, value));
+    .map(([key, value]) =>
+      key === "Arguments" && previous?.[key] !== undefined
+        ? changedArguments(previous[key], value)
+        : executionReviewFieldLine(key, value),
+    );
   for (const key of Object.keys(previous ?? {}))
     if (!(key in fields))
       lines.push(executionReviewFieldLine(visibleExecutionText(key), "Removed"));
