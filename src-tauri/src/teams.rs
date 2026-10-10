@@ -385,15 +385,31 @@ pub fn fetch_me(server_url: &str, team_id: &str, token: &str) -> Result<Membersh
     }
 }
 
+/// Entitlements and personal mode are asserted by the authenticated service.
+/// An older service keeps the governed flow; never infer ownership from role.
+pub fn fetch_account_status(conn: &TeamConnection, token: &str) -> Result<Option<Value>, String> {
+    require_secure_team_url(&conn.server_url)?;
+    let url = format!("{}/teams/{}/account/status", base(&conn.server_url), conn.team_id);
+    match agent(&conn.server_url).get(&url).set("authorization", &format!("Bearer {token}")).call() {
+        Ok(resp) => {
+            let value: Value = require_no_redirect(resp)?.into_json().map_err(|e| e.to_string())?;
+            if !value["plan"].is_string() || !value["canReceiveConfig"].is_boolean() { return Err("Account status response is incomplete".into()); }
+            Ok(Some(value))
+        }
+        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(e) => Err(stringify(e)),
+    }
+}
+
 /// A dashboard edit that lands between the preflight GET and PUT must never be overwritten.
 /// Keep this message stable and actionable: it is surfaced directly in the Teams UI.
-const STALE_PUSH_MESSAGE: &str =
+pub(crate) const STALE_PUSH_MESSAGE: &str =
     "The team config changed before this update could be saved. Sync to review the latest settings, then try again; nothing was overwritten.";
 
 /// Fetch the complete current config before an admin replaces its server list. Unlike the
 /// sync pull, this request uses the management view and is unconditional: disabled
 /// entries, dashboard metadata, policies and future fields must survive publishing.
-fn fetch_config_for_update(
+pub(crate) fn fetch_config_for_update(
     server_url: &str,
     team_id: &str,
     token: &str,
@@ -1127,14 +1143,21 @@ fn finish_connect(
     // multi-second) network round trip and apply onto that — mirroring `sync_inner`.
     // Loading first and saving here would clobber any change another command made to the
     // registry while we were waiting on the join window's pull.
-    let pulled = pull_config(
+    if let Some(status) = fetch_account_status(&conn, &joined.member_token)? {
+        conn.unknown_fields.insert("accountStatus".into(), status);
+    }
+    let personal = conn.role == "admin" && conn.unknown_fields.get("accountStatus").is_some_and(|s| s["personalSync"] == true);
+    let pulled = if personal {
+        let (version, config) = fetch_config_for_update(server_url, &joined.team_id, &joined.member_token)?;
+        Some((version, config, None))
+    } else { pull_config(
         &base(server_url),
         &joined.team_id,
         &joined.member_token,
         0,
         None,
         0,
-    )?;
+    )? };
     if let Ok(MembershipCheck::Active {
         team_name,
         account_linked,
@@ -1157,7 +1180,7 @@ fn finish_connect(
         reg.team = Some(conn);
         let mut outcome = MergeOutcome::default();
         if let Some((version, cfg, etag)) = pulled {
-            outcome = stage_team_config(reg, &joined.team_id, &cfg, version, &labels)?;
+            outcome = if crate::personal_sync::is_personal(reg) { crate::personal_sync::apply(reg, &cfg, version)? } else { stage_team_config(reg, &joined.team_id, &cfg, version, &labels)? };
             if let Some(t) = reg.team.as_mut() {
                 t.last_version = version;
                 t.last_etag = etag;
@@ -1189,7 +1212,9 @@ pub enum SyncResult {
 }
 
 pub fn sync_now() -> Result<SyncResult, String> {
-    sync_recorded(0)
+    let result = sync_recorded(0);
+    crate::personal_sync::record_error(result.as_ref().err().map(String::as_str));
+    result
 }
 
 /// Long-polling variant of [`sync_now`]: the config pull parks on the server for up to
@@ -1197,7 +1222,9 @@ pub fn sync_now() -> Result<SyncResult, String> {
 /// edit enforces in about a second. The membership heartbeat still runs first each cycle,
 /// so removal and role changes are caught at least once per cycle. The caller loops.
 pub fn sync_wait(wait_secs: u64) -> Result<SyncResult, String> {
-    sync_recorded(wait_secs)
+    let result = sync_recorded(wait_secs);
+    crate::personal_sync::record_error(result.as_ref().err().map(String::as_str));
+    result
 }
 
 /// Bounded retry pacing for native lifecycle owners; independent of window visibility.
@@ -1277,6 +1304,20 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         ),
     };
     let role_changed = role != conn.role;
+    let status = fetch_account_status(&conn, &token)?;
+    let (fresh, _) = crate::personal_sync::remote_update(|| crate::registry::update(|reg| {
+        if let Some(t) = reg.team.as_mut().filter(|t| t.team_id == conn.team_id && t.reporting_device_id == conn.reporting_device_id) {
+            t.role = role.clone(); t.team_name = team_name.clone(); t.account_linked = account_linked;
+            t.unknown_fields.insert("accountStatus".into(), status.clone().unwrap_or(Value::Null));
+        }
+        Ok(())
+    }))?;
+    if let Some(status) = &status {
+        if status["canReceiveConfig"] == false { return Err(status["reason"].as_str().unwrap_or("Sync is unavailable on this device. Open Your account to choose your active device.").into()); }
+    }
+    if crate::personal_sync::is_personal(&fresh) {
+        return crate::personal_sync::sync(fresh.team.as_ref().ok_or("Sign in to sync first")?, &token);
+    }
 
     let pulled = pull_config(
         &conn.server_url,
@@ -4011,7 +4052,7 @@ pub struct MergeOutcome {
 }
 
 /// How one team-config server is treated on the member's machine.
-enum TeamClass {
+pub(crate) enum TeamClass {
     /// No name/id, or an unusable shape — ignored silently.
     Skip,
     /// Link-local / cloud-metadata URL: SSRF-to-credentials, never synced.
@@ -4728,7 +4769,7 @@ fn team_host_is_private(host: &str) -> bool {
     crate::oauth::host_is_private(host)
 }
 
-fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
+pub(crate) fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
     // Management views include these rows; they must never become runtime routes.
     if s.get("disabled").and_then(Value::as_bool) == Some(true) {
         return TeamClass::Skip;

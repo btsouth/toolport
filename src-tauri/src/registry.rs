@@ -4723,7 +4723,9 @@ pub fn update<T>(
     let path = resolved_path().ok_or("Could not resolve registry path")?;
     let lock = lock_for(&path, registry_lock_timeout())?;
     let mut reg = load_from_locked(&path, &lock)?;
+    let before = reg.clone();
     let out = f(&mut reg)?;
+    crate::personal_sync::record(&before, &mut reg)?;
     // Save to the exact path we locked and loaded. Re-resolving after `f` would let a
     // runtime env override change redirect this write to a different, unlocked registry.
     save_to(&path, &reg)?;
@@ -4743,7 +4745,9 @@ pub fn update_authoritative<T>(
     if !source.is_authoritative() {
         return Err("Registry contents are not authoritative; refusing filesystem changes".into());
     }
+    let before = reg.clone();
     let out = f(&mut reg)?;
+    crate::personal_sync::record(&before, &mut reg)?;
     save_to(&path, &reg)?;
     Ok((reg, out))
 }
@@ -4771,7 +4775,9 @@ pub fn update_at<T>(
 ) -> Result<(Registry, T), String> {
     let lock = lock_for(path, registry_lock_timeout())?;
     let mut reg = load_from_locked(path, &lock)?;
+    let before = reg.clone();
     let out = f(&mut reg)?;
+    crate::personal_sync::record(&before, &mut reg)?;
     save_to(path, &reg)?;
     Ok((reg, out))
 }

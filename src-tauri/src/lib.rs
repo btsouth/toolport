@@ -61,6 +61,7 @@ pub mod stdio_adapter;
 pub mod team_activity;
 pub mod team_sync_status;
 pub mod teams;
+pub mod personal_sync;
 pub mod teams_plan;
 pub mod telemetry;
 pub mod topology;
