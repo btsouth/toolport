@@ -1848,6 +1848,10 @@ mod review_regressions {
                     ])
                     .env("TOOLPORT_APPROVAL_TEST_PATH", &path)
                     .env("TOOLPORT_APPROVAL_TEST_ID", format!("writer-{id}"))
+                    // The test checks for lost writes, not lock latency. Six cold
+                    // test processes can exceed the 5 s production deadline on
+                    // slow Windows runners.
+                    .env("TOOLPORT_LOCK_TIMEOUT_MS", "60000")
                     .stdout(Stdio::null())
                     .spawn()
                     .unwrap()
