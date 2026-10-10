@@ -1427,7 +1427,7 @@ impl SettingsPage {
             control.set_sensitive(false);
             let page = page.clone();
             gtk::glib::spawn_future_local(async move {
-                let result = gtk::gio::spawn_blocking(move || {
+                let result = super::run_user_action(move || {
                     crate::registry_controller::set_safety_level(level)
                 })
                 .await;
@@ -1477,7 +1477,7 @@ impl SettingsPage {
                 let switch = switch.clone();
                 let page = page.clone();
                 gtk::glib::spawn_future_local(async move {
-                    let result = gtk::gio::spawn_blocking(move || {
+                    let result = super::run_user_action(move || {
                         crate::registry_controller::set_essential_setting(setting, enabled)
                     })
                     .await;
@@ -1527,7 +1527,7 @@ impl SettingsPage {
                 page.begin_mutation();
                 let page = page.clone();
                 gtk::glib::spawn_future_local(async move {
-                    let result = gtk::gio::spawn_blocking(move || {
+                    let result = super::run_user_action(move || {
                         if enabled {
                             crate::autostart::enable_linux(NATIVE_AUTOSTART_NAME)
                         } else {

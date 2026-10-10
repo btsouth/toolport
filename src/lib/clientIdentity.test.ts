@@ -10,7 +10,11 @@ it("keeps raw IDs out of names and keeps version reports explicitly untrusted", 
   expect(trustedClientName({})).toBe("Unrecorded client");
   expect(
     activityClientName({ clientName: "Claude Code", clientLabel: "Claude Code 2.1" }),
-  ).toBe('Claude Code (reports "Claude Code 2.1")');
+  ).toBe("Claude Code");
+  expect(activityClientName({ clientName: "inbox", clientLabel: "inbox 1" })).toBe("inbox");
+  expect(
+    activityClientName({ clientName: "Codex", clientLabel: "codex-mcp-client 0.162.1" }),
+  ).toBe('Codex (reports "codex-mcp-client 0.162.1")');
   expect(activityClientName({ clientName: "Claude Code", clientLabel: "Other" })).toBe(
     'Claude Code (reports "Other")',
   );
