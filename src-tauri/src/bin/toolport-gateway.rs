@@ -18789,64 +18789,71 @@ fn spawn_daemon_idle_watchdog(
     grace: Duration,
 ) {
     let poll = Duration::from_millis(200).min(grace);
-    std::thread::spawn(move || loop {
-        std::thread::sleep(poll);
-        if inflight.load(Ordering::Relaxed) > 0 {
-            continue;
-        }
-        if host.http_service_lease_active() {
-            continue;
-        }
-        let update_requested = host.shutdown_if_idle.load(Ordering::Acquire);
-        if !update_requested && host.idle_for() < grace {
-            continue;
-        }
-        if update_requested
-            && host
-                .mcp_sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .values()
-                .any(|session| session.listener_active.load(Ordering::Acquire))
-        {
-            continue;
-        }
-        // Commit: stop advertising this daemon, then confirm nothing connected in the
-        // window between the check and here.
-        conduit_lib::daemon::clear_descriptor(&descriptor_path);
-        std::thread::sleep(poll);
-        if inflight.load(Ordering::Relaxed) > 0
-            || host.http_service_lease_active()
-            || (update_requested
+    std::thread::spawn(move || {
+        let mut cache_tick = Instant::now();
+        loop {
+            std::thread::sleep(poll);
+            if cache_tick.elapsed() >= Duration::from_secs(30) {
+                conduit_lib::shaping::maintain_cache();
+                cache_tick = Instant::now();
+            }
+            if inflight.load(Ordering::Relaxed) > 0 {
+                continue;
+            }
+            if host.http_service_lease_active() {
+                continue;
+            }
+            let update_requested = host.shutdown_if_idle.load(Ordering::Acquire);
+            if !update_requested && host.idle_for() < grace {
+                continue;
+            }
+            if update_requested
                 && host
                     .mcp_sessions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .values()
-                    .any(|session| session.listener_active.load(Ordering::Acquire)))
-        {
-            // A client found us first. Advertise again and keep serving.
-            let _ = conduit_lib::daemon::write_descriptor(&descriptor_path, &descriptor);
-            continue;
+                    .any(|session| session.listener_active.load(Ordering::Acquire))
+            {
+                continue;
+            }
+            // Commit: stop advertising this daemon, then confirm nothing connected in the
+            // window between the check and here.
+            conduit_lib::daemon::clear_descriptor(&descriptor_path);
+            std::thread::sleep(poll);
+            if inflight.load(Ordering::Relaxed) > 0
+                || host.http_service_lease_active()
+                || (update_requested
+                    && host
+                        .mcp_sessions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .values()
+                        .any(|session| session.listener_active.load(Ordering::Acquire)))
+            {
+                // A client found us first. Advertise again and keep serving.
+                let _ = conduit_lib::daemon::write_descriptor(&descriptor_path, &descriptor);
+                continue;
+            }
+            glog(if update_requested {
+                "daemon_exit reason=update_idle prior=healthy"
+            } else {
+                "daemon_exit reason=idle_timeout prior=healthy"
+            });
+            for session in host
+                .mcp_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+            {
+                session.close_reason(observation::CloseReason::GatewayShutdown);
+            }
+            // Land any queued audit/savings/search-trace lines before the process exits.
+            if let Some(dir) = descriptor_path.parent() {
+                conduit_lib::daemon_log::end_run_cleanly(dir);
+            }
+            conduit_lib::telemetry::exit_with(0);
         }
-        glog(if update_requested {
-            "daemon_exit reason=update_idle prior=healthy"
-        } else {
-            "daemon_exit reason=idle_timeout prior=healthy"
-        });
-        for session in host
-            .mcp_sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-        {
-            session.close_reason(observation::CloseReason::GatewayShutdown);
-        }
-        // Land any queued audit/savings/search-trace lines before the process exits.
-        if let Some(dir) = descriptor_path.parent() {
-            conduit_lib::daemon_log::end_run_cleanly(dir);
-        }
-        conduit_lib::telemetry::exit_with(0);
     });
 }
 

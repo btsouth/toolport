@@ -12,7 +12,7 @@
 
 use crate::session_store::SessionStore;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -26,11 +26,11 @@ pub const DEFAULT_BUDGET_BYTES: usize = 48 * 1024;
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// Cap on the number of cached shaped results. A burst of large tool calls would
-/// otherwise grow process memory without bound between lazy TTL sweeps. Oldest
+/// otherwise grow process memory without bound between TTL sweeps. Oldest
 /// entries (by insertion time) are evicted first.
 const MAX_CACHE_ENTRIES: usize = 64;
 
-/// Cap on total cached body bytes. Evict oldest until a new body fits, or the
+/// Cap on estimated retained bytes, including parsed JSON allocations. Evict oldest until a new body fits, or the
 /// cache is empty (then one over-cap body is kept rather than dropping the result
 /// the caller just produced).
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -62,9 +62,7 @@ struct Cached {
     server: Option<String>,
     body: String,
     structured: Option<Value>,
-    /// The entry's total serialized size (`body` + structured JSON), computed once at
-    /// insert. The eviction loop sums this across entries on every oversized call, so
-    /// caching it avoids re-serializing every structured payload on each iteration.
+    /// Estimated retained allocations, computed once at insertion.
     size: usize,
     /// The client the result belongs to (a registered HTTP client's label), or None
     /// for the single-tenant stdio process. Only this client may fetch it back.
@@ -85,8 +83,56 @@ fn next_cursor() -> String {
     format!("r{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
+static TRIM_PENDING: AtomicBool = AtomicBool::new(false);
+
 fn sweep(store: &mut SessionStore<Cached>) {
-    store.reap_expired();
+    let before = store.weight(|c| c.size);
+    if store.reap_expired() > 0 && before >= 1024 * 1024 {
+        TRIM_PENDING.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Called by the daemon's existing maintenance tick. Reads never extend the
+/// insertion-based TTL. Trim outside the cache lock and off the request path.
+pub fn maintain_cache() {
+    {
+        let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
+        sweep(&mut store);
+    }
+    if TRIM_PENDING.swap(false, Ordering::Relaxed) {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        // SAFETY: glibc's allocator synchronizes trimming with other allocations.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+}
+
+// Include array capacity, string capacity, and an amortized B-tree node estimate
+// per object member. This bounds retained cost rather than serialized JSON size.
+fn value_heap_size(value: &Value) -> usize {
+    match value {
+        Value::String(s) => s.capacity(),
+        Value::Array(a) => {
+            a.capacity() * std::mem::size_of::<Value>()
+                + a.iter().map(value_heap_size).sum::<usize>()
+        }
+        Value::Object(o) => o
+            .iter()
+            .map(|(key, value)| {
+                std::mem::size_of::<String>()
+                    + std::mem::size_of::<Value>()
+                    + 3 * std::mem::size_of::<usize>()
+                    + key.capacity()
+                    + value_heap_size(value)
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn retained_size(body: &String, structured: Option<&Value>) -> usize {
+    std::mem::size_of::<Cached>() + body.capacity() + structured.map(value_heap_size).unwrap_or(0)
 }
 
 /// Bound memory: evict oldest until the entry count and total bytes leave room for
@@ -101,6 +147,7 @@ fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) {
         if !store.remove_oldest() {
             break;
         }
+        TRIM_PENDING.store(true, Ordering::Relaxed);
     }
 }
 
@@ -295,7 +342,7 @@ pub fn shape_result_preserving_prefix(
         .unwrap_or(false);
 
     let cursor = next_cursor();
-    let new_entry_size = body.len() + structured.as_ref().map(value_size).unwrap_or(0);
+    let new_entry_size = retained_size(&body, structured.as_ref());
 
     // Build the shaped result for a given head, then measure it. The marker's own
     // length varies with the head length it reports, and the preserved envelope is
@@ -382,6 +429,9 @@ pub fn shape_result_preserving_prefix(
     }
 
     *result = shaped;
+    if size >= 1024 * 1024 {
+        TRIM_PENDING.store(true, Ordering::Relaxed);
+    }
     true
 }
 
@@ -391,7 +441,7 @@ pub fn shape_result_preserving_prefix(
 /// without inflating the result it rides on.
 pub fn stash_payload(body: String, structured: Option<Value>, owner: Option<&str>) -> String {
     let cursor = next_cursor();
-    let size = body.len() + structured.as_ref().map(value_size).unwrap_or(0);
+    let size = retained_size(&body, structured.as_ref());
     let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
     sweep(&mut store);
     evict_to_fit(&mut store, size);
@@ -1110,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_size_records_body_plus_structured_bytes() {
+    fn cached_size_records_retained_allocations() {
         // The eviction loop trusts `Cached.size` instead of re-serializing, so a
         // size recorded as 0 (or body-only) would silently disable the byte cap.
         let structured = json!({ "rows": ["y".repeat(3_000)] });
@@ -1128,10 +1178,34 @@ mod tests {
             .expect("the shaped result is cached under its cursor");
         assert_eq!(
             entry.size,
-            entry.body.len() + entry.structured.as_ref().map(value_size).unwrap_or(0),
+            retained_size(&entry.body, entry.structured.as_ref()),
             "recorded size must cover the body and the stashed structuredContent"
         );
         assert!(entry.size >= 8_000, "recorded size was {}", entry.size);
+    }
+
+    #[test]
+    fn small_json_members_charge_tree_allocations() {
+        let structured =
+            json!({"rows": (0..1000).map(|_| json!({"a": 1, "b": 2})).collect::<Vec<_>>()});
+        let size = retained_size(&String::new(), Some(&structured));
+        assert!(size > value_size(&structured) * 5);
+        let mut store = SessionStore::new(CACHE_TTL, MAX_CACHE_ENTRIES);
+        store.insert("first", cached_entry(MAX_CACHE_BYTES - size + 1));
+        evict_to_fit(&mut store, size);
+        assert!(store.is_empty(), "parsed allocations must trigger eviction");
+    }
+
+    #[test]
+    fn sweep_releases_expired_results_without_a_fetch() {
+        let mut store = SessionStore::new(Duration::ZERO, MAX_CACHE_ENTRIES);
+        store.insert("expired", cached_entry(1024 * 1024));
+        sweep(&mut store);
+        assert!(store.is_empty());
+        let mut live = SessionStore::new(CACHE_TTL, MAX_CACHE_ENTRIES);
+        live.insert("live", cached_entry(1));
+        sweep(&mut live);
+        assert!(live.get("live").is_some());
     }
 
     #[test]
