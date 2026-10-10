@@ -109,9 +109,29 @@ pub(crate) fn remove_toolport_entries(names: &[&str]) -> Vec<crate::purge::Lefto
         let run_path = format!("HKCU\\{RUN_KEY}\\{name}");
         let approval_path = format!("HKCU\\{STARTUP_APPROVED_KEY}\\{name}");
         let result = (|| {
+            let missing_run = || {
+                match user.open_subkey_with_flags(STARTUP_APPROVED_KEY, KEY_READ) {
+                    Ok(key) => match key.get_raw_value(name) {
+                        Ok(_) => Err(crate::purge::Leftover {
+                            path: approval_path.clone(),
+                            error: "Startup approval has no Toolport launch command to verify ownership. It was preserved.".into(),
+                        }),
+                        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(crate::purge::Leftover {
+                            path: approval_path.clone(),
+                            error: error.to_string(),
+                        }),
+                    },
+                    Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(crate::purge::Leftover {
+                        path: approval_path.clone(),
+                        error: error.to_string(),
+                    }),
+                }
+            };
             let run = match user.open_subkey_with_flags(RUN_KEY, KEY_READ | KEY_WRITE) {
                 Ok(run) => run,
-                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => return missing_run(),
                 Err(error) => {
                     return Err(crate::purge::Leftover {
                         path: run_path.clone(),
@@ -121,7 +141,7 @@ pub(crate) fn remove_toolport_entries(names: &[&str]) -> Vec<crate::purge::Lefto
             };
             let command = match run.get_value::<String, _>(*name) {
                 Ok(command) => command,
-                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => return missing_run(),
                 Err(error) => {
                     return Err(crate::purge::Leftover {
                         path: run_path.clone(),
