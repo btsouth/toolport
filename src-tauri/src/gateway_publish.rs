@@ -480,7 +480,7 @@ fn default_keep_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn paths_equal(a: &Path, b: &Path) -> bool {
+pub(crate) fn paths_equal(a: &Path, b: &Path) -> bool {
     // Resolve symlinks when the files exist so macOS helper vs Contents/MacOS
     // symlink to the same binary both match a keep path.
     let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());

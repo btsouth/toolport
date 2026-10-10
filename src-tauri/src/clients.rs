@@ -6831,7 +6831,10 @@ fn referenced_gateway_paths_in(clients: &[DetectedClient]) -> Option<Vec<PathBuf
                 continue;
             }
             let path = PathBuf::from(command);
-            if !out.iter().any(|p| p == &path) {
+            if !out
+                .iter()
+                .any(|p| crate::gateway_publish::paths_equal(p, &path))
+            {
                 out.push(path);
             }
         }
@@ -6857,10 +6860,12 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
         return outcome;
     }
     // Preserve paths cached by clients before their on-disk configs are repointed.
+    #[cfg(target_os = "linux")]
     let before = referenced_gateway_paths();
     let mut outcome = repoint_stale_gateways_in(&current, detect_clients(), managed);
     repoint_other_claude_configs(&current, &mut outcome);
     log_repoint_outcome(&current, &outcome);
+    #[cfg(target_os = "linux")]
     if let Some(dir) = crate::registry::conduit_dir().map(|d| d.join("bin")) {
         let references = before
             .zip(referenced_gateway_paths())
@@ -6878,9 +6883,10 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
     outcome
 }
 
-/// 1.x AppImage copies (stable_gateway_copy) and Windows published images used
-/// this private bin directory. A matching name alone is not ownership: preserve
+/// 1.x Linux AppImages used stable_gateway_copy in this private bin directory.
+/// macOS uses bundled helpers; Windows publishing remains owned by its pruner. A matching name alone is not ownership: preserve
 /// symlinks, scripts and foreign executables, including user-written wrappers.
+#[cfg(any(target_os = "linux", test))]
 fn is_legacy_gateway_copy(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -6914,6 +6920,7 @@ fn is_legacy_gateway_copy(path: &Path) -> bool {
         .all(|marker| bytes.windows(marker.len()).any(|w| w == *marker))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn refresh_legacy_gateway(current: &Path, dest: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -6952,7 +6959,11 @@ fn refresh_legacy_gateway(current: &Path, dest: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn cleanup_legacy_gateway_copies(current: &Path, dir: &Path, references: Option<&[PathBuf]>) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
     let Some(references) = references else {
         eprintln!("toolport: skipping legacy gateway cleanup: client references are unknown");
         return;
@@ -6966,20 +6977,14 @@ fn cleanup_legacy_gateway_copies(current: &Path, dir: &Path, references: Option<
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path == current
-            || path
-                .canonicalize()
-                .ok()
-                .zip(current.canonicalize().ok())
-                .is_some_and(|(p, c)| p == c)
-            || !is_legacy_gateway_copy(&path)
-        {
+        if crate::gateway_publish::paths_equal(&path, current) || !is_legacy_gateway_copy(&path) {
             continue;
         }
         let name = entry.file_name();
-        let referenced = references
-            .iter()
-            .any(|r| r == &path || (!r.is_absolute() && r.file_name() == path.file_name()));
+        let referenced = references.iter().any(|r| {
+            crate::gateway_publish::paths_equal(r, &path)
+                || (!r.is_absolute() && r.file_name() == path.file_name())
+        });
         let result = if referenced {
             // Keep cached/customized paths usable without leaving 1.x code behind.
             refresh_legacy_gateway(current, &path)
@@ -8045,6 +8050,24 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn legacy_cleanup_leaves_published_and_bundled_gateways_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("toolport-gateway-2.0.0.exe");
+        let cached = dir.path().join("toolport-gateway-1.23.0.exe");
+        let plain = dir.path().join("toolport-gateway.exe");
+        let old = b"MZtoolport-gateway\0TOOLPORT_CLIENT_ID\0tools/call";
+        for path in [&cached, &plain] {
+            std::fs::write(path, old).unwrap();
+        }
+        cleanup_legacy_gateway_copies(&current, dir.path(), Some(&[]));
+        for path in [&cached, &plain] {
+            assert_eq!(std::fs::read(path).unwrap(), old);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn f6_legacy_gateway_cleanup_preserves_foreign_files_and_references() {
         let _lock = crate::registry::data_dir_test_lock();
         let _env_lock = env_test_lock();
