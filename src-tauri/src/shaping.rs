@@ -246,7 +246,7 @@ fn extract_body(result: &Value) -> (String, usize, Option<Structured>) {
         let structured_text = serde_json::to_string(sc).unwrap_or_default();
         source_bytes += structured_text.len() + usize::from(!out.is_empty());
         // Some servers return the same JSON as text and structuredContent. Keep
-        // the original text bytes and the separately cached typed projection,
+        // the original text bytes and derive typed projections from those bytes,
         // without making every page repeat that JSON a second time. Only a
         // single text block can qualify; mixed/multiple blocks remain lossless.
         let single_text = result
@@ -518,6 +518,9 @@ pub fn stash_payload(body: String, structured: Option<Value>, owner: Option<&str
             owner: owner.map(str::to_string),
         },
     );
+    if size >= 1024 * 1024 {
+        TRIM_PENDING.store(true, Ordering::Relaxed);
+    }
     cursor
 }
 
