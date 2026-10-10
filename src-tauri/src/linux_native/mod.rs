@@ -10298,6 +10298,46 @@ mod tests {
     }
 
     #[test]
+    fn legacy_quarantine_review_stays_in_the_main_view_and_cannot_be_accepted() {
+        let data = crate::registry::DataDirTestEnv::new("gtk-legacy-quarantine-review");
+        let mut registry = crate::registry::Registry::default();
+        registry.profiles.push(crate::registry::Profile {
+            id: "work".into(),
+            name: "Work".into(),
+            enabled_server_ids: vec![],
+            tool_scope: Default::default(),
+            instructions: None,
+            unknown_fields: Default::default(),
+        });
+        crate::registry::save(&registry).unwrap();
+        let store = data.dir.join(format!(
+            "quarantine-v2-{}.json",
+            crate::registry::profile_store_key("work")
+        ));
+        std::fs::write(
+            store,
+            r#"{"srv__update":{"tool":"srv__update","change":"changed"}}"#,
+        )
+        .unwrap();
+        for profile in [serde_json::Value::Null, serde_json::json!("work")] {
+            let event = serde_json::json!({"type":"tool_drift", "tool":"srv__update", "server":"srv", "change":"changed", "profile":profile, "ts":1});
+            let mut lines = vec![event.to_string()];
+            lines.extend((2..=56).map(|ts| serde_json::json!({"type":"tool_drift", "tool":format!("other__read{ts}"), "server":"other", "ts":ts}).to_string()));
+            std::fs::write(data.dir.join("security.jsonl"), lines.join("\n") + "\n").unwrap();
+            let snapshot = state::load_activity_snapshot().unwrap();
+            let old = snapshot.security_events.last().unwrap();
+            assert!(old["blocked"].is_null());
+            assert_ne!(old["historical"], true);
+            assert!(!change_can_be_accepted(old));
+            assert!(!group_can_be_accepted(
+                &crate::integrity::group_tool_changes(&[old.clone()]).remove(0)
+            ));
+            assert!(security_review_lines(old)
+                .iter()
+                .any(|line| line.contains("Settings > Quarantined tools")));
+        }
+    }
+    #[test]
     fn poison_flagged_drift_requires_per_tool_review_and_shows_signatures() {
         let event = serde_json::json!({"type":"tool_drift", "server":"srv", "tool":"srv__update", "ts":100, "blocked":true, "blocked_profiles":["work"], "new_fp":"v2:reviewed", "signatures":["instruction_override"]});
         let group = crate::integrity::group_tool_changes(&[event.clone()]).remove(0);

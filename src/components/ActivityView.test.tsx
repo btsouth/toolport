@@ -800,6 +800,39 @@ describe("ActivityView security drift dismissals", () => {
     ).not.toHaveAttribute("open");
   });
 
+  it.each([undefined, "work"])(
+    "keeps an older unknown quarantine in the main view with profile %s",
+    async (profile) => {
+      localStorage.clear();
+      getSecurityEvents.mockResolvedValue([
+        ...Array.from({ length: 55 }, (_, i) => ({
+          ...warnEvent(1_700_000_000_000),
+          tool: `old__read${i}`,
+          server: "old",
+          historical: i >= 50,
+        })),
+        {
+          ...warnEvent(1_600_000_000_000),
+          tool: "legacy__update",
+          server: "legacy",
+          profile,
+          blocked: null,
+        },
+      ]);
+      render(<ActivityView refreshKey={0} registry={null} />);
+      await act(async () => {});
+      const row = screen.getByRole("button", { name: /legacy: 1 tool changed/ });
+      expect(row.closest("details")).toBeNull();
+      expect(screen.getByText(/5 older tool-change records/)).toBeInTheDocument();
+      expect(screen.getByText(/Settings > Quarantined tools/)).toBeInTheDocument();
+      fireEvent.click(row);
+      const accept = screen.getByRole("button", { name: "Accept this tool" });
+      expect(accept).toBeDisabled();
+      fireEvent.click(accept);
+      expect(releaseQuarantine).not.toHaveBeenCalled();
+    },
+  );
+
   it("accepts a server update larger than the old dismissal limit", async () => {
     localStorage.clear();
     const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });

@@ -4634,6 +4634,68 @@ mod tests {
     }
 
     #[test]
+    fn legacy_quarantine_review_stays_unknown_outside_recent_history() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("legacy-quarantine-review");
+        let mut reg = crate::registry::Registry::default();
+        reg.profiles.push(crate::registry::Profile {
+            id: "work".into(),
+            name: "Work".into(),
+            enabled_server_ids: vec![],
+            tool_scope: Default::default(),
+            instructions: None,
+            unknown_fields: Default::default(),
+        });
+        crate::registry::save(&reg).unwrap();
+        for (profile, event_profile) in [
+            (None, None),
+            (Some("work"), Some("work")),
+            (Some("work"), None),
+        ] {
+            for (event_fp, record_fp) in [(None, None), (Some("v2:new"), None), (None, Some("v2:new"))]
+            {
+                let mut record = json!({"tool":"srv__update", "change":"changed"});
+                if let Some(fp) = record_fp {
+                    record["definition_fp"] = json!(fp);
+                }
+                save_quarantine(profile, &BTreeMap::from([("srv__update".into(), record)])).unwrap();
+                let mut event = json!({"type":"tool_drift", "tool":"srv__update", "server":"srv", "change":"changed", "ts":1});
+                if let Some(profile) = event_profile {
+                    event["profile"] = json!(profile);
+                }
+                if let Some(fp) = event_fp {
+                    event["new_fp"] = json!(fp);
+                }
+                let mut lines = vec![event.to_string()];
+                lines.extend((2..=56).map(|ts| json!({"type":"tool_drift", "tool":format!("other__read{ts}"), "server":"other", "ts":ts}).to_string()));
+                std::fs::write(_data.path.join("security.jsonl"), lines.join("\n") + "\n").unwrap();
+                let events = review_events_uncached(2000).unwrap();
+                let old = events.last().unwrap();
+                assert!(
+                    old["blocked"].is_null(),
+                    "{profile:?}, {event_profile:?}, {event_fp:?}, {record_fp:?}: {old}"
+                );
+                assert!(old.get("historical").is_none());
+                assert!(events[50..55]
+                    .iter()
+                    .all(|event| event["historical"] == true));
+                save_quarantine(profile, &BTreeMap::new()).unwrap();
+            }
+        }
+        save_quarantine(
+            Some("work"),
+            &BTreeMap::from([(
+                "srv__update".into(),
+                json!({"tool":"srv__update", "change":"changed"}),
+            )]),
+        )
+        .unwrap();
+        record_event(
+            &json!({"type":"tool_drift", "tool":"srv__update", "profile":"personal", "ts":100}),
+        );
+        assert_eq!(review_events_uncached(2000).unwrap()[0]["blocked"], false);
+    }
+    #[test]
     fn review_cache_skips_unchanged_reads_and_invalidates_all_inputs() {
         let _data_dir_lock = crate::registry::data_dir_test_lock();
         let data = TestDataDir::new("review-cache");
