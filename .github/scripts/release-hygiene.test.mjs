@@ -199,3 +199,26 @@ test("complete payload manifests reject extra resources and require both binarie
     );
   }
 });
+
+test("MSI validates full installation paths before normalizing its app directory", async () => {
+  const { assertManifest } = await import("./package-manifest.mjs");
+  assertManifest(
+    [
+      "ProgramFiles64Folder/Toolport/conduit.exe",
+      "ProgramFiles64Folder/Toolport/toolport-gateway.exe",
+    ],
+    "msi",
+  );
+  assert.throws(
+    () =>
+      assertManifest(
+        [
+          "ProgramFiles64Folder/Toolport/conduit.exe",
+          "ProgramFiles64Folder/Toolport/toolport-gateway.exe",
+          "ProgramFiles64Folder/OtherApp/conduit.exe",
+        ],
+        "msi",
+      ),
+    /Unexpected/,
+  );
+});

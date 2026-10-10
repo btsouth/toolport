@@ -73,6 +73,12 @@ export function assertManifest(paths, kind) {
         : "Contents/MacOS/toolport-gateway";
   const files = normalized
     .map((path) => {
+      if (kind === "msi") {
+        return path.replace(
+          /^(?:ProgramFiles(?:64)?Folder|LocalAppDataFolder)\/Toolport\//,
+          "",
+        );
+      }
       if (kind === "mac") {
         if (/\.app(?:\/|$)/.test(path))
           return path
