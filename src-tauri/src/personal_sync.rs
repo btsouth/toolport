@@ -26,6 +26,8 @@ pub struct Mutation {
     pub before: Option<Value>,
     pub after: Option<Value>,
     pub at: i64,
+    /// First sign-in found two different definitions without a common ancestor.
+    pub initial_conflict: bool,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -384,6 +386,7 @@ pub(crate) fn record(before: &Registry, reg: &mut Registry) -> Result<(), String
             .get(id)
             .map(|m| m.before.clone())
             .unwrap_or_else(|| st.baseline.get(id).cloned());
+        let initial_conflict = st.pending.get(id).is_some_and(|m| m.initial_conflict);
         let local_id = b.get(id).or_else(|| a.get(id)).unwrap().0.clone();
         if same(base.as_ref(), after.as_ref()) {
             st.pending.remove(id);
@@ -396,6 +399,7 @@ pub(crate) fn record(before: &Registry, reg: &mut Registry) -> Result<(), String
                     before: base,
                     after,
                     at: now(),
+                    initial_conflict,
                 },
             );
         }
@@ -429,7 +433,9 @@ pub fn merge(
     let mut conflicts = BTreeMap::new();
     for (id, m) in pending {
         let current = servers.get(id).cloned();
-        if !same(current.as_ref(), m.before.as_ref()) && !same(current.as_ref(), m.after.as_ref()) {
+        if (m.initial_conflict || !same(current.as_ref(), m.before.as_ref()))
+            && !same(current.as_ref(), m.after.as_ref())
+        {
             conflicts.insert(id.clone(), current.unwrap_or(Value::Null));
             continue;
         }
@@ -646,7 +652,8 @@ pub fn apply(
                         local_id: local.id.clone(),
                         // With no common baseline, different existing local and
                         // remote definitions require an explicit conflict choice.
-                        before: None,
+                        before: remote.get(&id).cloned(),
+                        initial_conflict: remote.contains_key(&id),
                         after: Some(after),
                         at: now(),
                     },
@@ -927,7 +934,18 @@ pub fn resolve_conflict(id: &str, expected: &Value, keep_mine: bool) -> Result<R
                 m.before = (!expected.is_null()).then(|| expected.clone());
                 m.at = 0;
             } else {
-                st.pending.remove(id);
+                if let Some(m) = st.pending.remove(id) {
+                    if expected.is_null() {
+                        if let Some(team) = r.team.as_ref().map(|t| t.team_id.clone()) {
+                            crate::local_auth::revoke_personal_route(r, &team, &m.local_id);
+                        }
+                        r.servers.retain(|s| s.id != m.local_id);
+                        for profile in &mut r.profiles {
+                            profile.enabled_server_ids.retain(|sid| sid != &m.local_id);
+                            profile.tool_scope.remove(&m.local_id);
+                        }
+                    }
+                }
             }
             st.conflicts.remove(id);
             save(r, &st)
@@ -1215,11 +1233,37 @@ mod tests {
         let (merged, conflicts) = merge(&cloud, &state(&r).unwrap().pending).unwrap();
         assert_eq!(merged, cloud);
         assert!(conflicts.contains_key("docs"));
+        let (_, deleted_conflict) = merge(&config(vec![]), &state(&r).unwrap().pending).unwrap();
+        assert_eq!(deleted_conflict.get("docs"), Some(&Value::Null));
         assert_eq!(r.servers.len(), 1);
         assert_eq!(
             r.servers[0].url.as_deref(),
             Some("https://local.example/mcp")
         );
+    }
+    #[test]
+    fn accepting_remote_delete_after_conflict_removes_the_local_route() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-conflict-delete");
+        let mut r = machine();
+        let cloud = config(vec![http("docs")]);
+        apply(&mut r, &cloud, 1).unwrap();
+        let before = r.clone();
+        r.servers[0].name = "Local edit".into();
+        record(&before, &mut r).unwrap();
+        let deleted = config(vec![]);
+        apply(&mut r, &deleted, 2).unwrap();
+        let (_, conflicts) = merge(&deleted, &state(&r).unwrap().pending).unwrap();
+        let mut st = state(&r).unwrap();
+        st.conflicts = conflicts;
+        save(&mut r, &st).unwrap();
+        crate::registry::save(&r).unwrap();
+        let r = resolve_conflict("docs", &Value::Null, false).unwrap();
+        assert!(r.servers.is_empty());
+        assert!(!r
+            .profiles
+            .iter()
+            .any(|p| p.enabled_server_ids.iter().any(|id| id == "docs")));
+        assert!(state(&r).unwrap().pending.is_empty());
     }
     #[test]
     fn reference_sources_export_only_the_reference_and_use_secret_wire_defaults() {
