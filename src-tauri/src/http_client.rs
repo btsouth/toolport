@@ -54,12 +54,66 @@ impl ureq::unversioned::transport::Connector for ConnectPhaseConnector {
         details: &ureq::unversioned::transport::ConnectionDetails,
         chained: Option<()>,
     ) -> Result<Option<Self::Out>, ureq::Error> {
-        use ureq::unversioned::transport::Connector as _;
-        ureq::unversioned::transport::DefaultConnector::default()
-            .connect(details, chained)
-            .map(|transport| transport.map(|inner| MetadataTransport { inner }))
+        use ureq::unversioned::transport::{
+            ConnectionDetails, Connector as _, RustlsConnector, TcpConnector,
+        };
+        // v2 gives the configured TCP connect budget precedence over the
+        // request deadline. TLS and HTTP I/O still use the request deadline.
+        let tcp_details = ConnectionDetails {
+            uri: details.uri,
+            addrs: details.addrs.clone(),
+            config: details.config,
+            request_level: details.request_level,
+            resolver: details.resolver,
+            now: (details.current_time)(),
+            timeout: socket_connect_timeout(details.config, details.timeout),
+            current_time: details.current_time.clone(),
+            run_connector: details.run_connector.clone(),
+        };
+        let connect_started = std::time::Instant::now();
+        TcpConnector::default()
+            .connect(&tcp_details, chained)
+            .and_then(|tcp| {
+                let elapsed = connect_started.elapsed();
+                let mut tls_details = ConnectionDetails {
+                    addrs: details.addrs.clone(),
+                    current_time: details.current_time.clone(),
+                    run_connector: details.run_connector.clone(),
+                    ..*details
+                };
+                if let ureq::unversioned::transport::time::Duration::Exact(budget) =
+                    details.timeout.after
+                {
+                    let remaining = budget.saturating_sub(elapsed);
+                    if remaining.is_zero() && details.needs_tls() {
+                        return Err(ureq::Error::Timeout(details.timeout.reason));
+                    }
+                    tls_details.timeout.after =
+                        ureq::unversioned::transport::time::Duration::Exact(remaining);
+                }
+                RustlsConnector::default().connect(&tls_details, tcp)
+            })
+            .map(|transport| {
+                transport.map(|inner| MetadataTransport {
+                    inner: Box::new(inner),
+                })
+            })
             .map_err(|error| ureq::Error::Other(Box::new(ConnectFailure(error))))
     }
+}
+
+fn socket_connect_timeout(
+    config: &ureq::config::Config,
+    request: ureq::unversioned::transport::NextTimeout,
+) -> ureq::unversioned::transport::NextTimeout {
+    use ureq::unversioned::transport::{time, NextTimeout};
+    config
+        .timeouts()
+        .connect
+        .map_or(request, |connect| NextTimeout {
+            after: time::Duration::Exact(connect),
+            reason: ureq::Timeout::Connect,
+        })
 }
 
 /// A full parser buffer is oversized metadata, not a disconnected peer.
@@ -351,6 +405,36 @@ mod tests {
             config.tls_config().root_certs(),
             ureq::tls::RootCerts::WebPki
         ));
+    }
+
+    #[test]
+    fn socket_connect_budget_keeps_v2_precedence_over_request_deadlines() {
+        let request = NextTimeout {
+            after: time::Duration::Exact(Duration::from_secs(2)),
+            reason: ureq::Timeout::Global,
+        };
+        let configured = socket_connect_timeout(&config_builder!().build(), request);
+        assert_eq!(
+            configured.after,
+            time::Duration::Exact(Duration::from_secs(30))
+        );
+        assert_eq!(configured.reason, ureq::Timeout::Connect);
+        let config = config_builder!()
+            .timeout_connect(Some(Duration::from_secs(1)))
+            .build();
+        assert_eq!(
+            socket_connect_timeout(&config, request).after,
+            time::Duration::Exact(Duration::from_secs(1))
+        );
+        let config = config_builder!().timeout_connect(None).build();
+        assert_eq!(
+            socket_connect_timeout(&config, request).after,
+            request.after
+        );
+        assert_eq!(
+            socket_connect_timeout(&config, request).reason,
+            request.reason
+        );
     }
 
     #[test]
