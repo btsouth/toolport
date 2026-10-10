@@ -969,15 +969,39 @@ mod tests {
 
     #[test]
     fn connect_timeouts_are_silence_not_evidence_of_a_dead_daemon() {
-        for error in [
-            ureq::Error::Timeout(ureq::Timeout::Connect),
-            ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
-            ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
-        ] {
-            assert!(matches!(classify_probe_error(crate::http_client::Error::Transport(error)), ProbeFailure::Silent));
+        for wrapped in [false, true] {
+            for error in [
+                ureq::Error::Timeout(ureq::Timeout::Connect),
+                ureq::Error::Timeout(ureq::Timeout::Global),
+                ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+                ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            ] {
+                let error = if wrapped {
+                    crate::http_client::mark_connect_failure(error)
+                } else {
+                    error
+                };
+                assert!(matches!(
+                    classify_probe_error(crate::http_client::Error::Transport(error)),
+                    ProbeFailure::Silent
+                ));
+            }
+            for kind in [
+                std::io::ErrorKind::ConnectionRefused,
+                std::io::ErrorKind::ConnectionReset,
+            ] {
+                let error = ureq::Error::Io(std::io::Error::from(kind));
+                let error = if wrapped {
+                    crate::http_client::mark_connect_failure(error)
+                } else {
+                    error
+                };
+                assert!(matches!(
+                    classify_probe_error(crate::http_client::Error::Transport(error)),
+                    ProbeFailure::Unreachable
+                ));
+            }
         }
-        assert!(matches!(classify_probe_error(crate::http_client::Error::Transport(
-            ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)))), ProbeFailure::Unreachable));
     }
 
     #[test]
