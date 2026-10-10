@@ -110,7 +110,13 @@ pub fn launch_after_exit(report_path: &Path) -> Result<(), String> {
     let report = options
         .open(report_path)
         .map_err(|error| error.to_string())?;
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    let mut child = command
         .args(["--remove-data", "--confirm", "--after-desktop-exit"])
         .stdin(Stdio::piped())
         .stdout(report)

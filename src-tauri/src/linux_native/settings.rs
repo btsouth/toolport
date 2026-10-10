@@ -526,8 +526,12 @@ impl SettingsPage {
                     return;
                 }
             };
-            let details = format!("Normal uninstall keeps your data. Toolport will close, restore and disconnect clients, then permanently remove:\n\n{}\n\nClient files and native servers stay. Failed restoration or active sessions keep data for recovery. This cannot be undone.\n\nResults and exact leftovers: {}", plan.resources.join("\n\n"), plan.report_path);
-            let dialog = adw::MessageDialog::new(parent.as_ref(), Some("Remove Toolport data?"), Some(&details));
+            let details = format!("{}\n\nResults and exact leftovers: {}", plan.resources.join("\n\n"), plan.report_path);
+            let dialog = adw::MessageDialog::new(parent.as_ref(), Some("Remove Toolport data?"), Some("Normal uninstall keeps your data. Toolport will close, restore and disconnect clients, then permanently remove the resources below. Client files and native servers stay. Failed restoration or active sessions keep data for recovery. This cannot be undone."));
+            let inventory = gtk::Label::builder().label(&details).wrap(true).xalign(0.0).selectable(true).build();
+            let scroller = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never)
+                .max_content_height(360).propagate_natural_height(true).child(&inventory).build();
+            dialog.set_extra_child(Some(&scroller));
             dialog.add_response("cancel", "Cancel");
             dialog.add_response("remove", "Close and remove data");
             dialog.set_close_response("cancel");
