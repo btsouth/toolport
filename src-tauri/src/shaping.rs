@@ -109,19 +109,20 @@ pub fn maintain_cache() {
     }
 }
 
-// Structured JSON stays canonical, so projecting a borrowed raw subtree yields
-// exactly the bytes that serializing the former Value subtree produced.
+// Keep canonical structured JSON only when the original text cannot supply it.
 enum Structured {
-    Body,
+    Body { canonical: bool },
     Json(String),
 }
 
 impl Structured {
-    fn new(body: &str, value: Option<&Value>) -> Option<Self> {
+    fn new(body: &str, value: Option<&Value>, duplicate: bool) -> Option<Self> {
         value.map(|value| {
             let json = value.to_string();
-            if json == body {
-                Self::Body
+            if duplicate || json == body {
+                Self::Body {
+                    canonical: json == body,
+                }
             } else {
                 Self::Json(json)
             }
@@ -130,7 +131,7 @@ impl Structured {
 
     fn json<'a>(&'a self, body: &'a str) -> &'a str {
         match self {
-            Self::Body => body,
+            Self::Body { .. } => body,
             Self::Json(json) => json,
         }
     }
@@ -146,8 +147,9 @@ fn retained_size(body: &String, structured: Option<&Structured>) -> usize {
 }
 
 // Stop at the selected subtree rather than parsing the rest of a large array.
-// The input was serialized from a Value, so it is already validated canonical
-// JSON. A private early-return error carries the borrowed result through serde.
+// The input was serialized from a Value or checked equal to that Value, so it
+// is already validated JSON. A private early-return error carries the borrowed
+// result through serde.
 fn project_json<'a>(json: &'a str, path: &str) -> Option<&'a str> {
     use serde::de::{DeserializeSeed, Error, IgnoredAny, MapAccess, SeqAccess, Visitor};
     use serde::Deserialize;
@@ -226,7 +228,7 @@ fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) {
 /// Concatenate the model-facing text of an MCP tool result's content blocks, then
 /// fold in `structuredContent` so nothing is lost when the structured payload is
 /// the bloat.
-fn extract_body(result: &Value) -> (String, usize) {
+fn extract_body(result: &Value) -> (String, usize, bool) {
     let mut out = String::new();
     if let Some(blocks) = result.get("content").and_then(|c| c.as_array()) {
         for b in blocks {
@@ -239,6 +241,7 @@ fn extract_body(result: &Value) -> (String, usize) {
         }
     }
     let mut source_bytes = out.len();
+    let mut duplicate = false;
     if let Some(sc) = result.get("structuredContent") {
         let structured_text = serde_json::to_string(sc).unwrap_or_default();
         source_bytes += structured_text.len() + usize::from(!out.is_empty());
@@ -250,7 +253,7 @@ fn extract_body(result: &Value) -> (String, usize) {
             .get("content")
             .and_then(Value::as_array)
             .is_some_and(|blocks| blocks.len() == 1 && blocks[0]["type"] == "text");
-        let duplicate = single_text
+        duplicate = single_text
             && (out == structured_text
                 || serde_json::from_str::<Value>(&out)
                     .ok()
@@ -262,7 +265,7 @@ fn extract_body(result: &Value) -> (String, usize) {
             out.push_str(&structured_text);
         }
     }
-    (out, source_bytes)
+    (out, source_bytes, duplicate)
 }
 
 fn value_size(value: &Value) -> usize {
@@ -350,11 +353,11 @@ pub fn shape_result_preserving_prefix(
     // non-text blocks, or its size is dominated by non-body envelope (the text
     // projection captures under half the bytes), shaping would drop data and its
     // "nothing was lost" claim would be false. Pass those through untouched.
-    let (body, source_bytes) = extract_body(result);
+    let (body, source_bytes, duplicate) = extract_body(result);
     if !is_text_representable(result) || source_bytes < size / 2 {
         return false;
     }
-    let structured = Structured::new(&body, result.get("structuredContent"));
+    let structured = Structured::new(&body, result.get("structuredContent"), duplicate);
 
     let total = body.chars().count();
     // Envelope fields carried across (see below) are part of the shaped result, so
@@ -496,7 +499,7 @@ pub fn shape_result_preserving_prefix(
 /// without inflating the result it rides on.
 pub fn stash_payload(body: String, structured: Option<Value>, owner: Option<&str>) -> String {
     let cursor = next_cursor();
-    let structured = Structured::new(&body, structured.as_ref());
+    let structured = Structured::new(&body, structured.as_ref(), false);
     let size = retained_size(&body, structured.as_ref());
     let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
     sweep(&mut store);
@@ -564,7 +567,16 @@ pub fn fetch_result(
             }
         };
 
-        let mut result = text_result(value.to_string(), false);
+        let text = if matches!(structured, Structured::Body { canonical: false }) {
+            // The text may be pretty-printed or use another object-key order.
+            // Canonicalize only the selected subtree, preserving projection bytes.
+            serde_json::from_str::<Value>(value)
+                .map(|value| value.to_string())
+                .unwrap_or_default()
+        } else {
+            value.to_string()
+        };
+        let mut result = text_result(text, false);
         if let Some(server) = &c.server {
             crate::integrity::label_untrusted_result(server, &mut result);
         }
@@ -1244,13 +1256,13 @@ mod tests {
     fn duplicate_structured_json_retains_one_representation() {
         let value = json!({"rows": (0..1000).map(|_| json!({"a": 1, "b": 2})).collect::<Vec<_>>()});
         let body = value.to_string();
-        let structured = Structured::new(&body, Some(&value));
-        assert!(matches!(structured, Some(Structured::Body)));
+        let structured = Structured::new(&body, Some(&value), false);
+        assert!(matches!(structured, Some(Structured::Body { .. })));
         assert_eq!(
             retained_size(&body, structured.as_ref()),
             std::mem::size_of::<Cached>() + body.capacity()
         );
-        let distinct = Structured::new("different text", Some(&value));
+        let distinct = Structured::new("different text", Some(&value), false);
         let distinct_body = "different text".to_string();
         assert!(
             retained_size(&distinct_body, distinct.as_ref())
