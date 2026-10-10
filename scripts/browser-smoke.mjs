@@ -520,14 +520,14 @@ try {
     "title",
     /before reaching the model/,
   );
-  await expect(page.getByText(/5,225 calls saved/)).toContainText(
+  await expect(page.getByText(/5,225 calls recorded/)).toContainText(
     "Showing the latest 5.",
   );
   await expect(page.getByText("Nothing searched yet.", { exact: true })).toHaveCount(0);
   await expect(
     page.getByText("servers used", { exact: true }).locator(".."),
   ).toContainText("1");
-  await page.screenshot({ path: path.join(output, "A1-A2-A3-A4-activity-after-r2.png") });
+  await page.screenshot({ path: path.join(output, "A1-A2-A3-A4-activity-after-r3.png") });
   const counting = page.getByText("How this is counted", { exact: true });
   await expect(counting.locator("..")).not.toHaveAttribute("open");
   await counting.scrollIntoViewIfNeeded();
