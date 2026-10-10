@@ -7,6 +7,8 @@ import { ClientLogo } from "@/components/ClientLogo";
 import { ServerLogo } from "@/components/ServerLogo";
 import type {
   AuditEntry,
+  ClientSession,
+  ClientActivity,
   PendingApproval,
   Registry,
   SavingsSummary,
@@ -156,7 +158,8 @@ if (memberReviewFixture) {
 
 const approvalFixture = new URLSearchParams(location.search).has("approvals");
 const sessionFixture = new URLSearchParams(location.search).has("sessions");
-const sessionRows = sessionFixture
+const callerFixture = new URLSearchParams(location.search).has("caller-names");
+const sessionRows: ClientSession[] = sessionFixture
   ? [
       {
         sessionId: "f3-fixture-session",
@@ -238,6 +241,108 @@ if (approvalFixture) {
     })),
   );
 }
+if (callerFixture) {
+  const identities = [
+    { client: "adapter:inbox", clientName: "inbox" },
+    { clientName: "Unknown client", clientLabel: "inbox" },
+    {},
+    { clientName: "[private]" },
+  ];
+  auditRows.splice(
+    0,
+    auditRows.length,
+    ...identities.map((identity, index) => ({
+      ts: Date.now() - 1000,
+      server: "GitHub",
+      tool: `list_issues_${index}`,
+      ok: true,
+      durationMs: 12,
+      ...identity,
+    })),
+  );
+  sessionRows.splice(
+    0,
+    sessionRows.length,
+    ...identities.map<ClientSession>((identity, index) => ({
+      sessionId: `caller-fixture-${index}`,
+      clientType: "unknown",
+      gatewayVersion: "2.0.0-preview.6",
+      phase: "close",
+      reason: "client_disconnect",
+      transport: "stdio",
+      toolsListCount: 1,
+      listChangedCount: 0,
+      firstCatalogSize: 4,
+      firstCatalogRevision: 1,
+      catalogRevision: 1,
+      contentChanged: false,
+      clientName: "Unrecorded client",
+      ...identity,
+    })),
+  );
+  pendingApproval = identities.slice(0, 3).map((identity, index) => ({
+    id: `caller-approval-${index}`,
+    server: "team-slack",
+    tool: `delete_issue_${index}`,
+    reason: "destructive",
+    arguments: { issue: 42 },
+    deadlineMs: Date.now() + 120000,
+    client: null,
+    ...identity,
+  }));
+}
+const dogfoodFixture = new URLSearchParams(location.search).has("dogfood");
+if (dogfoodFixture) {
+  sessionRows.splice(
+    0,
+    sessionRows.length,
+    ...Array.from({ length: 5 }, (_, i): ClientSession => ({
+      sessionId: `codex-${i}`,
+      client: "adapter:codex",
+      clientName: "Codex",
+      clientType: "codex",
+      gatewayVersion: "2.0.0-preview.6",
+      phase: "close",
+      reason: "client_disconnect",
+      transport: "stdio",
+      toolsListCount: 0,
+      listChangedCount: 0,
+      firstCatalogSize: 1711,
+      firstCatalogRevision: 1,
+      catalogRevision: 1,
+      contentChanged: false,
+    })),
+  );
+  auditRows.splice(
+    0,
+    auditRows.length,
+    ...["search", "describe", "status", "fetch"].map((tool, i) => ({
+      ts: Date.now() - (i + 1) * 60000,
+      kind: "internal",
+      server: "toolport",
+      tool,
+      ok: true,
+      client: "adapter:codex",
+      clientName: "Codex",
+      durationMs: 5,
+      cold: false,
+      dispatchMs: 2,
+    })),
+    {
+      ts: Date.now() - 300000,
+      server: "GitHub",
+      tool: "list_issues",
+      ok: true,
+      client: "adapter:codex",
+      clientName: "Codex",
+      durationMs: 12,
+      piiReplaced: 1,
+      cold: false,
+      dispatchMs: 3,
+    },
+  );
+}
+
 const savingsSummary: SavingsSummary = {
   tokensSaved: 35_000,
   tokenizedLoads: 12,
@@ -578,12 +683,51 @@ mockIPC(
         return savingsSummary;
       case "plugin:app|version":
         return "1.18.0-fixture";
-      case "get_client_sessions":
-        return sessionRows;
+      case "get_client_sessions": {
+        if (new URLSearchParams(location.search).has("raw-sessions")) return sessionRows;
+        const grouped = new Map<string, ClientActivity>();
+        for (const row of sessionRows) {
+          const key = `${row.clientName}:${row.clientLabel ?? ""}`;
+          const previous = grouped.get(key);
+          grouped.set(key, {
+            ...row,
+            lastActiveMs: Date.now() - 180000,
+            callsToday: (previous?.callsToday ?? 0) + 12,
+            sessionCount: (previous?.sessionCount ?? 0) + 1,
+          });
+        }
+        return [...grouped.values()];
+      }
       case "get_audit_log":
         return auditRows;
       case "audit_stats":
-        return { total: 200, errors: 0, errorRate: 0, servers: [] };
+        return {
+          total: dogfoodFixture ? 5225 : 200,
+          errors: 0,
+          errorRate: 0,
+          servers: [
+            {
+              server: "GitHub",
+              calls: dogfoodFixture ? 5225 : 200,
+              errors: 0,
+              errorRate: 0,
+              avgMs: 12,
+              p95Ms: 12,
+              lastTs: auditRows[auditRows.length - 1].ts,
+              tools: [
+                {
+                  tool: "list_issues",
+                  calls: dogfoodFixture ? 5225 : 200,
+                  errors: 0,
+                  errorRate: 0,
+                  avgMs: 12,
+                  p95Ms: 12,
+                  lastTs: auditRows[auditRows.length - 1].ts,
+                },
+              ],
+            },
+          ],
+        };
       case "list_server_tools":
         return [
           {
@@ -623,13 +767,31 @@ mockIPC(
       case "list_pending_approvals":
         return pendingApproval;
       case "decide_approval":
-        pendingApproval = [];
+        pendingApproval = pendingApproval.filter((approval) => approval.id !== args.id);
         return null;
       case "clients_needing_restart":
       case "list_allowed_tools":
       case "list_quarantined":
       case "get_security_events":
+        return [];
       case "get_search_traces":
+        return auditRows
+          .filter((row) => row.kind === "internal" && row.tool === "search")
+          .map((row) => ({
+            ts: row.ts,
+            client: row.clientName,
+            query: "GitHub issues",
+            top: "github_list_issues",
+            names: ["github_list_issues"],
+            returned: 1,
+            total: 75,
+            returnedTokens: 100,
+            flatTokens: 1000,
+            savedTokens: 900,
+            responseContentBytes: 400,
+            escalated: false,
+            mode: "lexical",
+          }));
       case "get_inspect_log":
       case "list_tool_identities":
         return [];

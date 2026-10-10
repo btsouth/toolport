@@ -96,6 +96,12 @@ export interface ClientSession {
   contentChanged: boolean;
 }
 
+export interface ClientActivity extends Partial<ClientSession> {
+  lastActiveMs?: number;
+  callsToday?: number | null;
+  sessionCount?: number;
+}
+
 export interface AuditEntry {
   /** Approval outcomes are Activity events, never dispatched calls. */
   kind?: string;

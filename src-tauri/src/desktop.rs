@@ -1051,9 +1051,13 @@ async fn get_audit_log(limit: usize) -> Result<Vec<serde_json::Value>, String> {
 
 /// Bounded lifecycle summaries for the Clients page, with no request content.
 #[tauri::command]
-async fn get_client_sessions() -> Result<Vec<serde_json::Value>, String> {
-    tauri::async_runtime::spawn_blocking(|| audit::recent_sessions(12).map_err(|e| format!("Couldn't read client sessions: {e}")))
-        .await.map_err(|e| format!("client session task join failed: {e}"))?
+async fn get_client_sessions(since_ms: Option<u64>) -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        audit::recent_client_activity(64, since_ms)
+            .map_err(|e| format!("Couldn't read client sessions: {e}"))
+    })
+    .await
+    .map_err(|e| format!("client session task join failed: {e}"))?
 }
 
 /// Aggregate the full retained audit log into per-server call/error/latency stats for

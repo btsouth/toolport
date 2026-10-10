@@ -480,7 +480,7 @@ fn default_keep_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn paths_equal(a: &Path, b: &Path) -> bool {
+pub(crate) fn paths_equal(a: &Path, b: &Path) -> bool {
     // Resolve symlinks when the files exist so macOS helper vs Contents/MacOS
     // symlink to the same binary both match a keep path.
     let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
@@ -1907,7 +1907,7 @@ fn daemon_roles_from_cim_json(
 }
 
 #[cfg(windows)]
-fn list_gateway_processes() -> Vec<GatewayProcess> {
+pub(crate) fn list_gateway_processes() -> Vec<GatewayProcess> {
     let mut processes = windows_list_gateway_processes();
     windows_assign_daemon_roles(&mut processes);
     processes
@@ -1928,12 +1928,12 @@ fn kill_gateway_process(proc: &GatewayProcess) -> bool {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn list_gateway_processes() -> Vec<GatewayProcess> {
+pub(crate) fn list_gateway_processes() -> Vec<GatewayProcess> {
     linux_list_gateway_processes()
 }
 
 #[cfg(target_os = "macos")]
-fn list_gateway_processes() -> Vec<GatewayProcess> {
+pub(crate) fn list_gateway_processes() -> Vec<GatewayProcess> {
     macos_list_gateway_processes()
 }
 

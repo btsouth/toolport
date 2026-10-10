@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AuditEntry,
-  ClientSession,
+  ClientActivity,
   AuditStats,
   AuthInfo,
   CatalogEntry,
@@ -993,8 +993,9 @@ export function addSnippetServers(
 }
 
 /** Recent privacy-safe session summaries, capped by the backend. */
-export function getClientSessions(): Promise<ClientSession[]> {
-  return invoke<ClientSession[]>("get_client_sessions");
+export function getClientSessions(): Promise<ClientActivity[]> {
+  const sinceMs = new Date().setHours(0, 0, 0, 0);
+  return invoke<ClientActivity[]>("get_client_sessions", { sinceMs });
 }
 export function setSecretReference(
   serverId: string,

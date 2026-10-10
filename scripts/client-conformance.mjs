@@ -5,6 +5,7 @@ import { readFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   Fixture,
+  clientInventoryFromSource,
   profiles,
   repo,
   failed,
@@ -15,7 +16,7 @@ import {
 } from "./client-conformance-support.mjs";
 
 const source = await readFile(path.join(repo, "src-tauri/src/clients.rs"), "utf8");
-const inventory = [...source.matchAll(/\bid: "([a-z0-9-]+)"/g)].map((m) => m[1]);
+const inventory = clientInventoryFromSource(source);
 assert.deepEqual(
   [...profiles.map((p) => p.id)].sort(),
   [...inventory].sort(),

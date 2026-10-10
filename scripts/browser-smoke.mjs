@@ -71,11 +71,12 @@ try {
   }
   await page.goto(`${baseURL}/fixtures/`);
   await expect(page.getByText("GitHub", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "35.0k tokens saved" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "35.0k tokens saved" })).toHaveAttribute(
-    "title",
-    /cl100k_base.*net of discovery.*once per session/,
-  );
+  await expect(
+    page.getByRole("button", { name: "35.0k catalog tokens avoided" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "35.0k catalog tokens avoided" }),
+  ).toHaveAttribute("title", /cl100k_base.*net of discovery.*once per session/);
   await page.screenshot({ path: path.join(output, "servers.png") });
   await page.getByRole("button", { name: "Show GitHub details", exact: true }).click();
   await page.getByRole("tab", { name: "Tools", exact: true }).click();
@@ -89,11 +90,12 @@ try {
   await page.screenshot({ path: path.join(output, "server-tools.png") });
   await page.getByRole("button", { name: "Activity", exact: true }).click();
   await expect(page.getByText("Protection active.", { exact: true })).toBeVisible();
+  await expect(page.getByText("Catalog text avoided")).toBeVisible();
   await expect(
-    page.getByText("Tool definitions kept out of your agent's context"),
+    page.getByRole("main").getByText("35.0k catalog tokens avoided"),
   ).toBeVisible();
-  await expect(page.getByRole("main").getByText("35.0k tokens saved")).toBeVisible();
-  await expect(page.getByText(/Historical bytes\/4: ≈41.1k/)).toBeVisible();
+  await expect(page.getByText("How this is counted", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Older estimated records/)).not.toBeVisible();
   await page.screenshot({ path: path.join(output, "activity.png") });
   await page.getByRole("button", { name: "Clients", exact: true }).click();
   await page.getByRole("button", { name: /Codex/ }).click();
@@ -412,18 +414,136 @@ try {
   await expect(calls).toBeVisible();
   if ((await calls.getAttribute("aria-expanded")) === "false") await calls.click();
   await expect(page.getByText(/Unknown app \(via Cursor\).*reports.*kt 1/)).toBeVisible();
-  await expect(page.getByText(/dispatch 3 ms/)).toBeVisible();
+  await expect(page.getByText(/dispatch 3 ms/)).toHaveCount(0);
   await page.screenshot({ path: path.join(output, "session-activity.png") });
   await page.getByRole("button", { name: "Clients", exact: true }).click();
-  const sessions = page.getByRole("region", { name: "Recent client sessions" });
+  const sessions = page.getByRole("region", { name: "Recent client activity" });
+  await sessions.getByRole("button", { name: /Recent client activity/ }).click();
   await expect(sessions.getByText("Unknown app (via Cursor)")).toBeVisible();
-  await expect(sessions.getByText("Reports itself as: kt 1")).toBeVisible();
   await expect(
-    sessions.getByText(/3 tool lists.*1 list changes delivered/),
+    sessions.getByText(/Last active.*12 calls today.*Last saw 4 tools/),
   ).toBeVisible();
-  await expect(sessions.getByRole("button")).toHaveCount(0);
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   await page.screenshot({ path: path.join(output, "session-clients.png") });
+  await page.goto(`${baseURL}/fixtures/?sessions&caller-names`);
+  for (const name of ["inbox", "inbox (reported)", "Unrecorded client"]) {
+    await expect(
+      page.getByText(`${name} wants to run this · destructive tool`, { exact: true }),
+    ).toBeVisible();
+  }
+  await expect(
+    page.getByText("Unrecorded client wants to run this · destructive tool"),
+  ).toHaveAttribute("title", /Older Toolport versions did not record callers/);
+  const approvalCard = page.getByRole("alertdialog");
+  for (const height of [800, 520]) {
+    await page.setViewportSize({ width: 1280, height });
+    await approvalCard.evaluate(async (card) => {
+      await Promise.all(card.getAnimations().map((animation) => animation.finished));
+    });
+    const bounds = await approvalCard.boundingBox();
+    expect(bounds.y + bounds.height).toBeLessThanOrEqual(height - 15);
+    expect(
+      await approvalCard.evaluate((card) => getComputedStyle(card).backgroundColor),
+    ).not.toMatch(/rgba|\/\s*0\./);
+    const approvalList = approvalCard.locator("ul").first();
+    expect(
+      await approvalList.evaluate((list) => list.scrollHeight > list.clientHeight),
+    ).toBe(true);
+    await page.screenshot({ path: path.join(output, `approval-after-r2-${height}.png`) });
+    await approvalCard
+      .getByRole("button", { name: "Deny", exact: true })
+      .last()
+      .scrollIntoViewIfNeeded();
+    await expect(
+      approvalCard.getByRole("button", { name: "Deny", exact: true }).last(),
+    ).toBeInViewport();
+    await expect(
+      approvalCard.getByText("Action required", { exact: true }),
+    ).toBeInViewport();
+    await page.screenshot({
+      path: path.join(output, `approval-bottom-r2-${height}.png`),
+    });
+    await approvalList.evaluate((list) => {
+      list.scrollTop = 0;
+    });
+  }
+  await page.setViewportSize({ width: 1240, height: 900 });
+  await page.screenshot({ path: path.join(output, "caller-approvals.png") });
+  for (let i = 0; i < 3; i++)
+    await page
+      .getByRole("alertdialog")
+      .first()
+      .getByRole("button", { name: "Deny", exact: true })
+      .first()
+      .click();
+  await page.getByRole("button", { name: "Activity", exact: true }).click();
+  const callerCalls = page.getByRole("button", { name: /Recent calls and approvals/ });
+  if ((await callerCalls.getAttribute("aria-expanded")) === "false")
+    await callerCalls.click();
+  for (const name of ["inbox", "inbox (reported)", "Unrecorded client", "[private]"]) {
+    await expect(page.getByText(`${name} ·`, { exact: false })).toBeVisible();
+  }
+  await page.screenshot({ path: path.join(output, "caller-activity.png") });
+  await page.getByRole("button", { name: "Clients", exact: true }).click();
+  const callerSessions = page.getByRole("region", { name: "Recent client activity" });
+  await callerSessions.getByRole("button", { name: /Recent client activity/ }).click();
+  for (const name of ["inbox", "inbox (reported)", "Unrecorded client", "[private]"]) {
+    await expect(callerSessions.getByText(name, { exact: true })).toBeVisible();
+  }
+  await expect(
+    callerSessions.getByText("Unrecorded client", { exact: true }),
+  ).toHaveAttribute("title", /Older Toolport versions did not record callers/);
+  await page.screenshot({ path: path.join(output, "caller-clients.png") });
+  expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
+  await page.goto(`${baseURL}/fixtures/?sessions&dogfood`);
+  await page.getByRole("button", { name: "Clients", exact: true }).click();
+  const groupedClients = page.getByRole("region", { name: "Recent client activity" });
+  await expect(groupedClients.getByRole("button")).toHaveAttribute(
+    "aria-expanded",
+    "false",
+  );
+  await groupedClients.getByRole("button").click();
+  await expect(groupedClients.getByText("Codex", { exact: true })).toHaveCount(1);
+  await expect(
+    groupedClients.getByText(/60 calls today.*Last saw 1,711 tools/),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Activity", exact: true }).click();
+  await page.getByRole("button", { name: /Recent calls and approvals/ }).click();
+  for (const label of [
+    "Searched tools",
+    "Looked up a tool",
+    "Checked Toolport status",
+    "Retrieved a tool result",
+  ])
+    await expect(page.getByText(label, { exact: true })).toBeVisible();
+  await expect(page.getByText("1 value masked", { exact: true })).toHaveAttribute(
+    "title",
+    /before reaching the model/,
+  );
+  await expect(page.getByText(/5,225 calls recorded/)).toContainText(
+    "Showing the latest 5.",
+  );
+  await expect(page.getByText("Nothing searched yet.", { exact: true })).toHaveCount(0);
+  await expect(
+    page.getByText("servers used", { exact: true }).locator(".."),
+  ).toContainText("1");
+  await page.screenshot({ path: path.join(output, "A1-A2-A3-A4-activity-after-r3.png") });
+  const counting = page.getByText("How this is counted", { exact: true });
+  await expect(counting.locator("..")).not.toHaveAttribute("open");
+  await counting.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: path.join(output, "A5-savings-after-r2.png") });
+  await counting.click();
+  await page.screenshot({ path: path.join(output, "A5-savings-details-after-r2.png") });
+  await counting.click();
+  await page.getByRole("button", { name: /^Discovery/ }).click();
+  await expect(page.getByText(/GitHub issues/)).toBeVisible();
+  await page.screenshot({ path: path.join(output, "discovery-after-r2.png") });
+  await page.getByRole("button", { name: /^Per-server breakdown/ }).click();
+  await page.screenshot({ path: path.join(output, "server-stats-after-r2.png") });
+  await page.getByRole("button", { name: "Clear", exact: true }).click();
+  await expect(page.getByRole("dialog")).toContainText("Clear retained activity?");
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   await page.goto(`${baseURL}/fixtures/?logos`);
   await expect(page.getByText("Dark logo fixture")).toBeVisible();
   await page.evaluate(() => document.fonts.ready);

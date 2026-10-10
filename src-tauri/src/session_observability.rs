@@ -6,6 +6,7 @@ use std::time::Instant;
 
 #[derive(Clone, Default)]
 pub struct Context {
+    pub client: Option<String>,
     pub session_id: Option<String>,
     pub client_name: Option<String>,
     pub client_label: Option<String>,
@@ -52,12 +53,15 @@ pub fn display_label(label: &str) -> Option<String> {
     crate::approval::sanitize_client_label(&safe)
 }
 
-/// Retain only registered HTTP IDs and known adapter IDs in observation rows.
+/// Retain registered HTTP IDs and privacy-safe configured adapter IDs.
 pub fn telemetry_principal(client: &str) -> Option<&str> {
-    (client.starts_with("client:")
+    ((!client.contains(':')
+        && !client.starts_with("adapter-pid-")
+        && display_client_id(client) == client)
+        || client.starts_with("client:")
         || client
             .strip_prefix("adapter:")
-            .is_some_and(|id| crate::clients::known_adapter_name(id).is_some()))
+            .is_some_and(|id| !id.starts_with("adapter-pid-") && display_client_id(id) == id))
     .then_some(client)
 }
 
@@ -106,14 +110,15 @@ impl Drop for DispatchTimer {
 
 pub fn enrich(entry: &mut Value) {
     let ctx = current();
-    if entry.get("runId").is_some() || ctx.run_id.is_some() {
-        if entry["client"]
-            .as_str()
-            .is_some_and(|c| telemetry_principal(c).is_none())
-        {
-            if let Some(object) = entry.as_object_mut() {
-                object.remove("client");
-            }
+    // Carry the recorded principal into nested calls without changing access identity.
+    if let Some(client) = ctx.client.as_deref().and_then(telemetry_principal) {
+        entry["client"] = json!(client);
+    } else if entry["client"]
+        .as_str()
+        .is_some_and(|c| telemetry_principal(c).is_none())
+    {
+        if let Some(object) = entry.as_object_mut() {
+            object.remove("client");
         }
     }
     if let Some(ms) = ctx.dispatch_ms {
@@ -156,6 +161,16 @@ pub fn enrich(entry: &mut Value) {
                 object.remove(field);
             }
         }
+    }
+    if entry["clientName"].as_str().is_none() {
+        // Newly written calls always record attribution, even outside a gateway
+        // request. Missing caller fields remain meaningful on legacy rows only.
+        let name = crate::clients::unresolved_client_name(entry["client"].as_str());
+        entry["clientName"] = json!(if name == "Unrecorded client" {
+            "Unknown client"
+        } else {
+            &name
+        });
     }
 }
 
@@ -263,7 +278,7 @@ impl Session {
             // Anonymous process IDs and token-derived legacy principals are not retained.
             client: client.and_then(telemetry_principal).map(str::to_string),
             name: display_label(&crate::clients::trusted_client_name(display_client, name))
-                .unwrap_or_else(|| "An AI client".into()),
+                .unwrap_or_else(|| "Unknown client".into()),
             client_type,
             label: label.and_then(display_label),
             transport,
@@ -278,6 +293,7 @@ impl Session {
     }
     pub fn context(&self) -> Context {
         Context {
+            client: self.client.clone(),
             session_id: Some(self.id.clone()),
             client_name: Some(self.name.clone()),
             client_label: self.label.clone(),
@@ -417,6 +433,10 @@ mod tests {
             .and_then(telemetry_principal)
             .is_some()));
         assert_eq!(display_client_id("claude-code"), "claude-code");
+        assert_eq!(telemetry_principal("p08-client"), Some("p08-client"));
+        for id in ["adapter-pid-123", "/home/private/customer.env", "sk-live-abcdefghijk123456789"] {
+            assert_eq!(telemetry_principal(id), None);
+        }
     }
 
     #[test]
@@ -598,6 +618,31 @@ mod tests {
             std::time::Duration::from_secs(5)
         ));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn enrichment_does_not_load_registered_labels_on_the_request_path() {
+        let data = crate::registry::DataDirTestEnv::new("enrich-no-registry-load");
+        let mut registry = crate::registry::Registry::default();
+        registry.http_clients.push(crate::registry::HttpClient {
+            id: "real".into(),
+            label: "My assistant".into(),
+            token_sha256: "unused".into(),
+            profile: String::new(),
+            unknown_fields: Default::default(),
+        });
+        crate::registry::save(&registry).unwrap();
+        let _guard = ContextGuard::enter(Context::default());
+        let mut row = json!({"client":"client:real", "ok":true});
+        enrich(&mut row);
+        assert_eq!(row["clientName"], "Unknown client");
+        assert_eq!(row["client"], "client:real");
+        let names = crate::clients::CallerNames::for_entries(&[row.clone()]);
+        assert_eq!(
+            crate::audit::activity_client_name(row, &names)["clientName"],
+            "My assistant"
+        );
+        drop(data);
     }
 
     #[test]

@@ -505,7 +505,63 @@ pub fn record_code_mode(
     write_line(&entry);
 }
 
-/// Last summary per session, bounded by the retained audit and a small UI cap.
+/// One display summary per client, with calls counted from the full retained audit.
+pub fn recent_client_activity(limit: usize, since_ms: Option<u64>) -> std::io::Result<Vec<Value>> {
+    Ok(client_activity_from_entries(read_all()?, limit, since_ms))
+}
+
+fn client_activity_from_entries(
+    entries: Vec<Value>,
+    limit: usize,
+    since_ms: Option<u64>,
+) -> Vec<Value> {
+    let names = crate::clients::CallerNames::for_entries(&entries);
+    let mut groups =
+        std::collections::BTreeMap::<String, (Value, std::collections::HashSet<String>)>::new();
+    for entry in entries {
+        let call = tool_call_ok(&entry).is_some();
+        if !call
+            && !matches!(
+                entry["kind"].as_str(),
+                Some("session" | "internal" | "approval")
+            )
+        {
+            continue;
+        }
+        let entry = activity_client_name(entry, &names);
+        let name = crate::clients::display_caller_name(
+            entry["clientName"].as_str(),
+            entry["clientLabel"].as_str(),
+        );
+        let ts = entry["ts"].as_u64().unwrap_or(0);
+        let (summary, sessions) = groups.entry(name).or_insert_with(|| (json!({
+            "client":entry["client"], "clientName":entry["clientName"], "clientLabel":entry["clientLabel"],
+            "lastActiveMs":0, "callsToday": if since_ms.is_some() { json!(0) } else { Value::Null }
+        }), Default::default()));
+        summary["lastActiveMs"] = json!(summary["lastActiveMs"].as_u64().unwrap_or(0).max(ts));
+        if call && since_ms.is_some_and(|since| ts >= since) {
+            summary["callsToday"] = json!(summary["callsToday"].as_u64().unwrap_or(0) + 1);
+        }
+        if let Some(id) = entry["sessionId"].as_str() {
+            sessions.insert(id.to_string());
+        }
+        if summary.get("firstCatalogSize").is_none() && entry["firstCatalogSize"].is_u64() {
+            summary["firstCatalogSize"] = entry["firstCatalogSize"].clone();
+        }
+    }
+    let mut rows: Vec<Value> = groups
+        .into_values()
+        .map(|(mut row, sessions)| {
+            row["sessionCount"] = json!(sessions.len());
+            row
+        })
+        .collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row["lastActiveMs"].as_u64().unwrap_or(0)));
+    rows.truncate(limit.min(64));
+    rows
+}
+
+/// Last lifecycle summary per session, for protocol observability.
 pub fn recent_sessions(limit: usize) -> std::io::Result<Vec<Value>> {
     let mut seen = std::collections::HashSet::new();
     Ok(
@@ -603,24 +659,45 @@ fn read_recent_matching(
     // first let an unparseable line consume a slot, so one corrupt row among the
     // newest entries returned a short page and dropped older valid history that
     // should have filled it.
-    Ok(content
+    let entries: Vec<_> = content
         .lines()
         .rev()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(visible)
         .take(limit)
-        .map(activity_client_name)
+        .collect();
+    let names = crate::clients::CallerNames::for_entries(&entries);
+    Ok(entries
+        .into_iter()
+        .map(|entry| activity_client_name(entry, &names))
         .collect())
 }
 
-pub fn activity_client_name(mut entry: Value) -> Value {
+pub fn activity_client_name(mut entry: Value, names: &crate::clients::CallerNames) -> Value {
     if !entry.is_object() {
         return entry;
     }
-    entry["clientName"] = json!(crate::clients::trusted_client_name(
-        entry.get("client").and_then(Value::as_str),
-        entry.get("clientName").and_then(Value::as_str),
-    ));
+    if entry.get("client").is_some() || entry.get("clientName").is_some() {
+        entry["clientName"] = json!(names.trusted_name(
+            entry.get("client").and_then(Value::as_str),
+            entry.get("clientName").and_then(Value::as_str),
+        ));
+    }
+    // Historical rows can predate the write-time privacy filter. Keep their
+    // stored history intact while filtering every caller field used by the UI.
+    if entry["client"]
+        .as_str()
+        .is_some_and(|client| crate::session_observability::telemetry_principal(client).is_none())
+    {
+        entry.as_object_mut().unwrap().remove("client");
+    }
+    if let Some(label) = entry["clientLabel"].as_str() {
+        if let Some(safe) = crate::session_observability::display_label(label) {
+            entry["clientLabel"] = json!(safe);
+        } else {
+            entry.as_object_mut().unwrap().remove("clientLabel");
+        }
+    }
     entry
 }
 
@@ -942,6 +1019,113 @@ fn csv_cell(value: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn client_activity_groups_sessions_and_counts_only_todays_tool_calls() {
+        let rows = client_activity_from_entries(
+            vec![
+                json!({"kind":"session","sessionId":"c2","clientName":"Codex","ts":300,"firstCatalogSize":1711}),
+                json!({"kind":"approval","clientName":"Codex","ts":290,"ok":true}),
+                json!({"kind":"internal","clientName":"Codex","ts":280,"ok":true}),
+                json!({"clientName":"Codex","ts":250,"ok":false}),
+                json!({"clientName":"Codex","ts":240,"ok":true}),
+                json!({"clientName":"Codex","server":"toolport","tool":"run_script","ts":230,"ok":true}),
+                json!({"kind":"session","sessionId":"c1","clientName":"Codex","ts":220}),
+                json!({"clientName":"Codex","ts":50,"ok":true}),
+                json!({"clientName":"Unknown client","clientLabel":"inbox","ts":30,"ok":true}),
+            ],
+            64,
+            Some(100),
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["clientName"], "Codex");
+        assert_eq!(rows[0]["sessionCount"], 2);
+        assert_eq!(rows[0]["callsToday"], 3);
+        assert_eq!(rows[0]["lastActiveMs"], 300);
+        assert_eq!(rows[0]["firstCatalogSize"], 1711);
+        assert_eq!(rows[1]["callsToday"], 0);
+        assert_eq!(
+            crate::clients::display_caller_name(
+                rows[1]["clientName"].as_str(),
+                rows[1]["clientLabel"].as_str()
+            ),
+            "inbox (reported)"
+        );
+        assert!(
+            client_activity_from_entries(vec![json!({"ok":true,"ts":1})], 1, None)[0]["callsToday"]
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn f6_historical_caller_fields_are_private_on_display_only() {
+        let stored = json!({"client":"adapter:/home/private/customer.env", "clientLabel":"private/customer.env", "ok":true});
+        let displayed = activity_client_name(
+            stored.clone(),
+            &crate::clients::CallerNames::for_entries(&[]),
+        );
+        assert_eq!(displayed["clientName"], "[private]");
+        assert_eq!(displayed["clientLabel"], "[private]");
+        assert!(displayed.get("client").is_none());
+        assert_eq!(stored["client"], "adapter:/home/private/customer.env");
+        let reported = activity_client_name(
+            json!({"clientLabel":"private/customer.env", "ok":true}),
+            &crate::clients::CallerNames::for_entries(&[]),
+        );
+        assert!(reported.get("clientName").is_none());
+        assert_eq!(reported["clientLabel"], "[private]");
+    }
+
+    #[test]
+    fn f6_every_new_call_path_records_caller_identity() {
+        let _data = crate::registry::DataDirTestEnv::new("f6-audit-callers");
+        record_timed("fixture", "direct", true, Some(1), None, None);
+        record_internal("search", 1, false, Some("adapter:inbox"), true);
+        record_code_mode(true, 1, None, Some("adapter:inbox"));
+        {
+            let _context = crate::session_observability::ContextGuard::enter(
+                crate::session_observability::Context {
+                    client: Some("adapter:inbox".into()),
+                    client_name: Some("inbox".into()),
+                    ..Default::default()
+                },
+            );
+            record_timed("fixture", "nested", true, Some(1), None, None);
+            record_routed_call(
+                &crate::registry::Registry::default(),
+                "fixture",
+                "routed",
+                true,
+                Some(1),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        let rows = read_all().unwrap();
+        assert_eq!(rows.len(), 5);
+        for row in rows {
+            assert_eq!(
+                row["clientName"],
+                if row["tool"] == "direct" {
+                    "Unknown client"
+                } else {
+                    "inbox"
+                }
+            );
+            if row["tool"] != "direct" {
+                assert_eq!(row["client"], "adapter:inbox");
+            }
+        }
+        let legacy = activity_client_name(
+            json!({"ok":true,"tool":"legacy"}),
+            &crate::clients::CallerNames::for_entries(&[]),
+        );
+        assert!(legacy.get("clientName").is_none());
+    }
 
     #[test]
     fn p08b_r1_hyphenated_call_and_approval_share_activity_server() {
