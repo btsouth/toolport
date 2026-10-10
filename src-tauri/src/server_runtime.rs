@@ -38,7 +38,11 @@ impl ProbeResult {
         {
             return "Server stopped";
         }
-        if self.error.as_deref().is_some_and(|raw| raw.contains("Broken pipe")) {
+        if self
+            .error
+            .as_deref()
+            .is_some_and(|raw| raw.contains("Broken pipe"))
+        {
             return "Connection closed";
         }
         match self.failure.as_ref() {
@@ -173,31 +177,36 @@ pub fn probe_one(server: &ServerEntry) -> ProbeResult {
             failure: None,
             auth_target: None,
         },
-        Err(error) => {
-            let missing_credential = missing_secret(server);
-            let typed_auth = match error.kind {
-                crate::call_failure::CallFailureKind::Auth { target } => Some(target),
-                _ => None,
-            };
-            let auth_rejected = typed_auth.is_some() || remote::is_auth_error(&error.detail);
-            ProbeResult {
-                server_id: server.id.clone(),
-                ok: false,
-                tool_count: 0,
-                auth_required: auth_rejected || missing_credential,
-                auth_target: if missing_credential {
-                    Some(crate::call_failure::AuthTarget::ServiceCredential)
-                } else if let Some(target) = typed_auth {
-                    Some(target)
-                } else if auth_rejected && server.url.is_some() {
-                    Some(crate::call_failure::AuthTarget::Endpoint)
-                } else {
-                    None
-                },
-                failure: Some(error.kind),
-                error: Some(error.detail),
-            }
-        }
+        Err(error) => failed_probe(server, error),
+    }
+}
+
+fn failed_probe(server: &ServerEntry, error: crate::call_failure::CallFailure) -> ProbeResult {
+    let missing_credential = missing_secret(server);
+    let typed_auth = match error.kind {
+        crate::call_failure::CallFailureKind::Auth { target } => Some(target),
+        _ => None,
+    };
+    // Prose is a compatibility fallback for unclassified launch errors only.
+    let auth_rejected = typed_auth.is_some()
+        || (error.kind == crate::call_failure::CallFailureKind::Internal
+            && remote::is_auth_error(&error.detail));
+    ProbeResult {
+        server_id: server.id.clone(),
+        ok: false,
+        tool_count: 0,
+        auth_required: auth_rejected || missing_credential,
+        auth_target: if missing_credential {
+            Some(crate::call_failure::AuthTarget::ServiceCredential)
+        } else if let Some(target) = typed_auth {
+            Some(target)
+        } else if auth_rejected && server.url.is_some() {
+            Some(crate::call_failure::AuthTarget::Endpoint)
+        } else {
+            None
+        },
+        failure: Some(error.kind),
+        error: Some(error.detail),
     }
 }
 
@@ -307,6 +316,45 @@ mod tests {
         assert!(!result.auth_required);
         assert_eq!(result.tool_count, 0);
         assert_eq!(result.error.as_deref(), Some("no command or url"));
+    }
+
+    #[test]
+    fn typed_probe_failures_win_over_auth_words_in_details() {
+        use crate::call_failure::{AuthTarget, CallFailure, CallFailureKind as K};
+        let mut endpoint = server();
+        endpoint.url = Some("https://example.invalid/401/".into());
+        for (kind, detail, label) in [
+            (
+                K::Unavailable { after_send: false },
+                "could not reach https://example.invalid/401/",
+                "Unreachable",
+            ),
+            (
+                K::ServerError { after_send: true },
+                "HTTP 500: upstream unauthorized",
+                "Server failed",
+            ),
+        ] {
+            let result = failed_probe(&endpoint, CallFailure::new(kind.clone(), detail));
+            assert!(!result.auth_required);
+            assert_eq!(result.auth_target, None);
+            assert_eq!(result.failure, Some(kind));
+            assert_eq!(result.failure_label(), label);
+        }
+        let fallback = failed_probe(&endpoint, CallFailure::new(K::Internal, "unauthorized"));
+        assert!(fallback.auth_required);
+        assert_eq!(fallback.auth_target, Some(AuthTarget::Endpoint));
+        let scope = failed_probe(
+            &endpoint,
+            CallFailure::new(
+                K::Auth {
+                    target: AuthTarget::Scope,
+                },
+                "401 unauthorized",
+            ),
+        );
+        assert_eq!(scope.failure_label(), "Permission required");
+        assert_eq!(scope.auth_target, Some(AuthTarget::Scope));
     }
 
     #[test]
