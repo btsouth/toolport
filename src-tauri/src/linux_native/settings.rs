@@ -1481,14 +1481,23 @@ impl SettingsPage {
                         crate::registry_controller::set_essential_setting(setting, enabled)
                     })
                     .await;
+                    // Checked before the completion bump below, which would
+                    // otherwise make every save look stale and leave the switch
+                    // unconfirmed until the next 15-second refresh.
+                    let latest = page.mutation_generation.get() == generation;
                     // Again on completion, so a read that started mid-write is
                     // discarded too.
                     page.begin_mutation();
                     match result {
                         Ok(Ok(settings)) => {
-                            if page.mutation_generation.get() == generation {
+                            if latest {
                                 page.render_settings(settings);
                             } else {
+                                // Another toggle is in flight; confirm only this
+                                // switch rather than rendering a stale snapshot.
+                                page.updating.set(true);
+                                set_switch(&switch, enabled);
+                                page.updating.set(false);
                                 switch.set_sensitive(true);
                             }
                             let outcome =
