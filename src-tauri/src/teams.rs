@@ -1390,7 +1390,7 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         let reg = crate::registry::load()?;
         reg.team.clone().ok_or("not connected to a team")?
     };
-    let token = load_token()?.ok_or("team token is missing from the keychain")?;
+    let token = load_token()?.ok_or("Sync sign-in is missing from this machine. Sign in again.")?;
 
     // Membership heartbeat first. This catches two things a config pull can't: removal
     // (a config pull would just error on the now-invalid token, indistinguishable from a
@@ -2503,7 +2503,7 @@ pub fn account_link() -> Result<String, String> {
         .team
         .ok_or("not connected to a team")?;
     require_secure_team_url(&conn.server_url)?;
-    let token = load_token()?.ok_or("team token is missing from the keychain")?;
+    let token = load_token()?.ok_or("Sync sign-in is missing from this machine. Sign in again.")?;
     let response = agent(&conn.server_url)
         .post(&format!(
             "{}/teams/{}/account-link",
@@ -3054,7 +3054,7 @@ pub fn preview_push_selected(ids: &[String]) -> Result<PushPreview, String> {
         return Err("only a team admin can share servers".into());
     }
     let selected = selected_export(&reg, ids)?;
-    let token = load_token()?.ok_or("team token is missing from the keychain")?;
+    let token = load_token()?.ok_or("Sync sign-in is missing from this machine. Sign in again.")?;
     let (version, config) = fetch_config_for_update(&conn.server_url, &conn.team_id, &token)?;
     let remote = config
         .get("servers")
@@ -3080,7 +3080,7 @@ pub fn push_selected(
     if publisher_fingerprint(&reg, ids)? != fingerprint {
         return Err("Selected servers changed. Review the share again.".into());
     }
-    let token = load_token()?.ok_or("team token is missing from the keychain")?;
+    let token = load_token()?.ok_or("Sync sign-in is missing from this machine. Sign in again.")?;
     let (version, config) = fetch_config_for_update(&conn.server_url, &conn.team_id, &token)?;
     if version != expected_version {
         return Err(STALE_PUSH_MESSAGE.into());
@@ -3141,7 +3141,7 @@ pub fn preview_push_current() -> Result<PushPreview, String> {
     if conn.role != "admin" {
         return Err("only a team admin can push the shared config".into());
     }
-    let token = load_token()?.ok_or("team token is missing from the keychain")?;
+    let token = load_token()?.ok_or("Sync sign-in is missing from this machine. Sign in again.")?;
     let local_servers = team_server_export(&reg);
     let (base_version, remote_config) =
         fetch_config_for_update(&conn.server_url, &conn.team_id, &token)?;
@@ -3166,7 +3166,7 @@ pub fn push_current(
     if conn.role != "admin" {
         return Err("only a team admin can push the shared config".into());
     }
-    let token = load_token()?.ok_or("team token is missing from the keychain")?;
+    let token = load_token()?.ok_or("Sync sign-in is missing from this machine. Sign in again.")?;
     let servers = team_server_export(&reg);
     if crate::audit::args_hash(&servers) != expected_local_fingerprint {
         return Err(

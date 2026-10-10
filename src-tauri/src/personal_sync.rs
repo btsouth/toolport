@@ -1701,6 +1701,19 @@ pub fn record_error(error: Option<&str>) {
 mod tests {
     use super::*;
     #[test]
+    fn missing_sync_sign_in_gives_account_guidance_without_claiming_success() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            crate::registry::save(&machine()).unwrap();
+            let error = crate::teams::sync_now().unwrap_err();
+            assert!(error.contains("Sign in again"));
+            assert!(!error.contains("team token"));
+            let reg = crate::registry::load().unwrap();
+            let (message, healthy) = banner(&reg);
+            assert_eq!(message, error);
+            assert!(!healthy);
+        });
+    }
+    #[test]
     fn ordinary_user_values_survive_export_and_two_machine_roundtrips() {
         let _data = crate::registry::DataDirTestEnv::new("solo-values");
         let mut a = machine();
