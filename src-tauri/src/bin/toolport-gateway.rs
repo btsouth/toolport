@@ -4633,11 +4633,6 @@ fn execute_call(
             allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
         }));
     let _approval_cancel = ApprovalCancelGuard::enter(cancel.clone());
-    if active_live_router_resolver()
-        .is_some_and(|view| (view.stale)(router, DispatchTarget::Tool(name)))
-    {
-        return json!({"content": [{"type": "text", "text": STALE_LIVE_VIEW}], "isError": true});
-    }
     // Resolve existence before approval. A bounded namespace may identify several
     // cold owners; only visible candidates can start, and only an exact route runs.
     let mut fresh = clone_live_router(live_router);
@@ -4660,6 +4655,14 @@ fn execute_call(
         return json!({"content": [{"type": "text", "text": format!(
             "Blocked by Toolport: {name} is turned off for this client. Change it in Toolport > Clients."
         )}], "isError": true});
+    }
+    // An owner outside this request's original scope was already off, rather
+    // than becoming stale during dispatch. Scope loss after capture still fails
+    // the live check before startup or approval.
+    if active_live_router_resolver()
+        .is_some_and(|view| (view.stale)(router, DispatchTarget::Tool(name)))
+    {
+        return json!({"content": [{"type": "text", "text": STALE_LIVE_VIEW}], "isError": true});
     }
     let candidates: Vec<_> = candidates
         .into_iter()
