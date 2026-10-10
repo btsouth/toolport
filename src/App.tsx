@@ -436,7 +436,7 @@ function App() {
     const unlistenErrors = listen<string>("team-sync-error", (event) => {
       toastError("Sync needs attention", {
         id: "personal-sync-background",
-        description: event.payload.replaceAll("team server", "sync service"),
+        description: event.payload.replace(/team server/g, "sync service"),
       });
     });
     return () => {
