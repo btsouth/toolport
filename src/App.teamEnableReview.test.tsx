@@ -98,7 +98,7 @@ describe("team enable review dialog", () => {
       render(<App />);
       const toggle = await screen.findByRole("switch", { name: "Toggle Team tool" });
       await userEvent.click(toggle);
-      expect(await screen.findByText(/npx -y old-tool/)).toBeInTheDocument();
+      expect(await screen.findByText(/npx \["-y","old-tool"\]/)).toBeInTheDocument();
 
       // The push lands while the member is reading the dialog.
       await act(async () => {
@@ -113,7 +113,7 @@ describe("team enable review dialog", () => {
       expect(setServerEnabled).not.toHaveBeenCalled();
       expect(screen.getByRole("dialog")).toBeInTheDocument();
       await waitFor(() =>
-        expect(screen.getByText(/npx -y new-tool/)).toBeInTheDocument(),
+        expect(screen.getByText(/npx \["-y","new-tool"\]/)).toBeInTheDocument(),
       );
     },
   );
