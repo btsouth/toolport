@@ -1272,22 +1272,10 @@ mod p08b_revision_tests {
     fn p08b_r1_registered_clients_use_registry_labels() {
         let _env = crate::registry::DataDirTestEnv::new("p08b-r1-registry-label");
         let mut registry = crate::registry::Registry::default();
-        registry.http_clients.push(crate::registry::HttpClient {
-            id: "real".into(),
-            label: "My assistant".into(),
-            token_sha256: "unused".into(),
-            profile: String::new(),
-            unknown_fields: Default::default(),
-        });
+        registry.http_clients.push(crate::registry::HttpClient { id: "real".into(), label: "My assistant".into(), token_sha256: "unused".into(), profile: String::new(), unknown_fields: Default::default() });
         crate::registry::save(&registry).unwrap();
-        assert_eq!(
-            crate::clients::trusted_client_name(Some("client:real"), None),
-            "My assistant"
-        );
-        assert_eq!(
-            crate::clients::trusted_client_name(Some("client:unknown"), None),
-            "Unknown client"
-        );
+        assert_eq!(crate::clients::trusted_client_name(Some("client:real"), None), "My assistant");
+        assert_eq!(crate::clients::trusted_client_name(Some("client:unknown"), None), "Unknown client");
     }
 
     #[test]

@@ -575,9 +575,7 @@ impl Rendezvous {
             Ok(identity) if identity.is_compatible_with(&self.compat) => Probe::Live(descriptor),
             Ok(_) | Err(ProbeFailure::Answered(_)) => Probe::Gone,
             Err(ProbeFailure::Unreachable) => match attempt_identity_probe(&descriptor) {
-                Ok(identity) if identity.is_compatible_with(&self.compat) => {
-                    Probe::Live(descriptor)
-                }
+                Ok(identity) if identity.is_compatible_with(&self.compat) => Probe::Live(descriptor),
                 Err(ProbeFailure::Silent) => Probe::Silent(descriptor),
                 _ => Probe::Gone,
             },
@@ -693,7 +691,9 @@ pub fn serve_identity(
     // but only ours. If another daemon has already published over this path,
     // the file is the survivor's, and deleting it would strand every later
     // rendezvous with the wrong daemon.
-    if let Ok(_descriptor_lock) = registry::lock_at_for(descriptor_path, DESCRIPTOR_LOCK_TIMEOUT) {
+    if let Ok(_descriptor_lock) =
+        registry::lock_at_for(descriptor_path, DESCRIPTOR_LOCK_TIMEOUT)
+    {
         if let Some(current) = read_descriptor(descriptor_path) {
             if current.token == token && current.endpoint == descriptor.endpoint {
                 clear_descriptor_locked(descriptor_path);
@@ -1210,8 +1210,9 @@ mod tests {
         let worker_key = key.clone();
         let worker = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            Rendezvous::new(&worker_dir, worker_key)
-                .ensure(|| Err("must not spawn beside a published daemon".to_string()))
+            Rendezvous::new(&worker_dir, worker_key).ensure(|| {
+                Err("must not spawn beside a published daemon".to_string())
+            })
         });
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         // Let the worker observe an absent descriptor and block on our lock.
@@ -1260,9 +1261,7 @@ mod tests {
             .expect("a squatter's pointer is stale and gets replaced");
         assert_eq!(spawns.load(Ordering::SeqCst), 1);
         assert_ne!(descriptor.endpoint, squatter.endpoint);
-        assert!(probe_identity(&descriptor)
-            .unwrap()
-            .is_compatible_with(&compat));
+        assert!(probe_identity(&descriptor).unwrap().is_compatible_with(&compat));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1287,9 +1286,7 @@ mod tests {
             .expect("an endpoint that cannot parse is garbage, not a live daemon");
         assert_eq!(spawns.load(Ordering::SeqCst), 1);
         assert_ne!(descriptor.endpoint, broken.endpoint);
-        assert!(probe_identity(&descriptor)
-            .unwrap()
-            .is_compatible_with(&compat));
+        assert!(probe_identity(&descriptor).unwrap().is_compatible_with(&compat));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1297,7 +1294,8 @@ mod tests {
     fn unresolvable_host_is_replaced() {
         let dir = temp_dir("unresolvable");
         let compat = compat("1.0.0", &dir);
-        let broken = DaemonDescriptor::new("no-such-host.toolport.invalid:9123", "broken", &compat);
+        let broken =
+            DaemonDescriptor::new("no-such-host.toolport.invalid:9123", "broken", &compat);
         write_descriptor(&descriptor_path(&dir, &compat), &broken).unwrap();
 
         let spawns = Arc::new(AtomicUsize::new(0));
@@ -1314,9 +1312,7 @@ mod tests {
             .expect("a host that cannot resolve is garbage, not a live daemon");
         assert_eq!(spawns.load(Ordering::SeqCst), 1);
         assert_ne!(descriptor.endpoint, broken.endpoint);
-        assert!(probe_identity(&descriptor)
-            .unwrap()
-            .is_compatible_with(&compat));
+        assert!(probe_identity(&descriptor).unwrap().is_compatible_with(&compat));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

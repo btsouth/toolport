@@ -11,8 +11,8 @@ mod chaos_support;
 use std::time::Duration;
 
 use chaos_support::{
-    daemon_pid, mock_entry, pid_alive, pid_running, signal, start_daemon, wait_for, write_registry,
-    Client, Scratch,
+    daemon_pid, mock_entry, pid_alive, pid_running, signal, start_daemon, wait_for,
+    write_registry, Client, Scratch,
 };
 use serde_json::json;
 
@@ -21,7 +21,11 @@ const CATALOG: Duration = Duration::from_secs(60);
 #[test]
 fn a_killed_daemon_is_replaced_and_the_client_recovers() {
     let scratch = Scratch::new("daemon-kill");
-    write_registry(scratch.path(), &[mock_entry("x", &[])], &["x"]);
+    write_registry(
+        scratch.path(),
+        &[mock_entry("x", &[])],
+        &["x"],
+    );
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "a");
     assert!(
@@ -37,11 +41,9 @@ fn a_killed_daemon_is_replaced_and_the_client_recovers() {
 
     let old = daemon_pid(scratch.path()).expect("daemon pid");
     signal(old, "-KILL");
-    wait_for(
-        "the old daemon to stop running",
-        Duration::from_secs(10),
-        || !pid_running(old),
-    );
+    wait_for("the old daemon to stop running", Duration::from_secs(10), || {
+        !pid_running(old)
+    });
 
     // The adapter re-rendezvouses (a call against the dead daemon fails first),
     // and a later call succeeds without a gateway restart.
@@ -148,11 +150,7 @@ fn a_killed_daemon_does_not_leave_its_servers_running() {
     wait_for("the server pid", Duration::from_secs(30), || {
         std::fs::read_to_string(&pid_file)
             .ok()
-            .and_then(|raw| {
-                raw.lines()
-                    .next()
-                    .and_then(|l| l.trim().parse::<u64>().ok())
-            })
+            .and_then(|raw| raw.lines().next().and_then(|l| l.trim().parse::<u64>().ok()))
             .is_some()
     });
     let child: u64 = std::fs::read_to_string(&pid_file)

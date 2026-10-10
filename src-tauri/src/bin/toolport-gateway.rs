@@ -5236,16 +5236,15 @@ fn execute_call(
     // rehydration on the same leg. A host that answers an elicitation from model
     // context puts `⟦EMAIL_1⟧` in `inputResponses`, and the server would receive a
     // pseudonym where an address belongs (SBS-606).
-    let rehydrated_mrtr =
-        match rehydrate_mrtr_for_downstream(client, server_id, name, effective_mrtr) {
-            Ok(m) => m,
-            Err(msg) => {
-                return json!({
-                    "content": [{ "type": "text", "text": format!("Toolport: {msg}") }],
-                    "isError": true,
-                });
-            }
-        };
+    let rehydrated_mrtr = match rehydrate_mrtr_for_downstream(client, server_id, name, effective_mrtr) {
+        Ok(m) => m,
+        Err(msg) => {
+            return json!({
+                "content": [{ "type": "text", "text": format!("Toolport: {msg}") }],
+                "isError": true,
+            });
+        }
+    };
     let effective_mrtr = rehydrated_mrtr.as_ref().or(effective_mrtr);
     // This request kept the router it arrived with. If a newer one has gone live
     // since (a registry policy change, quarantine, or a rebuild), its policy has
@@ -6615,8 +6614,8 @@ fn execute_script_dispatch(
     // (SBS-881). Run the defense here, before the script's own result is returned,
     // so nothing unscanned reaches the model. The failure envelope was defended
     // part by part above and is all Toolport text now.
-    let untrusted =
-        result["isError"] != true && !defend_script_aggregate(reg, client, &owner, &mut result);
+    let untrusted = result["isError"] != true
+        && !defend_script_aggregate(reg, client, &owner, &mut result);
 
     // Intermediate calls were not shaped (full bodies stayed in the sandbox). The
     // script's aggregate can still blow the transport/context budget, so shape only
@@ -21301,22 +21300,10 @@ mod tests {
 
     #[test]
     fn disconnect_all_is_a_standalone_role_and_dry_run_cannot_start_gateway() {
-        assert_eq!(
-            parse_args(&["--disconnect-all".into()]),
-            ArgAction::DisconnectAll { dry_run: false }
-        );
-        assert_eq!(
-            parse_args(&["--disconnect-all".into(), "--dry-run".into()]),
-            ArgAction::DisconnectAll { dry_run: true }
-        );
-        assert!(matches!(
-            parse_args(&["--dry-run".into()]),
-            ArgAction::Unknown(_)
-        ));
-        assert!(matches!(
-            parse_args(&["--disconnect-all".into(), "--daemon".into()]),
-            ArgAction::Unknown(_)
-        ));
+        assert_eq!(parse_args(&["--disconnect-all".into()]), ArgAction::DisconnectAll { dry_run: false });
+        assert_eq!(parse_args(&["--disconnect-all".into(), "--dry-run".into()]), ArgAction::DisconnectAll { dry_run: true });
+        assert!(matches!(parse_args(&["--dry-run".into()]), ArgAction::Unknown(_)));
+        assert!(matches!(parse_args(&["--disconnect-all".into(), "--daemon".into()]), ArgAction::Unknown(_)));
     }
 
     /// A server whose NAME contains a write verb must not drag its read-only
@@ -23693,10 +23680,7 @@ mod tests {
             catalog_wait_budget(DiscoveryMode::Lazy, true, Some("claude-code"), true),
             downstream::SETUP_CATALOG_WAIT_BUDGET
         );
-        assert_eq!(
-            downstream::SETUP_CATALOG_WAIT_BUDGET,
-            Duration::from_secs(25)
-        );
+        assert_eq!(downstream::SETUP_CATALOG_WAIT_BUDGET, Duration::from_secs(25));
         assert!(downstream::SETUP_CATALOG_WAIT_BUDGET < downstream::STDIO_READ_TIMEOUT);
     }
 
@@ -23881,16 +23865,16 @@ mod tests {
     #[test]
     fn reviewed_unscoped_no_match_waits_for_first_catalog_publication() {
         let _env = DataDirTestEnv::new("reviewed-no-match-publication");
-        let router =
-            counting_cache_supervisor("publishing", Vec::new(), &Arc::new(AtomicUsize::new(0)));
+        let router = counting_cache_supervisor(
+            "publishing",
+            Vec::new(),
+            &Arc::new(AtomicUsize::new(0)),
+        );
         router.prepare_lazy_use("publishing");
         wait_for_supervisor_result(&router);
         assert!(router.any_publishing_first_catalog(|_| true));
         let text = reviewed_no_match_text(&router, None);
-        assert_eq!(
-            text,
-            "Servers are still connecting. Retry shortly or check toolport_status.\n\n[]"
-        );
+        assert_eq!(text, "Servers are still connecting. Retry shortly or check toolport_status.\n\n[]");
         let text = reviewed_no_match_text(&router, Some(&HashSet::new()));
         assert!(text.starts_with("No tools matched."), "{text}");
         assert!(!text.contains("still connecting"), "{text}");
@@ -25101,8 +25085,7 @@ mod tests {
 
     #[test]
     fn initial_modern_hitl_call_starts_mrtr_without_retry_fields() {
-        let _env =
-            DataDirTestEnv::new("p10c-initial_modern_hitl_call_starts_mrtr_without_retry_fields");
+        let _env = DataDirTestEnv::new("p10c-initial_modern_hitl_call_starts_mrtr_without_retry_fields");
         session_tables().hitl().clear();
         let request = json!({
             "params": {
@@ -27422,7 +27405,10 @@ mod tests {
         let host = dispatch_host(seed_code_mode_after_registry_load(Err(())));
         let mut reg = Registry::default();
         reg.code_mode = true;
-        assert!(reg.code_mode, "the request fixture explicitly opts in");
+        assert!(
+            reg.code_mode,
+            "the request fixture explicitly opts in"
+        );
 
         let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
         let list = handle_request(
@@ -29900,14 +29886,10 @@ mod tests {
         let ok = post("/s__work");
         assert_eq!(ok.status, 200, "body={}", ok.body);
         assert_eq!(ok.body, "\"called\"");
-        assert!(ok
-            .extra
-            .contains(&("X-Toolport-Content-Trust".into(), "untrusted".into())));
+        assert!(ok.extra.contains(&("X-Toolport-Content-Trust".into(), "untrusted".into())));
         for (name, _) in &ok.extra {
             assert!(
-                EXPOSED_HTTP_HEADERS
-                    .split(", ")
-                    .any(|exposed| exposed.eq_ignore_ascii_case(name)),
+                EXPOSED_HTTP_HEADERS.split(", ").any(|exposed| exposed.eq_ignore_ascii_case(name)),
                 "browser cannot read provenance header {name}"
             );
         }
@@ -31363,10 +31345,8 @@ mod tests {
         reg.servers.push(stub_server("team-slack", "Team Slack"));
         reg.servers.push(stub_server("team_slack", "slack"));
         let personal = reg.add_profile("Personal");
-        reg.set_access_server(&personal, "team-slack", true)
-            .unwrap();
-        reg.set_access_server("default", "team_slack", true)
-            .unwrap();
+        reg.set_access_server(&personal, "team-slack", true).unwrap();
+        reg.set_access_server("default", "team_slack", true).unwrap();
         reg.set_server_enabled(&personal, "team-slack", true)
             .unwrap();
         reg.set_server_enabled("default", "team_slack", true)
@@ -34525,8 +34505,10 @@ mod tests {
     fn lazy_discovery_keeps_ui_linked_tools_only_for_apps_hosts() {
         let _lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir =
-            std::env::temp_dir().join(format!("toolport-apps-measure-{}", new_correlation_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-apps-measure-{}",
+            new_correlation_id()
+        ));
         let _data = registry::DataDirOverride::set(&dir);
         let host = dispatch_host(false);
         let reg = Registry::default();
@@ -36023,11 +36005,7 @@ mod tests {
         let host = dispatch_host(false);
         host.set_code_mode(false);
         let tools = floor_tool_defs(&host);
-        assert_eq!(
-            tools.len(),
-            4,
-            "Code Mode off means the floor is the core four"
-        );
+        assert_eq!(tools.len(), 4, "Code Mode off means the floor is the core four");
         let tools_json = serde_json::to_string(&tools).expect("floor tools serialize");
         let instructions = discovery_instructions(DiscoveryMode::Lazy, None);
         let bytes = tools_json.len() + instructions.len();
@@ -36233,8 +36211,10 @@ mod tests {
     fn catalog_measurement_uses_actual_surfaces_for_modes_scope_and_dynamic_defs() {
         let _lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir =
-            std::env::temp_dir().join(format!("toolport-catalog-measure-{}", new_correlation_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-catalog-measure-{}",
+            new_correlation_id()
+        ));
         let _data = registry::DataDirOverride::set(&dir);
         let mut router = Router::new();
         for server in ["alpha", "beta"] {
@@ -36388,8 +36368,10 @@ mod tests {
     fn search_measurement_includes_lead_and_guidance_text() {
         let _lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir =
-            std::env::temp_dir().join(format!("toolport-search-measure-{}", new_correlation_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-search-measure-{}",
+            new_correlation_id()
+        ));
         let _data = registry::DataDirOverride::set(&dir);
         let response = handle_request(
             &dispatch_host(false),
@@ -37207,8 +37189,7 @@ mod tests {
             );
             // On the old denial path the second connection never happens.
             if decision == approval::ApprovalDecision::Denied && reply.is_empty() {
-                let mut unblock =
-                    approval::dial_broker(&approval::read_endpoint_descriptor().unwrap()).unwrap();
+                let mut unblock = approval::dial_broker(&approval::read_endpoint_descriptor().unwrap()).unwrap();
                 unblock.write_all(b"{}\n").unwrap();
             }
             worker.join().unwrap();
@@ -38039,10 +38020,7 @@ mod tests {
     fn team_quarantine_at_member_off_enforces_drift_and_survives_watcher_reconciliation() {
         let _data_lock = registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-team-quarantine-off-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("toolport-team-quarantine-off-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
@@ -38308,17 +38286,14 @@ mod tests {
                 let live = live_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let advertises = live
-                    .aggregated_tools()
-                    .iter()
-                    .any(|t| t["name"] == "srv__read");
-                *seen
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(advertises);
+                let advertises = live.aggregated_tools().iter().any(|t| t["name"] == "srv__read");
+                *seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(advertises);
             }),
         ));
 
-        let published = publish_built_router(&state.registry, &state.router, drifted, profile);
+        let published =
+            publish_built_router(&state.registry, &state.router, drifted, profile);
 
         *INTEGRITY_GATE_OBSERVER
             .lock()
@@ -38341,10 +38316,7 @@ mod tests {
             "the quarantine must be on the router the moment it becomes live"
         );
         assert!(
-            !live
-                .aggregated_tools()
-                .iter()
-                .any(|t| t["name"] == "srv__read"),
+            !live.aggregated_tools().iter().any(|t| t["name"] == "srv__read"),
             "the published router must not advertise the drifted tool"
         );
     }
@@ -41391,10 +41363,7 @@ mod tests {
         let tokens = savings::count_tokens(&fallback) - savings::count_tokens(&base);
         let bytes = fallback.len() - base.len();
         eprintln!("Full fallback: Codex +{tokens}, Cursor +{tokens} cl100k_base tokens; +{bytes} bytes; refresh clients +0");
-        assert!(
-            tokens <= 600,
-            "two compact recovery helpers cost {tokens} tokens"
-        );
+        assert!(tokens <= 600, "two compact recovery helpers cost {tokens} tokens");
     }
 
     #[test]
@@ -43112,11 +43081,7 @@ mod tests {
         let anonymous = probe(&state, None, false);
         assert_eq!(anonymous.status, 401, "body={}", anonymous.body);
         let registered_client = probe(&state, Some(&caller), false);
-        assert_eq!(
-            registered_client.status, 401,
-            "body={}",
-            registered_client.body
-        );
+        assert_eq!(registered_client.status, 401, "body={}", registered_client.body);
         let registered_topology = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
