@@ -601,14 +601,16 @@ fn a_wedged_daemon_moves_clients_to_their_own_gateways() {
     let descriptor = fixture.wait_for_descriptor();
     let daemon_pid = descriptor["pid"].as_u64().expect("daemon pid");
 
-    // Reproduce a daemon wedged while holding this lock on every platform.
-    let _registry_lock = registry::lock_at(&path).expect("hold wedged registry lock");
+    // Client setup must use prepared policy even when the registry is locked.
+    // Release before private initialization, which legitimately reads it.
+    let registry_lock = registry::lock_at(&path).expect("hold fixture registry lock");
     signal(daemon_pid, "-STOP");
 
     // A new client in the default role falls back to its own in-process gateway
     // instead of failing to start.
     let started = Instant::now();
     let mut fresh = Client::spawn_prepared(&fixture.dir, false, fresh_id);
+    drop(registry_lock);
     fresh.initialize();
     assert!(
         started.elapsed() < Duration::from_secs(45),
