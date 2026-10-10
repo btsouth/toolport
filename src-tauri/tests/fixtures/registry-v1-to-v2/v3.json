@@ -1,5 +1,6 @@
 {
   "accessUpgradeNoticeDismissed": false,
+  "accessUpgradeNoticePending": true,
   "activeProfileId": "default",
   "blockOnInjection": false,
   "clientManagedEntries": {
