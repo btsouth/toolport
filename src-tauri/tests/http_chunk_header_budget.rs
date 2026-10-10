@@ -132,8 +132,11 @@ fn http_chunk_headers_stay_within_allocation_budget_and_next_call_works() {
             eprintln!("{kind} metadata={metadata}: largest allocation={largest}, sent={sent}, error={error}");
             if !rejected
                 || largest > 16 * 1024 * 1024
-                || !error.to_string().contains("response was too large")
-                || !error.to_string().contains("8192-byte limit")
+                || !error.to_string().contains(if metadata == "fields" {
+                    "too many header fields"
+                } else {
+                    "response headers exceeded the 65536-byte limit"
+                })
             {
                 failures.push(format!(
                     "{kind} metadata={metadata}: largest allocation={largest}, error={error}"
@@ -143,4 +146,50 @@ fn http_chunk_headers_stay_within_allocation_budget_and_next_call_works() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn response_headers_accept_40_kib_and_reject_over_64_kib() {
+    for kind in ["application/json", "text/event-stream"] {
+        for header_bytes in [40 * 1024, 65 * 1024] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let request = read_request(&mut socket);
+                let json =
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":{"ok":true}}).to_string();
+                let body = if kind == "text/event-stream" {
+                    format!("event: message\ndata: {json}\n\n")
+                } else {
+                    json
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nX-Large: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", "x".repeat(header_bytes), body.len());
+                let _ = socket.write_all(response.as_bytes());
+            });
+            let result = HttpTransport::new(&url).request("tools/call", json!({}));
+            worker.join().unwrap();
+            if header_bytes < 64 * 1024 {
+                assert_eq!(result.unwrap()["ok"], true, "{kind}");
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(
+                    error,
+                    conduit_lib::downstream::TransportError::FrameRejected(_)
+                ));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("response headers exceeded the 65536-byte limit"),
+                    "{error}"
+                );
+            }
+        }
+    }
 }

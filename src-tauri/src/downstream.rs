@@ -1655,7 +1655,7 @@ fn http_read_error(error: std::io::Error) -> TransportError {
         .and_then(|cause| cause.downcast_ref::<ureq::Error>())
     {
         if http_metadata_rejected(ureq) {
-            return http_metadata_error();
+            return http_metadata_error(ureq);
         }
         if matches!(ureq, ureq::Error::Timeout(_)) {
             return TransportError::Classified(
@@ -1683,7 +1683,7 @@ fn http_read_error(error: std::io::Error) -> TransportError {
 
 fn http_transport_io_error(error: ureq::Error) -> TransportError {
     if http_metadata_rejected(&error) {
-        return http_metadata_error();
+        return http_metadata_error(&error);
     }
     match error {
         ureq::Error::Timeout(_) => http_read_error(std::io::Error::new(
@@ -1695,7 +1695,7 @@ fn http_transport_io_error(error: ureq::Error) -> TransportError {
     }
 }
 
-const HTTP_METADATA_BYTES: usize = 8192;
+const HTTP_METADATA_BYTES: usize = 64 * 1024;
 
 fn http_metadata_rejected(error: &ureq::Error) -> bool {
     matches!(
@@ -1705,11 +1705,13 @@ fn http_metadata_rejected(error: &ureq::Error) -> bool {
             if matches!(error, ureq_proto::Error::ChunkExpectedCrLf | ureq_proto::Error::HttpParseTooManyHeaders))
 }
 
-fn http_metadata_error() -> TransportError {
-    TransportError::FrameRejected(format!(
-        "downstream response was too large: {}",
-        oversized_frame_error(HTTP_METADATA_BYTES)
-    ))
+fn http_metadata_error(error: &ureq::Error) -> TransportError {
+    let message = if matches!(error, ureq::Error::Protocol(ureq_proto::Error::HttpParseTooManyHeaders)) {
+        "downstream response contained too many header fields".to_string()
+    } else {
+        format!("downstream response headers exceeded the {HTTP_METADATA_BYTES}-byte limit")
+    };
+    TransportError::FrameRejected(message)
 }
 
 /// Build an `Authorization` header value from a raw token, adding the `Bearer`
@@ -5825,6 +5827,7 @@ pub(crate) fn guarded_agent_with_timeout(
         .timeout_global(Some(timeout))
         // Metadata must fit in one fixed buffer; decoded bodies keep their own cap.
         .input_buffer_size(HTTP_METADATA_BYTES)
+        .max_response_header_size(HTTP_METADATA_BYTES)
         // Credential-bearing MCP calls never follow redirects.
         .max_redirects(0)
         .build();
