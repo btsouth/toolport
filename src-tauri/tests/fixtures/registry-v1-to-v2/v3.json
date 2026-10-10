@@ -16,12 +16,12 @@
   "clientScopes": {
     "cursor": "default"
   },
-  "codeMode": false,
+  "codeMode": true,
   "confirmDestructive": false,
   "defaultAccessContextId": "default",
   "defaultAccessLegacyPolicy": true,
   "denyDestructive": false,
-  "humanApproval": true,
+  "humanApproval": false,
   "humanApprovalAllow": ["github/search_code"],
   "lazyDiscovery": true,
   "pinnedTools": {
@@ -38,7 +38,7 @@
     }
   ],
   "quarantineOnDrift": false,
-  "safetyLevel": "ask",
+  "safetyLevel": "off",
   "servers": [
     {
       "args": ["-y", "@modelcontextprotocol/server-github"],

@@ -1100,11 +1100,39 @@ impl Default for SafetyLevel {
     }
 }
 
+/// 1.x protections an upgrader had on that their 2.0 level does not include.
+/// Set only by the v1 migration and cleared when the user picks a level, so an
+/// upgrade never quietly loosens or tightens what they chose.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeptV1Safety {
+    /// 1.x approval also held calls from shared or registry servers.
+    #[serde(default)]
+    pub hold_untrusted: bool,
+    #[serde(default)]
+    pub deny_destructive: bool,
+    #[serde(default)]
+    pub quarantine_on_drift: bool,
+    #[serde(default)]
+    pub block_on_injection: bool,
+}
+
+impl KeptV1Safety {
+    pub fn any(self) -> bool {
+        self.hold_untrusted
+            || self.deny_destructive
+            || self.quarantine_on_drift
+            || self.block_on_injection
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Registry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safety_level: Option<SafetyLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_v1_safety: Option<KeptV1Safety>,
     /// Schema version. Historically optional; a document with no `version` is a
     /// v1 file, which is what [`legacy_registry_version`] supplies.
     #[serde(default = "legacy_registry_version")]
@@ -1553,6 +1581,7 @@ impl Default for Registry {
             default_access_context_id: None,
             default_access_legacy_policy: false,
             safety_level: Some(SafetyLevel::Ask),
+            kept_v1_safety: None,
             deny_destructive: false,
             confirm_destructive: false,
             human_approval: false,
@@ -2419,12 +2448,10 @@ impl Registry {
         if self.version >= 2 {
             return self.safety_level.unwrap_or_default();
         }
-        // Legacy blocking flags map to Strict, approval/confirmation to Ask,
-        // and no blocking gates to Off. Labeling and recording never block.
+        // Approval or confirmation is Ask and nothing is Off. The 1.x blocking
+        // flags apply on their own (see `kept`), as they did in 1.x.
         self.safety_level.unwrap_or_else(|| {
-            if self.deny_destructive || self.quarantine_on_drift || self.block_on_injection {
-                SafetyLevel::Strict
-            } else if self.human_approval || self.confirm_destructive {
+            if self.human_approval || self.confirm_destructive {
                 SafetyLevel::Ask
             } else {
                 SafetyLevel::Off
@@ -2455,6 +2482,8 @@ impl Registry {
 
     pub fn set_safety_level(&mut self, level: SafetyLevel) {
         self.safety_level = Some(level);
+        // Choosing a level replaces any 1.x protections kept by the upgrade.
+        self.kept_v1_safety = None;
         self.sync_legacy_safety_mirror();
     }
 
@@ -2468,17 +2497,35 @@ impl Registry {
         }
         let level = self.safety_level_selected();
         let strict = level == SafetyLevel::Strict;
-        self.deny_destructive = strict;
-        self.quarantine_on_drift = strict;
-        self.block_on_injection = strict;
+        let kept = self.kept();
+        self.deny_destructive = strict || kept.deny_destructive;
+        self.quarantine_on_drift = strict || kept.quarantine_on_drift;
+        self.block_on_injection = strict || kept.block_on_injection;
         self.human_approval = level >= SafetyLevel::Ask;
         self.confirm_destructive = false;
     }
 
+    /// 1.x protections outside the level: saved by the migration, or read
+    /// straight from the toggles of a v1 registry that has not migrated yet.
+    fn kept(&self) -> KeptV1Safety {
+        if self.version < 2 && self.safety_level.is_none() {
+            return KeptV1Safety {
+                hold_untrusted: self.human_approval,
+                deny_destructive: self.deny_destructive,
+                quarantine_on_drift: self.quarantine_on_drift,
+                block_on_injection: self.block_on_injection,
+            };
+        }
+        self.kept_v1_safety.unwrap_or_default()
+    }
+
     pub fn requires_human_approval(&self, destructive: bool, untrusted: bool) -> bool {
+        // 1.x approval, kept by the upgrade or forced by a team, also held
+        // calls from untrusted servers.
+        let hold_untrusted = self.kept().hold_untrusted || self.team_forced_human_approval;
         match self.safety_level_effective() {
             SafetyLevel::Off => false,
-            SafetyLevel::Ask => destructive,
+            SafetyLevel::Ask => destructive || (untrusted && hold_untrusted),
             SafetyLevel::Strict => destructive || untrusted,
         }
     }
@@ -2490,7 +2537,7 @@ impl Registry {
     /// Effective (member's own OR team-forced) values for the other tighten-only safety flags,
     /// so an org lock is releasable on leave instead of permanently overwriting the member's own.
     pub fn deny_destructive_effective(&self) -> bool {
-        self.safety_level_effective() == SafetyLevel::Strict
+        self.safety_level_effective() == SafetyLevel::Strict || self.kept().deny_destructive
     }
     pub fn content_defense_effective(&self) -> bool {
         true
@@ -2500,11 +2547,15 @@ impl Registry {
         self.pii_redaction || self.team_forced_pii_redaction
     }
     pub fn quarantine_on_drift_effective(&self) -> bool {
-        self.safety_level_effective() == SafetyLevel::Strict || self.team_forced_quarantine_on_drift
+        self.safety_level_effective() == SafetyLevel::Strict
+            || self.team_forced_quarantine_on_drift
+            || self.kept().quarantine_on_drift
     }
     /// Member's own OR team-forced fail-closed injection block (SOU-345).
     pub fn block_on_injection_effective(&self) -> bool {
-        self.safety_level_effective() == SafetyLevel::Strict || self.team_forced_block_on_injection
+        self.safety_level_effective() == SafetyLevel::Strict
+            || self.team_forced_block_on_injection
+            || self.kept().block_on_injection
     }
     /// Whether this server should fail closed on a high-confidence injection hit:
     /// block mode effective, and the server is not on the exempt list.
@@ -2785,6 +2836,14 @@ impl Registry {
                 self.client_discovery.remove(client_id);
             }
         }
+    }
+
+    /// The global discovery mode only when the user picked one. 1.x wrote
+    /// `lazyDiscovery: true` by default, so only `false` there was a choice.
+    pub fn chosen_global_discovery_mode(&self) -> Option<&str> {
+        self.discovery_mode
+            .as_deref()
+            .or((!self.lazy_discovery).then_some("full"))
     }
 
     /// This client's discovery-mode override, if any (`None` = inherit the global mode).
@@ -8803,9 +8862,10 @@ mod safety_level_tests {
                         r.requires_human_approval(true, false),
                         expected >= SafetyLevel::Ask
                     );
+                    // Team-forced approval held untrusted calls in 1.x and still does.
                     assert_eq!(
                         r.requires_human_approval(false, true),
-                        expected == SafetyLevel::Strict
+                        expected == SafetyLevel::Strict || legacy
                     );
                     assert_eq!(r.safety_level_selected(), member);
                     for choice in [SafetyLevel::Off, SafetyLevel::Ask, SafetyLevel::Strict] {
@@ -8862,22 +8922,64 @@ mod safety_level_tests {
     }
 
     #[test]
+    fn kept_v1_protections_apply_until_the_user_picks_a_level() {
+        let mut r = Registry::default();
+        r.safety_level = Some(SafetyLevel::Off);
+        r.kept_v1_safety = Some(KeptV1Safety {
+            quarantine_on_drift: true,
+            ..Default::default()
+        });
+        assert!(r.quarantine_on_drift_effective());
+        assert!(!r.deny_destructive_effective());
+        assert!(!r.requires_human_approval(true, true));
+        r.safety_level = Some(SafetyLevel::Ask);
+        r.kept_v1_safety = Some(KeptV1Safety {
+            hold_untrusted: true,
+            ..Default::default()
+        });
+        assert!(r.requires_human_approval(false, true));
+        assert!(r.requires_human_approval(true, false));
+        assert!(!r.requires_human_approval(false, false));
+        r.set_safety_level(SafetyLevel::Ask);
+        assert_eq!(r.kept_v1_safety, None);
+        assert!(!r.requires_human_approval(false, true));
+    }
+
+    #[test]
     fn legacy_fields_derive_nearest_level_and_new_registry_asks() {
         assert_eq!(
             Registry::default().safety_level_effective(),
             SafetyLevel::Ask
         );
+        // A v1 registry behaves as 1.x did: each toggle on its own, no Strict.
         for (field, level) in [
-            ("denyDestructive", SafetyLevel::Strict),
-            ("quarantineOnDrift", SafetyLevel::Strict),
-            ("blockOnInjection", SafetyLevel::Strict),
+            ("denyDestructive", SafetyLevel::Off),
+            ("quarantineOnDrift", SafetyLevel::Off),
+            ("blockOnInjection", SafetyLevel::Off),
             ("humanApproval", SafetyLevel::Ask),
             ("confirmDestructive", SafetyLevel::Ask),
         ] {
             let mut value = serde_json::json!({"servers": [], "profiles": []});
             value[field] = serde_json::json!(true);
             let registry: Registry = serde_json::from_value(value).unwrap();
-            assert_eq!(registry.safety_level_effective(), level);
+            assert_eq!(registry.safety_level_effective(), level, "{field}");
+            assert_eq!(registry.deny_destructive_effective(), field == "denyDestructive");
+            assert_eq!(
+                registry.quarantine_on_drift_effective(),
+                field == "quarantineOnDrift"
+            );
+            assert_eq!(
+                registry.block_on_injection_effective(),
+                field == "blockOnInjection"
+            );
+            assert_eq!(
+                registry.requires_human_approval(false, true),
+                field == "humanApproval"
+            );
+            assert_eq!(
+                registry.requires_human_approval(true, false),
+                level == SafetyLevel::Ask
+            );
         }
         let registry: Registry =
             serde_json::from_value(serde_json::json!({"servers": [], "profiles": []})).unwrap();

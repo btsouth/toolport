@@ -110,7 +110,6 @@ mod tests {
     #[test]
     fn every_definition_carries_capability_evidence_and_preserves_overrides() {
         let mut registry = crate::registry::Registry::default();
-        registry.discovery_mode = Some("full".into());
         for definition in super::super::defs() {
             assert!(
                 !definition.discovery.evidence.is_empty(),
@@ -140,6 +139,33 @@ mod tests {
         assert_eq!(
             super::super::discovery_capabilities("client:claude-code").auto_mode(),
             "lazy"
+        );
+    }
+
+    #[test]
+    fn a_chosen_global_mode_beats_built_in_client_defaults() {
+        let mut registry = crate::registry::Registry::default();
+        assert_eq!(super::super::client_discovery_mode(&registry, "codex"), "full");
+        assert_eq!(
+            super::super::client_discovery_mode(&registry, "claude-code"),
+            "lazy"
+        );
+        registry.set_discovery_mode("lazy");
+        assert_eq!(super::super::client_discovery_mode(&registry, "codex"), "lazy");
+        registry.set_discovery_mode("grouped");
+        assert_eq!(
+            super::super::client_discovery_mode(&registry, "cursor"),
+            "grouped"
+        );
+        // A per-client choice still wins over the global one.
+        registry.set_client_discovery("cursor", Some("full"));
+        assert_eq!(super::super::client_discovery_mode(&registry, "cursor"), "full");
+        // 1.x "Find tools as needed" turned off meant full for everyone.
+        let mut v1 = crate::registry::Registry::default();
+        v1.lazy_discovery = false;
+        assert_eq!(
+            super::super::client_discovery_mode(&v1, "claude-code"),
+            "full"
         );
     }
 

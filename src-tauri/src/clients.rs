@@ -179,10 +179,14 @@ struct ClientDef {
 /// Resolve Auto without changing serialized per-client overrides. The global default
 /// remains for anonymous connections; identified clients use their capability table.
 pub fn client_discovery_mode(registry: &crate::registry::Registry, id: &str) -> &'static str {
-    let mode = registry.client_discovery_mode(id).or_else(|| {
-        id.strip_prefix("client:")
-            .and_then(|adapter| registry.client_discovery_mode(adapter))
-    });
+    let mode = registry
+        .client_discovery_mode(id)
+        .or_else(|| {
+            id.strip_prefix("client:")
+                .and_then(|adapter| registry.client_discovery_mode(adapter))
+        })
+        // A global mode the user chose beats the client's built-in default.
+        .or_else(|| registry.chosen_global_discovery_mode());
     discovery_capabilities(id).resolve_mode(mode)
 }
 
