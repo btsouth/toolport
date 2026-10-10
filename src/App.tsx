@@ -124,6 +124,7 @@ function App() {
   // than a couple of servers, so one menu click can't silently kill a big set.
   const [confirmDisableAll, setConfirmDisableAll] = useState(false);
   const [confirmEnableTeam, setConfirmEnableTeam] = useState<ServerEntry | null>(null);
+  const [enableReviewError, setEnableReviewError] = useState<string | null>(null);
   const [readyEnableReview, setReadyEnableReview] = useState<ServerEntry | null>(null);
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
   const [toolsServerId, setToolsServerId] = useState<string | null>(null);
@@ -635,7 +636,12 @@ function App() {
           )
         : await setServerEnabled(profileId, serverId, enabled, reviewed);
       applyRegistryChange(next);
+      if (reviewed) setEnableReviewError(null);
     } catch (e) {
+      if (reviewed) {
+        setEnableReviewError(e instanceof Error ? e.message : String(e));
+        throw e;
+      }
       toastError(`Couldn't toggle: ${e}`);
     } finally {
       setBusyId(null);
@@ -646,6 +652,7 @@ function App() {
     if (enabled) {
       const server = servers.find((s) => s.id === serverId);
       if (server && needsTeamEnableReview(server)) {
+        setEnableReviewError(null);
         setConfirmEnableTeam(server);
         return;
       }
@@ -1128,7 +1135,10 @@ function App() {
       <ConfirmDialog
         open={confirmEnableTeam !== null}
         onOpenChange={(open) => {
-          if (!open) setConfirmEnableTeam(null);
+          if (!open) {
+            setEnableReviewError(null);
+            setConfirmEnableTeam(null);
+          }
         }}
         title={
           confirmEnableTeam
@@ -1137,12 +1147,19 @@ function App() {
         }
         description={
           confirmEnableTeam ? (
-            <Suspense fallback={<p>Loading definition...</p>}>
-              <ExecutionReview
-                server={confirmEnableTeam}
-                onReady={setReadyEnableReview}
-              />
-            </Suspense>
+            <>
+              <Suspense fallback={<p>Loading definition...</p>}>
+                <ExecutionReview
+                  server={confirmEnableTeam}
+                  onReady={setReadyEnableReview}
+                />
+              </Suspense>
+              {enableReviewError && (
+                <p role="alert" className="mt-3 text-destructive">
+                  {enableReviewError}
+                </p>
+              )}
+            </>
           ) : undefined
         }
         contentClassName="sm:max-w-2xl"
@@ -1159,11 +1176,13 @@ function App() {
           // instead of enabling it.
           const live = registry?.servers.find((s) => s.id === confirmEnableTeam.id);
           if (!live) {
+            setEnableReviewError(null);
             setConfirmEnableTeam(null);
             toastError("That server is no longer in your registry.");
             return;
           }
           if (!sameReviewedDefinition(confirmEnableTeam, live)) {
+            setEnableReviewError(null);
             setConfirmEnableTeam(live);
             toastError(
               "This server changed while you were reviewing it. Check it again.",

@@ -174,6 +174,57 @@ describe("team enable review dialog", () => {
     await userEvent.click(dialog.getByText("Show full definition"));
     expect(dialog.getByText("Command: npx").closest("details")).toHaveAttribute("open");
   });
+  it("keeps a rejected enable visible and clears the error on a new review", async () => {
+    const message = "Plain values needs NOTES_DIR. Open server setup to add it.";
+    const registry = registryWith(["-y", "old-tool"]);
+    registry.servers[0].name = "Plain values";
+    getRegistry.mockResolvedValue(registry);
+    setServerEnabled.mockRejectedValueOnce(message);
+    render(<App />);
+    const toggle = await screen.findByRole("switch", { name: "Toggle Plain values" });
+    await userEvent.click(toggle);
+    const dialog = within(await screen.findByRole("dialog"));
+    await waitFor(() =>
+      expect(dialog.getByRole("button", { name: "Enable" })).toBeEnabled(),
+    );
+    await userEvent.click(dialog.getByRole("button", { name: "Enable" }));
+    expect(await dialog.findByRole("alert")).toHaveTextContent(message);
+    expect(dialog.getByRole("alert").textContent).toBe(message);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    await userEvent.click(dialog.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await userEvent.click(toggle);
+    expect(within(await screen.findByRole("dialog")).queryByRole("alert")).toBeNull();
+  });
+  it("closes after a successful retry and enables the server", async () => {
+    const registry = registryWith(["-y", "old-tool"]);
+    registry.profiles[0].enabledServerIds = ["team-tool"];
+    setServerEnabled
+      .mockRejectedValueOnce(
+        new Error("Plain values needs NOTES_DIR. Open server setup to add it."),
+      )
+      .mockResolvedValueOnce(registry);
+    render(<App />);
+    const toggle = await screen.findByRole("switch", { name: "Toggle Team tool" });
+    await userEvent.click(toggle);
+    const dialog = within(await screen.findByRole("dialog"));
+    const enable = dialog.getByRole("button", { name: "Enable" });
+    await waitFor(() => expect(enable).toBeEnabled());
+    await userEvent.click(enable);
+    await dialog.findByRole("alert");
+    await userEvent.click(enable);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(setServerEnabled).toHaveBeenLastCalledWith(
+      "default",
+      "team-tool",
+      true,
+      true,
+      expect.objectContaining({ id: "team-tool" }),
+    );
+  });
   // CodeRev on SBS-786: a team push landing while the confirm is open swaps the
   // definition. The handler re-opens review on the live entry, but a normal
   // return let ConfirmDialog close and null it out, so the promised in-place
