@@ -252,7 +252,7 @@ impl CallFailureKind {
             }
             Self::ServerError { .. } => "Server returned an error. Check the error details.",
             Self::Cancelled => "Call cancelled. Check state before repeating a write.",
-            Self::Internal => "Call failed. Check the error details.",
+            Self::Internal => "",
         };
         text.to_string()
     }
@@ -555,12 +555,7 @@ mod tests {
                 "Call cancelled. Check state before repeating a write.",
                 53,
             ),
-            (
-                CallFailureKind::Internal,
-                false,
-                "Call failed. Check the error details.",
-                37,
-            ),
+            (CallFailureKind::Internal, false, "", 0),
         ];
         for (kind, read_only, expected, bytes) in cases {
             let actual = kind.guidance(read_only);
