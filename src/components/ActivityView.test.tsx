@@ -225,14 +225,14 @@ describe("ActivityView trust-state loading", () => {
 
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    expect(screen.getByText(/last 2/)).toBeInTheDocument();
+    expect(screen.getByText(/latest 2/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear activity" }));
     await act(async () => {});
 
     expect(toast.success).toHaveBeenCalledWith("Cleared retained activity");
-    expect(screen.queryByText(/last 2/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/latest 2/)).not.toBeInTheDocument();
     expect(
       screen.getByText(/can't verify that the log is still empty/i),
     ).toBeInTheDocument();
@@ -253,7 +253,7 @@ describe("ActivityView trust-state loading", () => {
 
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    expect(screen.getByText(/last 2/)).toBeInTheDocument();
+    expect(screen.getByText(/latest 2/)).toBeInTheDocument();
 
     // A live tick starts a refetch that is still in flight when the user clears.
     await act(async () => {
@@ -268,7 +268,7 @@ describe("ActivityView trust-state loading", () => {
     await act(async () => {});
 
     expect(toast.success).toHaveBeenCalledWith("Cleared retained activity");
-    expect(screen.queryByText(/last 2/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/latest 2/)).not.toBeInTheDocument();
     expect(
       screen.getByText(/can't verify that the log is still empty/i),
     ).toBeInTheDocument();
