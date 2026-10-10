@@ -433,6 +433,10 @@ mod tests {
             .and_then(telemetry_principal)
             .is_some()));
         assert_eq!(display_client_id("claude-code"), "claude-code");
+        assert_eq!(telemetry_principal("p08-client"), Some("p08-client"));
+        for id in ["adapter-pid-123", "/home/private/customer.env", "sk-live-abcdefghijk123456789"] {
+            assert_eq!(telemetry_principal(id), None);
+        }
     }
 
     #[test]
