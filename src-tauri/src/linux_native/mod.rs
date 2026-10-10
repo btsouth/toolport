@@ -11577,9 +11577,7 @@ fn secret_reference_fields(
         .text(existing.unwrap_or(""))
         .placeholder_text(start.example)
         .build();
-    reference.set_tooltip_text(Some(
-        "Test uses the desktop app environment. The MCP client gateway may use different environment variables or PATH. Only the reference syncs.",
-    ));
+
     let reference_for_provider = reference.clone();
     provider.connect_selected_notify(move |provider| {
         reference_for_provider.set_text("");
@@ -11592,6 +11590,15 @@ fn secret_reference_fields(
     let test = gtk::Button::with_label("Test");
     actions.append(&test);
     container.append(&actions);
+    // A caption, not a tooltip: tooltips near the dialog edge were cut off.
+    container.append(
+        &gtk::Label::builder()
+            .label("Test runs in this app's environment, which can differ from the gateway's. Only the reference syncs, never the key.")
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(["toolport-muted", "caption"])
+            .build(),
+    );
     let box_for_choice = container.clone();
     choice
         .connect_selected_notify(move |choice| box_for_choice.set_visible(choice.selected() == 1));
