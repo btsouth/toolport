@@ -17,8 +17,10 @@ const getSavingsSummary = vi.fn();
 const getAuditStats = vi.fn();
 
 const clearActivityLogs = vi.fn();
+const releaseQuarantine = vi.fn();
 
 vi.mock("@/lib/api", () => ({
+  releaseQuarantine: (...a: unknown[]) => releaseQuarantine(...a),
   clearActivityLogs: (...a: unknown[]) => clearActivityLogs(...a),
   exportAuditToPath: vi.fn(),
   getAuditLog: (...a: unknown[]) => getAuditLog(...a),
@@ -725,6 +727,53 @@ describe("ActivityView security drift dismissals", () => {
       screen.getByRole("button", { name: /srv: 1 tool changed/ }),
     ).toBeInTheDocument();
   });
+  it("accepts one profile while the same finding stays visible and blocked in another", async () => {
+    localStorage.clear();
+    const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
+    const blocked = new Set(["personal", "work"]);
+    const events = ["personal", "work"].map((profile) => ({
+      ...warnEvent(1_700_000_000_000),
+      profile,
+      new_fp: "v2:same-definition",
+      blocked: true,
+      blocked_profiles: [profile],
+    }));
+    getSecurityEvents.mockImplementation(async () =>
+      events.map((event) => ({
+        ...event,
+        blocked: blocked.has(event.profile),
+        blocked_profiles: blocked.has(event.profile) ? [event.profile] : [],
+      })),
+    );
+    releaseQuarantine.mockImplementation(async (profile: string) =>
+      blocked.delete(profile),
+    );
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(screen.getAllByRole("button", { name: /srv: 1 tool changed/ })).toHaveLength(
+      2,
+    );
+    await user.click(
+      screen.getAllByRole("button", { name: "Accept all for this server" })[0],
+    );
+    await act(async () => {});
+    expect(releaseQuarantine).toHaveBeenCalledExactlyOnceWith(
+      "personal",
+      "srv__read",
+      "v2:same-definition",
+    );
+    expect(blocked).toEqual(new Set(["work"]));
+    expect(screen.getAllByRole("button", { name: /srv: 1 tool changed/ })).toHaveLength(
+      1,
+    );
+    expect(screen.getByText(/1 tool is blocked/)).toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(3000));
+    expect(
+      screen.getByRole("button", { name: /srv: 1 tool changed/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/1 tool is blocked/)).toBeInTheDocument();
+  });
+
   it("accepts a server update larger than the old dismissal limit", async () => {
     localStorage.clear();
     const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });

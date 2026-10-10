@@ -1893,14 +1893,21 @@ pub fn security_key(event: &Value) -> String {
         Some(severity) => severity,
         None => event_severity(event),
     };
-    format!(
+    let identity = format!(
         "{}:{}:{}:{}:{}",
         field("type"),
         field("server"),
         field("tool"),
         field("change"),
         severity
-    )
+    );
+    match event["profile"]
+        .as_str()
+        .filter(|profile| !profile.is_empty())
+    {
+        Some(profile) => format!("{identity}:profile={profile}"),
+        None => identity,
+    }
 }
 
 /// A first sighting of a brand-new tool is churn, not an alarm - unless it is
@@ -4513,6 +4520,54 @@ mod tests {
         assert!(quarantined(None).unwrap().contains("srv__update"));
         assert!(release_definition(None, "srv__update", &fingerprint(&tool)).unwrap());
         assert!(!quarantined(None).unwrap().contains("srv__update"));
+    }
+
+    #[test]
+    fn accepting_one_profile_keeps_the_other_finding_visible_and_blocked() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("cross-profile-review-acceptance");
+        let mut reg = crate::registry::Registry::default();
+        for id in ["personal", "work"] {
+            reg.profiles.push(crate::registry::Profile {
+                id: id.into(),
+                name: id.into(),
+                ..Default::default()
+            });
+        }
+        crate::registry::save(&reg).unwrap();
+        let before = vec![json!({"name":"srv__update", "description":"Before"})];
+        let after = vec![json!({"name":"srv__update", "description":"After"})];
+        for id in ["personal", "work"] {
+            check(Some(id), &before).unwrap();
+            let findings = check_staged(Some(id), &after).unwrap();
+            apply_quarantine(Some(id), &after, &findings).unwrap();
+            accept_quarantined_pins(Some(id)).unwrap();
+        }
+        let findings = dedupe_security(&review_events(2000).unwrap());
+        assert_eq!(findings.len(), 2);
+        assert_ne!(security_key(&findings[0]), security_key(&findings[1]));
+        assert!(findings.iter().all(|event| event["blocked"] == true));
+        let accepted = security_key(
+            findings
+                .iter()
+                .find(|e| e["profile"] == "personal")
+                .unwrap(),
+        );
+        assert!(
+            release_definition(Some("personal"), "srv__update", &fingerprint(&after[0])).unwrap()
+        );
+        let remaining: Vec<_> = dedupe_security(&review_events(2000).unwrap())
+            .into_iter()
+            .filter(|event| security_key(event) != accepted)
+            .collect();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["profile"], "work");
+        assert_eq!(remaining[0]["blocked_profiles"], json!(["work"]));
+        assert_eq!(remaining[0]["blocked"], true);
+        assert!(!quarantined(Some("personal"))
+            .unwrap()
+            .contains("srv__update"));
+        assert!(quarantined(Some("work")).unwrap().contains("srv__update"));
     }
 
     #[test]

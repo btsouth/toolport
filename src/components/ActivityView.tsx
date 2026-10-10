@@ -141,7 +141,8 @@ function severityIdentity(e: SecurityEvent): string {
  * that must still interrupt. */
 function securityKey(e: SecurityEvent): string {
   const severity = severityIdentity(e);
-  return `${e.type}:${e.server ?? ""}:${e.tool ?? ""}:${e.change}:${severity}`;
+  const identity = `${e.type}:${e.server ?? ""}:${e.tool ?? ""}:${e.change}:${severity}`;
+  return e.profile ? `${identity}:profile=${e.profile}` : identity;
 }
 
 /** Review changes and actionable findings through their occurrence timestamp.
@@ -190,6 +191,7 @@ function dedupeSecurity(events: SecurityEvent[]): SecurityEvent[] {
       (k) =>
         k.type === e.type &&
         k.server === e.server &&
+        (k.profile || "") === (e.profile || "") &&
         k.tool === e.tool &&
         k.change === e.change &&
         severityIdentity(k) === severityIdentity(e) &&
