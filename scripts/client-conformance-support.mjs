@@ -24,11 +24,8 @@ export const deadlineMs = 20_000;
 export function clientInventoryFromSource(source) {
   const definitions = source.match(/^fn defs\(\) -> Vec<ClientDef> \{([\s\S]*?)^\}/m);
   assert(definitions, "client definition inventory could not be read");
-  return [...definitions[1].matchAll(/\bClientDef\s*\{\s*id:\s*"([a-z0-9-]+)"/g)].map(
-    (match) => match[1],
-  );
+  return [...definitions[1].matchAll(/\bid:\s*"([a-z0-9-]+)"/g)].map((match) => match[1]);
 }
-
 
 export function cleanEnvironment(home) {
   const env = {};

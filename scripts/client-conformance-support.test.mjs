@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, writeFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import {
   Fixture,
   clientInventoryFromSource,
+  profiles,
   repo,
   waitExit,
   waitPidExit,
@@ -20,7 +21,10 @@ const example = HttpClient { id: "example", label: "Example" };
 fn defs() -> Vec<ClientDef> {
     vec![
         ClientDef { id: "cursor", name: "Cursor" },
-        ClientDef { id: "new-client", name: "New client" },
+        ClientDef {
+            // A definition can document its config before its ID.
+            id: "new-client", name: "New client"
+        },
     ]
 }
 #[cfg(test)]
@@ -36,6 +40,14 @@ test("client inventory fails closed when its definition factory is missing", () 
   assert.throws(
     () => clientInventoryFromSource('HttpClient { id: "real" }'),
     /client definition inventory could not be read/,
+  );
+});
+
+test("source client inventory matches every offline adapter profile", async () => {
+  const source = await readFile(path.join(repo, "src-tauri/src/clients.rs"), "utf8");
+  assert.deepEqual(
+    clientInventoryFromSource(source).sort(),
+    profiles.map((profile) => profile.id).sort(),
   );
 });
 
