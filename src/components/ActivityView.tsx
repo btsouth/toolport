@@ -524,21 +524,11 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
   const legacy = savings.legacyEstimatedTokensAvoided ?? 0;
   const oldV2 = savings.estimatedTokensAvoided ?? 0;
   const method =
-    "cl100k_base tokenizer; net of discovery responses and extra catalog exposure; counted once per session and scoped full/exposed catalog hash (sessionless HTTP: per listener/client). Historical estimates excluded. Client transformations and caching mean this is not model billing.";
+    "Tool descriptions are counted locally once per client session and catalog version, minus search results and any extra descriptions loaded. Older estimates are excluded; this is not a billing figure.";
   const since = savings.sinceTs > 0 ? fmtTs(savings.sinceTs, "monthDay") : null;
-  const details = [
-    (savings.tokenizedLoads ?? 0) > 0
-      ? `${savings.tokenizedLoads!.toLocaleString()} counted catalog exposure${savings.tokenizedLoads === 1 ? "" : "s"}`
-      : null,
-    hasCatalog && savings.peakCatalog > 4
-      ? `peak catalog ${savings.peakCatalog.toLocaleString()} tools`
-      : null,
-    since ? `since ${since}` : null,
-  ].filter(Boolean);
-
   const share = async () => {
     const text = hasCatalog
-      ? `Toolport counted ${fmtTokens(savings.tokensSaved)} catalog tokens avoided after discovery text. Counted with cl100k_base once per session and catalog hash, not model usage or billing. toolport.app`
+      ? `Toolport counted ${fmtTokens(savings.tokensSaved)} catalog tokens avoided. Estimated locally; not a billing figure. toolport.app`
       : `Toolport recorded ${savings.discoveryCount ?? 0} discovery searches returning ${fmtBytes(savings.discoveryResponseBytes ?? 0)} of text at its MCP boundary. toolport.app`;
     try {
       await navigator.clipboard.writeText(text);
@@ -566,34 +556,11 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
           </span>
         </span>
       </div>
-      {hasCatalog && (
-        <p className="mt-2 text-xs text-muted-foreground">
-          Counts tool-definition text with cl100k_base, after discovery text. This does
-          not measure model usage or billing.
-        </p>
-      )}
-      {(savings.latestCatalogTs ?? 0) > 0 && (
-        <div className="mt-2 text-sm text-muted-foreground">
-          Latest load: {fmtBytes(savings.latestFullSurfaceBytes ?? 0)} /{" "}
-          {(savings.latestFullToolCount ?? 0).toLocaleString()} tools full
-          {" → "}
-          {fmtBytes(savings.latestExposedSurfaceBytes ?? 0)} /{" "}
-          {(savings.latestExposedToolCount ?? 0).toLocaleString()} tools exposed
-        </div>
-      )}
-      {measured && (
-        <div
-          className="mt-2 text-sm text-muted-foreground"
-          title={`${avoided.toLocaleString()} exact UTF-8 bytes avoided`}
-        >
-          {fmtBytes(savings.fullSurfaceBytes ?? 0)} full ·{" "}
-          {fmtBytes(savings.exposedSurfaceBytes ?? 0)} exposed · {fmtBytes(avoided)}{" "}
-          avoided across measured loads
-          {` · ${fmtBytes(Math.round((savings.fullSurfaceBytes ?? 0) / (savings.measuredLoads ?? 1)))} full/load`}
-          {(savings.extraExposedSurfaceBytes ?? 0) > 0 &&
-            ` · ${fmtBytes(savings.extraExposedSurfaceBytes ?? 0)} extra exposure on small catalogs`}
-        </div>
-      )}
+      <p className="mt-2 text-xs text-muted-foreground">
+        {hasCatalog
+          ? "Tool descriptions your AI clients didn't have to load. Estimated locally; not a billing figure."
+          : "Text returned by tool searches, measured on this computer."}
+      </p>
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <button
           onClick={share}
@@ -602,22 +569,50 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
           <Share2 className="size-3.5" /> Share
         </button>
       </div>
-      <p className="mt-2.5 text-xs text-muted-foreground">
-        {details.length > 0 ? `${details.join(" · ")}. ` : ""}
-        {measured
-          ? `${(savings.measuredLoads ?? 0).toLocaleString()} measured load${savings.measuredLoads === 1 ? "" : "s"}. `
-          : ""}
-        {discovered
-          ? `${(savings.discoveryCount ?? 0).toLocaleString()} searches returned ${fmtBytes(savings.discoveryResponseBytes ?? 0)} of discovery text. `
-          : ""}
-        {legacy > 0
-          ? `Historical: ≈${fmtTokens(legacy)} from older estimated records, excluded. `
-          : ""}
-        {oldV2 > 0
-          ? `Historical bytes/4: ≈${fmtTokens(oldV2)} estimated tokens, excluded. `
-          : ""}
-        <span title={method}>Counting method</span>
-      </p>
+      <details className="mt-3 text-xs text-muted-foreground">
+        <summary className="cursor-pointer">How this is counted</summary>
+        <div className="mt-2 space-y-2">
+          <p>{method}</p>
+          <p>
+            {savings.tokenizedLoads ?? 0} catalog loads counted
+            {since ? ` since ${since}` : ""}; largest catalog:{" "}
+            {savings.peakCatalog.toLocaleString()} tools.
+          </p>
+          {measured && (
+            <p>
+              {fmtBytes(savings.fullSurfaceBytes ?? 0)} of tool descriptions available,{" "}
+              {fmtBytes(savings.exposedSurfaceBytes ?? 0)} loaded, {fmtBytes(avoided)}{" "}
+              avoided across {savings.measuredLoads} measured loads.
+            </p>
+          )}
+          {(savings.latestCatalogTs ?? 0) > 0 && (
+            <p>
+              Latest load: {savings.latestFullToolCount} tools available (
+              {fmtBytes(savings.latestFullSurfaceBytes ?? 0)}),{" "}
+              {savings.latestExposedToolCount} loaded (
+              {fmtBytes(savings.latestExposedSurfaceBytes ?? 0)}).
+            </p>
+          )}
+          {(savings.extraExposedSurfaceBytes ?? 0) > 0 && (
+            <p>
+              {fmtBytes(savings.extraExposedSurfaceBytes ?? 0)} of extra descriptions
+              loaded for small catalogs.
+            </p>
+          )}
+          {discovered && (
+            <p>
+              {savings.discoveryCount} searches returned{" "}
+              {fmtBytes(savings.discoveryResponseBytes ?? 0)} of text.
+            </p>
+          )}
+          {(legacy > 0 || oldV2 > 0) && (
+            <p>
+              Older estimated records ({fmtTokens(legacy)} and {fmtTokens(oldV2)} tokens)
+              are excluded.
+            </p>
+          )}
+        </div>
+      </details>
     </div>
   );
 }
@@ -985,7 +980,7 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
           <div className="text-2xl font-semibold tabular-nums">
             {stats.total.toLocaleString()}
           </div>
-          <div className="text-xs text-muted-foreground">tool calls retained</div>
+          <div className="text-xs text-muted-foreground">calls saved</div>
         </div>
         <div
           className={`rounded-lg border p-3 ${stats.errors > 0 ? "border-destructive/40 bg-destructive/[0.04]" : ""}`}
@@ -1001,7 +996,7 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
           <div className="text-2xl font-semibold tabular-nums">
             {stats.servers.length}
           </div>
-          <div className="text-xs text-muted-foreground">active servers</div>
+          <div className="text-xs text-muted-foreground">servers used</div>
         </div>
       </div>
 
@@ -1304,7 +1299,13 @@ function PanelErrorNotice({ label, onRetry }: { label: string; onRetry: () => vo
   );
 }
 
-function DiscoveryTraces({ refreshKey }: { refreshKey: number }) {
+function DiscoveryTraces({
+  refreshKey,
+  searches,
+}: {
+  refreshKey: number;
+  searches: number;
+}) {
   const [entries, setEntries] = useState<SearchTrace[]>([]);
   // Collapsed by default: this is glanceable telemetry, not an alert, and the list can run
   // to 100 rows. Leading with it open was a big part of the Activity tab feeling busy.
@@ -1349,8 +1350,9 @@ function DiscoveryTraces({ refreshKey }: { refreshKey: number }) {
           <Search className="size-4 shrink-0 text-owned" />
           <span className="font-medium text-foreground/80">Discovery</span>
         </div>
-        With lazy discovery on, this shows every tool search your agents run, what
-        matched, why it ranked, and the returned MCP payload size. Nothing searched yet.
+        {searches > 0
+          ? `${searches} searches in recent activity; detailed search records are no longer available.`
+          : "Nothing searched yet."}
       </div>
     );
 
@@ -1958,7 +1960,13 @@ export function ActivityView({
       ((savings.tokenizedLoads ?? 0) > 0 || (savings.discoveryCount ?? 0) > 0) ? (
         <SavingsBanner savings={savings} />
       ) : null}
-      <DiscoveryTraces refreshKey={liveKey} />
+      <DiscoveryTraces
+        refreshKey={liveKey}
+        searches={
+          (entries ?? []).filter((e) => e.kind === "internal" && e.tool === "search")
+            .length
+        }
+      />
       <ToolIdentities refreshKey={liveKey} />
       {registry?.liveInspect ? <LiveInspector refreshKey={liveKey} /> : null}
     </>
@@ -2109,11 +2117,10 @@ export function ActivityView({
       </div>
 
       <p className="mb-2 text-xs text-muted-foreground">
-        {stats ? `${stats.total.toLocaleString()} tool calls retained · ` : ""}
+        {stats ? `${stats.total.toLocaleString()} calls saved on this computer. ` : ""}
         {logOpen
-          ? `Showing ${visible.length.toLocaleString()} of the latest ${entries.length.toLocaleString()} events.`
-          : `Latest ${entries.length.toLocaleString()} events available.`}{" "}
-        Events include calls, approvals and Toolport lookups.
+          ? `Showing ${visible.length === entries.length ? "the latest" : ""} ${visible.length.toLocaleString()}${visible.length !== entries.length ? ` matching rows from the latest ${entries.length}` : ""}.`
+          : `Latest ${entries.length.toLocaleString()} available.`}
       </p>
 
       {logOpen && (

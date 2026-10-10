@@ -705,7 +705,28 @@ mockIPC(
           total: dogfoodFixture ? 5225 : 200,
           errors: 0,
           errorRate: 0,
-          servers: [],
+          servers: [
+            {
+              server: "GitHub",
+              calls: dogfoodFixture ? 5225 : 200,
+              errors: 0,
+              errorRate: 0,
+              avgMs: 12,
+              p95Ms: 12,
+              lastTs: auditRows[auditRows.length - 1].ts,
+              tools: [
+                {
+                  tool: "list_issues",
+                  calls: dogfoodFixture ? 5225 : 200,
+                  errors: 0,
+                  errorRate: 0,
+                  avgMs: 12,
+                  p95Ms: 12,
+                  lastTs: auditRows[auditRows.length - 1].ts,
+                },
+              ],
+            },
+          ],
         };
       case "list_server_tools":
         return [
@@ -752,7 +773,25 @@ mockIPC(
       case "list_allowed_tools":
       case "list_quarantined":
       case "get_security_events":
+        return [];
       case "get_search_traces":
+        return auditRows
+          .filter((row) => row.kind === "internal" && row.tool === "search")
+          .map((row) => ({
+            ts: row.ts,
+            client: row.clientName,
+            query: "GitHub issues",
+            top: "github_list_issues",
+            names: ["github_list_issues"],
+            returned: 1,
+            total: 75,
+            returnedTokens: 100,
+            flatTokens: 1000,
+            savedTokens: 900,
+            responseContentBytes: 400,
+            escalated: false,
+            mode: "lexical",
+          }));
       case "get_inspect_log":
       case "list_tool_identities":
         return [];

@@ -433,6 +433,40 @@ try {
   await expect(
     page.getByText("Unrecorded client wants to run this · destructive tool"),
   ).toHaveAttribute("title", /Older Toolport versions did not record callers/);
+  const approvalCard = page.getByRole("alertdialog");
+  for (const height of [800, 520]) {
+    await page.setViewportSize({ width: 1280, height });
+    await approvalCard.evaluate(async (card) => {
+      await Promise.all(card.getAnimations().map((animation) => animation.finished));
+    });
+    const bounds = await approvalCard.boundingBox();
+    expect(bounds.y + bounds.height).toBeLessThanOrEqual(height - 15);
+    expect(
+      await approvalCard.evaluate((card) => getComputedStyle(card).backgroundColor),
+    ).not.toMatch(/rgba|\/\s*0\./);
+    const approvalList = approvalCard.locator("ul").first();
+    expect(
+      await approvalList.evaluate((list) => list.scrollHeight > list.clientHeight),
+    ).toBe(true);
+    await page.screenshot({ path: path.join(output, `approval-after-r2-${height}.png`) });
+    await approvalCard
+      .getByRole("button", { name: "Deny", exact: true })
+      .last()
+      .scrollIntoViewIfNeeded();
+    await expect(
+      approvalCard.getByRole("button", { name: "Deny", exact: true }).last(),
+    ).toBeInViewport();
+    await expect(
+      approvalCard.getByText("Action required", { exact: true }),
+    ).toBeInViewport();
+    await page.screenshot({
+      path: path.join(output, `approval-bottom-r2-${height}.png`),
+    });
+    await approvalList.evaluate((list) => {
+      list.scrollTop = 0;
+    });
+  }
+  await page.setViewportSize({ width: 1240, height: 900 });
   await page.screenshot({ path: path.join(output, "caller-approvals.png") });
   for (let i = 0; i < 3; i++)
     await page
@@ -485,9 +519,26 @@ try {
     "title",
     /before reaching the model/,
   );
-  await expect(page.getByText(/5,225 tool calls retained/)).toContainText(
-    "Showing 5 of the latest 5 events",
+  await expect(page.getByText(/5,225 calls saved/)).toContainText(
+    "Showing the latest 5.",
   );
+  await expect(page.getByText("Nothing searched yet.", { exact: true })).toHaveCount(0);
+  await expect(
+    page.getByText("servers used", { exact: true }).locator(".."),
+  ).toContainText("1");
+  await page.screenshot({ path: path.join(output, "A1-A2-A3-A4-activity-after-r2.png") });
+  const counting = page.getByText("How this is counted", { exact: true });
+  await expect(counting.locator("..")).not.toHaveAttribute("open");
+  await counting.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: path.join(output, "A5-savings-after-r2.png") });
+  await counting.click();
+  await page.screenshot({ path: path.join(output, "A5-savings-details-after-r2.png") });
+  await counting.click();
+  await page.getByRole("button", { name: /^Discovery/ }).click();
+  await expect(page.getByText("GitHub issues", { exact: true })).toBeVisible();
+  await page.screenshot({ path: path.join(output, "discovery-after-r2.png") });
+  await page.getByRole("button", { name: /^Per-server breakdown/ }).click();
+  await page.screenshot({ path: path.join(output, "server-stats-after-r2.png") });
   await page.getByRole("button", { name: "Clear", exact: true }).click();
   await expect(page.getByRole("dialog")).toContainText("Clear retained activity?");
   await page.getByRole("button", { name: "Cancel", exact: true }).click();

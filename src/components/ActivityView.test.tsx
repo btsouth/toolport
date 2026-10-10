@@ -99,8 +99,8 @@ it("p10c shows approval outcomes without treating them as call errors", async ()
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   await user.click(await screen.findByRole("button", { name: /recent calls/i }));
-  expect(screen.getByText("tool calls retained").parentElement).toHaveTextContent(
-    /2\s*tool calls retained/,
+  expect(screen.getByText("calls saved").parentElement).toHaveTextContent(
+    /2\s*calls saved/,
   );
   expect(screen.getByText("errors (50%)").parentElement).toHaveTextContent(/1\s*errors/);
   for (const [, label] of outcomes) expect(screen.getByText(label)).toBeInTheDocument();
@@ -120,7 +120,7 @@ it("p10c shows an approval-only history even when no tools ran", async () => {
   await user.click(await screen.findByRole("button", { name: /recent calls/i }));
   expect(screen.getByText("Withdrawn")).toBeInTheDocument();
   expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
-  expect(screen.queryByText("tool calls retained")).not.toBeInTheDocument();
+  expect(screen.queryByText("calls saved")).not.toBeInTheDocument();
 });
 
 it("pauses Activity polling while hidden and resumes when visible", async () => {
@@ -357,6 +357,7 @@ describe("ActivityView recent calls", () => {
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
     await user.click(await screen.findByRole("button", { name: /recent calls/i }));
     expect(screen.getByText("Searched tools")).toBeInTheDocument();
+    expect(screen.queryByText(/Nothing searched yet/)).not.toBeInTheDocument();
     expect(screen.queryByText(/warm catalog|dispatch 3/)).not.toBeInTheDocument();
     expect(screen.getByText(/Unrecorded client ·/)).toHaveAttribute(
       "title",
@@ -366,8 +367,8 @@ describe("ActivityView recent calls", () => {
       "title",
       expect.stringContaining("before reaching the model"),
     );
-    expect(screen.getByText(/5,225 tool calls retained/)).toHaveTextContent(
-      "Showing 1 of the latest 1 events",
+    expect(screen.getByText(/5,225 calls saved/)).toHaveTextContent(
+      "Showing the latest 1.",
     );
     expect(screen.getByRole("button", { name: "Export" })).toHaveAttribute("title");
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
@@ -566,14 +567,14 @@ it("distinguishes measured bytes from legacy estimates in catalog savings", asyn
   expect(screen.getByText(/923/)).toHaveTextContent("catalog tokens avoided");
   expect(screen.getByText(/923/)).toHaveAttribute(
     "title",
-    expect.stringContaining("net of discovery"),
+    expect.stringContaining("counted locally"),
   );
-  expect(screen.getByText(/Historical bytes\/4/)).toBeInTheDocument();
-  expect(screen.getByText(/8\.0 KB full/)).toBeInTheDocument();
-  expect(
-    screen.getByText(/Latest load: 8\.0 KB \/ 1,725 tools full/),
-  ).toBeInTheDocument();
-  expect(screen.getByText(/older estimated records/)).toBeInTheDocument();
+  expect(screen.getByText("How this is counted").parentElement).not.toHaveAttribute(
+    "open",
+  );
+  expect(screen.getByText(/8\.0 KB of tool descriptions available/)).toBeInTheDocument();
+  expect(screen.getByText(/Latest load: 1725 tools available/)).toBeInTheDocument();
+  expect(screen.getByText(/Older estimated records/)).toBeInTheDocument();
   expect(screen.getByText(/searches returned 2\.5 KB/)).toBeInTheDocument();
 });
 
@@ -610,11 +611,10 @@ it("shares a token savings statement without a billing claim", async () => {
   await act(async () => {});
   await user.click(screen.getByRole("button", { name: "Share" }));
   expect(writeText).toHaveBeenCalledWith(
-    expect.stringContaining("-123 catalog tokens avoided after discovery text"),
+    expect.stringContaining("-123 catalog tokens avoided"),
   );
-  expect(writeText.mock.calls[0][0]).toContain("not model usage or billing");
-  expect(writeText.mock.calls[0][0]).toContain("once per session and catalog hash");
-  expect(writeText.mock.calls[0][0]).toContain("cl100k_base");
+  expect(writeText.mock.calls[0][0]).toContain("not a billing figure");
+  expect(writeText.mock.calls[0][0]).not.toMatch(/cl100k|bytes\/4|exposures/);
   expect(writeText.mock.calls[0][0]).not.toMatch(/billed tokens|money saved/i);
 });
 

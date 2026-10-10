@@ -164,7 +164,7 @@ export function PendingApprovals() {
         role="alertdialog"
         aria-modal="false"
         aria-label="Tool calls awaiting your approval"
-        className="animate-in fade-in slide-in-from-top-2 pointer-events-auto relative w-full max-w-lg overflow-hidden rounded-xl border border-warning/40 bg-popover/95 shadow-2xl ring-1 ring-warning/10 backdrop-blur outline-none focus-visible:ring-2 focus-visible:ring-warning"
+        className="animate-in fade-in slide-in-from-top-2 pointer-events-auto relative flex max-h-[calc(100dvh-2rem)] w-full max-w-lg flex-col overflow-hidden rounded-xl border border-warning/40 bg-popover shadow-2xl ring-1 ring-warning/10 outline-none focus-visible:ring-2 focus-visible:ring-warning"
       >
         {/* Announce count changes to screen readers without re-announcing on every countdown
          * tick (the visible timer lives elsewhere; this text only changes when the count does). */}
@@ -172,7 +172,7 @@ export function PendingApprovals() {
           {pending.length} request{pending.length > 1 ? "s" : ""} awaiting your action.
           Press Escape to cancel.
         </div>
-        <header className="flex items-center gap-3 border-b border-border/60 px-4 py-3">
+        <header className="flex shrink-0 items-center gap-3 border-b border-border/60 px-4 py-3">
           <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-warning/15 text-warning">
             <ShieldAlert className="size-4" />
           </span>
@@ -185,7 +185,7 @@ export function PendingApprovals() {
           </div>
         </header>
 
-        <ul className="max-h-[70vh] divide-y divide-border/60 overflow-auto">
+        <ul className="min-h-0 divide-y divide-border/60 overflow-y-auto overscroll-contain">
           {pending.map((a) => {
             const reason = REASON[a.reason];
             const clientName = trustedClientName(a);
