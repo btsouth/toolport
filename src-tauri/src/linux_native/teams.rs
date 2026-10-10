@@ -1707,7 +1707,11 @@ mod tests {
         assert_eq!(scroll.hscrollbar_policy(), gtk::PolicyType::Never);
         assert_eq!(scroll.vscrollbar_policy(), gtk::PolicyType::Automatic);
         assert_eq!(scroll.max_content_height(), 340);
-        let content = scroll.child().unwrap().downcast::<gtk::Box>().unwrap();
+        let child = scroll.child().unwrap();
+        let child = if let Ok(viewport) = child.clone().downcast::<gtk::Viewport>() {
+            viewport.child().unwrap()
+        } else { child };
+        let content = child.downcast::<gtk::Box>().unwrap();
         let label = content.first_child().unwrap().downcast::<gtk::Label>().unwrap();
         assert!(label.label().contains("new")); assert!(label.has_css_class("warning"));
         let expander = content.last_child().unwrap().downcast::<gtk::Expander>().unwrap();
