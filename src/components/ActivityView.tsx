@@ -982,7 +982,9 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
     <div className="mb-6 flex flex-col gap-3">
       <div className="grid grid-cols-3 gap-3">
         <div className="rounded-lg border p-3">
-          <div className="text-2xl font-semibold tabular-nums">{stats.total}</div>
+          <div className="text-2xl font-semibold tabular-nums">
+            {stats.total.toLocaleString()}
+          </div>
           <div className="text-xs text-muted-foreground">tool calls retained</div>
         </div>
         <div
@@ -1952,7 +1954,8 @@ export function ActivityView({
             : "Catalog telemetry unavailable. Retry Activity to load measurements."}
         </p>
       )}
-      {savings && (savings.listLoads > 0 || (savings.discoveryCount ?? 0) > 0) ? (
+      {savings &&
+      ((savings.tokenizedLoads ?? 0) > 0 || (savings.discoveryCount ?? 0) > 0) ? (
         <SavingsBanner savings={savings} />
       ) : null}
       <DiscoveryTraces refreshKey={liveKey} />
