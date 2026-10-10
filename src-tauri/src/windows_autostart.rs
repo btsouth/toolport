@@ -106,17 +106,28 @@ pub(crate) fn remove_toolport_entries(names: &[&str]) -> Vec<crate::purge::Lefto
     let mut leftovers = Vec::new();
     let user = RegKey::predef(HKEY_CURRENT_USER);
     for name in names {
-        let path = format!("HKCU\\{RUN_KEY}\\{name}");
+        let run_path = format!("HKCU\\{RUN_KEY}\\{name}");
+        let approval_path = format!("HKCU\\{STARTUP_APPROVED_KEY}\\{name}");
         let result = (|| {
             let run = match user.open_subkey_with_flags(RUN_KEY, KEY_READ | KEY_WRITE) {
                 Ok(run) => run,
                 Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(error.to_string()),
+                Err(error) => {
+                    return Err(crate::purge::Leftover {
+                        path: run_path.clone(),
+                        error: error.to_string(),
+                    })
+                }
             };
             let command = match run.get_value::<String, _>(*name) {
                 Ok(command) => command,
                 Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(error.to_string()),
+                Err(error) => {
+                    return Err(crate::purge::Leftover {
+                        path: run_path.clone(),
+                        error: error.to_string(),
+                    })
+                }
             };
             let binary = if let Some(rest) = command.strip_prefix('"') {
                 rest.split('"').next().unwrap_or("")
@@ -132,32 +143,39 @@ pub(crate) fn remove_toolport_entries(names: &[&str]) -> Vec<crate::purge::Lefto
                 "conduit.exe" | "toolport.exe"
             ) || !command.contains("--hidden")
             {
-                return Err("Startup command has different ownership. It was preserved.".into());
+                return Err(crate::purge::Leftover {
+                    path: run_path.clone(),
+                    error: "Startup command has different ownership. It was preserved.".into(),
+                });
             }
+            // Keep the Run command as ownership proof until approval cleanup succeeds.
             match user.open_subkey_with_flags(STARTUP_APPROVED_KEY, KEY_WRITE) {
                 Ok(key) => match key.delete_value(name) {
-                    run.delete_value(name).map_err(|error| error.to_string())?;
-            Ok(()) => {}
+                    Ok(()) => {}
                     Err(error) if error.kind() == ErrorKind::NotFound => {}
                     Err(error) => {
-                        leftovers.push(crate::purge::Leftover {
-                            path: format!("HKCU\\{STARTUP_APPROVED_KEY}\\{name}"),
+                        return Err(crate::purge::Leftover {
+                            path: approval_path,
                             error: error.to_string(),
-                        });
+                        })
                     }
                 },
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
                 Err(error) => {
-                    leftovers.push(crate::purge::Leftover {
-                        path: format!("HKCU\\{STARTUP_APPROVED_KEY}\\{name}"),
+                    return Err(crate::purge::Leftover {
+                        path: approval_path,
                         error: error.to_string(),
-                    });
+                    })
                 }
             }
-            Ok(())
+            run.delete_value(name)
+                .map_err(|error| crate::purge::Leftover {
+                    path: run_path,
+                    error: error.to_string(),
+                })
         })();
-        if let Err(error) = result {
-            leftovers.push(crate::purge::Leftover { path, error });
+        if let Err(leftover) = result {
+            leftovers.push(leftover);
         }
     }
     leftovers
