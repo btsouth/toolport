@@ -1941,18 +1941,24 @@ impl Router {
                 status.describe()
             ),
             None => {
-                let mut matches: Vec<_> = self.tools.iter().filter_map(|tool| {
-                    let name = tool["name"].as_str()?;
-                    let (server, _) = self.route_of(name)?;
-                    let model_visible = match tool.pointer("/_meta/ui/visibility") {
-                        None => true,
-                        Some(Value::Array(audiences)) => audiences.iter().any(|a| a == "model"),
-                        Some(_) => false,
-                    };
-                    if !visible(server) || !model_visible { return None; }
-                    let distance = alias_distance(exposed_name, name);
-                    (distance <= 3).then_some((distance, name))
-                }).collect();
+                let mut matches: Vec<_> = self
+                    .tools
+                    .iter()
+                    .filter_map(|tool| {
+                        let name = tool["name"].as_str()?;
+                        let (server, _) = self.route_of(name)?;
+                        let model_visible = match tool.pointer("/_meta/ui/visibility") {
+                            None => true,
+                            Some(Value::Array(audiences)) => audiences.iter().any(|a| a == "model"),
+                            Some(_) => false,
+                        };
+                        if !visible(server) || !model_visible {
+                            return None;
+                        }
+                        let distance = alias_distance(exposed_name, name);
+                        (distance <= 3).then_some((distance, name))
+                    })
+                    .collect();
                 matches.sort();
                 matches.truncate(3);
                 let hint = if matches.is_empty() {
@@ -3448,7 +3454,8 @@ impl Router {
             self.tool_owners
                 .insert(candidate.exposed.clone(), candidate.server.clone());
             if let Some(legacy) = &candidate.policy_name {
-                self.legacy_names.insert(candidate.exposed.clone(), legacy.clone());
+                self.legacy_names
+                    .insert(candidate.exposed.clone(), legacy.clone());
             }
             self.bind_policy_name(&candidate.exposed, &candidate.server, &candidate.original);
             if self.blocked.contains_key(&candidate.exposed) {
@@ -6672,15 +6679,22 @@ for line in sys.stdin:
         let long = format!("read_{}", "item_".repeat(20));
         let collision = bounded_alias(&format!("s__{long}"), &("s", long.as_str()));
         let short = collision.strip_prefix("s__").unwrap();
-        let tools = vec![json!({"name":long}), json!({"name":short}),
+        let tools = vec![
+            json!({"name":long}),
+            json!({"name":short}),
             json!({"name":format!("{}-x", "a".repeat(59))}),
-            json!({"name":format!("{}_x", "a".repeat(59))})];
+            json!({"name":format!("{}_x", "a".repeat(59))}),
+        ];
         let aliases = Router::server_tool_aliases("s", &tools, HashMap::new());
         assert_eq!(aliases[short], collision);
         assert_ne!(aliases[&long], collision);
         assert!(aliases.values().all(|name| name.len() <= 64));
-        let mut reversed = tools.clone(); reversed.reverse();
-        assert_eq!(aliases, Router::server_tool_aliases("s", &reversed, HashMap::new()));
+        let mut reversed = tools.clone();
+        reversed.reverse();
+        assert_eq!(
+            aliases,
+            Router::server_tool_aliases("s", &reversed, HashMap::new())
+        );
     }
 
     #[test]

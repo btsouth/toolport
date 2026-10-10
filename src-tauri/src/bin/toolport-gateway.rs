@@ -4652,15 +4652,19 @@ fn execute_call(
         }
         vec![owner]
     } else {
-        reg.servers.iter().filter_map(|server| {
-            let prefix = sanitize_segment(&server.id);
-            (prefix.len() > 24 && name.starts_with(&format!("{}__", &prefix[..24])))
-                .then(|| server.id.clone())
-        }).collect()
+        reg.servers
+            .iter()
+            .filter_map(|server| {
+                let prefix = sanitize_segment(&server.id);
+                (prefix.len() > 24 && name.starts_with(&format!("{}__", &prefix[..24])))
+                    .then(|| server.id.clone())
+            })
+            .collect()
     };
-    let candidates: Vec<_> = candidates.into_iter().filter(|id| {
-        visible(id) && view.authorize(DispatchTarget::Server(id)).is_ok()
-    }).collect();
+    let candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|id| visible(id) && view.authorize(DispatchTarget::Server(id)).is_ok())
+        .collect();
     if view.authorize(DispatchTarget::Tool(name)).is_ok() {
         for owner in &candidates {
             view.prepare_lazy_use(owner);
@@ -4673,16 +4677,24 @@ fn execute_call(
                 let view = fresh.as_deref().unwrap_or(router);
                 let loading = view.any_discovering(visible)
                     || view.any_publishing_first_catalog(visible)
-                    || candidates.iter().any(|owner| view.kick_pending(owner, |id| id == owner)
-                        .is_some_and(|status| status.connecting));
-                if view.route_of(name).is_some() || view.is_blocked(name)
-                    || !loading || Instant::now() >= deadline
-                    || cancel.as_ref().is_some_and(downstream::CancelContext::is_cancelled)
+                    || candidates.iter().any(|owner| {
+                        view.kick_pending(owner, |id| id == owner)
+                            .is_some_and(|status| status.connecting)
+                    });
+                if view.route_of(name).is_some()
+                    || view.is_blocked(name)
+                    || !loading
+                    || Instant::now() >= deadline
+                    || cancel
+                        .as_ref()
+                        .is_some_and(downstream::CancelContext::is_cancelled)
                 {
                     break;
                 }
-                seen = wait_for_started_supervisor(seen,
-                    deadline.min(Instant::now() + Duration::from_millis(25)));
+                seen = wait_for_started_supervisor(
+                    seen,
+                    deadline.min(Instant::now() + Duration::from_millis(25)),
+                );
                 fresh = clone_live_router(live_router);
             }
             fresh = clone_live_router(live_router);
@@ -4712,7 +4724,8 @@ fn execute_call(
         if message.starts_with("Unknown tool:")
             && (router.any_discovering(visible) || router.any_publishing_first_catalog(visible))
         {
-            message = "Servers are still connecting. Retry shortly or check toolport_status.".into();
+            message =
+                "Servers are still connecting. Retry shortly or check toolport_status.".into();
         }
         return json!({"content": [{"type": "text", "text": message}], "isError": true});
     }
@@ -7512,7 +7525,9 @@ fn handle_request_with_cancel(
                 // A bounded alias no longer contains the full server id. Resolve
                 // explicit server selectors through ownership before ranking.
                 let server_owner = server.and_then(|selector| {
-                    reg.servers.iter().find(|entry| entry.id == selector)
+                    reg.servers
+                        .iter()
+                        .find(|entry| entry.id == selector)
                         .map(|entry| entry.id.as_str())
                         .or_else(|| owners.get(&selector.to_lowercase()).map(String::as_str))
                 });
@@ -7523,7 +7538,8 @@ fn handle_request_with_cancel(
                             .and_then(Value::as_str)
                             .is_some_and(|name| {
                                 server_owner.is_none_or(|owner| {
-                                    owner_of_exposed_tool(Some(router), &owners, name).as_deref() == Some(owner)
+                                    owner_of_exposed_tool(Some(router), &owners, name).as_deref()
+                                        == Some(owner)
                                 }) && allowed.is_none_or(|allowed| {
                                     tool_in_scope(name, allowed, &|name| {
                                         owner_of_exposed_tool(Some(router), &owners, name)
@@ -24307,7 +24323,11 @@ mod tests {
                 Some(&live),
             );
             assert_eq!(reply["isError"], true, "got {reply}");
-            let expected = if reason == "disabled" { "turned off" } else { reason };
+            let expected = if reason == "disabled" {
+                "turned off"
+            } else {
+                reason
+            };
             assert!(reply.to_string().contains(expected), "got {reply}");
             assert!(
                 !snapshot.any_starting(|_| true),

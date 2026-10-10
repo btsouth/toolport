@@ -4123,8 +4123,11 @@ fn protocol_lane_unknown_names_never_request_approval_or_leak_hidden_matches() {
         protocol_lane_tool("read_items", false),
         protocol_lane_tool("read_itam", false),
         protocol_lane_tool("read_itum", false),
-        { let mut app = protocol_lane_tool("read_itma", false);
-          app["_meta"] = json!({"ui":{"visibility":["app"]}}); app },
+        {
+            let mut app = protocol_lane_tool("read_itma", false);
+            app["_meta"] = json!({"ui":{"visibility":["app"]}});
+            app
+        },
         protocol_lane_tool("delete_item", true),
     ];
     let mut scoped = profile("visible", &["files"]);
@@ -4171,13 +4174,28 @@ fn protocol_lane_unknown_names_never_request_approval_or_leak_hidden_matches() {
         !audit.contains("\"kind\":\"approval\""),
         "unknown call raised approval: {audit}"
     );
-    let mut full = spawn_adapter(&dir, &AdapterOptions { profile:Some("full"), ..Default::default() });
+    let mut full = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("full"),
+            ..Default::default()
+        },
+    );
     full.initialize("protocol-unknown-full");
     full.wait_for_tool("__read_item", Duration::from_secs(30));
-    let text = protocol_lane_error(&full.call_tool("files__read_itm", json!({})), "Unknown tool:");
-    let matches = text.lines().find(|line| line.starts_with("Close matches:")).unwrap();
+    let text = protocol_lane_error(
+        &full.call_tool("files__read_itm", json!({})),
+        "Unknown tool:",
+    );
+    let matches = text
+        .lines()
+        .find(|line| line.starts_with("Close matches:"))
+        .unwrap();
     assert_eq!(matches.split(',').count(), 3, "{text}");
-    assert!(!text.contains("read_itma"), "app-only suggestion leaked: {text}");
+    assert!(
+        !text.contains("read_itma"),
+        "app-only suggestion leaked: {text}"
+    );
     // A known destructive tool still fails closed without a broker.
     protocol_lane_error(
         &client.call_tool("files__delete_item", json!({})),
@@ -4290,9 +4308,13 @@ fn protocol_lane_policy_refusals_explain_the_reason_and_fix() {
             }
         };
         registry::save_to(&path, &reg).unwrap();
-        let mut client = spawn_adapter(&dir, &AdapterOptions {
-            profile: Some(&profile_id), ..AdapterOptions::default()
-        });
+        let mut client = spawn_adapter(
+            &dir,
+            &AdapterOptions {
+                profile: Some(&profile_id),
+                ..AdapterOptions::default()
+            },
+        );
         client.initialize(&format!("protocol-{case}"));
         client.wait_for_tool("__read_item", Duration::from_secs(30));
         for result in [
@@ -4472,8 +4494,16 @@ fn protocol_lane_long_destructive_names_keep_approval_and_team_source() {
     let original = format!("{}_delete", "account_".repeat(12));
     let mut tool = protocol_lane_tool(&original, true);
     tool.as_object_mut().unwrap().remove("annotations");
-    let aliases = conduit_lib::router::Router::server_tool_aliases("files", &[tool.clone()], Default::default());
-    write_registry(&dir, vec![protocol_lane_server(&dir, "files", &[tool])], vec![]);
+    let aliases = conduit_lib::router::Router::server_tool_aliases(
+        "files",
+        &[tool.clone()],
+        Default::default(),
+    );
+    write_registry(
+        &dir,
+        vec![protocol_lane_server(&dir, "files", &[tool])],
+        vec![],
+    );
     let path = dir.join("registry.json");
     let mut reg = registry::load_from(&path).unwrap();
     reg.set_safety_level(registry::SafetyLevel::Off);
@@ -4538,7 +4568,10 @@ fn protocol_lane_long_server_aliases_keep_both_identity_parts_and_cached_routes(
         Duration::from_secs(30),
     );
     let found = first.call_tool("toolport_search_tools", json!({"query":"","server":server}));
-    assert!(text_of(&found).contains(alias), "raw server selector lost its bounded alias: {found}");
+    assert!(
+        text_of(&found).contains(alias),
+        "raw server selector lost its bounded alias: {found}"
+    );
     assert_eq!(text_of(&first.call_tool(alias, json!({}))), "read_item");
     drop(first);
     kill_daemons(&dir);
