@@ -291,6 +291,58 @@ if (callerFixture) {
     ...identity,
   }));
 }
+const dogfoodFixture = new URLSearchParams(location.search).has("dogfood");
+if (dogfoodFixture) {
+  sessionRows.splice(
+    0,
+    sessionRows.length,
+    ...Array.from({ length: 5 }, (_, i): ClientSession => ({
+      sessionId: `codex-${i}`,
+      client: "adapter:codex",
+      clientName: "Codex",
+      clientType: "codex",
+      gatewayVersion: "2.0.0-preview.6",
+      phase: "close",
+      reason: "client_disconnect",
+      transport: "stdio",
+      toolsListCount: 0,
+      listChangedCount: 0,
+      firstCatalogSize: 1711,
+      firstCatalogRevision: 1,
+      catalogRevision: 1,
+      contentChanged: false,
+    })),
+  );
+  auditRows.splice(
+    0,
+    auditRows.length,
+    ...["search", "describe", "status", "fetch"].map((tool, i) => ({
+      ts: Date.now() - (i + 1) * 60000,
+      kind: "internal",
+      server: "toolport",
+      tool,
+      ok: true,
+      client: "adapter:codex",
+      clientName: "Codex",
+      durationMs: 5,
+      cold: false,
+      dispatchMs: 2,
+    })),
+    {
+      ts: Date.now() - 300000,
+      server: "GitHub",
+      tool: "list_issues",
+      ok: true,
+      client: "adapter:codex",
+      clientName: "Codex",
+      durationMs: 12,
+      piiReplaced: 1,
+      cold: false,
+      dispatchMs: 3,
+    },
+  );
+}
+
 const savingsSummary: SavingsSummary = {
   tokensSaved: 35_000,
   tokenizedLoads: 12,
@@ -631,17 +683,30 @@ mockIPC(
         return savingsSummary;
       case "plugin:app|version":
         return "1.18.0-fixture";
-      case "get_client_sessions":
-        return sessionRows.map<ClientActivity>((row) => ({
-          ...row,
-          lastActiveMs: Date.now() - 180000,
-          callsToday: 12,
-          sessionCount: 3,
-        }));
+      case "get_client_sessions": {
+        if (new URLSearchParams(location.search).has("raw-sessions")) return sessionRows;
+        const grouped = new Map<string, ClientActivity>();
+        for (const row of sessionRows) {
+          const key = `${row.clientName}:${row.clientLabel ?? ""}`;
+          const previous = grouped.get(key);
+          grouped.set(key, {
+            ...row,
+            lastActiveMs: Date.now() - 180000,
+            callsToday: (previous?.callsToday ?? 0) + 12,
+            sessionCount: (previous?.sessionCount ?? 0) + 1,
+          });
+        }
+        return [...grouped.values()];
+      }
       case "get_audit_log":
         return auditRows;
       case "audit_stats":
-        return { total: 200, errors: 0, errorRate: 0, servers: [] };
+        return {
+          total: dogfoodFixture ? 5225 : 200,
+          errors: 0,
+          errorRate: 0,
+          servers: [],
+        };
       case "list_server_tools":
         return [
           {

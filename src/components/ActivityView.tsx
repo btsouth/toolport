@@ -763,8 +763,8 @@ function internalActivityLabel(tool: string): string {
       {
         search: "Searched tools",
         describe: "Looked up a tool",
-        status: "Checked a tool request",
-        fetch: "Retrieved a tool result",
+        status: "Checked Toolport status",
+        fetch: "Fetched tool details",
       } as Record<string, string>
     )[tool] ?? "Used Toolport"
   );
@@ -2106,9 +2106,11 @@ export function ActivityView({
       </div>
 
       <p className="mb-2 text-xs text-muted-foreground">
-        {stats ? `${stats.total.toLocaleString()} tool calls retained · ` : ""}Showing{" "}
-        {visible.length.toLocaleString()} of the latest {entries.length.toLocaleString()}{" "}
-        events. Events include calls, approvals and Toolport lookups.
+        {stats ? `${stats.total.toLocaleString()} tool calls retained · ` : ""}
+        {logOpen
+          ? `Showing ${visible.length.toLocaleString()} of the latest ${entries.length.toLocaleString()} events.`
+          : `Latest ${entries.length.toLocaleString()} events available.`}{" "}
+        Events include calls, approvals and Toolport lookups.
       </p>
 
       {logOpen && (
@@ -2142,7 +2144,7 @@ export function ActivityView({
               Errors only
             </button>
             <span className="ml-auto text-xs text-muted-foreground">
-              {visible.length} of {entries.length}
+              {serverFilter || errorsOnly ? "Filtered" : ""}
             </span>
           </div>
 

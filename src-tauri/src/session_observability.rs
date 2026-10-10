@@ -55,7 +55,7 @@ pub fn display_label(label: &str) -> Option<String> {
 
 /// Retain registered HTTP IDs and privacy-safe configured adapter IDs.
 pub fn telemetry_principal(client: &str) -> Option<&str> {
-    ((!client.contains(':') && display_client_id(client) == client)
+    ((!client.contains(':') && !client.starts_with("adapter-pid-") && display_client_id(client) == client)
         || client.starts_with("client:")
         || client
             .strip_prefix("adapter:")

@@ -336,6 +336,44 @@ describe("ActivityView trust-state loading", () => {
 });
 
 describe("ActivityView recent calls", () => {
+  it("keeps catalog timing in tooltips and distinguishes internal lookups", async () => {
+    getAuditStats.mockResolvedValue({
+      total: 5225,
+      errors: 0,
+      errorRate: 0,
+      servers: [],
+    });
+    getAuditLog.mockResolvedValue([
+      entry({
+        kind: "internal",
+        server: "toolport",
+        tool: "search",
+        cold: false,
+        dispatchMs: 3,
+        piiReplaced: 1,
+      }),
+    ]);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+    expect(screen.getByText("Searched tools")).toBeInTheDocument();
+    expect(screen.queryByText(/warm catalog|dispatch 3/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Unrecorded client ·/)).toHaveAttribute(
+      "title",
+      expect.stringContaining("dispatch 3 ms"),
+    );
+    expect(screen.getByText("1 value masked")).toHaveAttribute(
+      "title",
+      expect.stringContaining("before reaching the model"),
+    );
+    expect(screen.getByText(/5,225 tool calls retained/)).toHaveTextContent(
+      "Showing 1 of the latest 1 events",
+    );
+    expect(screen.getByRole("button", { name: "Export" })).toHaveAttribute("title");
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expect(screen.getByText("Clear retained activity?")).toBeInTheDocument();
+    expect(clearActivityLogs).not.toHaveBeenCalled();
+  });
   it("expands a typed Code Mode failure without retaining error text", async () => {
     const user = userEvent.setup({
       advanceTimers: (ms) => vi.advanceTimersByTime(ms),
