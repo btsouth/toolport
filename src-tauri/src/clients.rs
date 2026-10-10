@@ -6968,14 +6968,26 @@ fn is_legacy_gateway_copy(path: &Path) -> bool {
         || bytes.starts_with(b"MZ")
         || bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
         || bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe]);
-    native
-        && [
-            b"toolport-gateway".as_slice(),
-            b"TOOLPORT_CLIENT_ID",
-            b"tools/call",
-        ]
-        .iter()
-        .all(|marker| bytes.windows(marker.len()).any(|w| w == *marker))
+    is_legacy_gateway_shim(path)
+        || native
+            && [
+                b"toolport-gateway".as_slice(),
+                b"TOOLPORT_CLIENT_ID",
+                b"tools/call",
+            ]
+            .iter()
+            .all(|marker| bytes.windows(marker.len()).any(|w| w == *marker))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_legacy_gateway_shim(path: &Path) -> bool {
+    use std::io::Read;
+    const HEADER: &[u8] = b"#!/bin/sh\n# Toolport gateway compatibility shim\n";
+    let mut header = [0u8; HEADER.len()];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok()
+        && header.as_slice() == HEADER
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -6995,6 +7007,9 @@ fn refresh_legacy_gateway(current: &Path, dest: &Path) -> std::io::Result<()> {
             .replace('\'', "'\"'\"'");
         let text =
             format!("#!/bin/sh\n# Toolport gateway compatibility shim\nexec '{command}' \"$@\"\n");
+        if std::fs::read(dest).is_ok_and(|bytes| bytes == text.as_bytes()) {
+            return Ok(());
+        }
         let tmp = dest.with_extension(format!("{}.tmp", crate::approval::new_correlation_id()));
         let result = (|| {
             let mut file = std::fs::OpenOptions::new()
@@ -7044,7 +7059,7 @@ fn cleanup_legacy_gateway_copies(current: &Path, dir: &Path, references: Option<
                 || (!r.is_absolute() && r.file_name() == path.file_name())
         });
         let plain = matches!(name.to_str(), Some("toolport-gateway" | "conduit-gateway"));
-        let keep = referenced || plain;
+        let keep = referenced || plain || is_legacy_gateway_shim(&path);
         let result = if keep {
             // Scripts, service units and unsupported clients may use the plain path.
             // Keep it and known references usable without leaving 1.x code behind.
@@ -8212,6 +8227,48 @@ mod tests {
                 .is_symlink());
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn legacy_gateway_shims_follow_install_moves_and_are_idempotent() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("bin");
+        std::fs::create_dir(&dir).unwrap();
+        let first = root.path().join("old install/toolport-gateway");
+        let second = root.path().join("new 'install'/toolport-gateway");
+        for current in [&first, &second] {
+            std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+            std::fs::write(current, "#!/bin/sh\nprintf '%s\n' \"$@\"\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(current, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plain = dir.join("toolport-gateway");
+        let versioned = dir.join("toolport-gateway-1.23.0");
+        let old = b"\x7fELFtoolport-gateway\0TOOLPORT_CLIENT_ID\0tools/call";
+        for path in [&plain, &versioned] {
+            std::fs::write(path, old).unwrap();
+        }
+        cleanup_legacy_gateway_copies(&first, &dir, Some(std::slice::from_ref(&versioned)));
+        let before = std::fs::read(&plain).unwrap();
+        cleanup_legacy_gateway_copies(&second, &dir, None);
+        assert_eq!(std::fs::read(&plain).unwrap(), before);
+        cleanup_legacy_gateway_copies(&second, &dir, Some(&[]));
+        for path in [&plain, &versioned] {
+            let output = std::process::Command::new(path)
+                .arg("still works")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"still works\n");
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(text.contains("new '"));
+            assert_ne!(text.as_bytes(), before);
+            let inode = std::fs::metadata(path).unwrap().ino();
+            cleanup_legacy_gateway_copies(&second, &dir, Some(&[]));
+            assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
+        }
     }
 
     #[test]
