@@ -154,21 +154,30 @@ def main():
             for image in (legacy, published, foreign):
                 image.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(gateway, image)
-            busy = [start_client(image) for image in (gateway, legacy, published)]
+            busy = [start_client(image) for image in (gateway, legacy)]
+            versioned = start_client(published)
             other = start_client(foreign)
-            children.extend([*busy, other])
-            installer_run(installer, f"/S /UPDATE /R /D={install}", "busy-update-reopen")
+            children.extend([*busy, versioned, other])
+            installer_run(installer, f"/S /UPDATE /D={install}", "busy-legacy-published-update")
             assert all(child.wait(timeout=10) is not None for child in busy)
+            assert versioned.poll() is None, "Installer stopped a versioned gateway"
             assert other.poll() is None, "Installer stopped an unrelated gateway"
             assert path.read_bytes() == connected
             shipped = ROOT / "src-tauri/binaries/toolport-gateway-x86_64-pc-windows-msvc.exe"
             assert hashlib.sha256(gateway.read_bytes()).digest() == hashlib.sha256(shipped.read_bytes()).digest()
-            wait_for(lambda: app_pids(app), "busy update /R reopens app")
-            stop_app(app)
+            assert not app_pids(app), "Silent update without /R must not reopen"
+            versioned.kill()
+            versioned.wait(timeout=10)
             other.kill()
             other.wait(timeout=10)
             legacy.unlink(missing_ok=True)
-            print("PASS: busy legacy/published update keeps foreign gateway and reopens app", flush=True)
+            print("PASS: busy legacy update keeps published and foreign gateways", flush=True)
+            client = start_client(gateway)
+            children.append(client)
+            installer_run(installer, f"/S /UPDATE /R /D={install}", "busy-update-reopen")
+            assert client.wait(timeout=10) is not None
+            wait_for(lambda: app_pids(app), "busy update /R reopens app")
+            stop_app(app)
 
             daemon = start_gateway(gateway, ["--daemon"])
             children.append(daemon)

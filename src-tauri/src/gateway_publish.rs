@@ -1231,6 +1231,11 @@ pub fn installer_preflight(install_dir: &Path) -> Result<(), Vec<String>> {
     if !install_dir.is_absolute() {
         return Err(vec!["Installer path must be absolute".into()]);
     }
+    // Published/versioned images do not lock the install directory. Leave those
+    // sessions running on Windows; normal launch migration handles old versions.
+    #[cfg(windows)]
+    let data_dir: Option<PathBuf> = None;
+    #[cfg(not(windows))]
     let data_dir = crate::registry::conduit_dir();
     let inventory = || {
         installer_process_inventory()
