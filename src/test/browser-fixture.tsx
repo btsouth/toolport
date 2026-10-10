@@ -764,7 +764,10 @@ mockIPC(
             "All contents of /fixture/home/.config/Toolport: registry, settings, logs, caches, migration exports, client backups, encrypted secrets and published gateways in bin/",
             "All credentials in Toolport's reserved conduit-mcp service, including Team tokens, OAuth state, master keys and orphaned Windows chunks. This service is shared by Toolport installs for this user.",
             "Toolport's daemon for this data directory, after all active sessions have closed",
-            "/fixture/home/.config/autostart/Toolport.desktop (only Toolport's startup entry)",
+            ...["Toolport", "Conduit", "conduit", "ToolportNativePreview"].map(
+              (name) =>
+                `/fixture/home/.config/autostart/${name}.desktop (only Toolport's startup entry)`,
+            ),
           ],
           reportPath: "/fixture/home/Toolport-removal-report.json",
         };
