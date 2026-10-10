@@ -170,6 +170,8 @@ const profileDriftFixture = new URLSearchParams(location.search).has("profile-dr
 const driftEvents = profileDriftFixture
   ? ["local", "work"].map((profile) => ({
       ...securityFixture()[0],
+      // Reloads reread the same persisted occurrence, just like the security log.
+      ts: 1_790_000_000_000,
       profile,
       new_fp: "v2:profile-fixture",
       blocked: true,
