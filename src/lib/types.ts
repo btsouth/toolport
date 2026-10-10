@@ -484,6 +484,7 @@ export interface ServerEntry {
   teamOriginalId?: string;
   personalSyncEntry?: boolean;
   teamEnableReview?: boolean;
+  personalSyncArgsReview?: boolean;
   enabled?: boolean;
   id: string;
   name: string;

@@ -2902,6 +2902,17 @@ pub fn apply_server_enabled(
     if enabled && crate::teams::server_change_held(registry, server_id) {
         return Err("Review this change in Teams before enabling it.".into());
     }
+    if enabled
+        && registry
+            .servers
+            .iter()
+            .any(|s| s.id == server_id && !crate::personal_sync::missing_secret_args(s).is_empty())
+    {
+        return Err(
+            "Edit this server and enter its secret argument on this machine before enabling it."
+                .into(),
+        );
+    }
     if !enabled {
         crate::teams::remember_held_disable(registry, profile_id, server_id)?;
     }
@@ -2934,6 +2945,14 @@ pub fn apply_server_enabled(
     if enabled && reviewed && crate::personal_sync::is_personal(registry) {
         if let Some(server) = registry.servers.iter_mut().find(|s| s.id == server_id) {
             server.unknown_fields.remove("teamEnableReview");
+            server.unknown_fields.remove("personalSyncArgsReview");
+            // Approving kept local arguments covers the synced layout that could
+            // not be matched, so the next poll does not hold the server again.
+            if let Some(incoming) = server.unknown_fields.remove("personalSyncArgsIncoming") {
+                server
+                    .unknown_fields
+                    .insert("personalSyncArgsApproved".into(), incoming);
+            }
             let identity =
                 crate::personal_sync::command_identity(&crate::personal_sync::export(server));
             let fields = crate::personal_sync::execution_review_fields(server);

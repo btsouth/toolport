@@ -1,7 +1,11 @@
 import type { ArgBinding, ServerEntry } from "./types";
 
 import { visibleExecutionText } from "./visibleExecutionText";
+import { referenceDestinationLines } from "./secretRefs";
 export { visibleExecutionText } from "./visibleExecutionText";
+
+export const ARGS_REVIEW_LINE =
+  "Arguments changed on another machine and could not be matched to the secret values saved here. Toolport kept this machine's arguments. Check them before enabling.";
 
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
@@ -18,7 +22,7 @@ function show(value: unknown): string {
     typeof value === "string" ? value : JSON.stringify(canonical(value)),
   );
 }
-function argumentValues(bindings: ArgBinding[]): string {
+export function argumentValues(bindings: ArgBinding[]): string {
   return bindings
     .map(
       (binding) =>
@@ -33,7 +37,9 @@ function argumentValues(bindings: ArgBinding[]): string {
 function reviewBaseline(previous: Record<string, string>): Record<string, string> {
   const fields = { ...previous };
   if (!("Transport" in fields) && !("inheritEnv" in fields)) return fields;
-  const stdio = fields.Transport === "stdio";
+  const stdio =
+    fields.Transport === "stdio" ||
+    (!!fields.Command && !["null", "[]"].includes(fields.Command));
   delete fields.Transport;
   for (const key of ["Command", "URL", "Arguments"])
     if (["null", "[]", ""].includes(fields[key])) delete fields[key];
@@ -80,7 +86,8 @@ function reviewBaseline(previous: Record<string, string>): Record<string, string
 }
 export function executionReviewFields(server: ServerEntry): Record<string, string> {
   const fields: Record<string, string> = {};
-  if (server.transport === "stdio") {
+  // The gateway launches any row with a command, whatever its transport says.
+  if (server.transport === "stdio" || server.command) {
     if (server.command) fields.Command = show(server.command);
     if (server.args.length)
       fields.Arguments = server.args
@@ -90,7 +97,8 @@ export function executionReviewFields(server: ServerEntry): Record<string, strin
     fields["Uses this machine's environment"] = server.inheritEnv ? "yes" : "no";
     if (server.launch?.bindings.length)
       fields["Argument values"] = argumentValues(server.launch.bindings);
-  } else if (server.url) fields.URL = show(server.url);
+  }
+  if (server.url) fields.URL = show(server.url);
   for (const [label, rows] of [
     ["Environment", server.env],
     ["Input", server.launch?.inputs ?? []],
@@ -127,5 +135,32 @@ export function executionReviewLines(server: ServerEntry): string[] {
   for (const key of Object.keys(previous ?? {}))
     if (!(key in fields))
       lines.push(executionReviewFieldLine(visibleExecutionText(key), "Removed"));
+  if (server.personalSyncArgsReview) lines.push(ARGS_REVIEW_LINE);
+  for (const n of missingSecretArgs(server))
+    lines.push(
+      `Argument ${n} is a secret that does not sync. Edit this server and enter it on this machine before enabling.`,
+    );
+  // Consent is to a reference reaching a destination, so this stays visible
+  // even when neither the reference nor the destination changed.
+  const references = referenceDestinationLines(server).map(show);
+  if (previous && !lines.length)
+    lines.push(
+      references.length
+        ? "Approve these password manager entries for this machine."
+        : "Nothing in this definition changed. Confirm it to run it on this machine.",
+    );
+  lines.push(...references);
   return previous ? lines : ["New server", ...lines];
+}
+/** One-based argument positions whose secret value never synced to this machine. */
+export function missingSecretArgs(server: ServerEntry): number[] {
+  if (!server.personalSyncEntry) return [];
+  const missing = new Set<number>();
+  server.args.forEach((arg, i) => {
+    if (arg.includes("<redacted>")) missing.add(i + 1);
+  });
+  for (const binding of server.launch?.bindings ?? [])
+    if (binding.parts.some((p) => p.kind === "literal" && p.value.includes("<redacted>")))
+      missing.add(binding.index + 1);
+  return [...missing].sort((a, b) => a - b);
 }

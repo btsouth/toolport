@@ -50,6 +50,10 @@ export function accountStatusText(status: AccountStatus, now = Date.now()): stri
     );
   return lines;
 }
+export function planName(plan: string | null | undefined): string {
+  const names: Record<string, string> = { pro: "Pro", team: "Team", free: "Free" };
+  return names[plan?.toLowerCase() ?? ""] ?? (plan || "unknown");
+}
 export function syncSignInUrl(origin: string): string {
   const url = new URL(origin.trim());
   url.search = "intent=pro&from=app-sync";

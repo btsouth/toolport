@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { ServerEntry } from "./types";
 import {
+  ARGS_REVIEW_LINE,
   executionReviewFields,
   executionReviewLines,
+  missingSecretArgs,
   visibleExecutionText,
 } from "./executionReview";
 const server: ServerEntry = {
@@ -49,9 +51,9 @@ describe("execution review", () => {
         "Launch input [0] project": "work; reference: null",
         "Launch input [1] auth": "<masked secret>; reference: null",
       };
-      expect(executionReviewLines({ ...server, syncExecutionReview: previous })).toEqual(
-        [],
-      );
+      expect(executionReviewLines({ ...server, syncExecutionReview: previous })).toEqual([
+        "Nothing in this definition changed. Confirm it to run it on this machine.",
+      ]);
       expect(
         executionReviewLines({
           ...server,
@@ -71,7 +73,10 @@ describe("execution review", () => {
             "Environment [1] TOKEN": `<masked secret>; reference: ${ref}`,
           },
         }),
-      ).toEqual([]);
+      ).toEqual([
+        "Approve these password manager entries for this machine.",
+        `1Password entry "${ref}" will be sent to npx (env:TOKEN)`,
+      ]);
     }
     expect(executionReviewFields(server).Arguments).toBe("\n  1. -y\n  2. @scope/pkg");
   });
@@ -125,7 +130,64 @@ describe("execution review", () => {
         ...server,
         syncExecutionReview: executionReviewFields(server),
       }),
-    ).toEqual([]);
+    ).toEqual([
+      "Nothing in this definition changed. Confirm it to run it on this machine.",
+    ]);
+    expect(
+      executionReviewLines({
+        ...server,
+        personalSyncArgsReview: true,
+        syncExecutionReview: executionReviewFields(server),
+      }),
+    ).toEqual([ARGS_REVIEW_LINE]);
+  });
+  it("shows the command on any transport and which reference reaches which destination", () => {
+    const mixed: ServerEntry = {
+      ...server,
+      transport: "http",
+      command: "curl-wrapper",
+      args: ["--token", "actual-secret"],
+      url: "https://example.com/mcp",
+      env: [
+        {
+          key: "TOKEN",
+          secret: true,
+          value: null,
+          source: { ref: "op://Private/Item/key" },
+        },
+      ],
+      headerKeys: [{ key: "Authorization", source: { ref: "op://Private/Header/key" } }],
+      launch: undefined,
+    };
+    const fields = executionReviewFields(mixed);
+    expect(fields.Command).toBe("curl-wrapper");
+    expect(fields.Arguments).toContain("--token");
+    expect(fields.URL).toBe("https://example.com/mcp");
+    expect(fields["Uses this machine's environment"]).toBe("no");
+    const lines = executionReviewLines({
+      ...mixed,
+      url: "https://attacker.example/mcp",
+      syncExecutionReview: fields,
+    });
+    expect(lines[0]).toBe("URL: https://attacker.example/mcp");
+    expect(lines).toContain(
+      '1Password entry "op://Private/Header/key" will be sent to https://attacker.example/mcp (header:Authorization)',
+    );
+    expect(lines).toContain(
+      '1Password entry "op://Private/Item/key" will be sent to curl-wrapper (env:TOKEN)',
+    );
+    expect(lines.join("\n")).not.toContain("actual-secret");
+  });
+  it("asks for a secret argument that never synced", () => {
+    const masked = {
+      ...server,
+      personalSyncEntry: true,
+      args: ["--token", "<redacted>"],
+    };
+    expect(missingSecretArgs(masked)).toEqual([2]);
+    expect(executionReviewLines(masked)).toContain(
+      "Argument 2 is a secret that does not sync. Edit this server and enter it on this machine before enabling.",
+    );
   });
   it("renders controls, bidi and zero-width characters visibly", () => {
     expect(visibleExecutionText("node\n\t\u202e\u200b\ufeff")).toBe(

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { InstructionsStatusView, Registry } from "@/lib/types";
 
@@ -990,6 +990,12 @@ it("shows both conflict versions as fields with the server name and highlighted 
         name: "Toolport docs",
         url: "https://gitmcp.io/btsouth/Toolport2026",
         args: ["machine B v2"],
+        headerKeys: [{ key: "Authorization", env: "TOKEN" }],
+        env: [{ key: "REGION", secret: false }],
+        launch: {
+          inputs: [],
+          bindings: [{ index: 0, parts: [{ kind: "input", key: "project" }] }],
+        },
       },
     },
     pending: {
@@ -1022,6 +1028,11 @@ it("shows both conflict versions as fields with the server name and highlighted 
   expect(screen.getByText("machine A v2")).toBeInTheDocument();
   expect(screen.getByText("machine B v2")).toBeInTheDocument();
   expect(screen.getAllByText("URL")).toHaveLength(2);
+  expect(screen.getByText("Uses environment: TOKEN")).toBeInTheDocument();
+  expect(screen.getByText("Set on this machine")).toBeInTheDocument();
+  expect(screen.getByText("Argument 1 = {project}")).toBeInTheDocument();
+  expect(screen.queryByText("null")).not.toBeInTheDocument();
+  expect(screen.queryByText("Launch bindings")).not.toBeInTheDocument();
 });
 it("uses the chosen sync service for browser sign-in", async () => {
   render(<TeamsView registry={{ ...registry, team: null }} onRegistryChange={vi.fn()} />);
@@ -1056,7 +1067,15 @@ it("shows refused environment warnings and treats a missing sign-in plan as save
     },
   };
   render(<TeamsView registry={personal} onRegistryChange={vi.fn()} />);
-  expect(screen.getByText(/Saved account plan: pro/)).toBeInTheDocument();
+  expect(screen.getByText(/Saved account plan: Pro\./)).toBeInTheDocument();
   expect(screen.queryByText("Pro · unlimited devices")).not.toBeInTheDocument();
   expect(screen.getByText(/npm_config_registry on Mock Tools/)).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Sync now" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
+  openExternal.mockClear();
+  openExternal.mockResolvedValue(undefined);
+  fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+  expect(openExternal).toHaveBeenCalledWith(
+    expect.stringContaining("intent=pro&from=app-sync"),
+  );
 });

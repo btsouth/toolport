@@ -550,20 +550,35 @@ impl TeamsPage {
             card.append(&gtk::Label::builder().label(warning).wrap(true).xalign(0.0).css_classes(["warning"]).build());
         }
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let button = gtk::Button::with_label("Sync now");
-        let page = self.clone();
-        button.connect_clicked(move |b| page.sync(b.clone()));
-        actions.append(&button);
-        let button = gtk::Button::with_label("Your account");
-        let origin = team.server_url.clone();
-        button.connect_clicked(move |_| {
-            let _ = crate::oauth::open_web_url(&origin);
-        });
-        actions.append(&button);
-        let button = gtk::Button::with_label("Sign out");
-        let page = self.clone();
-        button.connect_clicked(move |b| page.confirm_leave(b.clone()));
-        actions.append(&button);
+        for label in crate::personal_sync::account_actions(&sync) {
+            let button = gtk::Button::with_label(label);
+            let page = self.clone();
+            let origin = team.server_url.clone();
+            match label {
+                // Missing sign-in reuses the browser sign-in instead of a sync
+                // that cannot succeed.
+                "Sign in" => {
+                    button.add_css_class("suggested-action");
+                    button.connect_clicked(move |_| {
+                        if let Ok(url) = crate::teams::sync_sign_in_url(&origin) {
+                            let _ = crate::oauth::open_web_url(&url);
+                        }
+                    });
+                }
+                "Sync now" => {
+                    button.connect_clicked(move |b| page.sync(b.clone()));
+                }
+                "Your account" => {
+                    button.connect_clicked(move |_| {
+                        let _ = crate::oauth::open_web_url(&origin);
+                    });
+                }
+                _ => {
+                    button.connect_clicked(move |b| page.confirm_leave(b.clone()));
+                }
+            }
+            actions.append(&button);
+        }
         card.append(&actions);
         self.content.append(&card);
         if sync.choose_local_servers {

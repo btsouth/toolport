@@ -199,6 +199,8 @@ pub fn risky_sync_env(key: &str) -> bool {
     key.starts_with("GIT_CONFIG_")
         || key.starts_with("DYLD_")
         || key.starts_with("NPM_CONFIG_")
+        || key.starts_with("UV_INDEX")
+        || key.starts_with("UV_PYTHON")
         || [
             "PATH",
             "LD_PRELOAD",
@@ -232,7 +234,16 @@ pub fn risky_sync_env(key: &str) -> bool {
             "UV_INDEX_URL",
             "UV_EXTRA_INDEX_URL",
             "UV_DEFAULT_INDEX",
+            "GIT_SSH",
             "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
+            "GIT_PROXY_COMMAND",
+            "SSH_ASKPASS",
+            "SSH_ASKPASS_REQUIRE",
+            "PIP_FIND_LINKS",
+            "PIP_TRUSTED_HOST",
+            "UV_FIND_LINKS",
+            "UV_INSECURE_HOST",
             "DOCKER_HOST",
             "RUSTC_WRAPPER",
             "BASH_ENV",
@@ -316,7 +327,10 @@ fn review_baseline(previous: &serde_json::Map<String, Value>) -> BTreeMap<String
     if !fields.contains_key("Transport") && !fields.contains_key("inheritEnv") {
         return fields;
     }
-    let stdio = fields.remove("Transport").as_deref() == Some("stdio");
+    let stdio = fields.remove("Transport").as_deref() == Some("stdio")
+        || fields
+            .get("Command")
+            .is_some_and(|v| !matches!(v.as_str(), "null" | "[]" | ""));
     for key in ["Command", "URL", "Arguments"] {
         if fields
             .get(key)
@@ -399,7 +413,8 @@ pub fn execution_review_fields(server: &ServerEntry) -> BTreeMap<String, String>
         }
     };
     let mut fields = BTreeMap::new();
-    if server.transport == "stdio" {
+    // The gateway launches any row with a command, whatever its transport says.
+    if server.transport == "stdio" || server.command.is_some() {
         if let Some(command) = &server.command {
             fields.insert("Command".into(), visible_text(command));
         }
@@ -426,7 +441,8 @@ pub fn execution_review_fields(server: &ServerEntry) -> BTreeMap<String, String>
                 fields.insert("Argument values".into(), argument_values(&launch.bindings));
             }
         }
-    } else if let Some(url) = &server.url {
+    }
+    if let Some(url) = &server.url {
         fields.insert("URL".into(), visible_text(url));
     }
     for (label, path) in [
@@ -480,12 +496,59 @@ pub fn execution_review_lines(server: &ServerEntry) -> Vec<String> {
             lines.push(review_field_line(key, value));
         }
     }
-    if let Some(previous) = previous {
+    if let Some(previous) = &previous {
         for key in previous.keys().filter(|key| !fields.contains_key(*key)) {
             lines.push(review_field_line(key, "Removed"));
         }
     }
+    if server.unknown_fields.get("personalSyncArgsReview") == Some(&json!(true)) {
+        lines.push(ARGS_REVIEW_LINE.into());
+    }
+    for n in missing_secret_args(server) {
+        lines.push(format!("Argument {n} is a secret that does not sync. Edit this server and enter it on this machine before enabling."));
+    }
+    // Consent is to a reference reaching a destination, so this stays visible
+    // even when neither the reference nor the destination changed.
+    let references: Vec<String> = crate::secret_refs::destination_lines(server)
+        .iter()
+        .map(|line| visible_text(line))
+        .collect();
+    if previous.is_some() && lines.is_empty() {
+        lines.push(
+            if references.is_empty() {
+                "Nothing in this definition changed. Confirm it to run it on this machine."
+            } else {
+                "Approve these password manager entries for this machine."
+            }
+            .into(),
+        );
+    }
+    lines.extend(references);
     lines
+}
+pub const ARGS_REVIEW_LINE: &str = "Arguments changed on another machine and could not be matched to the secret values saved here. Toolport kept this machine's arguments. Check them before enabling.";
+/// One-based argument positions whose secret value never synced to this machine.
+pub fn missing_secret_args(server: &ServerEntry) -> Vec<usize> {
+    if server.unknown_fields.get("personalSyncEntry") != Some(&json!(true)) {
+        return Vec::new();
+    }
+    let mut missing: Vec<usize> = server
+        .args
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| arg.contains("<redacted>"))
+        .map(|(i, _)| i + 1)
+        .collect();
+    for binding in server.launch.iter().flat_map(|l| &l.bindings) {
+        if binding.parts.iter().any(|part| {
+            matches!(part, crate::registry::ArgPart::Literal { value, .. } if value.contains("<redacted>"))
+        }) {
+            missing.push(binding.index + 1);
+        }
+    }
+    missing.sort_unstable();
+    missing.dedup();
+    missing
 }
 fn now() -> i64 {
     std::time::SystemTime::now()
@@ -1067,14 +1130,42 @@ pub(crate) fn restore_local(entry: &mut ServerEntry, old: &ServerEntry) {
                                          // Preserve masked arguments on their originating machine; masking is a wire
                                          // boundary, not permission to erase the owner's installed setup.
     let old_wire = export(old);
-    // A masked value is identified by its flag, never by a shifted position.
-    // Older peers masked whole name=value args; unchanged legacy layouts are
-    // safe, while ambiguous edits retain the complete installed invocation.
+    // When the layout moved, a masked value is identified by its flag or name
+    // prefix, never by a shifted position. Ambiguous edits retain the complete
+    // installed invocation.
     let incoming = entry.args.clone();
     let wire: Vec<String> = serde_json::from_value(old_wire["args"].clone()).unwrap_or_default();
+    // Same layout as this machine's own wire form: every unmasked token equal
+    // and in place. Restore by position, so repeated flags or prefixes are not
+    // ambiguous. Older peers masked a whole token, including `--token=X`, as a
+    // bare `<redacted>`; that slot still holds this machine's own value.
+    let aligned = incoming.len() == wire.len()
+        && incoming
+            .iter()
+            .zip(&wire)
+            .zip(&old.args)
+            .all(|((arg, masked), local)| {
+                if !arg.contains("<redacted>") {
+                    return arg == masked;
+                }
+                arg == "<redacted>"
+                    || arg == masked
+                    || arg.split_once('=').is_some_and(|(key, _)| {
+                        local
+                            .split_once('=')
+                            .is_some_and(|(local_key, _)| key == local_key)
+                    })
+            });
     let mut ambiguous = false;
+    if aligned {
+        for (arg, local) in entry.args.iter_mut().zip(&old.args) {
+            if arg.contains("<redacted>") {
+                *arg = local.clone();
+            }
+        }
+    }
     for (index, arg) in entry.args.iter_mut().enumerate() {
-        if !arg.contains("<redacted>") {
+        if aligned || !arg.contains("<redacted>") {
             continue;
         }
         let flag = incoming
@@ -1106,12 +1197,18 @@ pub(crate) fn restore_local(entry: &mut ServerEntry, old: &ServerEntry) {
             ambiguous = true;
         }
     }
-    if ambiguous || entry.args.iter().any(|v| v.contains("<redacted>")) {
+    if ambiguous {
         entry.args = old.args.clone();
         entry.launch = old.launch.clone();
-        entry
-            .unknown_fields
-            .insert("personalSyncArgsReview".into(), json!(true));
+        // A reviewed layout stays approved until the synced arguments change again.
+        if old.unknown_fields.get("personalSyncArgsApproved") != Some(&json!(incoming)) {
+            entry
+                .unknown_fields
+                .insert("personalSyncArgsReview".into(), json!(true));
+            entry
+                .unknown_fields
+                .insert("personalSyncArgsIncoming".into(), json!(incoming));
+        }
     }
     if let (Some(installed), Some(previous)) = (&mut entry.launch, &old.launch) {
         for binding in &mut installed.bindings {
@@ -1385,7 +1482,9 @@ pub fn apply(
             .filter(|key| risky_sync_env(key))
             .map(visible_text)
             .collect();
-        if !risky.is_empty() {
+        if risky.is_empty() {
+            st.warnings.remove(id);
+        } else {
             let name = visible_text(value["name"].as_str().unwrap_or(id));
             let warning = format!("A synced change tried to set {} on {name}. Toolport ignored it. If you didn't make this change, sign out of other devices and change your password.", risky.join(", "));
             if st.warnings.get(id) != Some(&warning) {
@@ -1470,6 +1569,7 @@ pub fn apply(
                 "teamRouteRemoved",
                 "teamHeldChange",
                 "personalSyncArgsReview",
+                "personalSyncArgsIncoming",
                 "personalSyncRemoteRefs",
             ] {
                 entry.unknown_fields.remove(key);
@@ -1480,10 +1580,8 @@ pub fn apply(
             entry.unknown_fields.extend(classified);
             restore_local(&mut entry, old);
         } else {
-            if entry.args.iter().any(|arg| arg.contains("<redacted>")) {
-                outcome.blocked += 1;
-                continue;
-            }
+            // A secret argument never syncs. The server still appears here, off,
+            // and asks for that value on this machine before it can be enabled.
             entry.id = crate::registry::unique_id(
                 id,
                 &reg.servers.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
@@ -1559,7 +1657,11 @@ pub fn apply(
             }
         }
         let installed = old.as_ref().map(export);
-        let changed = execution_changed(installed.as_ref(), value);
+        // Consent covers what runs here: the arguments after restoring this
+        // machine's masked values, so an older peer's masking is not a change.
+        let mut effective = value.clone();
+        effective["args"] = export(&entry)["args"].clone();
+        let changed = execution_changed(installed.as_ref(), &effective);
         // Use the upstream approval sidecar, bound to the exact reference and
         // destination. Wire metadata is never evidence of local approval.
         if own_approved.contains(id) {
@@ -1569,7 +1671,7 @@ pub fn apply(
         let command_approved = old
             .as_ref()
             .and_then(|s| s.unknown_fields.get("syncCommandConsent"))
-            == Some(&command_identity(value));
+            == Some(&command_identity(&effective));
         let private_url_review = classified_review
             && entry.command.is_none()
             && entry
@@ -1580,16 +1682,17 @@ pub fn apply(
             && old.as_ref().is_none_or(|s| {
                 s.url != entry.url || s.unknown_fields.get("teamEnableReview") == Some(&json!(true))
             });
+        entry
+            .unknown_fields
+            .insert("personalSyncEntry".into(), json!(true));
         let review = entry.unknown_fields.get("personalSyncArgsReview") == Some(&json!(true))
+            || !missing_secret_args(&entry).is_empty()
             || private_url_review
             || (changed && !command_approved)
             || references_need_approval
             || old
                 .as_ref()
                 .is_some_and(|s| s.unknown_fields.get("teamEnableReview") == Some(&json!(true)));
-        entry
-            .unknown_fields
-            .insert("personalSyncEntry".into(), json!(true));
         if let Some(consent) = old
             .as_ref()
             .and_then(|s| s.unknown_fields.get("syncCommandConsent"))
@@ -1650,6 +1753,7 @@ pub fn apply(
         }
         reg.servers.push(entry);
     }
+    st.warnings.retain(|id, _| remote.contains_key(id));
     st.baseline = remote;
     if let Some(t) = &mut reg.team {
         t.last_version = version;
@@ -2037,9 +2141,10 @@ pub fn conflict_fields(value: Option<&Value>) -> BTreeMap<String, String> {
     for (i, v) in value["args"].as_array().into_iter().flatten().enumerate() {
         fields.insert(format!("Argument {}", i + 1), text(v));
     }
+    // Same plain labels and masking as the execution review.
     for (path, label) in [
         ("/env", "Environment"),
-        ("/launch/inputs", "Launch input"),
+        ("/launch/inputs", "Input"),
         ("/headerKeys", "Header"),
     ] {
         for v in value
@@ -2050,20 +2155,37 @@ pub fn conflict_fields(value: Option<&Value>) -> BTreeMap<String, String> {
         {
             fields.insert(
                 format!("{label}: {}", text(&v["key"])),
-                if v["secret"] == true {
-                    "<masked secret>".into()
+                if label == "Header" && v["env"].is_string() {
+                    format!("Uses environment: {}", text(&v["env"]))
                 } else if let Some(r) = reference(v) {
-                    format!("Reference: {}", visible_text(r))
+                    format!("Password manager: {}", visible_text(r))
+                } else if v["secret"] == true {
+                    "<masked secret>".into()
+                } else if let Some(v) = v.get("value").filter(|v| !v.is_null()) {
+                    text(v)
                 } else {
-                    text(&v["value"])
+                    "Set on this machine".into()
                 },
             );
         }
     }
-    if let Some(bindings) = value.pointer("/launch/bindings") {
-        fields.insert("Launch bindings".into(), text(bindings));
+    if let Some(bindings) = value
+        .pointer("/launch/bindings")
+        .and_then(|b| serde_json::from_value::<Vec<crate::registry::ArgBinding>>(b.clone()).ok())
+        .filter(|b| !b.is_empty())
+    {
+        fields.insert("Argument values".into(), argument_values(&bindings));
     }
     fields
+}
+fn plan_name(plan: Option<&str>) -> String {
+    match plan.map(str::to_ascii_lowercase).as_deref() {
+        Some("pro") => "Pro".into(),
+        Some("team") => "Team".into(),
+        Some("free") => "Free".into(),
+        Some(other) if !other.is_empty() => visible_text(plan.unwrap_or_default()),
+        _ => "unknown".into(),
+    }
 }
 pub fn account_display_lines(reg: &Registry) -> Vec<String> {
     let st = state(reg).unwrap_or_default();
@@ -2076,10 +2198,24 @@ pub fn account_display_lines(reg: &Registry) -> Vec<String> {
     if st.sign_in_required {
         return vec![format!(
             "Saved account plan: {}. Sign in to confirm your account and resume sync.",
-            status["plan"].as_str().unwrap_or("unknown")
+            plan_name(status["plan"].as_str())
         )];
     }
     status_lines(&status, st.last_synced_at)
+}
+/// Account buttons on the Sync page, shared by both shells. Without sign-in a
+/// sync cannot succeed, so the primary action is Sign in. Sign out stays
+/// because it clears the saved account and its token.
+pub fn account_actions(st: &SyncState) -> [&'static str; 3] {
+    [
+        if st.sign_in_required {
+            "Sign in"
+        } else {
+            "Sync now"
+        },
+        "Your account",
+        "Sign out",
+    ]
 }
 pub fn status_lines(status: &Value, last_synced: Option<i64>) -> Vec<String> {
     status_lines_at(status, last_synced, now())
@@ -2244,6 +2380,99 @@ mod tests {
         assert_eq!(received.args, vec!["--new", "--token=secret"]);
     }
     #[test]
+    fn repeated_masked_flags_restore_by_position_across_polls() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-repeated-flags");
+        for args in [
+            json!([
+                "--header",
+                "Authorization: Bearer a",
+                "--header",
+                "X-Api-Key: b"
+            ]),
+            json!(["--token=first", "--verbose", "--token=second"]),
+        ] {
+            let mut row = command("repeat");
+            row["args"] = args.clone();
+            let mut server = local(row);
+            server.enabled = true;
+            let mut r = machine();
+            r.servers.push(server);
+            r.profiles[0].enabled_server_ids.push("repeat".into());
+            let wire = config(r.servers.iter().map(export).collect());
+            assert!(wire.to_string().contains("<redacted>"));
+            for version in 1..=3 {
+                apply(&mut r, &wire, version).unwrap();
+                let s = &r.servers[0];
+                assert_eq!(json!(s.args), args, "poll {version}");
+                assert!(!s.unknown_fields.contains_key("personalSyncArgsReview"));
+                assert!(s.enabled && !s.needs_team_enable_review(), "poll {version}");
+                assert!(r.profiles[0].enabled_server_ids.contains(&"repeat".into()));
+            }
+        }
+    }
+    #[test]
+    fn approved_ambiguous_arguments_stay_approved_until_they_change() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-args-approval");
+        let mut row = command("amb");
+        row["args"] = json!(["--x", "--token", "secret"]);
+        let mut r = machine();
+        let mut server = local(row);
+        server.enabled = true;
+        r.servers.push(server);
+        let mut wire = config(r.servers.iter().map(export).collect());
+        apply(&mut r, &wire, 1).unwrap();
+        wire["servers"][0]["args"] = json!(["--unknown", "<redacted>"]);
+        apply(&mut r, &wire, 2).unwrap();
+        assert!(r.servers[0].needs_team_enable_review());
+        assert_eq!(
+            execution_review_lines(&r.servers[0]).last().unwrap(),
+            ARGS_REVIEW_LINE
+        );
+        let profile = r.active_profile_id();
+        crate::registry_controller::apply_server_enabled(&mut r, &profile, "amb", true, true)
+            .unwrap();
+        for version in 3..=5 {
+            apply(&mut r, &wire, version).unwrap();
+            let s = &r.servers[0];
+            assert_eq!(s.args, vec!["--x", "--token", "secret"]);
+            assert!(s.enabled && !s.needs_team_enable_review(), "poll {version}");
+        }
+        wire["servers"][0]["args"] = json!(["--other", "<redacted>"]);
+        apply(&mut r, &wire, 6).unwrap();
+        assert!(r.servers[0].needs_team_enable_review());
+    }
+    #[test]
+    fn new_server_with_secret_argument_waits_for_setup_on_this_machine() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-new-masked");
+        let mut row = command("masked");
+        row["args"] = json!(["--token", "actual-secret"]);
+        let wire = config(vec![export(&local(row))]);
+        assert!(!wire.to_string().contains("actual-secret"));
+        let mut r = machine();
+        for version in 1..=2 {
+            let outcome = apply(&mut r, &wire, version).unwrap();
+            assert_eq!((outcome.blocked, outcome.review), (0, 1));
+        }
+        let s = r.servers[0].clone();
+        assert!(!s.enabled && s.needs_team_enable_review());
+        assert_eq!(missing_secret_args(&s), vec![2]);
+        assert!(execution_review_lines(&s).contains(&"Argument 2 is a secret that does not sync. Edit this server and enter it on this machine before enabling.".to_string()));
+        assert_eq!(pending_review_count(&r), 1);
+        let profile = r.active_profile_id();
+        let id = s.id.clone();
+        assert!(crate::registry_controller::apply_server_enabled(
+            &mut r, &profile, &id, true, true
+        )
+        .unwrap_err()
+        .contains("secret argument"));
+        // Entered on this machine, kept across polls and never sent back.
+        r.servers[0].args[1] = "typed-here".into();
+        apply(&mut r, &wire, 3).unwrap();
+        assert_eq!(r.servers[0].args[1], "typed-here");
+        assert!(missing_secret_args(&r.servers[0]).is_empty());
+        assert!(!export(&r.servers[0]).to_string().contains("typed-here"));
+    }
+    #[test]
     fn opt_in_requires_choice_when_remote_advanced_while_local_only() {
         let _data = crate::registry::DataDirTestEnv::new("sync-opt-in-conflict");
         let mut r = machine();
@@ -2352,9 +2581,36 @@ mod tests {
             "UV_INDEX",
             "PIP_CONFIG_FILE",
             "NODE_EXTRA_CA_CERTS",
+            "GIT_SSH",
+            "git_ssh_command",
+            "GIT_ASKPASS",
+            "GIT_PROXY_COMMAND",
+            "GIT_EXEC_PATH",
+            "GIT_CONFIG_KEY_0",
+            "SSH_ASKPASS",
+            "PIP_FIND_LINKS",
+            "PIP_TRUSTED_HOST",
+            "PIP_EXTRA_INDEX_URL",
+            "UV_INDEX_STRATEGY",
+            "uv_extra_index_url",
+            "UV_FIND_LINKS",
+            "UV_PYTHON",
+            "UV_PYTHON_INSTALL_MIRROR",
+            "UV_DEFAULT_INDEX",
         ] {
             assert!(risky_sync_env(key), "{key}");
         }
+        assert!(!risky_sync_env("UV_CACHE_DIR"));
+        // The warning clears when the cloud definition drops the name, and
+        // when the server is gone.
+        let mut clean = attack.clone();
+        clean["env"] = json!([]);
+        apply(&mut r, &config(vec![clean]), 3).unwrap();
+        assert!(state(&r).unwrap().warnings.is_empty());
+        apply(&mut r, &config(vec![attack.clone()]), 4).unwrap();
+        assert!(state(&r).unwrap().warnings.contains_key("mock"));
+        apply(&mut r, &config(vec![]), 5).unwrap();
+        assert!(state(&r).unwrap().warnings.is_empty());
     }
     #[test]
     fn review_omits_irrelevant_empty_fields_and_labels_new_servers() {
@@ -2383,9 +2639,23 @@ mod tests {
                 "Environment [0] REGION":"west; reference: null",
                 "Environment [1] TOKEN":"<masked secret>; reference: op://Private/Item/key"
             }));
-            assert!(execution_review_lines(&server).is_empty());
+            let reference =
+                r#"1Password entry "op://Private/Item/key" will be sent to echo (env:TOKEN)"#;
+            assert_eq!(
+                execution_review_lines(&server),
+                vec![
+                    "Approve these password manager entries for this machine.",
+                    reference
+                ]
+            );
             server.command = Some("node".into());
-            assert_eq!(execution_review_lines(&server), vec!["Command: node"]);
+            assert_eq!(
+                execution_review_lines(&server),
+                vec![
+                    "Command: node",
+                    r#"1Password entry "op://Private/Item/key" will be sent to node (env:TOKEN)"#
+                ]
+            );
             server.command = Some("echo".into());
         }
         let mut server = local(http("http"));
@@ -2396,7 +2666,43 @@ mod tests {
                 "Transport":"http","URL":server.url,"inheritEnv":"false","Launch bindings":"null"
             }),
         );
-        assert!(execution_review_lines(&server).is_empty());
+        assert_eq!(
+            execution_review_lines(&server),
+            vec!["Nothing in this definition changed. Confirm it to run it on this machine."]
+        );
+        server
+            .unknown_fields
+            .insert("personalSyncArgsReview".into(), json!(true));
+        assert_eq!(execution_review_lines(&server), vec![ARGS_REVIEW_LINE]);
+    }
+    #[test]
+    fn review_shows_commands_on_any_transport_and_reference_destinations() {
+        let mut row = http("mixed");
+        row["command"] = json!("curl-wrapper");
+        row["args"] = json!(["--token", "actual-secret"]);
+        row["env"] =
+            json!([{"key":"TOKEN","secret":true,"source":{"ref":"op://Private/Item/key"}}]);
+        row["headerKeys"] =
+            json!([{"key":"Authorization","source":{"ref":"op://Private/Header/key"}}]);
+        let mut server = local(row);
+        server.source = Some("team:solo".into());
+        let fields = execution_review_fields(&server);
+        assert_eq!(fields["Command"], "curl-wrapper");
+        assert!(fields["Arguments"].contains("--token"));
+        assert_eq!(fields["URL"], "https://example.com/mcp");
+        assert!(fields.contains_key("Uses this machine's environment"));
+        server
+            .unknown_fields
+            .insert("syncExecutionReview".into(), json!(fields));
+        server.url = Some("https://attacker.example/mcp".into());
+        let lines = execution_review_lines(&server);
+        assert_eq!(lines[0], "URL: https://attacker.example/mcp");
+        assert!(lines.contains(&r#"1Password entry "op://Private/Header/key" will be sent to https://attacker.example/mcp (header:Authorization)"#.to_string()));
+        assert!(lines.contains(
+            &r#"1Password entry "op://Private/Item/key" will be sent to curl-wrapper (env:TOKEN)"#
+                .to_string()
+        ));
+        assert!(!lines.join("\n").contains("actual-secret"));
     }
     #[test]
     fn broad_argument_hints_warn_without_rewriting_values_or_legacy_local_args() {
@@ -2429,9 +2735,33 @@ mod tests {
         apply(&mut reg, &config(vec![wire.clone()]), 1).unwrap();
         let mut legacy = wire;
         legacy["args"][3] = json!("<redacted>");
-        apply(&mut reg, &config(vec![legacy]), 2).unwrap();
+        for version in 2..=4 {
+            apply(&mut reg, &config(vec![legacy.clone()]), version).unwrap();
+            assert!(!reg.servers[0]
+                .unknown_fields
+                .contains_key("personalSyncArgsReview"));
+            assert!(!reg.servers[0].needs_team_enable_review());
+        }
         crate::registry::save(&reg).unwrap();
         assert_eq!(crate::registry::load().unwrap().servers[0].args, args);
+        // Older peers masked `--token=X` as a bare token. Same layout, no hold.
+        let mut token: ServerEntry = serde_json::from_value(json!({"id":"token","name":"Token","transport":"stdio","command":"echo","args":["--verbose","--token=actual-secret"],"env":[]})).unwrap();
+        token.enabled = true;
+        let mut reg = machine();
+        reg.servers.push(token);
+        let mut legacy = config(reg.servers.iter().map(export).collect());
+        legacy["servers"][0]["args"][1] = json!("<redacted>");
+        for version in 1..=3 {
+            apply(&mut reg, &legacy, version).unwrap();
+            assert_eq!(
+                reg.servers[0].args,
+                vec!["--verbose", "--token=actual-secret"]
+            );
+            assert!(!reg.servers[0]
+                .unknown_fields
+                .contains_key("personalSyncArgsReview"));
+            assert!(!reg.servers[0].needs_team_enable_review());
+        }
         let known: ServerEntry = serde_json::from_value(json!({"id":"auth","name":"Auth","transport":"stdio","command":"echo","args":["--token","actual-secret","--header","Authorization: Bearer actual-secret"],"env":[]})).unwrap();
         assert!(!export(&known).to_string().contains("actual-secret"));
     }
@@ -2448,7 +2778,15 @@ mod tests {
             let (message, healthy) = banner(&reg);
             assert_eq!(message, error);
             assert!(state(&reg).unwrap().sign_in_required);
-            assert!(account_display_lines(&reg)[0].contains("Saved account plan: pro"));
+            assert!(account_display_lines(&reg)[0].contains("Saved account plan: Pro."));
+            assert_eq!(
+                account_actions(&state(&reg).unwrap()),
+                ["Sign in", "Your account", "Sign out"]
+            );
+            assert_eq!(
+                account_actions(&SyncState::default()),
+                ["Sync now", "Your account", "Sign out"]
+            );
             assert!(!healthy);
         });
     }
@@ -2630,11 +2968,22 @@ mod tests {
         let mut b = a.clone();
         b["url"] = json!("https://example.com/other");
         b["args"] = json!(["line\nnext"]);
+        b["headerKeys"] = json!([{"key":"Authorization","env":"TOKEN"}]);
+        b["env"] = json!([{"key":"TOKEN","secret":true},{"key":"REGION","secret":false}]);
+        b["launch"] = json!({"inputs":[{"key":"project","secret":false}],"bindings":[{"index":0,"parts":[{"kind":"input","key":"project"}]}]});
         let left = conflict_fields(Some(&a));
         let right = conflict_fields(Some(&b));
         assert_eq!(left["Name"], "Toolport docs");
         assert_ne!(left["URL"], right["URL"]);
         assert_eq!(right["Argument 1"], r"line\u{000A}next");
+        assert_eq!(right["Header: Authorization"], "Uses environment: TOKEN");
+        assert_eq!(right["Environment: TOKEN"], "<masked secret>");
+        assert_eq!(right["Environment: REGION"], "Set on this machine");
+        assert_eq!(right["Input: project"], "Set on this machine");
+        assert_eq!(right["Argument values"], "Argument 1 = {project}");
+        let text = format!("{right:?}");
+        assert!(!text.contains("null"));
+        assert!(!text.contains("Launch bindings"));
     }
     #[test]
     fn personal_pairing_copy_and_custom_origin_are_accurate() {
@@ -2706,7 +3055,16 @@ mod tests {
             "UV_INDEX_URL",
             "UV_EXTRA_INDEX_URL",
             "UV_DEFAULT_INDEX",
+            "GIT_SSH",
             "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
+            "GIT_PROXY_COMMAND",
+            "SSH_ASKPASS",
+            "SSH_ASKPASS_REQUIRE",
+            "PIP_FIND_LINKS",
+            "PIP_TRUSTED_HOST",
+            "UV_FIND_LINKS",
+            "UV_INSECURE_HOST",
             "DOCKER_HOST",
             "RUSTC_WRAPPER",
         ] {

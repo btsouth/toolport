@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { Registry } from "@/lib/types";
+import type { ArgBinding, Registry } from "@/lib/types";
 import {
   teamConnect,
   teamDisconnect,
@@ -9,7 +9,8 @@ import {
   getRegistry,
 } from "@/lib/api";
 import { HOSTED_TEAMS_URL, teamUrlError } from "@/lib/teamUrl";
-import { accountStatusText, syncSignInUrl } from "@/lib/personalSync";
+import { accountStatusText, planName, syncSignInUrl } from "@/lib/personalSync";
+import { argumentValues } from "@/lib/executionReview";
 import { PRO_LINE, TEAMS_FREE_LINE } from "@/lib/teamsPlan";
 import { openExternal } from "@/lib/openUrl";
 import { visibleExecutionText as visibleText } from "@/lib/visibleExecutionText";
@@ -38,24 +39,38 @@ function conflictFields(value: unknown): Record<string, string> {
     v.args.forEach((arg, i) => {
       fields[`Argument ${i + 1}`] = visibleText(String(arg));
     });
+  // Same plain labels and masking as the execution review.
+  const launch = v.launch as { inputs?: unknown[]; bindings?: ArgBinding[] } | undefined;
   for (const [label, rows] of [
     ["Environment", v.env],
-    ["Launch input", (v.launch as { inputs?: unknown[] } | undefined)?.inputs],
+    ["Input", launch?.inputs],
     ["Header", v.headerKeys],
   ] as const) {
     if (Array.isArray(rows))
       for (const row of rows as {
         key: string;
+        env?: unknown;
         value?: unknown;
         secret?: boolean;
-        source?: { ref: string };
+        source?: { ref?: string };
       }[])
-        fields[`${label}: ${visibleText(row.key)}`] = row.secret
-          ? "<masked secret>"
-          : row.source
-            ? `Reference: ${visibleText(row.source.ref)}`
-            : visibleText(String(row.value ?? "Not set"));
+        fields[`${label}: ${visibleText(row.key)}`] =
+          label === "Header" && typeof row.env === "string"
+            ? `Uses environment: ${visibleText(row.env)}`
+            : row.source?.ref
+              ? `Password manager: ${visibleText(row.source.ref)}`
+              : row.secret
+                ? "<masked secret>"
+                : row.value != null
+                  ? visibleText(
+                      typeof row.value === "string"
+                        ? row.value
+                        : JSON.stringify(row.value),
+                    )
+                  : "Set on this machine";
   }
+  if (Array.isArray(launch?.bindings) && launch.bindings.length)
+    fields["Argument values"] = argumentValues(launch.bindings);
   return fields;
 }
 function ConflictVersions({ local, remote }: { local: unknown; remote: unknown }) {
@@ -230,7 +245,7 @@ export function PersonalSyncView({
             <h3 className="font-medium">Your account</h3>
             {sync?.signInRequired ? (
               <p>
-                Saved account plan: {status?.plan ?? "unknown"}. Sign in to confirm your
+                Saved account plan: {planName(status?.plan)}. Sign in to confirm your
                 account and resume sync.
               </p>
             ) : status ? (
@@ -253,17 +268,30 @@ export function PersonalSyncView({
               <p className="text-sm">Changes waiting to sync</p>
             )}
             <div className="flex gap-2">
-              <Button
-                disabled={busy}
-                onClick={() =>
-                  void run(async () => {
-                    await teamSync();
-                    onRegistryChange(await getRegistry());
-                  })
-                }
-              >
-                Sync now
-              </Button>
+              {sync?.signInRequired ? (
+                // Sync cannot succeed without sign-in. Sign out stays: it clears
+                // the saved account and its token.
+                <Button
+                  disabled={busy}
+                  onClick={() =>
+                    void run(() => openExternal(syncSignInUrl(team.serverUrl)))
+                  }
+                >
+                  Sign in
+                </Button>
+              ) : (
+                <Button
+                  disabled={busy}
+                  onClick={() =>
+                    void run(async () => {
+                      await teamSync();
+                      onRegistryChange(await getRegistry());
+                    })
+                  }
+                >
+                  Sync now
+                </Button>
+              )}
               <Button
                 variant="outline"
                 onClick={() => void run(() => openExternal(team.serverUrl))}
