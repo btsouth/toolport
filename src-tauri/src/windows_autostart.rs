@@ -99,3 +99,68 @@ mod tests {
         );
     }
 }
+
+/// Remove only values whose command is recognizably Toolport's hidden launch.
+pub(crate) fn remove_toolport_entries(names: &[&str]) -> Vec<crate::purge::Leftover> {
+    use winreg::enums::KEY_WRITE;
+    let mut leftovers = Vec::new();
+    let user = RegKey::predef(HKEY_CURRENT_USER);
+    for name in names {
+        let path = format!("HKCU\\{RUN_KEY}\\{name}");
+        let result = (|| {
+            let run = match user.open_subkey_with_flags(RUN_KEY, KEY_READ | KEY_WRITE) {
+                Ok(run) => run,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.to_string()),
+            };
+            let command = match run.get_value::<String, _>(*name) {
+                Ok(command) => command,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.to_string()),
+            };
+            let binary = if let Some(rest) = command.strip_prefix('"') {
+                rest.split('"').next().unwrap_or("")
+            } else {
+                command.split_whitespace().next().unwrap_or("")
+            };
+            let basename = std::path::Path::new(binary)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if !matches!(
+                basename.to_ascii_lowercase().as_str(),
+                "conduit.exe" | "toolport.exe"
+            ) || !command.contains("--hidden")
+            {
+                return Err("Startup command has different ownership. It was preserved.".into());
+            }
+            if let Err(error) = run.delete_value(name) {
+                return Err(error.to_string());
+            }
+            match user.open_subkey_with_flags(STARTUP_APPROVED_KEY, KEY_WRITE) {
+                Ok(key) => match key.delete_value(name) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        leftovers.push(crate::purge::Leftover {
+                            path: format!("HKCU\\{STARTUP_APPROVED_KEY}\\{name}"),
+                            error: error.to_string(),
+                        });
+                    }
+                },
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    leftovers.push(crate::purge::Leftover {
+                        path: format!("HKCU\\{STARTUP_APPROVED_KEY}\\{name}"),
+                        error: error.to_string(),
+                    });
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            leftovers.push(crate::purge::Leftover { path, error });
+        }
+    }
+    leftovers
+}

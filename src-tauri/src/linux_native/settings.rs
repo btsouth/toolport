@@ -510,6 +510,43 @@ impl SettingsPage {
         let remove_clients = gtk::Button::with_label("Remove Toolport from all clients");
         remove_clients.set_halign(gtk::Align::Start);
         page.append(&remove_clients);
+        let purge_data = gtk::Button::with_label("Remove Toolport data");
+        purge_data.add_css_class("destructive-action");
+        purge_data.set_halign(gtk::Align::Start);
+        page.append(&purge_data);
+        let purge_root = root.clone();
+        purge_data.connect_clicked(move |_| {
+            let parent = purge_root.root().and_downcast::<gtk::Window>();
+            let plan = match crate::purge::plan() {
+                Ok(plan) => plan,
+                Err(error) => {
+                    let dialog = adw::MessageDialog::new(parent.as_ref(), Some("Could not prepare data removal"), Some(&error));
+                    dialog.add_response("close", "Close");
+                    dialog.present();
+                    return;
+                }
+            };
+            let details = format!("Normal uninstall keeps your data. Toolport will close, restore and disconnect clients, then permanently remove:\n\n{}\n\nClient files and native servers stay. Failed restoration or active sessions keep data for recovery. This cannot be undone.\n\nResults and exact leftovers: {}", plan.resources.join("\n\n"), plan.report_path);
+            let dialog = adw::MessageDialog::new(parent.as_ref(), Some("Remove Toolport data?"), Some(&details));
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("remove", "Close and remove data");
+            dialog.set_close_response("cancel");
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+            dialog.connect_response(None, move |dialog, response| {
+                if response == "remove" {
+                    match crate::purge::launch_after_exit(std::path::Path::new(&plan.report_path)) {
+                        Ok(()) => if let Some(app) = gtk::gio::Application::default() { app.quit(); },
+                        Err(error) => {
+                            let error_dialog = adw::MessageDialog::new(dialog.transient_for().as_ref(), Some("Could not start data removal"), Some(&error));
+                            error_dialog.add_response("close", "Close");
+                            error_dialog.present();
+                        }
+                    }
+                }
+            });
+            dialog.present();
+        });
         let removal_results = gtk::Label::new(None);
         removal_results.set_xalign(0.0);
         removal_results.set_wrap(true);

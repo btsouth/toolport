@@ -1017,3 +1017,15 @@ export interface TeamSyncStatus {
 export function teamSyncStatus(): Promise<TeamSyncStatus> {
   return invoke<TeamSyncStatus>("team_sync_status");
 }
+
+export interface DataRemovalPlan {
+  dataDir: string;
+  resources: string[];
+  reportPath: string;
+}
+export function dataRemovalPlan(): Promise<DataRemovalPlan> {
+  return invoke("data_removal_plan");
+}
+export function removeToolportData(reportPath: string): Promise<void> {
+  return invoke("remove_toolport_data", { reportPath, confirmed: true });
+}

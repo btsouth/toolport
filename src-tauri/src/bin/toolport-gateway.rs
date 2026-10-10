@@ -20139,6 +20139,11 @@ enum ArgAction {
     Guard(String),
     /// Standalone manual installer session check.
     InstallerPreflight(std::path::PathBuf),
+    RemoveData {
+        confirmed: bool,
+        dry_run: bool,
+        after_exit: bool,
+    },
     DisconnectAll {
         dry_run: bool,
     },
@@ -20169,6 +20174,29 @@ fn parse_args(args: &[String]) -> ArgAction {
             _ => ArgAction::Unknown(
                 "--installer-preflight requires one absolute install directory".into(),
             ),
+        };
+    }
+    if args.iter().any(|arg| arg == "--remove-data") {
+        if let Some(arg) = args.iter().find(|arg| {
+            !matches!(
+                arg.as_str(),
+                "--remove-data" | "--confirm" | "--dry-run" | "--after-desktop-exit"
+            )
+        }) {
+            return ArgAction::Unknown(arg.clone());
+        }
+        let confirmed = args.iter().any(|arg| arg == "--confirm");
+        let dry_run = args.iter().any(|arg| arg == "--dry-run");
+        let after_exit = args.iter().any(|arg| arg == "--after-desktop-exit");
+        if after_exit && (!confirmed || dry_run) {
+            return ArgAction::Unknown(
+                "--after-desktop-exit requires --remove-data --confirm".into(),
+            );
+        }
+        return ArgAction::RemoveData {
+            confirmed,
+            dry_run,
+            after_exit,
         };
     }
     if args.iter().any(|arg| arg == "--disconnect-all") {
@@ -20252,6 +20280,7 @@ fn usage() -> String {
          \x20   --private-gateway    One adapter's own gateway while the host daemon is\n\
          \x20                        unresponsive (internal)\n\
          \x20   --installer-preflight <absolute-install-dir> Defer installation while client gateways are open\n\
+         \x20   --remove-data [--dry-run | --confirm] Remove Toolport data after restoring clients; close desktop first\n\
          \x20   --disconnect-all [--dry-run] Restore all client configs and exit; JSON per-client results\n\
          \x20   --setup-review       Private setup verification with a 30-second catalog wait\n\
          \x20   --selftest-secrets    Diagnostic: read every vaulted secret and report\n\
@@ -20351,6 +20380,55 @@ fn main() {
             // answer allow, then exit 0. No gateway startup, no registry read, no policy.
             println!("{}", conduit_lib::guard_cleanup::run_no_op_hook());
             conduit_lib::telemetry::exit_with(0);
+        }
+        ArgAction::RemoveData {
+            confirmed,
+            dry_run,
+            after_exit,
+        } => {
+            if after_exit {
+                let mut ignored = Vec::new();
+                if let Err(error) = std::io::Read::read_to_end(&mut std::io::stdin(), &mut ignored)
+                {
+                    println!(
+                        "{}",
+                        json!({"leftovers":[{"path":"desktop-exit pipe", "error":error.to_string()}]})
+                    );
+                    std::process::exit(1);
+                }
+            }
+            if dry_run || !confirmed {
+                match conduit_lib::purge::plan() {
+                    Ok(plan) => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&plan).expect("serializable removal plan")
+                    ),
+                    Err(error) => {
+                        eprintln!("{error}");
+                        std::process::exit(1);
+                    }
+                }
+                if !dry_run {
+                    eprintln!("Nothing was removed. Close Toolport, then repeat with --confirm to remove the listed data.");
+                }
+                std::process::exit(if dry_run { 0 } else { 2 });
+            }
+            match conduit_lib::purge::run() {
+                Ok(report) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).expect("serializable removal report")
+                    );
+                    std::process::exit(if report.leftovers.is_empty() { 0 } else { 1 });
+                }
+                Err(error) => {
+                    println!(
+                        "{}",
+                        json!({"removed":[], "leftovers":[{"path":conduit_lib::registry::conduit_dir().map(|path| path.display().to_string()), "error":error}]})
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
         ArgAction::DisconnectAll { dry_run } => {
             if conduit_lib::registry::conduit_dir().is_none_or(|dir| !dir.exists()) {
@@ -21044,6 +21122,38 @@ mod tests {
         ] {
             assert!(matches!(parse_args(&args), ArgAction::Unknown(_)));
         }
+    }
+
+    #[test]
+    fn removal_requires_explicit_confirmation_and_cannot_start_gateway() {
+        assert_eq!(
+            parse_args(&["--remove-data".into()]),
+            ArgAction::RemoveData {
+                confirmed: false,
+                dry_run: false,
+                after_exit: false
+            }
+        );
+        assert_eq!(
+            parse_args(&["--remove-data".into(), "--dry-run".into()]),
+            ArgAction::RemoveData {
+                confirmed: false,
+                dry_run: true,
+                after_exit: false
+            }
+        );
+        assert_eq!(
+            parse_args(&["--remove-data".into(), "--confirm".into()]),
+            ArgAction::RemoveData {
+                confirmed: true,
+                dry_run: false,
+                after_exit: false
+            }
+        );
+        assert!(matches!(
+            parse_args(&["--remove-data".into(), "--daemon".into()]),
+            ArgAction::Unknown(_)
+        ));
     }
 
     #[test]

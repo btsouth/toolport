@@ -36,6 +36,8 @@ import { Button } from "@/components/ui/button";
 import {
   addHttpClient,
   disconnectAllClients,
+  dataRemovalPlan,
+  removeToolportData,
   getRegistry,
   type DisconnectResult,
   disableAutostart,
@@ -535,6 +537,27 @@ function ProfileToolScope({
 /** Anonymous discovery defaults and global security policy. Identified clients
  * choose discovery in Clients. */
 export function SettingsView({ registry, onRegistryChange }: Props) {
+  const [purgePlan, setPurgePlan] = useState<import("@/lib/api").DataRemovalPlan | null>(
+    null,
+  );
+  const [purgeBusy, setPurgeBusy] = useState(false);
+  const preparePurge = async () => {
+    try {
+      setPurgePlan(await dataRemovalPlan());
+    } catch (error) {
+      toastError(`Could not prepare data removal: ${error}`);
+    }
+  };
+  const purge = async () => {
+    if (!purgePlan) return;
+    setPurgeBusy(true);
+    try {
+      await removeToolportData(purgePlan.reportPath);
+    } catch (error) {
+      toastError(`Could not start data removal: ${error}`);
+      setPurgeBusy(false);
+    }
+  };
   const { theme, setTheme } = useTheme();
   const [removeOpen, setRemoveOpen] = useState(false);
   const [removeBusy, setRemoveBusy] = useState(false);
@@ -898,6 +921,60 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         >
           Remove Toolport from all clients
         </Button>
+        <p className="text-sm text-muted-foreground">
+          Normal uninstall keeps your data. Remove it only when you no longer need
+          Toolport.
+        </p>
+        <Button
+          variant="destructive"
+          className="self-start"
+          disabled={purgeBusy}
+          onClick={() => void preparePurge()}
+        >
+          Remove Toolport data
+        </Button>
+        <Dialog
+          open={purgePlan !== null}
+          onOpenChange={(open) => {
+            if (!open && !purgeBusy) setPurgePlan(null);
+          }}
+        >
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Remove Toolport data?</DialogTitle>
+              <DialogDescription>
+                Toolport will close, restore and disconnect its clients, then permanently
+                remove the resources below. Client files and native servers stay. If
+                restoration fails or sessions remain open, data stays for recovery.
+              </DialogDescription>
+            </DialogHeader>
+            <ul className="list-disc space-y-2 pl-5 text-sm break-words">
+              {purgePlan?.resources.map((resource) => (
+                <li key={resource}>{resource}</li>
+              ))}
+            </ul>
+            <p className="text-sm break-words">
+              Results and exact leftovers will be saved to{" "}
+              <strong>{purgePlan?.reportPath}</strong>. This cannot be undone.
+            </p>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                disabled={purgeBusy}
+                onClick={() => setPurgePlan(null)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={purgeBusy}
+                onClick={() => void purge()}
+              >
+                {purgeBusy ? "Closing Toolport…" : "Close and remove data"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
         {removeResults && (
           <ul className="text-sm" aria-live="polite">
             {removeResults.length === 0 ? (

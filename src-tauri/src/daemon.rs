@@ -334,6 +334,60 @@ pub fn request_shutdown_if_idle(descriptor: &DaemonDescriptor) -> Result<(), Str
     .map_err(|error| format!("could not request idle daemon shutdown: {error}"))
 }
 
+/// Stop only authenticated daemons advertised by this data directory. Busy or
+/// unreadable descriptors are preserved and reported rather than force-killed.
+pub(crate) fn stop_for_purge(data_dir: &Path) -> Vec<crate::purge::Leftover> {
+    let mut leftovers = Vec::new();
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return vec![crate::purge::Leftover {
+                path: data_dir.display().to_string(),
+                error: error.to_string(),
+            }]
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("daemon-") || !name.ends_with(".json") {
+            continue;
+        }
+        let result = (|| {
+            let descriptor = read_descriptor(&path).ok_or("Unreadable daemon descriptor")?;
+            if !process_exists(descriptor.pid) {
+                return Ok(());
+            }
+            let identity = probe_identity(&descriptor)?;
+            if identity.pid != descriptor.pid
+                || identity.compat != descriptor.compat
+                || identity.protocol != descriptor.protocol
+            {
+                return Err("Daemon identity does not match its descriptor".into());
+            }
+            request_shutdown_if_idle(&descriptor)?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while process_exists(descriptor.pid) {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!("Daemon PID {} remains busy or could not exit. Close active sessions and retry.", descriptor.pid));
+                }
+                // Bounded backoff between OS liveness checks; completion is observed,
+                // never inferred from a fixed delay or descriptor withdrawal.
+                std::thread::park_timeout(Duration::from_millis(100));
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            leftovers.push(crate::purge::Leftover {
+                path: path.display().to_string(),
+                error,
+            });
+        }
+    }
+    leftovers
+}
+
 /// Why an identity probe failed, in the terms the rendezvous decides on: what
 /// may be cleared, and what may spawn.
 #[derive(Debug)]

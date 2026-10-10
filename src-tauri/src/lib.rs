@@ -3,6 +3,7 @@ pub mod approval;
 pub(crate) mod approval_broker;
 pub mod audit;
 pub mod autostart;
+pub mod purge;
 pub mod brand;
 pub mod catalog;
 pub mod call_failure;

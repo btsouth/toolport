@@ -1357,6 +1357,30 @@ pub fn reap_stale(extra_keep: &[PathBuf]) -> ReapReport {
     report
 }
 
+/// Read-only blockers for explicit removal, scoped like the existing reaper.
+pub(crate) fn purge_blockers(data_dir: &Path) -> Vec<crate::purge::Leftover> {
+    let processes = list_gateway_processes();
+    let descriptors = verified_reap_daemons(data_dir, &processes);
+    processes
+        .iter()
+        .filter(|process| {
+            process.pid != std::process::id()
+                && stale_process_in_scope(process, data_dir, &descriptors)
+        })
+        .map(|process| crate::purge::Leftover {
+            path: process
+                .path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| process.basename.clone()),
+            error: format!(
+                "Gateway PID {} is still running. Close its client session and retry.",
+                process.pid
+            ),
+        })
+        .collect()
+}
+
 fn verified_reap_daemons(
     data_dir: &Path,
     processes: &[GatewayProcess],

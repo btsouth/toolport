@@ -5,6 +5,9 @@
 
 const SERVICE: &str = "conduit-mcp";
 
+#[path = "purge_keyring.rs"]
+pub(crate) mod purge;
+
 const INTERNAL_SERVER_ID: &str = "__toolport_internal__";
 const TASK_HANDLE_KEY: &str = "__task_handle_key__";
 

@@ -580,6 +580,25 @@ async fn uninstall_gateway(
 }
 
 #[tauri::command]
+fn data_removal_plan() -> Result<crate::purge::Plan, String> {
+    crate::purge::plan()
+}
+
+#[tauri::command]
+fn remove_toolport_data(
+    app: AppHandle,
+    report_path: String,
+    confirmed: bool,
+) -> Result<(), String> {
+    if !confirmed {
+        return Err("Data removal requires explicit confirmation".into());
+    }
+    crate::purge::launch_after_exit(std::path::Path::new(&report_path))?;
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
 async fn disconnect_all_clients() -> Result<Vec<clients::DisconnectResult>, String> {
     tauri::async_runtime::spawn_blocking(|| clients::disconnect_all(false))
         .await
@@ -4075,6 +4094,8 @@ pub fn run() {
             install_gateway,
             uninstall_gateway,
             disconnect_all_clients,
+            data_removal_plan,
+            remove_toolport_data,
             migrate_client,
             preview_client_setup,
             set_secret,
