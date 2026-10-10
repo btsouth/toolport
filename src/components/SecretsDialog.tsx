@@ -941,10 +941,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                     onChange={(e) =>
                       setReferences((refs) => ({
                         ...refs,
-                        [key]:
-                          e.target.value === "reference"
-                            ? "op://Engineering/Docs/key"
-                            : undefined,
+                        [key]: e.target.value === "reference" ? "op://" : undefined,
                       }))
                     }
                   >
@@ -1091,11 +1088,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                 className="self-start rounded border bg-background p-1 text-xs"
                 value={newReference === undefined ? "paste" : "reference"}
                 onChange={(e) =>
-                  setNewReference(
-                    e.target.value === "reference"
-                      ? "op://Engineering/Docs/key"
-                      : undefined,
-                  )
+                  setNewReference(e.target.value === "reference" ? "op://" : undefined)
                 }
               >
                 <option value="paste">Paste a key</option>

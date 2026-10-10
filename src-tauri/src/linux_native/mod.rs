@@ -10345,7 +10345,11 @@ mod tests {
         assert_eq!(reference.text(), format!("env:{key}"));
         assert!(!feedback.text().contains("synthetic-native-key-value"));
         provider.set_selected(0);
-        assert_eq!(reference.text(), crate::secret_refs::PROVIDERS[0].example);
+        assert_eq!(reference.text(), "");
+        assert_eq!(
+            reference.placeholder_text().as_deref(),
+            Some(crate::secret_refs::PROVIDERS[0].example)
+        );
         choice.set_selected(0);
         assert!(!controls.is_visible());
     }
@@ -11565,16 +11569,22 @@ fn secret_reference_fields(
             .and_then(|r| providers.iter().position(|p| r.starts_with(p.scheme)))
             .unwrap_or(0) as u32,
     );
+    // The example is a hint, never a value: prefilled text could be saved as-is.
+    let start = existing
+        .and_then(|r| providers.iter().find(|p| r.starts_with(p.scheme)))
+        .unwrap_or(&providers[0]);
     let reference = gtk::Entry::builder()
-        .text(existing.unwrap_or(providers[0].example))
-        .placeholder_text("Secret reference")
+        .text(existing.unwrap_or(""))
+        .placeholder_text(start.example)
         .build();
     reference.set_tooltip_text(Some(
         "Test uses the desktop app environment. The MCP client gateway may use different environment variables or PATH. Only the reference syncs.",
     ));
     let reference_for_provider = reference.clone();
     provider.connect_selected_notify(move |provider| {
-        reference_for_provider.set_text(providers[provider.selected() as usize].example)
+        reference_for_provider.set_text("");
+        reference_for_provider
+            .set_placeholder_text(Some(providers[provider.selected() as usize].example));
     });
     container.append(&provider);
     container.append(&reference);
