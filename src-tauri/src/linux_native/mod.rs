@@ -2225,7 +2225,7 @@ impl ClientPage {
                         .css_classes(["heading"])
                         .build(),
                 );
-                row.append(&gtk::Label::builder().label(client_activity_detail(&client)).tooltip_text("Calls today counts retained server calls since local midnight. Older calls may no longer be retained.").halign(gtk::Align::Start).wrap(true).css_classes(["toolport-muted"]).build());
+                row.append(&gtk::Label::builder().label(client_activity_detail(&client)).tooltip_text("Calls today counts retained tool calls since local midnight. Older calls may no longer be retained.").halign(gtk::Align::Start).wrap(true).css_classes(["toolport-muted"]).build());
                 rows.append(&row);
             }
             expander.set_child(Some(&rows));

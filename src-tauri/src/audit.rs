@@ -1002,7 +1002,7 @@ fn csv_cell(value: Option<&Value>) -> String {
 mod tests {
 
     #[test]
-    fn client_activity_groups_sessions_and_counts_only_todays_server_calls() {
+    fn client_activity_groups_sessions_and_counts_only_todays_tool_calls() {
         let rows = client_activity_from_entries(
             vec![
                 json!({"kind":"session","sessionId":"c2","clientName":"Codex","ts":300,"firstCatalogSize":1711}),
@@ -1010,6 +1010,7 @@ mod tests {
                 json!({"kind":"internal","clientName":"Codex","ts":280,"ok":true}),
                 json!({"clientName":"Codex","ts":250,"ok":false}),
                 json!({"clientName":"Codex","ts":240,"ok":true}),
+                json!({"clientName":"Codex","server":"toolport","tool":"run_script","ts":230,"ok":true}),
                 json!({"kind":"session","sessionId":"c1","clientName":"Codex","ts":220}),
                 json!({"clientName":"Codex","ts":50,"ok":true}),
                 json!({"clientName":"Unknown client","clientLabel":"inbox","ts":30,"ok":true}),
@@ -1020,7 +1021,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["clientName"], "Codex");
         assert_eq!(rows[0]["sessionCount"], 2);
-        assert_eq!(rows[0]["callsToday"], 2);
+        assert_eq!(rows[0]["callsToday"], 3);
         assert_eq!(rows[0]["lastActiveMs"], 300);
         assert_eq!(rows[0]["firstCatalogSize"], 1711);
         assert_eq!(rows[1]["callsToday"], 0);

@@ -281,7 +281,7 @@ export function ClientsView({
                   </p>
                   <p
                     className="text-xs text-muted-foreground"
-                    title="Calls today counts retained server calls since local midnight. Older calls may no longer be retained."
+                    title="Calls today counts retained tool calls since local midnight. Older calls may no longer be retained."
                   >
                     {client.lastActiveMs
                       ? `Last active ${fmtAgo(client.lastActiveMs)}`
