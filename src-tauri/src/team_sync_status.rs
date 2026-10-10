@@ -10,7 +10,7 @@ pub struct SyncStatus {
     pub checked_at_ms: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Stored {
     team_id: String,
@@ -18,6 +18,10 @@ struct Stored {
     device_id: String,
     status: SyncStatus,
 }
+
+// Scope the observation to both the data directory and the connected team.
+static LAST_OBSERVATION: std::sync::Mutex<Option<(std::path::PathBuf, Stored)>> =
+    std::sync::Mutex::new(None);
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -35,7 +39,21 @@ fn path() -> Result<std::path::PathBuf, String> {
 }
 
 fn for_connection(conn: &TeamConnection) -> SyncStatus {
-    std::fs::read_to_string(path().unwrap_or_default())
+    let receipt_path = path().unwrap_or_default();
+    if let Some((observed_path, stored)) = LAST_OBSERVATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        if *observed_path == receipt_path
+            && stored.team_id == conn.team_id
+            && stored.server_url == conn.server_url
+            && stored.device_id == conn.reporting_device_id
+        {
+            return stored.status.clone();
+        }
+    }
+    std::fs::read_to_string(receipt_path)
         .ok()
         .and_then(|raw| serde_json::from_str::<Stored>(&raw).ok())
         .filter(|stored| {
@@ -90,8 +108,13 @@ pub fn record(conn: &TeamConnection, result: Result<(), &str>) -> Result<(), Str
         device_id: conn.reporting_device_id.clone(),
         status,
     };
+    let receipt_path = path()?;
+    *LAST_OBSERVATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((receipt_path.clone(), stored.clone()));
     registry::atomic_write(
-        &path()?,
+        &receipt_path,
         &serde_json::to_string(&stored).map_err(|e| e.to_string())?,
     )
 }
@@ -136,6 +159,41 @@ mod tests {
         assert_eq!(current().last_success_ms, None);
     }
     #[test]
+    fn failed_receipt_write_keeps_latest_observation_and_success_history() {
+        let _data = registry::DataDirTestEnv::new("team-sync-status-write-failure");
+        let mut reg = registry::Registry::default();
+        let conn: TeamConnection = serde_json::from_value(serde_json::json!({
+            "serverUrl":"https://example.invalid", "teamId":"one", "role":"member"
+        }))
+        .unwrap();
+        reg.team = Some(conn.clone());
+        registry::save(&reg).unwrap();
+        record(&conn, Ok(())).unwrap();
+        let success = current().last_success_ms;
+        let receipt = path().unwrap();
+        let old_receipt = std::fs::read_to_string(&receipt).unwrap();
+        std::fs::remove_file(&receipt).unwrap();
+        std::fs::create_dir(&receipt).unwrap();
+        assert!(record(
+            &conn,
+            Err("could not reach the team server: connection refused")
+        )
+        .is_err());
+        assert_eq!(current().state, "offline");
+        assert_eq!(current().last_success_ms, success);
+        // Even when the previous successful receipt remains, both shells must
+        // receive the latest failed observation rather than rereading success.
+        std::fs::remove_dir(&receipt).unwrap();
+        std::fs::write(&receipt, old_receipt).unwrap();
+        assert_eq!(current().state, "offline");
+        assert_eq!(current().last_success_ms, success);
+        reg.team.as_mut().unwrap().reporting_device_id = "different-device".into();
+        registry::save(&reg).unwrap();
+        assert_eq!(current().state, "not_checked");
+        assert_eq!(current().last_success_ms, None);
+    }
+
+    #[test]
     fn old_success_is_history_not_a_live_connection() {
         let _data = registry::DataDirTestEnv::new("team-sync-status-age");
         let mut reg = registry::Registry::default();
@@ -151,6 +209,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(path().unwrap()).unwrap()).unwrap();
         stored.status.checked_at_ms = 0;
         registry::atomic_write(&path().unwrap(), &serde_json::to_string(&stored).unwrap()).unwrap();
+        *LAST_OBSERVATION.lock().unwrap() = None;
         assert_eq!(current().state, "not_checked");
         assert_eq!(current().last_success_ms, success);
         record(&conn, Err("server returned 500")).unwrap();

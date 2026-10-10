@@ -168,8 +168,7 @@ impl TeamsPage {
                                 failures.get(),
                             ));
                         if page.root.is_mapped() {
-                            page.render_sync_status();
-                            page.feedback.set_tooltip_text(Some(&error));
+                            page.render_sync_failure(&error);
                         }
                     }
                     Err(_) => {
@@ -196,6 +195,11 @@ impl TeamsPage {
         });
     }
 
+    fn render_sync_failure(&self, error: &str) {
+        self.render_sync_status();
+        self.set_status(&format!("{} {error}", self.feedback.label()), true);
+    }
+
     fn render_sync_status(&self) {
         let status = crate::team_sync_status::current();
         let last = status
@@ -209,7 +213,7 @@ impl TeamsPage {
                 "{}. Last successful sync: {last}.",
                 crate::team_sync_status::summary(&status)
             ),
-            false,
+            matches!(status.state.as_str(), "offline" | "error"),
         );
         self.feedback.remove_css_class("success");
     }
@@ -1889,6 +1893,44 @@ mod tests {
         }
         dialog.close();
         parent.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn sync_receipt_failure_is_visible_with_success_history() {
+        adw::init().unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("native-sync-receipt-failure");
+        let conn: crate::registry::TeamConnection = serde_json::from_value(serde_json::json!({
+            "serverUrl":"https://example.invalid", "teamId":"one", "role":"member"
+        }))
+        .unwrap();
+        let mut reg = crate::registry::Registry::default();
+        reg.team = Some(conn.clone());
+        crate::registry::save(&reg).unwrap();
+        crate::team_sync_status::record(&conn, Ok(())).unwrap();
+        let success = crate::team_sync_status::current().last_success_ms;
+        let receipt = crate::registry::conduit_dir()
+            .unwrap()
+            .join("team-sync-status.json");
+        std::fs::remove_file(&receipt).unwrap();
+        std::fs::create_dir(&receipt).unwrap();
+        assert!(crate::team_sync_status::record(&conn, Err("HTTP 500")).is_err());
+        let app = adw::Application::builder()
+            .application_id("app.toolport.SyncFixture")
+            .build();
+        let (_, server_page, _) =
+            super::super::build_content(&app, crate::approval_broker::start_native());
+        let page = super::TeamsPage::new(&app, server_page);
+        page.render_sync_failure("HTTP 500. Sync status could not be saved");
+        assert!(page.feedback.is_visible());
+        assert!(page.feedback.has_css_class("error"));
+        let text = page.feedback.label();
+        assert!(text.contains("Team sync failed"));
+        assert!(text.contains("Last successful sync:"));
+        assert!(!text.contains("not recorded yet"));
+        assert!(text.contains("HTTP 500. Sync status could not be saved"));
+        assert!(!text.contains("Last sync succeeded"));
+        assert_eq!(crate::team_sync_status::current().last_success_ms, success);
     }
 
     #[test]
