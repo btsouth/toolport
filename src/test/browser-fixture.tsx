@@ -33,7 +33,7 @@ const servers: ServerEntry[] = ["GitHub", "Linear", "Stripe"].map((name, i) => (
 if (new URLSearchParams(location.search).has("tool-changes")) {
   servers.push(
     ...[
-      ["cloudflare_full_api", "Cloudflare (Full API)"],
+      ["cloudflare-full-api", "Cloudflare (Full API)"],
       ["revenuecat", "RevenueCat"],
     ].map(([id, name]) => ({ ...servers[0], id, name, enabled: false })),
   );

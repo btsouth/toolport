@@ -92,8 +92,11 @@ export function ToolChanges({
           const blocked = group.tools.filter((tool) => tool.blocked === true).length;
           const unknown = group.tools.some((tool) => tool.blocked == null);
           const server =
-            registry?.servers.find((server) => server.id === group.server)?.name ||
-            group.server;
+            registry?.servers.find(
+              (server) =>
+                server.id.replace(/[^a-zA-Z0-9_]/g, "_") === group.server ||
+                server.id === group.server,
+            )?.name || group.server;
           const canAccept =
             !unknown &&
             !group.tools.some((tool) => tool.signatures !== undefined) &&

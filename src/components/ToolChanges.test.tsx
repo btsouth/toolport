@@ -10,7 +10,7 @@ vi.mock("@/lib/api", () => ({
 vi.mock("@/lib/toast", () => ({ toastError: vi.fn() }));
 const registry = {
   servers: [
-    { id: "cloudflare_full_api", name: "Cloudflare (Full API)" },
+    { id: "cloudflare-full-api", name: "Cloudflare (Full API)" },
     { id: "revenuecat", name: "RevenueCat" },
   ],
 } as Registry;

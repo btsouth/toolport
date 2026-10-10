@@ -341,15 +341,7 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
     match crate::registry::load()
         .map_err(|error| format!("could not read the registry for tool identities: {error}"))
         .and_then(|registry| {
-            for event in &mut snapshot.security_events {
-                if let Some(server) = registry
-                    .servers
-                    .iter()
-                    .find(|server| event["server"] == server.id)
-                {
-                    event["server_name"] = serde_json::json!(server.name);
-                }
-            }
+            annotate_security_server_names(&mut snapshot.security_events, &registry.servers);
             crate::integrity::tool_identities(&registry.servers, &registry.profiles)
                 .map_err(|error| format!("could not read the tool identity stores: {error}"))
         }) {
@@ -359,6 +351,20 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
         Err(error) => snapshot.tool_identities_error = Some(error),
     }
     Ok(snapshot)
+}
+
+fn annotate_security_server_names(
+    events: &mut [serde_json::Value],
+    servers: &[crate::registry::ServerEntry],
+) {
+    for event in events {
+        if let Some(server) = servers.iter().find(|server| {
+            event["server"] == server.id
+                || event["server"] == crate::router::sanitize_segment(&server.id)
+        }) {
+            event["server_name"] = serde_json::json!(server.name);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -946,6 +952,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn security_server_names_resolve_sanitized_dashed_ids() {
+        let servers = vec![
+            server("cloudflare-full-api", "Cloudflare (Full API)", "stdio"),
+            server("team_linear-9e8960ea8459d20b", "Team Linear", "http"),
+        ];
+        let mut events = vec![
+            serde_json::json!({"server":"cloudflare_full_api"}),
+            serde_json::json!({"server":"team_linear_9e8960ea8459d20b"}),
+        ];
+        annotate_security_server_names(&mut events, &servers);
+        assert_eq!(events[0]["server_name"], "Cloudflare (Full API)");
+        assert_eq!(events[1]["server_name"], "Team Linear");
+    }
     #[test]
     fn client_access_labels_show_migrated_default_all_and_missing_sets() {
         let mut registry = Registry::default();
