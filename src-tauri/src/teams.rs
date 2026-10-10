@@ -4262,7 +4262,11 @@ fn local_team_server_id(
 }
 
 fn restore_personal_definition(entry: &mut ServerEntry, old: &ServerEntry) {
-    if old.unknown_fields.get("personalSyncEntry") != Some(&json!(true)) { return; }
+    if old.unknown_fields.get("personalSyncEntry") != Some(&json!(true)) {
+        restore_local_references(entry, old);
+        return;
+    }
+    // Capture the cloud reference before applying the member-local override.
     crate::personal_sync::restore_local(entry, old);
     // Keep destination namespaces and the local review snapshot across governance.
     for key in ["personalSyncEntry", "personalSyncCredentialDestination", "syncExecutionReview"] {
@@ -4446,7 +4450,6 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
                         &legacy_launch_values_by_id,
                     );
                     if let Some(old) = previous.iter().find(|old| old.id == entry.id) {
-                        restore_local_references(&mut entry, old);
                         restore_personal_definition(&mut entry, old);
                     }
                     used_ids.push(entry.id.clone());
@@ -4488,7 +4491,6 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
                         &legacy_launch_values_by_id,
                     );
                     if let Some(old) = previous.iter().find(|old| old.id == entry.id) {
-                        restore_local_references(&mut entry, old);
                         restore_personal_definition(&mut entry, old);
                     }
                     used_ids.push(entry.id.clone());

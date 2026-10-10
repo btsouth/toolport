@@ -1740,6 +1740,44 @@ mod tests {
             .any(|s| s.id == ids[0] && s.args[1] == "local-argument-secret"));
     }
     #[test]
+    fn mode_transitions_never_export_local_reference_overrides() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-mode-reference-boundary");
+        let mut r = machine();
+        let mut row = http("references");
+        row["headerKeys"] = json!([{"key":"X-Key","source":{"ref":"op://Team/service/key"}}]);
+        let cloud = config(vec![row]);
+        apply(&mut r, &cloud, 1).unwrap();
+        r.servers[0].unknown_fields.insert(
+            "memberSecretRefs".into(),
+            json!({"header:X-Key":"op://Local/service/key"}),
+        );
+        r.servers[0].unknown_fields.insert(
+            "personalSyncRemoteRefs".into(),
+            json!({"header:X-Key":{"ref":"op://Team/service/key"}}),
+        );
+        r.servers[0].unknown_fields.get_mut("headerKeys").unwrap()[0]["source"] =
+            json!({"ref":"op://Local/service/key"});
+        r.team.as_mut().unwrap().unknown_fields["accountStatus"]["personalSync"] = json!(false);
+        mode_changed(&mut r, true).unwrap();
+        crate::teams::apply_team_config(&mut r, "solo", &cloud);
+        assert_eq!(
+            r.servers[0].unknown_fields["headerKeys"][0]["source"]["ref"],
+            "op://Local/service/key"
+        );
+        assert_eq!(
+            export(&r.servers[0])["headerKeys"][0]["source"]["ref"],
+            "op://Team/service/key"
+        );
+        r.team.as_mut().unwrap().unknown_fields["accountStatus"]["personalSync"] = json!(true);
+        mode_changed(&mut r, false).unwrap();
+        apply(&mut r, &cloud, 2).unwrap();
+        assert_eq!(
+            export(&r.servers[0])["headerKeys"][0]["source"]["ref"],
+            "op://Team/service/key"
+        );
+        assert!(state(&r).unwrap().pending.is_empty());
+    }
+    #[test]
     fn governance_transition_retains_disabled_personal_definitions_locally() {
         let _data = crate::registry::DataDirTestEnv::new("sync-mode-disabled");
         let mut r = machine();
