@@ -52,6 +52,7 @@
         }
       ],
       "id": "github",
+      "inheritEnv": true,
       "name": "GitHub",
       "source": "manual",
       "transport": "stdio"

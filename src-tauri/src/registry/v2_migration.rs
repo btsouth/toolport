@@ -90,6 +90,17 @@ pub(super) fn migrate_v1_to_v2(
         .and_then(Value::as_bool)
         .unwrap_or(true);
     registry.insert("codeMode".to_string(), Value::Bool(code_mode));
+    // 1.x local servers inherited the whole environment. New servers get the
+    // allowlist; existing ones keep working with what they had.
+    if let Some(servers) = registry.get_mut("servers").and_then(Value::as_array_mut) {
+        for server in servers.iter_mut().filter_map(Value::as_object_mut) {
+            let local = server.get("transport").and_then(Value::as_str) == Some("stdio")
+                || server.get("command").is_some_and(|command| !command.is_null());
+            if local && !server.contains_key("inheritEnv") {
+                server.insert("inheritEnv".to_string(), Value::Bool(true));
+            }
+        }
+    }
     for key in DROPPED_KEYS {
         registry.remove(*key);
     }
@@ -645,9 +656,14 @@ mod tests {
             "keep-entry"
         );
 
+        // Servers are unchanged apart from keeping the 1.x environment.
+        let mut servers = v2["servers"].clone();
+        assert_eq!(servers[0]["inheritEnv"], true, "local github server");
+        assert!(servers[1].get("inheritEnv").is_none(), "remote linear server");
+        servers[0].as_object_mut().unwrap().remove("inheritEnv");
+        assert_eq!(servers, v1["servers"]);
         // Kept exactly as they were.
         for key in [
-            "servers",
             "activeProfileId",
             "humanApprovalAllow",
             "teamForcedHumanApproval",
@@ -964,6 +980,24 @@ mod tests {
             assert_eq!(value["codeMode"], expected, "{flags}");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn local_1x_servers_keep_the_whole_environment() {
+        let mut value = json!({"version": 1, "profiles": [], "servers": [
+            {"id": "local", "transport": "stdio", "command": "npx"},
+            {"id": "legacy", "command": "uvx"},
+            {"id": "remote", "transport": "http", "url": "https://example.invalid/mcp"},
+            {"id": "chosen", "transport": "stdio", "command": "npx", "inheritEnv": false}
+        ]});
+        let dir = scratch_dir("inherit-env");
+        migrate_v1_to_v2(&mut value, &context(&dir)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let servers = value["servers"].as_array().unwrap();
+        assert_eq!(servers[0]["inheritEnv"], true);
+        assert_eq!(servers[1]["inheritEnv"], true);
+        assert!(servers[2].get("inheritEnv").is_none());
+        assert_eq!(servers[3]["inheritEnv"], false);
     }
 
     #[test]
