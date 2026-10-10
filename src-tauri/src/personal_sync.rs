@@ -124,7 +124,7 @@ fn input_export(mut input: Value) -> Value {
         } else {
             map.remove("source");
         }
-        if map.get("secret") == Some(&json!(true)) {
+        if map.get("secret") == Some(&json!(true)) || map.contains_key("source") {
             map.remove("secret");
         }
         if let Some(value) = value {
@@ -251,6 +251,15 @@ pub fn export(s: &ServerEntry) -> Value {
         for h in headers {
             if let Some(m) = h.as_object_mut() {
                 m.retain(|k, _| ["key", "env", "source"].contains(&k.as_str()));
+                if let Some(r) = m
+                    .get("source")
+                    .and_then(|s| s["ref"].as_str())
+                    .map(str::to_string)
+                {
+                    m.insert("source".into(), json!({"ref": r}));
+                } else {
+                    m.remove("source");
+                }
             }
         }
     }
@@ -1151,6 +1160,20 @@ mod tests {
         assert_eq!(apply(&mut b, &changed, 2).unwrap().review, 1);
         assert!(!b.servers[0].enabled);
         assert!(check_review(&b, &b.servers[0], Some(&reviewed)).is_err());
+    }
+    #[test]
+    fn reference_sources_export_only_the_reference_and_use_secret_wire_defaults() {
+        let mut s = local(http("ref"));
+        s.env = serde_json::from_value(json!([{"key":"TOKEN","secret":false,"source":{"ref":"op://Shared/Token/key","approval":"local-marker"}}])).unwrap();
+        s.unknown_fields.insert("headerKeys".into(), json!([{"key":"X-Key","source":{"ref":"op://Shared/Token/key","approval":"local-marker","value":"synthetic-private-value"}}]));
+        let wire = export(&s);
+        assert!(wire["env"][0].get("secret").is_none());
+        assert_eq!(
+            wire["headerKeys"][0]["source"],
+            json!({"ref":"op://Shared/Token/key"})
+        );
+        assert!(!wire.to_string().contains("local-marker"));
+        assert!(!wire.to_string().contains("synthetic-private-value"));
     }
     #[test]
     fn literal_launch_credentials_are_not_exported() {
