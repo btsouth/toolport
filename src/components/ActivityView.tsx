@@ -144,24 +144,21 @@ function securityKey(e: SecurityEvent): string {
   return `${e.type}:${e.server ?? ""}:${e.tool ?? ""}:${e.change}:${severity}`;
 }
 
-/** Durable key written when a notice is dismissed. Mirrors the GTK shell's
- * `security_dismissal_key`: the loud/actionable tier (high AND warn, per `eventSeverity`)
- * records the instance's timestamp too, so clearing one description rewrite does not also
- * silence a later, different rewrite of the same tool. The quiet tier keeps the
- * identity-only key so ordinary vendor churn stays dismissed. */
+/** Review changes and actionable findings through their occurrence timestamp.
+ * A later definition must reappear regardless of its severity. */
 function dismissalKey(e: SecurityEvent): string {
   const identity = securityKey(e);
-  return eventSeverity(e) === "high" ? `${identity}@${e.ts}` : identity;
+  return e.type === "tool_drift" || eventSeverity(e) === "high"
+    ? `${identity}@${e.ts}`
+    : identity;
 }
 
-/** Whether the user has already reviewed `e`. Loud events are reviewed through a
- * timestamp: a recorded marker for the same identity covers this instance when it
- * reviewed that timestamp or a later one, matching the GTK shell. A genuinely later
- * rewrite (a larger `ts`) therefore reappears instead of staying permanently hidden.
- * Quiet events are dismissed by identity alone. */
+/** An acceptance marker covers this occurrence and earlier duplicate reports.
+ * Later tool changes require a new review. */
 function isDismissed(e: SecurityEvent, dismissed: Set<string>): boolean {
   const identity = securityKey(e);
-  if (eventSeverity(e) !== "high") return dismissed.has(identity);
+  if (e.type !== "tool_drift" && eventSeverity(e) !== "high")
+    return dismissed.has(identity);
   const prefix = `${identity}@`;
   for (const marker of dismissed) {
     if (!marker.startsWith(prefix)) continue;
@@ -196,6 +193,7 @@ function dedupeSecurity(events: SecurityEvent[]): SecurityEvent[] {
         k.tool === e.tool &&
         k.change === e.change &&
         severityIdentity(k) === severityIdentity(e) &&
+        (e.type !== "tool_drift" || k.new_fp === e.new_fp) &&
         Math.abs(k.ts - e.ts) <= WINDOW_MS,
     );
     if (!dupe) kept.push(e);
@@ -239,8 +237,8 @@ function loadDismissed(): Set<string> {
 }
 
 /** Upper bound on remembered dismissals, so the persisted set can't grow without
- * limit across sessions. Well above any realistic count of distinct findings. */
-const MAX_DISMISSED = 500;
+ * limit across sessions. Covers the complete bounded security retention window. */
+const MAX_DISMISSED = 2000;
 
 /** Add keys to the dismissed set, cap it to the most-recent MAX_DISMISSED (Set
  * preserves insertion order, so slicing the tail keeps the newest), and persist.

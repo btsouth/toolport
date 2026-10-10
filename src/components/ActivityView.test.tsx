@@ -692,7 +692,7 @@ describe("ActivityView security drift dismissals", () => {
       server: "srv",
       tool: "srv__read",
       change: "changed",
-      severity: "warn",
+      severity: "info",
       blocked: false,
     };
   }
@@ -715,7 +715,7 @@ describe("ActivityView security drift dismissals", () => {
     await act(async () => {});
     expect(screen.queryByText("Read")).not.toBeInTheDocument();
 
-    // A later, different rewrite of the SAME tool must reappear: a warn dismissal is
+    // A later, different rewrite of the SAME tool must reappear: an accepted change is
     // per instance, not per tool identity.
     getSecurityEvents.mockResolvedValue([warnEvent(1_700_000_000_000 + 20 * 60 * 1000)]);
     await act(async () => {
@@ -724,6 +724,36 @@ describe("ActivityView security drift dismissals", () => {
     expect(
       screen.getByRole("button", { name: /srv: 1 tool changed/ }),
     ).toBeInTheDocument();
+  });
+  it("accepts a server update larger than the old dismissal limit", async () => {
+    localStorage.clear();
+    const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
+    const events = Array.from({ length: 600 }, (_, i) => ({
+      ...warnEvent(1_700_000_000_000),
+      tool: `srv__read${i}`,
+    }));
+    getSecurityEvents.mockResolvedValue(events);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    await user.click(screen.getByRole("button", { name: "Accept all for this server" }));
+    await act(async () => {});
+    expect(screen.queryByText("Tool changes")).not.toBeInTheDocument();
+    await act(async () => {
+      vi.advanceTimersByTime(3000);
+    });
+    expect(screen.queryByText("Tool changes")).not.toBeInTheDocument();
+  });
+
+  it("keeps separate definitions within the old duplicate window", async () => {
+    getSecurityEvents.mockResolvedValue([
+      { ...warnEvent(1_700_000_000_000), new_fp: "v2:old" },
+      { ...warnEvent(1_700_000_120_000), new_fp: "v2:new" },
+    ]);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(screen.getAllByRole("button", { name: /srv: 1 tool changed/ })).toHaveLength(
+      2,
+    );
   });
 });
 

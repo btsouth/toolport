@@ -3600,10 +3600,12 @@ impl ActivityPage {
         }
         self.set_security_status(&live);
         let groups = crate::integrity::group_tool_changes(&live);
-        self.security_expander.set_label(Some(&format!(
-            "Protection history · {} server updates",
-            groups.len()
-        )));
+        self.security_expander
+            .set_label(Some(&if groups.is_empty() {
+                "Protection history · Security notices".to_string()
+            } else {
+                format!("Protection history · {} server updates", groups.len())
+            }));
         for group in groups {
             self.security_list
                 .append(&tool_change_group_card(&group, self.clone()));
@@ -3733,7 +3735,7 @@ impl ActivityPage {
                     dismissed.push(key);
                 }
             }
-            const MAX_DISMISSED: usize = 500;
+            const MAX_DISMISSED: usize = 2000;
             let overflow = dismissed.len().saturating_sub(MAX_DISMISSED);
             if overflow > 0 {
                 dismissed.drain(..overflow);
@@ -4059,7 +4061,7 @@ fn security_event_kind(event: &serde_json::Value) -> &'static str {
 
 fn security_dismissal_key(event: &serde_json::Value) -> String {
     let identity = crate::integrity::security_key(event);
-    if crate::integrity::event_severity(event) != "high" {
+    if event["type"] != "tool_drift" && crate::integrity::event_severity(event) != "high" {
         return identity;
     }
     let timestamp = event
@@ -4071,7 +4073,7 @@ fn security_dismissal_key(event: &serde_json::Value) -> String {
 
 fn security_event_is_dismissed(event: &serde_json::Value, dismissed: &[String]) -> bool {
     let identity = crate::integrity::security_key(event);
-    if crate::integrity::event_severity(event) != "high" {
+    if event["type"] != "tool_drift" && crate::integrity::event_severity(event) != "high" {
         return dismissed.contains(&identity);
     }
     let timestamp = event
@@ -10809,6 +10811,13 @@ mod tests {
         assert!(security_event_is_dismissed(&finding(999), &markers));
         assert!(security_event_is_dismissed(&reviewed, &markers));
         assert!(!security_event_is_dismissed(&finding(1001), &markers));
+        let mut quiet_change = reviewed;
+        quiet_change["type"] = serde_json::json!("tool_drift");
+        quiet_change["severity"] = serde_json::json!("info");
+        let accepted = vec![security_dismissal_key(&quiet_change)];
+        assert!(security_event_is_dismissed(&quiet_change, &accepted));
+        quiet_change["ts"] = serde_json::json!(1001);
+        assert!(!security_event_is_dismissed(&quiet_change, &accepted));
     }
 
     #[test]

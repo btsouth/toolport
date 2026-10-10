@@ -1851,6 +1851,7 @@ pub fn dedupe_security(events: &[Value]) -> Vec<Value> {
     for event in newest_first {
         let duplicate = kept.iter().any(|existing| {
             security_key(existing) == security_key(event)
+                && (event["type"] != "tool_drift" || existing["new_fp"] == event["new_fp"])
                 && (ts(existing) - ts(event)).abs() <= WINDOW_MS
         });
         if !duplicate {
@@ -3980,6 +3981,10 @@ mod tests {
             event("tool_drift", "other", "changed", 1_500),
         ];
         assert_eq!(dedupe_security(&burst).len(), 2);
+        let mut distinct_updates = burst[..2].to_vec();
+        distinct_updates[0]["new_fp"] = json!("v2:first");
+        distinct_updates[1]["new_fp"] = json!("v2:second");
+        assert_eq!(dedupe_security(&distinct_updates).len(), 2);
         // Recurrence hours apart collapses to one row carrying the count and
         // the newest occurrence.
         let recurring = [
