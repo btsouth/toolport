@@ -288,6 +288,105 @@ pub fn visible_text(text: &str) -> String {
         } else { c.to_string() }
     }).collect()
 }
+fn argument_values(bindings: &[crate::registry::ArgBinding]) -> String {
+    bindings
+        .iter()
+        .map(|binding| {
+            let parts = binding
+                .parts
+                .iter()
+                .map(|part| match part {
+                    crate::registry::ArgPart::Literal { value, .. } => visible_text(value),
+                    crate::registry::ArgPart::Input { key, .. } => {
+                        format!("{{{}}}", visible_text(key))
+                    }
+                })
+                .collect::<String>();
+            format!("Argument {} = {parts}", binding.index + 1)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+// Read earlier display snapshots using today's labels without changing consent.
+fn review_baseline(previous: &serde_json::Map<String, Value>) -> BTreeMap<String, String> {
+    let mut fields: BTreeMap<String, String> = previous
+        .iter()
+        .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_string())))
+        .collect();
+    if !fields.contains_key("Transport") && !fields.contains_key("inheritEnv") {
+        return fields;
+    }
+    let stdio = fields.remove("Transport").as_deref() == Some("stdio");
+    for key in ["Command", "URL", "Arguments"] {
+        if fields
+            .get(key)
+            .is_some_and(|v| matches!(v.as_str(), "null" | "[]" | ""))
+        {
+            fields.remove(key);
+        }
+    }
+    if let Some(args) = fields
+        .get("Arguments")
+        .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+    {
+        fields.insert(
+            "Arguments".into(),
+            args.iter()
+                .enumerate()
+                .map(|(i, arg)| format!("\n  {}. {}", i + 1, visible_text(arg)))
+                .collect(),
+        );
+    }
+    if let Some(cwd) = fields
+        .remove("Working directory")
+        .filter(|v| !v.is_empty() && v != "Client default")
+    {
+        fields.insert("Working folder".into(), cwd);
+    }
+    let inherited = fields.remove("inheritEnv").as_deref() == Some("true");
+    if stdio {
+        fields.insert(
+            "Uses this machine's environment".into(),
+            if inherited { "yes" } else { "no" }.into(),
+        );
+    }
+    if let Some(bindings) = fields
+        .remove("Launch bindings")
+        .filter(|v| v != "null" && v != "[]" && !v.is_empty())
+    {
+        fields.insert(
+            "Argument values".into(),
+            serde_json::from_str::<Vec<crate::registry::ArgBinding>>(&bindings)
+                .map(|b| argument_values(&b))
+                .unwrap_or(bindings),
+        );
+    }
+    for (key, value) in fields.clone() {
+        let label = if key.starts_with("Environment [") {
+            "Environment"
+        } else if key.starts_with("Launch input [") {
+            "Input"
+        } else {
+            continue;
+        };
+        let Some((_, name)) = key.split_once("] ") else {
+            continue;
+        };
+        let (local, reference) = value
+            .rsplit_once("; reference: ")
+            .unwrap_or((&value, "null"));
+        let value = if reference != "null" {
+            format!("Password manager: {reference}")
+        } else if local == "null" {
+            "Set on this machine".into()
+        } else {
+            local.to_string()
+        };
+        fields.insert(format!("{label}: {name}"), value);
+        fields.remove(&key);
+    }
+    fields
+}
 /// Plain text only, for both native review entry points. Secret values are
 /// masked, but their names and references always remain visible.
 pub fn execution_review_fields(server: &ServerEntry) -> BTreeMap<String, String> {
@@ -324,29 +423,7 @@ pub fn execution_review_fields(server: &ServerEntry) -> BTreeMap<String, String>
         );
         if let Some(launch) = &server.launch {
             if !launch.bindings.is_empty() {
-                fields.insert(
-                    "Argument values".into(),
-                    launch
-                        .bindings
-                        .iter()
-                        .map(|binding| {
-                            let parts = binding
-                                .parts
-                                .iter()
-                                .map(|part| match part {
-                                    crate::registry::ArgPart::Literal { value, .. } => {
-                                        visible_text(value)
-                                    }
-                                    crate::registry::ArgPart::Input { key, .. } => {
-                                        format!("{{{}}}", visible_text(key))
-                                    }
-                                })
-                                .collect::<String>();
-                            format!("Argument {} = {parts}", binding.index + 1)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                );
+                fields.insert("Argument values".into(), argument_values(&launch.bindings));
             }
         }
     } else if let Some(url) = &server.url {
@@ -391,14 +468,15 @@ pub fn execution_review_lines(server: &ServerEntry) -> Vec<String> {
     let previous = server
         .unknown_fields
         .get("syncExecutionReview")
-        .and_then(Value::as_object);
+        .and_then(Value::as_object)
+        .map(review_baseline);
     let fields = execution_review_fields(server);
     let mut lines = Vec::new();
     if previous.is_none() {
         lines.push("New server".into());
     }
     for (key, value) in &fields {
-        if previous.is_none_or(|p| p.get(key).and_then(Value::as_str) != Some(value)) {
+        if previous.as_ref().is_none_or(|p| p.get(key) != Some(value)) {
             lines.push(review_field_line(key, value));
         }
     }
@@ -2291,6 +2369,34 @@ mod tests {
         assert!(!text.contains("CHANGED"));
         assert!(!text.contains("URL:"));
         assert!(text.contains("Uses this machine's environment: no"));
+    }
+    #[test]
+    fn earlier_review_snapshots_show_only_real_changes_with_plain_fields() {
+        let mut server = local(
+            json!({"id":"review","name":"Review","transport":"stdio","command":"echo","args":["old"],"cwd":"/work","env":[{"key":"REGION","secret":false,"value":"west"},{"key":"TOKEN","secret":true,"source":{"ref":"op://Private/Item/key"}}],"launch":{"inputs":[],"bindings":[{"index":0,"parts":[{"kind":"literal","value":"old"}]}]}}),
+        );
+        for args in ["\n  1. old", "[\"old\"]"] {
+            server.unknown_fields.insert("syncExecutionReview".into(), json!({
+                "Command":"echo","Arguments":args,"Working directory":"/work",
+                "Transport":"stdio","URL":"null","inheritEnv":"false",
+                "Launch bindings":"[{\"index\":0,\"parts\":[{\"kind\":\"literal\",\"value\":\"old\"}]}]",
+                "Environment [0] REGION":"west; reference: null",
+                "Environment [1] TOKEN":"<masked secret>; reference: op://Private/Item/key"
+            }));
+            assert!(execution_review_lines(&server).is_empty());
+            server.command = Some("node".into());
+            assert_eq!(execution_review_lines(&server), vec!["Command: node"]);
+            server.command = Some("echo".into());
+        }
+        let mut server = local(http("http"));
+        server.unknown_fields.insert(
+            "syncExecutionReview".into(),
+            json!({
+                "Command":"null","Arguments":"","Working directory":"Client default",
+                "Transport":"http","URL":server.url,"inheritEnv":"false","Launch bindings":"null"
+            }),
+        );
+        assert!(execution_review_lines(&server).is_empty());
     }
     #[test]
     fn broad_argument_hints_warn_without_rewriting_values_or_legacy_local_args() {

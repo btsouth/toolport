@@ -345,6 +345,7 @@ mod tests {
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
     #[allow(deprecated)]
     fn the_approval_prompt_follows_the_pairing_attempt() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-pairing-prompt");
         adw::init().unwrap();
         let parent = gtk::Window::builder()
             .title("Toolport")

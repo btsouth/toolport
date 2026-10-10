@@ -34,6 +34,47 @@ const server: ServerEntry = {
   },
 };
 describe("execution review", () => {
+  it("compares earlier Rust and React snapshots without raw labels or false changes", () => {
+    for (const args of [JSON.stringify(server.args), "\n  1. -y\n  2. @scope/pkg"]) {
+      const previous = {
+        Command: "npx",
+        Arguments: args,
+        "Working directory": "/work",
+        Transport: "stdio",
+        URL: "null",
+        inheritEnv: "false",
+        "Launch bindings": JSON.stringify(server.launch!.bindings),
+        "Environment [0] REGION": "west; reference: null",
+        "Environment [1] TOKEN": "<masked secret>; reference: null",
+        "Launch input [0] project": "work; reference: null",
+        "Launch input [1] auth": "<masked secret>; reference: null",
+      };
+      expect(executionReviewLines({ ...server, syncExecutionReview: previous })).toEqual(
+        [],
+      );
+      expect(
+        executionReviewLines({
+          ...server,
+          command: "node",
+          syncExecutionReview: previous,
+        }),
+      ).toEqual(["Command: node"]);
+      const ref = "op://Private/Item/key";
+      expect(
+        executionReviewLines({
+          ...server,
+          env: server.env.map((row) =>
+            row.key === "TOKEN" ? { ...row, source: { ref } } : row,
+          ),
+          syncExecutionReview: {
+            ...previous,
+            "Environment [1] TOKEN": `<masked secret>; reference: ${ref}`,
+          },
+        }),
+      ).toEqual([]);
+    }
+    expect(executionReviewFields(server).Arguments).toBe("\n  1. -y\n  2. @scope/pkg");
+  });
   it("shows the package-registry attack as a changed key and value", () => {
     const approved = executionReviewFields(server);
     const attack = {

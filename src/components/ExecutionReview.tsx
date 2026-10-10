@@ -22,8 +22,8 @@ export default function ExecutionReview({
           key={i}
           className={
             server.syncExecutionReview && line !== "New server"
-              ? "rounded bg-amber-500/10 p-1 text-foreground"
-              : undefined
+              ? "whitespace-pre-wrap rounded bg-amber-500/10 p-1 text-foreground"
+              : "whitespace-pre-wrap"
           }
         >
           {line}
@@ -33,7 +33,9 @@ export default function ExecutionReview({
         <details>
           <summary>Show full definition</summary>
           {Object.entries(executionReviewFields(server)).map(([key, value]) => (
-            <p key={key}>{executionReviewFieldLine(key, value)}</p>
+            <p key={key} className="whitespace-pre-wrap">
+              {executionReviewFieldLine(key, value)}
+            </p>
           ))}
         </details>
       )}
