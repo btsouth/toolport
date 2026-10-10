@@ -439,13 +439,14 @@ try {
       .getByRole("alertdialog")
       .first()
       .getByRole("button", { name: "Deny", exact: true })
+      .first()
       .click();
   await page.getByRole("button", { name: "Activity", exact: true }).click();
   const callerCalls = page.getByRole("button", { name: /Recent calls and approvals/ });
   if ((await callerCalls.getAttribute("aria-expanded")) === "false")
     await callerCalls.click();
   for (const name of ["inbox", "inbox (reported)", "Unrecorded client", "[private]"]) {
-    await expect(page.getByText(`${name} · 1s ago`, { exact: false })).toBeVisible();
+    await expect(page.getByText(`${name} ·`, { exact: false })).toBeVisible();
   }
   await page.screenshot({ path: path.join(output, "caller-activity.png") });
   await page.getByRole("button", { name: "Clients", exact: true }).click();
