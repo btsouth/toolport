@@ -9,6 +9,7 @@
 //! The pieces deliberately mirror the approval broker's endpoint descriptor
 //! (`crate::approval`) and reuse the registry's cross-process lock
 //! ([`crate::registry::lock_at`]) rather than inventing new primitives.
+use crate::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -323,15 +324,19 @@ pub fn request_shutdown_if_idle(descriptor: &DaemonDescriptor) -> Result<(), Str
     if !address.ip().is_loopback() {
         return Err("daemon endpoint must be a loopback address".to_string());
     }
-    ureq::post(&format!(
-        "http://{}{}",
-        descriptor.endpoint, SHUTDOWN_IF_IDLE_PATH
-    ))
-    .timeout(CONTROL_TIMEOUT)
-    .set("Authorization", &format!("Bearer {}", descriptor.token))
-    .call()
-    .map(|_| ())
-    .map_err(|error| format!("could not request idle daemon shutdown: {error}"))
+    crate::http_client::agent()
+        .post(&format!(
+            "http://{}{}",
+            descriptor.endpoint, SHUTDOWN_IF_IDLE_PATH
+        ))
+        .config()
+        .timeout_global(Some(CONTROL_TIMEOUT))
+        .build()
+        .set_header("Authorization", &format!("Bearer {}", descriptor.token))
+        .send_empty()
+        .retain_status_body()
+        .map(|_| ())
+        .map_err(|error| format!("could not request idle daemon shutdown: {error}"))
 }
 
 /// Why an identity probe failed, in the terms the rendezvous decides on: what
@@ -356,60 +361,37 @@ pub(crate) enum ProbeFailure {
 /// the port; silence alone says nothing either way. A busy answer (503 or 429)
 /// is a live daemon shedding load, so it counts as silence: clearing its
 /// pointer would elect a second daemon beside it.
-fn classify_probe_error(error: ureq::Error) -> ProbeFailure {
+fn classify_probe_error(error: crate::http_client::Error) -> ProbeFailure {
+    if let crate::http_client::Error::Transport(transport) = &error {
+        if let Some(connect) = crate::http_client::connect_error(transport) {
+            return match connect {
+                ureq::Error::Timeout(_) => ProbeFailure::Silent,
+                ureq::Error::Io(io) if matches!(io.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => ProbeFailure::Silent,
+                _ => ProbeFailure::Unreachable,
+            };
+        }
+    }
     match &error {
-        ureq::Error::Status(429 | 503, _) => ProbeFailure::Silent,
-        ureq::Error::Status(..) => ProbeFailure::Answered(error.to_string()),
-        ureq::Error::Transport(transport) => {
-            let io_kind = transport_io_kind(transport);
-            match transport.kind() {
-                ureq::ErrorKind::ConnectionFailed if is_timeout_io_kind(io_kind) => {
-                    ProbeFailure::Silent
-                }
-                ureq::ErrorKind::ConnectionFailed
-                | ureq::ErrorKind::InvalidUrl
-                | ureq::ErrorKind::UnknownScheme
-                | ureq::ErrorKind::Dns => ProbeFailure::Unreachable,
-                ureq::ErrorKind::BadStatus | ureq::ErrorKind::BadHeader => {
-                    ProbeFailure::Answered(error.to_string())
-                }
-                ureq::ErrorKind::Io => match io_kind {
-                    Some(std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
-                        ProbeFailure::Silent
-                    }
-                    Some(
-                        std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::BrokenPipe,
-                    ) => ProbeFailure::Unreachable,
-                    _ => ProbeFailure::Silent,
-                },
-                _ => ProbeFailure::Silent,
+        crate::http_client::Error::Status(429 | 503, _) => ProbeFailure::Silent,
+        crate::http_client::Error::Status(..) => ProbeFailure::Answered(error.to_string()),
+        crate::http_client::Error::Transport(transport) => match transport {
+            ureq::Error::Timeout(_) => ProbeFailure::Silent,
+            ureq::Error::ConnectionFailed | ureq::Error::BadUri(_) | ureq::Error::HostNotFound => {
+                ProbeFailure::Unreachable
             }
-        }
+            ureq::Error::Protocol(_)
+            | ureq::Error::LargeResponseHeader(..)
+            | ureq::Error::Http(_) => ProbeFailure::Answered(error.to_string()),
+            ureq::Error::Io(io) => match io.kind() {
+                std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe => ProbeFailure::Unreachable,
+                _ => ProbeFailure::Silent,
+            },
+            _ => ProbeFailure::Silent,
+        },
     }
-}
-
-/// Find an I/O cause anywhere in ureq's transport error chain. Connect
-/// timeouts are wrapped as `ConnectionFailed`, while read timeouts are `Io`;
-/// rendezvous must treat both as silence rather than evidence of a dead daemon.
-fn transport_io_kind(transport: &ureq::Transport) -> Option<std::io::ErrorKind> {
-    use std::error::Error as _;
-    let mut source = transport.source();
-    while let Some(error) = source {
-        if let Some(io) = error.downcast_ref::<std::io::Error>() {
-            return Some(io.kind());
-        }
-        source = error.source();
-    }
-    None
-}
-
-fn is_timeout_io_kind(kind: Option<std::io::ErrorKind>) -> bool {
-    matches!(
-        kind,
-        Some(std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
-    )
 }
 
 /// One authenticated attempt against `GET /host/identity`, keeping the
@@ -425,13 +407,20 @@ fn identity_probe_with_timeout(
     timeout: Duration,
 ) -> Result<DaemonIdentity, ProbeFailure> {
     let url = format!("http://{}{}", descriptor.endpoint, IDENTITY_PATH);
-    let response = ureq::get(&url)
-        .set("Authorization", &format!("Bearer {}", descriptor.token))
-        .timeout(timeout)
+    let response = crate::http_client::agent()
+        .get(&url)
+        .set_header("Authorization", &format!("Bearer {}", descriptor.token))
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
         .call()
+        .retain_status_body()
         .map_err(classify_probe_error)?;
     response
-        .into_json::<DaemonIdentity>()
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json::<DaemonIdentity>()
         .map_err(|e| ProbeFailure::Answered(format!("Daemon identity was not valid JSON: {e}")))
 }
 
@@ -980,11 +969,15 @@ mod tests {
 
     #[test]
     fn connect_timeouts_are_silence_not_evidence_of_a_dead_daemon() {
-        assert!(is_timeout_io_kind(Some(std::io::ErrorKind::TimedOut)));
-        assert!(is_timeout_io_kind(Some(std::io::ErrorKind::WouldBlock)));
-        assert!(!is_timeout_io_kind(Some(
-            std::io::ErrorKind::ConnectionRefused
-        )));
+        for error in [
+            ureq::Error::Timeout(ureq::Timeout::Connect),
+            ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+        ] {
+            assert!(matches!(classify_probe_error(crate::http_client::Error::Transport(error)), ProbeFailure::Silent));
+        }
+        assert!(matches!(classify_probe_error(crate::http_client::Error::Transport(
+            ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)))), ProbeFailure::Unreachable));
     }
 
     #[test]
