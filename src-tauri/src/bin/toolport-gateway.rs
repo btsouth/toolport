@@ -8649,7 +8649,9 @@ fn build_router_incremental(
         let root = root.map(str::to_string);
         let subs = resource_subs.clone();
         let updated = resource_updated.clone();
+        let reads = conduit_lib::secret_refs::ConnectionReads::new(previous_router.is_some());
         let connect: Connect = Arc::new(move || {
+            reads.before_connect(&server);
             let mut ds = connect_one_result(
                 &server,
                 &dirty,
@@ -8678,7 +8680,9 @@ fn server_credential_revision(server: &ServerEntry, generation: u64) -> String {
     let mut keys: BTreeSet<(String, bool)> = server
         .env
         .iter()
-        .filter(|entry| entry.secret && entry.value.is_none())
+        .filter(|entry| {
+            entry.secret && entry.value.is_none() && !entry.unknown_fields.contains_key("source")
+        })
         .map(|entry| (entry.key.clone(), false))
         .collect();
     if let Some(launch) = &server.launch {
@@ -8686,7 +8690,11 @@ fn server_credential_revision(server: &ServerEntry, generation: u64) -> String {
             launch
                 .inputs
                 .iter()
-                .filter(|input| input.secret && input.value.is_none())
+                .filter(|input| {
+                    input.secret
+                        && input.value.is_none()
+                        && !input.unknown_fields.contains_key("source")
+                })
                 .map(|input| (input.key.clone(), true)),
         );
     }
@@ -8740,7 +8748,7 @@ fn effective_server_spec(
         .map(|entry| {
             (
                 entry.key.clone(),
-                json!({"value": entry.value, "secret": entry.secret}),
+                json!({"value": entry.value, "secret": entry.secret, "source": entry.unknown_fields.get("source")}),
             )
         })
         .collect();
@@ -8751,7 +8759,7 @@ fn effective_server_spec(
             .map(|input| {
                 (
                     &input.key,
-                    json!({"secret":input.secret,"required":input.required,"value":input.value}),
+                    json!({"secret":input.secret,"required":input.required,"value":input.value,"source":input.unknown_fields.get("source")}),
                 )
             })
             .collect();
@@ -8759,7 +8767,7 @@ fn effective_server_spec(
     });
     json!({
         "command": server.command, "args": server.args, "launch": launch, "url": server.url,
-        "source": server.source,
+        "source": server.source, "headerKeys": server.unknown_fields.get("headerKeys"), "secretSources": server.unknown_fields.get("secretSources"),
         "cwdConfigured": server.cwd,
         "cwd": server.cwd.as_deref().and_then(|cwd| downstream::resolve_root_token(cwd, root)),
         "inheritEnv": server.inherit_env, "env": env,
@@ -8824,6 +8832,19 @@ fn connect_one_result(
     // connect, and `DownstreamServer::set_server_request_handler` wraps again afterwards
     // (idempotent) (SBS-891).
     let server_handler = downstream::stamping_server_request_handler(&server.id, server_handler);
+    // Each new stdio connection resolves once. The supervisor calls us again on restart.
+    let resolved_server;
+    let server = if server.command.is_some() {
+        resolved_server =
+            conduit_lib::secret_refs::resolve_server(server).map_err(|error| ConnectFailure {
+                message: error.to_string(),
+                needs_auth: false,
+                auth_target: None,
+            })?;
+        &resolved_server
+    } else {
+        server
+    };
     let initialize_timeout = server.initialize_timeout();
     let result = if let Err(error) = &initialize_timeout {
         Err(error.clone())
@@ -8895,16 +8916,22 @@ fn connect_one_result(
             resolved_cwd.as_deref(),
             server.inherit_env,
             Arc::clone(dirty),
-            resource_updated,
+            remote::protect_resource_updates(server, resource_updated),
         ) {
             Ok(mut t) => {
                 if let Some(timeout) = initialize_timeout.expect("validated above") {
                     t.set_connect_timeout(timeout);
                 }
-                t.set_server_request_handler(Arc::clone(&server_handler));
-                t.set_progress_sink(progress);
-                DownstreamServer::connect(server.id.clone(), Box::new(t))
-                    .map_err(|error| resolved.redact(error))
+                t.set_server_request_handler(remote::protect_server_requests(
+                    server,
+                    Arc::clone(&server_handler),
+                ));
+                t.set_progress_sink(remote::protect_progress(server, progress));
+                DownstreamServer::connect(
+                    server.id.clone(),
+                    remote::protect_transport(server, Box::new(t)),
+                )
+                .map_err(|error| resolved.redact(error))
             }
             Err(e) => Err(resolved.redact(e)),
         }
@@ -8945,7 +8972,7 @@ fn connect_one_result(
             eprintln!("toolport: {msg}");
             glog(&msg);
             Err(ConnectFailure {
-                needs_auth: server.url.is_some() && remote::is_auth_error(&e),
+                needs_auth: server.url.is_some() && !conduit_lib::secret_refs::has_references(server) && remote::is_auth_error(&e),
                 auth_target: (server.url.is_some() && remote::is_auth_error(&e))
                     .then_some(conduit_lib::call_failure::AuthTarget::Endpoint),
                 message: e,
@@ -11584,6 +11611,9 @@ impl RootLaunchPool {
             .filter(|(id, spec)| effective_specs.get(*id) != Some(*spec))
             .map(|(id, _)| id.clone())
             .collect();
+        for server in self.specs.iter().filter(|server| changed.contains(&server.id)) {
+            conduit_lib::secret_refs::invalidate_server(server);
+        }
         self.effective_specs = effective_specs;
         let keys: Vec<_> = self
             .launches
@@ -12137,6 +12167,9 @@ impl HostState {
             if active_keys.contains(&key) {
                 retained_launches.insert(key, launch);
             } else {
+                if let Some(server) = reg.servers.iter().find(|server| server.id == key.server) {
+                    conduit_lib::secret_refs::invalidate_server(server);
+                }
                 launch.active.store(false, Ordering::SeqCst);
                 launch.slot.retire();
                 retired_launches.push(launch);
@@ -12547,6 +12580,7 @@ impl HostState {
             let handler = Arc::clone(&self.server_handler);
             let server_id = server.id.clone();
             let reconnect_active = Arc::clone(&active);
+            let reads = conduit_lib::secret_refs::ConnectionReads::new(initial.is_some());
             let connect: Connect = Arc::new(move || {
                 if !reconnect_active.load(Ordering::SeqCst) {
                     return Err(ConnectFailure {
@@ -12555,6 +12589,7 @@ impl HostState {
                         auth_target: None,
                     });
                 }
+                reads.before_connect(&spec);
                 let mut ds = connect_one_result(
                     &spec,
                     &dirty,
@@ -20255,6 +20290,7 @@ fn detach_from_client_session() {}
 
 /// Entry point: classify the command line, then run the requested role.
 fn main() {
+    conduit_lib::secret_refs::enable_gateway_cache();
     // `--help`/`--version`/an unrecognized flag are decided before anything
     // else touches disk, the keychain, or stdin - see #605. Positional args
     // and the existing four flags fall through to `Run` unchanged.
@@ -23519,11 +23555,8 @@ mod tests {
     #[test]
     fn reviewed_unscoped_no_match_waits_for_first_catalog_publication() {
         let _env = DataDirTestEnv::new("reviewed-no-match-publication");
-        let router = counting_cache_supervisor(
-            "publishing",
-            Vec::new(),
-            &Arc::new(AtomicUsize::new(0)),
-        );
+        let router =
+            counting_cache_supervisor("publishing", Vec::new(), &Arc::new(AtomicUsize::new(0)));
         router.prepare_lazy_use("publishing");
         wait_for_supervisor_result(&router);
         assert!(router.any_publishing_first_catalog(|_| true));
@@ -24282,6 +24315,49 @@ mod tests {
         assert_eq!(effective_server_spec(&metadata, None, 0), configured_spec);
         metadata.launch.as_mut().unwrap().inputs[0].value = Some("/two".into());
         assert_ne!(effective_server_spec(&metadata, None, 0), configured_spec);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rooted_launch_replacement_and_idle_reaping_clear_reference_cache() {
+        let _env = DataDirTestEnv::new("root-reference-cache");
+        let reference = "op://v/rooted-restart/key";
+        let mut server = stub_server("root-ref", "Root ref");
+        server.cwd = Some("${ROOT}".into());
+        server.env.push(serde_json::from_value(json!({"key":"TOKEN","secret":true,"source":{"ref":reference}})).unwrap());
+        let cached = |value| conduit_lib::secret_refs::test_cached_value(reference, value);
+        let mut pool = RootLaunchPool::default();
+        pool.refresh_specs(vec![server.clone()], 0);
+        assert_eq!(cached("old"), "old");
+        pool.refresh_specs(vec![server.clone()], 0);
+        assert_eq!(cached("unchanged"), "old", "unchanged startup specs reuse their read");
+        let mut changed = server.clone();
+        changed.args.push("--changed".into());
+        pool.refresh_specs(vec![changed], 0);
+        assert_eq!(cached("replacement"), "replacement");
+        // A user disabling the server also retires its rooted launch.
+        pool.refresh_specs(Vec::new(), 0);
+        assert_eq!(cached("reenabled"), "reenabled");
+
+        let state = http_state(false);
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        let mut reg = Registry::default();
+        reg.servers.push(server.clone());
+        reg.set_server_enabled("default", &server.id, true).unwrap();
+        *state.registry.lock().unwrap() = reg.clone();
+        let root = _env.dir.display().to_string();
+        let key = root_launch_keys(&[server.clone()], &root, 0).remove(0);
+        let view = readonly_router(&server.id, "Root cache");
+        state.root_launch_pool.lock().unwrap().launches.insert(key, RootLaunch {
+            slot: view.server_slot(&server.id).unwrap(),
+            subscriptions: Arc::new(Mutex::new(ResourceSubscriptionTable::default())),
+            subscription_key: (server.id.clone(), root),
+            active: Arc::new(AtomicBool::new(true)),
+        });
+        state.reap_root_launches();
+        assert!(state.root_launch_pool.lock().unwrap().launches.is_empty());
+        assert_eq!(cached("after-idle"), "after-idle");
+        conduit_lib::secret_refs::invalidate(reference);
     }
 
     #[test]

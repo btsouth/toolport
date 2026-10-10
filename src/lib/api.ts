@@ -881,12 +881,14 @@ export function setServerEnabled(
   serverId: string,
   enabled: boolean,
   reviewed = false,
+  reviewedDefinition?: ServerEntry,
 ): Promise<Registry> {
   return invoke<Registry>("set_server_enabled", {
     profileId,
     serverId,
     enabled,
     reviewed,
+    ...(reviewedDefinition ? { reviewedDefinition } : {}),
   });
 }
 
@@ -993,4 +995,14 @@ export function addSnippetServers(
 /** Recent privacy-safe session summaries, capped by the backend. */
 export function getClientSessions(): Promise<ClientSession[]> {
   return invoke<ClientSession[]>("get_client_sessions");
+}
+export function setSecretReference(
+  serverId: string,
+  key: string,
+  reference: string,
+): Promise<Registry> {
+  return invoke<Registry>("set_secret_reference", { serverId, key, reference });
+}
+export function testSecretReference(serverId: string, reference: string): Promise<void> {
+  return invoke<void>("test_secret_reference", { serverId, reference });
 }

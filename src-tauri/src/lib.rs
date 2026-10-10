@@ -50,6 +50,7 @@ pub mod savings;
 pub(crate) mod schema_compat;
 pub mod searchtrace;
 pub mod secrets;
+pub mod secret_refs;
 pub mod semantic;
 pub mod server_runtime;
 pub mod session_store;

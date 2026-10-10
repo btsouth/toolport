@@ -862,6 +862,9 @@ impl ServerEntry {
     /// Team-synced local commands, LAN URLs and changed remote definitions need
     /// individual consent. Enable-all and the playground must not skip that gate.
     pub fn needs_team_enable_review(&self) -> bool {
+        if crate::secret_refs::is_shared(self) && crate::secret_refs::has_references(self) {
+            return true;
+        }
         let Some(src) = self.source.as_deref() else {
             return false;
         };
@@ -2165,7 +2168,7 @@ impl Registry {
             .find(|s| s.id == server_id)
             .ok_or_else(|| format!("No server with id '{server_id}'"))?;
         if enabled && server.launch.is_some() {
-            crate::launch_inputs::resolve_args(server)?;
+            crate::launch_inputs::check_ready_for_enable(server)?;
         }
         server.enabled = enabled;
         Ok(())
@@ -2243,7 +2246,7 @@ impl Registry {
             .find(|s| s.id == server_id)
             .ok_or_else(|| format!("No server with id '{server_id}'"))?;
         if enabled && server.launch.is_some() {
-            crate::launch_inputs::resolve_args(server)?;
+            crate::launch_inputs::check_ready_for_enable(server)?;
         }
         let profile = self
             .profiles

@@ -1,3 +1,4 @@
+import { secretReferenceReview } from "@/lib/secretRefs";
 import { TeamSharePreview } from "./TeamSharePreview";
 import { teamShareAction } from "@/lib/teamShare";
 import { useEffect, useState } from "react";
@@ -165,7 +166,7 @@ export function TeamsView({
         );
       if (blocked > 0)
         parts.push(
-          `${blocked} ${blocked === 1 ? "was" : "were"} blocked as unsafe (link-local or cloud-metadata URLs).`,
+          `${blocked} ${blocked === 1 ? "was" : "were"} Blocked because of unsafe definitions or references. env: references are local only, including personal Pro sync. Use a password manager reference instead.`,
         );
       setSkipNote(parts.join(" "));
     });
@@ -322,13 +323,13 @@ export function TeamsView({
 
   // Member consent: enable a review server (local command / LAN URL) into the active
   // profile after the confirm. Nothing from a team runs until this explicit opt-in.
-  const onEnable = (serverId: string) =>
+  const onEnable = (server: Registry["servers"][number]) =>
     run("enable", async () => {
       const pid = registry ? activeProfile(registry)?.id : undefined;
       if (!pid) throw new Error("Access context unavailable.");
       // reviewed=true: this runs only from the ConfirmDialog below, which showed
       // the member the exact command/URL. The backend refuses without it.
-      onRegistryChange(await setServerEnabled(pid, serverId, true, true));
+      onRegistryChange(await setServerEnabled(pid, server.id, true, true, server));
       setNotice("Enabled. That server is now on.");
     });
 
@@ -415,12 +416,14 @@ export function TeamsView({
               }
               title={`Enable "${s.name}"?`}
               description={
-                isLocal
+                secretReferenceReview(s).join("\n") +
+                "\n" +
+                (isLocal
                   ? `This runs a local command on your machine: ${detail}. Only enable it if you trust your team and recognize this command.`
-                  : `This connects Toolport to ${detail} using this server's saved authentication. Verify the address and credentials before enabling it.`
+                  : `This connects Toolport to ${detail} using this server's saved authentication. Verify the address and credentials before enabling it.`)
               }
               confirmLabel="Enable"
-              onConfirm={() => onEnable(s.id)}
+              onConfirm={() => onEnable(s)}
             />
           </div>
         )}

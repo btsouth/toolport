@@ -520,6 +520,7 @@ pub(super) struct ServerView {
     pub(super) url: Option<String>,
     pub(super) cwd: Option<String>,
     pub(super) secret_keys: Vec<String>,
+    pub(super) secret_references: std::collections::BTreeMap<String, String>,
     pub(super) client_credentials: Option<ClientCredentialsView>,
     pub(super) enabled: bool,
     pub(super) requires_review: bool,
@@ -593,11 +594,43 @@ impl RegistrySnapshot {
                     launch: server.launch.clone(),
                     url: server.url.clone(),
                     cwd: server.cwd.clone(),
+                    secret_references: server
+                        .env
+                        .iter()
+                        .filter_map(|e| {
+                            crate::secret_refs::reference_for(e)
+                                .map(|r| (e.key.clone(), r.to_string()))
+                        })
+                        .chain(
+                            server
+                                .launch
+                                .iter()
+                                .flat_map(|l| &l.inputs)
+                                .filter_map(|i| {
+                                    crate::secret_refs::source(&i.unknown_fields)
+                                        .ok()
+                                        .flatten()
+                                        .map(|r| (i.key.clone(), r.to_string()))
+                                }),
+                        )
+                        .chain(
+                            crate::secret_refs::headers(server)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter_map(|h| h.source.map(|r| (h.key, r.r#ref))),
+                        )
+                        .collect(),
                     secret_keys: server
                         .env
                         .iter()
                         .filter(|entry| entry.secret)
                         .map(|entry| entry.key.clone())
+                        .chain(
+                            crate::secret_refs::headers(server)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|h| if h.source.is_some() { h.key } else { h.env.unwrap_or(h.key) }),
+                        )
                         .collect(),
                     client_credentials: server.client_credentials.as_ref().map(|credentials| {
                         ClientCredentialsView {
@@ -939,6 +972,7 @@ mod tests {
                     url: None,
                     cwd: None,
                     secret_keys: vec!["TOKEN".into()],
+                    secret_references: Default::default(),
                     client_credentials: None,
                     enabled: false,
                     requires_review: false,
@@ -957,6 +991,7 @@ mod tests {
                     url: None,
                     cwd: None,
                     secret_keys: Vec::new(),
+                    secret_references: Default::default(),
                     client_credentials: None,
                     enabled: true,
                     requires_review: false,

@@ -1,3 +1,5 @@
+import { SecretReferenceField } from "@/components/SecretReferenceField";
+import { referenceProvider } from "@/lib/secretRefs";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Check, ExternalLink, KeyRound, Loader2, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
@@ -17,6 +19,7 @@ import {
   secretStatus,
   setAuthToken,
   setSecret,
+  setSecretReference,
 } from "@/lib/api";
 import type { AuthInfo, Registry, ServerEntry } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -97,6 +100,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [newKey, setNewKey] = useState("");
   const [newValue, setNewValue] = useState("");
+  const [newReference, setNewReference] = useState<string | undefined>();
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [authSet, setAuthSet] = useState(false);
   const [authProbeError, setAuthProbeError] = useState(false);
@@ -134,7 +138,35 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   const [authInfo, setAuthInfo] = useState<AuthInfo | null>(null);
   const [probing, setProbing] = useState(false);
 
-  const secretKeys = server.env.filter((e) => e.secret).map((e) => e.key);
+  const secretKeys = [
+    ...new Set([
+      ...server.env.filter((e) => e.secret).map((e) => e.key),
+      ...(server.headerKeys ?? []).map((h) => (h.source ? h.key : (h.env ?? h.key))),
+    ]),
+  ];
+  const [references, setReferences] = useState<Record<string, string | undefined>>({});
+  useEffect(() => {
+    setReferences(
+      Object.fromEntries(
+        [...server.env, ...(server.headerKeys ?? [])]
+          .filter((e) => e.source)
+          .map((e) => [e.key, e.source!.ref]),
+      ),
+    );
+  }, [server]);
+  async function saveReference(key: string) {
+    setBusyKey(key);
+    try {
+      const registry = await setSecretReference(server.id, key, references[key]!);
+      onSaved(registry);
+      onChanged?.();
+      toast.success("Reference saved");
+    } catch (error) {
+      toastError("Could not save reference", { description: String(error) });
+    } finally {
+      setBusyKey(null);
+    }
+  }
   // A server with a command is stdio (matches how the backend connects); only a
   // command-less, URL-based server is remote. Guards against a stray empty-string
   // url making a stdio server show the remote token/OAuth UI.
@@ -227,7 +259,14 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
    * is one answer for the whole list and one warning to show. */
   async function probeVaultedKeys(vaultRunId: number) {
     try {
-      const pairs = await secretStatus(server.id, secretKeys);
+      const pairs = await secretStatus(
+        server.id,
+        secretKeys.filter(
+          (key) =>
+            ![...server.env, ...(server.headerKeys ?? [])].find((e) => e.key === key)
+              ?.source,
+        ),
+      );
       if (vaultRunId !== vaultRunIdRef.current) return;
       setVaulted(Object.fromEntries(pairs));
       setSecretProbeError(false);
@@ -495,17 +534,22 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
 
   async function addNew() {
     const k = newKey.trim();
-    if (!k || !newValue) return;
+    if (!k || !(newReference ?? newValue)) return;
     retireInFlightVaultProbes();
     setBusyKey("add");
     try {
-      onSaved(await setSecret(server.id, k, newValue));
-      setVaulted((v) => ({ ...v, [k]: true }));
+      onSaved(
+        newReference !== undefined
+          ? await setSecretReference(server.id, k, newReference)
+          : await setSecret(server.id, k, newValue),
+      );
+      if (newReference === undefined) setVaulted((v) => ({ ...v, [k]: true }));
       setInputs((i) => ({ ...i, [k]: "" }));
       toast.success(`Saved ${k}`);
       onChanged?.();
       setNewKey("");
       setNewValue("");
+      setNewReference(undefined);
     } catch (e) {
       toastError(secretErrorMessage(e));
     } finally {
@@ -869,61 +913,101 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                       </span>
                     )}
                   </div>
-                  <div className="flex items-center gap-2">
-                    <Input
-                      type="password"
-                      placeholder={
-                        vaulted[key]
-                          ? "•••••••• (saved)"
-                          : `paste your ${vendorFromKey(key)} API key`
-                      }
-                      value={inputs[key] ?? ""}
-                      onChange={(e) =>
-                        setInputs((i) => ({ ...i, [key]: e.target.value }))
-                      }
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") save(key, inputs[key] ?? "");
-                      }}
-                    />
-                    <Button
-                      size="sm"
-                      disabled={busyKey !== null || !(inputs[key] ?? "")}
-                      onClick={() => save(key, inputs[key] ?? "")}
-                    >
-                      {busyKey === key ? (
-                        <>
-                          <Loader2 className="size-4 animate-spin" />
-                          Saving…
-                        </>
-                      ) : (
-                        "Save"
-                      )}
-                    </Button>
-                    {vaulted[key] && (
-                      <ConfirmDialog
-                        destructive
-                        title={`Remove the ${vendorFromKey(key)} API key?`}
-                        description="The saved key is deleted from your keychain. You'll need to paste it again before this server works."
-                        confirmLabel="Remove"
-                        onConfirm={() => remove(key)}
-                        trigger={
-                          <Button
-                            size="icon"
-                            variant="ghost"
-                            className="size-8 shrink-0 text-muted-foreground hover:text-destructive"
-                            aria-label={`Remove ${key}`}
-                            disabled={busyKey !== null}
-                          >
-                            {busyKey === `remove:${key}` ? (
-                              <Loader2 className="size-4 animate-spin" />
-                            ) : (
-                              <Trash2 className="size-4" />
-                            )}
-                          </Button>
+                  <select
+                    aria-label={`Key source for ${key}`}
+                    className="self-start rounded border bg-background p-1 text-xs"
+                    value={references[key] !== undefined ? "reference" : "paste"}
+                    onChange={(e) =>
+                      setReferences((refs) => ({
+                        ...refs,
+                        [key]:
+                          e.target.value === "reference"
+                            ? "op://Engineering/Docs/key"
+                            : undefined,
+                      }))
+                    }
+                  >
+                    <option value="paste">Paste a key</option>
+                    <option value="reference">From a password manager</option>
+                  </select>
+                  {references[key] !== undefined ? (
+                    <>
+                      <p className="text-xs">
+                        {referenceProvider(references[key])?.name ?? "Password manager"}
+                      </p>
+                      <SecretReferenceField
+                        serverId={server.id}
+                        value={references[key]!}
+                        onChange={(ref) =>
+                          setReferences((refs) => ({ ...refs, [key]: ref }))
                         }
                       />
-                    )}
-                  </div>
+                      <Button
+                        size="sm"
+                        className="self-start"
+                        disabled={busyKey !== null || !references[key]}
+                        onClick={() => void saveReference(key)}
+                      >
+                        Save reference
+                      </Button>
+                    </>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <Input
+                        type="password"
+                        placeholder={
+                          vaulted[key]
+                            ? "•••••••• (saved)"
+                            : `paste your ${vendorFromKey(key)} API key`
+                        }
+                        value={inputs[key] ?? ""}
+                        onChange={(e) =>
+                          setInputs((i) => ({ ...i, [key]: e.target.value }))
+                        }
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") save(key, inputs[key] ?? "");
+                        }}
+                      />
+                      <Button
+                        size="sm"
+                        disabled={busyKey !== null || !(inputs[key] ?? "")}
+                        onClick={() => save(key, inputs[key] ?? "")}
+                      >
+                        {busyKey === key ? (
+                          <>
+                            <Loader2 className="size-4 animate-spin" />
+                            Saving…
+                          </>
+                        ) : (
+                          "Save"
+                        )}
+                      </Button>
+                      {vaulted[key] && (
+                        <ConfirmDialog
+                          destructive
+                          title={`Remove the ${vendorFromKey(key)} API key?`}
+                          description="The saved key is deleted from your keychain. You'll need to paste it again before this server works."
+                          confirmLabel="Remove"
+                          onConfirm={() => remove(key)}
+                          trigger={
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              className="size-8 shrink-0 text-muted-foreground hover:text-destructive"
+                              aria-label={`Remove ${key}`}
+                              disabled={busyKey !== null}
+                            >
+                              {busyKey === `remove:${key}` ? (
+                                <Loader2 className="size-4 animate-spin" />
+                              ) : (
+                                <Trash2 className="size-4" />
+                              )}
+                            </Button>
+                          }
+                        />
+                      )}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -945,24 +1029,49 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
             <summary className="cursor-pointer text-xs text-muted-foreground select-none">
               Add another environment secret
             </summary>
-            <div className="mt-2 flex items-center gap-2">
+            <div className="mt-2 flex flex-col gap-2">
               <Input
                 placeholder="ENV_NAME"
                 className="font-mono"
                 value={newKey}
                 onChange={(e) => setNewKey(e.target.value)}
               />
-              <Input
-                type="password"
-                placeholder="value"
-                value={newValue}
-                onChange={(e) => setNewValue(e.target.value)}
-              />
+              <select
+                aria-label="Key source for new variable"
+                className="self-start rounded border bg-background p-1 text-xs"
+                value={newReference === undefined ? "paste" : "reference"}
+                onChange={(e) =>
+                  setNewReference(
+                    e.target.value === "reference"
+                      ? "op://Engineering/Docs/key"
+                      : undefined,
+                  )
+                }
+              >
+                <option value="paste">Paste a key</option>
+                <option value="reference">From a password manager</option>
+              </select>
+              {newReference !== undefined ? (
+                <SecretReferenceField
+                  serverId={server.id}
+                  value={newReference}
+                  onChange={setNewReference}
+                />
+              ) : (
+                <Input
+                  type="password"
+                  placeholder="value"
+                  value={newValue}
+                  onChange={(e) => setNewValue(e.target.value)}
+                />
+              )}
               <Button
                 size="icon"
                 className="size-8 shrink-0"
                 aria-label="Add secret"
-                disabled={busyKey !== null || !newKey.trim() || !newValue}
+                disabled={
+                  busyKey !== null || !newKey.trim() || !(newReference ?? newValue)
+                }
                 onClick={addNew}
               >
                 {busyKey === "add" ? (

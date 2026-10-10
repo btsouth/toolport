@@ -1,3 +1,4 @@
+import { secretReferenceReview } from "@/lib/secretRefs";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -602,11 +603,24 @@ function App() {
     setOnboardingStep(0);
   }
 
-  async function applyToggle(serverId: string, enabled: boolean, reviewed = false) {
+  async function applyToggle(
+    serverId: string,
+    enabled: boolean,
+    reviewed = false,
+    reviewedDefinition?: ServerEntry,
+  ) {
     if (!profileId) return;
     setBusyId(serverId);
     try {
-      const next = await setServerEnabled(profileId, serverId, enabled, reviewed);
+      const next = reviewedDefinition
+        ? await setServerEnabled(
+            profileId,
+            serverId,
+            enabled,
+            reviewed,
+            reviewedDefinition,
+          )
+        : await setServerEnabled(profileId, serverId, enabled, reviewed);
       applyRegistryChange(next);
     } catch (e) {
       toastError(`Couldn't toggle: ${e}`);
@@ -1092,9 +1106,11 @@ function App() {
         }
         description={
           confirmEnableTeam
-            ? confirmEnableTeam.transport === "stdio" || confirmEnableTeam.command
-              ? `This runs a local command on your machine: ${[confirmEnableTeam.command, ...(confirmEnableTeam.args ?? [])].join(" ")}. Only enable it if you trust your team and recognize this command.`
-              : `This connects Toolport to ${confirmEnableTeam.url ?? ""}, a private/LAN address. Only enable it if you trust your team.`
+            ? secretReferenceReview(confirmEnableTeam).join("\n") +
+              "\n" +
+              (confirmEnableTeam.transport === "stdio" || confirmEnableTeam.command
+                ? `This runs a local command on your machine: ${[confirmEnableTeam.command, ...(confirmEnableTeam.args ?? [])].join(" ")}. Only enable it if you trust your team and recognize this command.`
+                : `This connects Toolport to ${confirmEnableTeam.url ?? ""}, using its saved authentication. Verify the destination before enabling it.`)
             : undefined
         }
         confirmLabel="Enable"
@@ -1121,7 +1137,7 @@ function App() {
             // `live` entry we just swapped in, so the re-review never appears.
             throw new Error("definition changed");
           }
-          return applyToggle(confirmEnableTeam.id, true, true);
+          return applyToggle(confirmEnableTeam.id, true, true, confirmEnableTeam);
         }}
       />
       {/* Ctrl+N. Mounted only while open so `autoOpen` fires each time, and unmounted

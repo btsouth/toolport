@@ -70,6 +70,18 @@ pub fn resolve_args_for_prewarm(server: &ServerEntry) -> Result<ResolvedArgs, St
     resolve_args_with(server, crate::secrets::get_vault_secret_result)
 }
 
+/// A declared reference is configured before its value exists in this process.
+/// Enable review validates bindings using a transient placeholder; only connect resolves it.
+pub fn check_ready_for_enable(server: &ServerEntry) -> Result<(), String> {
+    let mut staged = server.clone();
+    for input in staged.launch.iter_mut().flat_map(|l| &mut l.inputs) {
+        if crate::secret_refs::source(&input.unknown_fields).map_err(|e| e.to_string())?.is_some() {
+            input.value = Some("<reference>".into());
+        }
+    }
+    resolve_args(&staged).map(|_| ())
+}
+
 pub fn resolve_args_with(
     server: &ServerEntry,
     mut vault: impl FnMut(&str, &str) -> Result<Option<String>, String>,
@@ -257,5 +269,15 @@ mod tests {
         });
         assert_eq!(resolve_args_for_prewarm(&server).unwrap().args[2], "/tmp");
         assert!(resolve_args(&server).is_err());
+    }
+}
+
+#[cfg(test)]
+mod reference_enable_regression {
+    #[test]
+    fn configured_reference_input_can_be_enabled_without_desktop_resolution() {
+        let server:crate::registry::ServerEntry=serde_json::from_value(serde_json::json!({"id":"ready","name":"Ready","transport":"stdio","command":"fixture","args":["<launch-input>"],"env":[],"launch":{"inputs":[{"key":"TOKEN","label":"Token","secret":true,"required":true,"source":{"ref":"op://Private/My Token/key"}}],"bindings":[{"index":0,"parts":[{"kind":"input","key":"TOKEN"}]}]}})).unwrap();
+        super::check_ready_for_enable(&server).unwrap();
+        assert!(server.launch.unwrap().inputs[0].value.is_none());
     }
 }

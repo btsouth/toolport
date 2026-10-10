@@ -184,8 +184,12 @@ fn selected_servers_to_import(
 async fn import_servers(
     state: State<'_, RegistryState>,
     selected: Option<Vec<String>>,
-    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
-    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
+    secret_choices: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    >,
+    credential_inputs: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    >,
 ) -> Result<Registry, String> {
     let selected = match selected {
         Some(selected) => selected,
@@ -195,7 +199,11 @@ async fn import_servers(
             .collect(),
     };
     tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::import_client_servers_inputs(selected, &secret_choices.unwrap_or_default(), &credential_inputs.unwrap_or_default())
+        crate::registry_controller::import_client_servers_inputs(
+            selected,
+            &secret_choices.unwrap_or_default(),
+            &credential_inputs.unwrap_or_default(),
+        )
     })
     .await
     .map_err(|_| "Import stopped".to_string())??;
@@ -207,11 +215,20 @@ async fn add_snippet_servers(
     state: State<'_, RegistryState>,
     text: String,
     selected: Vec<String>,
-    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
-    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
+    secret_choices: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    >,
+    credential_inputs: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    >,
 ) -> Result<serde_json::Value, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::add_snippet_servers_inputs(&text,&selected,&secret_choices.unwrap_or_default(),&credential_inputs.unwrap_or_default())
+        crate::registry_controller::add_snippet_servers_inputs(
+            &text,
+            &selected,
+            &secret_choices.unwrap_or_default(),
+            &credential_inputs.unwrap_or_default(),
+        )
     })
     .await
     .map_err(|_| "Paste import stopped".to_string())??;
@@ -334,12 +351,21 @@ fn set_server_enabled(
     server_id: String,
     enabled: bool,
     reviewed: Option<bool>,
+    reviewed_definition: Option<ServerEntry>,
 ) -> Result<Registry, String> {
     let reviewed = reviewed.unwrap_or(false);
     let (reg, _) = write_registry(state.inner(), |reg| {
         // Checked inside the write closure so it sees the registry that will be
         // persisted: a team_sync_wait replace landing between a pre-lock check and
         // this write could swap the entry for one that needs review.
+        if enabled && reviewed {
+            if let Some(server) = reg.servers.iter().find(|s| s.id == server_id) {
+                crate::secret_refs::check_reviewed_definition(
+                    server,
+                    reviewed_definition.as_ref(),
+                )?;
+            }
+        }
         crate::registry_controller::apply_server_enabled(
             reg,
             &profile_id,
@@ -652,8 +678,12 @@ async fn migrate_client(
     force: Option<bool>,
     selected: Vec<String>,
     revision: String,
-    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
-    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
+    secret_choices: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    >,
+    credential_inputs: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    >,
 ) -> Result<MigrateResult, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         crate::registry_controller::migrate_client_reviewed_inputs(
@@ -670,7 +700,20 @@ async fn migrate_client(
     .map_err(|e| e.to_string())??;
 
     let registry = reload_into_state(state.inner())?;
-    let backup_date = outcome.result.outcome.backup.as_ref().and_then(|path|std::fs::metadata(path).ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()).map(|duration|duration.as_secs());
+    let backup_date = outcome
+        .result
+        .outcome
+        .backup
+        .as_ref()
+        .and_then(|path| {
+            std::fs::metadata(path)
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+        })
+        .map(|duration| duration.as_secs());
     Ok(MigrateResult {
         registry,
         imported: outcome.imported,
@@ -680,6 +723,42 @@ async fn migrate_client(
         backup_date,
         outcome: outcome.result.outcome,
     })
+}
+
+#[tauri::command]
+async fn set_secret_reference(
+    app: AppHandle,
+    server_id: String,
+    key: String,
+    reference: String,
+) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        let (reg, ()) = write_registry(state.inner(), |reg| {
+            crate::registry_controller::apply_secret_reference(reg, &server_id, &key, &reference)
+        })?;
+        Ok(reg)
+    })
+    .await
+    .map_err(|_| "Reference task stopped".to_string())?
+}
+#[tauri::command]
+async fn test_secret_reference(
+    server_id: String,
+    reference: String,
+) -> Result<(), crate::secret_refs::ResolveError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::registry_controller::test_secret_reference(&server_id, &reference)
+    })
+    .await
+    .map_err(|_| crate::secret_refs::ResolveError {
+        state: crate::secret_refs::ErrorState::Failed,
+        message: "Reference test stopped".into(),
+    })?
+}
+#[tauri::command]
+fn secret_reference_providers() -> Vec<crate::secret_refs::Provider> {
+    crate::secret_refs::PROVIDERS.to_vec()
 }
 
 /// Store a secret env value in the OS keychain and mark it on the server entry
@@ -2030,8 +2109,14 @@ fn team_disconnect(state: State<RegistryState>) -> Result<Registry, String> {
 }
 
 #[tauri::command]
-async fn team_use_managed(app: tauri::AppHandle, state: State<'_, RegistryState>, server_id: String) -> Result<Registry, String> {
-    tauri::async_runtime::spawn_blocking(move || teams::use_managed_server(&server_id)).await.map_err(|e| e.to_string())??;
+async fn team_use_managed(
+    app: tauri::AppHandle,
+    state: State<'_, RegistryState>,
+    server_id: String,
+) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || teams::use_managed_server(&server_id))
+        .await
+        .map_err(|e| e.to_string())??;
     let fresh = reload_into_state(state.inner())?;
     let _ = app.emit("team-sync-registry", &fresh);
     Ok(fresh)
@@ -2062,11 +2147,17 @@ fn team_open_confirmation(url: String) -> Result<(), String> {
 /// only, secret values never sent). Remote instructions and policy fields are preserved, and
 /// an optimistic-concurrency conflict is returned rather than overwriting another admin.
 #[tauri::command]
-async fn team_push_preview(state: State<'_, RegistryState>, selected_ids: Option<Vec<String>>) -> Result<teams::PushPreview, String> {
+async fn team_push_preview(
+    state: State<'_, RegistryState>,
+    selected_ids: Option<Vec<String>>,
+) -> Result<teams::PushPreview, String> {
     refresh_from_disk(state.inner())?;
-    tauri::async_runtime::spawn_blocking(move || match selected_ids { Some(ids) => teams::preview_push_selected(&ids), None => teams::preview_push_current() })
-        .await
-        .map_err(|e| format!("push preview task join failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || match selected_ids {
+        Some(ids) => teams::preview_push_selected(&ids),
+        None => teams::preview_push_current(),
+    })
+    .await
+    .map_err(|e| format!("push preview task join failed: {e}"))?
 }
 
 #[tauri::command]
@@ -2462,6 +2553,7 @@ struct ImportItem {
     url: Option<String>,
     /// False if a server with this name already exists (the import would skip it).
     is_new: bool,
+    reference_review: Vec<String>,
     credentials: Vec<crate::registry_controller::CredentialReview>,
     unsupported: Option<String>,
 }
@@ -2479,6 +2571,7 @@ async fn preview_import_servers(
     Ok(candidates
         .into_iter()
         .map(|server| ImportItem {
+            reference_review: Vec::new(),
             key: Some(server.key),
             name: server.name,
             transport: server.transport,
@@ -2513,6 +2606,7 @@ fn preview_import(state: State<RegistryState>, json: String) -> Result<Vec<Impor
                 .iter()
                 .any(|e| e.name.eq_ignore_ascii_case(&s.name));
             ImportItem {
+                reference_review: crate::secret_refs::review_lines(&s),
                 key: None,
                 name: s.name,
                 transport: s.transport,
@@ -3495,7 +3589,11 @@ struct TeamPairEvent {
 
 impl TeamPairEvent {
     fn new(state: &'static str) -> Self {
-        Self { state, check: None, message: None }
+        Self {
+            state,
+            check: None,
+            message: None,
+        }
     }
 }
 
@@ -3510,12 +3608,21 @@ fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
         if let Some(current) = pairing.as_ref() {
             // A repeated link brings the waiting prompt back instead of pairing twice.
             if let Some(check) = &current.check {
-                let _ = app.emit("team-pair", TeamPairEvent { check: Some(check.clone()), ..TeamPairEvent::new("pending") });
+                let _ = app.emit(
+                    "team-pair",
+                    TeamPairEvent {
+                        check: Some(check.clone()),
+                        ..TeamPairEvent::new("pending")
+                    },
+                );
             }
             return;
         }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        *pairing = Some(TeamPairing { cancel: std::sync::Arc::clone(&cancel), check: None });
+        *pairing = Some(TeamPairing {
+            cancel: std::sync::Arc::clone(&cancel),
+            check: None,
+        });
         cancel
     };
     let pending = TeamPairGuard(std::sync::Arc::clone(&cancel));
@@ -3595,11 +3702,8 @@ fn tray_host_present() -> bool {
     let class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
     // Windows owns this class for Explorer's notification area.
     unsafe {
-        !windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(
-            class.as_ptr(),
-            std::ptr::null(),
-        )
-        .is_null()
+        !windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(class.as_ptr(), std::ptr::null())
+            .is_null()
     }
 }
 
@@ -3960,6 +4064,9 @@ pub fn run() {
             migrate_client,
             preview_client_setup,
             set_secret,
+            set_secret_reference,
+            test_secret_reference,
+            secret_reference_providers,
             set_launch_secret,
             set_launch_input_value,
             delete_secret,

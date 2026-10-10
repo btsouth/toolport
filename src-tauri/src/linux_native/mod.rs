@@ -12,8 +12,8 @@ mod onboarding;
 mod package_updates;
 mod pairing;
 mod settings;
-mod single_instance;
 mod setup;
+mod single_instance;
 mod state;
 mod teams;
 mod theme;
@@ -120,7 +120,12 @@ pub fn run() {
     let bridge_for_open = bridge.clone();
     let notice_for_open = startup_notice.clone();
     app.connect_open(move |app, files, _hint| {
-        if files.iter().any(|file| crate::teams::parse_pair_link(file.uri().as_str()).is_some()) { let _ = onboarding::mark_complete(); }
+        if files
+            .iter()
+            .any(|file| crate::teams::parse_pair_link(file.uri().as_str()).is_some())
+        {
+            let _ = onboarding::mark_complete();
+        }
         build_window(
             app,
             theme::ThemeController::new(),
@@ -2014,14 +2019,33 @@ impl ClientPage {
         });
     }
 
-    fn show_import_review(&self, candidates: Vec<crate::registry_controller::ClientImportCandidate>) {
-        let Some(parent) = self.root.root().and_downcast::<gtk::Window>() else { return; };
-        let items = candidates.into_iter().map(|candidate| crate::registry_controller::SetupItem {
-            key: candidate.key, name: candidate.name, transport: candidate.transport,
-            command: candidate.command, args: candidate.args, url: candidate.url,
-            env_keys: candidate.credentials.iter().map(|env| env.key.clone()).collect(),
-            credentials: candidate.credentials, unsupported: candidate.unsupported, updates: Vec::new(), is_new: true,
-        }).collect();
+    fn show_import_review(
+        &self,
+        candidates: Vec<crate::registry_controller::ClientImportCandidate>,
+    ) {
+        let Some(parent) = self.root.root().and_downcast::<gtk::Window>() else {
+            return;
+        };
+        let items = candidates
+            .into_iter()
+            .map(|candidate| crate::registry_controller::SetupItem {
+                key: candidate.key,
+                name: candidate.name,
+                transport: candidate.transport,
+                command: candidate.command,
+                args: candidate.args,
+                url: candidate.url,
+                env_keys: candidate
+                    .credentials
+                    .iter()
+                    .map(|env| env.key.clone())
+                    .collect(),
+                credentials: candidate.credentials,
+                unsupported: candidate.unsupported,
+                updates: Vec::new(),
+                is_new: true,
+            })
+            .collect();
         let page = self.clone();
         setup::review(&parent, "Review servers to import", items,
             "Review each command and URL. Values are saved using your keychain choices. Missing inputs stay off.",
@@ -2396,10 +2420,7 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             let client_for_connect = client.clone();
             let page_for_connect = page.clone();
             connect.connect_clicked(move |_| {
-                confirm_client_migrate(
-                    &client_for_connect,
-                    page_for_connect.clone(),
-                );
+                confirm_client_migrate(&client_for_connect, page_for_connect.clone());
             });
             actions.append(&connect);
         }
@@ -2434,7 +2455,10 @@ fn confirm_client_migrate(client: &state::ClientView, page: ClientPage) {
         client.id.clone(),
         client.scope_id.clone(),
         client.gateway_state == state::ClientGatewayState::Customized,
-        { let page = page.clone(); move || page.refresh() },
+        {
+            let page = page.clone();
+            move || page.refresh()
+        },
         Some(page.credential_page.clone()),
     );
 }
@@ -2536,10 +2560,7 @@ fn connected_client_actions_menu(client: state::ClientView, page: ClientPage) ->
         let menu_for_migrate = menu.clone();
         migrate.connect_clicked(move |_| {
             menu_for_migrate.popdown();
-            confirm_client_migrate(
-                &client_for_migrate,
-                page_for_migrate.clone(),
-            );
+            confirm_client_migrate(&client_for_migrate, page_for_migrate.clone());
         });
         content.append(&migrate);
         content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
@@ -2725,7 +2746,12 @@ fn run_client_mutation(
                         "Disconnected {client_name} from Toolport. Restart {client_name} to apply it."
                     )
                 };
-                page.refresh_with_confirmation(std::iter::once(message).chain(result.outcome.warnings).collect::<Vec<_>>().join(" "));
+                page.refresh_with_confirmation(
+                    std::iter::once(message)
+                        .chain(result.outcome.warnings)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
             }
             Ok(Err(error)) => page.show_error(&format!("{client_name}: {error}")),
             Err(_) => page.show_error(&format!("{client_name}: the operation stopped")),
@@ -5422,7 +5448,10 @@ fn approval_card(
     {
         card.append(
             &gtk::Label::builder()
-                .label(format!("Reports itself as: {}", crate::approval::shorten_client_label(label, 60)))
+                .label(format!(
+                    "Reports itself as: {}",
+                    crate::approval::shorten_client_label(label, 60)
+                ))
                 .tooltip_text(label)
                 .xalign(0.0)
                 .wrap(true)
@@ -5745,7 +5774,8 @@ fn build_content(
     }
     page.append(&summary);
     let short = adw::Breakpoint::new(
-        adw::BreakpointCondition::parse("max-height: 450px").expect("static short-window condition"),
+        adw::BreakpointCondition::parse("max-height: 450px")
+            .expect("static short-window condition"),
     );
     short.add_setter(&intro, "visible", Some(&false.to_value()));
     short.add_setter(&description, "visible", Some(&false.to_value()));
@@ -5902,26 +5932,47 @@ fn build_content(
 
 fn open_shared_setup(url: &str, page: ServerPage) {
     if let Some((origin, team)) = crate::teams::parse_pair_link(url) {
-        if crate::registry::load().is_ok_and(|reg| crate::teams::pair_target_is_current(&reg, &origin, &team)) {
-            if let Some(action) = page.app.lookup_action("show-teams") { action.activate(None); }
-            if let Some(window) = page.app.active_window() { window.present(); }
+        if crate::registry::load()
+            .is_ok_and(|reg| crate::teams::pair_target_is_current(&reg, &origin, &team))
+        {
+            if let Some(action) = page.app.lookup_action("show-teams") {
+                action.activate(None);
+            }
+            if let Some(window) = page.app.active_window() {
+                window.present();
+            }
             return;
         }
-        for window in page.app.windows() { if window.title().as_deref() == Some("Toolport setup") { window.close(); } }
-        let (parent_app, connected_app, feedback) = (page.app.clone(), page.app.clone(), page.clone());
+        for window in page.app.windows() {
+            if window.title().as_deref() == Some("Toolport setup") {
+                window.close();
+            }
+        }
+        let (parent_app, connected_app, feedback) =
+            (page.app.clone(), page.app.clone(), page.clone());
         let hooks = pairing::PairingHooks {
             parent: Box::new(move || parent_app.active_window()),
             feedback: Box::new(move |message, error| feedback.show_feedback(message, error)),
             connected: Box::new(move || {
-                if let Some(action) = connected_app.lookup_action("show-teams") { action.activate(None); }
-                if let Some(window) = connected_app.active_window() { window.present(); }
+                if let Some(action) = connected_app.lookup_action("show-teams") {
+                    action.activate(None);
+                }
+                if let Some(window) = connected_app.active_window() {
+                    window.present();
+                }
             }),
-            open_url: Box::new(|url| { let _ = crate::oauth::open_web_url(url); }),
+            open_url: Box::new(|url| {
+                let _ = crate::oauth::open_web_url(url);
+            }),
         };
         let pair_origin = origin.clone();
-        pairing::request(hooks, &origin, Box::new(move |cancel, show| {
-            crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
-        }));
+        pairing::request(
+            hooks,
+            &origin,
+            Box::new(move |cancel, show| {
+                crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
+            }),
+        );
         return;
     }
     let Some(id) = crate::sharing_controller::parse_share_url(url) else {
@@ -6460,6 +6511,15 @@ fn show_setup_import_review(
                 .css_classes(["toolport-muted"])
                 .build(),
         );
+        for line in &item.reference_review {
+            row.append(
+                &gtk::Label::builder()
+                    .label(line)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .build(),
+            );
+        }
         // The two facts that change the risk calculus, stated on the row that
         // carries them - not buried in the dialog preamble.
         for warning in crate::sharing_controller::import_item_warnings(&item) {
@@ -6894,6 +6954,23 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
                 .build(),
         );
     }
+    if !server.secret_references.is_empty() {
+        let providers: std::collections::BTreeSet<_> = server
+            .secret_references
+            .values()
+            .filter_map(|r| crate::secret_refs::parse(r).ok().map(|p| p.name))
+            .collect();
+        text.append(
+            &gtk::Label::builder()
+                .label(format!(
+                    "Keys from {}",
+                    providers.into_iter().collect::<Vec<_>>().join(", ")
+                ))
+                .halign(gtk::Align::Start)
+                .css_classes(["toolport-muted"])
+                .build(),
+        );
+    }
     card.append(&text);
 
     let authenticate = gtk::Button::with_label("Sign in");
@@ -6968,7 +7045,7 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
     }
 
     if server.requires_review {
-        let badge = gtk::Label::new(Some("Review in Teams"));
+        let badge = gtk::Label::new(Some("Review required"));
         badge.add_css_class("toolport-badge");
         badge.set_valign(gtk::Align::Center);
         badge.set_halign(gtk::Align::Start);
@@ -6977,6 +7054,53 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
             "This team server must be reviewed before its command or private address can run",
         ));
         card.append(&badge);
+        let review = gtk::Button::with_label("Review references");
+        review.set_visible(!server.secret_references.is_empty());
+        let page = page.clone();
+        let id = server.id.clone();
+        let profile = profile_id.to_string();
+        review.connect_clicked(move |_| {
+            let Ok(reg) = crate::registry::load() else {
+                return;
+            };
+            let Some(entry) = reg.servers.iter().find(|s| s.id == id).cloned() else {
+                return;
+            };
+            if !crate::secret_refs::has_references(&entry) {
+                return;
+            }
+            let Some(parent) = page.app.active_window() else {
+                return;
+            };
+            let dialog = adw::MessageDialog::new(
+                Some(&parent),
+                Some("Approve references and enable?"),
+                Some(&crate::secret_refs::review_lines(&entry).join("\n")),
+            );
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("enable", "Enable");
+            dialog.set_default_response(Some("cancel"));
+            let profile = profile.clone();
+            let page = page.clone();
+            dialog.connect_response(None, move |_, response| {
+                if response != "enable" {
+                    return;
+                }
+                let profile = profile.clone();
+                let entry = entry.clone();
+                let page = page.clone();
+                gtk::glib::spawn_future_local(async move {
+                    let result = gtk::gio::spawn_blocking(move || crate::registry_controller::set_server_enabled_after_reference_review(&profile, &entry)).await;
+                    match result {
+                        Ok(Ok(reg)) => page.render(state::RegistryState::Ready(state::RegistrySnapshot::from_registry(reg))),
+                        Ok(Err(e)) => page.show_feedback(&e, true),
+                        Err(_) => page.show_feedback("The reference review stopped. Retry enabling the server.", true),
+                    }
+                });
+            });
+            dialog.present();
+        });
+        card.append(&review);
     } else {
         let status = gtk::Label::new(Some(if server.enabled {
             "Enabled"
@@ -7865,7 +7989,7 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
     let intro = editor_intro(
         "dialog-password-symbolic",
         "Server credentials",
-        "Secret values stay in the system keychain and are never read back into Toolport.",
+        "Paste a key into the system keychain or save a password manager reference. Only references sync.",
     );
     content.append(&intro);
     let feedback = gtk::Label::builder()
@@ -7924,7 +8048,21 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
         let replace = gtk::Button::with_label("Replace");
         replace.add_css_class("toolport-secondary-action");
         replace_row.append(&replace);
+        let (source_choice, reference_box) = secret_reference_controls(
+            &server.id,
+            key,
+            server.secret_references.get(key).map(String::as_str),
+            &page,
+            &editor,
+            &feedback,
+        );
+        replace_row.set_visible(source_choice.selected() == 0);
+        let paste_row = replace_row.clone();
+        source_choice
+            .connect_selected_notify(move |choice| paste_row.set_visible(choice.selected() == 0));
+        row.append(&source_choice);
         row.append(&replace_row);
+        row.append(&reference_box);
         stored.append(&row);
 
         let server_id = server.id.clone();
@@ -8002,7 +8140,23 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
     let add = gtk::Button::with_label("Store");
     add.add_css_class("suggested-action");
     add_row.append(&new_key);
+    let (source_choice, reference_box) = secret_reference_controls_dynamic(
+        &server.id,
+        new_key.clone(),
+        None,
+        &page,
+        &editor,
+        &feedback,
+    );
+    add_row.append(&source_choice);
+    let value_for_source = new_value.clone();
+    let add_for_source = add.clone();
+    source_choice.connect_selected_notify(move |choice| {
+        value_for_source.set_visible(choice.selected() == 0);
+        add_for_source.set_visible(choice.selected() == 0);
+    });
     add_row.append(&new_value);
+    add_row.append(&reference_box);
     let add_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     add_actions.set_halign(gtk::Align::End);
     add_actions.append(&add);
@@ -8374,14 +8528,18 @@ fn open_server_editor_prefilled(
         .as_ref()
         .map(|server| server.args.clone())
         .unwrap_or_default();
-    let mut launch_entries: Vec<(crate::registry::LaunchInput, gtk::Entry)> = Vec::new();
+    let mut launch_entries: Vec<(
+        crate::registry::LaunchInput,
+        gtk::Entry,
+        Option<(gtk::DropDown, gtk::Entry)>,
+    )> = Vec::new();
     if let Some(launch) = &original_launch {
         if !launch.inputs.is_empty() {
             let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
             section.add_css_class("toolport-form-section");
             section.append(&section_heading(
                 "Launch setup",
-                "Secret values stay in Toolport's vault. Leave a saved secret blank to keep it.",
+                "Paste a key or use a password manager reference. Leave a saved key blank to keep it.",
             ));
             for input in &launch.inputs {
                 let field = gtk::Entry::builder()
@@ -8399,8 +8557,27 @@ fn open_server_editor_prefilled(
                     .hexpand(true)
                     .css_classes(["toolport-input"])
                     .build();
-                section.append(&editor_field(&input.label, &field));
-                launch_entries.push((input.clone(), field));
+                let row = editor_field(&input.label, &field);
+                let source = if input.secret {
+                    let existing = crate::secret_refs::source(&input.unknown_fields)
+                        .ok()
+                        .flatten();
+                    let (choice, controls, reference) = secret_reference_fields(
+                        server_id.as_deref().unwrap_or(""),
+                        existing,
+                        &feedback,
+                    );
+                    field.set_visible(choice.selected() == 0);
+                    let paste = field.clone();
+                    choice.connect_selected_notify(move |c| paste.set_visible(c.selected() == 0));
+                    row.append(&choice);
+                    row.append(&controls);
+                    Some((choice, reference))
+                } else {
+                    None
+                };
+                section.append(&row);
+                launch_entries.push((input.clone(), field, source));
             }
             connection.append(&section);
         }
@@ -8645,7 +8822,17 @@ fn open_server_editor_prefilled(
             fields.command != original_command_for_test || fields.args != original_args_for_test;
         let launch_values = launch_for_test
             .iter()
-            .map(|(input, field)| (input.key.clone(), input.secret, field.text().to_string()))
+            .map(|(input, field, source)| {
+                launch_editor_value(
+                    input,
+                    &field.text(),
+                    source
+                        .as_ref()
+                        .filter(|(c, _)| c.selected() == 1)
+                        .map(|(_, r)| r.text().to_string())
+                        .as_deref(),
+                )
+            })
             .collect::<Vec<_>>();
         let launch_definition = launch_definition_for_test.clone();
         let server_id = server_id_for_test.clone();
@@ -8663,9 +8850,11 @@ fn open_server_editor_prefilled(
                     }
                     if let Some(launch) = &mut entry.launch {
                         for input in &mut launch.inputs {
-                            if let Some((_, _, value)) =
-                                launch_values.iter().find(|(key, _, _)| *key == input.key)
+                            if let Some((edited, value)) = launch_values
+                                .iter()
+                                .find(|(edited, _)| edited.key == input.key)
                             {
+                                input.unknown_fields = edited.unknown_fields.clone();
                                 apply_launch_probe_value(input, value);
                             }
                         }
@@ -8730,7 +8919,17 @@ fn open_server_editor_prefilled(
             fields.command != original_command_for_save || fields.args != original_args_for_save;
         let launch_values = launch_for_save
             .iter()
-            .map(|(input, field)| (input.clone(), field.text().to_string()))
+            .map(|(input, field, source)| {
+                launch_editor_value(
+                    input,
+                    &field.text(),
+                    source
+                        .as_ref()
+                        .filter(|(c, _)| c.selected() == 1)
+                        .map(|(_, r)| r.text().to_string())
+                        .as_deref(),
+                )
+            })
             .collect::<Vec<_>>();
         let launch_definition = original_launch_for_save.clone();
         let display_name = fields.name.trim().to_string();
@@ -8832,14 +9031,44 @@ fn apply_launch_probe_value(input: &mut crate::registry::LaunchInput, value: &st
     }
 }
 
+fn launch_editor_value(
+    input: &crate::registry::LaunchInput,
+    value: &str,
+    reference: Option<&str>,
+) -> (crate::registry::LaunchInput, String) {
+    let mut input = input.clone();
+    if let Some(reference) = reference {
+        input.value = None;
+        input
+            .unknown_fields
+            .insert("source".into(), serde_json::json!({"ref": reference}));
+        (input, String::new())
+    } else {
+        input.unknown_fields.remove("source");
+        (input, value.to_string())
+    }
+}
+
 fn save_launch_entries(
     server_id: &str,
     values: &[(crate::registry::LaunchInput, String)],
     mut registry: crate::registry::Registry,
 ) -> Result<crate::registry::Registry, String> {
     for (input, value) in values {
-        if input.secret {
-            if !value.is_empty() {
+        if let Some(reference) =
+            crate::secret_refs::source(&input.unknown_fields).map_err(|e| e.to_string())?
+        {
+            registry =
+                crate::registry_controller::set_secret_reference(server_id, &input.key, reference)?;
+        } else if input.secret {
+            if value.is_empty() {
+                registry = crate::registry::update(|reg| {
+                    crate::registry_controller::apply_launch_secret_generation(
+                        reg, server_id, &input.key,
+                    )
+                })?
+                .0;
+            } else {
                 registry =
                     crate::registry_controller::set_launch_secret(server_id, &input.key, value)?;
             }
@@ -9094,6 +9323,17 @@ fn state_card(icon_name: &str, title: &str, body: &str, error: bool) -> gtk::Box
 #[cfg(test)]
 mod tests {
     #[test]
+    fn returning_to_keychain_with_blank_launch_input_clears_reference() {
+        let input:crate::registry::LaunchInput=serde_json::from_value(serde_json::json!({"key":"TOKEN","label":"Token","secret":true,"required":true,"source":{"ref":"op://v/i/key"}})).unwrap();
+        let (edited,value)=super::launch_editor_value(&input,"",None);
+        assert_eq!(value,"");
+        assert!(!edited.unknown_fields.contains_key("source"));
+        let mut reg=crate::registry::Registry::default();
+        reg.servers.push(serde_json::from_value(serde_json::json!({"id":"ref","name":"Ref","transport":"stdio","command":"fixture","env":[],"launch":{"inputs":[input],"bindings":[]}})).unwrap());
+        crate::registry_controller::apply_launch_secret_generation(&mut reg,"ref","TOKEN").unwrap();
+        assert!(!reg.servers[0].launch.as_ref().unwrap().inputs[0].unknown_fields.contains_key("source"));
+    }
+    #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn session_identity_visual_fixture() {
         use super::*;
@@ -9315,6 +9555,82 @@ mod tests {
         let access = registry.resolve_profile_id(registry.client_scopes.get(&client.id).unwrap());
         assert_eq!(access, registry.default_access_id());
         assert_ne!(access, registry.all_access_id());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn reference_controls_test_reports_status_without_showing_value() {
+        use adw::prelude::*;
+        adw::init().unwrap();
+        let key = "TOOLPORT_NATIVE_REFERENCE_TEST_483762";
+        std::env::set_var(key, "synthetic-native-key-value");
+        let feedback = gtk::Label::new(None);
+        let (choice, controls, reference) =
+            super::secret_reference_fields("", Some(&format!("env:{key}")), &feedback);
+        assert_eq!(choice.selected(), 1);
+        assert!(controls.is_visible());
+        let provider = controls
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::DropDown>()
+            .unwrap();
+        assert_eq!(
+            provider.selected(),
+            (crate::secret_refs::PROVIDERS.len() - 1) as u32
+        );
+        let test = controls
+            .last_child()
+            .unwrap()
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        test.emit_clicked();
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !test.is_sensitive() && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::env::remove_var(key);
+        assert!(test.is_sensitive(), "reference test must finish");
+        assert_eq!(feedback.text(), "Success in the desktop app environment. The MCP client gateway may use different environment variables or PATH.");
+        assert_eq!(reference.text(), format!("env:{key}"));
+        assert!(!feedback.text().contains("synthetic-native-key-value"));
+        provider.set_selected(0);
+        assert_eq!(reference.text(), crate::secret_refs::PROVIDERS[0].example);
+        choice.set_selected(0);
+        assert!(!controls.is_visible());
+    }
+
+    #[test]
+    fn launch_reference_edit_discards_pasted_value_and_switches_back_to_vault() {
+        let input = crate::registry::LaunchInput {
+            key: "TOKEN".into(),
+            label: "Key".into(),
+            secret: true,
+            required: true,
+            value: None,
+            unknown_fields: Default::default(),
+        };
+        let (mut edited, value) =
+            super::launch_editor_value(&input, "synthetic-pasted-value", Some("env:TOKEN"));
+        assert!(value.is_empty());
+        super::apply_launch_probe_value(&mut edited, &value);
+        assert!(edited.value.is_none());
+        assert_eq!(
+            crate::secret_refs::source(&edited.unknown_fields).unwrap(),
+            Some("env:TOKEN")
+        );
+        assert!(!serde_json::to_string(&edited)
+            .unwrap()
+            .contains("synthetic-pasted-value"));
+        let (mut pasted, value) = super::launch_editor_value(&edited, "replacement", None);
+        super::apply_launch_probe_value(&mut pasted, &value);
+        assert!(crate::secret_refs::source(&pasted.unknown_fields)
+            .unwrap()
+            .is_none());
+        assert_eq!(pasted.value.as_deref(), Some("replacement"));
     }
 
     #[test]
@@ -9587,11 +9903,38 @@ mod tests {
     #[test]
     fn p08b_r1_hyphenated_activity_filter_uses_one_server() {
         let _env = crate::registry::DataDirTestEnv::new("p08b-r1-gtk-filter");
-        crate::audit::record_routed_call(&crate::registry::Registry::default(), "team-slack", "read", true, Some(850), None, Some("adapter:claude-code"), None, None, None, None);
-        crate::audit::record_decision("team-slack", "delete", Some("adapter:claude-code"), None, "destructive", "denied", &serde_json::json!({}), Some(1500));
+        crate::audit::record_routed_call(
+            &crate::registry::Registry::default(),
+            "team-slack",
+            "read",
+            true,
+            Some(850),
+            None,
+            Some("adapter:claude-code"),
+            None,
+            None,
+            None,
+            None,
+        );
+        crate::audit::record_decision(
+            "team-slack",
+            "delete",
+            Some("adapter:claude-code"),
+            None,
+            "destructive",
+            "denied",
+            &serde_json::json!({}),
+            Some(1500),
+        );
         let snapshot = state::load_activity_snapshot().unwrap();
-        assert_eq!(activity_server_filter_options(&snapshot.recent), vec!["All servers", "team_slack"]);
-        assert_eq!(filter_calls(&snapshot.recent, Some("team_slack"), false).len(), snapshot.recent.len());
+        assert_eq!(
+            activity_server_filter_options(&snapshot.recent),
+            vec!["All servers", "team_slack"]
+        );
+        assert_eq!(
+            filter_calls(&snapshot.recent, Some("team_slack"), false).len(),
+            snapshot.recent.len()
+        );
     }
 
     #[test]
@@ -10303,6 +10646,7 @@ mod tests {
             url: None,
             cwd: None,
             secret_keys: Vec::new(),
+            secret_references: Default::default(),
             client_credentials: None,
             enabled: true,
             requires_review: false,
@@ -10367,4 +10711,131 @@ mod p10c_r1_presentation_tests {
         assert_eq!(approval_outcome("denied").2, "approval-denied");
         assert_eq!(approval_outcome("withdrawn").2, "disabled");
     }
+}
+
+fn secret_reference_controls(
+    server_id: &str,
+    key: &str,
+    existing: Option<&str>,
+    page: &ServerPage,
+    editor: &adw::Window,
+    feedback: &gtk::Label,
+) -> (gtk::DropDown, gtk::Box) {
+    let key = gtk::Entry::builder().text(key).build();
+    secret_reference_controls_dynamic(server_id, key, existing, page, editor, feedback)
+}
+fn secret_reference_controls_dynamic(
+    server_id: &str,
+    key: gtk::Entry,
+    existing: Option<&str>,
+    page: &ServerPage,
+    editor: &adw::Window,
+    feedback: &gtk::Label,
+) -> (gtk::DropDown, gtk::Box) {
+    let (choice, container, reference) = secret_reference_fields(server_id, existing, feedback);
+    let save = gtk::Button::with_label("Save reference");
+    container.append(&save);
+    let id = server_id.to_string();
+    let page = page.clone();
+    let editor = editor.clone();
+    let feedback = feedback.clone();
+    save.connect_clicked(move |button| {
+        button.set_sensitive(false);
+        let id = id.clone();
+        let reprobe_id = id.clone();
+        let key = key.text().to_string();
+        let reference = reference.text().to_string();
+        let page = page.clone();
+        let editor = editor.clone();
+        let feedback = feedback.clone();
+        let button = button.clone();
+        gtk::glib::spawn_future_local(async move {
+            let result = gtk::gio::spawn_blocking(move || {
+                crate::registry_controller::set_secret_reference(&id, &key, &reference)
+            })
+            .await;
+            finish_credential_update(
+                result,
+                &reprobe_id,
+                &page,
+                &editor,
+                &feedback,
+                &button,
+                "Reference saved",
+            );
+        });
+    });
+    (choice, container)
+}
+
+fn secret_reference_fields(
+    server_id: &str,
+    existing: Option<&str>,
+    feedback: &gtk::Label,
+) -> (gtk::DropDown, gtk::Box, gtk::Entry) {
+    let choice = gtk::DropDown::from_strings(&["Paste a key", "From a password manager"]);
+    choice.set_selected(u32::from(existing.is_some()));
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    container.set_visible(existing.is_some());
+    let providers = crate::secret_refs::PROVIDERS;
+    let names: Vec<_> = providers.iter().map(|p| p.name).collect();
+    let provider = gtk::DropDown::from_strings(&names);
+    provider.set_selected(
+        existing
+            .and_then(|r| providers.iter().position(|p| r.starts_with(p.scheme)))
+            .unwrap_or(0) as u32,
+    );
+    let reference = gtk::Entry::builder()
+        .text(existing.unwrap_or(providers[0].example))
+        .placeholder_text("Secret reference")
+        .build();
+    reference.set_tooltip_text(Some(
+        "Test uses the desktop app environment. The MCP client gateway may use different environment variables or PATH. Only the reference syncs.",
+    ));
+    let reference_for_provider = reference.clone();
+    provider.connect_selected_notify(move |provider| {
+        reference_for_provider.set_text(providers[provider.selected() as usize].example)
+    });
+    container.append(&provider);
+    container.append(&reference);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let test = gtk::Button::with_label("Test");
+    actions.append(&test);
+    container.append(&actions);
+    let box_for_choice = container.clone();
+    choice
+        .connect_selected_notify(move |choice| box_for_choice.set_visible(choice.selected() == 1));
+    let test_id = server_id.to_string();
+    let test_reference = reference.clone();
+    let test_provider = provider.clone();
+    let feedback_for_changes = feedback.clone();
+    reference.connect_changed(move |_| feedback_for_changes.set_visible(false));
+    let test_feedback = feedback.clone();
+    test.connect_clicked(move |button| {
+        button.set_sensitive(false);
+        test_reference.set_sensitive(false);
+        test_provider.set_sensitive(false);
+        let reference_field = test_reference.clone();
+        let provider_field = test_provider.clone();
+        let id = test_id.clone();
+        let reference = test_reference.text().to_string();
+        let button = button.clone();
+        let feedback = test_feedback.clone();
+        gtk::glib::spawn_future_local(async move {
+            let result = gtk::gio::spawn_blocking(move || {
+                crate::registry_controller::test_secret_reference(&id, &reference)
+            })
+            .await;
+            button.set_sensitive(true);
+            reference_field.set_sensitive(true);
+            provider_field.set_sensitive(true);
+            feedback.set_visible(true);
+            feedback.set_label(&match result {
+                Ok(Ok(())) => "Success in the desktop app environment. The MCP client gateway may use different environment variables or PATH.".into(),
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => "Reference test stopped".into(),
+            });
+        });
+    });
+    (choice, container, reference)
 }

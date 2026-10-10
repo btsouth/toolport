@@ -55,6 +55,25 @@ describe("RegistryServerRow status accessibility", () => {
     renderRow(true, health({ ok: true }), { ...server, teamRouteRemoved: true });
     expect(screen.queryByText(/Your personal server stays off/)).not.toBeInTheDocument();
   });
+  it("names the provider for a launch credential on the server card", () => {
+    renderRow(false, undefined, {
+      ...server,
+      launch: {
+        inputs: [
+          {
+            key: "KEY",
+            label: "Key",
+            secret: true,
+            required: true,
+            source: { ref: "op://v/i/key" },
+          },
+        ],
+        bindings: [],
+      },
+    });
+    expect(screen.getByText("Keys from 1Password")).toBeInTheDocument();
+  });
+
   it.each([
     ["endpoint", "MCP endpoint auth required"],
     ["service_credential", "Service credential required"],

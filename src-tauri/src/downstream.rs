@@ -5790,6 +5790,8 @@ pub(crate) fn guarded_agent_with_timeout(
 /// the JSON-RPC message. A session id from `initialize` is echoed on later calls.
 pub struct HttpTransport {
     url: String,
+    credential_headers: Vec<(String, String)>,
+    reference_credentials: bool,
     agent: ureq::Agent,
     /// Separate pool so inline replies can POST while an SSE body is still open.
     inline_agent: ureq::Agent,
@@ -6411,6 +6413,8 @@ impl HttpTransport {
     ) -> Self {
         HttpTransport {
             url: url.to_string(),
+            credential_headers: Vec::new(),
+            reference_credentials: false,
             agent: guarded_agent_with_timeout(block_private, request_timeout),
             inline_agent: guarded_agent_with_timeout(block_private, request_timeout),
             connect_timeout: request_timeout,
@@ -6442,6 +6446,35 @@ impl HttpTransport {
             owns_listener_generation: true,
             draining: None,
         }
+    }
+
+    pub fn set_reference_credentials(&mut self, enabled: bool) {
+        self.reference_credentials = enabled;
+    }
+
+    pub fn set_credential_headers(&mut self, headers: Vec<(String, String)>) -> Result<(), String> {
+        for (name, value) in &headers {
+            if !crate::secret_refs::header_name(name)
+                || value.chars().any(char::is_control)
+                || [
+                    "host",
+                    "content-length",
+                    "transfer-encoding",
+                    "connection",
+                    "content-type",
+                    "accept",
+                ]
+                .contains(&name.to_ascii_lowercase().as_str())
+                || name.to_ascii_lowercase().starts_with("mcp-")
+            {
+                return Err(
+                    "Invalid credential header. Use an API key header without control characters."
+                        .into(),
+                );
+            }
+        }
+        self.credential_headers = headers;
+        Ok(())
     }
 
     pub fn set_scope_reauthorize(&mut self, callback: Option<ScopeReauthorizeFn>) {
@@ -6524,6 +6557,8 @@ impl HttpTransport {
     fn draining_shell(&self, receiver: Receiver<HttpAttemptOutcome>) -> Self {
         Self {
             url: self.url.clone(),
+            credential_headers: self.credential_headers.clone(),
+            reference_credentials: self.reference_credentials,
             agent: self.agent.clone(),
             inline_agent: self.inline_agent.clone(),
             connect_timeout: self.connect_timeout,
@@ -6600,6 +6635,7 @@ impl HttpTransport {
         let agent = guarded_agent_with_timeout(self.block_private, HTTP_CANCEL_FORWARD_TIMEOUT);
         let url = self.url.clone();
         let auth = Arc::clone(&self.auth);
+        let credential_headers = self.credential_headers.clone();
         let session_id = self
             .session_id
             .lock()
@@ -6641,6 +6677,9 @@ impl HttpTransport {
                 .clone();
             if let Some(token) = token.as_deref() {
                 request = request.set("Authorization", &bearer_header(token));
+            }
+            for (name, value) in &credential_headers {
+                request = request.set(name, value);
             }
             if let Err(error) = request.send_string(&body.to_string()) {
                 downstream_trace(&format!("HTTP cancellation forward failed: {error}"));
@@ -7154,6 +7193,9 @@ impl HttpTransport {
             if let Some(token) = auth.as_deref() {
                 req = req.set("Authorization", &bearer_header(token));
             }
+            for (name, value) in &self.credential_headers {
+                req = req.set(name, value);
+            }
             if cancel.is_some_and(|signal| !signal.mark_sending()) {
                 return Err(TransportError::Cancelled(
                     "HTTP request cancelled by upstream client".to_string(),
@@ -7472,6 +7514,9 @@ impl HttpTransport {
                 req = req.set("Authorization", &bearer_header(token));
             }
 
+            for (name, value) in &self.credential_headers {
+                req = req.set(name, value);
+            }
             if cancel.is_some_and(|signal| !signal.mark_sending()) {
                 return Err(TransportError::Cancelled(
                     "request cancelled before it reached the HTTP server".to_string(),
@@ -7845,6 +7890,7 @@ impl Transport for HttpTransport {
         let agent = self.agent.clone();
         let url = self.url.clone();
         let auth = Arc::clone(&self.auth);
+        let credential_headers = self.credential_headers.clone();
         let mut auth_shell = self.request_shell();
         let wire_version = self.wire_protocol_version();
         let dirty = self.change_dirty.clone();
@@ -7885,10 +7931,28 @@ impl Transport for HttpTransport {
                     if let Some(token) = token.as_deref() {
                         request = request.set("Authorization", &bearer_header(token));
                     }
+                    for (name, value) in &credential_headers {
+                        request = request.set(name, value);
+                    }
                     match request.send_string(&payload) {
                         Ok(response) => {
                             auth_shell.accept_auth(token);
                             break Some(response);
+                        }
+                        Err(ureq::Error::Status(code, response))
+                            if (code == 401 || code == 403) && auth_shell.reference_credentials =>
+                        {
+                            let _ = read_capped(response, 8 * 1024);
+                            // Let the supervisor retire this transport and resolve
+                            // the reference again instead of retrying a stale key.
+                            auth_shell
+                                .concurrency
+                                .session_invalid
+                                .store(true, Ordering::Release);
+                            downstream_trace(
+                                "subscriptions/listen credential rejected; reconnecting",
+                            );
+                            return;
                         }
                         Err(ureq::Error::Status(429, response)) => {
                             // Rate limited: record the shared window like
@@ -7955,11 +8019,10 @@ impl Transport for HttpTransport {
                     .header("content-type")
                     .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
                 if !is_sse {
-                    let detail: String =
-                        read_capped(response, 64 * 1024).chars().take(200).collect();
-                    downstream_trace(&format!(
-                        "subscriptions/listen returned a non-SSE response: {detail}"
-                    ));
+                    // Provider bodies can echo API keys, including fragments. Drain
+                    // within the bound, but never copy the response into diagnostics.
+                    let _ = read_capped(response, 64 * 1024);
+                    downstream_trace("subscriptions/listen returned a non-SSE response");
                     std::thread::sleep(retry_delay);
                     retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
                     continue;
@@ -15086,6 +15149,50 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn reference_listener_auth_failure_invalidates_connection_without_replaying() {
+        use super::{HttpTransport, SubscriptionFilter, Transport};
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", server.server_addr());
+        let worker = std::thread::spawn(move || {
+            let request = server
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .expect("listen request");
+            assert!(request
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("X-Api-Key") && h.value.as_str() == "synthetic-ref-value"));
+            request
+                .respond(
+                    tiny_http::Response::from_string("synthetic-ref-value").with_status_code(401),
+                )
+                .unwrap();
+            assert!(
+                server
+                    .recv_timeout(std::time::Duration::from_millis(300))
+                    .unwrap()
+                    .is_none(),
+                "stale reference must not be replayed"
+            );
+        });
+        let mut transport = HttpTransport::new(&url);
+        transport.set_reference_credentials(true);
+        transport
+            .set_credential_headers(vec![("X-Api-Key".into(), "synthetic-ref-value".into())])
+            .unwrap();
+        transport
+            .set_subscription_listener(SubscriptionFilter::default())
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while transport.connection_reset_reason().is_none() && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(transport.connection_reset_reason().is_some());
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn modern_http_listener_steps_up_scope_and_retries() {
         use super::{
             HttpTransport, ScopeReauthorizeFn, SubscriptionFilter, Transport,
@@ -16752,9 +16859,12 @@ for line in sys.stdin:
         handle.join().unwrap();
 
         assert!(error.to_string().contains("HTTP 401"));
-        assert_eq!(error.call_failure().kind, crate::call_failure::CallFailureKind::Auth {
-            target: crate::call_failure::AuthTarget::Scope,
-        });
+        assert_eq!(
+            error.call_failure().kind,
+            crate::call_failure::CallFailureKind::Auth {
+                target: crate::call_failure::AuthTarget::Scope,
+            }
+        );
         assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
     }
 

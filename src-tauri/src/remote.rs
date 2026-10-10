@@ -1336,16 +1336,25 @@ pub fn connect_remote_with_handler(
     progress: Option<ProgressSink>,
     change_dirty: Option<Arc<AtomicU8>>,
 ) -> Result<DownstreamServer, String> {
+    let (resolved, header_values) =
+        crate::secret_refs::resolve_connection(server).map_err(|e| e.to_string())?;
+    let server = &resolved;
     let imported = crate::import_credentials::has_imported_url(server);
     if !imported {
         return connect_remote_inner(
             server,
+            header_values,
             server_handler,
             resource_updated,
             progress,
             change_dirty,
         )
-        .map_err(|error| safe_imported_error(server, error));
+        .map_err(|error| {
+            if is_auth_error(&error) {
+                crate::secret_refs::invalidate_server(server);
+            }
+            safe_imported_error(server, error)
+        });
     }
     let url = secrets::get_vault_secret_result(&server.id, secrets::IMPORTED_URL_KEY)
         .map_err(|_| "Keychain unavailable. Unlock it and retry.")?
@@ -1357,6 +1366,7 @@ pub fn connect_remote_with_handler(
     resolved.url = Some(url);
     connect_remote_inner(
         &resolved,
+        header_values,
         server_handler,
         resource_updated,
         progress,
@@ -1366,10 +1376,14 @@ pub fn connect_remote_with_handler(
 }
 
 /// Keep provider errors from echoing a credential-bearing endpoint after connect.
-struct ImportedTransport(Box<dyn Transport>, Redaction);
-struct ImportedConcurrent(Arc<dyn crate::downstream::ConcurrentTransport>, Redaction);
+struct ImportedTransport(Box<dyn Transport>, Redaction, bool);
+struct ImportedConcurrent(
+    Arc<dyn crate::downstream::ConcurrentTransport>,
+    Redaction,
+    bool,
+);
 #[derive(Clone)]
-struct Redaction(Vec<String>);
+struct Redaction(Vec<String>, Vec<String>);
 impl Redaction {
     fn for_server(server: &ServerEntry) -> Self {
         let mut values = Vec::new();
@@ -1445,7 +1459,7 @@ impl Redaction {
         values.retain(|value| !value.is_empty());
         values.sort_by_key(|value| std::cmp::Reverse(value.len()));
         values.dedup();
-        Self(values)
+        Self(values, crate::secret_refs::review_references(server))
     }
     fn text(&self, mut message: String) -> String {
         for value in &self.0 {
@@ -1472,6 +1486,56 @@ impl Redaction {
             ),
             value => value,
         }
+    }
+    fn connection_error(
+        &self,
+        error: crate::downstream::TransportError,
+        reference: bool,
+    ) -> crate::downstream::TransportError {
+        if !reference {
+            return self.error(error);
+        }
+        use crate::call_failure::CallFailureKind as K;
+        use crate::downstream::TransportError as E;
+        let kind = error.call_failure().kind;
+        // An auth rejection invalidates this connection, so its supervisor reads the
+        // reference again. Never replay a possibly completed write automatically.
+        if matches!(kind, K::Auth { .. }) {
+            for reference in &self.1 {
+                crate::secret_refs::invalidate(reference);
+            }
+            return E::Classified(
+                K::Unavailable { after_send: true },
+                "Password manager credential rejected. Reconnecting will read the key again."
+                    .into(),
+            );
+        }
+        // Child tails can contain a fragment or an escaped credential. Use fixed
+        // text for reference-backed errors while retaining their retry classification.
+        let message = match error {
+            E::Retry { retry_after, .. } => {
+                return E::Retry {
+                    retry_after,
+                    message: "Reference-backed server asked to retry.".into(),
+                }
+            }
+            E::RateLimited { retry_after, .. } => {
+                return E::RateLimited {
+                    retry_after,
+                    message: "Reference-backed server rate limited the request.".into(),
+                }
+            }
+            E::Fatal(_) => {
+                return E::Unavailable("Reference-backed server connection closed.".into())
+            }
+            E::Rpc(ref value) => {
+                return E::Rpc(
+                    serde_json::json!({"code": value.get("code").and_then(serde_json::Value::as_i64).unwrap_or(-32603), "message": "Reference-backed server rejected the request."}),
+                )
+            }
+            _ => "Reference-backed server request failed.",
+        };
+        E::Classified(kind, message.into())
     }
     fn error(&self, error: crate::downstream::TransportError) -> crate::downstream::TransportError {
         use crate::downstream::TransportError as E;
@@ -1510,7 +1574,8 @@ impl crate::downstream::ConcurrentTransport for ImportedConcurrent {
     ) -> Result<serde_json::Value, crate::downstream::TransportError> {
         self.0
             .request_with_cancel_and_headers(method, params, cancel, headers)
-            .map_err(|error| self.1.error(error))
+            .map(|value| if self.2 { self.1.value(value) } else { value })
+            .map_err(|error| self.1.connection_error(error, self.2))
     }
     fn is_closed(&self) -> bool {
         self.0.is_closed()
@@ -1524,9 +1589,13 @@ impl Transport for ImportedTransport {
         self.0.response_count()
     }
     fn connection_reset_reason(&self) -> Option<String> {
-        self.0
-            .connection_reset_reason()
-            .map(|error| self.1.text(error))
+        self.0.connection_reset_reason().map(|error| {
+            if self.2 {
+                "Reference-backed connection closed. Restart to read its key again.".into()
+            } else {
+                self.1.text(error)
+            }
+        })
     }
 
     fn request(
@@ -1536,7 +1605,8 @@ impl Transport for ImportedTransport {
     ) -> Result<serde_json::Value, crate::downstream::TransportError> {
         self.0
             .request(method, params)
-            .map_err(|error| self.1.error(error))
+            .map(|value| if self.2 { self.1.value(value) } else { value })
+            .map_err(|error| self.1.connection_error(error, self.2))
     }
     fn notify(
         &mut self,
@@ -1545,7 +1615,7 @@ impl Transport for ImportedTransport {
     ) -> Result<(), crate::downstream::TransportError> {
         self.0
             .notify(method, params)
-            .map_err(|error| self.1.error(error))
+            .map_err(|error| self.1.connection_error(error, self.2))
     }
     fn request_with_cancel(
         &mut self,
@@ -1555,7 +1625,8 @@ impl Transport for ImportedTransport {
     ) -> Result<serde_json::Value, crate::downstream::TransportError> {
         self.0
             .request_with_cancel(method, params, cancel)
-            .map_err(|error| self.1.error(error))
+            .map(|value| if self.2 { self.1.value(value) } else { value })
+            .map_err(|error| self.1.connection_error(error, self.2))
     }
     fn request_with_cancel_and_headers(
         &mut self,
@@ -1566,7 +1637,8 @@ impl Transport for ImportedTransport {
     ) -> Result<serde_json::Value, crate::downstream::TransportError> {
         self.0
             .request_with_cancel_and_headers(method, params, cancel, headers)
-            .map_err(|error| self.1.error(error))
+            .map(|value| if self.2 { self.1.value(value) } else { value })
+            .map_err(|error| self.1.connection_error(error, self.2))
     }
     fn cancel_matching_pending_request(
         &mut self,
@@ -1586,7 +1658,7 @@ impl Transport for ImportedTransport {
     ) -> Result<(), crate::downstream::TransportError> {
         self.0
             .set_subscription_listener(filter)
-            .map_err(|error| self.1.error(error))
+            .map_err(|error| self.1.connection_error(error, self.2))
     }
     fn supports_request_headers(&self) -> bool {
         self.0.supports_request_headers()
@@ -1604,14 +1676,21 @@ impl Transport for ImportedTransport {
         self.0.arm_tools_watch()
     }
     fn set_server_request_handler(&mut self, handler: ServerRequestHandler) {
-        self.0.set_server_request_handler(handler)
+        if self.2 {
+            let redact = self.1.clone();
+            self.0.set_server_request_handler(Arc::new(move |frame| {
+                handler(&redact.value(frame.clone()))
+            }));
+        } else {
+            self.0.set_server_request_handler(handler)
+        }
     }
     fn set_server_id(&mut self, id: &str) {
         self.0.set_server_id(id)
     }
     fn concurrent(&self) -> Option<Arc<dyn crate::downstream::ConcurrentTransport>> {
         self.0.concurrent().map(|transport| {
-            Arc::new(ImportedConcurrent(transport, self.1.clone()))
+            Arc::new(ImportedConcurrent(transport, self.1.clone(), self.2))
                 as Arc<dyn crate::downstream::ConcurrentTransport>
         })
     }
@@ -1623,18 +1702,27 @@ impl Transport for ImportedTransport {
     }
 }
 fn reviewed_transport(server: &ServerEntry, transport: HttpTransport) -> Box<dyn Transport> {
-    if has_imported_credentials(server) {
+    protect_transport(server, Box::new(transport))
+}
+
+/// Share the existing credential redaction with stdio reference-backed connections.
+pub fn protect_transport(
+    server: &ServerEntry,
+    transport: Box<dyn Transport>,
+) -> Box<dyn Transport> {
+    if has_imported_credentials(server) || crate::secret_refs::has_references(server) {
         Box::new(ImportedTransport(
-            Box::new(transport),
+            transport,
             Redaction::for_server(server),
+            crate::secret_refs::has_references(server),
         ))
     } else {
-        Box::new(transport)
+        transport
     }
 }
 
 fn safe_imported_error(server: &ServerEntry, error: String) -> String {
-    if !has_imported_credentials(server) {
+    if !has_imported_credentials(server) && !crate::secret_refs::has_references(server) {
         return error;
     }
     Redaction::for_server(server).text(error)
@@ -1646,12 +1734,24 @@ fn has_imported_credentials(server: &ServerEntry) -> bool {
 
 fn connect_remote_inner(
     server: &ServerEntry,
+    mut header_values: Vec<(String, String)>,
     server_handler: Option<ServerRequestHandler>,
     resource_updated: Option<ResourceUpdatedSink>,
     progress: Option<ProgressSink>,
     change_dirty: Option<Arc<AtomicU8>>,
 ) -> Result<DownstreamServer, String> {
     guard_connect_target(server)?;
+    let legacy_bearer = crate::secret_refs::take_legacy_bearer(server, &mut header_values);
+    let mut server_with_headers = server.clone();
+    for (key, value) in &header_values {
+        server_with_headers.env.push(crate::registry::EnvVar {
+            key: key.clone(),
+            value: Some(value.clone()),
+            secret: true,
+            unknown_fields: Default::default(),
+        });
+    }
+    let server = &server_with_headers;
     let url = server.url.as_deref().unwrap_or("");
     let server_id = &server.id;
     // Untrusted-provenance servers also get private/loopback refused at the resolver,
@@ -1676,54 +1776,85 @@ fn connect_remote_inner(
     //
     // Handled here because this is the only place that sees both the current entry
     // and the vault; the reacquire seam takes just a server id by design.
-    let stale_cc = client_credentials_state_is_stale(server, server_id, url).or_else(|error| {
-        let update = credential_update(server_id);
-        let update = update
-            .lock()
-            .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
-        if !uses_client_credentials(server) && update.valid_pending_token().is_some() {
-            Ok(false)
-        } else {
-            Err(error)
+    if !crate::secret_refs::has_references(server) {
+        let stale_cc =
+            client_credentials_state_is_stale(server, server_id, url).or_else(|error| {
+                let update = credential_update(server_id);
+                let update = update
+                    .lock()
+                    .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
+                if !uses_client_credentials(server) && update.valid_pending_token().is_some() {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            })?;
+        if stale_cc {
+            // Not ignored: leaving stale state would silently keep using the wrong
+            // flow, or the wrong resource binding, for the rest of the session.
+            reset_client_credentials(server_id)?;
         }
-    })?;
-    if stale_cc {
-        // Not ignored: leaving stale state would silently keep using the wrong
-        // flow, or the wrong resource binding, for the rest of the session.
-        reset_client_credentials(server_id)?;
-    }
-    // A failed CC-state read is not "no state" (SBS-840): do not mint a second grant.
-    if uses_client_credentials(server) && load_cc_state(server_id)?.is_none() {
-        let config = server
-            .client_credentials
-            .as_ref()
-            .expect("uses_client_credentials checked it");
-        acquire_client_credentials(server_id, url, config)?;
+        // A failed CC-state read is not "no state" (SBS-840): do not mint a second grant.
+        if uses_client_credentials(server) && load_cc_state(server_id)?.is_none() {
+            let config = server
+                .client_credentials
+                .as_ref()
+                .expect("uses_client_credentials checked it");
+            acquire_client_credentials(server_id, url, config)?;
+        }
     }
     // A vault read failure is not "no token" (SBS-789): connecting anonymous on a
     // locked keychain would surface as a bogus 401/"needs sign-in" and can hand an
     // unauthenticated session to a server the user believes is authenticated.
-    let auth = match refresh_token_if_needed(server_id)? {
-        Some(fresh) => Some(fresh),
-        None => match current_credential(server_id)? {
-            Some(token) => Some(token),
-            None => first_vaulted_secret(server)
-                .map_err(|e| format!("could not read the vaulted auth token: {e}"))?,
-        },
+    let reference_auth = server
+        .env
+        .iter()
+        .find(|e| e.unknown_fields.contains_key("source") && e.secret)
+        .and_then(|e| e.value.clone());
+    let auth = if crate::secret_refs::has_references(server) && !header_values.is_empty() {
+        None
+    } else if reference_auth.is_some() {
+        reference_auth.clone()
+    } else {
+        match refresh_token_if_needed(server_id)? {
+            Some(fresh) => Some(fresh),
+            None => match current_credential(server_id)? {
+                Some(token) => Some(token),
+                None => match legacy_bearer {
+                    Some(token) => Some(token),
+                    None => first_vaulted_secret(server)
+                        .map_err(|e| format!("could not read the vaulted auth token: {e}"))?,
+                },
+            },
+        }
+        // Remember exactly what we hand the transport. The transport force-refreshes
+        // internally on a 401/403 and vaults the result, so if the vaulted token
+        // differs from this afterwards, an exchange already happened during this
+        // connect (SOU-474).
     };
-    // Remember exactly what we hand the transport. The transport force-refreshes
-    // internally on a 401/403 and vaults the result, so if the vaulted token
-    // differs from this afterwards, an exchange already happened during this
-    // connect (SOU-474).
     let sent_auth = auth.clone();
-    let (mut transport, refreshed_during_connect) =
-        authed_transport(url, auth, server_id, block_private, request_timeout)?;
+    let (mut transport, refreshed_during_connect) = if reference_auth.is_some()
+        || crate::secret_refs::has_references(server)
+    {
+        require_secure_for_auth(url)?;
+        (
+            HttpTransport::guarded_with_timeout(url, auth, None, block_private, request_timeout),
+            Arc::new(AtomicBool::new(false)),
+        )
+    } else {
+        authed_transport(url, auth, server_id, block_private, request_timeout)?
+    };
+    if !header_values.is_empty() {
+        require_secure_for_auth(url)?;
+    }
+    transport.set_credential_headers(header_values.clone())?;
+    transport.set_reference_credentials(crate::secret_refs::has_references(server));
     transport.set_connect_timeout(initialize_timeout);
     if let Some(ref handler) = server_handler {
-        transport.set_server_request_handler(handler.clone());
+        transport.set_server_request_handler(protect_server_requests(server, handler.clone()));
     }
-    transport.set_resource_updated_sink(resource_updated.clone());
-    transport.set_progress_sink(progress.clone());
+    transport.set_resource_updated_sink(protect_resource_updates(server, resource_updated.clone()));
+    transport.set_progress_sink(protect_progress(server, progress.clone()));
     transport.set_change_sink(change_dirty.clone());
     match DownstreamServer::connect(server_id.to_string(), reviewed_transport(server, transport))
         .map_err(|e| safe_imported_error(server, e))
@@ -1732,7 +1863,7 @@ fn connect_remote_inner(
             ds.set_call_timeout(request_timeout);
             Ok(ds)
         }
-        Err(e) if is_auth_error(&e) => {
+        Err(e) if is_auth_error(&e) && !crate::secret_refs::has_references(server) => {
             // The transport already gets one forced refresh per token on a 401/403.
             // If it spent one during this connect, the vault now holds a token that
             // has ALREADY been rejected, so minting yet another cannot help - and
@@ -1781,6 +1912,7 @@ fn connect_remote_inner(
                         block_private,
                         request_timeout,
                     )?;
+                    transport.set_credential_headers(header_values.clone())?;
                     transport.set_connect_timeout(initialize_timeout);
                     if let Some(handler) = server_handler.clone() {
                         transport.set_server_request_handler(handler);
@@ -1811,6 +1943,100 @@ fn connect_remote_inner(
 mod tests {
     use super::*;
 
+    #[test]
+    fn legacy_authorization_sends_bearer_or_nothing_without_oauth() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            let mut server = remote_server(&endpoint.url, None);
+            server.unknown_fields.insert("headerKeys".into(), serde_json::json!([{"key":"Authorization","env":"AUTH"}]));
+            for (saved, expected) in [(None,""),(Some("bare-token"),"Bearer bare-token"),(Some("Bearer x"),"Bearer x")] {
+                if let Some(value)=saved {secrets::set_secret(&server.id,"AUTH",value).unwrap();}
+                let mut connection=connect_remote(&server).unwrap();
+                assert_eq!(connection.call("fixture",serde_json::json!({})).unwrap()["authorization"],expected);
+            }
+            assert_eq!(endpoint.count(),0);
+        });
+    }
+    #[test]
+    fn legacy_authorization_keeps_oauth_and_allows_oauth_only_members() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            let mut state = load_state("rotation").unwrap().unwrap();
+            state.expires_at = Some(now_epoch_seconds() + 3600);
+            secrets::set_secret(
+                "rotation",
+                STATE_KEY,
+                &serde_json::to_string(&state).unwrap(),
+            )
+            .unwrap();
+            let mut server = remote_server(&endpoint.url, None);
+            server.id = "rotation".into();
+            server.unknown_fields.insert(
+                "headerKeys".into(),
+                serde_json::json!([{"key":"Authorization","env":"AUTH"}]),
+            );
+            for saved in [None, Some("bare-token"), Some("Bearer x")] {
+                if let Some(value) = saved {
+                    secrets::set_secret("rotation", "AUTH", value).unwrap();
+                }
+                let mut connection = connect_remote(&server).unwrap();
+                assert_eq!(
+                    connection.call("fixture", serde_json::json!({})).unwrap()["authorization"],
+                    "Bearer token-0"
+                );
+            }
+            assert_eq!(endpoint.count(), 0);
+        });
+    }
+    #[test]
+    fn legacy_team_headers_keep_oauth_bearer_and_refresh_callback() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            let mut state = load_state("rotation").unwrap().unwrap();
+            state.expires_at = Some(now_epoch_seconds() + 3600);
+            secrets::set_secret(
+                "rotation",
+                STATE_KEY,
+                &serde_json::to_string(&state).unwrap(),
+            )
+            .unwrap();
+            let mut server = remote_server(&endpoint.url, None);
+            server.id = "rotation".into();
+            server.unknown_fields.insert(
+                "headerKeys".into(),
+                serde_json::json!([{"key":"X-Api-Key","env":"API_HEADER"}]),
+            );
+            secrets::set_secret("rotation", "API_HEADER", "header-fixture").unwrap();
+            let mut connection = connect_remote(&server).unwrap();
+            let result = connection.call("fixture", serde_json::json!({})).unwrap();
+            assert_eq!(result["authorization"], "Bearer token-0");
+            assert_eq!(endpoint.count(), 0);
+        });
+    }
+    #[test]
+    fn legacy_headers_do_not_skip_client_credentials_state_validation() {
+        secrets::tests::with_isolated_vault(|| {
+            let mut server = remote_server("https://example.com/mcp", None);
+            server.client_credentials = Some(crate::registry::ClientCredentials {
+                client_id: "client".into(),
+                ..Default::default()
+            });
+            server.unknown_fields.insert(
+                "headerKeys".into(),
+                serde_json::json!([{"key":"X-Api-Key","env":"API_HEADER"}]),
+            );
+            secrets::set_secret(&server.id, "API_HEADER", "header-fixture").unwrap();
+            let result = secrets::tests::with_failed_read(CC_STATE_KEY, || connect_remote(&server));
+            assert!(result.err().unwrap().contains("client-credentials state"));
+        });
+    }
+    #[test]
+    fn inline_secret_env_does_not_replace_existing_bearer_keychain_lookup() {
+        let server: ServerEntry = serde_json::from_value(serde_json::json!({"id":"old","name":"Old","transport":"http","url":"https://example.invalid/mcp","env":[{"key":"TOKEN","secret":true,"value":"inline-never-bearer"}]})).unwrap();
+        assert_eq!(first_vaulted_secret(&server).unwrap(), None);
+    }
     #[test]
     fn reviewed_url_only_vault_is_recognized_as_owned_credentials() {
         secrets::tests::with_isolated_vault(|| {
@@ -1892,10 +2118,13 @@ mod tests {
 
     #[test]
     fn reviewed_transport_preserves_rpc_errors_and_redacts_only_private_values() {
-        let redact = Redaction(vec![
-            "synthetic-pat".into(),
-            "https://example.invalid/mcp?token=secret".into(),
-        ]);
+        let redact = Redaction(
+            vec![
+                "synthetic-pat".into(),
+                "https://example.invalid/mcp?token=secret".into(),
+            ],
+            vec![],
+        );
         let frame = redact.error(crate::downstream::TransportError::FrameRejected(
             "oversized frame near synthetic-pat".into(),
         ));
@@ -4017,4 +4246,85 @@ mod tests {
 
         let _ = secrets::delete_secret(server_id, secrets::HTTP_AUTH_KEY);
     }
+}
+
+#[cfg(test)]
+mod reference_redaction_tests {
+    use super::*;
+    #[test]
+    fn handshake_requests_do_not_expose_resolved_credentials() {
+        let server: ServerEntry = serde_json::from_value(serde_json::json!({"id":"refs", "name":"Refs", "transport":"stdio", "command":"mock", "env":[{"key":"KEY", "secret":true, "value":"synthetic-ref-value", "source":{"ref":"env:SYNTHETIC"}}]})).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let handler = protect_server_requests(
+            &server,
+            Arc::new(move |frame| {
+                assert!(!frame.to_string().contains("synthetic-ref-value"));
+                observed.fetch_add(1, Ordering::Relaxed);
+                None
+            }),
+        );
+        handler(
+            &serde_json::json!({"method":"elicitation/create", "params":{"message":"synthetic-ref-value"}}),
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reference_errors_are_opaque_and_auth_triggers_reconnection() {
+        let reference = "op://auth-test/item/key";
+        assert_eq!(crate::secret_refs::test_cached_value(reference, "old"), "old");
+        let redaction = Redaction(vec!["synthetic-ref-value".into()], vec![reference.into()]);
+        let e = redaction.connection_error(
+            crate::downstream::TransportError::Fatal("tail ends in ref-value".into()),
+            true,
+        );
+        assert!(!e.to_string().contains("ref-value"));
+        assert!(e.is_health_failure());
+        let e = redaction.connection_error(
+            crate::downstream::TransportError::Classified(
+                crate::call_failure::CallFailureKind::Auth {
+                    target: crate::call_failure::AuthTarget::Endpoint,
+                },
+                "HTTP 401 synthetic-ref-value".into(),
+            ),
+            true,
+        );
+        assert!(e.is_health_failure());
+        assert_eq!(crate::secret_refs::test_cached_value(reference, "new"), "new");
+        assert!(!e.to_string().contains("synthetic-ref-value"));
+        let payload=redaction.value(serde_json::json!({"content":[{"text":"synthetic-ref-value"}],"synthetic-ref-value":"synthetic-ref-value"}));
+        assert!(!payload.to_string().contains("synthetic-ref-value"));
+    }
+}
+
+/// Prevent unsolicited progress and resource notifications from echoing injected keys.
+pub fn protect_progress(server: &ServerEntry, sink: Option<ProgressSink>) -> Option<ProgressSink> {
+    if !crate::secret_refs::has_references(server) {
+        return sink;
+    }
+    let redact = Redaction::for_server(server);
+    sink.map(|sink| Arc::new(move |value| sink(redact.value(value))) as ProgressSink)
+}
+pub fn protect_resource_updates(
+    server: &ServerEntry,
+    sink: Option<ResourceUpdatedSink>,
+) -> Option<ResourceUpdatedSink> {
+    if !crate::secret_refs::has_references(server) {
+        return sink;
+    }
+    let redact = Redaction::for_server(server);
+    sink.map(|sink| Arc::new(move |uri| sink(redact.text(uri))) as ResourceUpdatedSink)
+}
+
+/// Redact handshake-time requests before the protected transport is installed.
+pub fn protect_server_requests(
+    server: &ServerEntry,
+    handler: ServerRequestHandler,
+) -> ServerRequestHandler {
+    if !crate::secret_refs::has_references(server) {
+        return handler;
+    }
+    let redact = Redaction::for_server(server);
+    Arc::new(move |frame| handler(&redact.value(frame.clone())))
 }
