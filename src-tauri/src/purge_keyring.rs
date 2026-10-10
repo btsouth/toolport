@@ -1,6 +1,7 @@
 //! Removal is scoped to Toolport's reserved service, including orphaned entries.
 use crate::purge::Leftover;
 
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn remove_owned<T>(
     entries: impl IntoIterator<Item = T>,
     mut service: impl FnMut(&T) -> Result<String, String>,
@@ -114,55 +115,79 @@ pub(crate) fn remove() -> Result<Vec<Leftover>, String> {
 #[cfg(target_os = "macos")]
 pub(crate) fn remove() -> Result<Vec<Leftover>, String> {
     use core_foundation::{
-        base::{CFType, TCFType},
+        array::CFArray,
+        base::{CFType, CFTypeRef, TCFType},
         boolean::CFBoolean,
         dictionary::CFDictionary,
         string::CFString,
     };
-    use security_framework::item::{ItemClass, ItemSearchOptions, Limit, Reference, SearchResult};
+    use security_framework::item::{ItemClass, ItemSearchOptions, Limit, SearchResult};
     use security_framework_sys::item::*;
     #[link(name = "Security", kind = "framework")]
     extern "C" {
-        fn SecItemDelete(query: core_foundation::base::CFTypeRef) -> i32;
+        fn SecItemDelete(query: CFTypeRef) -> i32;
+        fn SecItemCopyMatching(query: CFTypeRef, result: *mut CFTypeRef) -> i32;
+    }
+    unsafe fn k(raw: CFTypeRef) -> CFType {
+        unsafe { CFType::wrap_under_get_rule(raw) }
+    }
+    fn account(attributes: &CFDictionary) -> Option<String> {
+        let value = attributes.find(unsafe { kSecAttrAccount.cast::<std::ffi::c_void>() })?;
+        Some(unsafe { CFString::wrap_under_get_rule((*value).cast()) }.to_string())
     }
     let mut leftovers = Vec::new();
-    // The legacy ACL-bearing store requires deleting references, not a broad SecItemDelete.
+    // Legacy ACL-bearing entries require reference deletion. No secret data is read.
     let entries = ItemSearchOptions::new()
         .class(ItemClass::generic_password())
         .service(super::SERVICE)
         .limit(Limit::All)
         .load_refs(true)
+        .load_attributes(true)
         .load_data(false)
         .search();
     match entries {
         Ok(entries) => {
-            for (index, entry) in entries.into_iter().enumerate() {
-                if let SearchResult::Ref(Reference::KeychainItem(item)) = entry {
-                    let status = unsafe {
-                        security_framework_sys::keychain_item::SecKeychainItemDelete(
-                            item.as_concrete_TypeRef(),
-                        )
-                    };
-                    if status != 0 {
-                        leftovers.push(Leftover {
-                            path: format!("keychain:conduit-mcp/legacy/{index}"),
-                            error: format!("SecKeychainItemDelete: {status}"),
-                        });
-                    }
+            for entry in entries {
+                let SearchResult::Dict(attributes) = entry else {
+                    leftovers.push(Leftover {
+                        path: "keychain:conduit-mcp/legacy (unreadable item)".into(),
+                        error: "Keychain did not return item attributes".into(),
+                    });
+                    continue;
+                };
+                let path = format!(
+                    "keychain:conduit-mcp/legacy/{}",
+                    account(&attributes).unwrap_or_else(|| "(unknown account)".into())
+                );
+                let reference = attributes.find(unsafe { kSecValueRef.cast::<std::ffi::c_void>() });
+                let Some(reference) = reference else {
+                    leftovers.push(Leftover {
+                        path,
+                        error: "Keychain did not return an item reference".into(),
+                    });
+                    continue;
+                };
+                let status = unsafe {
+                    security_framework_sys::keychain_item::SecKeychainItemDelete(
+                        (*reference).cast(),
+                    )
+                };
+                if status != 0 {
+                    leftovers.push(Leftover {
+                        path,
+                        error: format!("SecKeychainItemDelete: {status}"),
+                    });
                 }
             }
         }
         Err(error) if error.code() == -25300 => {}
         Err(error) => leftovers.push(Leftover {
-            path: "keychain:conduit-mcp/legacy".into(),
+            path: "keychain:conduit-mcp/legacy (inventory unavailable)".into(),
             error: error.to_string(),
         }),
     }
     unsafe {
-        fn k(raw: core_foundation::base::CFTypeRef) -> CFType {
-            unsafe { CFType::wrap_under_get_rule(raw) }
-        }
-        let query = CFDictionary::from_CFType_pairs(&[
+        let base = vec![
             (k(kSecClass.cast()), k(kSecClassGenericPassword.cast())),
             (
                 k(kSecAttrService.cast()),
@@ -176,15 +201,46 @@ pub(crate) fn remove() -> Result<Vec<Leftover>, String> {
                 k(kSecUseDataProtectionKeychain.cast()),
                 CFBoolean::true_value().as_CFType(),
             ),
+        ];
+        let mut search = base.clone();
+        search.extend([
+            (
+                k(kSecReturnAttributes.cast()),
+                CFBoolean::true_value().as_CFType(),
+            ),
+            (k(kSecMatchLimit.cast()), k(kSecMatchLimitAll.cast())),
         ]);
-        let status = SecItemDelete(query.as_concrete_TypeRef().cast());
-        if status != 0 && status != -25300 {
+        let query = CFDictionary::from_CFType_pairs(&search);
+        let mut result = std::ptr::null();
+        let status = SecItemCopyMatching(query.as_concrete_TypeRef().cast(), &mut result);
+        if status == 0 && !result.is_null() {
+            let entries = CFArray::<CFDictionary>::wrap_under_create_rule(result.cast());
+            for attributes in entries.iter() {
+                let Some(account) = account(&attributes) else {
+                    leftovers.push(Leftover {
+                        path: "keychain:conduit-mcp/data-protection (unknown account)".into(),
+                        error: "Keychain did not return an account".into(),
+                    });
+                    continue;
+                };
+                let mut delete = base.clone();
+                delete.push((
+                    k(kSecAttrAccount.cast()),
+                    CFString::new(&account).as_CFType(),
+                ));
+                let query = CFDictionary::from_CFType_pairs(&delete);
+                let status = SecItemDelete(query.as_concrete_TypeRef().cast());
+                if status != 0 && status != -25300 {
+                    leftovers.push(Leftover {
+                        path: format!("keychain:conduit-mcp/data-protection/{account}"),
+                        error: format!("SecItemDelete: {status}"),
+                    });
+                }
+            }
+        } else if status != -25300 {
             leftovers.push(Leftover {
-                path: format!(
-                    "keychain:conduit-mcp/{}",
-                    super::platform::SHARED_ACCESS_GROUP
-                ),
-                error: format!("SecItemDelete: {status}"),
+                path: "keychain:conduit-mcp/data-protection (inventory unavailable)".into(),
+                error: format!("SecItemCopyMatching: {status}"),
             });
         }
     }
