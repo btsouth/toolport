@@ -26,6 +26,7 @@ impl ProbeResult {
         use crate::call_failure::{AuthTarget, CallFailureKind as K};
         if self.auth_required {
             return match self.auth_target {
+                Some(AuthTarget::Scope) => "Permission required",
                 Some(AuthTarget::ServiceCredential) => "Service key required",
                 _ => "Needs sign-in",
             };

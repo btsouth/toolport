@@ -76,6 +76,7 @@ describe("RegistryServerRow status accessibility", () => {
 
   it.each([
     ["endpoint", "Needs sign-in"],
+    ["scope", "Permission required"],
     ["service_credential", "Service key required"],
   ] as const)("shows %s auth ownership", (authTarget, text) => {
     renderRow(true, health({ authRequired: true, authTarget }));

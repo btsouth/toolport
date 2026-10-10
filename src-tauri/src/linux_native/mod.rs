@@ -10513,6 +10513,7 @@ mod tests {
         use crate::call_failure::AuthTarget;
         for (target, text, action) in [
             (AuthTarget::Endpoint, "Needs sign-in", "Sign in"),
+            (AuthTarget::Scope, "Permission required", "Sign in"),
             (
                 AuthTarget::ServiceCredential,
                 "Service key required",

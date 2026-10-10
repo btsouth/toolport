@@ -3,9 +3,11 @@ import { errorHeadline } from "./errors";
 
 export function serverFailureLabel(health: ProbeResult): string {
   if (health.authRequired)
-    return health.authTarget === "service_credential"
-      ? "Service key required"
-      : "Needs sign-in";
+    return health.authTarget === "scope"
+      ? "Permission required"
+      : health.authTarget === "service_credential"
+        ? "Service key required"
+        : "Needs sign-in";
   if (health.error?.includes("downstream server exited")) return "Server stopped";
   if (health.error?.includes("Broken pipe")) return "Connection closed";
   switch (health.failure?.kind) {
