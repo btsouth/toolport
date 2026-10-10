@@ -4869,23 +4869,23 @@ fn team_launch_value(value: &Value) -> Value {
     value
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static PUBLIC_TEST_HOST: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Thread-local host classification fixture. Never built into shipping binaries.
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub struct PublicTeamHostOverride(Option<String>);
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 impl PublicTeamHostOverride {
     pub fn set(host: &str) -> Self {
         Self(PUBLIC_TEST_HOST.with(|value| value.replace(Some(host.into()))))
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for PublicTeamHostOverride {
     fn drop(&mut self) {
         PUBLIC_TEST_HOST.with(|value| value.replace(self.0.take()));
@@ -4893,7 +4893,7 @@ impl Drop for PublicTeamHostOverride {
 }
 
 pub(crate) fn team_host_is_private(host: &str) -> bool {
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     if PUBLIC_TEST_HOST.with(|value| value.borrow().as_deref() == Some(host)) {
         return false;
     }
