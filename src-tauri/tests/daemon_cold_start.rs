@@ -5,6 +5,7 @@
 //! drives an MCP `initialize` + `tools/list` over the internal endpoint. The unit
 //! tests cover the rendezvous primitives and the identity payload; this is the
 //! only test that exercises the two together over a real socket.
+use conduit_lib::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -45,12 +46,17 @@ fn read_descriptor(dir: &std::path::Path) -> Option<serde_json::Value> {
 
 /// A JSON-RPC response body, whether the server answered with `application/json`
 /// or a one-shot `text/event-stream` frame.
-fn json_body(response: ureq::Response) -> serde_json::Value {
+fn json_body(response: ureq::http::Response<ureq::Body>) -> serde_json::Value {
     let content_type = response
-        .header("Content-Type")
+        .headers()
+        .get("Content-Type")
+        .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let body = response.into_string().expect("response body");
+    let body = response
+        .into_body()
+        .read_to_string()
+        .expect("response body");
     if content_type.contains("text/event-stream") {
         body.lines()
             .filter_map(|line| line.strip_prefix("data:"))
@@ -69,16 +75,22 @@ fn post_mcp(
     token: &str,
     session: Option<&str>,
     body: &serde_json::Value,
-) -> ureq::Response {
-    let mut request = ureq::post(&format!("http://{endpoint}/mcp"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Content-Type", "application/json")
-        .set("Accept", "application/json, text/event-stream")
-        .timeout(Duration::from_secs(20));
+) -> ureq::http::Response<ureq::Body> {
+    let mut request = conduit_lib::http_client::agent()
+        .post(&format!("http://{endpoint}/mcp"))
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .set_header("Content-Type", "application/json")
+        .set_header("Accept", "application/json, text/event-stream")
+        .config()
+        .timeout_global(Some(Duration::from_secs(20)))
+        .build();
     if let Some(session) = session {
-        request = request.set("Mcp-Session-Id", session);
+        request = request.set_header("Mcp-Session-Id", session);
     }
-    request.send_json(body.clone()).expect("MCP request")
+    request
+        .send_json(body.clone())
+        .retain_status_body()
+        .expect("MCP request")
 }
 
 #[test]
@@ -123,10 +135,14 @@ fn daemon_cold_start_serves_identity_and_an_mcp_session() {
 
     // 2. The authenticated identity handshake matches the descriptor.
     let identity = json_body(
-        ureq::get(&format!("http://{endpoint}/host/identity"))
-            .set("Authorization", &format!("Bearer {token}"))
-            .timeout(Duration::from_secs(10))
+        conduit_lib::http_client::agent()
+            .get(&format!("http://{endpoint}/host/identity"))
+            .set_header("Authorization", &format!("Bearer {token}"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build()
             .call()
+            .retain_status_body()
             .expect("identity handshake"),
     );
     assert_eq!(identity["compat"], compat);
@@ -134,9 +150,13 @@ fn daemon_cold_start_serves_identity_and_an_mcp_session() {
     assert!(identity["gatewayVersion"].is_string());
 
     // 3. Without the bearer, the identity route is refused.
-    let unauthorized = ureq::get(&format!("http://{endpoint}/host/identity"))
-        .timeout(Duration::from_secs(10))
-        .call();
+    let unauthorized = conduit_lib::http_client::agent()
+        .get(&format!("http://{endpoint}/host/identity"))
+        .config()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .call()
+        .retain_status_body();
     assert!(
         unauthorized.is_err(),
         "the internal identity route must require the bearer"
@@ -159,7 +179,9 @@ fn daemon_cold_start_serves_identity_and_an_mcp_session() {
         }),
     );
     let session = initialize_response
-        .header("Mcp-Session-Id")
+        .headers()
+        .get("Mcp-Session-Id")
+        .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let initialize = json_body(initialize_response);
     assert_eq!(

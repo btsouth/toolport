@@ -5,6 +5,7 @@
 //! descriptor; a daemon holding a live MCP session does not until that session is
 //! deleted. The unit tests cover the rendezvous; this is the only test that watches
 //! the process actually leave.
+use conduit_lib::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -118,16 +119,22 @@ fn post_mcp(
     token: &str,
     session: Option<&str>,
     body: &serde_json::Value,
-) -> ureq::Response {
-    let mut request = ureq::post(&format!("http://{endpoint}/mcp"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Content-Type", "application/json")
-        .set("Accept", "application/json, text/event-stream")
-        .timeout(Duration::from_secs(20));
+) -> ureq::http::Response<ureq::Body> {
+    let mut request = conduit_lib::http_client::agent()
+        .post(&format!("http://{endpoint}/mcp"))
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .set_header("Content-Type", "application/json")
+        .set_header("Accept", "application/json, text/event-stream")
+        .config()
+        .timeout_global(Some(Duration::from_secs(20)))
+        .build();
     if let Some(session) = session {
-        request = request.set("Mcp-Session-Id", session);
+        request = request.set_header("Mcp-Session-Id", session);
     }
-    request.send_json(body.clone()).expect("MCP request")
+    request
+        .send_json(body.clone())
+        .retain_status_body()
+        .expect("MCP request")
 }
 
 #[test]
@@ -182,7 +189,9 @@ fn an_open_listen_stream_prevents_idle_exit() {
         }),
     );
     let session = initialize
-        .header("Mcp-Session-Id")
+        .headers()
+        .get("Mcp-Session-Id")
+        .and_then(|value| value.to_str().ok())
         .map(str::to_string)
         .expect("a session id");
 
@@ -232,8 +241,11 @@ fn updater_shutdown_waits_for_a_client_session_then_exits_without_the_idle_grace
         conduit_lib::daemon::SHUTDOWN_IF_IDLE_PATH
     );
     assert!(matches!(
-        ureq::post(&shutdown_url).call(),
-        Err(ureq::Error::Status(401, _))
+        conduit_lib::http_client::agent()
+            .post(&shutdown_url)
+            .send_empty()
+            .retain_status_body(),
+        Err(conduit_lib::http_client::Error::Status(401, _))
     ));
     let initialize = post_mcp(
         endpoint,
@@ -249,7 +261,9 @@ fn updater_shutdown_waits_for_a_client_session_then_exits_without_the_idle_grace
         }),
     );
     let session = initialize
-        .header("Mcp-Session-Id")
+        .headers()
+        .get("Mcp-Session-Id")
+        .and_then(|value| value.to_str().ok())
         .expect("session id")
         .to_string();
     let mut listen = TcpStream::connect(endpoint).expect("connect session listen stream");
@@ -265,19 +279,23 @@ fn updater_shutdown_waits_for_a_client_session_then_exits_without_the_idle_grace
     let mut head = [0u8; 128];
     let read = listen.read(&mut head).expect("read listen response");
     assert!(String::from_utf8_lossy(&head[..read]).starts_with("HTTP/1.1 200"));
-    ureq::post(&shutdown_url)
-        .set("Authorization", &format!("Bearer {token}"))
-        .call()
+    conduit_lib::http_client::agent()
+        .post(&shutdown_url)
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .send_empty()
+        .retain_status_body()
         .expect("authenticated updater request");
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         child.0.try_wait().expect("daemon status").is_none(),
         "the updater stopped a daemon with a live session"
     );
-    ureq::delete(&format!("http://{endpoint}/mcp"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Mcp-Session-Id", &session)
+    conduit_lib::http_client::agent()
+        .delete(&format!("http://{endpoint}/mcp"))
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .set_header("Mcp-Session-Id", &session)
         .call()
+        .retain_status_body()
         .expect("close client session");
     drop(listen);
     let status = wait_for_exit(&mut child, &dir, Duration::from_secs(5));

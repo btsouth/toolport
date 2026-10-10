@@ -8,6 +8,7 @@
 //!
 //! The HTTP calls (join/pull/push) are thin; the value and the risk live in the merge,
 //! which is pure and unit-tested below.
+use crate::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -111,11 +112,11 @@ fn agent(server_url: &str) -> ureq::Agent {
 /// decides when to return.
 fn agent_with_timeout(server_url: &str, secs: u64) -> ureq::Agent {
     let block_private = block_private_for_team_url(server_url);
-    ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(secs))
-        .redirects(0)
-        .resolver(move |netloc: &str| crate::oauth::screened_resolve(netloc, block_private))
-        .build()
+    let config = crate::http_client::config_builder!()
+        .timeout_global(Some(std::time::Duration::from_secs(secs)))
+        .max_redirects(0)
+        .build();
+    crate::http_client::screened_agent(config, block_private, crate::oauth::screen_addrs)
 }
 
 /// `300 Multiple Choices` is a redirect too, and excluding it made it read as
@@ -131,8 +132,10 @@ fn is_redirect_status(status: u16) -> bool {
 
 /// ureq with `redirects(0)` returns 3xx as a successful response. Treat those as
 /// errors so a team API never follows (or silently accepts) a bearer-bearing hop.
-fn require_no_redirect(resp: ureq::Response) -> Result<ureq::Response, String> {
-    if is_redirect_status(resp.status()) {
+fn require_no_redirect(
+    resp: ureq::http::Response<ureq::Body>,
+) -> Result<ureq::http::Response<ureq::Body>, String> {
+    if is_redirect_status(resp.status().as_u16()) {
         Err("team server redirected; Toolport does not follow redirects on team API calls".into())
     } else {
         Ok(resp)
@@ -185,9 +188,15 @@ pub fn join(
         agent(server_url)
             .post(&url)
             .send_json(body)
+            .retain_status_body()
             .map_err(stringify)?,
     )?;
-    let v: Value = resp.into_json().map_err(|e| e.to_string())?;
+    let v: Value = resp
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
+        .map_err(|e| e.to_string())?;
     // An approval-gated link hands back a request token instead of a member token.
     if v["pending"].as_bool().unwrap_or(false) {
         let request_token = v["request_token"].as_str().unwrap_or_default().to_string();
@@ -225,9 +234,15 @@ pub fn poll_join(
         agent(server_url)
             .post(&url)
             .send_json(body)
+            .retain_status_body()
             .map_err(stringify)?,
     )?;
-    let v: Value = resp.into_json().map_err(|e| e.to_string())?;
+    let v: Value = resp
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
+        .map_err(|e| e.to_string())?;
     match v["status"].as_str().unwrap_or("") {
         "approved" => {
             complete_join(server_url, member_name, joined_from(&v)?).map(JoinPoll::Connected)
@@ -268,17 +283,26 @@ pub fn pull_config(
         .unwrap_or_else(|| format!("\"v{last_version}\""));
     let req = ag
         .get(&url)
-        .set("authorization", &format!("Bearer {token}"))
-        .set("if-none-match", &etag);
-    match req.call() {
+        .set_header("authorization", &format!("Bearer {token}"))
+        .set_header("if-none-match", &etag);
+    match req.call().retain_status_body() {
         Ok(resp) => {
-            if resp.status() == 304 {
+            if resp.status().as_u16() == 304 {
                 return Ok(None);
             }
             let resp = require_no_redirect(resp)?;
             // Capture the fresh ETag before the body consumes `resp`.
-            let new_etag = resp.header("etag").map(str::to_string);
-            let v: Value = resp.into_json().map_err(|e| e.to_string())?;
+            let new_etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let v: Value = resp
+                .into_body()
+                .with_config()
+                .limit(u64::MAX)
+                .read_json()
+                .map_err(|e| e.to_string())?;
             // Guard a malformed-but-200 body: without a real server list we must NOT
             // proceed, since apply_team_config would read the missing list as "the team
             // removed every server" and wipe the user's merged team servers. An empty
@@ -293,7 +317,7 @@ pub fn pull_config(
                 .ok_or("team server returned a config without a version")?;
             Ok(Some((version, config, new_etag)))
         }
-        Err(ureq::Error::Status(304, _)) => Ok(None),
+        Err(crate::http_client::Error::Status(304, _)) => Ok(None),
         // A team that has never had a config pushed yet returns 404 (no config row on the
         // server). That is "nothing to sync," not a failure: without this, the first
         // pull_config in `connect` errors out and rolls the just-saved member token back, so
@@ -301,7 +325,7 @@ pub fn pull_config(
         // `{servers:[]}` 200 for this case; this keeps a new client working against an older
         // self-hosted server that still 404s. Mirrors `fetch_me`/`post_usage_day` below,
         // which likewise treat a 404 as "resource/endpoint absent, degrade gracefully."
-        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(crate::http_client::Error::Status(404, _)) => Ok(None),
         Err(e) => Err(stringify(e)),
     }
 }
@@ -331,12 +355,18 @@ pub fn fetch_me(server_url: &str, team_id: &str, token: &str) -> Result<Membersh
     let url = format!("{}/teams/{}/me", base(server_url), team_id);
     match agent(server_url)
         .get(&url)
-        .set("authorization", &format!("Bearer {token}"))
+        .set_header("authorization", &format!("Bearer {token}"))
         .call()
+        .retain_status_body()
     {
         Ok(resp) => {
             let resp = require_no_redirect(resp)?;
-            let v: Value = resp.into_json().map_err(|e| e.to_string())?;
+            let v: Value = resp
+                .into_body()
+                .with_config()
+                .limit(u64::MAX)
+                .read_json()
+                .map_err(|e| e.to_string())?;
             // Fail noisily on a malformed 200 rather than defaulting to "member": a
             // silent default would demote an admin's persisted role on a buggy response.
             let role = v["role"]
@@ -349,8 +379,8 @@ pub fn fetch_me(server_url: &str, team_id: &str, token: &str) -> Result<Membersh
                 account_linked: v["accountLinked"].as_bool(),
             })
         }
-        Err(ureq::Error::Status(401 | 403, _)) => Ok(MembershipCheck::Removed),
-        Err(ureq::Error::Status(404, _)) => Ok(MembershipCheck::Unsupported),
+        Err(crate::http_client::Error::Status(401 | 403, _)) => Ok(MembershipCheck::Removed),
+        Err(crate::http_client::Error::Status(404, _)) => Ok(MembershipCheck::Unsupported),
         Err(e) => Err(stringify(e)),
     }
 }
@@ -372,12 +402,18 @@ fn fetch_config_for_update(
     let url = format!("{}/teams/{}/config?manage=1", base(server_url), team_id);
     match agent(server_url)
         .get(&url)
-        .set("authorization", &format!("Bearer {token}"))
+        .set_header("authorization", &format!("Bearer {token}"))
         .call()
+        .retain_status_body()
     {
         Ok(resp) => {
             let resp = require_no_redirect(resp)?;
-            let v: Value = resp.into_json().map_err(|e| e.to_string())?;
+            let v: Value = resp
+                .into_body()
+                .with_config()
+                .limit(u64::MAX)
+                .read_json()
+                .map_err(|e| e.to_string())?;
             let version = v["version"]
                 .as_i64()
                 .ok_or("team server returned a config without a version")?;
@@ -389,7 +425,7 @@ fn fetch_config_for_update(
         }
         // Older self-hosted servers can have no config row until the first push. Version zero
         // is the optimistic-concurrency baseline used by current servers for that empty state.
-        Err(ureq::Error::Status(404, _)) => Ok((0, json!({ "servers": [] }))),
+        Err(crate::http_client::Error::Status(404, _)) => Ok((0, json!({ "servers": [] }))),
         Err(e) => Err(stringify(e)),
     }
 }
@@ -768,15 +804,16 @@ pub fn push_config(
     let body = push_body(config, base_version);
     let resp = match agent(server_url)
         .put(&url)
-        .set("authorization", &format!("Bearer {token}"))
+        .set_header("authorization", &format!("Bearer {token}"))
         .send_json(body)
+        .retain_status_body()
     {
         Ok(resp) => require_no_redirect(resp)?,
-        Err(ureq::Error::Status(status, resp)) => {
+        Err(crate::http_client::Error::Status(status, resp)) => {
             if let Some(message) = push_status_message(status) {
                 return Err(message.into());
             }
-            let body = resp.into_string().unwrap_or_default();
+            let body = resp.into_body().read_to_string().unwrap_or_default();
             let not_admin_session = serde_json::from_str::<Value>(&body)
                 .ok()
                 .and_then(|value| value["error"].as_str().map(str::to_owned))
@@ -788,8 +825,13 @@ pub fn push_config(
         }
         Err(e) => return Err(stringify(e)),
     };
-    let status = resp.status();
-    let v: Value = resp.into_json().map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    let v: Value = resp
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
+        .map_err(|e| e.to_string())?;
     parse_push_response(server_url, status, v)
 }
 
@@ -821,25 +863,41 @@ fn post_usage_day(
     }
     match agent(server_url)
         .post(&url)
-        .set("authorization", &format!("Bearer {token}"))
+        .set_header("authorization", &format!("Bearer {token}"))
         .send_json(body)
+        .retain_status_body()
     {
         Ok(resp) => {
             require_no_redirect(resp)?;
             Ok(true)
         }
-        Err(ureq::Error::Status(404 | 405, _)) => Ok(false),
+        Err(crate::http_client::Error::Status(404 | 405, _)) => Ok(false),
         Err(e) => Err(stringify(e)),
     }
 }
 
-fn stringify(e: ureq::Error) -> String {
+#[cfg(test)]
+#[test]
+fn connect_errors_keep_socket_wording_in_team_messages() {
+    let io = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+    let expected = format!("could not reach the team server: {io}");
+    let error = crate::http_client::mark_connect_failure(ureq::Error::Io(io));
+    assert_eq!(
+        stringify(crate::http_client::Error::Transport(error)),
+        expected
+    );
+}
+
+fn stringify(e: crate::http_client::Error) -> String {
     match e {
-        ureq::Error::Status(code, resp) => {
-            let msg = resp.into_string().unwrap_or_default();
+        crate::http_client::Error::Status(code, resp) => {
+            let msg = resp.into_body().read_to_string().unwrap_or_default();
             format!("server returned {code}: {}", msg.trim())
         }
-        ureq::Error::Transport(t) => format!("could not reach the team server: {t}"),
+        crate::http_client::Error::Transport(t) => format!(
+            "could not reach the team server: {}",
+            crate::http_client::transport_error_message(&t)
+        ),
     }
 }
 
@@ -942,9 +1000,13 @@ pub fn pair_device(
             std::env::consts::OS,
             env!("CARGO_PKG_VERSION"),
         ))
+        .retain_status_body()
         .map_err(stringify)?;
     let data: Value = require_no_redirect(response)?
-        .into_json()
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
         .map_err(|e| e.to_string())?;
     let transaction = data["transaction"]
         .as_str()
@@ -961,9 +1023,13 @@ pub fn pair_device(
         let response = agent(origin)
             .post(&format!("{}/pairing/{transaction}/poll", base(origin)))
             .send_json(json!({"verifier":verifier}))
+            .retain_status_body()
             .map_err(stringify)?;
         let data: Value = require_no_redirect(response)?
-            .into_json()
+            .into_body()
+            .with_config()
+            .limit(u64::MAX)
+            .read_json()
             .map_err(|e| e.to_string())?;
         if let Some(code) = data["connectCode"].as_str() {
             match connect(origin, code, None)? {
@@ -1451,11 +1517,17 @@ fn report_activation(conn: &TeamConnection, token: &str) -> Result<(), String> {
                 base(&conn.server_url),
                 conn.team_id
             ))
-            .set("authorization", &format!("Bearer {token}"))
+            .set_header("authorization", &format!("Bearer {token}"))
             .send_json(body)
+            .retain_status_body()
             .map_err(stringify)?;
         let response = require_no_redirect(response)?;
-        let ack: Value = response.into_json().map_err(|e| e.to_string())?;
+        let ack: Value = response
+            .into_body()
+            .with_config()
+            .limit(u64::MAX)
+            .read_json()
+            .map_err(|e| e.to_string())?;
         let revision = ack
             .get("acknowledgedRevision")
             .and_then(Value::as_u64)
@@ -2171,14 +2243,15 @@ fn post_call_events(
     let body = json!({ "events": events });
     match agent(server_url)
         .post(&url)
-        .set("authorization", &format!("Bearer {token}"))
+        .set_header("authorization", &format!("Bearer {token}"))
         .send_json(body)
+        .retain_status_body()
     {
         Ok(resp) => {
             require_no_redirect(resp)?;
             Ok(true)
         }
-        Err(ureq::Error::Status(404 | 405, _)) => Ok(false),
+        Err(crate::http_client::Error::Status(404 | 405, _)) => Ok(false),
         Err(e) => Err(stringify(e)),
     }
 }
@@ -2250,11 +2323,15 @@ pub fn account_link() -> Result<String, String> {
             base(&conn.server_url),
             conn.team_id
         ))
-        .set("authorization", &format!("Bearer {token}"))
+        .set_header("authorization", &format!("Bearer {token}"))
         .send_json(json!({}))
+        .retain_status_body()
         .map_err(stringify)?;
     let body: Value = require_no_redirect(response)?
-        .into_json()
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
         .map_err(|e| e.to_string())?;
     let url = body
         .get("url")
@@ -3343,14 +3420,20 @@ fn fetch_change_labels(
             base(&conn.server_url),
             conn.team_id
         ))
-        .set("authorization", &format!("Bearer {token}"))
+        .set_header("authorization", &format!("Bearer {token}"))
         .call()
+        .retain_status_body()
     {
         Ok(response) => require_no_redirect(response)?,
-        Err(ureq::Error::Status(404, _)) => return Ok(vec![]),
+        Err(crate::http_client::Error::Status(404, _)) => return Ok(vec![]),
         Err(error) => return Err(stringify(error)),
     };
-    let data = response.into_json().map_err(|e| e.to_string())?;
+    let data = response
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
+        .map_err(|e| e.to_string())?;
     Ok(covered_changes(data, since, version))
 }
 

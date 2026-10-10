@@ -6,6 +6,7 @@
 //!
 //! Both produce the same [`CatalogEntry`] shape, which the UI turns into a
 //! registry server with one click - the existing auth flow then handles creds.
+use crate::http_client::ResponseResultExt as _;
 
 use crate::registry::{ArgBinding, ArgPart, LaunchConfig, LaunchInput};
 use serde::{Deserialize, Serialize};
@@ -1067,13 +1068,18 @@ fn bounded_registry_fetch(
 
 fn fetch_registry(url: &str) -> Result<Vec<CatalogEntry>, RegistryStatus> {
     use std::io::Read;
-    let resp = ureq::get(url)
-        .timeout(std::time::Duration::from_secs(5))
+    let resp = crate::http_client::agent()
+        .get(url)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(5)))
+        .build()
         .call()
+        .retain_status_body()
         .map_err(|error| registry_failure(&error))?;
     // Cap the registry response (defense in depth against a huge or MITM'd body).
     let mut buf = Vec::new();
-    resp.into_reader()
+    resp.into_body()
+        .into_reader()
         .take(8 * 1024 * 1024)
         .read_to_end(&mut buf)
         .map_err(|error| registry_failure(&error))?;

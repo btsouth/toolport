@@ -1,4 +1,5 @@
 //! #759: exercise the shipped gateway/worker boundary, not an in-process Boa harness.
+use conduit_lib::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -112,9 +113,7 @@ impl Gateway {
         };
         if let (Some(port), Some(token)) = (http_port, http_token) {
             let deadline = Instant::now() + Duration::from_secs(20);
-            let agent = ureq::AgentBuilder::new()
-                .timeout(Duration::from_millis(500))
-                .build();
+            let agent = conduit_lib::http_client::agent();
             loop {
                 assert!(
                     gateway.child.try_wait().unwrap().is_none(),
@@ -125,10 +124,12 @@ impl Gateway {
                 // before this child has actually bound its HTTP listener.
                 let ready = agent
                     .get(&format!("http://127.0.0.1:{port}/"))
-                    .set("Authorization", &format!("Bearer {token}"))
+                    .config().timeout_global(Some(Duration::from_millis(500))).build()
+                    .set_header("Authorization", &format!("Bearer {token}"))
                     .call()
+                    .retain_status_body()
                     .ok()
-                    .and_then(|response| response.into_string().ok())
+                    .and_then(|response| response.into_body().read_to_string().ok())
                     .is_some_and(|body| body.starts_with("Toolport gateway (HTTP mode)."));
                 if ready {
                     return gateway;
@@ -202,21 +203,26 @@ impl Gateway {
     }
 
     fn http_call(&self, token: &str, name: &str, args: Value) -> Value {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(75))
-            .build();
+        let agent = conduit_lib::http_client::agent();
         let response = agent
             .post(&format!(
                 "http://127.0.0.1:{}/{name}",
                 self.http_port.unwrap()
             ))
-            .set("Authorization", &format!("Bearer {token}"))
-            .send_json(args);
+            .config().timeout_global(Some(Duration::from_secs(75))).build()
+            .set_header("Authorization", &format!("Bearer {token}"))
+            .send_json(args)
+            .retain_status_body();
         let response = match response {
-            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Ok(response) | Err(conduit_lib::http_client::Error::Status(_, response)) => response,
             Err(error) => panic!("HTTP gateway failed: {error}"),
         };
-        response.into_json().expect("JSON HTTP result")
+        response
+            .into_body()
+            .with_config()
+            .limit(u64::MAX)
+            .read_json()
+            .expect("JSON HTTP result")
     }
 
     fn audit(&self) -> Vec<Value> {

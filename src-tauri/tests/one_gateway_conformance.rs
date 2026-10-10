@@ -20,6 +20,7 @@
 //! `--stdio-adapter` roles, the real rendezvous files, and the real
 //! `mock-mcp-server` fixture as the downstream. Every wait is bounded, so a
 //! case that hangs fails its own deadline rather than the CI job.
+use conduit_lib::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 mod discovery_support;
 
@@ -801,12 +802,17 @@ fn wait_for_descriptor(dir: &Path, within: Duration) -> Value {
 
 /// A JSON-RPC response body, whether the server answered with `application/json`
 /// or a one-shot `text/event-stream` frame (mirrors `tests/daemon_cold_start.rs`).
-fn json_body(response: ureq::Response) -> Value {
+fn json_body(response: ureq::http::Response<ureq::Body>) -> Value {
     let content_type = response
-        .header("Content-Type")
+        .headers()
+        .get("Content-Type")
+        .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let body = response.into_string().expect("response body");
+    let body = response
+        .into_body()
+        .read_to_string()
+        .expect("response body");
     if content_type.contains("text/event-stream") {
         body.lines()
             .filter_map(|line| line.strip_prefix("data:"))
@@ -824,10 +830,14 @@ fn json_body(response: ureq::Response) -> Value {
 /// errors, and a wrong bearer alike: from a caller's point of view none of them
 /// is a daemon it may talk to.
 fn probe_identity(endpoint: &str, token: &str) -> Result<Value, String> {
-    let response = ureq::get(&format!("http://{endpoint}/host/identity"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .timeout(Duration::from_secs(10))
+    let response = conduit_lib::http_client::agent()
+        .get(&format!("http://{endpoint}/host/identity"))
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .config()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
         .call()
+        .retain_status_body()
         .map_err(|e| format!("identity probe failed: {e}"))?;
     Ok(json_body(response))
 }
@@ -1674,31 +1684,48 @@ fn matrix_rollout_default_selects_the_shared_daemon() {
     let token = descriptor["token"].as_str().expect("daemon bearer");
     let url = format!("http://{endpoint}{}", conduit_lib::daemon::TOPOLOGY_PATH);
     assert!(
-        matches!(ureq::get(&url).call(), Err(ureq::Error::Status(401, _))),
+        matches!(
+            conduit_lib::http_client::agent()
+                .get(&url)
+                .call()
+                .retain_status_body(),
+            Err(conduit_lib::http_client::Error::Status(401, _))
+        ),
         "topology probe must require the private bearer"
     );
-    let public_route = ureq::get(&format!("http://{endpoint}/openapi.json"))
-        .set("Authorization", "Bearer registered-probe-token")
+    let public_route = conduit_lib::http_client::agent()
+        .get(&format!("http://{endpoint}/openapi.json"))
+        .set_header("Authorization", "Bearer registered-probe-token")
         .call()
+        .retain_status_body()
         .expect("registered client can reach an ordinary HTTP route");
-    assert_eq!(public_route.status(), 200);
+    assert_eq!(public_route.status().as_u16(), 200);
     for path in [
         conduit_lib::daemon::IDENTITY_PATH,
         conduit_lib::daemon::TOPOLOGY_PATH,
     ] {
-        let response = ureq::get(&format!("http://{endpoint}{path}"))
-            .set("Authorization", "Bearer registered-probe-token")
-            .call();
+        let response = conduit_lib::http_client::agent()
+            .get(&format!("http://{endpoint}{path}"))
+            .set_header("Authorization", "Bearer registered-probe-token")
+            .call()
+            .retain_status_body();
         assert!(
-            matches!(&response, Err(ureq::Error::Status(401, _))),
+            matches!(
+                &response,
+                Err(conduit_lib::http_client::Error::Status(401, _))
+            ),
             "a registered HTTP client token reached private {path}: {response:?}"
         );
     }
     let topology = json_body(
-        ureq::get(&url)
-            .set("Authorization", &format!("Bearer {token}"))
-            .timeout(Duration::from_secs(10))
+        conduit_lib::http_client::agent()
+            .get(&url)
+            .set_header("Authorization", &format!("Bearer {token}"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build()
             .call()
+            .retain_status_body()
             .expect("authenticated topology probe"),
     );
     assert_eq!(topology["role"], "daemon");
@@ -1719,31 +1746,41 @@ fn matrix_rollout_default_selects_the_shared_daemon() {
         "bindHost": "bridge.example"
     });
     assert!(matches!(
-        ureq::post(&lease_url)
-            .set("Authorization", "Bearer registered-probe-token")
-            .send_json(lease_body.clone()),
-        Err(ureq::Error::Status(401, _))
+        conduit_lib::http_client::agent()
+            .post(&lease_url)
+            .set_header("Authorization", "Bearer registered-probe-token")
+            .send_json(lease_body.clone())
+            .retain_status_body(),
+        Err(conduit_lib::http_client::Error::Status(401, _))
     ));
-    ureq::post(&lease_url)
-        .set("Authorization", &format!("Bearer {token}"))
+    conduit_lib::http_client::agent()
+        .post(&lease_url)
+        .set_header("Authorization", &format!("Bearer {token}"))
         .send_json(lease_body.clone())
+        .retain_status_body()
         .expect("private bearer acquires public bridge lease");
-    ureq::get(&format!("http://{endpoint}/openapi.json"))
-        .set("Authorization", "Bearer registered-probe-token")
-        .set("Origin", "http://127.0.0.1")
+    conduit_lib::http_client::agent()
+        .get(&format!("http://{endpoint}/openapi.json"))
+        .set_header("Authorization", "Bearer registered-probe-token")
+        .set_header("Origin", "http://127.0.0.1")
         .call()
+        .retain_status_body()
         .expect("service lease keeps registered clients' Origin policy");
-    ureq::get(&format!("http://{endpoint}/openapi.json"))
-        .set("Authorization", &format!("Bearer {bridge_token}"))
-        .set("Origin", "http://bridge.example")
+    conduit_lib::http_client::agent()
+        .get(&format!("http://{endpoint}/openapi.json"))
+        .set_header("Authorization", &format!("Bearer {bridge_token}"))
+        .set_header("Origin", "http://bridge.example")
         .call()
+        .retain_status_body()
         .expect("leased bridge token reaches its public origin");
     assert!(matches!(
-        ureq::get(&format!("http://{endpoint}/openapi.json"))
-            .set("Authorization", &format!("Bearer {bridge_token}"))
-            .set("Origin", "http://attacker.example")
-            .call(),
-        Err(ureq::Error::Status(403, _))
+        conduit_lib::http_client::agent()
+            .get(&format!("http://{endpoint}/openapi.json"))
+            .set_header("Authorization", &format!("Bearer {bridge_token}"))
+            .set_header("Origin", "http://attacker.example")
+            .call()
+            .retain_status_body(),
+        Err(conduit_lib::http_client::Error::Status(403, _))
     ));
     for path in [
         conduit_lib::daemon::IDENTITY_PATH,
@@ -1751,35 +1788,49 @@ fn matrix_rollout_default_selects_the_shared_daemon() {
         conduit_lib::daemon::HTTP_SERVICE_LEASE_PATH,
         conduit_lib::daemon::SHUTDOWN_IF_IDLE_PATH,
     ] {
-        let response = ureq::get(&format!("http://{endpoint}{path}"))
-            .set("Authorization", &format!("Bearer {bridge_token}"))
-            .call();
+        let response = conduit_lib::http_client::agent()
+            .get(&format!("http://{endpoint}{path}"))
+            .set_header("Authorization", &format!("Bearer {bridge_token}"))
+            .call()
+            .retain_status_body();
         assert!(
-            matches!(response, Err(ureq::Error::Status(401, _))),
+            matches!(
+                response,
+                Err(conduit_lib::http_client::Error::Status(401, _))
+            ),
             "leased public bearer reached private {path}"
         );
     }
     for bearer in [bridge_token, "registered-probe-token"] {
-        let response = ureq::post(&format!(
-            "http://{endpoint}{}",
-            conduit_lib::daemon::SHUTDOWN_IF_IDLE_PATH
-        ))
-        .set("Authorization", &format!("Bearer {bearer}"))
-        .call();
+        let response = conduit_lib::http_client::agent()
+            .post(&format!(
+                "http://{endpoint}{}",
+                conduit_lib::daemon::SHUTDOWN_IF_IDLE_PATH
+            ))
+            .set_header("Authorization", &format!("Bearer {bearer}"))
+            .send_empty()
+            .retain_status_body();
         assert!(
-            matches!(response, Err(ureq::Error::Status(401, _))),
+            matches!(
+                response,
+                Err(conduit_lib::http_client::Error::Status(401, _))
+            ),
             "a non-private bearer reached the shutdown endpoint: {response:?}"
         );
     }
-    ureq::delete(&lease_url)
-        .set("Authorization", &format!("Bearer {token}"))
-        .send_json(lease_body)
+    conduit_lib::http_client::agent()
+        .delete(&lease_url)
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .force_send_body().send_json(lease_body)
+        .retain_status_body()
         .expect("private bearer releases public bridge lease");
     assert!(matches!(
-        ureq::get(&format!("http://{endpoint}/openapi.json"))
-            .set("Authorization", &format!("Bearer {bridge_token}"))
-            .call(),
-        Err(ureq::Error::Status(401, _))
+        conduit_lib::http_client::agent()
+            .get(&format!("http://{endpoint}/openapi.json"))
+            .set_header("Authorization", &format!("Bearer {bridge_token}"))
+            .call()
+            .retain_status_body(),
+        Err(conduit_lib::http_client::Error::Status(401, _))
     ));
 }
 
@@ -1833,12 +1884,19 @@ fn matrix_desktop_http_proxy_shares_daemon_and_releases_lease() {
             proxy.0.try_wait().unwrap().is_none(),
             "HTTP proxy exited before readiness"
         );
-        if let Ok(response) = ureq::get(&format!("{public_url}/"))
-            .timeout(Duration::from_millis(300))
-            .set("Authorization", &format!("Bearer {public_token}"))
+        if let Ok(response) = conduit_lib::http_client::agent()
+            .get(&format!("{public_url}/"))
+            .config()
+            .timeout_global(Some(Duration::from_millis(300)))
+            .build()
+            .set_header("Authorization", &format!("Bearer {public_token}"))
             .call()
+            .retain_status_body()
         {
-            let banner = response.into_string().expect("read proxy readiness banner");
+            let banner = response
+                .into_body()
+                .read_to_string()
+                .expect("read proxy readiness banner");
             assert!(
                 banner.starts_with("Toolport gateway (HTTP mode)."),
                 "desktop readiness requires the HTTP-mode banner: {banner}"
@@ -1849,31 +1907,38 @@ fn matrix_desktop_http_proxy_shares_daemon_and_releases_lease() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(
-        ureq::get(&format!("{public_url}/openapi.json"))
-            .set("Authorization", "Bearer registered-proxy-token")
-            .set("Origin", "http://127.0.0.1")
+        conduit_lib::http_client::agent()
+            .get(&format!("{public_url}/openapi.json"))
+            .set_header("Authorization", "Bearer registered-proxy-token")
+            .set_header("Origin", "http://127.0.0.1")
             .call()
+            .retain_status_body()
             .expect("registered client reaches Shared HTTP through the proxy")
-            .status(),
+            .status()
+            .as_u16(),
         200
     );
 
     let request = |id: u64, method: &str, mut params: Value| {
         params["_meta"] = json!({ "io.modelcontextprotocol/protocolVersion": "2026-07-28" });
-        let mut request = ureq::post(&format!("{public_url}/mcp"))
-            .timeout(Duration::from_secs(10))
-            .set("Authorization", &format!("Bearer {public_token}"))
-            .set("MCP-Protocol-Version", "2026-07-28")
-            .set("Mcp-Method", method)
-            .set("Accept", "application/json");
+        let mut request = conduit_lib::http_client::agent()
+            .post(&format!("{public_url}/mcp"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build()
+            .set_header("Authorization", &format!("Bearer {public_token}"))
+            .set_header("MCP-Protocol-Version", "2026-07-28")
+            .set_header("Mcp-Method", method)
+            .set_header("Accept", "application/json");
         if let Some(name) = params.get("name").and_then(Value::as_str) {
-            request = request.set("Mcp-Name", name);
+            request = request.set_header("Mcp-Name", name);
         }
         json_body(
             request
                 .send_json(json!({
                     "jsonrpc": "2.0", "id": id, "method": method, "params": params
                 }))
+                .retain_status_body()
                 .expect("public MCP request through proxy"),
         )
     };
@@ -1906,15 +1971,19 @@ fn matrix_desktop_http_proxy_shares_daemon_and_releases_lease() {
         assert!(Instant::now() < deadline, "HTTP proxy ignored parent EOF");
         std::thread::sleep(Duration::from_millis(25));
     }
-    ureq::get(&identity_url)
-        .set("Authorization", &format!("Bearer {private_token}"))
+    conduit_lib::http_client::agent()
+        .get(&identity_url)
+        .set_header("Authorization", &format!("Bearer {private_token}"))
         .call()
+        .retain_status_body()
         .expect("shared daemon survives desktop bridge exit");
     assert!(matches!(
-        ureq::get(&format!("http://{endpoint}/openapi.json"))
-            .set("Authorization", &format!("Bearer {public_token}"))
-            .call(),
-        Err(ureq::Error::Status(401, _))
+        conduit_lib::http_client::agent()
+            .get(&format!("http://{endpoint}/openapi.json"))
+            .set_header("Authorization", &format!("Bearer {public_token}"))
+            .call()
+            .retain_status_body(),
+        Err(conduit_lib::http_client::Error::Status(401, _))
     ));
 }
 
@@ -2160,23 +2229,25 @@ fn matrix_pooling_sessionless_modern_requests_keep_a_warm_root_launch() {
         "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}
     });
     let request = || {
-        let response = ureq::post(&format!("http://{endpoint}/mcp"))
-            .set("Authorization", &format!("Bearer {token}"))
-            .set(
+        let response = conduit_lib::http_client::agent()
+            .post(&format!("http://{endpoint}/mcp"))
+            .set_header("Authorization", &format!("Bearer {token}"))
+            .set_header(
                 conduit_lib::stdio_adapter::ADAPTER_CLIENT_ID_HEADER,
                 "sessionless-root",
             )
-            .set(
+            .set_header(
                 conduit_lib::stdio_adapter::ADAPTER_CWD_HEADER,
                 &encoded_root,
             )
-            .set("MCP-Protocol-Version", "2026-07-28")
-            .set("Mcp-Method", "tools/list")
-            .set("Accept", "application/json")
-            .set("Content-Type", "application/json")
-            .send_string(&body.to_string())
+            .set_header("MCP-Protocol-Version", "2026-07-28")
+            .set_header("Mcp-Method", "tools/list")
+            .set_header("Accept", "application/json")
+            .set_header("Content-Type", "application/json")
+            .send(&body.to_string())
+            .retain_status_body()
             .expect("modern rooted tools/list");
-        let value: Value = serde_json::from_reader(response.into_reader()).unwrap();
+        let value: Value = serde_json::from_reader(response.into_body().into_reader()).unwrap();
         assert!(
             value["result"]["tools"]
                 .as_array()
@@ -3129,38 +3200,53 @@ fn matrix_routing_profiles_cannot_reach_servers_outside_their_scope() {
     let descriptor = wait_for_descriptor(&dir, Duration::from_secs(10));
     let endpoint = descriptor["endpoint"].as_str().expect("endpoint");
     let token = descriptor["token"].as_str().expect("token");
-    let rejected = ureq::post(&format!("http://{endpoint}/mcp"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set(
+    let rejected = conduit_lib::http_client::agent()
+        .post(&format!("http://{endpoint}/mcp"))
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .set_header(
             conduit_lib::stdio_adapter::ADAPTER_PROFILE_HEADER,
             "scope-two",
         )
-        .set("Content-Type", "application/json")
-        .send_string(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+        .set_header("Content-Type", "application/json")
+        .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .retain_status_body();
     assert!(
-        matches!(rejected, Err(ureq::Error::Status(401, _))),
+        matches!(
+            rejected,
+            Err(conduit_lib::http_client::Error::Status(401, _))
+        ),
         "a profile claim without a client id must be refused"
     );
-    let rejected_root = ureq::post(&format!("http://{endpoint}/mcp"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set(conduit_lib::stdio_adapter::ADAPTER_CWD_HEADER, "!!!")
-        .set("Content-Type", "application/json")
-        .send_string(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    let rejected_root = conduit_lib::http_client::agent()
+        .post(&format!("http://{endpoint}/mcp"))
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .set_header(conduit_lib::stdio_adapter::ADAPTER_CWD_HEADER, "!!!")
+        .set_header("Content-Type", "application/json")
+        .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .retain_status_body();
     assert!(
-        matches!(rejected_root, Err(ureq::Error::Status(401, _))),
+        matches!(
+            rejected_root,
+            Err(conduit_lib::http_client::Error::Status(401, _))
+        ),
         "a root claim without a client id must be refused"
     );
-    let malformed_root = ureq::post(&format!("http://{endpoint}/mcp"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set(
+    let malformed_root = conduit_lib::http_client::agent()
+        .post(&format!("http://{endpoint}/mcp"))
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .set_header(
             conduit_lib::stdio_adapter::ADAPTER_CLIENT_ID_HEADER,
             "matrix-root",
         )
-        .set(conduit_lib::stdio_adapter::ADAPTER_CWD_HEADER, "!!!")
-        .set("Content-Type", "application/json")
-        .send_string(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+        .set_header(conduit_lib::stdio_adapter::ADAPTER_CWD_HEADER, "!!!")
+        .set_header("Content-Type", "application/json")
+        .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .retain_status_body();
     assert!(
-        matches!(malformed_root, Err(ureq::Error::Status(401, _))),
+        matches!(
+            malformed_root,
+            Err(conduit_lib::http_client::Error::Status(401, _))
+        ),
         "a malformed root claim must be refused"
     );
 

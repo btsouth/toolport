@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! What a killed or crashed host daemon leaves behind, end to end.
 //!
 //! - Its stdio servers do not outlive it: on Linux the direct child gets
@@ -11,8 +12,7 @@
 //! The servers used here ignore stdin EOF, like ones holding a listener or a
 //! pool, so only an explicit kill stops them. Everything runs against a scratch
 //! data directory, and every process signalled is one this test started.
-
-#![cfg(unix)]
+use conduit_lib::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -278,15 +278,21 @@ fn mcp_request(scratch: &Scratch, daemon: &ChildGuard, method: &str, params: Val
     let endpoint = descriptor["endpoint"].as_str().unwrap().to_string();
     let token = descriptor["token"].as_str().unwrap().to_string();
     let post = |body: Value, session: Option<&str>| {
-        let mut request = ureq::post(&format!("http://{endpoint}/mcp"))
-            .set("Authorization", &format!("Bearer {token}"))
-            .set("Content-Type", "application/json")
-            .set("Accept", "application/json, text/event-stream")
-            .timeout(Duration::from_secs(30));
+        let mut request = conduit_lib::http_client::agent()
+            .post(&format!("http://{endpoint}/mcp"))
+            .set_header("Authorization", &format!("Bearer {token}"))
+            .set_header("Content-Type", "application/json")
+            .set_header("Accept", "application/json, text/event-stream")
+            .config()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build();
         if let Some(session) = session {
-            request = request.set("Mcp-Session-Id", session);
+            request = request.set_header("Mcp-Session-Id", session);
         }
-        request.send_json(body).expect("daemon request")
+        request
+            .send_json(body)
+            .retain_status_body()
+            .expect("daemon request")
     };
     let initialize = post(
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
@@ -294,16 +300,18 @@ fn mcp_request(scratch: &Scratch, daemon: &ChildGuard, method: &str, params: Val
             "clientInfo":{"name":"crash","version":"1"}}}),
         None,
     );
-    let session = initialize.header("Mcp-Session-Id").unwrap().to_string();
+    let session = initialize.headers().get("Mcp-Session-Id").and_then(|value| value.to_str().ok()).unwrap().to_string();
     let reply = post(
         json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}),
         Some(&session),
     );
     let sse = reply
-        .header("Content-Type")
+        .headers()
+        .get("Content-Type")
+        .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .contains("text/event-stream");
-    let body = reply.into_string().unwrap();
+    let body = reply.into_body().read_to_string().unwrap();
     let message: Value = if sse {
         body.lines()
             .filter_map(|line| line.strip_prefix("data:"))

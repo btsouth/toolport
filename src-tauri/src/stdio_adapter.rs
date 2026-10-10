@@ -32,6 +32,7 @@
 //! requires. Notifications stay on the reader thread, which keeps a cancellation
 //! ahead of whatever is queued behind it (MCP cancellation is best-effort, so one
 //! that loses the race simply does not apply).
+use crate::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -545,28 +546,28 @@ impl Session {
         }
     }
 
-    fn with_identity(&self, request: ureq::Request) -> ureq::Request {
+    fn with_identity<B>(&self, request: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
         let request = request
-            .set(ADAPTER_CLIENT_ID_HEADER, &self.client_id)
-            .set("Toolport-Adapter-Pid", &std::process::id().to_string())
-            .set("Toolport-Adapter-Instance", &self.instance);
+            .set_header(ADAPTER_CLIENT_ID_HEADER, &self.client_id)
+            .set_header("Toolport-Adapter-Pid", &std::process::id().to_string())
+            .set_header("Toolport-Adapter-Instance", &self.instance);
         let request = match &self.attribution_id {
-            Some(id) => request.set(ADAPTER_ATTRIBUTION_HEADER, id),
+            Some(id) => request.set_header(ADAPTER_ATTRIBUTION_HEADER, id),
             None => request,
         };
         let request = match &self.env_profile {
-            Some(profile) => request.set(ADAPTER_PROFILE_HEADER, profile),
+            Some(profile) => request.set_header(ADAPTER_PROFILE_HEADER, profile),
             None => request,
         };
         let request = match &self.cwd {
-            Some(cwd) => request.set(
+            Some(cwd) => request.set_header(
                 ADAPTER_CWD_HEADER,
                 &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cwd.as_bytes()),
             ),
             None => request,
         };
         let request = match &self.root_override {
-            Some(root) => request.set(
+            Some(root) => request.set_header(
                 ADAPTER_ROOT_OVERRIDE_HEADER,
                 &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(root.as_bytes()),
             ),
@@ -578,7 +579,7 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         match declared_root {
-            Some(root) => request.set(
+            Some(root) => request.set_header(
                 ADAPTER_DECLARED_ROOT_HEADER,
                 &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(root.as_bytes()),
             ),
@@ -747,35 +748,41 @@ impl Session {
         let descriptor = self.descriptor();
         let url = format!("http://{}/mcp", descriptor.endpoint);
         let request = match subscription {
-            Some(_) => ureq::AgentBuilder::new()
-                .timeout_read(SUBSCRIPTION_READ_TIMEOUT)
-                .build()
-                .post(&url),
-            None => ureq::post(&url).timeout(self.request_timeout),
+            Some(_) => crate::http_client::idle_agent(
+                SUBSCRIPTION_READ_TIMEOUT,
+                None,
+                Duration::from_secs(30),
+            )
+            .post(&url),
+            None => crate::http_client::agent()
+                .post(&url)
+                .config()
+                .timeout_global(Some(self.request_timeout))
+                .build(),
         };
         let mut request = self.with_identity(
             request
-                .set("Authorization", &format!("Bearer {}", descriptor.token))
-                .set("Content-Type", "application/json")
+                .set_header("Authorization", &format!("Bearer {}", descriptor.token))
+                .set_header("Content-Type", "application/json")
                 // Each POST owns a fresh agent, so this connection cannot be reused.
                 // Release the daemon's keepalive parser instead of leaving it waiting
                 // for a second request while the first call is still in flight.
-                .set("Connection", "close")
-                .set("Accept", "application/json, text/event-stream"),
+                .set_header("Connection", "close")
+                .set_header("Accept", "application/json, text/event-stream"),
         );
         for (name, value) in modern_headers(&message) {
-            request = request.set(&name, &value);
+            request = request.set_header(&name, &value);
         }
         let sent_session = self.session_id();
         if let Some(session) = &sent_session {
-            request = request.set("Mcp-Session-Id", session);
+            request = request.set_header("Mcp-Session-Id", session);
         }
-        let response = match request.send_string(body) {
+        let response = match request.send(body).retain_status_body() {
             Ok(response) => response,
             // The daemon answered, just not with 2xx. It is alive, so this is not a
             // reason to re-rendezvous; the body is the error the caller should see.
-            Err(ureq::Error::Status(code, response)) => {
-                let body = response.into_string().unwrap_or_default();
+            Err(crate::http_client::Error::Status(code, response)) => {
+                let body = response.into_body().read_to_string().unwrap_or_default();
                 // A modern protocol error comes with a 4xx status and a JSON-RPC
                 // body. That body is the answer, and the client needs it intact:
                 // an unsupported version lists the versions to retry with.
@@ -810,20 +817,26 @@ impl Session {
                 return Err(ExchangeError::Failed(error.to_string()));
             }
         };
-        if let Some(session) = response.header("Mcp-Session-Id") {
+        if let Some(session) = response
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|value| value.to_str().ok())
+        {
             if let Ok(mut guard) = self.session_id.lock() {
                 *guard = Some(session.to_string());
             }
         }
         let is_sse = response
-            .header("Content-Type")
+            .headers()
+            .get("Content-Type")
+            .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_ascii_lowercase()
             .contains("text/event-stream");
         let mut replied = false;
         let mut replay_error = None;
         relay_frames(
-            BufReader::new(response.into_reader()),
+            BufReader::new(response.into_body().into_reader()),
             is_sse,
             || {
                 subscription
@@ -1038,11 +1051,15 @@ impl Session {
         let descriptor = self.descriptor();
         let _ = self
             .with_identity(
-                ureq::delete(&format!("http://{}/adapter/lifetime", descriptor.endpoint))
-                    .set("Authorization", &format!("Bearer {}", descriptor.token))
-                    .timeout(Duration::from_secs(5)),
+                crate::http_client::agent()
+                    .delete(&format!("http://{}/adapter/lifetime", descriptor.endpoint))
+                    .set_header("Authorization", &format!("Bearer {}", descriptor.token))
+                    .config()
+                    .timeout_global(Some(Duration::from_secs(5)))
+                    .build(),
             )
-            .call();
+            .call()
+            .retain_status_body();
         let Some(session) = self.session_id() else {
             return;
         };
@@ -1050,12 +1067,16 @@ impl Session {
         let url = format!("http://{}/mcp", descriptor.endpoint);
         let _ = self
             .with_identity(
-                ureq::delete(&url)
-                    .set("Authorization", &format!("Bearer {}", descriptor.token))
-                    .set("Mcp-Session-Id", &session)
-                    .timeout(Duration::from_secs(5)),
+                crate::http_client::agent()
+                    .delete(&url)
+                    .set_header("Authorization", &format!("Bearer {}", descriptor.token))
+                    .set_header("Mcp-Session-Id", &session)
+                    .config()
+                    .timeout_global(Some(Duration::from_secs(5)))
+                    .build(),
             )
-            .call();
+            .call()
+            .retain_status_body();
     }
 }
 
@@ -1385,21 +1406,22 @@ impl Session {
         }
         let response = self
             .with_identity(
-                ureq::AgentBuilder::new()
-                    .timeout_connect(Duration::from_secs(2))
-                    .timeout_write(Duration::from_secs(2))
-                    .timeout_read(SUBSCRIPTION_READ_TIMEOUT)
-                    .build()
-                    .get(&format!("http://{}/adapter/lifetime", descriptor.endpoint))
-                    .set("Authorization", &format!("Bearer {}", descriptor.token)),
+                crate::http_client::idle_agent(
+                    SUBSCRIPTION_READ_TIMEOUT,
+                    Some(Duration::from_secs(2)),
+                    Duration::from_secs(2),
+                )
+                .get(&format!("http://{}/adapter/lifetime", descriptor.endpoint))
+                .set_header("Authorization", &format!("Bearer {}", descriptor.token)),
             )
             .call()
+            .retain_status_body()
             .map_err(|error| format!("could not open adapter lifetime: {error}"))?;
         *endpoint = Some(descriptor.endpoint.clone());
         let lifetime_endpoint = self.lifetime_endpoint.clone();
         let closed = self.closed.clone();
         std::thread::spawn(move || {
-            let mut reader = BufReader::new(response.into_reader());
+            let mut reader = BufReader::new(response.into_body().into_reader());
             while !closed.load(Ordering::SeqCst) {
                 if !matches!(read_bounded_line(&mut reader, MAX_FRAME_BYTES), Ok(Some(_))) {
                     break;
@@ -1435,18 +1457,21 @@ fn spawn_listen_stream(session: Arc<Session>) {
         let url = format!("http://{}/mcp", descriptor.endpoint);
         let response = session
             .with_identity(
-                ureq::AgentBuilder::new()
-                    .timeout_read(SUBSCRIPTION_READ_TIMEOUT)
-                    .build()
-                    .get(&url)
-                    .set("Authorization", &format!("Bearer {}", descriptor.token))
-                    .set("Accept", "text/event-stream")
-                    .set("Mcp-Session-Id", &session_id),
+                crate::http_client::idle_agent(
+                    SUBSCRIPTION_READ_TIMEOUT,
+                    None,
+                    Duration::from_secs(30),
+                )
+                .get(&url)
+                .set_header("Authorization", &format!("Bearer {}", descriptor.token))
+                .set_header("Accept", "text/event-stream")
+                .set_header("Mcp-Session-Id", &session_id),
             )
-            .call();
+            .call()
+            .retain_status_body();
         match response {
             Ok(response) => {
-                let mut reader = BufReader::new(response.into_reader());
+                let mut reader = BufReader::new(response.into_body().into_reader());
                 while let Ok(Some(ClientFrame::Line(line))) =
                     read_bounded_line(&mut reader, MAX_FRAME_BYTES)
                 {
