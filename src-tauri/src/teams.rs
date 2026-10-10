@@ -413,6 +413,21 @@ pub fn fetch_account_status(conn: &TeamConnection, token: &str) -> Result<Option
     }
 }
 
+fn apply_account_status(reg: &mut Registry, result: Result<Option<Value>, String>, was_personal: bool) -> Result<(), String> {
+    if let Some(t) = &mut reg.team {
+        match result {
+            Ok(value) => {
+                t.unknown_fields.insert("accountStatus".into(), value.unwrap_or(Value::Null));
+                t.unknown_fields.remove("accountStatusError");
+            }
+            // A legacy device token or a transient service failure must not
+            // prevent governed sync or invent a mode transition.
+            Err(error) => { t.unknown_fields.insert("accountStatusError".into(), json!(error)); }
+        }
+    }
+    crate::personal_sync::mode_changed(reg, was_personal)
+}
+
 /// A dashboard edit that lands between the preflight GET and PUT must never be overwritten.
 /// Keep this message stable and actionable: it is surfaced directly in the Teams UI.
 pub(crate) const STALE_PUSH_MESSAGE: &str =
@@ -1184,8 +1199,10 @@ fn finish_connect(
     // multi-second) network round trip and apply onto that — mirroring `sync_inner`.
     // Loading first and saving here would clobber any change another command made to the
     // registry while we were waiting on the join window's pull.
-    if let Some(status) = fetch_account_status(&conn, &joined.member_token)? {
-        conn.unknown_fields.insert("accountStatus".into(), status);
+    match fetch_account_status(&conn, &joined.member_token) {
+        Ok(Some(status)) => { conn.unknown_fields.insert("accountStatus".into(), status); }
+        Ok(None) => {}
+        Err(error) => { conn.unknown_fields.insert("accountStatusError".into(), json!(error)); }
     }
     let personal = conn.role == "admin"
         && conn
@@ -1232,6 +1249,7 @@ fn finish_connect(
     let (reg, outcome) = crate::registry::update(|reg| {
         if let Some(previous) = reg.team.as_ref().map(|t| t.team_id.clone()) { remove_team(reg, &previous); }
         reg.team = Some(conn);
+        crate::personal_sync::mode_changed(reg, false)?;
         let mut outcome = MergeOutcome::default();
         if let Some((version, cfg, etag)) = pulled {
             outcome = if crate::personal_sync::is_personal(reg) {
@@ -1362,19 +1380,20 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         ),
     };
     let role_changed = role != conn.role;
-    let status = fetch_account_status(&conn, &token)?;
+    let status_result = fetch_account_status(&conn, &token);
+    let status = status_result.as_ref().ok().and_then(|v| v.clone());
     let (fresh, _) = crate::personal_sync::remote_update(|| {
         crate::registry::update(|reg| {
+            let was_personal = crate::personal_sync::is_personal(reg);
             if let Some(t) = reg.team.as_mut().filter(|t| {
-                t.team_id == conn.team_id && t.reporting_device_id == conn.reporting_device_id
+                t.team_id == conn.team_id && t.server_url == conn.server_url && t.reporting_device_id == conn.reporting_device_id
             }) {
                 t.role = role.clone();
                 t.team_name = team_name.clone();
                 t.account_linked = account_linked;
-                t.unknown_fields.insert(
-                    "accountStatus".into(),
-                    status.clone().unwrap_or(Value::Null),
-                );
+            }
+            if reg.team.as_ref().is_some_and(|t| t.team_id == conn.team_id && t.server_url == conn.server_url && t.reporting_device_id == conn.reporting_device_id) {
+                apply_account_status(reg, status_result.clone(), was_personal)?;
             }
             Ok(())
         })
@@ -1408,7 +1427,7 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         &conn.team_id,
         &token,
         conn.last_version,
-        conn.last_etag.as_deref(),
+        fresh.team.as_ref().and_then(|t| t.last_etag.as_deref()),
         wait_secs,
     )?;
 
@@ -4242,6 +4261,15 @@ fn local_team_server_id(
     candidate
 }
 
+fn restore_personal_definition(entry: &mut ServerEntry, old: &ServerEntry) {
+    if old.unknown_fields.get("personalSyncEntry") != Some(&json!(true)) { return; }
+    crate::personal_sync::restore_local(entry, old);
+    // Keep destination namespaces and the local review snapshot across governance.
+    for key in ["personalSyncEntry", "personalSyncCredentialDestination", "syncExecutionReview"] {
+        if let Some(value) = old.unknown_fields.get(key) { entry.unknown_fields.insert(key.into(), value.clone()); }
+    }
+}
+
 pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) -> MergeOutcome {
     let tag = tag_for(team_id);
     let previous: Vec<ServerEntry> = reg
@@ -4419,6 +4447,7 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
                     );
                     if let Some(old) = previous.iter().find(|old| old.id == entry.id) {
                         restore_local_references(&mut entry, old);
+                        restore_personal_definition(&mut entry, old);
                     }
                     used_ids.push(entry.id.clone());
                     managed_server_ids.insert(entry.id.clone(), shared_id.clone());
@@ -4460,6 +4489,7 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
                     );
                     if let Some(old) = previous.iter().find(|old| old.id == entry.id) {
                         restore_local_references(&mut entry, old);
+                        restore_personal_definition(&mut entry, old);
                     }
                     used_ids.push(entry.id.clone());
                     managed_server_ids.insert(entry.id.clone(), shared_id.clone());
@@ -4854,6 +4884,9 @@ fn team_host_is_private(host: &str) -> bool {
 }
 
 pub(crate) fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
+    if s["env"].as_array().into_iter().flatten().any(|e| e["key"].as_str().is_some_and(crate::personal_sync::risky_sync_env)) {
+        return TeamClass::Blocked;
+    }
     // Management views include these rows; they must never become runtime routes.
     if s.get("disabled").and_then(Value::as_bool) == Some(true) {
         return TeamClass::Skip;
@@ -5118,6 +5151,33 @@ pub fn remove_team(reg: &mut Registry, team_id: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn account_status_errors_keep_governed_and_personal_sync_modes() {
+        let _data = crate::registry::DataDirTestEnv::new("account-status-fallback");
+        for code in [401, 403, 500, 503] {
+            let endpoint = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let origin = format!("http://{}", endpoint.server_addr());
+            let worker = std::thread::spawn(move || {
+                let request = endpoint.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+                request.respond(tiny_http::Response::from_string("unavailable").with_status_code(code)).unwrap();
+            });
+            let mut reg = base_registry();
+            reg.team = Some(serde_json::from_value(json!({"serverUrl":origin,"teamId":"t","role":"admin","reportingDeviceId":"legacy"})).unwrap());
+            let error = fetch_account_status(reg.team.as_ref().unwrap(), "legacy-without-device-id").unwrap_err();
+            worker.join().unwrap();
+            apply_account_status(&mut reg, Err(error.clone()), false).unwrap();
+            assert!(!crate::personal_sync::is_personal(&reg));
+            assert!(reg.team.as_ref().unwrap().unknown_fields["accountStatusError"].is_string());
+            stage_team_config(&mut reg, "t", &json!({"servers":[{"id":"safe","transport":"http","url":"https://example.com/mcp"}]}), 1, &[]).unwrap();
+            assert!(!member_review(&reg).unwrap().pending.is_empty());
+            reg.team.as_mut().unwrap().unknown_fields.insert("accountStatus".into(), json!({"personalSync":true}));
+            apply_account_status(&mut reg, Err(error), true).unwrap();
+            assert!(crate::personal_sync::is_personal(&reg));
+            apply_account_status(&mut reg, Ok(None), true).unwrap();
+            assert!(!crate::personal_sync::is_personal(&reg));
+            assert!(!reg.team.as_ref().unwrap().unknown_fields.contains_key("accountStatusError"));
+        }
+    }
     #[test]
     fn activation_counts_reference_inputs_as_configured_without_reading_keychain() {
         crate::secrets::tests::with_isolated_vault(|| {

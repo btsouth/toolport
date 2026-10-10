@@ -14,6 +14,9 @@ export interface PersonalSyncState {
   error?: string | null;
   pending?: Record<string, { localId: string; after: unknown }>;
   conflicts?: Record<string, unknown>;
+  conflictVersions?: Record<string, string>;
+  publishErrors?: Record<string, string>;
+  chooseLocalServers?: boolean;
 }
 export function isPersonalSync(registry: Registry | null | undefined): boolean {
   return (

@@ -478,6 +478,8 @@ export interface KeptV1Safety {
 }
 
 export interface ServerEntry {
+  syncExecutionReview?: Record<string, string>;
+  inheritEnv?: boolean;
   syncLocalOnly?: boolean;
   teamOriginalId?: string;
   personalSyncEntry?: boolean;
@@ -705,6 +707,7 @@ export interface HttpClient {
 /** A joined Toolport Teams server (the shared config-sync layer). */
 export interface TeamConnection {
   accountStatus?: import("./personalSync").AccountStatus | null;
+  accountStatusError?: string | null;
   personalSyncState?: import("./personalSync").PersonalSyncState;
   managedServerIds?: Record<string, string>;
   serverUrl: string;

@@ -602,6 +602,7 @@ export type ReviewedFields = {
   headerKeys?: ServerEntry["headerKeys"];
   launch?: ServerEntry["launch"];
   cwd?: ServerEntry["cwd"];
+  inheritEnv?: ServerEntry["inheritEnv"];
 };
 
 /** Compared on confirm so a team push landing mid-dialog cannot swap the definition
@@ -615,6 +616,7 @@ export function sameReviewedDefinition(a: ReviewedFields, b: ReviewedFields): bo
     JSON.stringify(a.env ?? []) === JSON.stringify(b.env ?? []) &&
     JSON.stringify(a.headerKeys ?? []) === JSON.stringify(b.headerKeys ?? []) &&
     JSON.stringify(a.launch ?? null) === JSON.stringify(b.launch ?? null) &&
+    (a.inheritEnv ?? false) === (b.inheritEnv ?? false) &&
     (a.cwd ?? "") === (b.cwd ?? "")
   );
 }

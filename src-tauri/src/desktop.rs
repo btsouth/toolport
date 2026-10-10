@@ -2120,10 +2120,16 @@ fn personal_sync_portable(
     reload_into_state(state.inner())
 }
 #[tauri::command]
+fn personal_sync_finish_selection(state: State<RegistryState>) -> Result<Registry, String> {
+    crate::personal_sync::finish_local_selection()?;
+    reload_into_state(state.inner())
+}
+
+#[tauri::command]
 fn personal_sync_resolve_conflict(
     state: State<RegistryState>,
     id: String,
-    expected: serde_json::Value,
+    expected: String,
     keep_mine: bool,
 ) -> Result<Registry, String> {
     crate::personal_sync::resolve_conflict(&id, &expected, keep_mine)?;
@@ -4146,6 +4152,7 @@ pub fn run() {
             personal_sync_local_only,
             personal_sync_portable,
             personal_sync_resolve_conflict,
+            personal_sync_finish_selection,
             team_connect,
             team_join_poll,
             team_sync,

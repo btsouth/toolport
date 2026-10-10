@@ -2438,6 +2438,16 @@ pub fn has_client_secret(server_id: &str) -> Result<bool, String> {
     Ok(crate::secrets::get_secret_result(server_id, crate::secrets::CLIENT_SECRET_KEY)?.is_some())
 }
 
+fn client_credentials_edit_owner(reg: &Registry, id: &str) -> Result<String, String> {
+    let owner = crate::local_auth::owner_in(reg, id)?;
+    // A managed alias still edits its personal original. A random personal-sync
+    // vault owner or URL-specific namespace is the server's own authentication.
+    if reg.unknown_fields.get("localTeamAuthentication").and_then(|v| v.get(id)).is_some() && owner != id {
+        return Err("Edit the personal original to change the shared local sign-in configuration.".into());
+    }
+    Ok(owner)
+}
+
 pub fn set_client_credentials(
     server_id: &str,
     client_id: &str,
@@ -2446,11 +2456,9 @@ pub fn set_client_credentials(
     scope: Option<&str>,
 ) -> Result<Registry, String> {
     let _mutation = acquire_auth_lock(server_id)?;
-    if crate::local_auth::owner(server_id)? != server_id {
-        return Err(
-            "Edit the personal original to change the shared local sign-in configuration.".into(),
-        );
-    }
+    let current = read_registry_exact()?;
+    let owner = client_credentials_edit_owner(&current, server_id)?;
+    let _owner_pin = crate::local_auth::pin_credential_owner(server_id, &owner);
     let client_id = client_id.trim().to_string();
     if client_id.is_empty() {
         return Err("a client id is required for client-credentials auth".into());
@@ -2472,7 +2480,6 @@ pub fn set_client_credentials(
             ));
         }
     }
-    let current = read_registry_exact()?;
     if !current.servers.iter().any(|server| server.id == server_id) {
         return Err(format!("no server with id {server_id:?}"));
     }
@@ -2482,6 +2489,9 @@ pub fn set_client_credentials(
     }
     crate::remote::reset_client_credentials(server_id)?;
     let (registry, ()) = registry::update(|registry| {
+        if client_credentials_edit_owner(registry, server_id)? != owner {
+            return Err("The destination changed. Review authentication again.".into());
+        }
         let Some(server) = registry
             .servers
             .iter_mut()
@@ -2508,13 +2518,14 @@ pub fn set_client_credentials(
 
 pub fn clear_client_credentials(server_id: &str) -> Result<Registry, String> {
     let _mutation = acquire_auth_lock(server_id)?;
-    if crate::local_auth::owner(server_id)? != server_id {
-        return Err(
-            "Edit the personal original to change the shared local sign-in configuration.".into(),
-        );
-    }
+    let current = read_registry_exact()?;
+    let owner = client_credentials_edit_owner(&current, server_id)?;
+    let _owner_pin = crate::local_auth::pin_credential_owner(server_id, &owner);
     crate::remote::reset_client_credentials(server_id)?;
     let (registry, ()) = registry::update(|registry| {
+        if client_credentials_edit_owner(registry, server_id)? != owner {
+            return Err("The destination changed. Review authentication again.".into());
+        }
         let Some(server) = registry
             .servers
             .iter_mut()
@@ -2878,6 +2889,8 @@ pub fn apply_server_enabled(
             server.unknown_fields.remove("teamEnableReview");
             let identity =
                 crate::personal_sync::command_identity(&crate::personal_sync::export(server));
+            let fields = crate::personal_sync::execution_review_fields(server);
+            server.unknown_fields.insert("syncExecutionReview".into(), serde_json::json!(fields));
             server
                 .unknown_fields
                 .insert("syncCommandConsent".into(), identity);
@@ -3054,6 +3067,30 @@ mod tests {
         )
     }
 
+    #[test]
+    fn personal_sync_client_credentials_work_for_received_and_changed_urls() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut reg = Registry::default();
+            reg.team = Some(serde_json::from_value(serde_json::json!({"serverUrl":"https://example.com","teamId":"solo","role":"admin","accountStatus":{"personalSync":true}})).unwrap());
+            crate::personal_sync::apply(&mut reg, &serde_json::json!({"servers":[{"id":"received","name":"Received","transport":"http","url":"https://first.example/mcp"}]}), 1).unwrap();
+            let id = reg.servers[0].id.clone();
+            registry::save(&reg).unwrap();
+            assert_ne!(crate::local_auth::owner(&id).unwrap(), id);
+            set_client_credentials(&id, "client", Some("first-secret".into()), None, None).unwrap();
+            assert!(has_client_secret(&id).unwrap());
+            clear_client_credentials(&id).unwrap();
+            assert!(!has_client_secret(&id).unwrap());
+            set_client_credentials(&id, "client", Some("first-secret".into()), None, None).unwrap();
+            crate::personal_sync::remote_update(|| registry::update(|r| { r.servers[0].url = Some("https://second.example/mcp".into()); Ok(()) })).unwrap();
+            assert!(!has_client_secret(&id).unwrap());
+            set_client_credentials(&id, "other", Some("second-secret".into()), None, None).unwrap();
+            assert!(has_client_secret(&id).unwrap());
+            clear_client_credentials(&id).unwrap();
+            assert!(!has_client_secret(&id).unwrap());
+            crate::personal_sync::remote_update(|| registry::update(|r| { r.servers[0].url = Some("https://first.example/mcp".into()); Ok(()) })).unwrap();
+            assert!(has_client_secret(&id).unwrap());
+        });
+    }
     #[test]
     fn reviewed_bulk_import_shows_unsupported_and_uses_storage_choices() {
         let fixture = MoveFixture::new(&Registry::default());

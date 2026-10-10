@@ -7262,7 +7262,7 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
             let dialog = adw::MessageDialog::new(
                 Some(&parent),
                 Some("Approve references and enable?"),
-                Some(&crate::secret_refs::review_lines(&entry).join("\n")),
+                Some(&crate::personal_sync::execution_review_lines(&entry).join("\n")),
             );
             dialog.add_response("cancel", "Cancel");
             dialog.add_response("enable", "Enable");

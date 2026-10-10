@@ -1,4 +1,4 @@
-import { secretReferenceReview } from "@/lib/secretRefs";
+import { executionReviewLines, visibleExecutionText } from "@/lib/executionReview";
 import { isPersonalSync } from "@/lib/personalSync";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
@@ -1128,17 +1128,33 @@ function App() {
           if (!open) setConfirmEnableTeam(null);
         }}
         title={
-          confirmEnableTeam ? `Enable "${confirmEnableTeam.name}"?` : "Enable server?"
+          confirmEnableTeam
+            ? `Enable "${visibleExecutionText(confirmEnableTeam.name)}"?`
+            : "Enable server?"
         }
         description={
-          confirmEnableTeam
-            ? secretReferenceReview(confirmEnableTeam).join("\n") +
-              "\n" +
-              (confirmEnableTeam.transport === "stdio" || confirmEnableTeam.command
-                ? `This runs a local command on your machine: ${confirmEnableTeam.command} ${JSON.stringify(confirmEnableTeam.args ?? [])}, working directory: ${confirmEnableTeam.cwd ?? "client default"}. Only enable it if you recognize and trust this command.`
-                : `This connects Toolport to ${confirmEnableTeam.url ?? ""}, using its saved authentication. Verify the destination before enabling it.`)
-            : undefined
+          confirmEnableTeam ? (
+            <div className="max-h-[60vh] space-y-2 overflow-auto break-all font-mono text-xs">
+              <p>
+                Review every execution input. CHANGED fields differ from the last approved
+                version. Enable only a setup you trust.
+              </p>
+              {executionReviewLines(confirmEnableTeam).map((line, i) => (
+                <p
+                  key={i}
+                  className={
+                    line.startsWith("CHANGED:")
+                      ? "font-semibold text-foreground"
+                      : undefined
+                  }
+                >
+                  {line}
+                </p>
+              ))}
+            </div>
+          ) : undefined
         }
+        contentClassName="sm:max-w-2xl"
         confirmLabel="Enable"
         onConfirm={() => {
           if (!confirmEnableTeam) return;

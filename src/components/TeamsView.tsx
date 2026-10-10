@@ -549,9 +549,9 @@ export function TeamsView({
         <h2 className="text-base font-semibold">Toolport Teams</h2>
       </div>
 
-      {error && (
+      {(error || team?.accountStatusError) && (
         <Callout variant="danger" className="mb-4">
-          {error}
+          {error || team?.accountStatusError}
         </Callout>
       )}
       {skipNote && (

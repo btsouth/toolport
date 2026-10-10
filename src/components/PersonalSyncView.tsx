@@ -77,9 +77,9 @@ export function PersonalSyncView({
         Set up once. Your servers follow you to every machine. Secret values and approvals
         stay on this machine.
       </p>
-      {(error || sync?.error) && (
+      {(error || sync?.error || team?.accountStatusError) && (
         <Callout variant="danger">
-          <p role="alert">{error || sync?.error}</p>
+          <p role="alert">{error || sync?.error || team?.accountStatusError}</p>
         </Callout>
       )}
       {!team ? (
@@ -191,6 +191,62 @@ export function PersonalSyncView({
               </Button>
             </div>
           </section>
+          {sync?.chooseLocalServers && (
+            <section
+              className="space-y-3 rounded-lg border p-4"
+              aria-label="Choose local servers to sync"
+            >
+              <h3 className="font-medium">Choose local servers to sync</h3>
+              <p className="text-sm">
+                Your account now has one person. Existing local servers stay on this
+                machine unless you choose them here.
+              </p>
+              {registry.servers
+                .filter((s) => !s.source?.startsWith("team:"))
+                .map((s) => (
+                  <label key={s.id} className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={!s.syncLocalOnly}
+                      disabled={busy}
+                      onChange={(e) => {
+                        const localOnly = !e.target.checked;
+                        void run(async () =>
+                          onRegistryChange(
+                            await invoke<Registry>("personal_sync_local_only", {
+                              serverId: s.id,
+                              localOnly,
+                            }),
+                          ),
+                        );
+                      }}
+                    />
+                    {s.name}
+                  </label>
+                ))}
+              <Button
+                disabled={busy}
+                onClick={() =>
+                  void run(async () =>
+                    onRegistryChange(
+                      await invoke<Registry>("personal_sync_finish_selection"),
+                    ),
+                  )
+                }
+              >
+                Done
+              </Button>
+            </section>
+          )}
+          {Object.entries(sync?.publishErrors ?? {}).map(([id, message]) => (
+            <Callout key={id} variant="warning">
+              <p role="alert">
+                {registry.servers.find((s) => s.id === sync?.pending?.[id]?.localId)
+                  ?.name ?? id}
+                : {message}
+              </p>
+            </Callout>
+          ))}
           {Object.entries(sync?.conflicts ?? {}).map(([id, remote]) => (
             <section
               key={id}
@@ -220,7 +276,7 @@ export function PersonalSyncView({
                       onRegistryChange(
                         await invoke<Registry>("personal_sync_resolve_conflict", {
                           id,
-                          expected: remote,
+                          expected: sync?.conflictVersions?.[id],
                           keepMine,
                         }),
                       );

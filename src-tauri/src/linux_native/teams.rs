@@ -336,6 +336,9 @@ impl TeamsPage {
         registry: crate::registry::Registry,
         team: crate::registry::TeamConnection,
     ) {
+        if let Some(error) = team.unknown_fields.get("accountStatusError").and_then(serde_json::Value::as_str) {
+            self.content.append(&gtk::Label::builder().label(error).wrap(true).xalign(0.0).build());
+        }
         if crate::personal_sync::is_personal(&registry) {
             self.render_personal(registry, team);
             return;
@@ -518,6 +521,36 @@ impl TeamsPage {
         actions.append(&button);
         card.append(&actions);
         self.content.append(&card);
+        if sync.choose_local_servers {
+            let choices = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            choices.add_css_class("toolport-card");
+            choices.append(&gtk::Label::builder().label("Choose local servers to sync. Your account now has one person. Existing local servers stay on this machine unless selected.").wrap(true).xalign(0.0).build());
+            for server in registry.servers.iter().filter(|s| !s.source.as_deref().unwrap_or("").starts_with("team:")) {
+                let choice = gtk::CheckButton::with_label(&crate::personal_sync::visible_text(&server.name));
+                choice.set_active(!crate::personal_sync::keep_local(server));
+                let id = server.id.clone();
+                let page = self.clone();
+                choice.connect_toggled(move |button| {
+                    let id = id.clone(); let page = page.clone(); let local = !button.is_active();
+                    gtk::glib::spawn_future_local(async move {
+                        match gtk::gio::spawn_blocking(move || crate::personal_sync::set_local_only(&id, local)).await {
+                            Ok(Ok(_)) => page.refresh(), Ok(Err(e)) => page.show_error(&e), Err(_) => page.show_error("Could not save sync choice"),
+                        }
+                    });
+                });
+                choices.append(&choice);
+            }
+            let done = gtk::Button::with_label("Done"); let page = self.clone();
+            done.connect_clicked(move |_| { let page = page.clone(); gtk::glib::spawn_future_local(async move {
+                match gtk::gio::spawn_blocking(crate::personal_sync::finish_local_selection).await {
+                    Ok(Ok(_)) => page.refresh(), Ok(Err(e)) => page.show_error(&e), Err(_) => page.show_error("Could not finish sync selection"),
+                }
+            }); });
+            choices.append(&done); self.content.append(&choices);
+        }
+        for (id, error) in &sync.publish_errors {
+            self.content.append(&gtk::Label::builder().label(format!("{}: {error}", crate::personal_sync::visible_text(id))).wrap(true).xalign(0.0).build());
+        }
         for (id, remote) in &sync.conflicts {
             let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
             row.add_css_class("toolport-card");
@@ -544,7 +577,7 @@ impl TeamsPage {
             ] {
                 let button = gtk::Button::with_label(label);
                 let id = id.clone();
-                let expected = remote.clone();
+                let expected = crate::personal_sync::conflict_version(remote);
                 let page = self.clone();
                 button.connect_clicked(move |_| {
                     let id = id.clone();
@@ -1084,38 +1117,7 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
             .css_classes(["heading"])
             .build(),
     );
-    let credentials = server
-        .env
-        .iter()
-        .map(|e| e.key.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let target = if let Some(command) = &server.command {
-        format!(
-            "Command: {command}\nArguments: {}\nWorking directory: {}\nLocal keys: {}",
-            serde_json::to_string(&server.args).unwrap_or_default(),
-            server.cwd.as_deref().unwrap_or("Inherit from client"),
-            if credentials.is_empty() {
-                "Sign-in requirements are checked when this server connects"
-            } else {
-                &credentials
-            }
-        )
-    } else {
-        format!(
-            "URL: {}\nLocal keys: {}",
-            server.url.as_deref().unwrap_or("Unknown target"),
-            if credentials.is_empty() {
-                "Sign-in requirements are checked when this server connects"
-            } else {
-                &credentials
-            }
-        )
-    };
-    let target = format!(
-        "{target}\n{}",
-        crate::secret_refs::review_lines(&server).join("\n")
-    );
+    let target = crate::personal_sync::execution_review_lines(&server).join("\n");
     copy.append(
         &gtk::Label::builder()
             .label(&target)
