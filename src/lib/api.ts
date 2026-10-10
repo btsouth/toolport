@@ -59,6 +59,7 @@ export interface SecurityEvent {
   tool?: string;
   change: string;
   changed_fields?: string[];
+  new_fp?: string;
   parameters?: { added: string[]; removed: string[]; changed: string[] };
   /** Current quarantine status; absent/null means unavailable. */
   blocked?: boolean | null;
@@ -297,8 +298,12 @@ export function listQuarantined(): Promise<QuarantinedTool[]> {
 }
 
 /** Re-approve a quarantined tool so the gateway re-exposes it on its next rebuild. */
-export function releaseQuarantine(profile: string, tool: string): Promise<void> {
-  return invoke<void>("release_quarantine", { profile, tool });
+export function releaseQuarantine(
+  profile: string,
+  tool: string,
+  expectedFingerprint?: string,
+): Promise<void> {
+  return invoke<void>("release_quarantine", { profile, tool, expectedFingerprint });
 }
 
 /** Outcome of a bulk re-approval. `skipped` names tools that stay blocked. */

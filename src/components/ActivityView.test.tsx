@@ -707,7 +707,6 @@ describe("ActivityView security drift dismissals", () => {
 
     // A description rewrite stays visible as a server update.
     expect(screen.getByText("Tool changes")).toBeInTheDocument();
-    expect(screen.getByText("Read")).toBeInTheDocument();
 
     // Accept just this tool.
     await user.click(screen.getByRole("button", { name: /srv: 1 tool changed/ }));
@@ -722,7 +721,9 @@ describe("ActivityView security drift dismissals", () => {
     await act(async () => {
       vi.advanceTimersByTime(3000);
     });
-    expect(screen.getByText("Read")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /srv: 1 tool changed/ }),
+    ).toBeInTheDocument();
   });
 });
 

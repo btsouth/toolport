@@ -40,6 +40,7 @@ describe("server tool changes", () => {
     expect(
       screen.getByLabelText("Tool changes").querySelector(".text-destructive"),
     ).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Cloudflare \(Full API\):/ }));
     expect(screen.getAllByText("Added parameters: comment")).toHaveLength(26);
     expect(screen.getAllByText("Removed parameters: legacy_id")).toHaveLength(26);
     expect(screen.getAllByText("Changed parameters: ttl")).toHaveLength(26);
@@ -52,13 +53,14 @@ describe("server tool changes", () => {
         ...event,
         blocked: true,
         blocked_profiles: ["work", "personal"],
+        new_fp: "v2:reviewed",
       }));
     const accept = vi.fn();
     render(<ToolChanges events={events} registry={registry} onAccept={accept} />);
     fireEvent.click(screen.getByRole("button", { name: "Accept all for this server" }));
     await waitFor(() => expect(accept).toHaveBeenCalledWith(events));
     expect(release).toHaveBeenCalledTimes(4);
-    expect(release).toHaveBeenCalledWith("work", events[0].tool);
+    expect(release).toHaveBeenCalledWith("work", events[0].tool, "v2:reviewed");
   });
   it("keeps unknown blocking state visible and disables acceptance", () => {
     render(
@@ -71,6 +73,7 @@ describe("server tool changes", () => {
     expect(
       screen.getByRole("button", { name: "Accept all for this server" }),
     ).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: /Cloudflare \(Full API\):/ }));
     expect(screen.getByRole("button", { name: "Accept this tool" })).toBeDisabled();
   });
 });

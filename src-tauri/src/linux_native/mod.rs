@@ -3628,9 +3628,10 @@ impl ActivityPage {
                     let tool = event["tool"].as_str().unwrap_or("");
                     if let Some(profiles) = event["blocked_profiles"].as_array() {
                         for profile in profiles.iter().filter_map(serde_json::Value::as_str) {
-                            crate::integrity::release(
+                            crate::integrity::release_definition(
                                 (!profile.is_empty()).then_some(profile),
                                 tool,
+                                event["new_fp"].as_str().ok_or("This older finding has no saved definition. Review the active block in Settings.")?,
                             )?;
                         }
                     }
@@ -4139,7 +4140,7 @@ fn remember_activity_expansion(
 fn change_can_be_accepted(event: &serde_json::Value) -> bool {
     event["blocked"] == false
         || (event["blocked"] == true
-            && event["blocked_profiles"]
+            && event["new_fp"].is_string() && event["blocked_profiles"]
                 .as_array()
                 .is_some_and(|profiles| !profiles.is_empty()))
 }
@@ -4351,7 +4352,7 @@ fn security_review_lines(event: &serde_json::Value) -> Vec<String> {
 
     match (event_type, change) {
         ("tool_drift", "changed") => {
-            lines.push("Definition changed since Toolport's trusted baseline.".to_string());
+            lines.push("This tool changed since it was last accepted.".to_string());
             let fields: Vec<&str> = event
                 .get("changed_fields")
                 .and_then(serde_json::Value::as_array)
@@ -4362,9 +4363,9 @@ fn security_review_lines(event: &serde_json::Value) -> Vec<String> {
             for field in &fields {
                 let label = match *field {
                     "description" => "Description",
-                    "input_schema" => "Input schema",
-                    "output_schema" => "Output schema",
-                    "annotations" => "Annotations",
+                    "input_schema" => "Inputs",
+                    "output_schema" => "Output format",
+                    "annotations" => "Safety hints",
                     other => other,
                 };
                 lines.push(format!("Changed field: {label}"));
@@ -10193,12 +10194,32 @@ mod tests {
         assert_eq!(
             security_review_lines(&event),
             vec![
-                "Definition changed since Toolport's trusted baseline.",
+                "This tool changed since it was last accepted.",
                 "Changed field: Description",
-                "Changed field: Annotations",
+                "Changed field: Safety hints",
                 "readOnlyHint: true to false",
+                "Parameter details were not saved for this older change.",
+                "Blocking status unavailable. Refresh to check.",
             ]
         );
+    }
+
+    #[test]
+    fn tool_change_review_lists_parameter_deltas_and_requires_the_displayed_block() {
+        let event = serde_json::json!({"type":"tool_drift", "change":"changed", "changed_fields":["input_schema"], "parameters":{"added":["comment"],"removed":["old_id"],"changed":["ttl"]}, "blocked":false});
+        let lines = security_review_lines(&event);
+        assert!(lines.contains(&"Added parameters: comment".to_string()));
+        assert!(lines.contains(&"Removed parameters: old_id".to_string()));
+        assert!(lines.contains(&"Changed parameters: ttl".to_string()));
+        assert!(lines.contains(&"Not blocked.".to_string()));
+        assert!(change_can_be_accepted(&event));
+        let mut blocked = event; blocked["blocked"] = serde_json::json!(true);
+        blocked["blocked_profiles"] = serde_json::json!(["work"]);
+        assert!(!change_can_be_accepted(&blocked));
+        blocked["new_fp"] = serde_json::json!("v2:reviewed");
+        assert!(change_can_be_accepted(&blocked));
+        blocked["blocked"] = serde_json::Value::Null;
+        assert!(!change_can_be_accepted(&blocked));
     }
 
     #[test]
@@ -10214,8 +10235,10 @@ mod tests {
         assert_eq!(
             security_review_lines(&event),
             vec![
-                "Definition changed since Toolport's trusted baseline.",
+                "This tool changed since it was last accepted.",
                 "This older event does not contain field-level change details.",
+                "Parameter details were not saved for this older change.",
+                "Blocking status unavailable. Refresh to check.",
             ]
         );
     }

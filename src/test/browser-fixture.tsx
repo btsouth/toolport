@@ -166,6 +166,7 @@ if (memberReviewFixture) {
 }
 
 const driftFixture = new URLSearchParams(location.search).has("tool-changes");
+const driftEvents = driftFixture ? securityFixture() : [];
 const approvalFixture = new URLSearchParams(location.search).has("approvals");
 const sessionFixture = new URLSearchParams(location.search).has("sessions");
 const callerFixture = new URLSearchParams(location.search).has("caller-names");
@@ -780,7 +781,7 @@ mockIPC(
         pendingApproval = pendingApproval.filter((approval) => approval.id !== args.id);
         return null;
       case "get_security_events":
-        return driftFixture ? securityFixture() : [];
+        return driftEvents;
       case "clients_needing_restart":
       case "list_allowed_tools":
       case "list_quarantined":

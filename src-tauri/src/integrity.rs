@@ -1921,6 +1921,27 @@ pub fn release(profile: Option<&str>, tool: &str) -> Result<bool, String> {
     })
 }
 
+/// Accept only the definition displayed in a review. A newer quarantine written
+/// while the user was reading must remain blocked.
+pub fn release_definition(
+    profile: Option<&str>,
+    tool: &str,
+    expected_fp: &str,
+) -> Result<bool, String> {
+    let path = quarantine_path(profile).ok_or("Could not resolve the quarantine store")?;
+    with_store_lock(&path, || {
+        let quarantine = load_quarantine(profile)?;
+        if let Some(record) = quarantine.get(tool) {
+            if record["pending_pin"]["fp"].as_str() != Some(expected_fp) {
+                return Err(
+                    "The tool changed again. Refresh and review its latest definition.".to_string(),
+                );
+            }
+        }
+        release_inner(profile, tool, save_pins, save_quarantine)
+    })
+}
+
 fn release_inner(
     profile: Option<&str>,
     tool: &str,
@@ -3507,6 +3528,7 @@ fn event(server: &str, tool: &str, change: &str, severity: &str) -> Value {
 /// `changed` drift with prior/new safety annotations for the quarantine card (SOU-305).
 fn changed_event(server: &str, tool: &str, severity: &str, old: &Pin, new: &Pin) -> Value {
     let mut e = event(server, tool, "changed", severity);
+    e["new_fp"] = json!(new.fp);
     e["prev_ro"] = json!(old.ro);
     e["new_ro"] = json!(new.ro);
     e["prev_dh"] = json!(old.dh);
@@ -3962,6 +3984,7 @@ mod tests {
 
     #[test]
     fn raw_source_survives_schema_normalization_and_overrides() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
         let _data = TestDataDir::new("raw-source");
         let raw = json!({"name":"srv__update", "description":"Original", "inputSchema":{"type":"object", "properties":{"limit":{"type":"integer", "maximum":"100"}}}});
         let mut client = raw.clone();
@@ -3983,6 +4006,7 @@ mod tests {
 
     #[test]
     fn source_migration_verifies_cache_and_keeps_real_changes_visible() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
         let _data = TestDataDir::new("raw-migration");
         let raw = json!({"name":"srv__update", "description":"Original", "inputSchema":{"type":"object", "properties":{"limit":{"type":"integer", "maximum":"100"}}}});
         let mut projected = raw.clone();
@@ -4021,6 +4045,7 @@ mod tests {
 
     #[test]
     fn migration_does_not_hide_changes_erased_by_old_normalization() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
         let _data = TestDataDir::new("raw-lossy-migration");
         let raw = json!({"name":"srv__update", "inputSchema":{"properties":{"limit":{"maximum":"invalid-old"}}}});
         let mut projected = raw.clone();
@@ -4041,6 +4066,51 @@ mod tests {
         let mut changed = raw;
         changed["inputSchema"]["properties"]["limit"]["maximum"] = json!("invalid-new");
         assert_eq!(check(None, &vec![changed]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn accepting_displayed_change_cannot_release_a_newer_definition() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("reviewed-definition");
+        let tool = json!({"name":"srv__update", "description":"New upstream definition"});
+        let pending = pin_of(&tool);
+        save_quarantine(
+            None,
+            &BTreeMap::from([(
+                "srv__update".to_string(),
+                json!({"tool":"srv__update", "change":"changed", "pending_pin":pending}),
+            )]),
+        )
+        .unwrap();
+        assert!(
+            release_definition(None, "srv__update", "v2:older-definition")
+                .unwrap_err()
+                .contains("changed again")
+        );
+        assert!(quarantined(None).unwrap().contains("srv__update"));
+        assert!(release_definition(None, "srv__update", &fingerprint(&tool)).unwrap());
+        assert!(!quarantined(None).unwrap().contains("srv__update"));
+    }
+
+    #[test]
+    fn review_reports_current_blocks_and_damaged_store_as_unknown() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("review-blocking-status");
+        record_event(
+            &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv", "change":"changed", "ts":1}),
+        );
+        assert_eq!(review_events(2000).unwrap()[0]["blocked"], false);
+        save_quarantine(
+            None,
+            &BTreeMap::from([(
+                "srv__update".to_string(),
+                json!({"tool":"srv__update", "change":"changed"}),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(review_events(2000).unwrap()[0]["blocked"], true);
+        std::fs::write(quarantine_path(None).unwrap(), "{broken").unwrap();
+        assert!(review_events(2000).unwrap()[0]["blocked"].is_null());
     }
 
     #[test]

@@ -41,7 +41,7 @@ try {
     await group.click();
     await page.getByText("Update dns record", { exact: true }).click();
     await expect(
-      page.getByText("Added parameters: comment", { exact: true }),
+      page.getByText("Added parameters: comment", { exact: true }).first(),
     ).toBeVisible();
     await page.screenshot({ path: path.join(output, "react-expanded.png") });
   }

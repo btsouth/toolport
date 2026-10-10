@@ -1610,13 +1610,18 @@ fn release_quarantine(
     state: State<RegistryState>,
     profile: String,
     tool: String,
+    expected_fingerprint: Option<String>,
 ) -> Result<(), String> {
     let prof = if profile.is_empty() {
         None
     } else {
         Some(profile.as_str())
     };
-    crate::registry_controller::release_quarantine(prof, &tool)?;
+    if let Some(expected) = expected_fingerprint {
+        integrity::release_definition(prof, &tool, &expected)?;
+    } else {
+        crate::registry_controller::release_quarantine(prof, &tool)?;
+    }
     // The quarantine release lives in the separate tool-pins file; the former blind re-save
     // here was only a gateway mtime-nudge (which the no-op guard usually swallowed anyway)
     // and it could revert a concurrent gateway/team write (SOU-23). Refresh the cache

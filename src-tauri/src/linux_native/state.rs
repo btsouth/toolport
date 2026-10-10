@@ -341,18 +341,15 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
     match crate::registry::load()
         .map_err(|error| format!("could not read the registry for tool identities: {error}"))
         .and_then(|registry| {
+            for event in &mut snapshot.security_events {
+                if let Some(server) = registry.servers.iter().find(|server| event["server"] == server.id) {
+                    event["server_name"] = serde_json::json!(server.name);
+                }
+            }
             crate::integrity::tool_identities(&registry.servers, &registry.profiles)
                 .map_err(|error| format!("could not read the tool identity stores: {error}"))
         }) {
         Ok(identities) => {
-            for event in &mut snapshot.security_events {
-                if let Some(identity) = identities
-                    .iter()
-                    .find(|identity| event["server"] == identity.server_id)
-                {
-                    event["server_name"] = serde_json::json!(identity.server_name);
-                }
-            }
             snapshot.tool_identities = identities;
         }
         Err(error) => snapshot.tool_identities_error = Some(error),

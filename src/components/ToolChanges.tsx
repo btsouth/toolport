@@ -53,12 +53,13 @@ export function ToolChanges({
   onAccept: (events: SecurityEvent[]) => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   async function accept(events: SecurityEvent[]) {
     setBusy(true);
     try {
       for (const event of events) {
         for (const profile of event.blocked_profiles || []) {
-          if (event.tool) await releaseQuarantine(profile, event.tool);
+          if (event.tool) await releaseQuarantine(profile, event.tool, event.new_fp);
         }
       }
       onAccept(events);
@@ -86,25 +87,56 @@ export function ToolChanges({
             group.server;
           const canAccept =
             !unknown &&
-            group.tools.every((tool) => !tool.blocked || tool.blocked_profiles?.length);
+            group.tools.every(
+              (tool) => !tool.blocked || (tool.blocked_profiles?.length && tool.new_fp),
+            );
+          const key = `${group.server}:${group.ts}`;
+          const open = expanded.has(key);
           return (
             <div
-              key={`${group.server}:${group.ts}`}
+              key={key}
               className={`rounded-md border p-3 ${blocked ? "border-destructive/40 bg-destructive/5" : "border-border"}`}
             >
-              <details>
-                <summary
-                  className="flex cursor-pointer list-none items-center gap-2 text-sm"
-                  role="button"
+              <button
+                type="button"
+                aria-expanded={open}
+                onClick={() =>
+                  setExpanded((prev) => {
+                    const next = new Set(prev);
+                    if (open) next.delete(key);
+                    else next.add(key);
+                    return next;
+                  })
+                }
+                className="flex w-full items-center gap-2 text-left text-sm"
+              >
+                <ChevronRight
+                  className={`size-4 shrink-0 transition-transform ${open ? "rotate-90" : ""}`}
+                />
+                <span>
+                  {server}: {summary(group.tools)}
+                </span>
+                <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+                  {ago(group.ts)}
+                </span>
+              </button>
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                <p className={blocked ? "text-destructive" : "text-muted-foreground"}>
+                  {blocked
+                    ? `${blocked} ${blocked === 1 ? "tool is" : "tools are"} blocked. Review the changes or accept them.`
+                    : unknown
+                      ? "Blocking status unavailable. Refresh to check."
+                      : "Not blocked. Review the changes or accept them."}
+                </p>
+                <button
+                  disabled={busy || !canAccept}
+                  onClick={() => void accept(group.tools)}
+                  className="ml-auto rounded border border-border px-2 py-1 text-foreground disabled:opacity-50"
                 >
-                  <ChevronRight className="size-4 shrink-0" />
-                  <span>
-                    {server}: {summary(group.tools)}
-                  </span>
-                  <span className="ml-auto shrink-0 text-xs text-muted-foreground">
-                    {ago(group.ts)}
-                  </span>
-                </summary>
+                  Accept all for this server
+                </button>
+              </div>
+              {open && (
                 <div className="mt-3 space-y-2">
                   {group.tools.map((event) => (
                     <details
@@ -153,7 +185,8 @@ export function ToolChanges({
                           disabled={
                             busy ||
                             event.blocked == null ||
-                            (event.blocked && !event.blocked_profiles?.length)
+                            (event.blocked &&
+                              (!event.blocked_profiles?.length || !event.new_fp))
                           }
                           onClick={() => void accept([event])}
                           className="mt-1 rounded border border-border px-2 py-1 text-foreground disabled:opacity-50"
@@ -164,23 +197,7 @@ export function ToolChanges({
                     </details>
                   ))}
                 </div>
-              </details>
-              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-                <p className={blocked ? "text-destructive" : "text-muted-foreground"}>
-                  {blocked
-                    ? `${blocked} ${blocked === 1 ? "tool is" : "tools are"} blocked. Review the changes or accept them.`
-                    : unknown
-                      ? "Blocking status unavailable. Refresh to check."
-                      : "Not blocked. Review the changes or accept them."}
-                </p>
-                <button
-                  disabled={busy || !canAccept}
-                  onClick={() => void accept(group.tools)}
-                  className="ml-auto rounded border border-border px-2 py-1 text-foreground disabled:opacity-50"
-                >
-                  Accept all for this server
-                </button>
-              </div>
+              )}
             </div>
           );
         })}

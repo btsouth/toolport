@@ -4702,6 +4702,23 @@ mod tests {
     use crate::downstream::{CancelRegistry, DownstreamServer, Transport};
 
     #[test]
+    fn integrity_catalog_retains_raw_downstream_definitions() {
+        let mut server = mock_server("s");
+        let original = json!({"name":"echo", "description":"Upstream description", "inputSchema":{"properties":{"a b":{"type":"integer", "maximum":"100"}}}});
+        server.tools = vec![original.clone()].into();
+        let mut router = Router::new();
+        router.add(server);
+        let tools = router.shared_tools();
+        assert_eq!(tools[0]["inputSchema"]["properties"]["a_b"]["maximum"], 100);
+        let mut raw = original;
+        raw["name"] = json!("s__echo");
+        assert_eq!(tools.source_values().next().unwrap(), &raw);
+        let mut client = tools[0].clone(); client["inputSchema"] = json!({"type":"object"});
+        assert_ne!(crate::integrity::fingerprint(&client), crate::integrity::fingerprint(&raw));
+        assert_eq!(router.policy_catalog(&tools).source_values().next().unwrap(), &raw);
+    }
+
+    #[test]
     fn schema_compat_recursive_arguments_restore_below_cycles() {
         let mut server = mock_server("s");
         server.tools = vec![json!({"name": "echo", "inputSchema": {
