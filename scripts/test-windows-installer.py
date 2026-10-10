@@ -146,6 +146,30 @@ def main():
             replacement.wait(timeout=10)
             print("PASS: busy update replaces gateway, preserves config and accepts a new client", flush=True)
 
+            # Repeat with legacy install-dir and published/versioned gateways,
+            # plus an unrelated same-named image that must survive the update.
+            legacy = install / "conduit-gateway.exe"
+            published = data / "bin/toolport-gateway-1.24.0.exe"
+            foreign = root / "foreign/toolport-gateway.exe"
+            for image in (legacy, published, foreign):
+                image.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(gateway, image)
+            busy = [start_client(image) for image in (gateway, legacy, published)]
+            other = start_client(foreign)
+            children.extend([*busy, other])
+            installer_run(installer, f"/S /UPDATE /R /D={install}", "busy-update-reopen")
+            assert all(child.wait(timeout=10) is not None for child in busy)
+            assert other.poll() is None, "Installer stopped an unrelated gateway"
+            assert path.read_bytes() == connected
+            shipped = ROOT / "src-tauri/binaries/toolport-gateway-x86_64-pc-windows-msvc.exe"
+            assert hashlib.sha256(gateway.read_bytes()).digest() == hashlib.sha256(shipped.read_bytes()).digest()
+            wait_for(lambda: app_pids(app), "busy update /R reopens app")
+            stop_app(app)
+            other.kill()
+            other.wait(timeout=10)
+            legacy.unlink(missing_ok=True)
+            print("PASS: busy legacy/published update keeps foreign gateway and reopens app", flush=True)
+
             daemon = start_gateway(gateway, ["--daemon"])
             children.append(daemon)
             wait_for(lambda: list(data.glob("daemon-*.json")), "idle daemon descriptor")
