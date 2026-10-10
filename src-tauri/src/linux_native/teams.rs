@@ -268,9 +268,11 @@ impl TeamsPage {
             self.content.remove(&child);
         }
         if let Some((notice, is_error)) = notice {
-            self.set_status(&notice, is_error);
-            if !is_error {
-                self.feedback.add_css_class("success");
+            if personal {
+                self.show_sync_status(&registry);
+            } else {
+                self.set_status(&notice, is_error);
+                if !is_error { self.feedback.add_css_class("success"); }
             }
             if let Some(team) = registry.team.clone() {
                 self.render_connected(registry, team);
@@ -1687,7 +1689,9 @@ mod tests {
         reg.team = Some(serde_json::from_value(serde_json::json!({"teamId":"solo","role":"admin","serverUrl":"http://127.0.0.1:1","accountStatus":{"personalSync":true,"plan":"pro","canReceiveConfig":true},"personalSyncState":{"initialized":true,"pending":{"docs-http":{"localId":"docs-http","after":{"name":"Toolport docs","url":"https://example.com/this"}}},"conflicts":{"docs-http":{"name":"Toolport docs","url":"https://gitmcp.io/btsouth/Toolport2026"}}}})).unwrap());
         let server: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({"id":"docs-http","name":"Toolport docs","transport":"http","url":"https://example.com/this","env":[],"enabled":false,"source":"team:solo","personalSyncEntry":true})).unwrap();
         reg.servers.push(server.clone()); crate::registry::save(&reg).unwrap();
+        *page.sync_notice.borrow_mut() = Some(("Sync is up to date".into(), false));
         page.render(reg);
+        assert!(!page.feedback.has_css_class("success"));
         let mut text = String::new(); collect(page.root.upcast_ref(), &mut text);
         assert!(text.contains("Toolport docs changed on both machines")); assert!(text.contains("This machine")); assert!(text.contains("Other machine")); assert!(text.contains("CHANGED: URL:"));
         assert!(!text.contains("Sync is up to date")); assert!(!text.contains("Review and enable")); assert!(text.contains("Turned off")); assert!(!page.plan_badge.is_visible());

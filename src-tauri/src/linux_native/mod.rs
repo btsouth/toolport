@@ -1751,7 +1751,7 @@ impl ServerPage {
         for server in on {
             let card = previous
                 .iter()
-                .find(|(old, _)| old == server)
+                .find(|(old, card)| old == server && card.widget_name() == format!("toolport-profile:{}", snapshot.active_profile_id))
                 .map(|(_, card)| card.clone())
                 .unwrap_or_else(|| server_card(server, &snapshot.active_profile_id, self.clone()));
             if card.parent().is_none() {
@@ -1771,7 +1771,7 @@ impl ServerPage {
         for server in off {
             let card = previous
                 .iter()
-                .find(|(old, _)| old == server)
+                .find(|(old, card)| old == server && card.widget_name() == format!("toolport-profile:{}", snapshot.active_profile_id))
                 .map(|(_, card)| card.clone())
                 .unwrap_or_else(|| server_card(server, &snapshot.active_profile_id, self.clone()));
             card.add_css_class("toolport-card-off");
@@ -7215,6 +7215,7 @@ fn open_server_details(server: &state::ServerView, page: &ServerPage, show_tools
 
 fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    card.set_widget_name(&format!("toolport-profile:{profile_id}"));
     card.add_css_class("toolport-card");
     card.set_margin_top(1);
     card.set_margin_bottom(1);
