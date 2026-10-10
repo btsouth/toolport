@@ -1080,7 +1080,9 @@ mod tests {
         let reviewed = r.servers[0].clone();
         let id = reviewed.id.clone();
         let profile = r.active_profile_id();
-        enable_reviewed(&mut r, &profile, &id, &reviewed).unwrap();
+        check_review(&r, &r.servers[0], Some(&reviewed)).unwrap();
+        crate::registry_controller::apply_server_enabled(&mut r, &profile, &id, true, true)
+            .unwrap();
         let mut changed = cloud.clone();
         changed["servers"][0]["name"] = json!("New display name");
         changed["servers"][0]["requestTimeoutMs"] = json!(5000);
