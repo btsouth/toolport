@@ -9517,7 +9517,7 @@ mod tests {
         assert_eq!(snapshot.server_stats.len(), 1);
         assert_eq!(snapshot.server_stats[0]["calls"], 1);
         activity.render(snapshot);
-        let counting = activity.savings_detail.parent().unwrap().downcast::<gtk::Expander>().unwrap();
+        let counting = activity.savings_banner.last_child().unwrap().downcast::<gtk::Expander>().unwrap();
         assert!(!counting.is_expanded());
         assert!(!activity.savings_detail.text().contains("cl100k"));
         assert!(!activity.savings_detail.text().contains("bytes/4"));
@@ -9564,6 +9564,8 @@ mod tests {
         let theme = theme::ThemeController::new(); theme.attach(&window);
         window.present();
         let main_loop = gtk::glib::MainLoop::new(None, false);
+        let closed = main_loop.clone();
+        window.connect_close_request(move |_| { closed.quit(); gtk::glib::Propagation::Proceed });
         let stop = main_loop.clone();
         gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(180), move || stop.quit());
         main_loop.run();
