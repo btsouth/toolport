@@ -3030,7 +3030,7 @@ impl ActivityPage {
             ("–", "Calls recorded"),
             ("–", "Success rate"),
             ("–", "Average latency"),
-            ("–", "Catalog tokens avoided"),
+            ("–", "Tokens saved"),
         ] {
             let (item, value) = summary_item(value, label);
             values.push(value);
@@ -4764,7 +4764,7 @@ fn savings_primary_display(
             "discovery text returned",
         );
     }
-    (format_saved_tokens(tokens_saved), "catalog tokens avoided")
+    (format_saved_tokens(tokens_saved), "tokens saved")
 }
 
 fn savings_share_line(tokens_saved: i64, loads: u64, searches: u64, bytes: u64) -> String {
@@ -10374,7 +10374,7 @@ mod tests {
     fn savings_detail_and_share_describe_net_tokenized_exposure() {
         assert_eq!(
             savings_primary_display(-123, 1, 0),
-            ("-123".into(), "catalog tokens avoided")
+            ("-123".into(), "tokens saved")
         );
         assert!(!savings_banner_visible(0, 0));
         assert!(
@@ -10384,7 +10384,7 @@ mod tests {
         assert!(savings_banner_visible(1, 0));
         assert_eq!(
             savings_primary_display(41_100, 12, 0),
-            ("41.1k".into(), "catalog tokens avoided")
+            ("41.1k".into(), "tokens saved")
         );
         assert_eq!(
             savings_primary_display(0, 0, 12_340),

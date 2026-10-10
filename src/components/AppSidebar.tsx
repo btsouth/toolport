@@ -611,7 +611,7 @@ export function AppSidebar({
               <span className="font-semibold text-foreground">
                 {fmtTokens(savings.tokensSaved)}
               </span>{" "}
-              catalog tokens avoided{savingsStale ? " (stale)" : ""}
+              tokens saved{savingsStale ? " (stale)" : ""}
             </span>
           </button>
         )}

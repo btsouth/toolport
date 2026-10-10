@@ -552,7 +552,7 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
             ? fmtTokens(savings.tokensSaved)
             : fmtBytes(savings.discoveryResponseBytes ?? 0)}{" "}
           <span className="text-base font-normal text-muted-foreground">
-            {hasCatalog ? "catalog tokens avoided" : "discovery text"}
+            {hasCatalog ? "tokens saved" : "discovery text"}
           </span>
         </span>
       </div>

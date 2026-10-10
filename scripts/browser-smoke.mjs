@@ -71,12 +71,11 @@ try {
   }
   await page.goto(`${baseURL}/fixtures/`);
   await expect(page.getByText("GitHub", { exact: true })).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "35.0k catalog tokens avoided" }),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "35.0k catalog tokens avoided" }),
-  ).toHaveAttribute("title", /cl100k_base.*net of discovery.*once per session/);
+  await expect(page.getByRole("button", { name: "35.0k tokens saved" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "35.0k tokens saved" })).toHaveAttribute(
+    "title",
+    /cl100k_base.*net of discovery.*once per session/,
+  );
   await page.screenshot({ path: path.join(output, "servers.png") });
   await page.getByRole("button", { name: "Show GitHub details", exact: true }).click();
   await page.getByRole("tab", { name: "Tools", exact: true }).click();
@@ -91,9 +90,7 @@ try {
   await page.getByRole("button", { name: "Activity", exact: true }).click();
   await expect(page.getByText("Protection active.", { exact: true })).toBeVisible();
   await expect(page.getByText("Catalog text avoided")).toBeVisible();
-  await expect(
-    page.getByRole("main").getByText("35.0k catalog tokens avoided"),
-  ).toBeVisible();
+  await expect(page.getByRole("main").getByText("35.0k tokens saved")).toBeVisible();
   await expect(page.getByText("How this is counted", { exact: true })).toBeVisible();
   await expect(page.getByText(/Older estimated records/)).not.toBeVisible();
   await page.screenshot({ path: path.join(output, "activity.png") });

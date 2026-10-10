@@ -654,7 +654,7 @@ it("shows negative net savings with the tokenizer method and excludes legacy est
     </TooltipProvider>,
   );
   const badge = await screen.findByRole("button", {
-    name: "-12.3k catalog tokens avoided",
+    name: "-12.3k tokens saved",
   });
   expect(badge).toHaveAttribute("title", expect.stringContaining("cl100k_base"));
   expect(badge).toHaveAttribute("title", expect.stringContaining("net of discovery"));

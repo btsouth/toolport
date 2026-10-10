@@ -564,7 +564,7 @@ it("distinguishes measured bytes from legacy estimates in catalog savings", asyn
   });
   render(<ActivityView refreshKey={0} registry={null} />);
   await act(async () => {});
-  expect(screen.getByText(/923/)).toHaveTextContent("catalog tokens avoided");
+  expect(screen.getByText(/923/)).toHaveTextContent("tokens saved");
   expect(screen.getByText(/923/)).toHaveAttribute(
     "title",
     expect.stringContaining("counted locally"),
