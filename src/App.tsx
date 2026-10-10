@@ -1,9 +1,4 @@
-import {
-  executionReviewLines,
-  executionReviewFields,
-  executionReviewFieldLine,
-  visibleExecutionText,
-} from "@/lib/executionReview";
+import { visibleExecutionText } from "@/lib/visibleExecutionText";
 import { isPersonalSync } from "@/lib/personalSync";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
@@ -86,6 +81,7 @@ const ActivityView = lazy(() =>
 const CatalogView = lazy(() =>
   import("@/components/CatalogView").then((m) => ({ default: m.CatalogView })),
 );
+const ExecutionReview = lazy(() => import("@/components/ExecutionReview"));
 const TeamsView = lazy(() =>
   import("@/components/TeamsView").then((m) => ({ default: m.TeamsView })),
 );
@@ -1139,31 +1135,9 @@ function App() {
         }
         description={
           confirmEnableTeam ? (
-            <div className="max-h-[60vh] space-y-2 overflow-auto break-all font-mono text-xs">
-              <p>Review the highlighted changes. Enable only a setup you trust.</p>
-              {executionReviewLines(confirmEnableTeam).map((line, i) => (
-                <p
-                  key={i}
-                  className={
-                    line !== "New server"
-                      ? "rounded bg-amber-500/10 p-1 text-foreground"
-                      : undefined
-                  }
-                >
-                  {line}
-                </p>
-              ))}
-              {confirmEnableTeam.syncExecutionReview && (
-                <details>
-                  <summary>Show full definition</summary>
-                  {Object.entries(executionReviewFields(confirmEnableTeam)).map(
-                    ([key, value]) => (
-                      <p key={key}>{executionReviewFieldLine(key, value)}</p>
-                    ),
-                  )}
-                </details>
-              )}
-            </div>
+            <Suspense fallback={<p>Loading definition...</p>}>
+              <ExecutionReview server={confirmEnableTeam} />
+            </Suspense>
           ) : undefined
         }
         contentClassName="sm:max-w-2xl"

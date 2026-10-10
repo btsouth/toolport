@@ -12,7 +12,7 @@ import { HOSTED_TEAMS_URL, teamUrlError } from "@/lib/teamUrl";
 import { accountStatusText, syncSignInUrl } from "@/lib/personalSync";
 import { PRO_LINE, TEAMS_FREE_LINE } from "@/lib/teamsPlan";
 import { openExternal } from "@/lib/openUrl";
-import { visibleExecutionText as visibleText } from "@/lib/executionReview";
+import { visibleExecutionText as visibleText } from "@/lib/visibleExecutionText";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Callout } from "./Callout";
