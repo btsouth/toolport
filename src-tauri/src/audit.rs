@@ -961,12 +961,31 @@ mod tests {
                 },
             );
             record_timed("fixture", "nested", true, Some(1), None, None);
-            record_routed_call(&crate::registry::Registry::default(), "fixture", "routed", true, Some(1), None, None, None, None, None, None);
+            record_routed_call(
+                &crate::registry::Registry::default(),
+                "fixture",
+                "routed",
+                true,
+                Some(1),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
         }
         let rows = read_all().unwrap();
         assert_eq!(rows.len(), 5);
         for row in rows {
-            assert_eq!(row["clientName"], if row["tool"] == "direct" { "Unknown client" } else { "inbox" });
+            assert_eq!(
+                row["clientName"],
+                if row["tool"] == "direct" {
+                    "Unknown client"
+                } else {
+                    "inbox"
+                }
+            );
             if row["tool"] != "direct" {
                 assert_eq!(row["client"], "adapter:inbox");
             }

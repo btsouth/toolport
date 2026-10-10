@@ -1907,7 +1907,7 @@ fn daemon_roles_from_cim_json(
 }
 
 #[cfg(windows)]
-fn list_gateway_processes() -> Vec<GatewayProcess> {
+pub(crate) fn list_gateway_processes() -> Vec<GatewayProcess> {
     let mut processes = windows_list_gateway_processes();
     windows_assign_daemon_roles(&mut processes);
     processes
@@ -1928,12 +1928,12 @@ fn kill_gateway_process(proc: &GatewayProcess) -> bool {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn list_gateway_processes() -> Vec<GatewayProcess> {
+pub(crate) fn list_gateway_processes() -> Vec<GatewayProcess> {
     linux_list_gateway_processes()
 }
 
 #[cfg(target_os = "macos")]
-fn list_gateway_processes() -> Vec<GatewayProcess> {
+pub(crate) fn list_gateway_processes() -> Vec<GatewayProcess> {
     macos_list_gateway_processes()
 }
 

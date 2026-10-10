@@ -110,8 +110,13 @@ pub fn enrich(entry: &mut Value) {
     // Carry the recorded principal into nested calls without changing access identity.
     if let Some(client) = ctx.client.as_deref().and_then(telemetry_principal) {
         entry["client"] = json!(client);
-    } else if entry["client"].as_str().is_some_and(|c| telemetry_principal(c).is_none()) {
-        if let Some(object) = entry.as_object_mut() { object.remove("client"); }
+    } else if entry["client"]
+        .as_str()
+        .is_some_and(|c| telemetry_principal(c).is_none())
+    {
+        if let Some(object) = entry.as_object_mut() {
+            object.remove("client");
+        }
     }
     if let Some(ms) = ctx.dispatch_ms {
         entry["dispatchMs"] = json!(ms);
@@ -158,7 +163,11 @@ pub fn enrich(entry: &mut Value) {
         // Newly written calls always record attribution, even outside a gateway
         // request. Missing caller fields remain meaningful on legacy rows only.
         let name = crate::clients::trusted_client_name(entry["client"].as_str(), None);
-        entry["clientName"] = json!(if name == "Unrecorded client" { "Unknown client" } else { &name });
+        entry["clientName"] = json!(if name == "Unrecorded client" {
+            "Unknown client"
+        } else {
+            &name
+        });
     }
 }
 

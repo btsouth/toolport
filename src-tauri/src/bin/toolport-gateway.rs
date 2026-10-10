@@ -15325,7 +15325,13 @@ fn observed_client_name(
     holder
         .zip(pid)
         .and_then(|(session, pid)| session.parent_app.resolve(pid))
-        .unwrap_or_else(|| if client.is_none() && name.is_none() { "Unknown client".into() } else { clients::trusted_client_name(client, name) })
+        .unwrap_or_else(|| {
+            if client.is_none() && name.is_none() {
+                "Unknown client".into()
+            } else {
+                clients::trusted_client_name(client, name)
+            }
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
