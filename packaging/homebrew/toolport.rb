@@ -33,18 +33,10 @@ cask "toolport" do
     "Remove Toolport from all clients". Keep Toolport's data if cleanup fails.
     Or run "#{appdir}/Toolport.app/Contents/MacOS/toolport-gateway" --disconnect-all
     as your normal user while the app is still installed.
+    Uninstall and zap keep your data and credentials. To remove them, choose
+    "Remove Toolport data" in Settings before uninstalling.
   EOS
 
-  # The gateway is a nested helper the app manages; no separate binaries to link.
-  # Application Support: current leaf is Toolport (brand.rs data_dir_leaf_name);
-  # Conduit remains for installs that have not migrated. Cache/pref paths keep
-  # com.tsout.conduit because the bundle id is intentionally unchanged.
-  zap trash: [
-    "~/Library/Application Support/Conduit",
-    "~/Library/Application Support/Toolport",
-    "~/Library/Caches/com.tsout.conduit",
-    "~/Library/HTTPStorages/com.tsout.conduit",
-    "~/Library/Preferences/com.tsout.conduit.plist",
-    "~/Library/Saved Application State/com.tsout.conduit.savedState",
-  ]
+  # Keep recovery data on uninstall and zap. Explicit removal in Settings or
+  # the gateway CLI restores clients before removing data and credentials.
 end

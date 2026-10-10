@@ -510,6 +510,47 @@ impl SettingsPage {
         let remove_clients = gtk::Button::with_label("Remove Toolport from all clients");
         remove_clients.set_halign(gtk::Align::Start);
         page.append(&remove_clients);
+        let purge_data = gtk::Button::with_label("Remove Toolport data");
+        purge_data.add_css_class("destructive-action");
+        purge_data.set_halign(gtk::Align::Start);
+        page.append(&purge_data);
+        let purge_root = root.clone();
+        purge_data.connect_clicked(move |_| {
+            let parent = purge_root.root().and_downcast::<gtk::Window>();
+            let plan = match crate::purge::plan() {
+                Ok(plan) => plan,
+                Err(error) => {
+                    let dialog = adw::MessageDialog::new(parent.as_ref(), Some("Could not prepare data removal"), Some(&error));
+                    dialog.add_response("close", "Close");
+                    dialog.present();
+                    return;
+                }
+            };
+            let details = format!("{}\n\nResults and exact leftovers: {}", plan.resources.join("\n\n"), plan.report_path);
+            let dialog = adw::MessageDialog::new(parent.as_ref(), Some("Remove Toolport data?"), Some("Normal uninstall keeps your data. Toolport will close, restore and disconnect clients, then permanently remove the resources below. Client files and native servers stay. Failed restoration or active sessions keep data for recovery. This cannot be undone."));
+            let inventory = gtk::Label::builder().label(&details).wrap(true).xalign(0.0).selectable(true).build();
+            let scroller = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never)
+                .max_content_height(360).propagate_natural_height(true).child(&inventory).build();
+            dialog.set_extra_child(Some(&scroller));
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("remove", "Close and remove data");
+            dialog.set_close_response("cancel");
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+            dialog.connect_response(None, move |dialog, response| {
+                if response == "remove" {
+                    match crate::purge::launch_after_exit(std::path::Path::new(&plan.report_path)) {
+                        Ok(()) => if let Some(app) = gtk::gio::Application::default() { app.quit(); },
+                        Err(error) => {
+                            let error_dialog = adw::MessageDialog::new(dialog.transient_for().as_ref(), Some("Could not start data removal"), Some(&error));
+                            error_dialog.add_response("close", "Close");
+                            error_dialog.present();
+                        }
+                    }
+                }
+            });
+            dialog.present();
+        });
         let removal_results = gtk::Label::new(None);
         removal_results.set_xalign(0.0);
         removal_results.set_wrap(true);
@@ -2545,5 +2586,60 @@ mod tests {
             "Re-approved 1. 1 access-set scope could not be re-approved: store locked"
         );
         assert!(is_error);
+    }
+}
+
+#[cfg(test)]
+mod purge_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn purge_confirmation_visual_fixture() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-purge-confirmation");
+        crate::registry::save(&crate::registry::Registry::default()).unwrap();
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.PurgeFixture")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let page = SettingsPage::new(
+            super::super::http_bridge::BridgeController::default(),
+            crate::approval_broker::start_native(),
+        );
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .title("Toolport removal fixture")
+            .default_width(900)
+            .default_height(900)
+            .content(&page.root)
+            .build();
+        fn find_button(widget: &gtk::Widget) -> Option<gtk::Button> {
+            if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                if button.label().as_deref() == Some("Remove Toolport data") {
+                    return Some(button.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if let Some(button) = find_button(&current) {
+                    return Some(button);
+                }
+                child = current.next_sibling();
+            }
+            None
+        }
+        let button = find_button(page.root.upcast_ref()).unwrap();
+        window.present();
+        gtk::glib::idle_add_local_once(move || button.emit_clicked());
+        let main_loop = gtk::glib::MainLoop::new(None, false);
+        let stop = main_loop.clone();
+        window.connect_close_request(move |_| {
+            stop.quit();
+            gtk::glib::Propagation::Proceed
+        });
+        let stop = main_loop.clone();
+        gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(180), move || stop.quit());
+        main_loop.run();
     }
 }

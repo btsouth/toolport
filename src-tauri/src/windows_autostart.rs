@@ -99,3 +99,104 @@ mod tests {
         );
     }
 }
+
+/// Remove only values whose command is recognizably Toolport's hidden launch.
+pub(crate) fn remove_toolport_entries(names: &[&str]) -> Vec<crate::purge::Leftover> {
+    use winreg::enums::KEY_WRITE;
+    let mut leftovers = Vec::new();
+    let user = RegKey::predef(HKEY_CURRENT_USER);
+    for name in names {
+        let run_path = format!("HKCU\\{RUN_KEY}\\{name}");
+        let approval_path = format!("HKCU\\{STARTUP_APPROVED_KEY}\\{name}");
+        let result = (|| {
+            let missing_run = || {
+                match user.open_subkey_with_flags(STARTUP_APPROVED_KEY, KEY_READ) {
+                    Ok(key) => match key.get_raw_value(name) {
+                        Ok(_) => Err(crate::purge::Leftover {
+                            path: approval_path.clone(),
+                            error: "Startup approval has no Toolport launch command to verify ownership. It was preserved.".into(),
+                        }),
+                        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(crate::purge::Leftover {
+                            path: approval_path.clone(),
+                            error: error.to_string(),
+                        }),
+                    },
+                    Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(crate::purge::Leftover {
+                        path: approval_path.clone(),
+                        error: error.to_string(),
+                    }),
+                }
+            };
+            let run = match user.open_subkey_with_flags(RUN_KEY, KEY_READ | KEY_WRITE) {
+                Ok(run) => run,
+                Err(error) if error.kind() == ErrorKind::NotFound => return missing_run(),
+                Err(error) => {
+                    return Err(crate::purge::Leftover {
+                        path: run_path.clone(),
+                        error: error.to_string(),
+                    })
+                }
+            };
+            let command = match run.get_value::<String, _>(*name) {
+                Ok(command) => command,
+                Err(error) if error.kind() == ErrorKind::NotFound => return missing_run(),
+                Err(error) => {
+                    return Err(crate::purge::Leftover {
+                        path: run_path.clone(),
+                        error: error.to_string(),
+                    })
+                }
+            };
+            let binary = if let Some(rest) = command.strip_prefix('"') {
+                rest.split('"').next().unwrap_or("")
+            } else {
+                command.split_whitespace().next().unwrap_or("")
+            };
+            let basename = std::path::Path::new(binary)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if !matches!(
+                basename.to_ascii_lowercase().as_str(),
+                "conduit.exe" | "toolport.exe"
+            ) || !command.contains("--hidden")
+            {
+                return Err(crate::purge::Leftover {
+                    path: run_path.clone(),
+                    error: "Startup command has different ownership. It was preserved.".into(),
+                });
+            }
+            // Keep the Run command as ownership proof until approval cleanup succeeds.
+            match user.open_subkey_with_flags(STARTUP_APPROVED_KEY, KEY_WRITE) {
+                Ok(key) => match key.delete_value(name) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(crate::purge::Leftover {
+                            path: approval_path,
+                            error: error.to_string(),
+                        })
+                    }
+                },
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(crate::purge::Leftover {
+                        path: approval_path,
+                        error: error.to_string(),
+                    })
+                }
+            }
+            run.delete_value(name)
+                .map_err(|error| crate::purge::Leftover {
+                    path: run_path,
+                    error: error.to_string(),
+                })
+        })();
+        if let Err(leftover) = result {
+            leftovers.push(leftover);
+        }
+    }
+    leftovers
+}

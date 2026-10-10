@@ -2,7 +2,7 @@
 
 Toolport installs a gateway entry into each AI client's own config file and keeps
 its state in a per-user data directory. A clean removal has two parts: disconnect
-the clients while Toolport is still installed, then remove the app and its data.
+the clients while Toolport is still installed, then remove the app. Normal uninstall and upgrades keep your data and credentials.
 
 ## 1. Disconnect your clients
 
@@ -47,39 +47,46 @@ CLI is `"/Applications/Toolport.app/Contents/MacOS/toolport-gateway" --disconnec
   - Native GTK `.rpm`: `sudo dnf remove toolport`.
   - AppImage: quit Toolport and delete the `.AppImage` file.
 
-## 3. Remove Toolport's data
+## Optional: remove Toolport data
 
-The data directory holds the registry, audit and savings logs, cached tool lists,
-the v2 migration's exports (including any pre-2.0 saved scripts), client-config backups,
-and the gateway binaries Toolport published
-for clients to spawn. Removing the directory removes all of it.
+While Toolport is installed, choose **Remove Toolport data** in Settings. The
+confirmation lists the data directory, credentials and startup entries affected,
+and the report file in your home directory. Toolport closes before removal.
+This is permanent and never runs during an upgrade or normal uninstall.
 
-- **Linux:** `~/.config/Toolport`
-- **macOS:** `~/Library/Application Support/Toolport`
-- **Windows:** `%USERPROFILE%\AppData\Roaming\Toolport` (that is `%APPDATA%\Toolport`)
+For the CLI, close Toolport and run as your normal user, without sudo:
 
-Installs from before the Conduit to Toolport rename keep a `Conduit` directory in
-the same place (`~/.config/Conduit`, `~/Library/Application Support/Conduit`, or
-`%APPDATA%\Conduit`). A `tauri dev` build uses `Toolport-dev` and is separate from
-a normal install.
+```sh
+toolport-gateway --remove-data --dry-run
+toolport-gateway --remove-data --confirm
+```
 
-On Linux, an AppImage install can also leave `~/.config/autostart/Toolport.desktop`
-behind; delete it if it is there.
+On macOS, use the gateway in `Toolport.app/Contents/MacOS/` as in step 1.
+The CLI prints JSON results. Exit 0 means complete, 1 means leftovers or a
+failure, and 2 means confirmation was required. Review the report before
+removing the app.
 
-## 4. Remove stored credentials
+Removal first restores and disconnects clients through the same path as step 1.
+A failed restoration or retained edited Toolport entry keeps recovery data.
+Resolve the reported client paths before retrying. Active gateway sessions block
+removal: close the listed sessions and retry. Toolport requests a graceful stop
+only from authenticated daemons for this data directory.
 
-Server credentials and Team bearer tokens live in your OS keychain, not in the
-config files. They use the service name `conduit-mcp` (kept from before the rename,
-so removals must use it):
+The action removes all contents of the selected Toolport data directory,
+including registry, logs, caches, migration exports, client backups, encrypted
+secrets and published gateway copies in `bin/`. The empty directory may remain.
+It also removes credentials under Toolport's reserved `conduit-mcp` service
+on Linux Secret Service, Windows Credential Manager and macOS Keychain,
+including orphaned entries, Windows chunks and the macOS encryption master key.
+This service is shared by Toolport installations for the same user.
+Toolport's own launch-at-login entries are removed; changed or unrecognized
+entries are preserved and reported. Failed removals list the exact resource
+paths, or the credential scope if the OS denied inventory access.
 
-- **macOS:** open Keychain Access and delete the `conduit-mcp` items.
-- **Windows:** open Credential Manager > Windows Credentials and delete the
-  `conduit-mcp` entries.
-- **Linux:** open your keyring (GNOME Keyring via Seahorse, or KWallet) and delete
-  the `conduit-mcp` entries.
-
-If Toolport ever ran without an OS keyring, it fell back to an encrypted
-`secrets.enc` file inside the data directory, which step 3 already removes.
+Native client files, servers, shared app data and installed package binaries
+are kept. The package manager removes installed binaries in step 2. The action
+uses the current data directory, including a custom `TOOLPORT_DATA_DIR`, an
+existing `Conduit` directory or the separate `Toolport-dev` directory.
 
 ## Keeping Toolport
 

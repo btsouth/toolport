@@ -580,6 +580,25 @@ async fn uninstall_gateway(
 }
 
 #[tauri::command]
+fn data_removal_plan() -> Result<crate::purge::Plan, String> {
+    crate::purge::plan()
+}
+
+#[tauri::command]
+fn remove_toolport_data(
+    app: AppHandle,
+    report_path: String,
+    confirmed: bool,
+) -> Result<(), String> {
+    if !confirmed {
+        return Err("Data removal requires explicit confirmation".into());
+    }
+    crate::purge::launch_after_exit(std::path::Path::new(&report_path))?;
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
 async fn disconnect_all_clients() -> Result<Vec<clients::DisconnectResult>, String> {
     tauri::async_runtime::spawn_blocking(|| clients::disconnect_all(false))
         .await
@@ -1507,12 +1526,6 @@ async fn get_search_traces(limit: usize) -> Result<Vec<serde_json::Value>, Strin
     })
     .await
     .map_err(|e| format!("search traces task join failed: {e}"))?
-}
-
-/// Clear legacy and v2 search-trace logs.
-#[tauri::command]
-fn clear_search_traces() -> Result<(), String> {
-    searchtrace::try_clear().map_err(|e| format!("Couldn't clear the search traces: {e}"))
 }
 
 /// Clear all retained local activity in one confirmed action: the audit log, discovery
@@ -4075,6 +4088,8 @@ pub fn run() {
             install_gateway,
             uninstall_gateway,
             disconnect_all_clients,
+            data_removal_plan,
+            remove_toolport_data,
             migrate_client,
             preview_client_setup,
             set_secret,
@@ -4117,7 +4132,6 @@ pub fn run() {
             get_inspect_log,
             clear_inspect_log,
             get_search_traces,
-            clear_search_traces,
             clear_activity_logs,
             list_tool_identities,
             set_pii_redaction,

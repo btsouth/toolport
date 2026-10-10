@@ -8,6 +8,8 @@ import { SettingsView } from "./SettingsView";
 import {
   clientsNeedingRestart,
   disconnectAllClients,
+  dataRemovalPlan,
+  removeToolportData,
   getRegistry,
   isAutostartEnabled,
   listServerTools,
@@ -29,6 +31,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return {
     ...actual,
     disconnectAllClients: vi.fn(),
+    dataRemovalPlan: vi.fn(),
+    removeToolportData: vi.fn(),
     getRegistry: vi.fn(),
     listServerTools: vi.fn(),
     isAutostartEnabled: vi.fn(),
@@ -636,4 +640,34 @@ it("shows a team's Ask minimum even when the member chose Off", () => {
   expect(
     screen.getByText(/Destructive calls need your approval before they run/),
   ).toBeInTheDocument();
+});
+
+describe("SettingsView explicit data removal", () => {
+  it("lists resources and the report path, and requires confirmation", async () => {
+    vi.mocked(dataRemovalPlan).mockResolvedValue({
+      dataDir: "/fixture/Toolport",
+      resources: [
+        "All contents of /fixture/Toolport",
+        "keychain:conduit-mcp",
+        "/fixture/autostart/Toolport.desktop",
+      ],
+      reportPath: "/fixture/Toolport-removal-report.json",
+    });
+    vi.mocked(removeToolportData).mockResolvedValue();
+    const user = userEvent.setup();
+    renderSettings();
+    await user.click(screen.getByRole("button", { name: "Remove Toolport data" }));
+    const dialog = await screen.findByRole("dialog", { name: "Remove Toolport data?" });
+    expect(within(dialog).getByText("All contents of /fixture/Toolport")).toBeVisible();
+    expect(within(dialog).getByText("keychain:conduit-mcp")).toBeVisible();
+    expect(within(dialog).getByText("/fixture/autostart/Toolport.desktop")).toBeVisible();
+    expect(removeToolportData).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(removeToolportData).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Remove Toolport data" }));
+    await user.click(screen.getByRole("button", { name: "Close and remove data" }));
+    expect(removeToolportData).toHaveBeenCalledWith(
+      "/fixture/Toolport-removal-report.json",
+    );
+  });
 });

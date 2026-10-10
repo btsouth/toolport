@@ -757,6 +757,22 @@ mockIPC(
           content: [{ type: "text", text: `Fixture result: ${JSON.stringify(payload)}` }],
           isError: false,
         };
+      case "data_removal_plan":
+        return {
+          dataDir: "/fixture/home/.config/Toolport",
+          resources: [
+            "All contents of /fixture/home/.config/Toolport: registry, settings, logs, caches, migration exports, client backups, encrypted secrets and published gateways in bin/",
+            "All credentials in Toolport's reserved conduit-mcp service, including Team tokens, OAuth state, master keys and orphaned Windows chunks. This service is shared by Toolport installs for this user.",
+            "Toolport's daemon for this data directory, after all active sessions have closed",
+            ...["Toolport", "Conduit", "conduit", "ToolportNativePreview"].map(
+              (name) =>
+                `/fixture/home/.config/autostart/${name}.desktop (only Toolport's startup entry)`,
+            ),
+          ],
+          reportPath: "/fixture/home/Toolport-removal-report.json",
+        };
+      case "remove_toolport_data":
+        return null;
       case "is_launch_at_login_enabled":
       case "plugin:autostart|is_enabled":
         return false;

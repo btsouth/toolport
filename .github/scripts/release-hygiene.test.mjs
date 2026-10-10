@@ -1,7 +1,14 @@
 import { Buffer } from "node:buffer";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import {
+  readFileSync,
+  readdirSync,
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  rmSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +28,17 @@ const release = {
   assets: [{ name: "Toolport_2.0.0_x64-setup.exe", browser_download_url: url, digest }],
 };
 const installer = releaseInstaller(release, tag, "btsouth/toolport");
+test("Tauri's directory scan sees only shipping entry points", () => {
+  assert.deepEqual(readdirSync("src-tauri/src/bin"), ["toolport-gateway.rs"]);
+  const cargo = readFileSync("src-tauri/Cargo.toml", "utf8");
+  assert.match(cargo, /autobins = false/);
+  const mock = cargo
+    .split("[[bin]]")
+    .find((target) => target.includes('name = "mock-mcp-server"'));
+  assert.match(mock, /path = "src\/test_support\/mock-mcp-server.rs"/);
+  assert.match(mock, /required-features = \["test-support"\]/);
+  assert.doesNotMatch(cargo.match(/^default = .*$/m)[0], /test-support/);
+});
 const templates = [
   "Toolport.Toolport.yaml",
   "Toolport.Toolport.installer.yaml",
@@ -166,4 +184,127 @@ test("AppImage offset skips runtime magic and rejects truncated filesystems", ()
   assert.equal(appImageOffset(bytes), offset);
   bytes.writeBigUInt64LE(1024n, offset + 40);
   assert.equal(appImageOffset(bytes), -1);
+});
+
+test("complete payload manifests reject extra resources and require both binaries", async () => {
+  const { assertManifest } = await import("./package-manifest.mjs");
+  for (const [kind, files] of [
+    ["native", ["./usr/bin/toolport-gtk", "./usr/bin/toolport-gateway"]],
+    ["pacman", ["usr/bin/toolport-gtk", "usr/bin/toolport-gateway", ".PKGINFO"]],
+    [
+      "mac",
+      [
+        "Toolport.app/Contents/MacOS/conduit",
+        "Toolport.app/Contents/MacOS/toolport-gateway",
+      ],
+    ],
+    ["nsis", ["conduit.exe", "toolport-gateway.exe"]],
+    [
+      "msi",
+      [
+        "ProgramFiles64Folder/Toolport/conduit.exe",
+        "ProgramFiles64Folder/Toolport/toolport-gateway.exe",
+      ],
+    ],
+    [
+      "appimage",
+      ["squashfs-root/usr/bin/conduit", "squashfs-root/usr/bin/toolport-gateway"],
+    ],
+  ]) {
+    assertManifest(files, kind);
+    assert.throws(() => assertManifest(files.slice(0, 1), kind), /Missing intended/);
+    const prefix = kind === "msi" ? "ProgramFiles64Folder/Toolport/" : "";
+    assert.throws(
+      () => assertManifest([...files, `${prefix}unexpected-notes.txt`], kind),
+      /Unexpected/,
+    );
+    assert.throws(
+      () => assertManifest([...files, `${prefix}mock-mcp-server`], kind),
+      /Test artifact/,
+    );
+  }
+});
+
+test("MSI validates full installation paths before normalizing its app directory", async () => {
+  const { assertManifest } = await import("./package-manifest.mjs");
+  assert.throws(
+    () => assertManifest(["conduit.exe", "toolport-gateway.exe"], "msi"),
+    /Unexpected msi installation path/,
+  );
+  assertManifest(
+    [
+      "ProgramFiles64Folder/Toolport/conduit.exe",
+      "ProgramFiles64Folder/Toolport/toolport-gateway.exe",
+    ],
+    "msi",
+  );
+  assert.throws(
+    () =>
+      assertManifest(
+        [
+          "ProgramFiles64Folder/Toolport/conduit.exe",
+          "ProgramFiles64Folder/Toolport/toolport-gateway.exe",
+          "ProgramFiles64Folder/OtherApp/conduit.exe",
+        ],
+        "msi",
+      ),
+    /Unexpected/,
+  );
+});
+
+test("macOS manifest includes the signed gateway helper and provisioning profiles", async () => {
+  const { assertManifest } = await import("./package-manifest.mjs");
+  const files = [
+    "Toolport.app/Contents/MacOS/conduit",
+    "Toolport.app/Contents/MacOS/toolport-gateway",
+    "Toolport.app/Contents/MacOS/conduit-gateway",
+    "Toolport.app/Contents/embedded.provisionprofile",
+    "Toolport.app/Contents/Helpers/ToolportGateway.app/",
+    "Toolport.app/Contents/Helpers/ToolportGateway.app/Contents/",
+    "Toolport.app/Contents/Helpers/ToolportGateway.app/Contents/MacOS/toolport-gateway",
+    "Toolport.app/Contents/Helpers/ToolportGateway.app/Contents/embedded.provisionprofile",
+  ];
+  assertManifest(files, "mac");
+  assert.throws(
+    () =>
+      assertManifest(
+        [
+          ...files,
+          "Toolport.app/Contents/Helpers/Unknown.app/Contents/MacOS/toolport-gateway",
+        ],
+        "mac",
+      ),
+    /Unexpected/,
+  );
+});
+
+test("AppImage permits its declared deep-link and GTK runtime resources", async () => {
+  const { assertManifest } = await import("./package-manifest.mjs");
+  const paths = [
+    "squashfs-root/AppRun.wrapped",
+    "squashfs-root/usr/bin/conduit",
+    "squashfs-root/usr/bin/toolport-gateway",
+    "squashfs-root/usr/bin/xdg-mime",
+    "squashfs-root/apprun-hooks/linuxdeploy-plugin-gtk.sh",
+    "squashfs-root/usr/lib/girepository-1.0/Gtk-3.0.typelib",
+    "squashfs-root/usr/lib/girepository-1.0/Adw-1.typelib",
+    "squashfs-root/usr/lib/im-xim.so",
+    "squashfs-root/usr/share/doc/libglib2.0-0/copyright",
+  ];
+  assertContents(paths, { appImage: true });
+  assertManifest(paths, "appimage");
+  assert.throws(() => assertContents(paths), /Unexpected packaged binary/);
+  assert.throws(
+    () => assertManifest([...paths, "squashfs-root/usr/bin/other-helper"], "appimage"),
+    /Unexpected/,
+  );
+  assert.throws(
+    () =>
+      assertManifest([...paths, "squashfs-root/apprun-hooks/test-helper.sh"], "appimage"),
+    /Unexpected/,
+  );
+  assert.throws(
+    () => assertManifest([...paths, "squashfs-root/usr/lib/im-unknown.so"], "appimage"),
+    /Unexpected/,
+  );
 });
