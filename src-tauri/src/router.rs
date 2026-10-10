@@ -1907,8 +1907,7 @@ impl Router {
             });
         if let Some(real) = client_prefixed {
             return format!(
-                "no route for tool '{exposed_name}'; that looks like a client-side alias - \
-                 inside Toolport the tool is named '{real}', call that instead"
+                "Unknown tool: {exposed_name}\nThis client-side alias is named '{real}' inside Toolport.\nUse toolport_search_tools to find tools."
             );
         }
         match self.kick_pending(exposed_name, &visible) {

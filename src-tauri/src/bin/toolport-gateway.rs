@@ -24286,7 +24286,8 @@ mod tests {
                 Some(&live),
             );
             assert_eq!(reply["isError"], true, "got {reply}");
-            assert!(reply.to_string().contains(reason), "got {reply}");
+            let expected = if reason == "disabled" { "turned off" } else { reason };
+            assert!(reply.to_string().contains(expected), "got {reply}");
             assert!(
                 !snapshot.any_starting(|_| true),
                 "{reason} call started the server"

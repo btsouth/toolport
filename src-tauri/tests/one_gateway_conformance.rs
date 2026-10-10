@@ -4122,6 +4122,9 @@ fn protocol_lane_unknown_names_never_request_approval_or_leak_hidden_matches() {
         protocol_lane_tool("read_item", false),
         protocol_lane_tool("read_items", false),
         protocol_lane_tool("read_itam", false),
+        protocol_lane_tool("read_itum", false),
+        { let mut app = protocol_lane_tool("read_itma", false);
+          app["_meta"] = json!({"ui":{"visibility":["app"]}}); app },
         protocol_lane_tool("delete_item", true),
     ];
     let mut scoped = profile("visible", &["files"]);
@@ -4132,7 +4135,7 @@ fn protocol_lane_unknown_names_never_request_approval_or_leak_hidden_matches() {
     write_registry(
         &dir,
         vec![protocol_lane_server(&dir, "files", &tools)],
-        vec![scoped],
+        vec![scoped, profile("full", &["files"])],
     );
     let mut client = spawn_adapter(
         &dir,
@@ -4168,6 +4171,13 @@ fn protocol_lane_unknown_names_never_request_approval_or_leak_hidden_matches() {
         !audit.contains("\"kind\":\"approval\""),
         "unknown call raised approval: {audit}"
     );
+    let mut full = spawn_adapter(&dir, &AdapterOptions { profile:Some("full"), ..Default::default() });
+    full.initialize("protocol-unknown-full");
+    full.wait_for_tool("__read_item", Duration::from_secs(30));
+    let text = protocol_lane_error(&full.call_tool("files__read_itm", json!({})), "Unknown tool:");
+    let matches = text.lines().find(|line| line.starts_with("Close matches:")).unwrap();
+    assert_eq!(matches.split(',').count(), 3, "{text}");
+    assert!(!text.contains("read_itma"), "app-only suggestion leaked: {text}");
     // A known destructive tool still fails closed without a broker.
     protocol_lane_error(
         &client.call_tool("files__delete_item", json!({})),
@@ -4262,7 +4272,7 @@ fn protocol_lane_policy_refusals_explain_the_reason_and_fix() {
                 } else {
                     "files__delete_item"
                 };
-                reg.quarantine_on_drift = true;
+                reg.team_forced_quarantine_on_drift = true;
                 for store in [
                     dir.join("quarantine.json"),
                     dir.join(format!(
