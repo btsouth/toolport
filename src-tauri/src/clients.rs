@@ -1514,6 +1514,8 @@ impl CallerNames {
             entry["client"]
                 .as_str()
                 .is_some_and(|id| id.starts_with("client:"))
+                && recorded_client_name(entry["client"].as_str(), entry["clientName"].as_str())
+                    .is_none()
         }) {
             if let Some(registry) = load() {
                 for client in registry.http_clients {
@@ -1551,12 +1553,11 @@ pub(crate) fn unresolved_client_name(client: Option<&str>) -> String {
     trusted_client_name_with(client, None, |_| None)
 }
 
-fn trusted_client_name_with(
+fn recorded_client_name<'a>(
     client: Option<&str>,
-    recorded_name: Option<&str>,
-    lookup: impl FnOnce(&str) -> Option<String>,
-) -> String {
-    if let Some(name) = recorded_name.filter(|name| {
+    recorded_name: Option<&'a str>,
+) -> Option<&'a str> {
+    recorded_name.filter(|name| {
         !name.is_empty()
             && !matches!(
                 *name,
@@ -1564,7 +1565,15 @@ fn trusted_client_name_with(
             )
             && !name.starts_with("adapter-pid-")
             && !client.is_some_and(|c| c.strip_prefix("adapter:") == Some(*name))
-    }) {
+    })
+}
+
+fn trusted_client_name_with(
+    client: Option<&str>,
+    recorded_name: Option<&str>,
+    lookup: impl FnOnce(&str) -> Option<String>,
+) -> String {
+    if let Some(name) = recorded_client_name(client, recorded_name) {
         return crate::session_observability::display_label(name)
             .unwrap_or_else(|| "Unknown client".into());
     }
@@ -8304,6 +8313,12 @@ mod tests {
             );
         }
         assert_eq!(loads, 1);
+        let _ = CallerNames::for_entries_with(
+            &[serde_json::json!({
+                "client":"client:real", "clientName":"Recorded name"
+            })],
+            || panic!("recorded friendly names must not load the registry"),
+        );
         let _ =
             CallerNames::for_entries_with(&[serde_json::json!({"client":"adapter:inbox"})], || {
                 panic!("adapter rows must not load the registry")
