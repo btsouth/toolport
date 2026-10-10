@@ -21078,7 +21078,10 @@ mod tests {
         drop(stop);
         // Drain any tick already in progress and wait for the worker's sender
         // to disconnect. This proves shutdown rather than guessing with a sleep.
-        while ticks.recv_timeout(Duration::from_secs(5)).is_ok() {}
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ticks.recv_timeout(Duration::from_secs(5)).is_ok() {
+            assert!(Instant::now() < deadline, "maintenance did not stop");
+        }
         assert!(matches!(
             ticks.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Disconnected)

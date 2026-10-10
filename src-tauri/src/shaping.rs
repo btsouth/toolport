@@ -3,7 +3,7 @@
 //! byte budget, the full body is cached in-process and the model gets a truncated
 //! head plus a Toolport-stamped marker carrying a cursor. `toolport_fetch_result`
 //! pages through the cached full result. Lossless: nothing is dropped, only
-//! deferred, and the full data stays retrievable.
+//! deferred while the entry fits the retained-memory cap and has not expired.
 //!
 //! This is the "other half" of the token story: lazy discovery trims tool
 //! DEFINITION bloat; this trims tool RESULT bloat (a 10k-row response that would
@@ -92,8 +92,8 @@ fn sweep(store: &mut SessionStore<Cached>) {
     }
 }
 
-/// Called by every gateway runtime's background maintenance tick. Reads never extend the
-/// insertion-based TTL. Trim outside the cache lock and off the request path.
+/// Called by every gateway runtime's background maintenance tick. Reads never
+/// extend the insertion-based TTL. Trim outside the cache lock and off the request path.
 pub fn maintain_cache(idle_transition: bool) {
     {
         let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
@@ -153,8 +153,8 @@ fn retained_size(body: &String, structured: Option<&Value>) -> usize {
 }
 
 /// Bound memory: evict oldest until the entry count and total bytes leave room for
-/// a `new_entry_size`-byte result. Each entry's `size` is precomputed, so this sum is O(n) adds, not O(n)
-/// JSON re-serializations, on every iteration.
+/// a `new_entry_size`-byte result. Each entry's `size` is precomputed, so this sum
+/// is O(n) adds, not O(n) JSON re-serializations, on every iteration.
 fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) {
     while !store.is_empty()
         && (store.len() >= MAX_CACHE_ENTRIES
@@ -311,8 +311,8 @@ fn is_text_representable(result: &Value) -> bool {
 
 /// If `result` serializes to more than `budget` bytes, cache its full body, replace
 /// it with a truncated head + a stamped cursor marker, and return `true` (shaped).
-/// A `budget` of 0 disables shaping. Lossless: the full body stays fetchable via
-/// [`fetch_result`].
+/// A `budget` of 0 disables shaping. The full body stays fetchable via
+/// [`fetch_result`] while retained within the memory cap and insertion TTL.
 pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> bool {
     shape_result_preserving_prefix(result, budget, owner, 0)
 }
@@ -506,7 +506,6 @@ pub fn stash_payload(body: String, structured: Option<Value>, owner: Option<&str
             owner: owner.map(str::to_string),
         },
     );
-
     cursor
 }
 
@@ -1206,6 +1205,29 @@ mod tests {
         // Reserved capacity exercises real admission without a huge text reply.
         let cursor = stash_payload(String::with_capacity(MAX_CACHE_BYTES), None, None);
         let reply = fetch_result(&cursor, 0, 1, None, None);
+        assert_eq!(reply["isError"], true);
+        assert!(reply["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown or expired"));
+    }
+
+    #[test]
+    fn over_cap_shaping_keeps_the_first_response_contract() {
+        let mut result = json!({
+            "content": [{"type": "text", "text": "x".repeat(MAX_CACHE_BYTES)}],
+            "isError": false,
+            "_meta": {"fixture": true},
+        });
+        assert!(shape_result(&mut result, 2048, None));
+        assert!(value_size(&result) <= 2048);
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["_meta"]["fixture"], true);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("xxx"));
+        let reply = fetch_result(&cursor_of(&result), 0, 1, None, None);
         assert_eq!(reply["isError"], true);
         assert!(reply["content"][0]["text"]
             .as_str()

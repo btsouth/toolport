@@ -5,6 +5,18 @@ use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+struct Scratch(std::path::PathBuf);
+impl Scratch {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {
@@ -14,7 +26,11 @@ impl Drop for Process {
 }
 
 fn check_mode(mode: &str) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = Scratch(std::env::temp_dir().join(format!(
+        "toolport-cache-maintenance-{}-{mode}",
+        std::process::id()
+    )));
+    std::fs::create_dir_all(dir.path()).unwrap();
     let probe = dir.path().join("maintenance-complete");
     let mut command = Command::new(env!("CARGO_BIN_EXE_toolport-gateway"));
     command
