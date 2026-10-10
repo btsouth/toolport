@@ -225,6 +225,7 @@ impl TeamsPage {
             self.pending.borrow().is_some(),
         );
         if notice.is_none() && self.rendered_state.borrow().as_ref() == Some(&render_state) {
+            if let Some(error)=crate::personal_sync::state(&registry).ok().and_then(|s|s.error) { self.set_status(&error,true);return; }
             if registry.team.is_some() {
                 self.render_sync_status();
             } else if self.pending.borrow().is_some() {

@@ -664,8 +664,10 @@ pub fn set_local_only(server_id: &str, local_only: bool) -> Result<Registry, Str
         server
             .unknown_fields
             .insert("syncLocalOnly".into(), json!(local_only));
-        if local_only {
-            server.source = Some("manual".into());
+        if local_only && server.source.as_deref().is_some_and(|s|s.starts_with("team:")) {
+            // Preserve shared provenance: opting out must never launder a
+            // received command or key reference into trusted local input.
+            server.source = Some("shared".into());
         }
         Ok(())
     })

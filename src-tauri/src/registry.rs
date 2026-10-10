@@ -865,6 +865,9 @@ impl ServerEntry {
         if crate::secret_refs::is_shared(self) && crate::secret_refs::has_references(self) {
             return true;
         }
+        if self.unknown_fields.get("personalSyncEntry") == Some(&serde_json::Value::Bool(true)) {
+            return self.unknown_fields.get("teamEnableReview") == Some(&serde_json::Value::Bool(true));
+        }
         let Some(src) = self.source.as_deref() else {
             return false;
         };
@@ -873,9 +876,6 @@ impl ServerEntry {
         }
         if self.unknown_fields.get("teamEnableReview") == Some(&serde_json::Value::Bool(true)) {
             return true;
-        }
-        if self.unknown_fields.get("personalSyncEntry") == Some(&serde_json::Value::Bool(true)) {
-            return false;
         }
         if self.transport == "stdio" || self.command.is_some() {
             return true;

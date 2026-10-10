@@ -562,8 +562,8 @@ export function needsTeamEnableReview(
       server.launch?.inputs.some((i) => i.source))
   )
     return true;
-  if (!server.source?.startsWith("team:")) return false;
   if (server.personalSyncEntry) return server.teamEnableReview === true;
+  if (!server.source?.startsWith("team:")) return false;
   if (server.transport === "stdio" || !!server.command) return true;
   // Anything that is not a plain https:// URL to a dotted public name is treated as
   // needing review: a bare hostname is an intranet name far more often than not, and

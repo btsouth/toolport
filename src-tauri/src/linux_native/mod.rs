@@ -522,11 +522,7 @@ fn build_window(
         // paired, without a relaunch.
         if let state::RegistryState::Ready(ready) = &snapshot {
             team_button.set_visible(true);
-            team_button.set_label(if ready.paired {
-                "Sync"
-            } else {
-                "Sign in to sync"
-            });
+            team_button.set_label(if !ready.paired { "Sign in to sync" } else if ready.personal_sync { "Sync" } else { "Team" });
         }
         server_page.render(snapshot);
         if let Some(notice) = startup_notice.borrow_mut().take() {
