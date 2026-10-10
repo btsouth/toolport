@@ -155,13 +155,13 @@ fn project_json<'a>(json: &'a str, path: &str) -> Option<&'a str> {
     use serde::Deserialize;
 
     struct Select<'p, 'out, 'de> {
-        path: &'p [&'p str],
+        path: std::str::Split<'p, char>,
         found: &'out mut Option<&'de serde_json::value::RawValue>,
     }
     impl<'de> DeserializeSeed<'de> for Select<'_, '_, 'de> {
         type Value = ();
         fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
-            if self.path.is_empty() {
+            if self.path.clone().next().is_none() {
                 *self.found = Some(<&serde_json::value::RawValue>::deserialize(deserializer)?);
                 return Err(D::Error::custom("selected projection"));
             }
@@ -173,11 +173,12 @@ fn project_json<'a>(json: &'a str, path: &str) -> Option<&'a str> {
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             f.write_str("an object or array")
         }
-        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
+        fn visit_map<M: MapAccess<'de>>(mut self, mut map: M) -> Result<(), M::Error> {
+            let segment = self.path.next().expect("a nonempty projection path");
             while let Some(key) = map.next_key::<String>()? {
-                if key == self.path[0] {
+                if key == segment {
                     return map.next_value_seed(Select {
-                        path: &self.path[1..],
+                        path: self.path,
                         found: self.found,
                     });
                 }
@@ -185,24 +186,28 @@ fn project_json<'a>(json: &'a str, path: &str) -> Option<&'a str> {
             }
             Ok(())
         }
-        fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<(), S::Error> {
-            let index = self.path[0].parse::<usize>().map_err(S::Error::custom)?;
+        fn visit_seq<S: SeqAccess<'de>>(mut self, mut seq: S) -> Result<(), S::Error> {
+            let index = self
+                .path
+                .next()
+                .expect("a nonempty projection path")
+                .parse::<usize>()
+                .map_err(S::Error::custom)?;
             for _ in 0..index {
                 if seq.next_element::<IgnoredAny>()?.is_none() {
                     return Ok(());
                 }
             }
             seq.next_element_seed(Select {
-                path: &self.path[1..],
+                path: self.path,
                 found: self.found,
             })?;
             Ok(())
         }
     }
-    let path: Vec<_> = path.split('.').collect();
     let mut found = None;
     let _ = Select {
-        path: &path,
+        path: path.split('.'),
         found: &mut found,
     }
     .deserialize(&mut serde_json::Deserializer::from_str(json));
