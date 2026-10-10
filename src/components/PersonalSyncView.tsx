@@ -336,7 +336,9 @@ export function PersonalSyncView({
             >
               <h3 className="font-medium">
                 {registry.servers.find((s) => s.id === sync?.pending?.[id]?.localId)
-                  ?.name ?? id}{" "}
+                  ?.name ??
+                  (remote as { name?: string } | null)?.name ??
+                  id}{" "}
                 changed on both machines
               </h3>
               <p className="text-sm">

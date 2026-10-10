@@ -76,6 +76,8 @@ function fakeUpdate(version = "1.1.0") {
  * ProfileBar renders, and a team connection so Team is a top-level row. */
 function pairedRegistry(): Registry {
   return {
+    version: 3,
+    servers: [],
     profiles: [{ id: "default", name: "Default" }],
     activeProfileId: "default",
     team: { teamId: "team-1" },
