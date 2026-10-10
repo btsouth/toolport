@@ -29,17 +29,49 @@ const AUTOSTART_NAMES: &[&str] = &["Toolport", "Conduit", "conduit", "ToolportNa
 fn data_dir() -> Result<PathBuf, String> {
     let dir =
         crate::registry::conduit_dir().ok_or("Could not resolve Toolport's data directory")?;
-    let home = dirs::home_dir().ok_or("Could not resolve your home directory")?;
+    let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+    let shared = [
+        dirs::home_dir(),
+        dirs::config_dir(),
+        dirs::data_dir(),
+        Some(std::env::temp_dir()),
+    ];
     if !dir.is_absolute()
-        || dir.parent().is_none()
-        || dir == home
-        || Some(&dir) == dirs::config_dir().as_ref()
-        || Some(&dir) == dirs::data_dir().as_ref()
+        || canonical.parent().is_none()
+        || shared
+            .into_iter()
+            .flatten()
+            .any(|path| canonical == std::fs::canonicalize(&path).unwrap_or(path))
         || std::fs::symlink_metadata(&dir).is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
         return Err(format!("Refusing unsafe data directory: {}", dir.display()));
     }
     Ok(dir)
+}
+
+fn verify_data_ownership(dir: &Path) -> Result<(), String> {
+    if dir.file_name().is_some_and(|name| {
+        matches!(
+            name.to_str(),
+            Some("Toolport" | "Conduit" | "Toolport-dev" | "Conduit-dev")
+        )
+    }) {
+        return Ok(());
+    }
+    let owned = std::fs::read(dir.join("registry.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|value| {
+            value["version"].is_u64() && value["servers"].is_array() && value["profiles"].is_array()
+        });
+    if owned {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not verify Toolport ownership of custom data directory {}. Nothing was removed.",
+            dir.display()
+        ))
+    }
 }
 
 fn autostart_files(home: &Path) -> Vec<PathBuf> {
@@ -131,6 +163,7 @@ pub fn launch_after_exit(report_path: &Path) -> Result<(), String> {
 }
 
 pub fn run() -> Result<Report, String> {
+    verify_data_ownership(&data_dir()?)?;
     run_with(
         || crate::clients::disconnect_all(false),
         |dir| {
@@ -218,7 +251,20 @@ fn run_with(
         });
         return Ok(report);
     }
-    remove_contents(&dir, Some(&owner_path), &mut report);
+    let registry_path = dir.join("registry.json");
+    remove_contents(
+        &dir,
+        &[owner_path.clone(), registry_path.clone()],
+        &mut report,
+    );
+    if report.leftovers.is_empty() {
+        remove_path(&registry_path, &mut report);
+    } else if registry_path.exists() {
+        report.leftovers.push(Leftover {
+            path: registry_path.display().to_string(),
+            error: "Retained as ownership and recovery evidence for retry.".into(),
+        });
+    }
     // Windows cannot unlink an open owner lock. It is the last resource removed.
     drop(owner);
     remove_path(&owner_path, &mut report);
@@ -244,7 +290,7 @@ fn remove_path(path: &Path, report: &mut Report) {
     }
 }
 
-fn remove_contents(dir: &Path, keep: Option<&Path>, report: &mut Report) {
+fn remove_contents(dir: &Path, keep: &[PathBuf], report: &mut Report) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) => {
@@ -259,14 +305,14 @@ fn remove_contents(dir: &Path, keep: Option<&Path>, report: &mut Report) {
         match entry {
             Ok(entry) => {
                 let path = entry.path();
-                if keep == Some(path.as_path()) {
+                if keep.iter().any(|keep| keep == &path) {
                     continue;
                 }
                 match entry.file_type() {
                     Ok(kind) if kind.is_dir() => {
                         remove_contents(&path, keep, report);
                         // A directory holding the owner lock stays until it is released.
-                        if !keep.is_some_and(|keep| keep.starts_with(&path)) {
+                        if !keep.iter().any(|keep| keep.starts_with(&path)) {
                             remove_path(&path, report);
                         }
                     }
@@ -360,7 +406,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&native, dir.join("link")).unwrap();
         let mut report = Report::default();
-        remove_contents(&dir, None, &mut report);
+        remove_contents(&dir, &[], &mut report);
         assert!(report.leftovers.is_empty(), "{:?}", report.leftovers);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         assert_eq!(
@@ -480,5 +526,17 @@ mod tests {
         assert!(!files
             .iter()
             .any(|file| file.to_string_lossy().contains("Claude")));
+    }
+    #[test]
+    fn custom_native_directory_is_not_a_toolport_data_directory() {
+        let env = crate::registry::DataDirTestEnv::new("purge_ownership");
+        std::fs::write(
+            env.dir.join("registry.json"),
+            r#"{"mcpServers":{"native":{"command":"native"}}}"#,
+        )
+        .unwrap();
+        assert!(verify_data_ownership(&env.dir).is_err());
+        crate::registry::save(&crate::registry::Registry::default()).unwrap();
+        assert!(verify_data_ownership(&env.dir).is_ok());
     }
 }
