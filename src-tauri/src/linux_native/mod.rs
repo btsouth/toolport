@@ -1061,13 +1061,12 @@ fn install_star_prompt(container: &gtk::Box) {
             let eligible = gtk::gio::spawn_blocking(|| {
                 crate::registry::load()
                     .map(|registry| {
-                        let profile = registry.active_profile_id();
                         registry
                             .servers
                             .iter()
                             .filter(|server| {
                                 !crate::clients::is_gateway_server(server)
-                                    && registry.is_enabled(&profile, &server.id)
+                                    && registry.enabled_here(&server.id)
                             })
                             .count()
                     })

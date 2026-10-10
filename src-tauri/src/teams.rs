@@ -1662,14 +1662,13 @@ fn report_activation(conn: &TeamConnection, token: &str) -> Result<(), String> {
         return Ok(());
     };
     let journal = crate::team_activity::snapshot(&current.reporting_device_id)?;
-    let enabled = reg.enabled_servers_for(&reg.active_profile_id());
     let pending = reg
         .servers
         .iter()
         .filter(|s| {
             s.source.as_deref() == Some(tag_for(&conn.team_id).as_str())
                 && s.needs_team_enable_review()
-                && !enabled.iter().any(|e| e.id == s.id)
+                && !reg.enabled_here(&s.id)
         })
         .count();
     let clients = crate::clients::detect_clients();
@@ -1683,7 +1682,7 @@ fn report_activation(conn: &TeamConnection, token: &str) -> Result<(), String> {
         let Some(raw) = current.managed_server_ids.get(&server.id) else {
             continue;
         };
-        let enabled_here = reg.is_enabled(&reg.active_profile_id(), &server.id);
+        let enabled_here = reg.enabled_here(&server.id);
         let mut missing = 0usize;
         let mut known = true;
         for env in &server.env {
@@ -2897,11 +2896,12 @@ fn stage_publisher_handoffs(
             .find(|s| &s.id == id)
             .map(|s| s.name.clone())
             .unwrap_or_else(|| id.clone());
-        let personal_on = before.is_enabled(&profile, id);
+        let personal_on = before.enabled_here(id);
         // A personal server that an earlier share handed off is off here only
         // because its Team copy is in use. Re-sharing a change must keep that route.
         let using_team_copy =
-            !personal_on && crate::local_auth::bound_copy_enabled(before, &profile, id);
+            !personal_on
+            && crate::local_auth::bound_copy_enabled(before, id);
         // Sync may revoke this route after the share was confirmed. A stale
         // handoff snapshot must not turn its personal original back on.
         let removed_shared_route = using_team_copy && managed_copy_of(reg, id).is_err();
@@ -2936,8 +2936,8 @@ fn stage_publisher_handoffs(
                 }
                 Err(reason) => {
                     let team_on = managed_copy_of(reg, id)
-                        .is_ok_and(|managed| reg.is_enabled(&profile, &managed));
-                    let route = if reg.is_enabled(&profile, id) {
+                        .is_ok_and(|managed| reg.enabled_here(&managed));
+                    let route = if reg.enabled_here(id) {
                         "Your personal server stays on in this profile."
                     } else if team_on {
                         "The Team copy stays on in this profile."
@@ -3024,12 +3024,12 @@ fn same_display_name(a: &str, b: &str) -> bool {
 /// the same rules.
 pub fn personal_share_hint(reg: &Registry, personal: &ServerEntry) -> Option<&'static str> {
     if personal.unknown_fields.get("teamRouteRemoved") == Some(&json!(true))
-        && !reg.is_enabled(&reg.active_profile_id(), &personal.id)
+        && !reg.enabled_here(&personal.id)
     {
         return Some("Removed or disabled by the team. Your personal server stays off.");
     }
     if let Ok(copy) = managed_copy_of(reg, &personal.id) {
-        return Some(if reg.is_enabled(&reg.active_profile_id(), &copy) {
+        return Some(if reg.enabled_here(&copy) {
             "Shared. The Team copy is in use in this profile."
         } else {
             "Shared. The Team copy is not in use in this profile."
@@ -9291,7 +9291,7 @@ mod tests {
                     let expected = local_value(&edited.servers[0]);
                     let profile = edited.active_profile_id();
                     assert!(
-                        crate::local_auth::bound_copy_enabled(&edited, &profile, "mine"),
+                        crate::local_auth::bound_copy_enabled(&edited, "mine"),
                         "the first share handed off"
                     );
                     edited

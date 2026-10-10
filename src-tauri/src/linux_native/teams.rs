@@ -1268,7 +1268,7 @@ pub(super) fn execution_review_scroll(server: &crate::registry::ServerEntry) -> 
 }
 fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> gtk::Box {
     if let Ok(registry) = crate::registry::load() {
-        if registry.is_enabled(&registry.active_profile_id(), &server.id) {
+        if registry.enabled_here(&server.id) {
             let snapshot = super::state::RegistrySnapshot::from_registry(registry);
             if let Some(view) = snapshot.servers.iter().find(|s| s.id == server.id) {
                 return super::server_card(
@@ -1303,7 +1303,7 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
             .find(|s| {
                 &s.id == id
                     && !s.source.as_deref().unwrap_or("").starts_with("team:")
-                    && r.is_enabled(&r.active_profile_id(), id)
+                    && r.enabled_here(id)
             })
             .map(|s| s.name.clone())
     });
@@ -1332,7 +1332,7 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
         row.append(&use_managed);
     }
     let already_enabled =
-        crate::registry::load().is_ok_and(|r| r.is_enabled(&r.active_profile_id(), &server.id));
+        crate::registry::load().is_ok_and(|r| r.enabled_here(&server.id));
     if already_enabled || !server.needs_team_enable_review() {
         row.append(
             &gtk::Label::builder()

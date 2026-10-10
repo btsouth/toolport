@@ -2371,6 +2371,17 @@ impl Registry {
             .unwrap_or(false)
     }
 
+    /// The switch the Servers page shows, as React's `isEnabled` reads it. In v3
+    /// it is global and the legacy active profile's list can be stale, so asking
+    /// `is_enabled(active_profile_id())` there is wrong.
+    pub fn enabled_here(&self, server_id: &str) -> bool {
+        if self.version >= 3 {
+            self.server_enabled(server_id)
+        } else {
+            self.is_enabled(&self.active_profile_id(), server_id)
+        }
+    }
+
     /// Toggle the user's global switch in v3, or legacy profile membership in v1/v2.
     pub fn set_server_enabled(
         &mut self,
@@ -5737,6 +5748,27 @@ pub(crate) mod tests {
         assert!(!r.is_tool_allowed(&new_key));
         assert!(!r.injection_block_exempt.contains_key(&sanitized_id));
         assert!(!r.result_budgets.contains_key(&sanitized_id));
+    }
+
+    #[test]
+    fn enabled_here_follows_the_switch_not_a_stale_legacy_profile() {
+        let mut r = Registry::default();
+        let id = r.add_server(sample_server("github"));
+        let legacy = r.active_profile_id();
+        r.set_server_enabled(&legacy, &id, true).unwrap();
+        // v3 enables globally, so the legacy profile list never gains the id.
+        assert!(!r.is_enabled(&legacy, &id));
+        assert!(r.enabled_here(&id));
+        r.set_server_enabled(&legacy, &id, false).unwrap();
+        assert!(!r.enabled_here(&id));
+
+        let mut old = Registry::default();
+        old.version = 2;
+        let id = old.add_server(sample_server("files"));
+        old.set_server_enabled(&legacy, &id, true).unwrap();
+        assert!(old.enabled_here(&id));
+        old.profiles[0].enabled_server_ids.clear();
+        assert!(!old.enabled_here(&id));
     }
 
     #[test]
