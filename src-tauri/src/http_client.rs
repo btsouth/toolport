@@ -21,14 +21,17 @@ pub(crate) use config_builder;
 pub fn agent() -> ureq::Agent {
     ureq::Agent::with_parts(
         config_builder!().build(),
-        ConnectPhaseConnector,
+        ConnectPhaseConnector::default(),
         DirectResolver,
     )
 }
 
 /// Remember connection failures before HTTP dispatch, when retry is safe.
-#[derive(Debug)]
-struct ConnectPhaseConnector;
+#[derive(Debug, Default)]
+struct ConnectPhaseConnector {
+    tcp: ureq::unversioned::transport::TcpConnector,
+    tls: ureq::unversioned::transport::RustlsConnector,
+}
 
 #[derive(Debug)]
 struct ConnectFailure(ureq::Error);
@@ -73,9 +76,7 @@ impl ureq::unversioned::transport::Connector for ConnectPhaseConnector {
         details: &ureq::unversioned::transport::ConnectionDetails,
         chained: Option<()>,
     ) -> Result<Option<Self::Out>, ureq::Error> {
-        use ureq::unversioned::transport::{
-            ConnectionDetails, Connector as _, RustlsConnector, TcpConnector,
-        };
+        use ureq::unversioned::transport::ConnectionDetails;
         // v2 gives the configured TCP connect budget precedence over the
         // request deadline. TLS and HTTP I/O still use the request deadline.
         let tcp_details = ConnectionDetails {
@@ -90,7 +91,7 @@ impl ureq::unversioned::transport::Connector for ConnectPhaseConnector {
             run_connector: details.run_connector.clone(),
         };
         let connect_started = std::time::Instant::now();
-        TcpConnector::default()
+        self.tcp
             .connect(&tcp_details, chained)
             .and_then(|tcp| {
                 let elapsed = connect_started.elapsed();
@@ -110,7 +111,7 @@ impl ureq::unversioned::transport::Connector for ConnectPhaseConnector {
                     tls_details.timeout.after =
                         ureq::unversioned::transport::time::Duration::Exact(remaining);
                 }
-                RustlsConnector::default().connect(&tls_details, tcp)
+                self.tls.connect(&tls_details, tcp)
             })
             .map(|transport| {
                 transport.map(|inner| MetadataTransport {
@@ -202,7 +203,7 @@ pub(crate) fn screened_agent(
 ) -> ureq::Agent {
     ureq::Agent::with_parts(
         config,
-        ConnectPhaseConnector,
+        ConnectPhaseConnector::default(),
         ScreenedResolver {
             block_private,
             screen,
@@ -309,7 +310,7 @@ pub(crate) fn idle_agent(
     let config = config_builder!().timeout_connect(Some(connect)).build();
     ureq::Agent::with_parts(
         config,
-        ConnectPhaseConnector.chain(IdleConnector { read, write }),
+        ConnectPhaseConnector::default().chain(IdleConnector { read, write }),
         DirectResolver,
     )
 }
