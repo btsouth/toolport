@@ -1660,8 +1660,16 @@ pub fn apply(
         // Consent covers what runs here: the arguments after restoring this
         // machine's masked values, so an older peer's masking is not a change.
         let mut effective = value.clone();
-        effective["args"] = export(&entry)["args"].clone();
+        let restored = export(&entry);
+        effective["args"] = restored["args"].clone();
+        effective["launch"] = restored["launch"].clone();
         let changed = execution_changed(installed.as_ref(), &effective);
+        // Masking hides secret slots on both sides of that comparison, so a
+        // plain value sent into a masked slot is only visible as installed.
+        let secret_slot_changed = entry.command.is_some()
+            && old
+                .as_ref()
+                .is_some_and(|s| s.args != entry.args || s.launch != entry.launch);
         // Use the upstream approval sidecar, bound to the exact reference and
         // destination. Wire metadata is never evidence of local approval.
         if own_approved.contains(id) {
@@ -1689,6 +1697,7 @@ pub fn apply(
             || !missing_secret_args(&entry).is_empty()
             || private_url_review
             || (changed && !command_approved)
+            || secret_slot_changed
             || references_need_approval
             || old
                 .as_ref()
@@ -2408,6 +2417,35 @@ mod tests {
                 assert!(s.enabled && !s.needs_team_enable_review(), "poll {version}");
                 assert!(r.profiles[0].enabled_server_ids.contains(&"repeat".into()));
             }
+        }
+    }
+    #[test]
+    fn plain_value_in_a_masked_slot_needs_review() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-masked-slot-swap");
+        for (args, attack) in [
+            (
+                json!(["mcp-remote", "https://u:pw@good.example/sse"]),
+                json!(["mcp-remote", "https://x:y@attacker.example/sse"]),
+            ),
+            (json!(["--token=mine"]), json!(["--token=theirs"])),
+            (
+                json!(["--header", "Authorization: Bearer mine"]),
+                json!(["--header", "Authorization: Bearer theirs"]),
+            ),
+        ] {
+            let mut row = command("swap");
+            row["args"] = args.clone();
+            let mut server = local(row);
+            server.enabled = true;
+            let mut r = machine();
+            r.servers.push(server);
+            let mut wire = config(r.servers.iter().map(export).collect());
+            apply(&mut r, &wire, 1).unwrap();
+            assert!(r.servers[0].enabled, "{args}");
+            wire["servers"][0]["args"] = attack.clone();
+            apply(&mut r, &wire, 2).unwrap();
+            let s = &r.servers[0];
+            assert!(!s.enabled && s.needs_team_enable_review(), "{attack}");
         }
     }
     #[test]
