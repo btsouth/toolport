@@ -36915,9 +36915,9 @@ mod tests {
             .filter(|row| row["kind"] == "approval")
             .collect();
         assert_eq!(entries.len(), 2, "{entries:?}");
-        assert_eq!(entries[0]["decision"], "requested");
-        assert_eq!(entries[0]["gatewayVersion"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(entries[1]["decision"], "withdrawn");
+        assert_eq!(entries[1]["decision"], "requested");
+        assert_eq!(entries[1]["gatewayVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(entries[0]["decision"], "withdrawn");
         assert_eq!(audit::stats().unwrap()["total"], 0);
     }
 
@@ -37042,11 +37042,11 @@ mod tests {
         assert!(result["isError"].as_bool().unwrap());
         let rows = audit::read_all().unwrap();
         assert_eq!(rows.len(), 2, "{rows:?}");
-        assert_eq!(rows[0]["decision"], "requested");
-        assert_eq!(rows[0]["gatewayVersion"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(rows[1]["decision"], "no_response");
-        assert_eq!(rows[1]["server"], "team_slack");
-        assert_eq!(rows[1]["serverId"], "team-slack");
+        assert_eq!(rows[1]["decision"], "requested");
+        assert_eq!(rows[1]["gatewayVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(rows[0]["decision"], "no_response");
+        assert_eq!(rows[0]["server"], "team_slack");
+        assert_eq!(rows[0]["serverId"], "team-slack");
     }
 
     #[test]
@@ -37078,11 +37078,11 @@ mod tests {
         }
         let rows = audit::read_all().unwrap();
         assert_eq!(rows.len(), 2, "{rows:?}");
-        assert_eq!(rows[0]["decision"], "requested");
-        assert_eq!(rows[0]["gatewayVersion"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(rows[1]["decision"], "stale_state");
-        assert_eq!(rows[1]["reason"], "destructive");
-        assert!(rows[1]["heldMs"].as_u64().unwrap() >= 1500);
+        assert_eq!(rows[1]["decision"], "requested");
+        assert_eq!(rows[1]["gatewayVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(rows[0]["decision"], "stale_state");
+        assert_eq!(rows[0]["reason"], "destructive");
+        assert!(rows[0]["heldMs"].as_u64().unwrap() >= 1500);
     }
 
     #[test]
