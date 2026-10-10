@@ -1809,39 +1809,63 @@ mod review_regressions {
         let id = std::env::var("TOOLPORT_APPROVAL_TEST_ID").unwrap();
         let mut server = remote("team:t");
         server.id = id;
-        for _ in 0..10 {
-            approve_at(&server, Path::new(&path)).unwrap();
-        }
+        server.url = Some(std::env::var("TOOLPORT_APPROVAL_TEST_URL").unwrap());
+        approve_at(&server, Path::new(&path)).unwrap();
     }
     #[test]
     fn concurrent_approval_writers_preserve_all_entries() {
         let scratch = crate::registry::DataDirTestEnv::new("approval-contention");
+        // This checks lossless RMW, not disk latency. Under concurrent build IO,
+        // observed fsyncs took over a second each and peers exceeded five seconds.
+        let _lock_budget = crate::registry::LockTimeoutOverride::generous();
         let path = scratch.dir.join("approvals.json");
-        // Hold the same OS lock to make every child contend before beginning its RMW.
-        let lock = crate::registry::lock_at(&path).unwrap();
-        let mut children: Vec<_> = (0..6)
-            .map(|id| {
-                Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "secret_refs::review_regressions::approval_writer_child",
-                        "--ignored",
-                    ])
-                    .env("TOOLPORT_APPROVAL_TEST_PATH", &path)
-                    .env("TOOLPORT_APPROVAL_TEST_ID", format!("writer-{id}"))
-                    .stdout(Stdio::null())
-                    .spawn()
-                    .unwrap()
-            })
-            .collect();
-        drop(lock);
-        for child in &mut children {
-            assert!(child.wait().unwrap().success());
-        }
-        let entries = approvals(&path);
-        assert_eq!(entries.len(), 6);
-        for id in 0..6 {
-            assert!(entries.contains_key(&format!("writer-{id}")));
+        // Keep all sixty RMWs and check both inserts and changed identities.
+        // Each round bounds contention to six writes; spawning holds no OS lock.
+        for round in 0..10 {
+            let url = format!("https://attacker.example/round-{round}");
+            let children: Vec<_> = (0..6)
+                .map(|id| {
+                    Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "secret_refs::review_regressions::approval_writer_child",
+                            "--ignored",
+                        ])
+                        .env("TOOLPORT_APPROVAL_TEST_PATH", &path)
+                        .env("TOOLPORT_APPROVAL_TEST_ID", format!("writer-{id}"))
+                        .env("TOOLPORT_APPROVAL_TEST_URL", &url)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap()
+                })
+                .collect();
+            // Reap every writer before reporting a failure or removing its directory.
+            let outputs: Vec<_> = children
+                .into_iter()
+                .map(|child| child.wait_with_output().unwrap())
+                .collect();
+            for output in outputs {
+                assert!(
+                    output.status.success(),
+                    "approval writer failed in round {round}: {}\n{}\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let entries = approvals(&path);
+            assert_eq!(entries.len(), 6);
+            for id in 0..6 {
+                let mut server = remote("team:t");
+                server.id = format!("writer-{id}");
+                server.url = Some(url.clone());
+                assert_eq!(
+                    entries.get(&server.id),
+                    Some(&approval_identity(&server).unwrap()),
+                    "writer {id}'s update must survive round {round}"
+                );
+            }
         }
     }
     #[test]
