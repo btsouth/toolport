@@ -86,13 +86,6 @@ fn eligible(s: &ServerEntry) -> bool {
 fn reference(value: &Value) -> Option<&str> {
     value.get("source")?.get("ref")?.as_str()
 }
-fn has_references(value: &Value) -> bool {
-    match value {
-        Value::Object(m) => reference(value).is_some() || m.values().any(has_references),
-        Value::Array(a) => a.iter().any(has_references),
-        _ => false,
-    }
-}
 fn env_references(value: &Value) -> bool {
     match value {
         Value::Object(m) => {
@@ -484,9 +477,6 @@ pub(crate) fn command_identity(v: &Value) -> Value {
         "transport":v["transport"], "bindings":v["launch"]["bindings"],
         "inputs":inputs(&v["launch"]["inputs"]), "env":inputs(&v["env"])})
 }
-fn reference_identity(value: &Value) -> Value {
-    json!({"url":value["url"],"command":command_identity(value),"headers":value["headerKeys"]})
-}
 fn execution_changed(before: Option<&Value>, after: &Value) -> bool {
     let command = after["transport"] == "stdio" || after["command"].is_string();
     command && before.is_none_or(|b| command_identity(b) != command_identity(after))
@@ -503,65 +493,42 @@ fn restore_local(entry: &mut ServerEntry, old: &ServerEntry) {
             }
         }
     }
+    // Keep the cloud references for export before upstream restores local overrides.
     if let Some(overrides) = old
         .unknown_fields
         .get("memberSecretRefs")
         .and_then(Value::as_object)
     {
+        let wire = json!(entry);
         let mut remote_refs = serde_json::Map::new();
-        for (location, reference) in overrides {
+        for location in overrides.keys() {
             let Some((field, key)) = location.split_once(':') else {
                 continue;
             };
-            let update = |source: &mut serde_json::Map<String, Value>| {
-                remote_refs.insert(
-                    location.clone(),
-                    source.get("source").cloned().unwrap_or(Value::Null),
-                );
-                source.insert("source".into(), json!({"ref": reference}));
+            let path = match field {
+                "env" => "/env",
+                "input" => "/launch/inputs",
+                "header" => "/headerKeys",
+                _ => continue,
             };
-            let mut update = update;
-            match field {
-                "env" => {
-                    for input in entry.env.iter_mut().filter(|i| i.key == key) {
-                        update(&mut input.unknown_fields);
-                        input.secret = true;
-                        input.value = None;
-                    }
-                }
-                "input" => {
-                    for input in entry
-                        .launch
-                        .iter_mut()
-                        .flat_map(|l| &mut l.inputs)
-                        .filter(|i| i.key == key)
-                    {
-                        update(&mut input.unknown_fields);
-                        input.secret = true;
-                        input.value = None;
-                    }
-                }
-                "header" => {
-                    for header in entry
-                        .unknown_fields
-                        .get_mut("headerKeys")
-                        .and_then(Value::as_array_mut)
+            if let Some(input) = wire
+                .pointer(path)
+                .and_then(Value::as_array)
                         .into_iter()
                         .flatten()
-                        .filter(|i| i["key"] == key)
+                .find(|i| i["key"] == key)
                     {
-                        if let Some(m) = header.as_object_mut() {
-                            update(m);
-                        }
-                    }
-                }
-                _ => {}
+                remote_refs.insert(
+                    location.clone(),
+                    input.get("source").cloned().unwrap_or(Value::Null),
+                );
             }
         }
         entry
             .unknown_fields
             .insert("personalSyncRemoteRefs".into(), json!(remote_refs));
     }
+    crate::teams::restore_local_references(entry, old);
     for input in &mut entry.env {
         if !portable(&json!(input)) && !input.secret && reference(&json!(input)).is_none() {
             input.value = old
@@ -773,6 +740,11 @@ pub fn apply(
                 &reg.servers.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
             );
         }
+        if crate::secret_refs::validate_server(&entry).is_err() {
+            stop_blocked(reg, &tag, id);
+            outcome.blocked += 1;
+            continue;
+        }
         // Preserve existing sign-in only for its exact HTTP destination. New
         // destinations get an empty local vault namespace, never copied tokens.
         let credential_owner = reg
@@ -839,16 +811,15 @@ pub fn apply(
         }
         let installed = old.as_ref().map(export);
         let changed = execution_changed(installed.as_ref(), value);
-        let refs_changed = has_references(value)
-            && old
-                .as_ref()
-                .is_none_or(|o| reference_identity(&export(o)) != reference_identity(value));
+        // Use the upstream approval sidecar, bound to the exact reference and
+        // destination. Wire metadata is never evidence of local approval.
+        let references_need_approval = crate::secret_refs::check_approval(&entry).is_err();
         let command_approved = old
             .as_ref()
             .and_then(|s| s.unknown_fields.get("syncCommandConsent"))
             == Some(&command_identity(value));
         let review = (changed && !command_approved)
-            || refs_changed
+            || references_need_approval
             || old
                 .as_ref()
                 .is_some_and(|s| s.unknown_fields.get("teamEnableReview") == Some(&json!(true)));
@@ -915,10 +886,10 @@ pub(crate) fn check_review(
     current: &ServerEntry,
     reviewed: Option<&ServerEntry>,
 ) -> Result<(), String> {
+    crate::secret_refs::check_reviewed_definition(current, reviewed)?;
     if is_personal(reg) && current.needs_team_enable_review() {
         if reviewed.is_none_or(|s| {
-            s.id != current.id
-                || reference_identity(&export(s)) != reference_identity(&export(current))
+            s.id != current.id || command_identity(&export(s)) != command_identity(&export(current))
         }) {
             return Err(
                 "The command, reference or destination changed. Review this server again.".into(),
@@ -928,16 +899,7 @@ pub(crate) fn check_review(
     Ok(())
 }
 pub fn enable_reviewed(profile: &str, reviewed: &ServerEntry) -> Result<Registry, String> {
-    crate::registry::update(|reg| {
-        let current = reg
-            .servers
-            .iter()
-            .find(|s| s.id == reviewed.id)
-            .ok_or("Server no longer exists")?;
-        check_review(reg, current, Some(reviewed))?;
-        crate::registry_controller::apply_server_enabled(reg, profile, &reviewed.id, true, true)
-    })
-    .map(|(r, ())| r)
+    crate::registry_controller::set_server_enabled_after_reference_review(profile, reviewed)
 }
 
 pub fn set_local_only(server_id: &str, local_only: bool) -> Result<Registry, String> {
@@ -1694,6 +1656,73 @@ mod tests {
         assert!(b.servers[0].needs_team_enable_review());
         row["env"][0]["source"]["ref"] = json!("env:OP_SERVICE_ACCOUNT_TOKEN");
         assert_eq!(apply(&mut b, &config(vec![row]), 2).unwrap().blocked, 1);
+    }
+    #[test]
+    fn personal_references_use_upstream_destination_approval_and_exact_review() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-reference-approval");
+        let mut r = machine();
+        let mut row = http("reference");
+        row["headerKeys"] = json!([{"key":"X-Key","source":{"ref":"op://Private/service/key"}}]);
+        let first = config(vec![row.clone()]);
+        assert_eq!(apply(&mut r, &first, 1).unwrap().review, 1);
+        let reviewed = r.servers[0].clone();
+        assert!(crate::secret_refs::check_approval(&reviewed).is_err());
+        crate::registry::save(&r).unwrap();
+        r = enable_reviewed(&r.active_profile_id(), &reviewed).unwrap();
+        crate::secret_refs::check_approval(&r.servers[0]).unwrap();
+        assert_eq!(apply(&mut r, &first, 1).unwrap().review, 0);
+        assert!(r.servers[0].enabled);
+        row["name"] = json!("Metadata only");
+        assert_eq!(
+            apply(&mut r, &config(vec![row.clone()]), 2).unwrap().review,
+            0
+        );
+        row["headerKeys"][0]["key"] = json!("Authorization");
+        assert_eq!(
+            apply(&mut r, &config(vec![row.clone()]), 3).unwrap().review,
+            1
+        );
+        assert!(check_review(&r, &r.servers[0], Some(&reviewed)).is_err());
+        crate::registry::save(&r).unwrap();
+        assert!(enable_reviewed(&r.active_profile_id(), &reviewed).is_err());
+        let reviewed = r.servers[0].clone();
+        r = enable_reviewed(&r.active_profile_id(), &reviewed).unwrap();
+        row["url"] = json!("https://other.example/mcp");
+        assert_eq!(
+            apply(&mut r, &config(vec![row.clone()]), 4).unwrap().review,
+            1
+        );
+        assert!(crate::secret_refs::check_approval(&r.servers[0]).is_err());
+        assert!(check_review(&r, &r.servers[0], Some(&reviewed)).is_err());
+        row["headerKeys"][0]["source"]["ref"] = json!("op://Private/changed/key");
+        assert_eq!(apply(&mut r, &config(vec![row]), 5).unwrap().review, 1);
+        assert!(!r.servers[0].enabled);
+    }
+    #[test]
+    fn pro_sync_refuses_environment_references_and_local_override_injection() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-pro-reference-policy");
+        let mut r = machine();
+        r.team.as_mut().unwrap().unknown_fields["accountStatus"]["plan"] = json!("pro");
+        let mut row = http("reference");
+        row["headerKeys"] = json!([{"key":"X-Key","source":{"ref":"env:ACCESS_TOKEN"}}]);
+        assert_eq!(
+            apply(&mut r, &config(vec![row.clone()]), 1)
+                .unwrap()
+                .blocked,
+            1
+        );
+        assert!(r.servers.is_empty());
+        row["headerKeys"][0]["source"]["ref"] = json!("op://Private/service/key");
+        assert_eq!(
+            apply(&mut r, &config(vec![row.clone()]), 2).unwrap().review,
+            1
+        );
+        r.servers[0].unknown_fields.insert(
+            "memberSecretRefs".into(),
+            json!({"header:X-Key":"env:ACCESS_TOKEN"}),
+        );
+        assert_eq!(apply(&mut r, &config(vec![row]), 3).unwrap().blocked, 1);
+        assert!(!r.servers[0].enabled);
     }
     #[test]
     fn solo_requires_authenticated_owner_signal_and_teams_keep_review() {

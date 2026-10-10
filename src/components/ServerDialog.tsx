@@ -110,7 +110,13 @@ export function ServerDialog({
   // Env vars (API keys etc.). Values are vaulted in the OS keychain, never stored
   // in the registry, so existing secrets show as declared keys with empty values.
   const [envRows, setEnvRows] = useState<
-    { key: string; value: string; secret?: boolean; portable?: boolean; source?: { ref: string } }[]
+    {
+      key: string;
+      value: string;
+      secret?: boolean;
+      portable?: boolean;
+      source?: { ref: string };
+    }[]
   >(
     initial?.env.map((e) => ({
       key: e.key,

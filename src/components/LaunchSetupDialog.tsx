@@ -65,6 +65,7 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
         }
         if (
           !input.secret &&
+          references[input.key] === undefined &&
           (portable[input.key] === true) !== (input.portable === true)
         ) {
           result = await invoke<Registry>("personal_sync_portable", {
@@ -144,7 +145,7 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
                   }
                 />
               )}
-              {!input.secret && (
+              {!input.secret && references[input.key] === undefined && (
                 <label className="flex items-center gap-2 text-xs">
                   <input
                     type="checkbox"

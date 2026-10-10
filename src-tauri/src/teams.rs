@@ -4687,7 +4687,7 @@ fn restore_local_launch_values(
     }
 }
 
-fn restore_local_references(entry: &mut ServerEntry, old: &ServerEntry) {
+pub(crate) fn restore_local_references(entry: &mut ServerEntry, old: &ServerEntry) {
     if let Some(overrides) = old.unknown_fields.get("memberSecretRefs").and_then(Value::as_object) {
         entry.unknown_fields.insert("memberSecretRefs".into(), json!(overrides));
         for (location, reference) in overrides {

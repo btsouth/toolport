@@ -2918,7 +2918,7 @@ pub fn set_server_enabled_after_reference_review(
             .iter()
             .find(|s| s.id == reviewed.id)
             .ok_or("Server no longer exists")?;
-        crate::secret_refs::check_reviewed_definition(current, Some(reviewed))?;
+        crate::personal_sync::check_review(registry, current, Some(reviewed))?;
         apply_server_enabled(registry, profile_id, &reviewed.id, true, true)
     })?;
     Ok(registry)

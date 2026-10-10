@@ -552,7 +552,10 @@ export function isPrivateHostUrl(url: string | null | undefined): boolean {
  * and refuses without an explicit reviewed flag, so a miss here costs a clear error
  * rather than an unreviewed enable. */
 export function needsTeamEnableReview(
-  server: Pick<ServerEntry, "source" | "transport" | "command" | "url" | "personalSyncEntry" | "teamEnableReview"> &
+  server: Pick<
+    ServerEntry,
+    "source" | "transport" | "command" | "url" | "personalSyncEntry" | "teamEnableReview"
+  > &
     Partial<Pick<ServerEntry, "env" | "headerKeys" | "launch">>,
 ): boolean {
   if (

@@ -351,10 +351,6 @@ fn set_server_enabled(
         // this write could swap the entry for one that needs review.
         if enabled && reviewed {
             if let Some(server) = reg.servers.iter().find(|s| s.id == server_id) {
-                crate::secret_refs::check_reviewed_definition(
-                    server,
-                    reviewed_definition.as_ref(),
-                )?;
                 crate::personal_sync::check_review(reg, server, reviewed_definition.as_ref())?;
             }
         }
