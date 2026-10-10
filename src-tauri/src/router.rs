@@ -169,13 +169,18 @@ pub fn sanitize_segment(s: &str) -> String {
 }
 
 /// Keep the established short spelling; hash the raw identity for long aliases.
-fn bounded_alias(name: &str, identity: &impl serde::Serialize) -> String {
+fn bounded_alias(name: &str, identity: &impl serde::Serialize, namespace: Option<&str>) -> String {
     if name.len() <= 64 {
         return name.to_string();
     }
     let hash = content_digest(identity);
     let suffix: String = hash[..6].iter().map(|byte| format!("{byte:02x}")).collect();
-    let prefix = if let Some((server, tool)) = name.split_once("__") {
+    let namespace = namespace.map(sanitize_segment);
+    let parts = namespace.as_deref().and_then(|server| {
+        name.strip_prefix(&format!("{server}__"))
+            .map(|tool| (server, tool))
+    });
+    let prefix = if let Some((server, tool)) = parts {
         let server = &server[..server.len().min(24)];
         let tool = &tool[..tool.len().min(51 - server.len() - 2)];
         format!("{server}__{tool}")
@@ -2147,7 +2152,7 @@ impl Router {
             let exposed = match ov_name {
                 Some(new) => {
                     let legacy = sanitize_segment(&new);
-                    let cand = bounded_alias(&legacy, &(server_id, orig, &new));
+                    let cand = bounded_alias(&legacy, &(server_id, orig, &new), None);
                     // The gateway owns the toolport_* helper/core namespace.
                     // Keep the original alias when an override would shadow it.
                     if !cand.is_empty()
@@ -2940,12 +2945,12 @@ impl Router {
     }
 
     fn exposed_name(&mut self, server_id: &str, tool: &str, legacy: &str) -> String {
-        let mut name = bounded_alias(legacy, &(server_id, tool));
+        let mut name = bounded_alias(legacy, &(server_id, tool), Some(server_id));
         let mut attempt = 0u64;
         while !self.seen.insert(name.clone()) {
             attempt += 1;
             let candidate = format!("{legacy}_{attempt}");
-            name = bounded_alias(&candidate, &(server_id, tool, attempt));
+            name = bounded_alias(&candidate, &(server_id, tool, attempt), Some(server_id));
         }
         if name != legacy {
             self.legacy_names.insert(name.clone(), legacy.to_string());
@@ -6677,7 +6682,7 @@ for line in sys.stdin:
     #[test]
     fn bounded_aliases_keep_short_names_and_resolve_hash_collisions() {
         let long = format!("read_{}", "item_".repeat(20));
-        let collision = bounded_alias(&format!("s__{long}"), &("s", long.as_str()));
+        let collision = bounded_alias(&format!("s__{long}"), &("s", long.as_str()), Some("s"));
         let short = collision.strip_prefix("s__").unwrap();
         let tools = vec![
             json!({"name":long}),

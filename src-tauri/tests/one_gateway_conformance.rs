@@ -4580,37 +4580,46 @@ fn protocol_lane_long_destructive_names_keep_approval_and_team_source() {
 #[test]
 fn protocol_lane_long_server_aliases_keep_both_identity_parts_and_cached_routes() {
     let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let (_fixture, dir) = Fixture::new("protocol-long-server");
-    let server = format!("service_{}", "account_".repeat(12));
-    let tools = [protocol_lane_tool("read_item", false)];
-    let aliases =
-        conduit_lib::router::Router::server_tool_aliases(&server, &tools, Default::default());
-    let alias = &aliases["read_item"];
-    assert!(
-        alias.len() <= 64 && alias.contains("__read_item_"),
-        "{alias}"
-    );
-    write_registry(
-        &dir,
-        vec![protocol_lane_server(&dir, &server, &tools)],
-        vec![],
-    );
-    let mut first = spawn_adapter(&dir, &AdapterOptions::default());
-    first.initialize("protocol-long-server");
-    first.wait_for_tool_where(
-        "long server alias",
-        |name| name == alias,
-        Duration::from_secs(30),
-    );
-    let found = first.call_tool("toolport_search_tools", json!({"query":"","server":server}));
-    assert!(
-        text_of(&found).contains(alias),
-        "raw server selector lost its bounded alias: {found}"
-    );
-    assert_eq!(text_of(&first.call_tool(alias, json!({}))), "read_item");
-    drop(first);
-    kill_daemons(&dir);
-    let mut second = spawn_adapter(&dir, &AdapterOptions::default());
-    second.initialize("protocol-long-server-restart");
-    assert_eq!(text_of(&second.call_tool(alias, json!({}))), "read_item");
+    for prefix in ["service_", "service__"] {
+        let (_fixture, dir) = Fixture::new("protocol-long-server");
+        let server = format!("{prefix}{}", "account_".repeat(12));
+        let tools = [
+            protocol_lane_tool("read_item", false),
+            protocol_lane_tool("read__item", false),
+        ];
+        let aliases =
+            conduit_lib::router::Router::server_tool_aliases(&server, &tools, Default::default());
+        let alias = &aliases["read_item"];
+        assert!(
+            alias.len() <= 64 && alias.contains("__read_item_"),
+            "{alias}"
+        );
+        write_registry(
+            &dir,
+            vec![protocol_lane_server(&dir, &server, &tools)],
+            vec![],
+        );
+        let mut first = spawn_adapter(&dir, &AdapterOptions::default());
+        first.initialize("protocol-long-server");
+        first.wait_for_tool_where(
+            "long server alias",
+            |name| name == alias,
+            Duration::from_secs(30),
+        );
+        let found = first.call_tool("toolport_search_tools", json!({"query":"","server":server}));
+        assert!(
+            text_of(&found).contains(alias),
+            "raw server selector lost its bounded alias: {found}"
+        );
+        for (original, alias) in &aliases {
+            assert_eq!(text_of(&first.call_tool(alias, json!({}))), *original);
+        }
+        drop(first);
+        kill_daemons(&dir);
+        let mut second = spawn_adapter(&dir, &AdapterOptions::default());
+        second.initialize("protocol-long-server-restart");
+        for (original, alias) in &aliases {
+            assert_eq!(text_of(&second.call_tool(alias, json!({}))), *original);
+        }
+    }
 }
