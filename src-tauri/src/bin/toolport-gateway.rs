@@ -4665,6 +4665,9 @@ fn execute_call(
         .into_iter()
         .filter(|id| visible(id) && view.authorize(DispatchTarget::Server(id)).is_ok())
         .collect();
+    let catalog_visible = |id: &str| {
+        visible(id) && (candidates.is_empty() || candidates.iter().any(|owner| owner == id))
+    };
     if view.authorize(DispatchTarget::Tool(name)).is_ok() {
         for owner in &candidates {
             view.prepare_lazy_use(owner);
@@ -4675,8 +4678,8 @@ fn execute_call(
             let mut seen = started_supervisors();
             loop {
                 let view = fresh.as_deref().unwrap_or(router);
-                let loading = view.any_discovering(visible)
-                    || view.any_publishing_first_catalog(visible)
+                let loading = view.any_discovering(catalog_visible)
+                    || view.any_publishing_first_catalog(catalog_visible)
                     || candidates.iter().any(|owner| {
                         view.kick_pending(owner, |id| id == owner)
                             .is_some_and(|status| status.connecting)
@@ -4722,7 +4725,8 @@ fn execute_call(
     if router.route_of(name).is_none() {
         let mut message = router.no_route_message_within(name, visible);
         if message.starts_with("Unknown tool:")
-            && (router.any_discovering(visible) || router.any_publishing_first_catalog(visible))
+            && (router.any_discovering(catalog_visible)
+                || router.any_publishing_first_catalog(catalog_visible))
         {
             message =
                 "Servers are still connecting. Retry shortly or check toolport_status.".into();

@@ -4375,6 +4375,29 @@ fn protocol_lane_cold_calls_wait_for_catalog_or_report_starting() {
 }
 
 #[test]
+fn protocol_lane_unknown_on_loaded_owner_does_not_wait_for_other_catalogs() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (_fixture, dir) = Fixture::new("protocol-loaded-owner");
+    let mut slow = protocol_lane_server(&dir, "slow", &[protocol_lane_tool("read_item", false)]);
+    slow.args.push("--start-delay-ms=20000".into());
+    write_registry(
+        &dir,
+        vec![protocol_lane_server(&dir, "files", &[protocol_lane_tool("read_item", false)]), slow],
+        vec![],
+    );
+    let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+    client.initialize("protocol-loaded-owner");
+    client.wait_for_tool("files__read_item", Duration::from_secs(30));
+    assert_eq!(transcript_method_count(&dir.join("transcript-slow.jsonl"), "tools/list"), 0);
+    let started = Instant::now();
+    protocol_lane_error(
+        &client.call_tool("toolport_call_tool", json!({"name":"files__read_itm","arguments":{}})),
+        "Unknown tool: files__read_itm",
+    );
+    assert!(started.elapsed() < Duration::from_millis(1500), "loaded owner waited for another server");
+}
+
+#[test]
 fn protocol_lane_long_aliases_route_and_survive_reorder_restart_and_old_policy() {
     let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let _data_lock = registry::data_dir_test_lock();
