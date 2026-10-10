@@ -1,5 +1,3 @@
-/home/bts/Projects/toolport-pages-truth/src-tauri/src/team_sync_status.rs:
-
 //! Last observed Teams sync, separate from registry configuration and backups.
 use crate::registry::{self, TeamConnection};
 use serde::{Deserialize, Serialize};

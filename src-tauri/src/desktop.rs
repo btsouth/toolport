@@ -2093,7 +2093,8 @@ async fn team_instructions_status() -> Option<teams::InstructionsStatusView> {
 
 #[tauri::command]
 async fn team_sync_status() -> crate::team_sync_status::SyncStatus {
-    crate::team_sync_status::current()
+    tauri::async_runtime::spawn_blocking(crate::team_sync_status::current)
+        .await.unwrap_or_default()
 }
 
 // --- Agent hook sensor (SBS-822), retired -------------------------------------

@@ -841,12 +841,16 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     settingKey: SettingKey,
     extra?: {
       switchDisabled?: boolean;
+      tooltip?: string;
       hint?: string;
       hintTone?: "muted" | "destructive";
       onRetry?: () => void;
     },
   ) => (
-    <label className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm">
+    <label
+      title={extra?.tooltip}
+      className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm"
+    >
       <Icon className={`size-4 shrink-0 ${on ? accent : "text-muted-foreground"}`} />
       <span className="flex min-w-0 flex-1 flex-col leading-tight">
         <span className="font-medium">{title}</span>
@@ -1321,6 +1325,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             "Let agents combine several tool calls in one script to reduce back-and-forth. Each call follows your access and approval settings. Scripts run in a restricted environment, but this does not replace those settings.",
             apply("code-mode", setCodeMode),
             "code-mode",
+            {
+              tooltip:
+                "A gateway started with TOOLPORT_CODE_MODE=1 can keep scripts available even when this setting is off.",
+            },
           )}
 
           {toggle(

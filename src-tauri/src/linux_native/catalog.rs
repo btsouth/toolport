@@ -859,7 +859,6 @@ mod tests {
             app: app.clone(),
             server_count: gtk::Label::new(None),
             enabled_count: gtk::Label::new(None),
-            profile_count: gtk::Label::new(None),
             section_title: gtk::Label::new(None),
             posture: gtk::Label::new(None),
             search: gtk::SearchEntry::new(),
