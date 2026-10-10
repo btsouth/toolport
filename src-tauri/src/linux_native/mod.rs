@@ -10118,7 +10118,7 @@ mod tests {
         };
         assert_eq!(
             rows(false),
-            vec!["servers", "clients", "activity", "settings"]
+            vec!["servers", "clients", "activity", "settings", "teams"]
         );
         assert_eq!(
             rows(true),

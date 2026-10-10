@@ -33,17 +33,14 @@ vi.mock("@/lib/openUrl", () => ({ openExternal }));
 
 import { listen } from "@tauri-apps/api/event";
 import { TeamsView } from "./TeamsView";
-import { TEAMS_CREATE_URL, TEAMS_PRICING_URL, TEAMS_SELFHOST_URL } from "@/lib/teamUrl";
 import {
   TEAMS_ANNUAL_PRICE,
   TEAMS_BASE_PRICE,
   TEAMS_FREE_LINE,
-  TEAMS_FREE_SEATS,
   TEAMS_PAID_LINE,
   TEAMS_SEAT_PRICE,
   TEAMS_ANNUAL_SEAT_PRICE,
   TEAMS_TEAM_SEATS,
-  TEAMS_TRIAL_DAYS,
 } from "@/lib/teamsPlan";
 
 /** Everything on this tab that only a person without a team should ever see. Named once
@@ -582,136 +579,79 @@ describe("TeamsView instructions status", () => {
   });
 });
 
-/** The disconnected Teams tab is the only sales page Toolport Teams gets in front of a
- * free user, and it is also the join form for someone who already has a code. These
- * tests hold both halves: the pitch has to be there, and it must not have pushed the
- * form down or broken it. */
-describe("TeamsView disconnected pitch", () => {
+describe("Sync setup", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     api.getRegistry.mockResolvedValue(registry);
-    openExternal.mockClear();
+    openExternal.mockResolvedValue(undefined);
   });
-
-  it("keeps the connect form ahead of the pitch in the DOM", () => {
+  it("offers sign in before pairing with a clear manual fallback", async () => {
     render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
-
-    const form = screen.getByRole("heading", { name: "Have an invite or connect code?" });
-    const pitch = screen.getByRole("heading", { name: "No team yet?" });
-
-    // Someone who came here holding a code is the conversion this page already has. If
-    // the pitch ever lands first in the DOM it also lands first on a narrow window,
-    // where the lanes stack, and that person has to scroll past an ad to paste a code.
-    expect(form.compareDocumentPosition(pitch)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
-  });
-
-  it("still connects with a pasted invite code", async () => {
-    const onRegistryChange = vi.fn();
-    api.teamConnect.mockResolvedValue({ status: "connected", registry: noTeam });
-
-    render(<TeamsView registry={noTeam} onRegistryChange={onRegistryChange} />);
-    await userEvent.type(
-      screen.getByPlaceholderText("Paste your invite or connect code"),
-      "invite-abc",
+    await userEvent.click(screen.getByRole("button", { name: "Sign in to sync" }));
+    expect(openExternal).toHaveBeenCalledWith(
+      "https://teams.toolport.app/?intent=pro&from=app-sync",
     );
-    await userEvent.click(screen.getByRole("button", { name: "Connect" }));
-
+    expect(screen.getByText("Use a manual code")).toBeInTheDocument();
+    expect(screen.queryByText("Ask an admin")).not.toBeInTheDocument();
+  });
+  it("connects with a manual code", async () => {
+    const changed = vi.fn();
+    api.teamConnect.mockResolvedValue({ status: "connected", registry });
+    render(<TeamsView registry={noTeam} onRegistryChange={changed} />);
+    await userEvent.click(screen.getByText("Use a manual code"));
+    await userEvent.type(screen.getByLabelText("Manual code"), "fixture-code");
+    await userEvent.click(screen.getByRole("button", { name: "Sign in with code" }));
     await waitFor(() =>
       expect(api.teamConnect).toHaveBeenCalledWith(
         "https://teams.toolport.app",
-        "invite-abc",
-        undefined,
+        "fixture-code",
       ),
     );
-    expect(onRegistryChange).toHaveBeenCalledWith(noTeam);
+    expect(changed).toHaveBeenCalledWith(registry);
   });
-
-  it("offers a way to start a team, which the desktop app cannot do itself", async () => {
+  it("refuses a plaintext public service before transmitting the code", async () => {
     render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
-
-    await userEvent.click(screen.getByRole("button", { name: /Create a free team/ }));
-
-    // The hosted app reads both of these: `intent` restores team creation after the
-    // sign-in round trip, `from` attributes the app tab separately from the marketing
-    // funnel. Dropping either silently degrades to the generic manage view.
-    expect(openExternal).toHaveBeenCalledWith(TEAMS_CREATE_URL);
-    expect(TEAMS_CREATE_URL).toContain("intent=create-team");
-    expect(TEAMS_CREATE_URL).toContain("from=app-teams-tab");
-  });
-
-  it("states the free tier and what the paid tier actually buys", () => {
-    render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
-
-    expect(screen.getByText(TEAMS_FREE_LINE)).toBeInTheDocument();
-    expect(screen.getByText(TEAMS_PAID_LINE)).toBeInTheDocument();
-    // The paid tier is a flat team price whose difference from Free is governance, so
-    // it has to name what it buys rather than just quote a per-person figure.
-    expect(TEAMS_PAID_LINE).toMatch(/access control/i);
-    // Anchored to the phrase, not to the bare digit: a `toContain("2")` would match a
-    // price string elsewhere and survive the seat count being dropped entirely.
-    expect(TEAMS_FREE_LINE).toContain(`Free for ${TEAMS_FREE_SEATS} people`);
-  });
-
-  it("says how long the free trial of Team features lasts", () => {
-    render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
-
-    // The number is the whole reason "Create a free team" is not a commitment. It is
-    // interpolated, so it can silently vanish without the surrounding sentence changing.
-    expect(
-      screen.getByText(new RegExp(`free to try for ${TEAMS_TRIAL_DAYS} days`)),
-    ).toBeInTheDocument();
-  });
-
-  it("shows why a team is worth having, not just what it costs", () => {
-    render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
-
-    // Price answers "how much", these answer "why at all". They are the only part of the
-    // page that names a problem the reader already has.
-    for (const title of PAIN_TILES) {
-      expect(screen.getByText(title)).toBeInTheDocument();
-    }
-  });
-
-  it("refuses a non-https team server URL before it reaches the backend", async () => {
-    render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
-
-    const url = screen.getByPlaceholderText("https://toolport.yourcompany.com");
-    await userEvent.clear(url);
-    await userEvent.type(url, "http://teams.evil.example.com");
-    await userEvent.type(
-      screen.getByPlaceholderText("Paste your invite or connect code"),
-      "invite-abc",
-    );
-    await userEvent.click(screen.getByRole("button", { name: "Connect" }));
-
-    // The check has to be worth something to the person reading it: a rejected URL that
-    // says nothing is indistinguishable from a broken button. And it must run before the
-    // call, not after — an invite code posted over plaintext http is already spent.
-    expect(await screen.findByText(/must use https:\/\//i)).toBeInTheDocument();
+    await userEvent.click(screen.getByText("Use a manual code"));
+    await userEvent.clear(screen.getByLabelText("Sync service URL"));
+    await userEvent.type(screen.getByLabelText("Sync service URL"), "http://example.com");
+    await userEvent.type(screen.getByLabelText("Manual code"), "fixture-code");
+    await userEvent.click(screen.getByRole("button", { name: "Sign in with code" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/https/);
     expect(api.teamConnect).not.toHaveBeenCalled();
   });
-
-  it("keeps self-hosting a first-class option, not a footnote", async () => {
-    render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
-
-    expect(screen.getByText(/self-hosted on your own network/i)).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: /Self-host it/ }));
-    expect(openExternal).toHaveBeenCalledWith(TEAMS_SELFHOST_URL);
+  it("explains trial, grace and blocked status in personal mode", () => {
+    const solo = {
+      ...registry,
+      team: {
+        ...registry.team!,
+        accountStatus: {
+          personalSync: true,
+          plan: "pro",
+          trialActive: true,
+          trialEndsAt: Date.now() + 2 * 86400000,
+          freeSyncGraceEndsAt: Date.now() + 86400000,
+          deviceId: "fixture",
+          canReceiveConfig: false,
+          reason: "Choose your active device",
+        },
+        personalSyncState: { lastSyncedAt: Date.now(), error: "Network offline" },
+      },
+    };
+    render(<TeamsView registry={solo} onRegistryChange={vi.fn()} />);
+    expect(screen.getByText("Pro · unlimited devices")).toBeInTheDocument();
+    expect(screen.getByText("2 trial days left")).toBeInTheDocument();
+    expect(screen.getByText(/Every device keeps syncing until/)).toBeInTheDocument();
+    expect(screen.getByText("Choose your active device")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Network offline");
+    expect(screen.getByText(/Last synced/)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Share selected/ }),
+    ).not.toBeInTheDocument();
   });
-
-  it("links out for the authoritative price", async () => {
-    render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
-
-    await userEvent.click(screen.getByRole("button", { name: /Pricing/ }));
-    expect(openExternal).toHaveBeenCalledWith(TEAMS_PRICING_URL);
-  });
-
-  it("shows none of the pitch once a team is connected", () => {
-    render(<TeamsView registry={registry} onRegistryChange={vi.fn()} />);
-
-    // The ask happens once, on a tab the person chose to open, and stops the moment it
-    // has been answered. A member should never see marketing for the thing they joined,
-    // and that covers every piece of it: headings, prices, buttons and pain tiles alike.
+  it("keeps multi-person governance and the unloaded view", () => {
+    render(
+      <TeamsView registry={registry} onRegistryChange={vi.fn()} />,
+    );
     expectNoPitch();
     expect(screen.getByText("Linked to team")).toBeInTheDocument();
   });
@@ -725,25 +665,6 @@ describe("TeamsView disconnected pitch", () => {
     // state, and it renders as neither answer.
     expectNoPitch();
     expect(screen.getByLabelText("Loading Toolport Teams")).toBeInTheDocument();
-  });
-
-  it("drops the pitch while a join waits for an admin", async () => {
-    api.teamConnect.mockResolvedValue({ status: "pending", requestToken: "req-1" });
-    api.teamJoinPoll.mockResolvedValue({ status: "pending" });
-
-    render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
-    await userEvent.type(
-      screen.getByPlaceholderText("Paste your invite or connect code"),
-      "invite-abc",
-    );
-    await userEvent.click(screen.getByRole("button", { name: "Connect" }));
-
-    expect(
-      await screen.findByText(/Leave this open, it finishes on its own/),
-    ).toBeVisible();
-    // This person has picked their team and is waiting on a human. Offering them a second
-    // team to create, at a price, is the app arguing against the thing it just did.
-    expectNoPitch();
   });
 });
 

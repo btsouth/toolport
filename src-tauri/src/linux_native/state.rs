@@ -566,6 +566,7 @@ pub(super) struct RegistrySnapshot {
     /// which has to appear the moment pairing writes the registry, not only on
     /// the next launch.
     pub(super) paired: bool,
+    pub(super) personal_sync: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -692,6 +693,7 @@ impl RegistrySnapshot {
             profiles,
             servers,
             paired: registry.team.is_some(),
+            personal_sync: crate::personal_sync::is_personal(&registry),
         }
     }
 }

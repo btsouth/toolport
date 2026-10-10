@@ -1163,7 +1163,8 @@ fn finish_connect(
             .unknown_fields
             .get("accountStatus")
             .is_some_and(|s| s["personalSync"] == true);
-    let pulled = if personal {
+    let delivery_blocked = conn.unknown_fields.get("accountStatus").is_some_and(|s|s["canReceiveConfig"]==false);
+    let pulled = if delivery_blocked { None } else if personal {
         let (version, config) =
             fetch_config_for_update(server_url, &joined.team_id, &joined.member_token)?;
         Some((version, config, None))

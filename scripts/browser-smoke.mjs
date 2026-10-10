@@ -245,6 +245,27 @@ try {
   );
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   expect(errors).toEqual([]);
+  for (const scenario of ["setup", "trial", "grace", "blocked"]) {
+    await page.goto(`${baseURL}/fixtures/?personal-sync=${scenario}`);
+    await expect(page.getByRole("heading", { name: "Sync", exact: true })).toBeVisible();
+    if (scenario === "setup") {
+      await expect(
+        page.getByRole("button", { name: "Sign in to sync", exact: true }),
+      ).toBeVisible();
+      await page.getByText("Use a manual code", { exact: true }).click();
+      await expect(page.getByLabel("Manual code", { exact: true })).toBeVisible();
+    } else {
+      await expect(page.getByText(/Last synced/)).toBeVisible();
+      if (scenario === "trial")
+        await expect(page.getByText("7 trial days left", { exact: true })).toBeVisible();
+      if (scenario === "grace")
+        await expect(page.getByText(/Every device keeps syncing until/)).toBeVisible();
+      if (scenario === "blocked")
+        await expect(page.getByRole("alert")).toHaveText("Sync is paused on this device");
+    }
+    await page.screenshot({ path: path.join(output, `personal-sync-${scenario}.png`) });
+    expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
+  }
   await page.goto(`${baseURL}/fixtures/?approvals`);
   const approval = page.getByRole("alertdialog");
   await expect(

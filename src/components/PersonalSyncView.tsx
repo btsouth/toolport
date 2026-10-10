@@ -1,7 +1,13 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Registry } from "@/lib/types";
-import { teamConnect, teamDisconnect, teamSync, getRegistry } from "@/lib/api";
+import {
+  teamConnect,
+  teamDisconnect,
+  teamSync,
+  teamJoinPoll,
+  getRegistry,
+} from "@/lib/api";
 import { HOSTED_TEAMS_URL, teamUrlError } from "@/lib/teamUrl";
 import { accountStatusText, SYNC_SIGN_IN_URL } from "@/lib/personalSync";
 import { PRO_LINE, TEAMS_FREE_LINE } from "@/lib/teamsPlan";
@@ -21,6 +27,35 @@ export function PersonalSyncView({
   const [busy, setBusy] = useState(false);
   const [url, setUrl] = useState(HOSTED_TEAMS_URL);
   const [code, setCode] = useState("");
+  const [pending, setPending] = useState<{ url: string; token: string } | null>(null);
+  useEffect(() => {
+    if (!pending) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      void teamJoinPoll(pending.url, pending.token)
+        .then((result) => {
+          if (cancelled) return;
+          if (result.status === "connected") {
+            setPending(null);
+            if (result.registry) onRegistryChange(result.registry);
+          } else if (result.status === "pending") setPending({ ...pending });
+          else {
+            setPending(null);
+            setError("The invitation was declined or expired. Get a new manual code.");
+          }
+        })
+        .catch((e) => {
+          if (!cancelled) {
+            setPending(null);
+            setError(String(e));
+          }
+        });
+    }, 2500);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [pending, onRegistryChange]);
   const team = registry.team;
   const status = team?.accountStatus;
   const sync = team?.personalSyncState;
@@ -58,6 +93,16 @@ export function PersonalSyncView({
           <p className="text-sm">
             {TEAMS_FREE_LINE} {PRO_LINE}
           </p>
+          {pending && (
+            <Callout variant="warning">
+              <p>
+                Waiting for invitation approval. Leave this open, it finishes on its own.
+              </p>
+              <Button variant="outline" onClick={() => setPending(null)}>
+                Cancel request
+              </Button>
+            </Callout>
+          )}
           <details className="rounded-lg border p-4">
             <summary className="cursor-pointer text-sm font-medium">
               Use a manual code

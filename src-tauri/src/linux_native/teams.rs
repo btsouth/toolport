@@ -1260,7 +1260,6 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
     enable.set_sensitive(!already_enabled && !held);
     enable.add_css_class("toolport-secondary-action");
     let server_name = server.name.clone();
-    let server_id = server.id.clone();
     let reviewed_entry = server.clone();
     enable.connect_clicked(move |button| {
         let Some(parent) = page.app.active_window() else {

@@ -397,6 +397,19 @@ fn restore_local(entry: &mut ServerEntry, old: &ServerEntry) {
         }
     }
 }
+fn stop_blocked(reg: &mut Registry, tag: &str, original_id: &str) {
+    for s in reg
+        .servers
+        .iter_mut()
+        .filter(|s| s.source.as_deref() == Some(tag) && original(s) == original_id)
+    {
+        s.enabled = false;
+        s.require_team_enable_review();
+        for p in &mut reg.profiles {
+            p.enabled_server_ids.retain(|id| id != &s.id);
+        }
+    }
+}
 /// Merge personal definitions directly while retaining machine-local command and
 /// credential consent. No new command or reference is resolved during this step.
 pub fn apply(
@@ -428,6 +441,9 @@ pub fn apply(
                 })
                 .collect();
             if matches.len() == 1 {
+                if matches[0].1["disabled"] == true {
+                    local.enabled = false;
+                }
                 local
                     .unknown_fields
                     .insert("teamOriginalId".into(), json!(matches[0].0));
@@ -476,6 +492,7 @@ pub fn apply(
             continue;
         }
         if env_references(value) {
+            stop_blocked(reg, &tag, id);
             outcome.blocked += 1;
             continue;
         }
@@ -484,6 +501,7 @@ pub fn apply(
         let mut entry = match crate::teams::classify_team_server(&runtime, &tag) {
             crate::teams::TeamClass::Ready(e) | crate::teams::TeamClass::Review(e) => e,
             _ => {
+                stop_blocked(reg, &tag, id);
                 outcome.blocked += 1;
                 continue;
             }
@@ -529,6 +547,11 @@ pub fn apply(
                 id,
                 &reg.servers.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
             );
+        }
+        if value["disabled"] == true {
+            if let Some(old) = &old {
+                crate::local_auth::revoke_personal_route(reg, &team_id, &old.id);
+            }
         }
         let changed = execution_changed(st.baseline.get(id), value);
         let refs_changed = has_references(value)
@@ -802,27 +825,23 @@ fn current(r: &Registry, c: &crate::registry::TeamConnection) -> bool {
         })
 }
 pub fn status_lines(status: &Value, last_synced: Option<i64>) -> Vec<String> {
+    status_lines_at(status, last_synced, now())
+}
+fn status_lines_at(status: &Value, last_synced: Option<i64>, now: i64) -> Vec<String> {
     let mut lines = vec![match status["plan"].as_str().unwrap_or("Unknown plan") {
         "free" => "Free · 1 person, 1 device".into(),
         "pro" => "Pro · unlimited devices".into(),
         plan => plan.to_string(),
     }];
+    let days = |end: i64| ((end - now).max(0) as u64).div_ceil(86_400_000);
     if status["trialActive"] == true {
         if let Some(end) = status["trialEndsAt"].as_i64() {
-            lines.push(format!(
-                "{} trial days left",
-                (end - now()).max(0).div_ceil(86_400_000)
-            ));
+            lines.push(format!("{} trial days left", days(end)));
         }
     }
     if let Some(end) = status["freeSyncGraceEndsAt"].as_i64() {
-        lines.push(if end > now() {
-            format!(
-                "Every device keeps syncing until {}",
-                chrono::DateTime::from_timestamp_millis(end)
-                    .map(|d| d.to_rfc3339())
-                    .unwrap_or_default()
-            )
+        lines.push(if end > now {
+            format!("Every device keeps syncing for {} more days", days(end))
         } else {
             "Sync grace period ended. Choose your active Free device in Your account.".into()
         });
@@ -830,12 +849,11 @@ pub fn status_lines(status: &Value, last_synced: Option<i64>) -> Vec<String> {
     if status["canReceiveConfig"] == false {
         lines.push(status["reason"].as_str().unwrap_or("This device cannot receive your setup. Choose your active device in Your account.").into());
     }
-    lines.push(
-        last_synced
-            .and_then(chrono::DateTime::from_timestamp_millis)
-            .map(|d| format!("Last synced {}", d.to_rfc3339()))
-            .unwrap_or_else(|| "Waiting for first sync".into()),
-    );
+    lines.push(match last_synced {
+        Some(t) if now - t < 60_000 => "Last synced just now".into(),
+        Some(t) => format!("Last synced {} minutes ago", (now - t).max(0) / 60_000),
+        None => "Waiting for first sync".into(),
+    });
     lines
 }
 
@@ -1077,5 +1095,172 @@ mod tests {
         let (merged, c) = merge(&config(vec![remote]), &pending).unwrap();
         assert!(c.is_empty());
         assert_eq!(merged["servers"][0]["dashboardMetadata"]["keep"], true);
+    }
+    #[test]
+    fn two_machine_http_fixture_covers_delivery_retry_conflict_and_secret_boundary() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+        let _data = crate::registry::DataDirTestEnv::new("solo-http-fixture");
+        let fixture = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", fixture.server_addr());
+        let cloud = Arc::new(Mutex::new((0i64, config(vec![]))));
+        let shared = cloud.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = stop.clone();
+        let stale = Arc::new(AtomicBool::new(false));
+        let retry = stale.clone();
+        let handle = std::thread::spawn(move || {
+            while !done.load(Ordering::Acquire) {
+                let Some(mut req) = fixture
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .unwrap()
+                else {
+                    continue;
+                };
+                assert_eq!(
+                    req.headers()
+                        .iter()
+                        .find(|h| h.field.equiv("authorization"))
+                        .unwrap()
+                        .value
+                        .as_str(),
+                    "Bearer fixture"
+                );
+                let mut state = shared.lock().unwrap();
+                let (code, body) = if req.method() == &tiny_http::Method::Get {
+                    assert!(req.url().contains("manage=1"));
+                    (200, json!({"version":state.0,"config":state.1}))
+                } else {
+                    let body: Value = serde_json::from_reader(req.as_reader()).unwrap();
+                    if retry.swap(false, Ordering::AcqRel) {
+                        state.0 += 1;
+                        state.1["servers"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(http("unrelated"));
+                    }
+                    if body["base_version"] != state.0 {
+                        (409, json!({"error":"stale"}))
+                    } else {
+                        state.0 += 1;
+                        state.1 = body["config"].clone();
+                        (200, json!({"version":state.0}))
+                    }
+                };
+                req.respond(
+                    tiny_http::Response::from_string(body.to_string())
+                        .with_status_code(code)
+                        .with_header(
+                            tiny_http::Header::from_bytes("content-type", "application/json")
+                                .unwrap(),
+                        ),
+                )
+                .unwrap();
+            }
+        });
+        fn flush(r: &mut Registry, url: &str) {
+            r.team.as_mut().unwrap().server_url = url.into();
+            let mut st = state(r).unwrap();
+            for m in st.pending.values_mut() {
+                m.at = 0;
+            }
+            save(r, &st).unwrap();
+            crate::registry::save(r).unwrap();
+            let conn = r.team.clone().unwrap();
+            sync(&conn, "fixture").unwrap();
+            *r = crate::registry::load().unwrap();
+        }
+        let mut a = machine();
+        let mut b = machine();
+        flush(&mut a, &url);
+        flush(&mut b, &url);
+        let before = a.clone();
+        let mut server = local(http("docs"));
+        server.enabled = true;
+        server.env=serde_json::from_value(json!([{"key":"REGION","secret":false,"portable":true,"value":"west"},{"key":"LOCAL","secret":false,"value":"only-A"},{"key":"TOKEN","secret":true,"portable":true,"value":"synthetic-secret"}])).unwrap();
+        a.servers.push(server);
+        record(&before, &mut a).unwrap();
+        stale.store(true, Ordering::Release);
+        flush(&mut a, &url);
+        assert!(state(&a).unwrap().pending.is_empty());
+        flush(&mut b, &url);
+        assert!(b.servers.iter().find(|s| s.id == "docs").unwrap().enabled);
+        assert_eq!(
+            b.servers.iter().find(|s| s.id == "docs").unwrap().env[0]
+                .value
+                .as_deref(),
+            Some("west")
+        );
+        let payload = cloud.lock().unwrap().1.to_string();
+        assert!(!payload.contains("synthetic-secret"));
+        assert!(!payload.contains("only-A"));
+        assert!(payload.contains("unrelated"));
+        let before = a.clone();
+        let mut command_entry = local(command("command"));
+        command_entry.enabled = true;
+        a.servers.push(command_entry);
+        record(&before, &mut a).unwrap();
+        flush(&mut a, &url);
+        assert!(
+            a.servers
+                .iter()
+                .find(|s| s.id == "command")
+                .unwrap()
+                .enabled
+        );
+        flush(&mut b, &url);
+        let reviewed = b
+            .servers
+            .iter()
+            .find(|s| s.id == "command")
+            .unwrap()
+            .clone();
+        assert!(!reviewed.enabled);
+        crate::registry::save(&b).unwrap();
+        b = enable_reviewed(&b.active_profile_id(), &reviewed).unwrap();
+        flush(&mut b, &url);
+        assert!(
+            b.servers
+                .iter()
+                .find(|s| s.id == "command")
+                .unwrap()
+                .enabled
+        );
+        let before = a.clone();
+        a.servers.iter_mut().find(|s| s.id == "docs").unwrap().name = "Edited on A".into();
+        record(&before, &mut a).unwrap();
+        flush(&mut a, &url);
+        flush(&mut b, &url);
+        assert_eq!(
+            b.servers.iter().find(|s| s.id == "docs").unwrap().name,
+            "Edited on A"
+        );
+        let before = a.clone();
+        a.servers.iter_mut().find(|s| s.id == "docs").unwrap().name = "A conflict".into();
+        record(&before, &mut a).unwrap();
+        let before = b.clone();
+        b.servers.iter_mut().find(|s| s.id == "docs").unwrap().name = "B conflict".into();
+        record(&before, &mut b).unwrap();
+        flush(&mut b, &url);
+        flush(&mut a, &url);
+        assert!(state(&a).unwrap().conflicts.contains_key("docs"));
+        let remote = state(&a).unwrap().conflicts["docs"].clone();
+        crate::registry::save(&a).unwrap();
+        a = resolve_conflict("docs", &remote, false).unwrap();
+        flush(&mut a, &url);
+        assert_eq!(
+            a.servers.iter().find(|s| s.id == "docs").unwrap().name,
+            "B conflict"
+        );
+        let before = a.clone();
+        a.servers.retain(|s| s.id != "docs");
+        record(&before, &mut a).unwrap();
+        flush(&mut a, &url);
+        flush(&mut b, &url);
+        assert!(!b.servers.iter().any(|s| s.id == "docs"));
+        stop.store(true, Ordering::Release);
+        handle.join().unwrap();
     }
 }
