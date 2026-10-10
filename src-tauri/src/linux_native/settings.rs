@@ -2584,3 +2584,58 @@ mod tests {
         assert!(is_error);
     }
 }
+
+#[cfg(test)]
+mod purge_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn purge_confirmation_visual_fixture() {
+        let _data = crate::registry::DataDirTestEnv::new("gtk-purge-confirmation");
+        crate::registry::save(&crate::registry::Registry::default()).unwrap();
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.PurgeFixture")
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let page = SettingsPage::new(
+            super::super::http_bridge::BridgeController::default(),
+            crate::approval_broker::start_native(),
+        );
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .title("Toolport removal fixture")
+            .default_width(900)
+            .default_height(900)
+            .content(&page.root)
+            .build();
+        fn find_button(widget: &gtk::Widget) -> Option<gtk::Button> {
+            if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                if button.label().as_deref() == Some("Remove Toolport data") {
+                    return Some(button.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if let Some(button) = find_button(&current) {
+                    return Some(button);
+                }
+                child = current.next_sibling();
+            }
+            None
+        }
+        let button = find_button(page.root.upcast_ref()).unwrap();
+        window.present();
+        gtk::glib::idle_add_local_once(move || button.emit_clicked());
+        let main_loop = gtk::glib::MainLoop::new(None, false);
+        let stop = main_loop.clone();
+        window.connect_close_request(move |_| {
+            stop.quit();
+            gtk::glib::Propagation::Proceed
+        });
+        let stop = main_loop.clone();
+        gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(180), move || stop.quit());
+        main_loop.run();
+    }
+}
