@@ -1071,6 +1071,11 @@ pub fn apply(
             == Some(&command_identity(value));
         let private_url_review = classified_review
             && entry.command.is_none()
+            && entry
+                .url
+                .as_deref()
+                .and_then(crate::oauth::host_of_url)
+                .is_some_and(|host| crate::teams::team_host_is_private(&host))
             && old
                 .as_ref()
                 .is_none_or(|s| s.url != entry.url || s.needs_team_enable_review());
@@ -2068,6 +2073,9 @@ mod tests {
                 crate::remote::current_credential(&id).unwrap().as_deref(),
                 Some("synthetic-old-token")
             );
+            // The shared URL guard fails closed on unresolved DNS. This
+            // credential test needs an explicitly public synthetic destination.
+            let _public = crate::teams::PublicTeamHostOverride::set("changed.example");
             let mut changed = original.clone();
             changed["servers"][0]["url"] = json!("https://changed.example/mcp");
             assert_eq!(apply(&mut b, &changed, 2).unwrap().review, 0);

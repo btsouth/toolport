@@ -4892,7 +4892,7 @@ impl Drop for PublicTeamHostOverride {
     }
 }
 
-fn team_host_is_private(host: &str) -> bool {
+pub(crate) fn team_host_is_private(host: &str) -> bool {
     #[cfg(feature = "test-support")]
     if PUBLIC_TEST_HOST.with(|value| value.borrow().as_deref() == Some(host)) {
         return false;
