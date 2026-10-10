@@ -1,4 +1,5 @@
 //! Shell-neutral setup import and export operations.
+use crate::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use crate::registry::{self, Registry, ServerEntry};
 
@@ -343,12 +344,17 @@ pub fn fetch_shared_setup(id: &str) -> Result<String, String> {
     }
     let url = format!("{SHARE_ENDPOINT}?id={id}");
     use std::io::Read as _;
-    let response = ureq::get(&url)
-        .timeout(std::time::Duration::from_secs(20))
+    let response = crate::http_client::agent()
+        .get(&url)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
+        .build()
         .call()
+        .retain_status_body()
         .map_err(|error| format!("couldn't reach the share service: {error}"))?;
     let mut body = Vec::new();
     response
+        .into_body()
         .into_reader()
         .take(128 * 1024)
         .read_to_end(&mut body)
@@ -358,13 +364,18 @@ pub fn fetch_shared_setup(id: &str) -> Result<String, String> {
 
 pub fn share_setup(setup_json: &str) -> Result<String, String> {
     use std::io::Read as _;
-    let response = ureq::post(SHARE_ENDPOINT)
-        .timeout(std::time::Duration::from_secs(20))
-        .set("content-type", "application/json")
-        .send_string(setup_json)
+    let response = crate::http_client::agent()
+        .post(SHARE_ENDPOINT)
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
+        .build()
+        .set_header("content-type", "application/json")
+        .send(setup_json)
+        .retain_status_body()
         .map_err(|error| format!("couldn't reach the share service: {error}"))?;
     let mut body = Vec::new();
     response
+        .into_body()
         .into_reader()
         .take(64 * 1024)
         .read_to_end(&mut body)
