@@ -142,6 +142,29 @@ describe("RegistryServerRow status accessibility", () => {
     },
   );
 
+  it("offers View log alongside Sign in for a failed team auth probe", () => {
+    renderRow(
+      true,
+      health({
+        authRequired: true,
+        authTarget: "endpoint",
+        failure: { kind: "auth", target: "endpoint" },
+        error: "HTTP 401: team Linear unauthorized",
+      }),
+      { ...server, source: "team:fixture" },
+    );
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    act(() => screen.getByRole("button", { name: "View log" }).click());
+    expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(
+      screen.getByText("HTTP 401: team Linear unauthorized", { exact: true }),
+    ).toBeVisible();
+  });
+
   it("shows a closed local connection instead of an unreachable endpoint", () => {
     renderRow(
       true,

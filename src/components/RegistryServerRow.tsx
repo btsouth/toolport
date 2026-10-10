@@ -243,9 +243,9 @@ export function RegistryServerRow({
             <StatusLabel status={status} label={label} error={health?.error ?? null} />
           )}
 
-          {status === "error" && (
+          {health && !health.ok && health.error && (
             <span className="flex gap-1">
-              {onReprobe && (
+              {status === "error" && onReprobe && (
                 <button
                   type="button"
                   title={`Retry ${server.name} connection`}
@@ -341,7 +341,7 @@ export function RegistryServerRow({
                   {target}
                 </code>
               )}
-              {status === "error" && health?.error && (
+              {health && !health.ok && health.error && (
                 <div className="flex flex-col gap-1">
                   {/* Lead with a readable headline so the useful signal (exit status,
                   EADDRINUSE, a 401) isn't buried under a stack trace + a giant
