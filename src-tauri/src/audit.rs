@@ -672,13 +672,27 @@ pub fn activity_client_name(mut entry: Value) -> Value {
     if !entry.is_object() {
         return entry;
     }
-    if entry.get("client").is_none() && entry.get("clientName").is_none() {
-        return entry;
+    if entry.get("client").is_some() || entry.get("clientName").is_some() {
+        entry["clientName"] = json!(crate::clients::trusted_client_name(
+            entry.get("client").and_then(Value::as_str),
+            entry.get("clientName").and_then(Value::as_str),
+        ));
     }
-    entry["clientName"] = json!(crate::clients::trusted_client_name(
-        entry.get("client").and_then(Value::as_str),
-        entry.get("clientName").and_then(Value::as_str),
-    ));
+    // Historical rows can predate the write-time privacy filter. Keep their
+    // stored history intact while filtering every caller field used by the UI.
+    if entry["client"]
+        .as_str()
+        .is_some_and(|client| crate::session_observability::telemetry_principal(client).is_none())
+    {
+        entry.as_object_mut().unwrap().remove("client");
+    }
+    if let Some(label) = entry["clientLabel"].as_str() {
+        if let Some(safe) = crate::session_observability::display_label(label) {
+            entry["clientLabel"] = json!(safe);
+        } else {
+            entry.as_object_mut().unwrap().remove("clientLabel");
+        }
+    }
     entry
 }
 
@@ -1036,6 +1050,19 @@ mod tests {
             client_activity_from_entries(vec![json!({"ok":true,"ts":1})], 1, None)[0]["callsToday"]
                 .is_null()
         );
+    }
+
+    #[test]
+    fn f6_historical_caller_fields_are_private_on_display_only() {
+        let stored = json!({"client":"adapter:/home/private/customer.env", "clientLabel":"private/customer.env", "ok":true});
+        let displayed = activity_client_name(stored.clone());
+        assert_eq!(displayed["clientName"], "[private]");
+        assert_eq!(displayed["clientLabel"], "[private]");
+        assert!(displayed.get("client").is_none());
+        assert_eq!(stored["client"], "adapter:/home/private/customer.env");
+        let reported = activity_client_name(json!({"clientLabel":"private/customer.env", "ok":true}));
+        assert!(reported.get("clientName").is_none());
+        assert_eq!(reported["clientLabel"], "[private]");
     }
 
     #[test]

@@ -82,6 +82,7 @@ impl ActivitySnapshot {
         let mut calls = Vec::new();
 
         for entry in entries {
+            let entry = crate::audit::activity_client_name(entry);
             let call_ok = crate::audit::tool_call_ok(&entry);
             let is_approval = entry["kind"] == "approval";
             if call_ok.is_none() && !is_approval && entry["kind"] != "internal" {
@@ -850,6 +851,20 @@ fn connect_reload(monitor: &gio::FileMonitor, controller: Weak<RegistryControlle
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn historical_caller_paths_do_not_reach_native_rows_or_tooltips() {
+        let snapshot = super::ActivitySnapshot::from_entries(
+            vec![
+                serde_json::json!({"client":"adapter:/home/private/customer.env", "clientLabel":"private/customer.env", "ok":true}),
+            ],
+            10,
+        );
+        let row = &snapshot.recent[0];
+        assert_eq!(row.client.as_deref(), Some("[private]"));
+        assert_eq!(row.client_label.as_deref(), Some("[private]"));
+        assert!(row.client_id.is_none());
+    }
+
     use super::*;
     use crate::registry::ServerEntry;
 
