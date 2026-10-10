@@ -488,6 +488,9 @@ export interface ServerEntry {
   /** Working directory for a stdio server. Unset = inherit the gateway's cwd.
    * `~` and `${VAR}` are expanded. Lets a server run in a project dir (#239). */
   cwd?: string | null;
+  /** Pass the user's whole shell environment to this stdio server instead of
+   * the default allowlist. Servers migrated from 1.x start with it on. */
+  inheritEnv?: boolean;
   /** Headless outbound OAuth (SBS-524). Present = this server uses the
    * client-credentials flow instead of the interactive browser one. */
   clientCredentials?: ClientCredentials | null;
