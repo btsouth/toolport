@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, act, fireEvent } from "@testing-library/react";
+import { render, screen, act, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ActivityView } from "./ActivityView";
 import type { AuditEntry, SearchTrace } from "@/lib/types";
@@ -825,8 +825,12 @@ describe("ActivityView security drift dismissals", () => {
       expect(row.closest("details")).toBeNull();
       expect(screen.getByText(/5 older tool-change records/)).toBeInTheDocument();
       expect(screen.getByText(/Settings > Quarantined tools/)).toBeInTheDocument();
+      const card = within(row.parentElement!);
+      expect(
+        card.getByRole("button", { name: "Accept all for this server" }),
+      ).toBeDisabled();
       fireEvent.click(row);
-      const accept = screen.getByRole("button", { name: "Accept this tool" });
+      const accept = card.getByRole("button", { name: "Accept this tool" });
       expect(accept).toBeDisabled();
       fireEvent.click(accept);
       expect(releaseQuarantine).not.toHaveBeenCalled();
