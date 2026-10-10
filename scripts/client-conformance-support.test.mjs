@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   Fixture,
+  clientInventoryFromSource,
   repo,
   waitExit,
   waitPidExit,
@@ -12,6 +13,31 @@ import {
   stopTree,
   wireMetadata,
 } from "./client-conformance-support.mjs";
+
+test("client inventory includes every definition and excludes unrelated fixture IDs", () => {
+  const source = `
+const example = HttpClient { id: "example", label: "Example" };
+fn defs() -> Vec<ClientDef> {
+    vec![
+        ClientDef { id: "cursor", name: "Cursor" },
+        ClientDef { id: "new-client", name: "New client" },
+    ]
+}
+#[cfg(test)]
+mod tests {
+    let fixture = HttpClient { id: "real", label: "My assistant" };
+    let other = ClientDef { id: "fixture-only", name: "Fixture" };
+}
+`;
+  assert.deepEqual(clientInventoryFromSource(source), ["cursor", "new-client"]);
+});
+
+test("client inventory fails closed when its definition factory is missing", () => {
+  assert.throws(
+    () => clientInventoryFromSource('HttpClient { id: "real" }'),
+    /client definition inventory could not be read/,
+  );
+});
 
 function firstOutput(child) {
   return new Promise((resolve, reject) => {
