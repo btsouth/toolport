@@ -4138,7 +4138,7 @@ fn protocol_lane_unknown_names_never_request_approval_or_leak_hidden_matches() {
     write_registry(
         &dir,
         vec![protocol_lane_server(&dir, "files", &tools)],
-        vec![scoped, profile("full", &["files"])],
+        vec![scoped, profile("full", &["files"]), profile("none", &[])],
     );
     let mut client = spawn_adapter(
         &dir,
@@ -4169,6 +4169,24 @@ fn protocol_lane_unknown_names_never_request_approval_or_leak_hidden_matches() {
         "{message}"
     );
     assert!(message.contains("toolport_search_tools"));
+    let mut none = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("none"),
+            ..Default::default()
+        },
+    );
+    none.initialize("protocol-no-access");
+    for name in ["files__read_item", "files__private_guessed"] {
+        let text = protocol_lane_error(
+            &none.call_tool(name, json!({})),
+            "turned off for this client",
+        );
+        assert!(
+            text.contains("Toolport > Clients") && !text.contains("Mock files"),
+            "{text}"
+        );
+    }
     let audit = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
     assert!(
         !audit.contains("\"kind\":\"approval\""),
