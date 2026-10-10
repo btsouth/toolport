@@ -4695,7 +4695,7 @@ fn activity_count_summary(total: usize, visible: usize, recent: usize, filtered:
     } else {
         format!("Showing {visible} of the latest {recent}.")
     };
-    format!("{} calls saved on this computer. {shown}", grouped_number(total as u64))
+    format!("{} {} saved on this computer. {shown}", grouped_number(total as u64), if total == 1 { "call" } else { "calls" })
 }
 
 fn format_saved_tokens(tokens_saved: i64) -> String {
@@ -9502,7 +9502,8 @@ mod tests {
         let app = adw::Application::builder().application_id("com.tsout.Toolport.PolishFixture").build();
         app.register(None::<&gtk::gio::Cancellable>).unwrap();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-        std::fs::write(data.dir.join("audit.jsonl"), format!("{}\n{}\n", serde_json::json!({"ts":now,"kind":"internal","server":"toolport","tool":"search","ok":true,"client":"adapter:codex","clientName":"Codex","durationMs":5}), serde_json::json!({"ts":now-60000,"server":"GitHub","tool":"list_issues","ok":true,"client":"adapter:codex","clientName":"Codex","durationMs":12,"piiReplaced":1}))).unwrap();
+        let rows = [serde_json::json!({"ts":now-60000,"server":"GitHub","tool":"list_issues","ok":true,"client":"adapter:codex","clientName":"Codex","durationMs":12,"piiReplaced":1}), serde_json::json!({"ts":now,"kind":"internal","server":"toolport","tool":"search","ok":true,"client":"adapter:codex","clientName":"Codex","durationMs":5})];
+        std::fs::write(data.dir.join("audit.jsonl"), rows.iter().map(|row| format!("{row}\n")).collect::<String>()).unwrap();
         let activity = ActivityPage::new(&app);
         let mut snapshot = state::load_activity_snapshot().unwrap();
         snapshot.tokens_saved = 35100;
@@ -9548,7 +9549,8 @@ mod tests {
                 reason: crate::approval::ApprovalReason::Destructive, arguments: serde_json::json!({"issue":42}),
                 url_elicitation: None, pii_release: None, deadline_ms: now+120000,
             };
-            let (card, _) = approval_card(view, approval_page.clone());
+            let (card, countdown) = approval_card(view, approval_page.clone());
+            countdown.set_label("120s left");
             approvals.append(&card);
         }
         let approval_scroll = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).child(&approvals).build();
@@ -10262,6 +10264,7 @@ mod tests {
 
     #[test]
     fn saved_call_summary_uses_plain_counts() {
+        assert_eq!(activity_count_summary(1, 2, 2, false), "1 call saved on this computer. Showing the latest 2.");
         assert_eq!(activity_count_summary(5225, 5, 5, false), "5,225 calls saved on this computer. Showing the latest 5.");
         assert_eq!(activity_count_summary(5225, 10, 100, false), "5,225 calls saved on this computer. Showing 10 of the latest 100.");
         assert_eq!(activity_count_summary(5225, 2, 5, true), "5,225 calls saved on this computer. Showing 2 matching rows from the latest 5.");

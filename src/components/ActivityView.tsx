@@ -2117,7 +2117,9 @@ export function ActivityView({
       </div>
 
       <p className="mb-2 text-xs text-muted-foreground">
-        {stats ? `${stats.total.toLocaleString()} calls saved on this computer. ` : ""}
+        {stats
+          ? `${stats.total.toLocaleString()} ${stats.total === 1 ? "call" : "calls"} saved on this computer. `
+          : ""}
         {logOpen
           ? visible.length === entries.length
             ? `Showing the latest ${visible.length.toLocaleString()}.`
