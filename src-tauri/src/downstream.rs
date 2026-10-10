@@ -8331,16 +8331,13 @@ impl DownstreamServer {
                             }
                         }
                     }
-                    // Anything else (an unrecognized error, or silence) identifies
-                    // a legacy server, so the `initialize` refusal is the
-                    // actionable error. Carry the probe failure too: if discover
-                    // timed out rather than being refused, reporting only the
-                    // initialize error hides that connect paid a read timeout.
+                    // Preserve the probe's actionable category while retaining
+                    // the initialize refusal as handshake context.
                     Err(probe_err) => {
-                        return Err(format!(
-                            "{init_err} (server/discover probe also failed: {probe_err})"
-                        )
-                        .into())
+                        return Err(crate::call_failure::CallFailure::new(
+                            probe_err.call_failure().kind,
+                            format!("{init_err} (server/discover probe also failed: {probe_err})"),
+                        ))
                     }
                 };
                 let version = choose_protocol_version(&discovered).ok_or_else(|| {
@@ -15871,6 +15868,68 @@ for line in sys.stdin:
                 .any(|e| *e == expected),
             "the retry must re-stamp between the two sends, got {events:?}"
         );
+    }
+
+    #[test]
+    fn failed_discover_preserves_actionable_failure_after_initialize_refusal() {
+        use crate::call_failure::{AuthTarget, CallFailureKind as K};
+        use std::collections::VecDeque;
+        struct Probe {
+            responses: VecDeque<Result<Value, TransportError>>,
+            methods: Vec<String>,
+        }
+        impl Transport for Probe {
+            fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+                let expected = if self.methods.is_empty() {
+                    "initialize"
+                } else {
+                    "server/discover"
+                };
+                assert_eq!(method, expected);
+                self.methods.push(method.into());
+                self.responses.pop_front().expect("a response per request")
+            }
+            fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+                panic!("a failed handshake must not send notifications")
+            }
+        }
+        for (probe_error, expected) in [
+            (
+                TransportError::Classified(
+                    K::Timeout { after_send: true },
+                    "discover timed out".into(),
+                ),
+                K::Timeout { after_send: true },
+            ),
+            (
+                TransportError::Unavailable("discover unavailable".into()),
+                K::Unavailable { after_send: true },
+            ),
+            (
+                TransportError::Rpc(json!({"code": 403, "message": "access denied"})),
+                K::Auth {
+                    target: AuthTarget::Scope,
+                },
+            ),
+        ] {
+            let transport = Probe {
+                responses: VecDeque::from(vec![
+                    Err(TransportError::Rpc(
+                        json!({"code": -32601, "message": "no initialize"}),
+                    )),
+                    Err(probe_error),
+                ]),
+                methods: Vec::new(),
+            };
+            let failure =
+                match DownstreamServer::connect_classified("mock".into(), Box::new(transport)) {
+                    Err(failure) => failure,
+                    Ok(_) => panic!("failed discover cannot connect"),
+                };
+            assert_eq!(failure.kind, expected);
+            assert!(failure.detail.contains("no initialize"));
+            assert!(failure.detail.contains("server/discover probe also failed"));
+        }
     }
 
     #[test]
