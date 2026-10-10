@@ -205,6 +205,8 @@ mod linux {
                 surface: Some(Arc::new(conduit_lib::savings::SerializedSurface::new(
                     &tools,
                 ))),
+                observation: None,
+                tools_list: true,
             }
         }
 

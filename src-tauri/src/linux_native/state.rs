@@ -16,6 +16,10 @@ pub(super) struct ActivityView {
     pub(super) client_id: Option<String>,
     pub(super) client_label: Option<String>,
     pub(super) approval_decision: Option<String>,
+    pub(super) cold: Option<bool>,
+    pub(super) dispatch_ms: Option<u64>,
+    pub(super) failure_kind: Option<String>,
+    pub(super) run_id: Option<String>,
     pub(super) ok: bool,
     pub(super) held: bool,
     pub(super) duration_ms: Option<u64>,
@@ -78,7 +82,7 @@ impl ActivitySnapshot {
         for entry in entries {
             let call_ok = crate::audit::tool_call_ok(&entry);
             let is_approval = entry["kind"] == "approval";
-            if call_ok.is_none() && !is_approval {
+            if call_ok.is_none() && !is_approval && entry["kind"] != "internal" {
                 continue;
             }
             let duration_ms = entry
@@ -118,9 +122,13 @@ impl ActivitySnapshot {
                         .get("clientLabel")
                         .and_then(serde_json::Value::as_str)
                         .and_then(crate::approval::sanitize_client_label),
+                    cold: entry["cold"].as_bool(),
+                    dispatch_ms: entry["dispatchMs"].as_u64(),
+                    failure_kind: entry["failureKind"].as_str().map(str::to_string),
+                    run_id: entry["runId"].as_str().map(str::to_string),
                     approval_decision: is_approval
                         .then(|| entry["decision"].as_str().unwrap_or("unknown").to_string()),
-                    ok: call_ok.unwrap_or(true),
+                    ok: call_ok.unwrap_or_else(|| entry["ok"].as_bool().unwrap_or(true)),
                     held: entry
                         .get("held")
                         .and_then(serde_json::Value::as_bool)
@@ -401,6 +409,8 @@ impl ClientView {
 pub(super) struct ClientSnapshot {
     pub(super) clients: Vec<ClientView>,
     pub(super) profiles: Vec<ProfileView>,
+    pub(super) sessions: Vec<serde_json::Value>,
+    pub(super) sessions_error: bool,
 }
 
 fn client_access_label(registry: &Registry, scope: Option<&str>) -> String {
@@ -437,6 +447,23 @@ fn client_access_options(registry: &Registry) -> Vec<ProfileView> {
     options
 }
 
+fn client_session_history() -> (Vec<serde_json::Value>, bool) {
+    match crate::audit::recent_sessions(12) {
+        Ok(sessions) => (sessions, false),
+        Err(_) => (Vec::new(), true),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn unreadable_session_history_is_optional_to_client_detection() {
+    let _data = crate::registry::DataDirTestEnv::new("f3-history-unreadable");
+    std::fs::create_dir(crate::audit::audit_path().unwrap()).unwrap();
+    let (rows, error) = client_session_history();
+    assert!(rows.is_empty());
+    assert!(error);
+}
+
 pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
     let path = registry::resolved_path().ok_or_else(|| "registry path unavailable".to_string())?;
     let registry = match std::fs::read_to_string(&path) {
@@ -471,9 +498,12 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
             .cmp(&left.app_present)
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     });
+    let (sessions, sessions_error) = client_session_history();
     Ok(ClientSnapshot {
         clients,
         profiles: client_access_options(&registry),
+        sessions,
+        sessions_error,
     })
 }
 

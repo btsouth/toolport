@@ -77,6 +77,25 @@ export interface MigrateResult {
   outcome: WriteOutcome;
 }
 
+/** Retained transport observations. Reported labels are never app identity. */
+export interface ClientSession {
+  sessionId: string;
+  client?: string;
+  clientName: string;
+  clientLabel?: string;
+  clientType: string;
+  phase: "start" | "checkpoint" | "close";
+  reason: string;
+  gatewayVersion: string;
+  transport: string;
+  toolsListCount: number;
+  listChangedCount: number;
+  firstCatalogSize?: number;
+  firstCatalogRevision?: number;
+  catalogRevision: number;
+  contentChanged: boolean;
+}
+
 export interface AuditEntry {
   /** Approval outcomes are Activity events, never dispatched calls. */
   kind?: string;
@@ -90,6 +109,11 @@ export interface AuditEntry {
   ok: boolean;
   /** How long the call took, ms. Absent for records logged before timing. */
   durationMs?: number;
+  cold?: boolean;
+  dispatchMs?: number;
+  failureKind?: string;
+  runId?: string;
+  sessionId?: string;
   /** How long a gated call waited for a human approval decision, ms. Present on
    * `kind:"approval"` records instead of durationMs (which is downstream exec time). */
   heldMs?: number;

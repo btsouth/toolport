@@ -2056,9 +2056,25 @@ impl ClientPage {
 
     fn render(&self, snapshot: state::ClientSnapshot) {
         *self.profiles.borrow_mut() = snapshot.profiles;
+        let sessions = snapshot.sessions;
         let clients = snapshot.clients;
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
+        }
+        if snapshot.sessions_error {
+            self.list.append(&gtk::Label::builder().label("Client session history could not be read.").halign(gtk::Align::Start).wrap(true).css_classes(["toolport-muted"]).build());
+        }
+        if !sessions.is_empty() {
+            self.list.append(&client_section_title("Recent client sessions", sessions.len()));
+            for session in sessions {
+                let card = gtk::Box::new(gtk::Orientation::Vertical, 3);
+                card.add_css_class("toolport-card");
+                card.append(&gtk::Label::builder().label(session["clientName"].as_str().unwrap_or("An AI client")).halign(gtk::Align::Start).wrap(true).css_classes(["heading"]).build());
+                if let Some(label) = session["clientLabel"].as_str() { card.append(&gtk::Label::builder().label(format!("Reports itself as: {label}")).halign(gtk::Align::Start).wrap(true).css_classes(["toolport-muted"]).build()); }
+                let first = session["firstCatalogSize"].as_u64().map(|n| format!("{n} tools at first list")).unwrap_or_else(|| "No catalog delivered".into());
+                card.append(&gtk::Label::builder().label(format!("{} · {} tool lists · {} list changes delivered · {first} · {}", if session["phase"] == "close" { "Closed" } else { "Last observed" }, session["toolsListCount"].as_u64().unwrap_or(0), session["listChangedCount"].as_u64().unwrap_or(0), if session["contentChanged"] == true { "Catalog changed" } else { "Catalog unchanged" })).halign(gtk::Align::Start).wrap(true).css_classes(["toolport-muted"]).build());
+                self.list.append(&card);
+            }
         }
         let installed = clients
             .iter()
@@ -4695,6 +4711,9 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
         activity_client_name(activity),
         relative_activity_time(activity.timestamp_ms),
     ];
+    if let Some(cold) = activity.cold { detail.push(if cold { "cold catalog" } else { "warm catalog" }.into()); }
+    if let Some(kind) = &activity.failure_kind { detail.push(kind.replace('_', " ")); }
+    if let Some(ms) = activity.dispatch_ms { detail.push(format!("dispatch {}", format_duration(ms))); }
     if let Some(duration) = activity.duration_ms {
         detail.push(if outcome.is_some() {
             format!("waited {}", format_duration(duration))
@@ -4705,7 +4724,7 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     copy.append(
         &gtk::Label::builder()
             .label(detail.join(" · "))
-            .tooltip_text(activity.client_id.as_deref().unwrap_or(""))
+            .tooltip_text(format!("{}{}", activity.client_id.as_deref().unwrap_or(""), activity.run_id.as_ref().map(|id| format!("\nRun: {id}")).unwrap_or_default()))
             .halign(gtk::Align::Fill)
             .xalign(0.0)
             .single_line_mode(true)
@@ -4823,10 +4842,7 @@ fn activity_client_name(activity: &state::ActivityView) -> String {
         .as_deref()
         .filter(|label| *label != name)
     {
-        Some(label) => match label.strip_prefix(name) {
-            Some(remainder) => format!("{name} {}", remainder.trim()),
-            None => format!("{name} (reports \"{label}\")"),
-        },
+        Some(label) => format!("{name} (reports \"{label}\")"),
         None => name.to_string(),
     }
 }
@@ -9079,6 +9095,74 @@ fn state_card(icon_name: &str, title: &str, body: &str, error: bool) -> gtk::Box
 mod tests {
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn session_identity_visual_fixture() {
+        use super::*;
+        let _data = crate::registry::DataDirTestEnv::new("f3-gtk-identity");
+        adw::init().unwrap();
+        let app = adw::Application::builder().application_id("com.tsout.Toolport.SessionFixture").build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let broker = crate::approval_broker::start_native();
+        let approval = ApprovalPage::new(&app, broker);
+        let view = crate::approval_broker::PendingView {
+            id: "fixture-approval".into(), client: None,
+            client_name: "Unknown app (via Cursor)".into(), client_label: Some("kt 1".into()),
+            server: "team-slack".into(), tool: "delete_issue".into(), tool_fingerprint: None,
+            reason: crate::approval::ApprovalReason::Destructive,
+            arguments: serde_json::json!({"issue":42}), url_elicitation: None, pii_release: None,
+            deadline_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 120_000,
+        };
+        let (card, _) = approval_card(view, approval);
+        let mut activity = call("team-slack", false);
+        activity.client = Some("Unknown app (via Cursor)".into());
+        activity.client_label = Some("kt 1".into());
+        activity.tool = "delete_issue".into();
+        activity.duration_ms = Some(120);
+        activity.dispatch_ms = Some(3);
+        activity.cold = Some(false);
+        activity.failure_kind = Some("downstream_failure".into());
+        activity.run_id = Some("0123456789abcdef0123456789abcdef".into());
+        let server_page = ServerPage {
+            app: app.clone(), server_count: gtk::Label::new(None), enabled_count: gtk::Label::new(None),
+            profile_count: gtk::Label::new(None), section_title: gtk::Label::new(None), posture: gtk::Label::new(None),
+            search: gtk::SearchEntry::new(), feedback: gtk::Label::new(None), list: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            last_snapshot: Default::default(), feedback_timer: Default::default(), health_rows: Default::default(),
+            rows: Default::default(), no_matches: Default::default(), off_heading: Default::default(), health: Default::default(),
+        };
+        let clients = ClientPage::new(&app, server_page);
+        clients.render(state::ClientSnapshot { clients: Vec::new(), profiles: Vec::new(), sessions_error: false, sessions: vec![serde_json::json!({
+            "clientName":"Unknown app (via Cursor)", "clientLabel":"kt 1", "phase":"close",
+            "toolsListCount":3, "listChangedCount":1, "firstCatalogSize":4, "contentChanged":true,
+        })] });
+        clients.list.parent().unwrap().downcast::<gtk::Box>().unwrap().remove(&clients.list);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        root.set_margin_top(24); root.set_margin_bottom(24); root.set_margin_start(24); root.set_margin_end(24);
+        for (title, widget) in [("Approval required", card.upcast::<gtk::Widget>()), ("Activity", activity_card(&activity).upcast()), ("Clients", clients.list.clone().upcast())] {
+            root.append(&gtk::Label::builder().label(title).halign(gtk::Align::Start).css_classes(["title-2"]).build());
+            root.append(&widget);
+        }
+        fn labels(widget: &gtk::Widget, out: &mut Vec<String>) {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() { out.push(label.text().to_string()); }
+            let mut child = widget.first_child();
+            while let Some(w) = child { labels(&w, out); child = w.next_sibling(); }
+        }
+        let mut text = Vec::new(); labels(root.upcast_ref(), &mut text);
+        assert!(text.iter().any(|t| t == "Unknown app (via Cursor)"));
+        assert!(text.iter().any(|t| t == "Reports itself as: kt 1"));
+        assert!(text.iter().any(|t| t.contains("dispatch 3 ms")));
+        assert!(text.iter().position(|t| t.contains("Unknown app (via Cursor)")).unwrap() < text.iter().position(|t| t.contains("kt 1")).unwrap());
+        if std::env::var_os("TOOLPORT_F3_VISUAL").is_some() {
+            let window = adw::ApplicationWindow::builder().application(&app).title("Toolport session observability").default_width(1040).default_height(860).content(&root).build();
+            let theme = theme::ThemeController::new(); theme.attach(&window);
+            window.present();
+            let main_loop = gtk::glib::MainLoop::new(None, false);
+            let stop = main_loop.clone();
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(45), move || stop.quit());
+            main_loop.run();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn client_rows_keep_disconnected_copy_short_and_badges_compact() {
         use super::*;
         adw::init().unwrap();
@@ -9489,6 +9573,7 @@ mod tests {
             client: None,
             client_label: None,
             client_id: None,
+            cold: None, dispatch_ms: None, failure_kind: None, run_id: None,
             approval_decision: None,
             ok,
             held: false,
@@ -10260,6 +10345,7 @@ mod p10c_r1_presentation_tests {
             client: Some("Claude Code".into()),
             client_id: Some("adapter:claude-code".into()),
             client_label: Some("Claude Code 2.1".into()),
+            cold: None, dispatch_ms: None, failure_kind: None, run_id: None,
             approval_decision: Some("denied".into()),
             ok: true,
             held: true,
@@ -10268,7 +10354,7 @@ mod p10c_r1_presentation_tests {
             pii_replaced: None,
             pii_incomplete: false,
         };
-        assert_eq!(activity_client_name(&row), "Claude Code 2.1");
+        assert_eq!(activity_client_name(&row), "Claude Code (reports \"Claude Code 2.1\")");
         row.client_label = Some("Someone else".into());
         assert_eq!(
             activity_client_name(&row),

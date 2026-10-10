@@ -8,6 +8,8 @@ written automatically when you connect:
 
 - `TOOLPORT_CLIENT_ID=<id>` - identifies this client for live profile resolution
   (written automatically when you Connect a client).
+- `TOOLPORT_ATTRIBUTION_ID=<id>` - display-only identity added by repairs and
+  plugin launches. It never selects access, profile, or discovery policy.
 - `TOOLPORT_PROFILE=<name>` - initial profile scope for a scoped install. Unset =
   follow Default access (resolved live via `TOOLPORT_CLIENT_ID`).
 - `TOOLPORT_DISCOVERY=lazy|full|grouped` - optional process default for a standalone

@@ -932,6 +932,8 @@ mod tests {
         let empty = ClientSnapshot {
             clients: Vec::new(),
             profiles: Vec::new(),
+            sessions: Vec::new(),
+            sessions_error: false,
         };
         assert!(should_offer(&registry, &empty));
 
@@ -953,6 +955,8 @@ mod tests {
                 config_error: false,
             }],
             profiles: Vec::new(),
+            sessions: Vec::new(),
+            sessions_error: false,
         };
         assert!(!should_offer(&registry, &connected));
 

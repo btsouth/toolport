@@ -1175,8 +1175,8 @@ fn initial_catalog_announced(log: &str, servers: &[&str]) -> bool {
         && servers.iter().all(|server| {
             startup.as_ref().unwrap().iter().any(|id| id == server)
                 || log.lines().any(|line| {
-                    line.split_once("reconnected ")
-                        .and_then(|(_, rest)| rest.split_once(" after retrying;"))
+                    line.split_once("catalog_publish reason=reconnect_adoption servers=")
+                        .and_then(|(_, rest)| rest.split_once(" tools="))
                         .is_some_and(|(ids, _)| ids.split(", ").any(|id| id == *server))
                 })
         })
@@ -1185,7 +1185,7 @@ fn initial_catalog_announced(log: &str, servers: &[&str]) -> bool {
 #[test]
 fn initial_catalog_barrier_accepts_startup_reconnect_and_mixed_publications() {
     let startup = "2026-10-07T00:00:00Z pid=1 role=daemon background build: initial catalog announced; servers=[\"one\"]\n";
-    let reconnect = "2026-10-07T00:00:01Z pid=1 role=daemon reconnected two after retrying; 8 tools, sent tools/list_changed\n";
+    let reconnect = "2026-10-07T00:00:01Z pid=1 role=daemon catalog_publish reason=reconnect_adoption servers=two tools=8; scoped notification delivery is recorded per session\n";
     assert!(initial_catalog_announced(startup, &["one"]));
     assert!(!initial_catalog_announced(startup, &["two"]));
     assert!(!initial_catalog_announced(reconnect, &["two"]));

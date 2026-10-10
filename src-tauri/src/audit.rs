@@ -360,6 +360,7 @@ impl PendingApprovalAudit {
         if let Some(label) = client_label.and_then(crate::approval::sanitize_client_label) {
             entry["clientLabel"] = json!(label);
         }
+        crate::session_observability::enrich(&mut entry);
         Self {
             path: audit_path(),
             entry,
@@ -462,7 +463,62 @@ fn write_line(entry: &Value) {
     let Some(path) = audit_path() else {
         return;
     };
-    write_line_at(&path, entry);
+    let mut entry = entry.clone();
+    crate::session_observability::enrich(&mut entry);
+    write_line_at(&path, &entry);
+}
+
+/// Lifecycle rows are independent of the active request and never contain payloads.
+pub(crate) fn record_session_at(path: &Path, mut entry: Value) {
+    entry["ts"] = json!(epoch_millis() as u64);
+    write_line_at(path, &entry);
+}
+
+pub fn record_internal(tool: &str, duration_ms: u64, cold: bool, client: Option<&str>, ok: bool) {
+    let mut entry = json!({"ts": epoch_millis() as u64, "kind":"internal", "ok":ok, "server":"toolport", "tool":tool, "durationMs":duration_ms, "cold":cold});
+    if let Some(client) = client.and_then(crate::session_observability::telemetry_principal) {
+        entry["client"] = json!(client);
+    }
+    write_line(&entry);
+}
+
+pub fn record_code_mode(
+    ok: bool,
+    duration_ms: u64,
+    failure: Option<crate::codemode::FailureKind>,
+    client: Option<&str>,
+) {
+    let mut entry = timed_entry(
+        "toolport",
+        "run_script",
+        ok,
+        Some(duration_ms),
+        None,
+        client.and_then(crate::session_observability::telemetry_principal),
+        None,
+        None,
+        None,
+    );
+    if let Some(failure) = failure {
+        entry["failureKind"] = json!(failure);
+    }
+    write_line(&entry);
+}
+
+/// Last summary per session, bounded by the retained audit and a small UI cap.
+pub fn recent_sessions(limit: usize) -> std::io::Result<Vec<Value>> {
+    let mut seen = std::collections::HashSet::new();
+    Ok(
+        read_recent_matching(KEEP_LINES, |row| row["kind"] == "session")?
+            .into_iter()
+            .filter(|row| {
+                row["sessionId"]
+                    .as_str()
+                    .is_some_and(|id| seen.insert(id.to_string()))
+            })
+            .take(limit.min(64))
+            .collect(),
+    )
 }
 
 fn write_line_at(path: &Path, entry: &Value) {
@@ -523,7 +579,7 @@ pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
 /// cannot hide an older call or approval outcome.
 pub fn read_activity(limit: usize) -> std::io::Result<Vec<Value>> {
     read_recent_matching(limit, |row| {
-        tool_call_ok(row).is_some() || row["kind"] == "approval"
+        tool_call_ok(row).is_some() || row["kind"] == "approval" || row["kind"] == "internal"
     })
 }
 
@@ -619,9 +675,10 @@ pub fn read_all() -> std::io::Result<Vec<Value>> {
 pub fn tool_call_ok(entry: &Value) -> Option<bool> {
     let ok = entry.get("ok").and_then(Value::as_bool)?;
     match entry.get("kind").and_then(Value::as_str) {
-        Some("approval" | "routine" | "advisor" | "suggestion" | "candidate" | "telemetry_gap") => {
-            None
-        }
+        Some(
+            "approval" | "routine" | "advisor" | "suggestion" | "candidate" | "telemetry_gap"
+            | "internal" | "session",
+        ) => None,
         _ => Some(ok),
     }
 }

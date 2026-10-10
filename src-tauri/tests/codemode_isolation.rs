@@ -377,7 +377,7 @@ fn allocating_scripts_fail_without_killing_stdio_gateway() {
             .filter(|entry| {
                 entry["server"] == "toolport"
                     && entry["tool"] == "run_script"
-                    && entry["error"] == "code_mode_memory_budget"
+                    && entry["failureKind"] == "memory_limit"
             })
             .count()
             == 2
@@ -387,7 +387,7 @@ fn allocating_scripts_fail_without_killing_stdio_gateway() {
             .iter()
             .filter(|entry| entry["server"] == "toolport"
                 && entry["tool"] == "run_script"
-                && entry["error"] == "code_mode_memory_budget")
+                && entry["failureKind"] == "memory_limit")
             .count(),
         2
     );
@@ -434,9 +434,25 @@ fn script_error_text_cannot_impersonate_memory_exhaustion() {
     assert!(
         failures
             .iter()
-            .all(|entry| entry["error"] == "code_mode_failed"),
+            .all(|entry| entry["failureKind"] == "script_exception"),
         "script text changed the audit category: {failures:?}"
     );
+    for entry in &failures {
+        assert!(entry.get("error").is_none(), "{entry}");
+        let run_id = entry["runId"].as_str().expect("opaque run ID");
+        assert_eq!(run_id.len(), 32, "{entry}");
+        assert!(run_id.bytes().all(|byte| byte.is_ascii_hexdigit()), "{entry}");
+        let recorded = entry.to_string();
+        for private_text in [
+            "data.message",
+            "out of memory from a downstream service",
+            "memory allocation failed in the remote tool",
+            "invalid layout Layout",
+            "code mode script exceeded its memory budget",
+        ] {
+            assert!(!recorded.contains(private_text), "{entry}");
+        }
+    }
     gateway.assert_alive();
 }
 

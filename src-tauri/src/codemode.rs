@@ -354,6 +354,20 @@ pub struct CallRecord {
     pub result_bytes: usize,
 }
 
+/// Stable diagnosis fields. Messages are returned to the caller, never used as
+/// telemetry categories: scripts can throw text that impersonates a limit error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    SyntaxValidation,
+    ScriptException,
+    DownstreamFailure,
+    Cancelled,
+    MemoryLimit,
+    Deadline,
+    WorkerFailure,
+}
+
 /// The outcome of running a script.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScriptOutcome {
@@ -395,6 +409,8 @@ pub struct ScriptOutcome {
     /// `Some(message)` if the script threw, hit a limit, or failed to compile. Fail-closed:
     /// the caller surfaces this to the agent as an error result.
     pub error: Option<String>,
+    #[serde(default)]
+    pub failure_kind: Option<FailureKind>,
 }
 
 /// True unless the downstream result carried `isError: true`.
@@ -845,6 +861,7 @@ pub(crate) fn run_script_indexed(
                 progress: Vec::new(),
                 final_result_bytes: 0,
                 checkpoint: None,
+                failure_kind: Some(FailureKind::WorkerFailure),
                 error: Some(format!(
                     "toolport code mode: failed to create JS context: {e}"
                 )),
@@ -1070,8 +1087,15 @@ pub(crate) fn run_script_indexed(
             progress: executed.take(),
             checkpoint: checkpoint.take(),
             error: None,
+            failure_kind: None,
         },
-        Err(e) => fail(calls_made.get(), executed.take(), checkpoint.take(), e),
+        Err(e) => {
+            let mut outcome = fail(calls_made.get(), executed.take(), checkpoint.take(), e);
+            if Instant::now() >= deadline {
+                outcome.failure_kind = Some(FailureKind::Deadline);
+            }
+            outcome
+        }
     }
 }
 
@@ -1335,6 +1359,11 @@ fn fail(
         progress,
         final_result_bytes: 0,
         checkpoint,
+        failure_kind: Some(if err.as_native().is_some_and(|e| e.is_syntax()) {
+            FailureKind::SyntaxValidation
+        } else {
+            FailureKind::ScriptException
+        }),
         error: Some(err.to_string()),
     }
 }
@@ -1358,6 +1387,17 @@ mod tests {
             log.lock().unwrap().push((name.to_string(), args.clone()));
             json!({ "echo": name, "args": args })
         })
+    }
+
+    #[test]
+    fn typed_failure_does_not_trust_thrown_limit_text() {
+        let exception = returns(
+            "throw new Error('code mode script exceeded its memory budget; wall-clock deadline');",
+        );
+        assert_eq!(exception.failure_kind, Some(FailureKind::ScriptException));
+        let syntax = returns("return )(");
+        assert_eq!(syntax.failure_kind, Some(FailureKind::SyntaxValidation));
+        assert_eq!(returns("return 42").failure_kind, None);
     }
 
     fn run(script: &str, data: Value, call: CallBinding, limits: Limits) -> ScriptOutcome {

@@ -128,13 +128,34 @@ if (memberReviewFixture) {
 }
 
 const approvalFixture = new URLSearchParams(location.search).has("approvals");
+const sessionFixture = new URLSearchParams(location.search).has("sessions");
+const sessionRows = sessionFixture
+  ? [
+      {
+        sessionId: "f3-fixture-session",
+        clientName: "Unknown app (via Cursor)",
+        clientLabel: "kt 1",
+        clientType: "unknown",
+        gatewayVersion: "2.0.0-preview.3",
+        phase: "checkpoint",
+        reason: "tools_list",
+        transport: "stdio",
+        toolsListCount: 3,
+        listChangedCount: 1,
+        firstCatalogSize: 4,
+        firstCatalogRevision: 1,
+        catalogRevision: 2,
+        contentChanged: true,
+      },
+    ]
+  : [];
 let pendingApproval: PendingApproval[] = approvalFixture
   ? [
       {
         id: "fixture-approval",
         client: "adapter:claude-code",
-        clientName: "Claude Code",
-        clientLabel: "Claude Code 2.1.0",
+        clientName: sessionFixture ? "Unknown app (via Cursor)" : "Claude Code",
+        clientLabel: sessionFixture ? "kt 1" : "Claude Code 2.1.0",
         server: "team-slack",
         tool: "delete_issue",
         reason: "destructive",
@@ -163,8 +184,10 @@ if (approvalFixture) {
       ok: true,
       durationMs: 850,
       client: "adapter:claude-code",
-      clientName: "Claude Code",
-      clientLabel: "Claude Code 2.1",
+      clientName: sessionFixture ? "Unknown app (via Cursor)" : "Claude Code",
+      clientLabel: sessionFixture ? "kt 1" : "Claude Code 2.1",
+      dispatchMs: sessionFixture ? 3 : undefined,
+      cold: sessionFixture ? false : undefined,
     },
     ...[
       "approved",
@@ -481,6 +504,8 @@ mockIPC(
         return savingsSummary;
       case "plugin:app|version":
         return "1.18.0-fixture";
+      case "get_client_sessions":
+        return sessionRows;
       case "get_audit_log":
         return auditRows;
       case "audit_stats":

@@ -56,6 +56,7 @@ use conduit_lib::savings;
 use conduit_lib::searchtrace;
 use conduit_lib::secrets;
 use conduit_lib::semantic;
+use conduit_lib::session_observability as observation;
 use conduit_lib::session_store::SessionStore;
 use conduit_lib::shaping;
 use conduit_lib::tool_definitions::{CatalogRef, SerializedTools, SharedTools, ToolCatalog};
@@ -70,6 +71,7 @@ mod search_cache;
 mod search_static;
 
 thread_local! {
+    static CODE_MODE_FAILURE: std::cell::Cell<Option<codemode::FailureKind>> = const { std::cell::Cell::new(None) };
     static APPROVAL_CANCEL: std::cell::RefCell<Option<downstream::CancelContext>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -1650,6 +1652,7 @@ fn removed_meta_tool_error(name: &str) -> String {
          toolport_call_tool to run it."
     )
 }
+
 
 // --- Grouped discovery mode (CONDUIT_DISCOVERY=grouped) ---
 //
@@ -4129,7 +4132,13 @@ fn resolve_adapter_caller(
     (
         Some(allowed),
         HttpCaller {
-            audit_label: Some(client_id.to_string()),
+            audit_label: Some(clients::trusted_client_name(
+                Some(&format!(
+                    "adapter:{}",
+                    conduit_lib::session_observability::display_client_id(client_id)
+                )),
+                None,
+            )),
             session_owner: McpSessionOwner {
                 identity: format!("adapter:{client_id}"),
                 profile: Some(profile.clone()),
@@ -4619,6 +4628,10 @@ fn execute_call(
     // `None` only in test wrappers that lack `GatewayState`.
     live_router: Option<&Arc<Mutex<Arc<Router>>>>,
 ) -> Value {
+    let mut dispatch_timing =
+        observation::DispatchTimer::start(router.any_missing_catalog(|id| {
+            allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
+        }));
     let _approval_cancel = ApprovalCancelGuard::enter(cancel.clone());
     if active_live_router_resolver()
         .is_some_and(|view| (view.stale)(router, DispatchTarget::Tool(name)))
@@ -4817,6 +4830,7 @@ fn execute_call(
                 token: String::new(),
                 id: new_correlation_id(),
                 client: client.map(str::to_string),
+                client_name: observation::current().client_name,
                 client_label: active_client_label(),
                 server: server_id.to_string(),
                 tool: tool.to_string(),
@@ -5135,6 +5149,7 @@ fn execute_call(
     );
     let guidance_arguments = arguments.clone();
     match live_policy.map_err(CallFailure::from).and_then(|()| {
+        dispatch_timing.finish();
         exec_router.route_call_typed(name, arguments, cancel.clone(), client_meta, effective_mrtr)
     }) {
         Ok(mut result) => {
@@ -5621,6 +5636,7 @@ fn approve_pii_release(
         token: String::new(),
         id: new_correlation_id(),
         client: client.map(str::to_string),
+        client_name: observation::current().client_name,
         client_label: active_client_label(),
         server: server.to_string(),
         tool: tool.to_string(),
@@ -6090,6 +6106,7 @@ fn render_script_validation(validation: ScriptValidation, client: Option<&str>) 
         plan,
         unresolved,
     } = validation;
+    if let Some(kind) = outcome.failure_kind { CODE_MODE_FAILURE.with(|failure| failure.set(Some(kind))); }
     let planned = plan.len();
 
     // `finished` is deliberately NOT called `complete`. It says only that the dry
@@ -6334,6 +6351,7 @@ fn execute_script_dispatch(
     // request reach its HTTP client but then misclassifies it as legacy when a
     // downstream asks for sampling/elicitation/roots (SBS-551, extending WS2-3).
     let request_context = active_request_context();
+    let observation_context = observation::current();
     let live_view_resolver = active_live_router_resolver();
 
     // Arc + Send + Sync so independent callAsync work can run on a small host thread pool.
@@ -6365,6 +6383,7 @@ fn execute_script_dispatch(
             );
             result
         };
+        let _observation = observation::ContextGuard::enter(observation_context.clone());
         let _context = ActiveRequestContextGuard::enter(request_context.clone());
         let _live_view = LiveRouterResolverGuard::enter(live_view_resolver.clone());
         run()
@@ -6398,6 +6417,8 @@ fn execute_script_dispatch(
         cancel.clone(),
         host_calls,
     );
+
+    CODE_MODE_FAILURE.with(|kind| kind.set(outcome.failure_kind));
 
     // Account the round-trips this one call replaced (calls - 1), composing with the
     // lazy-discovery savings in the same log + counter.
@@ -6680,6 +6701,8 @@ fn handle_request(
 struct GatewayResponse {
     envelope: Value,
     surface: Option<Arc<savings::SerializedSurface>>,
+    observation: Option<Arc<observation::Session>>,
+    tools_list: bool,
 }
 
 impl From<Value> for GatewayResponse {
@@ -6687,6 +6710,29 @@ impl From<Value> for GatewayResponse {
         Self {
             envelope,
             surface: None,
+            observation: None,
+            tools_list: false,
+        }
+    }
+}
+
+impl GatewayResponse {
+    fn catalog_delivery(&self) -> Option<observation::CatalogDelivery> {
+        if !self.tools_list { return None; }
+        if let Some(surface) = &self.surface {
+            return Some(observation::CatalogDelivery {
+                count: surface.tool_count(),
+                fingerprint: surface.hash,
+            });
+        }
+        self.envelope
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .map(|tools| observation::catalog_delivery(tools))
+    }
+    fn delivered(&self) {
+        if let (Some(session), Some(catalog)) = (&self.observation, self.catalog_delivery()) {
+            session.list_delivered(catalog);
         }
     }
 }
@@ -7692,6 +7738,12 @@ fn handle_request_with_cancel(
                     ));
                 }
                 let started = Instant::now();
+                let _run = observation::ContextGuard::enter(observation::Context {
+                    run_id: Some(approval::new_correlation_id()),
+                    ..observation::current()
+                });
+                CODE_MODE_FAILURE
+                    .with(|kind| kind.set(Some(codemode::FailureKind::SyntaxValidation)));
                 let result = run_script_dispatch(
                     reg,
                     router_arc,
@@ -7707,28 +7759,17 @@ fn handle_request_with_cancel(
                     .get("isError")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let detail = result
-                    .pointer("/structuredContent/toolportScript/error")
-                    .or_else(|| result.pointer("/structuredContent/toolportValidate/error"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                // Log attribution and a bounded category, never submitted source,
-                // input values, or arbitrary text thrown by a script.
-                let reason = failed.then_some(
-                    if detail.starts_with("code mode script exceeded its memory budget") {
-                        "code_mode_memory_budget"
-                    } else if detail.contains("wall-clock") {
-                        "code_mode_deadline"
-                    } else {
-                        "code_mode_failed"
-                    },
-                );
-                audit::record_timed(
-                    "toolport",
-                    "run_script",
+                let failure = if failed {
+                    CODE_MODE_FAILURE
+                        .with(|kind| kind.get())
+                        .or(Some(codemode::FailureKind::ScriptException))
+                } else {
+                    None
+                };
+                audit::record_code_mode(
                     !failed,
-                    Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
-                    reason,
+                    started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    failure,
                     client,
                 );
                 return Some(success(id, result));
@@ -8950,6 +8991,10 @@ fn notify_tools_changed_for_catalog_diff(
         .collect();
     let msg = json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" });
     let mut changed_by_scope: HashMap<Option<McpSessionOwner>, bool> = HashMap::new();
+    let mut scoped = 0usize;
+    let mut queued = 0usize;
+    let mut dropped = 0usize;
+    let mut suppressed = 0usize;
     for session in sessions {
         if session.is_expired() || session.closed.load(Ordering::SeqCst) {
             continue;
@@ -9001,14 +9046,21 @@ fn notify_tools_changed_for_catalog_diff(
             before != after
         });
         if !changed {
+            suppressed += 1;
             continue;
         }
+        scoped += 1;
         if let Some(json) = session.notification_json(&msg) {
-            if !session.push_message(json, None) {
-                eprintln!("toolport: MCP session could not take a notification; dropped");
+            if session.push_message(json, None) {
+                queued += 1;
+            } else {
+                dropped += 1;
             }
+        } else {
+            suppressed += 1;
         }
     }
+    glog(&format!("catalog_notification reason=catalog_refresh prior=published content_changed={} scoped_clients={scoped} accepted={queued} dropped={dropped} suppressed={suppressed}; accepted HTTP messages await transport delivery", !previous.iter().eq(current.iter())));
 }
 
 #[derive(Clone, Copy)]
@@ -9132,12 +9184,20 @@ fn await_stdio_client_ready(stdio: &SessionState, timeout: Duration) -> bool {
 }
 
 /// Put one bare `list_changed` notification on stdout.
-fn write_stdio_list_changed(stdout: &Arc<Mutex<std::io::Stdout>>, method: &str) {
+fn write_stdio_list_changed(
+    stdio: &SessionState,
+    stdout: &Arc<Mutex<std::io::Stdout>>,
+    method: &str,
+) {
     let msg = json!({ "jsonrpc": "2.0", "method": method });
     let mut out = stdout
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = write_json_line(&mut *out, &msg);
+    if write_json_line(&mut *out, &msg).is_ok() && method == "notifications/tools/list_changed" {
+        if let Some(session) = stdio.observation() {
+            session.notification_delivered();
+        }
+    }
 }
 
 /// Record that the raw-stdio peer finished the handshake, and replay whatever
@@ -9199,7 +9259,7 @@ fn drain_stdio_deferred(stdio: &SessionState) {
     // Outside the queue lock: writing takes the stdout mutex, and no other path
     // holds these two at once.
     for method in deferred {
-        write_stdio_list_changed(&stdout, &method);
+        write_stdio_list_changed(stdio, &stdout, &method);
     }
 }
 
@@ -9240,7 +9300,7 @@ fn notify_list_changed(
                 ready
             };
             if ready {
-                write_stdio_list_changed(&stdout, method);
+                write_stdio_list_changed(stdio, &stdout, method);
             }
         }
     }
@@ -10028,9 +10088,8 @@ type IntegrityCheckFailure = (String, BTreeSet<String>);
 /// prove the drifted definition is never published in the first place. Registered and
 /// consumed on one thread, so a parallel test's gate cannot trigger it.
 #[cfg(test)]
-static INTEGRITY_GATE_OBSERVER: Mutex<
-    Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>,
-> = Mutex::new(None);
+static INTEGRITY_GATE_OBSERVER: Mutex<Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>> =
+    Mutex::new(None);
 
 #[cfg(test)]
 fn observe_integrity_gate() {
@@ -10777,16 +10836,7 @@ fn resolve_live_profile(
     client_id: Option<&str>,
     env_profile: &Option<String>,
 ) -> Option<String> {
-    let profile_ref = match client_id.and_then(|id| reg.client_scopes.get(id)) {
-        Some(p) if p.trim().is_empty() => return Some(reg.default_access_id()),
-        Some(p) => Some(p.as_str()),
-        None => env_profile.as_deref(),
-    };
-    Some(
-        profile_ref
-            .map(|profile| reg.resolve_profile_id(profile))
-            .unwrap_or_else(|| reg.default_access_id()),
-    )
+    clients::resolve_launch_profile(reg, client_id, env_profile)
 }
 
 /// The profile that actually governs a client's scope right now: a folder-scoped override
@@ -11062,7 +11112,7 @@ fn adopt_reconnected_servers(
         Some(&previous_adapter_tools),
     );
     let msg = format!(
-        "reconnected {} after retrying; {} tools, sent tools/list_changed",
+        "catalog_publish reason=reconnect_adoption servers={} tools={}; scoped notification delivery is recorded per session",
         adopted.join(", "),
         tools.len()
     );
@@ -12824,6 +12874,7 @@ struct GatewayState {
     /// root-change handler can recompute the effective (folder-scoped) profile off the
     /// request thread without re-reading env. Process constants; unused in HTTP mode.
     client_id: Option<String>,
+    attribution_id: Option<String>,
     env_profile: Option<String>,
 }
 
@@ -13087,6 +13138,12 @@ fn register_modern_subscription(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = state.active_adapter_root();
     }
+    if transport == ModernSubscriptionTransport::Stdio {
+        if let Some(observed) = state.stdio_upstream.observation() {
+            *session.observation.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observed);
+            session.observation_shared.store(true, Ordering::Relaxed);
+        }
+    }
     if transport == ModernSubscriptionTransport::Http {
         let _ = session.try_begin_listen();
     }
@@ -13274,6 +13331,9 @@ struct SessionState {
     wait: (Mutex<()>, Condvar),
     client_upstream: Mutex<ClientUpstreamCaps>,
     client_label: Mutex<Option<String>>,
+    observation: Mutex<Option<Arc<observation::Session>>>,
+    parent_app: conduit_lib::client_process::ParentApp,
+    observation_shared: AtomicBool,
     upstream_pending: Mutex<HashMap<String, std::sync::mpsc::Sender<Value>>>,
     next_upstream_id: AtomicI64,
     /// The upstream client's project root for the `${ROOT}` cwd token (issue #239),
@@ -13367,6 +13427,9 @@ impl SessionState {
             wait: (Mutex::new(()), Condvar::new()),
             client_upstream: Mutex::new(ClientUpstreamCaps::default()),
             client_label: Mutex::new(None),
+            observation: Mutex::new(None),
+            parent_app: conduit_lib::client_process::ParentApp::default(),
+            observation_shared: AtomicBool::new(false),
             upstream_pending: Mutex::new(HashMap::new()),
             next_upstream_id: AtomicI64::new(1),
             client_root: Arc::new(Mutex::new(None)),
@@ -13650,10 +13713,26 @@ impl SessionState {
         self.upstream_call_timeout(method, params, upstream_rpc_timeout(method))
     }
 
-    fn close(&self) {
+    fn observation(&self) -> Option<Arc<observation::Session>> {
+        self.observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn close_reason(&self, reason: observation::CloseReason) {
+        if !self.observation_shared.load(Ordering::Relaxed) {
+            if let Some(session) = self.observation() {
+                session.close(reason);
+            }
+        }
         self.cancellations.close();
         self.closed.store(true, Ordering::SeqCst);
         self.wait.1.notify_all();
+    }
+
+    fn close(&self) {
+        self.close_reason(observation::CloseReason::ClientDisconnect);
     }
 
     fn try_begin_listen(&self) -> bool {
@@ -13677,7 +13756,13 @@ impl SessionState {
                 let mut out = stdout
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                write_json_line(&mut *out, &value).is_ok()
+                let delivered = write_json_line(&mut *out, &value).is_ok();
+                if delivered && value["method"] == "notifications/tools/list_changed" {
+                    if let Some(session) = self.observation() {
+                        session.notification_delivered();
+                    }
+                }
+                delivered
             }
             SessionTransportFace::Http => {
                 let mut outbound = self
@@ -13740,6 +13825,8 @@ struct McpSseReader {
     cancel_guard: Option<downstream::CancelGuard>,
     buf: Vec<u8>,
     pos: usize,
+    tools_changed: bool,
+    pending_deliveries: Arc<AtomicUsize>,
 }
 
 impl McpSseReader {
@@ -13750,6 +13837,8 @@ impl McpSseReader {
             cancel_guard: None,
             buf: Vec::new(),
             pos: 0,
+            tools_changed: false,
+            pending_deliveries: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -13760,6 +13849,8 @@ impl McpSseReader {
             cancel_guard: None,
             buf: Vec::new(),
             pos: 0,
+            tools_changed: false,
+            pending_deliveries: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -13774,10 +13865,20 @@ impl Read for McpSseReader {
                 let n = dest.len().min(self.buf.len() - self.pos);
                 dest[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
                 self.pos += n;
+                if self.pos == self.buf.len() && self.tools_changed {
+                    self.pending_deliveries.fetch_add(1, Ordering::Relaxed);
+                    self.tools_changed = false;
+                }
                 return Ok(n);
             }
             match self.session.next_sse_chunk(MCP_SSE_KEEPALIVE) {
                 Some(chunk) => {
+                    self.tools_changed = chunk.starts_with(b"event: message\ndata: ")
+                        && serde_json::from_slice::<Value>(
+                            &chunk[b"event: message\ndata: ".len()..],
+                        )
+                        .ok()
+                        .is_some_and(|v| v["method"] == "notifications/tools/list_changed");
                     self.buf = chunk;
                     self.pos = 0;
                 }
@@ -13853,7 +13954,7 @@ fn reap_stale_mcp_sessions(state: &GatewayState) {
             .collect()
     };
     for (id, session) in stale {
-        session.close();
+        session.close_reason(observation::CloseReason::Expired);
         cleanup_resource_subs_for_session(state, &id);
         clear_mcp_session_tables(&id);
     }
@@ -14030,6 +14131,7 @@ fn broker_url_elicitation(
         token: String::new(),
         id: format!("toolport-url-{}", new_correlation_id()),
         client: None,
+        client_name: observation::current().client_name,
         client_label: None,
         server: screened.origin.clone(),
         tool: "browser interaction".to_string(),
@@ -15155,8 +15257,168 @@ fn catalog_wait_budget(
     }
 }
 
+fn observed_client_name(
+    state: &GatewayState,
+    holder: Option<&SessionState>,
+    client: Option<&str>,
+    name: Option<&str>,
+) -> String {
+    if client
+        .and_then(|c| c.strip_prefix("adapter:"))
+        .is_some_and(|id| clients::known_adapter_name(id).is_some())
+    {
+        return clients::trusted_client_name(client, None);
+    }
+    let pid = if state.http {
+        HTTP_ADAPTER_ATTRIBUTION.with(|current| current.borrow().1)
+    } else {
+        Some(std::process::id())
+    };
+    holder
+        .zip(pid)
+        .and_then(|(session, pid)| session.parent_app.resolve(pid))
+        .map(|name| format!("Unknown app (via {name})"))
+        .unwrap_or_else(|| clients::trusted_client_name(client, name))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_request_wire(
+    state: &GatewayState,
+    req: &Value,
+    guard: &SearchGuard,
+    allowed: Option<&std::collections::HashSet<String>>,
+    adapter_profile: Option<&str>,
+    // The profile an HTTP caller is scoped to (`HttpCaller::profile`); `None` on stdio.
+    connection_profile: Option<&str>,
+    cancel: Option<downstream::CancelContext>,
+    client: Option<&str>,
+    client_name: Option<&str>,
+    discovery: DiscoveryMode,
+) -> Option<GatewayResponse> {
+    let holder = if !state.http {
+        Some(state.stdio_upstream.clone())
+    } else {
+        adapter_lifetime_key()
+            .or_else(active_mcp_session)
+            .and_then(|id| {
+                state
+                    .mcp_sessions
+                    .lock()
+                    .ok()
+                    .and_then(|sessions| sessions.get(&id).cloned())
+            })
+    };
+    let method = req["method"].as_str().unwrap_or("");
+    let label = approval::client_info_label(req.get("params"));
+    let reason = if method == "initialize" {
+        "initialize"
+    } else if upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
+        "modern_first_request"
+    } else {
+        "legacy_first_request"
+    };
+    let display_client = if state.http {
+        HTTP_ADAPTER_ATTRIBUTION.with(|current| current.borrow().0.clone())
+    } else {
+        state
+            .attribution_id
+            .clone()
+            .or_else(|| {
+                state.client_id.as_deref().map(conduit_lib::session_observability::display_client_id)
+            })
+    }
+    .map(|id| format!("adapter:{id}"));
+    let display_client = display_client.as_deref().or(client);
+    let name = observed_client_name(state, holder.as_deref(), display_client, client_name);
+    let observed = if let Some(holder) = &holder {
+        let mut current = holder
+            .observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if method == "initialize" {
+            if let Some(previous) = current.take() {
+                previous.close(observation::CloseReason::Reinitialize);
+            }
+        }
+        current
+            .get_or_insert_with(|| {
+                observation::Session::start_attributed(
+                    client,
+                    display_client,
+                    Some(&name),
+                    label.as_deref(),
+                    if state.http { "http" } else { "stdio" },
+                    reason,
+                )
+            })
+            .clone()
+    } else {
+        // Modern remote HTTP has no protocol session. A request is the only
+        // observable lifetime; never merge two windows merely by bearer identity.
+        observation::Session::start_attributed(
+            client,
+            display_client,
+            Some(&name),
+            label.as_deref(),
+            "http_request",
+            "sessionless_request",
+        )
+    };
+    let _context = observation::ContextGuard::enter(observed.context());
+    let internal = match (method, req["params"]["name"].as_str()) {
+        ("server/discover", _) => Some("describe"),
+        ("tools/call", Some("toolport_search_tools")) => Some("search"),
+        ("tools/call", Some(name))
+            if discovery == DiscoveryMode::Grouped && grouped_help_target(name).is_some() =>
+        {
+            Some("search")
+        }
+        _ => None,
+    };
+    let cold = internal.is_some() && {
+        let base = state
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        base.any_missing_catalog(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
+            || state.cached_tools.lock().map(|c| !has_scoped_tools(&c.tools, allowed, &base, &reg)).unwrap_or(true)
+    };
+    let started = Instant::now();
+    let mut response = process_request_wire_inner(
+        state,
+        req,
+        guard,
+        allowed,
+        adapter_profile,
+        connection_profile,
+        cancel,
+        client,
+        Some(&name),
+        discovery,
+    );
+    if let Some(tool) = internal {
+        audit::record_internal(
+            tool,
+            started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            cold,
+            client,
+            response.as_ref().is_some_and(|r| r.envelope.get("error").is_none() && r.envelope.pointer("/result/isError").and_then(Value::as_bool) != Some(true)),
+        );
+    }
+    // One-way HTTP messages finish here rather than at a JSON-RPC reply write.
+    if observed.is_request() && req.get("id").is_none() {
+        observed.close(observation::CloseReason::RequestComplete);
+    }
+    if let Some(response) = &mut response {
+        response.observation = Some(observed.clone());
+        response.tools_list = method == "tools/list";
+    }
+    response
+}
+
+fn process_request_wire_inner(
     state: &GatewayState,
     req: &Value,
     guard: &SearchGuard,
@@ -15728,6 +15990,8 @@ fn process_request_wire(
         return Some(GatewayResponse {
             envelope,
             surface: Some(exposed),
+            observation: None,
+            tools_list: true,
         });
     }
     handle_request_with_cancel(
@@ -15824,6 +16088,7 @@ fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
         // `stdio_may_speak`; the peer's post-handshake message is the other, and
         // either one may land last.
         if write_stdio_response(&state.stdio_upstream, &resp) {
+            resp.delivered();
             state.stdio_upstream.mark_stdio_responded();
             drain_stdio_deferred(&state.stdio_upstream);
         }
@@ -16228,6 +16493,8 @@ struct HttpOut {
     extra: Vec<(String, String)>,
     /// Long-lived MCP SSE listen stream (chunked response).
     mcp_listen: Option<McpListen>,
+    catalog_delivery: Option<(Arc<observation::Session>, observation::CatalogDelivery)>,
+    observation: Option<Arc<observation::Session>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -16257,6 +16524,8 @@ impl HttpOut {
             body,
             extra: Vec::new(),
             mcp_listen: None,
+            catalog_delivery: None,
+            observation: None,
         }
     }
 
@@ -16266,6 +16535,8 @@ impl HttpOut {
             ctype: "text/event-stream",
             body: String::new(),
             extra: Vec::new(),
+            catalog_delivery: None,
+            observation: None,
             mcp_listen: Some(McpListen {
                 session,
                 cleanup: None,
@@ -16280,6 +16551,8 @@ impl HttpOut {
             ctype: "text/event-stream",
             body: String::new(),
             extra: Vec::new(),
+            catalog_delivery: None,
+            observation: None,
             mcp_listen: Some(McpListen {
                 session,
                 cancel_guard: None,
@@ -16626,7 +16899,7 @@ fn handle_mcp_http(
             }
             match mcp_require_session(state, headers.session_id, session_owner) {
                 Ok((sid, session)) => {
-                    session.close();
+                    session.close_reason(observation::CloseReason::ClientDelete);
                     state
                         .mcp_sessions
                         .lock()
@@ -16723,7 +16996,42 @@ fn handle_mcp_http(
                     session_owner,
                     ModernSubscriptionTransport::Http,
                 ) {
-                    Ok((key, session)) => HttpOut::modern_mcp_listen(state.clone(), key, session),
+                    Ok((key, session)) => {
+                        let lifetime = adapter_lifetime(state, session_owner);
+                        let display = HTTP_ADAPTER_ATTRIBUTION
+                            .with(|current| current.borrow().0.clone())
+                            .map(|id| format!("adapter:{id}"));
+                        let display = display.as_deref().or(client);
+                        let name =
+                            observed_client_name(state, lifetime.as_deref(), display, client_name);
+                        let start = || {
+                            observation::Session::start_attributed(
+                                client,
+                                display,
+                                Some(&name),
+                                None,
+                                "http_subscription",
+                                "modern_subscription",
+                            )
+                        };
+                        let observed = if let Some(lifetime) = &lifetime {
+                            let mut current = lifetime
+                                .observation
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            current.get_or_insert_with(start).clone()
+                        } else {
+                            start()
+                        };
+                        *session
+                            .observation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observed);
+                        session
+                            .observation_shared
+                            .store(lifetime.is_some(), Ordering::Relaxed);
+                        HttpOut::modern_mcp_listen(state.clone(), key, session)
+                    }
                     Err(response) => HttpOut::new(
                         200,
                         "application/json",
@@ -16922,6 +17230,11 @@ fn handle_mcp_http(
                     } else {
                         200
                     };
+                    let catalog_delivery = resp
+                        .observation
+                        .as_ref()
+                        .zip(resp.catalog_delivery())
+                        .map(|(session, catalog)| (session.clone(), catalog));
                     if resp.surface.is_none() {
                         let body = serde_json::to_string(&resp.envelope).unwrap_or_else(|_| {
                             json!({
@@ -16931,7 +17244,10 @@ fn handle_mcp_http(
                             })
                             .to_string()
                         });
-                        return mcp_rpc_response(status, body, session_id.as_deref(), prefer_sse);
+                        let mut out = mcp_rpc_response(status, body, session_id.as_deref(), prefer_sse);
+                        out.catalog_delivery = catalog_delivery;
+                        out.observation = resp.observation.clone();
+                        return out;
                     }
                     let body = gateway_memory::serialize(&resp, prefer_sse).unwrap_or_else(|_| {
                         let body = json!({
@@ -16946,7 +17262,10 @@ fn handle_mcp_http(
                             body
                         }
                     });
-                    mcp_rpc_response_ready(status, body, session_id.as_deref(), prefer_sse)
+                    let mut out = mcp_rpc_response_ready(status, body, session_id.as_deref(), prefer_sse);
+                    out.catalog_delivery = catalog_delivery;
+                    out.observation = resp.observation.clone();
+                    out
                 }
                 None => {
                     let body = json!({
@@ -17743,6 +18062,7 @@ fn http_connection_cancellations() -> &'static Mutex<HashMap<SocketAddr, downstr
     CONNECTIONS.get_or_init(Mutex::default)
 }
 thread_local! {
+    static HTTP_ADAPTER_ATTRIBUTION: std::cell::RefCell<(Option<String>, Option<u32>)> = const { std::cell::RefCell::new((None, None)) };
     static HTTP_ADAPTER_INSTANCE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static HTTP_CONNECTION_CANCEL: std::cell::RefCell<Option<downstream::CancelRegistry>> = const { std::cell::RefCell::new(None) };
 }
@@ -17751,6 +18071,12 @@ impl Drop for HttpConnectionScope {
     fn drop(&mut self) {
         HTTP_CONNECTION_CANCEL.with(|current| current.replace(self.0.take()));
         HTTP_ADAPTER_INSTANCE.with(|current| current.replace(self.1.take()));
+    }
+}
+struct AdapterAttributionScope((Option<String>, Option<u32>));
+impl Drop for AdapterAttributionScope {
+    fn drop(&mut self) {
+        HTTP_ADAPTER_ATTRIBUTION.with(|current| current.replace(std::mem::take(&mut self.0)));
     }
 }
 struct HttpRequestEnd {
@@ -18458,7 +18784,19 @@ fn spawn_daemon_idle_watchdog(
             let _ = conduit_lib::daemon::write_descriptor(&descriptor_path, &descriptor);
             continue;
         }
-        glog("daemon: idle exit");
+        glog(if update_requested {
+            "daemon_exit reason=update_idle prior=healthy"
+        } else {
+            "daemon_exit reason=idle_timeout prior=healthy"
+        });
+        for session in host
+            .mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+        {
+            session.close_reason(observation::CloseReason::GatewayShutdown);
+        }
         // Land any queued audit/savings/search-trace lines before the process exits.
         if let Some(dir) = descriptor_path.parent() {
             conduit_lib::daemon_log::end_run_cleanly(dir);
@@ -18832,7 +19170,12 @@ fn proxy_public_http_connection(
     }
     // The daemon detects the public caller's full socket close. Keep the write
     // side open during the relay so waiting callers do not appear abandoned.
-    let _ = relay_http_response(&mut client, &mut upstream, Arc::new(|| {}), Arc::new(|| {}));
+    let _ = relay_http_response(
+        &mut client,
+        &mut upstream,
+        Arc::new(|| {}),
+        Arc::new(|| {}),
+    );
 }
 
 /// The desktop keeps this lightweight public listener as its child. The heavy
@@ -19048,9 +19391,34 @@ fn respond_mcp_sse_listen(request: tiny_http::Request, mut out: HttpOut, allow_h
     };
     reader.cancel_guard = listen.cancel_guard;
     let version = request.http_version().clone();
-    let mut writer = request.into_writer();
+    let mut writer = DeliveryWriter {
+        inner: request.into_writer(),
+        session: reader.session.clone(),
+        pending: reader.pending_deliveries.clone(),
+    };
     let _ = write_mcp_sse_response(&mut writer, &version, &headers, &mut reader);
 }
+
+struct DeliveryWriter<W> {
+        inner: W,
+        session: Arc<SessionState>,
+        pending: Arc<AtomicUsize>,
+    }
+    impl<W: Write> Write for DeliveryWriter<W> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()?;
+            let delivered = self.pending.swap(0, Ordering::Relaxed);
+            if let Some(session) = self.session.observation() {
+                for _ in 0..delivered {
+                    session.notification_delivered();
+                }
+            }
+            Ok(())
+        }
+    }
 
 /// Write a long-lived SSE response directly so every event is flushed to the
 /// client. `tiny_http` otherwise buffers chunked response bodies until 8 KiB,
@@ -19238,18 +19606,20 @@ fn healthz_out(state: &GatewayState, method: &str) -> HttpOut {
     }
 }
 
-fn respond_http<R: Read>(request: tiny_http::Request, response: tiny_http::Response<R>) {
+fn respond_http<R: Read>(request: tiny_http::Request, response: tiny_http::Response<R>) -> bool {
     let cancellations = request.remote_addr().and_then(|peer| {
         http_connection_cancellations()
             .lock()
             .ok()
             .and_then(|connections| connections.get(peer).cloned())
     });
-    if request.respond(response).is_ok() {
+    let delivered = request.respond(response).is_ok();
+    if delivered {
         if let Some(cancellations) = cancellations {
             cancellations.finish_connection();
         }
     }
+    delivered
 }
 
 /// Handle one accepted HTTP request end to end: parse, CORS, auth/scope, dispatch,
@@ -19567,6 +19937,29 @@ fn handle_connection(
                 let previous_instance =
                     HTTP_ADAPTER_INSTANCE.with(|current| current.replace(instance));
                 let _connection_scope = HttpConnectionScope(previous, previous_instance);
+                let attribution = if private_daemon_bearer && valid_adapter_claim {
+                    let id = request
+                        .headers()
+                        .iter()
+                        .find(|h| {
+                            h.field
+                                .equiv(conduit_lib::stdio_adapter::ADAPTER_ATTRIBUTION_HEADER)
+                        })
+                        .map(|h| h.value.as_str())
+                        .filter(|id| clients::known_adapter_name(id).is_some())
+                        .map(str::to_string);
+                    let pid = request
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.equiv("Toolport-Adapter-Pid"))
+                        .and_then(|h| h.value.as_str().parse().ok());
+                    (id, pid)
+                } else {
+                    (None, None)
+                };
+                let _attribution = AdapterAttributionScope(
+                    HTTP_ADAPTER_ATTRIBUTION.with(|current| current.replace(attribution)),
+                );
                 // A panic in a handler must return 500, not kill the listener.
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     handle_http_with_headers(
@@ -19626,10 +20019,7 @@ fn handle_connection(
         ),
         (b"Access-Control-Allow-Headers", allow_headers.as_bytes()),
         // Browser clients need session identity and untrusted-data provenance.
-        (
-            b"Access-Control-Expose-Headers",
-            EXPOSED_HTTP_HEADERS.as_bytes(),
-        ),
+        (b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()),
     ];
     for (name, value) in cors {
         // Skip a header that won't encode rather than panicking the thread.
@@ -19643,7 +20033,17 @@ fn handle_connection(
             response = response.with_header(h);
         }
     }
-    respond_http(request, response);
+    let delivered = respond_http(request, response);
+    if delivered {
+        if let Some((session, catalog)) = out.catalog_delivery {
+            session.list_delivered(catalog);
+        }
+    }
+    if let Some(session) = out.observation {
+        if session.is_request() {
+            session.close(if delivered { observation::CloseReason::RequestComplete } else { observation::CloseReason::ClientDisconnect });
+        }
+    }
 }
 
 /// Flags `toolport-gateway` recognizes on the command line today, kept in one
@@ -19908,13 +20308,11 @@ fn main() {
                         "{}",
                         serde_json::to_string(&results).expect("serializable disconnect results")
                     );
-                    conduit_lib::telemetry::exit_with(
-                        if results.iter().any(|result| result.error.is_some()) {
-                            1
-                        } else {
-                            0
-                        },
-                    );
+                    conduit_lib::telemetry::exit_with(if results.iter().any(|result| result.error.is_some()) {
+                        1
+                    } else {
+                        0
+                    });
                 }
                 Err(error) => {
                     eprintln!("toolport-gateway --disconnect-all: {error}");
@@ -20100,11 +20498,12 @@ fn main() {
     let http_mode = http_port_opt.is_some() || daemon_mode;
     glog("=== gateway start ===");
     glog(&format!(
-        "cwd={:?} TOOLPORT_REGISTRY={:?} registry_path={:?} dir_resolution={:?} profile={env_profile:?} client_id={client_id:?}",
+        "cwd={:?} TOOLPORT_REGISTRY={:?} registry_path={:?} dir_resolution={:?} profile={env_profile:?} client_id={:?}",
         std::env::current_dir().ok(),
         conduit_lib::brand::env_var("TOOLPORT_REGISTRY", "CONDUIT_REGISTRY"),
         registry::resolved_path(),
         registry::conduit_dir_resolution(),
+        client_id.as_deref().map(conduit_lib::session_observability::display_client_id),
     ));
     if registry::conduit_dir_resolution() == registry::DirResolution::VirtualizedFallback {
         // Loud, not fatal: inside an MSIX container with no UNC escape, the data
@@ -20386,6 +20785,9 @@ fn main() {
         profile: Arc::clone(&profile),
         stdio_upstream,
         client_id: client_id.clone(),
+        attribution_id: std::env::var(conduit_lib::brand::ATTRIBUTION_ID)
+            .ok()
+            .filter(|id| clients::known_adapter_name(id).is_some()),
         env_profile: env_profile.clone(),
     };
 
@@ -24597,6 +24999,7 @@ mod tests {
             token: String::new(),
             id: "id".into(),
             client: None,
+            client_name: observation::current().client_name,
             client_label: None,
             server: "db".into(),
             tool: "drop".into(),
@@ -24654,6 +25057,7 @@ mod tests {
             token: String::new(),
             id: "id".into(),
             client: None,
+            client_name: observation::current().client_name,
             client_label: None,
             server: "crm".into(),
             tool: "export_all".into(),
@@ -25274,6 +25678,29 @@ mod tests {
     /// Code mode: a script that calls a downstream tool twice through `toolport.call()`
     /// aggregates both results and returns ONE value; only that value comes back, and the
     /// call count is reported for savings accounting.
+    #[test]
+    fn session_code_mode_audit_correlates_nested_calls_without_source_or_thrown_text() {
+        let _data = DataDirTestEnv::new("f3-code-mode-correlation");
+        let host = dispatch_host(true);
+        let reg = Registry::default();
+        let router = Arc::new(paging_router("x".into()));
+        let req = json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"toolport_run_script", "arguments":{"script":"toolport.call('s__big', {private:'f3-private-argument'}); throw new Error('f3-private-thrown');"}}});
+        let _context = observation::ContextGuard::enter(observation::Context { session_id: Some("opaque-session".into()), client_name: Some("Unknown app (via Cursor)".into()), client_label: Some("kt 1".into()), ..Default::default() });
+        let response = handle_request_with_cancel(&host, &req, &reg, &router, &[], DiscoveryMode::Lazy, None, &SearchGuard::default(), None, None, None, None, Some(&CatalogSearchIndex::build(&[])), Some(&router), None).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        let rows = audit::read_all().unwrap();
+        let run = rows.iter().find(|row| row["tool"] == "run_script").unwrap();
+        let nested = rows.iter().find(|row| row["server"] == "s").unwrap();
+        assert_eq!(run["failureKind"], "script_exception");
+        assert_eq!(run["runId"].as_str().unwrap().len(), 32);
+        assert_eq!(nested["runId"], run["runId"]);
+        assert_eq!(nested["sessionId"], "opaque-session");
+        assert_eq!(nested["clientName"], "Unknown app (via Cursor)");
+        assert!(nested["dispatchMs"].is_u64());
+        let retained = serde_json::to_string(&rows).unwrap();
+        for private in ["f3-private-argument", "f3-private-thrown", "throw new Error", "toolport.call"] { assert!(!retained.contains(private), "{retained}"); }
+    }
+
     #[test]
     fn run_script_aggregates_downstream_calls() {
         let _data_env = DataDirTestEnv::new("run_script_aggregates_downstream_calls");
@@ -26567,6 +26994,7 @@ mod tests {
         assert!(explicit_on.code_mode);
     }
 
+
     /// A failed registry load must not advertise or run Code Mode, even when
     /// a later request snapshot contains an explicit opt-in.
     #[test]
@@ -26980,6 +27408,7 @@ mod tests {
             profile: Arc::new(Mutex::new(None)),
             stdio_upstream,
             client_id: None,
+            attribution_id: None,
             env_profile: None,
         }
     }
@@ -27016,6 +27445,7 @@ mod tests {
     /// rebuild and let the loser's Drop kill mid-flight work.
     #[test]
     fn one_host_backs_every_session_with_the_same_router_and_registry() {
+        let _data = DataDirTestEnv::new("f3-one-host-backs-every-session-with-the-same-router-and-registry");
         let first = http_state(true);
         let second = first.clone();
 
@@ -27460,6 +27890,7 @@ mod tests {
 
     #[test]
     fn http_over_cap_rejects_promptly_and_recovers() {
+        let _data = DataDirTestEnv::new("f3-http-over-cap-rejects-promptly-and-recovers");
         let state = http_state(false);
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
@@ -27476,7 +27907,14 @@ mod tests {
 
         let listener_inflight = Arc::clone(&inflight);
         std::thread::spawn(move || {
-            serve_http_loop_with_inflight(server, state, None, search, true, listener_inflight)
+            serve_http_loop_with_inflight(
+                server,
+                state,
+                None,
+                search,
+                true,
+                listener_inflight,
+            )
         });
         std::thread::sleep(Duration::from_millis(50));
 
@@ -27609,6 +28047,7 @@ mod tests {
 
     #[test]
     fn openapi_exposes_meta_tools_as_post_paths() {
+        let _data = DataDirTestEnv::new("f3-openapi-exposes-meta-tools-as-post-paths");
         let spec = openapi_spec(&http_state(true), None, DiscoveryMode::Lazy);
         let paths = spec.get("paths").unwrap().as_object().unwrap();
         // The lazy meta-tools are each a POST path.
@@ -28332,6 +28771,21 @@ mod tests {
     }
 
     #[test]
+    fn private_adapter_id_keeps_authorization_and_scope() {
+        for id in ["/home/private/customer.env", "sk-live-abcdefghijk123456789"] {
+            let mut reg = Registry::default();
+            let profile = reg.add_profile("Private scope");
+            reg.client_scopes.insert(id.into(), profile.clone());
+            let (_, caller) = resolve_adapter_caller(&reg, id, None, None);
+            assert_eq!(caller.session_owner.identity, format!("adapter:{id}"));
+            assert_eq!(caller.profile, Some(profile));
+            assert_eq!(caller.audit_label.as_deref(), Some("An AI client"));
+            assert_eq!(conduit_lib::session_observability::display_client_id(id), "[private]");
+            assert!(conduit_lib::session_observability::telemetry_principal(&caller.session_owner.identity).is_none());
+        }
+    }
+
+    #[test]
     fn http_session_owner_uses_stable_client_id_and_effective_scope() {
         let mut reg = Registry::default();
         let billing = reg.add_profile("Billing");
@@ -28714,6 +29168,7 @@ mod tests {
 
     #[test]
     fn http_options_preflight_is_answered() {
+        let _data = DataDirTestEnv::new("f3-http-options-preflight-is-answered");
         // Browsers preflight a cross-origin POST; we must answer OPTIONS so the
         // real request goes through (CORS headers themselves are added per-response).
         let state = http_state(true);
@@ -28857,6 +29312,93 @@ mod tests {
             .find(|(k, _)| k.eq_ignore_ascii_case("Mcp-Session-Id"))
             .map(|(_, v)| v.clone())
             .expect("Mcp-Session-Id header")
+    }
+
+    #[test]
+    fn session_notifications_count_only_complete_successful_flushes() {
+        let _data = DataDirTestEnv::new("session-notification-delivery");
+        let observed = observation::Session::start(None, Some("Unknown app (via Cursor)"), Some("kt 1"), "http", "initialize");
+        let session = Arc::new(SessionState::new_http(None));
+        *session.observation.lock().unwrap() = Some(observed.clone());
+        assert!(session.push_message(json!({"jsonrpc":"2.0", "method":"notifications/tools/list_changed"}).to_string(), None));
+        assert_eq!(audit::recent_sessions(1).unwrap()[0]["listChangedCount"], 0);
+        let mut reader = McpSseReader::new(session.clone());
+        let mut bytes = [0; 8192];
+        assert!(reader.read(&mut bytes).unwrap() > 0);
+        assert_eq!(audit::recent_sessions(1).unwrap()[0]["listChangedCount"], 0);
+        struct Failing;
+        impl Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { Err(std::io::ErrorKind::BrokenPipe.into()) }
+            fn flush(&mut self) -> std::io::Result<()> { Err(std::io::ErrorKind::BrokenPipe.into()) }
+        }
+        let mut failed = DeliveryWriter { inner: Failing, session: session.clone(), pending: reader.pending_deliveries.clone() };
+        assert!(failed.flush().is_err());
+        assert_eq!(audit::recent_sessions(1).unwrap()[0]["listChangedCount"], 0);
+        let mut successful = DeliveryWriter { inner: Vec::<u8>::new(), session: session.clone(), pending: reader.pending_deliveries.clone() };
+        successful.flush().unwrap();
+        successful.flush().unwrap();
+        assert_eq!(audit::recent_sessions(1).unwrap()[0]["listChangedCount"], 1);
+        session.close();
+        assert_eq!(audit::recent_sessions(1).unwrap()[0]["reason"], "client_disconnect");
+    }
+
+    #[test]
+    fn session_catalog_fields_on_other_methods_are_not_tool_list_deliveries() {
+        let mut response = GatewayResponse::from(json!({"result":{"tools":[{"name":"fixture"}]}}));
+        assert!(response.catalog_delivery().is_none());
+        response.tools_list = true;
+        assert_eq!(response.catalog_delivery().unwrap().count, 1);
+    }
+
+    #[test]
+    fn sessionless_notification_closes_as_a_completed_request() {
+        let _data = DataDirTestEnv::new("sessionless-notification-close");
+        let state = http_state(true);
+        let req = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION}}
+        });
+        let out = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            "POST",
+            "/mcp",
+            &req.to_string(),
+            modern_http_headers("notifications/initialized", None, None, None),
+            None,
+            None,
+        );
+        assert_eq!(out.status, 202, "{}", out.body);
+        let rows = audit::recent_sessions(1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["transport"], "http_request");
+        assert_eq!(rows[0]["phase"], "close");
+        assert_eq!(rows[0]["reason"], "request_complete");
+        assert_eq!(rows[0]["toolsListCount"], 0);
+        assert_eq!(rows[0]["listChangedCount"], 0);
+    }
+
+    #[test]
+    fn session_http_lists_are_delivery_bound_and_close_on_delete() {
+        let _data = DataDirTestEnv::new("session-http-lifecycle");
+        let state = http_state(true);
+        let guard = SearchGuard::default();
+        let init = handle_http(&state, &guard, "POST", "/mcp", &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"kt","version":"1"},"capabilities":{}}}).to_string(), None, None, None, None);
+        let sid = mcp_session_of(&init);
+        let list = handle_http(&state, &guard, "POST", "/mcp", &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}).to_string(), Some(&sid), None, None, None);
+        assert_eq!(audit::recent_sessions(1).unwrap()[0]["toolsListCount"], 0);
+        let (session, delivery) = list.catalog_delivery.unwrap();
+        session.list_delivered(delivery);
+        let rows = audit::recent_sessions(1).unwrap();
+        assert_eq!(rows[0]["clientLabel"], "kt 1");
+        assert_eq!(rows[0]["toolsListCount"], 1);
+        assert!(rows[0]["firstCatalogSize"].as_u64().unwrap() > 0);
+        let delete = handle_http(&state, &guard, "DELETE", "/mcp", "", Some(&sid), None, None, None);
+        assert_eq!(delete.status, 204);
+        let closed = audit::recent_sessions(1).unwrap();
+        assert_eq!(closed[0]["sessionId"], rows[0]["sessionId"]);
+        assert_eq!(closed[0]["reason"], "client_delete");
     }
 
     #[test]
@@ -29057,6 +29599,7 @@ mod tests {
 
     #[test]
     fn legacy_http_client_still_requires_a_session() {
+        let _data = DataDirTestEnv::new("f3-legacy-http-client-still-requires-a-session");
         // The other half of dual-era: nothing about the legacy path changed.
         let state = http_state(true);
         let caller = test_caller("client:cursor", None);
@@ -29138,6 +29681,7 @@ mod tests {
     /// recorded the old boot-frozen read as a hazard; this pins the fix.
     #[test]
     fn http_bridge_follows_a_live_discovery_switch() {
+        let _data = DataDirTestEnv::new("f3-http-bridge-follows-a-live-discovery-switch");
         let state = http_state(false);
         let spec = |state: &GatewayState, caller: Option<&HttpCaller>| -> Value {
             let out = handle_http_with_headers(
@@ -29292,6 +29836,7 @@ mod tests {
 
     #[test]
     fn modern_http_transport_headers_gate_dispatch_and_map_protocol_statuses() {
+        let _data = DataDirTestEnv::new("f3-modern-http-transport-headers-gate-dispatch-and-map-protocol-statuses");
         let state = http_state(true);
         let body = modern_http_body(1, "tools/list", json!({}));
 
@@ -29514,6 +30059,7 @@ mod tests {
 
     #[test]
     fn modern_http_scope_is_resolved_per_request_not_from_session_state() {
+        let _data = DataDirTestEnv::new("f3-modern-http-scope-is-resolved-per-request-not-from-session-state");
         let state = http_state(false);
         {
             let mut reg = state.registry.lock().unwrap();
@@ -29568,6 +30114,7 @@ mod tests {
 
     #[test]
     fn modern_http_rejects_removed_resource_subscription_methods() {
+        let _data = DataDirTestEnv::new("f3-modern-http-rejects-removed-resource-subscription-methods");
         let state = http_state(true);
         let out = handle_http_with_headers(
             &state,
@@ -29700,6 +30247,7 @@ mod tests {
 
     #[test]
     fn mcp_http_get_opens_listen_stream() {
+        let _data = DataDirTestEnv::new("f3-mcp-http-get-opens-listen-stream");
         let state = http_state(true);
         let search = SearchGuard::default();
         let init = handle_http(
@@ -29742,6 +30290,7 @@ mod tests {
 
     #[test]
     fn mcp_http_get_without_sse_accept_returns_406() {
+        let _data = DataDirTestEnv::new("f3-mcp-http-get-without-sse-accept-returns-406");
         let state = http_state(true);
         let search = SearchGuard::default();
         let init = handle_http(
@@ -29782,6 +30331,7 @@ mod tests {
 
     #[test]
     fn modern_http_subscription_listen_is_sessionless_tagged_and_filtered() {
+        let _data = DataDirTestEnv::new("f3-modern-http-subscription-listen-is-sessionless-tagged-and-filtered");
         let state = http_state(true);
         let search = SearchGuard::default();
         let caller = test_caller("client:modern", None);
@@ -29895,6 +30445,7 @@ mod tests {
 
     #[test]
     fn modern_adapter_listener_keeps_its_authenticated_root() {
+        let _data = DataDirTestEnv::new("f3-modern-adapter-listener-keeps-its-authenticated-root");
         let state = http_state(true);
         state.daemon_mode.store(true, Ordering::SeqCst);
         let caller = test_caller("adapter:modern-root", None);
@@ -29929,6 +30480,7 @@ mod tests {
 
     #[test]
     fn modern_subscription_listen_rejects_bad_filters_without_a_session() {
+        let _data = DataDirTestEnv::new("f3-modern-subscription-listen-rejects-bad-filters-without-a-session");
         let state = http_state(true);
         let out = handle_http_with_headers(
             &state,
@@ -29956,6 +30508,7 @@ mod tests {
 
     #[test]
     fn modern_http_listeners_do_not_collide_across_instances_of_one_client() {
+        let _data = DataDirTestEnv::new("f3-modern-http-listeners-do-not-collide-across-instances-of-one-client");
         let state = http_state(true);
         let caller = test_caller("client:shared-token", None);
         let body = modern_http_body(
@@ -30003,6 +30556,7 @@ mod tests {
 
     #[test]
     fn cancelling_modern_stdio_listener_releases_its_resource_subscriptions() {
+        let _data = DataDirTestEnv::new("f3-cancelling-modern-stdio-listener-releases-its-resource-subscriptions");
         let state = http_state(true);
         let id = json!("listen-1");
         let key = modern_subscription_key(None, &id, ModernSubscriptionTransport::Stdio);
@@ -30046,6 +30600,7 @@ mod tests {
 
     #[test]
     fn mcp_push_server_message_queues_sse_payload() {
+        let _data = DataDirTestEnv::new("f3-mcp-push-server-message-queues-sse-payload");
         let state = http_state(true);
         let sid = mint_mcp_session(&state, None).ok().unwrap();
         let msg = json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"});
@@ -30063,6 +30618,7 @@ mod tests {
 
     #[test]
     fn fanout_mcp_notification_reaches_every_live_session() {
+        let _data = DataDirTestEnv::new("f3-fanout-mcp-notification-reaches-every-live-session");
         // SOU-328: list_changed must fan over HTTP MCP sessions, not only stdio.
         let state = http_state(true);
         let sid_a = mint_mcp_session(&state, None).ok().unwrap();
@@ -30309,6 +30865,7 @@ mod tests {
     /// description, and schema - before any call was ever made.
     #[test]
     fn http_cold_cache_withholds_the_sanitized_twin() {
+        let _data = DataDirTestEnv::new("f3-http-cold-cache-withholds-the-sanitized-twin");
         let state = http_state(false);
         *state.registry.lock().unwrap() = twin_registry();
         let cached = vec![
@@ -30346,6 +30903,7 @@ mod tests {
     /// servers the Personal token gets its own tool back, and only that one.
     #[test]
     fn http_warm_router_lists_only_the_personal_twin() {
+        let _data = DataDirTestEnv::new("f3-http-warm-router-lists-only-the-personal-twin");
         let state = http_state(false);
         *state.registry.lock().unwrap() = twin_registry();
         let router = twin_router();
@@ -31231,6 +31789,7 @@ mod tests {
 
     #[test]
     fn http_roots_refresh_updates_only_its_session_and_keeps_adapter_cwd_fallback() {
+        let _data = DataDirTestEnv::new("f3-http-roots-refresh-updates-only-its-session-and-keeps-adapter-cwd-fallback");
         let state = http_state(false);
         state.daemon_mode.store(true, Ordering::SeqCst);
         let owner_a = McpSessionOwner {
@@ -31319,6 +31878,7 @@ mod tests {
 
     #[test]
     fn adapter_initialize_seeds_its_session_root_without_changing_other_sessions() {
+        let _data = DataDirTestEnv::new("f3-adapter-initialize-seeds-its-session-root-without-changing-other-sessions");
         let state = http_state(false);
         state.daemon_mode.store(true, Ordering::SeqCst);
         let caller = test_caller("adapter:root-test", None);
@@ -31503,6 +32063,7 @@ mod tests {
 
     #[test]
     fn mcp_http_get_without_session_returns_400() {
+        let _data = DataDirTestEnv::new("f3-mcp-http-get-without-session-returns-400");
         let state = http_state(true);
         let out = handle_http(
             &state,
@@ -31520,6 +32081,7 @@ mod tests {
 
     #[test]
     fn mcp_http_bad_session_format_returns_400() {
+        let _data = DataDirTestEnv::new("f3-mcp-http-bad-session-format-returns-400");
         let state = http_state(true);
         let out = handle_http(
             &state,
@@ -31537,6 +32099,7 @@ mod tests {
 
     #[test]
     fn mcp_http_delete_without_session_returns_400() {
+        let _data = DataDirTestEnv::new("f3-mcp-http-delete-without-session-returns-400");
         let state = http_state(true);
         let out = handle_http(
             &state,
@@ -31575,6 +32138,7 @@ mod tests {
 
     #[test]
     fn mcp_http_options_preflight_returns_204() {
+        let _data = DataDirTestEnv::new("f3-mcp-http-options-preflight-returns-204");
         let state = http_state(true);
         let out = handle_http(
             &state,
@@ -31643,6 +32207,7 @@ mod tests {
 
     #[test]
     fn docs_mention_mcp_endpoint() {
+        let _data = DataDirTestEnv::new("f3-docs-mention-mcp-endpoint");
         let state = http_state(true);
         let out = handle_http(
             &state,
@@ -31671,6 +32236,7 @@ mod tests {
 
     #[test]
     fn healthz_reports_registry_readiness_and_carries_no_data() {
+        let _data = DataDirTestEnv::new("f3-healthz-reports-registry-readiness-and-carries-no-data");
         let state = http_state(true);
         let ok = healthz_out(&state, "GET");
         assert_eq!(ok.status, 200);
@@ -32054,6 +32620,7 @@ mod tests {
 
     #[test]
     fn rooted_subscriptions_consume_the_process_wide_capacity() {
+        let _data = DataDirTestEnv::new("f3-rooted-subscriptions-consume-the-process-wide-capacity");
         let state = http_state(false);
         let table = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
         {
@@ -32094,6 +32661,7 @@ mod tests {
 
     #[test]
     fn retired_root_route_cannot_report_a_new_subscription_as_open() {
+        let _data = DataDirTestEnv::new("f3-retired-root-route-cannot-report-a-new-subscription-as-open");
         let state = http_state(false);
         state.daemon_mode.store(true, Ordering::SeqCst);
         let router = cache_router();
@@ -32244,6 +32812,7 @@ mod tests {
 
     #[test]
     fn cancelled_modern_registration_rolls_back_earlier_resource_joins() {
+        let _data = DataDirTestEnv::new("f3-cancelled-modern-registration-rolls-back-earlier-resource-joins");
         let state = http_state(false);
         let router = cache_router();
         let id = json!(77);
@@ -32332,6 +32901,7 @@ mod tests {
     /// WS1-1: mint_mcp_session must release resource subs held by reaped sessions.
     #[test]
     fn mint_mcp_session_cleans_resource_subs_of_closed_sessions() {
+        let _data = DataDirTestEnv::new("f3-mint-mcp-session-cleans-resource-subs-of-closed-sessions");
         let state = http_state(false);
         let owner = McpSessionOwner {
             identity: "client:reaped-pii".into(),
@@ -32431,6 +33001,7 @@ mod tests {
 
     #[test]
     fn deliver_resource_updated_reaches_only_subscribed_http_sessions() {
+        let _data = DataDirTestEnv::new("f3-deliver-resource-updated-reaches-only-subscribed-http-sessions");
         let state = http_state(false);
         let s1 = match mint_mcp_session(&state, None) {
             Ok(s) => s,
@@ -32828,6 +33399,7 @@ mod tests {
 
     #[test]
     fn registered_http_clients_get_their_own_profiles_instructions() {
+        let _data = DataDirTestEnv::new("f3-registered-http-clients-get-their-own-profiles-instructions");
         let state = http_state(true);
         let mut reg = instructions_registry();
         for (id, profile) in [("c-media", "media"), ("c-pg", "Postgres"), ("c-all", "")] {
@@ -32895,6 +33467,7 @@ mod tests {
 
     #[test]
     fn a_daemon_adapter_gets_its_profiles_instructions() {
+        let _data = DataDirTestEnv::new("f3-a-daemon-adapter-gets-its-profiles-instructions");
         let state = http_state(false);
         state.daemon_mode.store(true, Ordering::SeqCst);
         let reg = instructions_registry();
@@ -32917,6 +33490,7 @@ mod tests {
 
     #[test]
     fn a_caller_without_its_own_profile_uses_the_gateways() {
+        let _data = DataDirTestEnv::new("f3-a-caller-without-its-own-profile-uses-the-gateways");
         // The stdio path: no caller profile, so the gateway's live profile decides.
         let state = http_state(false);
         *state.registry.lock().unwrap() = instructions_registry();
@@ -34193,6 +34767,7 @@ mod tests {
 
     #[test]
     fn progress_reaches_only_the_client_that_minted_the_token() {
+        let _data = DataDirTestEnv::new("f3-progress-reaches-only-the-client-that-minted-the-token");
         // SOU-444: progress is request-scoped, so it must land on the one client
         // whose request carried the token, never fan out like a subscription.
         let state = http_state(false);
@@ -34238,6 +34813,7 @@ mod tests {
 
     #[test]
     fn identical_client_tokens_from_two_clients_do_not_collide() {
+        let _data = DataDirTestEnv::new("f3-identical-client-tokens-from-two-clients-do-not-collide");
         // `progressToken` is client-chosen and small integers are common, so two
         // clients picking the same value is likely. Keying the route table on it
         // directly meant the second registration clobbered the first, and against
@@ -34275,6 +34851,7 @@ mod tests {
 
     #[test]
     fn progress_drops_cross_server_spoof_and_stale_tokens() {
+        let _data = DataDirTestEnv::new("f3-progress-drops-cross-server-spoof-and-stale-tokens");
         // Same lesson as SOU-398, on a notification whose correlator is chosen by
         // the client: a server must not be able to push progress for a token it
         // was never given, and a finished call must stop accepting progress.
@@ -34349,6 +34926,7 @@ mod tests {
 
     #[test]
     fn stdio_progress_is_handed_off_without_blocking_the_caller() {
+        let _data = DataDirTestEnv::new("f3-stdio-progress-is-handed-off-without-blocking-the-caller");
         // The stdio delivery branch had no test at all, and it is the primary
         // Toolport deployment. It must also never block: this runs on the
         // downstream drain thread, before that thread forwards response lines, so
@@ -34476,6 +35054,7 @@ mod tests {
 
     #[test]
     fn deliver_resource_updated_drops_cross_server_spoof() {
+        let _data = DataDirTestEnv::new("f3-deliver-resource-updated-drops-cross-server-spoof");
         // SOU-398: a server that does not own the URI must not fan out updates.
         let state = http_state(false);
         let s1 = match mint_mcp_session(&state, None) {
@@ -34526,6 +35105,7 @@ mod tests {
 
     #[test]
     fn deliver_resource_updated_silent_when_unsubscribed() {
+        let _data = DataDirTestEnv::new("f3-deliver-resource-updated-silent-when-unsubscribed");
         // Unsolicited update for a URI with no local subscription: drop, no panic.
         let state = http_state(false);
         let s1 = match mint_mcp_session(&state, None) {
@@ -35631,6 +36211,7 @@ mod tests {
 
     #[test]
     fn p08_lifetime_delete_releases_sessions_lock_before_cancel_hooks() {
+        let _data = DataDirTestEnv::new("f3-p08-lifetime-delete-releases-sessions-lock-before-cancel-hooks");
         let state = http_state(false);
         let caller = test_caller("adapter:p08-delete-lock", None);
         let key = "adapter-lifetime:p08-delete-lock".to_string();
@@ -35691,6 +36272,7 @@ mod tests {
 
     #[test]
     fn p08_sessionless_same_owner_can_start_the_same_id_on_two_connections() {
+        let _data = DataDirTestEnv::new("f3-p08-sessionless-same-owner-can-start-the-same-id-on-two-connections");
         let state = http_state(false);
         let owner = test_caller("client:shared-token", None).session_owner;
         let first = downstream::CancelRegistry::new();
@@ -35711,6 +36293,7 @@ mod tests {
 
     #[test]
     fn p08_sessionless_cancel_notification_cannot_cross_connections() {
+        let _data = DataDirTestEnv::new("f3-p08-sessionless-cancel-notification-cannot-cross-connections");
         let state = http_state(false);
         let owner = test_caller("client:shared-token", None).session_owner;
         let first = downstream::CancelRegistry::new();
@@ -35740,6 +36323,7 @@ mod tests {
 
     #[test]
     fn p08_other_owner_traffic_never_reaps_active_or_retained_calls() {
+        let _data = DataDirTestEnv::new("f3-p08-other-owner-traffic-never-reaps-active-or-retained-calls");
         let state = http_state(false);
         let owner = test_caller("client:p08-aged", None).session_owner;
         let connection = downstream::CancelRegistry::new();
@@ -35772,6 +36356,7 @@ mod tests {
 
     #[test]
     fn p08_live_adapter_lifetime_survives_session_ttl_and_initialize() {
+        let _data = DataDirTestEnv::new("f3-p08-live-adapter-lifetime-survives-session-ttl-and-initialize");
         let state = http_state(false);
         let owner = test_caller("adapter:p08-long-lived", None).session_owner;
         let connection = downstream::CancelRegistry::new();
@@ -35807,6 +36392,7 @@ mod tests {
 
     #[test]
     fn p08_old_lifetime_reader_cannot_remove_reopened_row() {
+        let _data = DataDirTestEnv::new("f3-p08-old-lifetime-reader-cannot-remove-reopened-row");
         let state = http_state(false);
         let key = "adapter-lifetime:p08-reopened".to_string();
         let mut old = SessionState::new_http(None);
@@ -35908,6 +36494,7 @@ mod tests {
                     token: String::new(),
                     id: "1".into(),
                     client: None,
+                    client_name: observation::current().client_name,
                     client_label: None,
                     server: "s".into(),
                     tool: "t".into(),
@@ -36026,7 +36613,7 @@ mod tests {
             .get("result")
             .is_some());
         broker.join().unwrap();
-        let entries = audit::read_all().unwrap();
+        let entries: Vec<_> = audit::read_all().unwrap().into_iter().filter(|row| row["kind"] == "approval").collect();
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "withdrawn");
         assert_eq!(audit::stats().unwrap()["total"], 0);
@@ -36223,7 +36810,7 @@ mod tests {
             ),
             ModernHitlPoll::Missing
         ));
-        let entries = audit::read_all().unwrap();
+        let entries: Vec<_> = audit::read_all().unwrap().into_iter().filter(|row| row["kind"] == "approval").collect();
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "withdrawn");
         assert_eq!(entries[0]["client"], "p08-client");
@@ -36302,6 +36889,7 @@ mod tests {
 
     #[test]
     fn p08_reopening_a_legacy_session_keeps_the_adapter_live() {
+        let _data = DataDirTestEnv::new("f3-p08-reopening-a-legacy-session-keeps-the-adapter-live");
         let state = http_state(false);
         let lifetime = Arc::new(SessionState::new_http(None));
         state
@@ -36699,11 +37287,7 @@ mod tests {
             (**guard).clone()
         };
 
-        fail_closed_integrity_catalog(
-            &mut live,
-            Some("sbs714-gateway"),
-            set_of(&["srv__new_drift"]),
-        );
+        fail_closed_integrity_catalog(&mut live, Some("sbs714-gateway"), set_of(&["srv__new_drift"]));
 
         assert_eq!(
             live.quarantined(),
@@ -40124,6 +40708,82 @@ mod tests {
     }
 
     #[test]
+    fn discovery_helpers_record_private_scoped_timings_in_every_mode() {
+        let _data = DataDirTestEnv::new("discovery-helper-timings");
+        for (client, mode) in [
+            ("adapter:claude-code", DiscoveryMode::Lazy),
+            ("adapter:codex", DiscoveryMode::Full),
+            ("adapter:cursor", DiscoveryMode::Full),
+            ("adapter:codex", DiscoveryMode::Grouped),
+            ("adapter:/home/private/customer.env", DiscoveryMode::Full),
+        ] {
+            let state = http_state(false);
+            let (router, calls, _) = counting_router(false);
+            let mut reg = Registry::default();
+            reg.servers.push(stub_server("s", "Server"));
+            *state.registry.lock().unwrap() = reg;
+            *state.cached_tools.lock().unwrap() =
+                Arc::new(CatalogSnapshot::new(router.shared_tools()));
+            swap_router(&state, router);
+            let allowed = HashSet::from(["s".to_string()]);
+            let search_name = if mode == DiscoveryMode::Grouped {
+                "help_s"
+            } else {
+                "toolport_search_tools"
+            };
+            let run = |name: &str, arguments: Value| {
+                process_request_wire(
+                    &state,
+                    &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":name,"arguments":arguments}}),
+                    &SearchGuard::default(), Some(&allowed), None, None, None, Some(client), None, mode,
+                ).unwrap()
+            };
+            let mut session_ids = Vec::new();
+            for query in ["work", "s__work"] {
+                let response = run(search_name, json!({"query":query}));
+                session_ids.push(response.observation.as_ref().unwrap().context().session_id.unwrap());
+                let text = response.envelope["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap();
+                assert!(text.contains("s__work"), "{text}");
+                assert_eq!(response.envelope["result"]["isError"], false);
+            }
+            let response = if observation::telemetry_principal(client).is_some() {
+                let response = run("toolport_call_tool", json!({"name":"s__work", "arguments":{}}));
+                assert_eq!(response.envelope["result"]["isError"], false);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                response
+            } else {
+                run(search_name, json!({"query":"work"}))
+            };
+            session_ids.push(response.observation.as_ref().unwrap().context().session_id.unwrap());
+            assert!(conduit_lib::telemetry::flush_for_test(Duration::from_secs(5)));
+            let rows: Vec<_> = audit::read_all()
+                .unwrap()
+                .into_iter()
+                .filter(|row| {
+                    row["sessionId"].as_str().is_some_and(|id| session_ids.iter().any(|session| session == id))
+                        && (row["kind"] == "internal" || row["tool"] == "work")
+                })
+                .collect();
+            assert_eq!(rows.len(), 3, "{rows:?}");
+            for row in rows {
+                assert_eq!(
+                    row["client"].as_str(),
+                    observation::telemetry_principal(client)
+                );
+                assert!(row["durationMs"].is_u64(), "{row}");
+                assert!(row["cold"].is_boolean(), "{row}");
+                if row["kind"] == "internal" {
+                    assert_eq!(row["tool"], "search");
+                } else {
+                    assert!(row["dispatchMs"].is_u64(), "{row}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn tool_surface_wire_hit_is_byte_identical_to_uncached_for_every_mode_and_era() {
         let _clock = CacheHint::freeze_clock_for_test();
         let _env = DataDirTestEnv::new("tool-surface-wire-equality");
@@ -40234,6 +40894,8 @@ mod tests {
             let response = GatewayResponse {
                 envelope: success(id, json!({"tools": [], "cacheTTL": 123})),
                 surface: Some(Arc::clone(&surface)),
+                observation: None,
+                tools_list: true,
             };
             let expected = serde_json::to_string(&response).unwrap();
             let body = response.to_json().unwrap();
@@ -41581,6 +42243,7 @@ mod tests {
     /// call) falls back to the listener-level guard.
     #[test]
     fn http_requests_use_the_guards_of_their_session() {
+        let _data = DataDirTestEnv::new("f3-http-requests-use-the-guards-of-their-session");
         let state = http_state(false);
         let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
         let s2 = mint_mcp_session(&state, None).ok().expect("mint s2");
@@ -41604,6 +42267,7 @@ mod tests {
     /// one's daemon flag or activity clock; while those were process statics it did.
     #[test]
     fn daemon_runtime_state_belongs_to_the_host() {
+        let _data = DataDirTestEnv::new("f3-daemon-runtime-state-belongs-to-the-host");
         let first = http_state(true);
         let second = http_state(true);
 
@@ -41723,6 +42387,7 @@ mod tests {
 
     #[test]
     fn expired_http_service_lease_stops_authorizing_its_bearer() {
+        let _data = DataDirTestEnv::new("f3-expired-http-service-lease-stops-authorizing-its-bearer");
         let state = http_state(true);
         let token = "expired-public-token";
         *state

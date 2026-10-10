@@ -16,6 +16,5 @@ export function activityClientName(client: {
   const name = trustedClientName(client);
   const label = client.clientLabel;
   if (!label || label === name) return name;
-  if (label.startsWith(name)) return `${name} ${label.slice(name.length).trim()}`;
   return `${name} (reports "${label}")`;
 }

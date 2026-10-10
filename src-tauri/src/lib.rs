@@ -9,6 +9,8 @@ pub mod call_failure;
 pub mod child_ledger;
 pub mod clients;
 pub mod tool_definitions;
+pub mod client_process;
+pub mod session_observability;
 pub mod codemode;
 pub mod codemode_worker;
 pub mod daemon;
