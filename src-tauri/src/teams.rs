@@ -1353,10 +1353,11 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         }
     }
     if crate::personal_sync::is_personal(&fresh) {
-        return crate::personal_sync::sync(
-            fresh.team.as_ref().ok_or("Sign in to sync first")?,
-            &token,
-        );
+        let personal = fresh.team.as_ref().ok_or("Sign in to sync first")?;
+        let result = crate::personal_sync::sync(personal, &token)?;
+        report_activation(personal, &token)?;
+        report_usage(personal, &token)?;
+        return Ok(result);
     }
 
     let pulled = pull_config(

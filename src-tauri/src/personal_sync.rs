@@ -200,6 +200,41 @@ pub fn export(s: &ServerEntry) -> Value {
             }
         }
     }
+    // A local password-manager override must never replace the synced reference.
+    if let Some(overrides) = s
+        .unknown_fields
+        .get("memberSecretRefs")
+        .and_then(Value::as_object)
+    {
+        for location in overrides.keys() {
+            let saved = s
+                .unknown_fields
+                .get("personalSyncRemoteRefs")
+                .and_then(|m| m.get(location))
+                .cloned();
+            if let Some((field, key)) = location.split_once(':') {
+                let path = match field {
+                    "env" => "/env",
+                    "input" => "/launch/inputs",
+                    "header" => "/headerKeys",
+                    _ => continue,
+                };
+                for input in v
+                    .pointer_mut(path)
+                    .and_then(Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                    .filter(|i| i["key"] == key)
+                {
+                    if let Some(source) = saved.clone().filter(|v| !v.is_null()) {
+                        input["source"] = source;
+                    } else if let Some(m) = input.as_object_mut() {
+                        m.remove("source");
+                    }
+                }
+            }
+        }
+    }
     v
 }
 fn definition(value: &Value) -> Value {
@@ -364,9 +399,21 @@ pub fn merge(
     Ok((config, conflicts))
 }
 pub(crate) fn command_identity(v: &Value) -> Value {
-    // Portable launch inputs can alter arguments; their exact values belong in
-    // executable consent as well as command, args, cwd and launch bindings.
-    json!({"command":v["command"], "args":v["args"], "cwd":v["cwd"], "transport":v["transport"], "launch":v["launch"], "env":v["env"]})
+    // Labels and timeout/tool metadata do not change what executes. Portable
+    // values, references and launch bindings do, and remain in exact consent.
+    let inputs = |values: &Value| {
+        values
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .map(|i| json!({"key": i["key"], "value": i["value"], "source": i["source"]}))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    json!({"command":v["command"], "args":v["args"], "cwd":v["cwd"],
+        "transport":v["transport"], "bindings":v["launch"]["bindings"],
+        "inputs":inputs(&v["launch"]["inputs"]), "env":inputs(&v["env"])})
 }
 fn reference_identity(value: &Value) -> Value {
     json!({"url":value["url"],"command":command_identity(value),"headers":value["headerKeys"]})
@@ -377,8 +424,67 @@ fn execution_changed(before: Option<&Value>, after: &Value) -> bool {
 }
 fn restore_local(entry: &mut ServerEntry, old: &ServerEntry) {
     entry.inherit_env = old.inherit_env; // Never import ambient-env consent.
+    if let Some(overrides) = old
+        .unknown_fields
+        .get("memberSecretRefs")
+        .and_then(Value::as_object)
+    {
+        let mut remote_refs = serde_json::Map::new();
+        for (location, reference) in overrides {
+            let Some((field, key)) = location.split_once(':') else {
+                continue;
+            };
+            let update = |source: &mut serde_json::Map<String, Value>| {
+                remote_refs.insert(
+                    location.clone(),
+                    source.get("source").cloned().unwrap_or(Value::Null),
+                );
+                source.insert("source".into(), json!({"ref": reference}));
+            };
+            let mut update = update;
+            match field {
+                "env" => {
+                    for input in entry.env.iter_mut().filter(|i| i.key == key) {
+                        update(&mut input.unknown_fields);
+                        input.secret = true;
+                        input.value = None;
+                    }
+                }
+                "input" => {
+                    for input in entry
+                        .launch
+                        .iter_mut()
+                        .flat_map(|l| &mut l.inputs)
+                        .filter(|i| i.key == key)
+                    {
+                        update(&mut input.unknown_fields);
+                        input.secret = true;
+                        input.value = None;
+                    }
+                }
+                "header" => {
+                    for header in entry
+                        .unknown_fields
+                        .get_mut("headerKeys")
+                        .and_then(Value::as_array_mut)
+                        .into_iter()
+                        .flatten()
+                        .filter(|i| i["key"] == key)
+                    {
+                        if let Some(m) = header.as_object_mut() {
+                            update(m);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        entry
+            .unknown_fields
+            .insert("personalSyncRemoteRefs".into(), json!(remote_refs));
+    }
     for input in &mut entry.env {
-        if !portable(&json!(input)) && !input.secret {
+        if !portable(&json!(input)) && !input.secret && reference(&json!(input)).is_none() {
             input.value = old
                 .env
                 .iter()
@@ -387,7 +493,7 @@ fn restore_local(entry: &mut ServerEntry, old: &ServerEntry) {
         }
     }
     for input in entry.launch.iter_mut().flat_map(|l| &mut l.inputs) {
-        if !portable(&json!(input)) && !input.secret {
+        if !portable(&json!(input)) && !input.secret && reference(&json!(input)).is_none() {
             input.value = old
                 .launch
                 .iter()
@@ -428,9 +534,12 @@ pub fn apply(
     let tag = format!("team:{team_id}");
     let mut outcome = crate::teams::MergeOutcome::default();
     if !st.initialized {
+        crate::local_auth::adopt_personal_sync_routes(reg)?;
         // Bind by explicit identity first, then by a unique display name. Recreating
         // the same named server does not produce a second cloud definition.
-        for local in reg.servers.iter_mut().filter(|s| eligible(s)) {
+        for local in reg.servers.iter_mut().filter(|s| {
+            eligible(s) && s.unknown_fields.get("teamRouteRemoved") != Some(&json!(true))
+        }) {
             let matches: Vec<_> = remote
                 .iter()
                 .filter(|(id, v)| {
@@ -756,6 +865,13 @@ pub(crate) fn sync(
             Ok(())
         })
     })?;
+    if !current(&reg, conn) {
+        return Ok(crate::teams::SyncResult::Ok {
+            role: conn.role.clone(),
+            role_changed: false,
+            applied: None,
+        });
+    }
     let queued = state(&reg)?.pending;
     let ready: BTreeMap<_, _> = queued
         .into_iter()
@@ -775,6 +891,13 @@ pub(crate) fn sync(
         })?;
         if merged == latest.1 {
             break;
+        }
+        if !current(&crate::registry::load()?, conn) {
+            return Ok(crate::teams::SyncResult::Ok {
+                role: conn.role.clone(),
+                role_changed: false,
+                applied: None,
+            });
         }
         match crate::teams::push_config(&conn.server_url, &conn.team_id, token, &merged, latest.0) {
             Ok(crate::teams::PushOutcome::Published(_)) => {
@@ -828,7 +951,9 @@ pub(crate) fn sync(
 fn current(r: &Registry, c: &crate::registry::TeamConnection) -> bool {
     is_personal(r)
         && r.team.as_ref().is_some_and(|t| {
-            t.team_id == c.team_id && t.reporting_device_id == c.reporting_device_id
+            t.team_id == c.team_id
+                && t.server_url == c.server_url
+                && t.reporting_device_id == c.reporting_device_id
         })
 }
 pub fn status_lines(status: &Value, last_synced: Option<i64>) -> Vec<String> {
@@ -945,6 +1070,87 @@ mod tests {
         assert_eq!(apply(&mut b, &changed, 2).unwrap().review, 1);
         assert!(!b.servers[0].enabled);
         assert!(check_review(&b, &b.servers[0], Some(&reviewed)).is_err());
+    }
+    #[test]
+    fn metadata_edits_do_not_reopen_command_review() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-metadata");
+        let mut r = machine();
+        let cloud = config(vec![command("tool")]);
+        apply(&mut r, &cloud, 1).unwrap();
+        let reviewed = r.servers[0].clone();
+        let id = reviewed.id.clone();
+        let profile = r.active_profile_id();
+        enable_reviewed(&mut r, &profile, &id, &reviewed).unwrap();
+        let mut changed = cloud.clone();
+        changed["servers"][0]["name"] = json!("New display name");
+        changed["servers"][0]["requestTimeoutMs"] = json!(5000);
+        assert_eq!(apply(&mut r, &changed, 2).unwrap().review, 0);
+        assert!(r.servers[0].enabled);
+    }
+    #[test]
+    fn adopted_legacy_copy_uses_one_existing_credential_identity() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-adoption");
+        let mut r = machine();
+        let mut personal = local(http("docs"));
+        personal.enabled = false;
+        let mut managed = personal.clone();
+        managed.id = "team_solo_docs".into();
+        managed.source = Some("team:solo".into());
+        managed.enabled = true;
+        managed
+            .unknown_fields
+            .insert("teamOriginalId".into(), json!("docs"));
+        r.team
+            .as_mut()
+            .unwrap()
+            .managed_server_ids
+            .insert(managed.id.clone(), personal.id.clone());
+        r.servers = vec![personal.clone(), managed.clone()];
+        crate::local_auth::bind(&mut r, &managed, &personal).unwrap();
+        apply(&mut r, &config(vec![http("docs")]), 1).unwrap();
+        assert_eq!(r.servers.len(), 1);
+        assert_eq!(r.servers[0].id, "docs");
+        assert!(r.servers[0].enabled);
+        assert_eq!(crate::local_auth::owner_in(&r, "docs").unwrap(), "docs");
+        assert!(state(&r).unwrap().pending.is_empty());
+    }
+    #[test]
+    fn removed_bound_original_is_not_republished_on_first_sync() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-removed");
+        let mut r = machine();
+        let mut old = local(http("gone"));
+        old.enabled = false;
+        old.unknown_fields
+            .insert("teamRouteRemoved".into(), json!(true));
+        r.servers.push(old);
+        apply(&mut r, &config(vec![]), 2).unwrap();
+        assert!(state(&r).unwrap().pending.is_empty());
+        assert!(!r.servers[0].enabled);
+    }
+    #[test]
+    fn local_reference_override_is_retained_and_never_exported() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-local-ref");
+        let mut r = machine();
+        let mut row = http("docs");
+        row["headerKeys"] = json!([{"key":"X-Key","source":{"ref":"op://Shared/Token/key"}}]);
+        let cloud = config(vec![row]);
+        apply(&mut r, &cloud, 1).unwrap();
+        r.servers[0].unknown_fields.insert(
+            "memberSecretRefs".into(),
+            json!({"header:X-Key":"op://Private/Token/key"}),
+        );
+        apply(&mut r, &cloud, 1).unwrap();
+        assert_eq!(
+            r.servers[0].unknown_fields["headerKeys"][0]["source"]["ref"],
+            "op://Private/Token/key"
+        );
+        let wire = export(&r.servers[0]);
+        assert_eq!(
+            wire["headerKeys"][0]["source"]["ref"],
+            "op://Shared/Token/key"
+        );
+        assert!(!wire.to_string().contains("Private"));
+        assert!(!wire.to_string().contains("memberSecretRefs"));
     }
     #[test]
     fn concurrent_edits_and_edit_delete_conflict_but_other_servers_merge() {

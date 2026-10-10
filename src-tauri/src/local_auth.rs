@@ -267,3 +267,57 @@ fn restore_routes(reg: &mut Registry, team_id: &str, only: Option<&str>) {
         reg.unknown_fields.insert(FIELD.into(), value);
     }
 }
+
+/// Consolidate a previously adopted copy onto its existing credential identity.
+/// Only exact, still-valid bindings qualify; no credentials are read or copied.
+pub(crate) fn adopt_personal_sync_routes(reg: &mut Registry) -> Result<(), String> {
+    let mut entries = bindings(reg)?;
+    for (managed_id, binding) in entries.clone() {
+        if owner_in(reg, &managed_id).ok().as_deref() != Some(&binding.personal_id) {
+            continue;
+        }
+        let Some(mut managed) = reg.servers.iter().find(|s| s.id == managed_id).cloned() else {
+            continue;
+        };
+        managed.id = binding.personal_id.clone();
+        managed.unknown_fields.insert(
+            "teamOriginalId".into(),
+            serde_json::json!(binding.personal_id),
+        );
+        reg.servers
+            .retain(|s| s.id != managed_id && s.id != binding.personal_id);
+        for profile in &mut reg.profiles {
+            for id in &mut profile.enabled_server_ids {
+                if *id == managed_id {
+                    *id = binding.personal_id.clone();
+                }
+            }
+            profile.enabled_server_ids.sort();
+            profile.enabled_server_ids.dedup();
+            if let Some(scope) = profile.tool_scope.remove(&managed_id) {
+                let scope = match profile.tool_scope.get(&binding.personal_id) {
+                    Some(personal_scope) => scope
+                        .into_iter()
+                        .filter(|tool| personal_scope.contains(tool))
+                        .collect(),
+                    None => scope,
+                };
+                profile
+                    .tool_scope
+                    .insert(binding.personal_id.clone(), scope);
+            }
+        }
+        if let Some(team) = &mut reg.team {
+            team.managed_server_ids.remove(&managed_id);
+            team.managed_server_ids
+                .insert(binding.personal_id.clone(), binding.personal_id.clone());
+        }
+        reg.servers.push(managed);
+        entries.remove(&managed_id);
+    }
+    reg.unknown_fields.insert(
+        FIELD.into(),
+        serde_json::to_value(entries).map_err(|e| e.to_string())?,
+    );
+    Ok(())
+}

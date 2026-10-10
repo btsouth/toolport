@@ -110,7 +110,7 @@ impl TeamsPage {
         if self.busy.replace(true) {
             return;
         }
-        self.feedback.set_label("Loading team status…");
+        self.feedback.set_label("Loading sync status…");
         self.server_page.reprobe_if_stale();
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
@@ -225,11 +225,17 @@ impl TeamsPage {
             self.pending.borrow().is_some(),
         );
         if notice.is_none() && self.rendered_state.borrow().as_ref() == Some(&render_state) {
-            if let Some(error)=crate::personal_sync::state(&registry).ok().and_then(|s|s.error) { self.set_status(&error,true);return; }
+            if let Some(error) = crate::personal_sync::state(&registry)
+                .ok()
+                .and_then(|s| s.error)
+            {
+                self.set_status(&error, true);
+                return;
+            }
             if registry.team.is_some() {
                 self.render_sync_status();
             } else if self.pending.borrow().is_some() {
-                self.set_status("Join request is waiting for an administrator.", false);
+                self.set_status("Waiting for invitation approval.", false);
                 self.feedback.remove_css_class("success");
             } else {
                 self.set_status("", false);
@@ -259,7 +265,7 @@ impl TeamsPage {
         } else {
             self.feedback.remove_css_class("success");
             if self.pending.borrow().is_some() {
-                self.set_status("Join request is waiting for an administrator.", false);
+                self.set_status("Waiting for invitation approval.", false);
             } else {
                 self.set_status("", false);
             }
@@ -377,6 +383,16 @@ impl TeamsPage {
     }
 
     fn render_join(&self) {
+        if self.pending.borrow().is_some() {
+            let cancel = gtk::Button::with_label("Cancel request");
+            let page = self.clone();
+            cancel.connect_clicked(move |_| {
+                page.cancel_join_poll();
+                *page.pending.borrow_mut() = None;
+                page.refresh();
+            });
+            self.content.append(&cancel);
+        }
         let sign_in = gtk::Button::with_label("Sign in to sync");
         sign_in.add_css_class("suggested-action");
         sign_in.connect_clicked(|_| {
@@ -670,11 +686,11 @@ impl TeamsPage {
 
     fn connect_team(&self, url: String, code: String, name: String, button: gtk::Button) {
         if url.trim().is_empty() || code.trim().is_empty() {
-            self.show_error("enter the team server and invite code");
+            self.show_error("Enter the sync service URL and manual code");
             return;
         }
         button.set_sensitive(false);
-        self.feedback.set_label("Connecting to team…");
+        self.feedback.set_label("Signing in to sync…");
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let url_for_join = url.clone();
@@ -763,7 +779,7 @@ impl TeamsPage {
                 }
                 Ok(Ok(crate::teams::JoinPoll::Pending)) => {
                     page.feedback.set_label(
-                        "Still waiting for administrator approval. Checking again automatically…",
+                        "Still waiting for invitation approval. Checking again automatically…",
                     );
                     page.schedule_join_poll();
                 }
@@ -978,11 +994,20 @@ impl TeamsPage {
         let Some(parent) = self.app.active_window() else {
             return;
         };
+        let personal = crate::registry::load().is_ok_and(|r| crate::personal_sync::is_personal(&r));
         #[allow(deprecated)]
         let dialog = adw::MessageDialog::new(
             Some(&parent),
-            Some("Disconnect this app from the team?"),
-            Some("Team servers, instructions and policy are removed from this app. Your personal servers stay saved. Your Team membership and shared setup remain. Reconnect from the Teams website."),
+            Some(if personal {
+                "Sign out of sync?"
+            } else {
+                "Disconnect this app from the team?"
+            }),
+            Some(if personal {
+                "Synced servers are removed from this app. Your setup stays in Your account. Sign in again to restore it."
+            } else {
+                "Team servers, instructions and policy are removed from this app. Your personal servers stay saved. Your Team membership and shared setup remain. Reconnect from the Teams website."
+            }),
         );
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("leave", "Disconnect app");
@@ -1023,7 +1048,8 @@ impl TeamsPage {
     }
 
     fn show_error(&self, error: &str) {
-        self.feedback.set_label(&format!("Teams error: {error}"));
+        self.feedback.set_label(&format!("Sync error: {error}"));
+        self.feedback.set_visible(true);
         self.feedback.remove_css_class("success");
         self.feedback.add_css_class("error");
     }
