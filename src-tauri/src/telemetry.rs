@@ -203,9 +203,19 @@ impl Writer {
             return false;
         };
         let (done_tx, done_rx) = mpsc::sync_channel(1);
-        if tx.try_send(Msg::Flush(done_tx)).is_ok() && done_rx.recv_timeout(budget).is_ok() {
+        let started = Instant::now();
+        let queued = tx.try_send(Msg::Flush(done_tx)).is_ok();
+        if queued && done_rx.recv_timeout(budget).is_ok() {
             return true;
         }
+        #[cfg(any(test, feature = "test-support"))]
+        eprintln!(
+            "telemetry flush failed: barrier_queued={queued}, elapsed={:?}, health={:?}",
+            started.elapsed(),
+            self.counters.health()
+        );
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = started;
         self.counters
             .incomplete_flushes
             .fetch_add(1, Ordering::Relaxed);
