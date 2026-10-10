@@ -311,7 +311,7 @@ fn build_window(
     let client_page = ClientPage::new(app, server_page.clone());
     let activity_page = ActivityPage::new(app);
     let catalog_page = CatalogPage::new(server_page.clone());
-    let teams_page = TeamsPage::new(app);
+    let teams_page = TeamsPage::new(app, server_page.clone());
     let settings_page = SettingsPage::new(bridge, broker);
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
@@ -1516,7 +1516,6 @@ struct ServerPage {
     app: adw::Application,
     server_count: gtk::Label,
     enabled_count: gtk::Label,
-    profile_count: gtk::Label,
     section_title: gtk::Label,
     posture: gtk::Label,
     search: gtk::SearchEntry,
@@ -1547,6 +1546,7 @@ struct HealthRow {
     transport: String,
     authenticate: gtk::Button,
     copy_error: gtk::Button,
+    retry: gtk::Button,
 }
 
 impl ServerPage {
@@ -1571,8 +1571,6 @@ impl ServerPage {
                     .set_label(&snapshot.servers.len().to_string());
                 self.enabled_count
                     .set_label(&snapshot.enabled_count.to_string());
-                self.profile_count
-                    .set_label(&snapshot.profile_count.to_string());
                 self.render_server_list(&snapshot);
             }
             state::RegistryState::FirstRun => {
@@ -1592,7 +1590,6 @@ impl ServerPage {
                 *self.last_snapshot.borrow_mut() = None;
                 self.server_count.set_label("–");
                 self.enabled_count.set_label("–");
-                self.profile_count.set_label("–");
                 self.section_title.set_label("Servers unavailable");
                 self.list.append(&state_card(
                     "dialog-warning-symbolic",
@@ -1606,7 +1603,6 @@ impl ServerPage {
                 *self.last_snapshot.borrow_mut() = None;
                 self.server_count.set_label("–");
                 self.enabled_count.set_label("–");
-                self.profile_count.set_label("–");
                 self.section_title.set_label("Servers unavailable");
                 self.list.append(&state_card(
                     "software-update-available-symbolic",
@@ -1745,6 +1741,7 @@ impl ServerPage {
                 row.label.set_tooltip_text(None);
                 row.authenticate.set_visible(false);
                 row.copy_error.set_visible(false);
+                row.retry.set_visible(false);
             }
             self.spawn_probe(ticket);
         }
@@ -1768,6 +1765,7 @@ impl ServerPage {
                     tool_count: 0,
                     error: Some(error),
                     auth_required: false,
+                    failure: None,
                     auth_target: None,
                 },
                 Err(_) => crate::server_runtime::ProbeResult {
@@ -1776,6 +1774,7 @@ impl ServerPage {
                     tool_count: 0,
                     error: Some("the probe stopped unexpectedly".to_string()),
                     auth_required: false,
+                    failure: None,
                     auth_target: None,
                 },
             };
@@ -1808,13 +1807,13 @@ impl ServerPage {
             row.authenticate.set_visible(probe.auth_required);
             row.copy_error
                 .set_visible(!probe.ok && probe.error.is_some());
+            row.retry.set_visible(!probe.ok && !probe.auth_required);
         }
     }
 
     fn reset_summary(&self) {
         self.server_count.set_label("0");
         self.enabled_count.set_label("0");
-        self.profile_count.set_label("1");
     }
 
     fn show_feedback(&self, message: &str, error: bool) {
@@ -5762,7 +5761,7 @@ fn build_content(
     summary.set_column_spacing(10);
     summary.set_column_homogeneous(true);
     let mut values = Vec::new();
-    for (column, (value, label)) in [("0", "Servers"), ("0", "Enabled"), ("1", "Access sets")]
+    for (column, (value, label)) in [("0", "Servers"), ("0", "Enabled")]
         .into_iter()
         .enumerate()
     {
@@ -5840,7 +5839,6 @@ fn build_content(
             app: app.clone(),
             server_count: values.remove(0),
             enabled_count: values.remove(0),
-            profile_count: values.remove(0),
             section_title,
             posture,
             search: search.clone(),
@@ -6773,20 +6771,8 @@ fn probe_status_line(probe: &crate::server_runtime::ProbeResult) -> (String, &'s
             ),
             "success",
         )
-    } else if probe.auth_required {
-        (
-            match probe.auth_target {
-                Some(crate::call_failure::AuthTarget::ServiceCredential) => {
-                    "Service credential required"
-                }
-                Some(crate::call_failure::AuthTarget::Endpoint) => "MCP endpoint auth required",
-                _ => "Authentication required",
-            }
-            .to_string(),
-            "review",
-        )
     } else {
-        ("Error".to_string(), "error")
+        (probe.failure_label().to_string(), if probe.auth_required { "review" } else { "error" })
     }
 }
 
@@ -6992,31 +6978,39 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
         });
     }
     let copy_error = gtk::Button::builder()
-        .icon_name("edit-copy-symbolic")
-        .tooltip_text("Copy the full probe error")
+        .label("View log")
+        .tooltip_text("View the connection error and server output")
         .valign(gtk::Align::Center)
         .visible(false)
         .css_classes(["flat"])
         .build();
     {
-        // The full error rides on the health label's tooltip; copying reads it
-        // from there so the two can never disagree.
-        let health_for_copy = health.clone();
-        copy_error.connect_clicked(move |button| {
-            let Some(error) = health_for_copy.tooltip_text() else {
-                return;
-            };
-            if let Some(display) = gtk::gdk::Display::default() {
-                display.clipboard().set_text(error.as_str());
-                button.set_tooltip_text(Some("Copied"));
-            }
+        let health_for_log = health.clone();
+        let app = page.app.clone();
+        copy_error.connect_clicked(move |_| {
+            let Some(error) = health_for_log.tooltip_text() else { return; };
+            let window = adw::Window::builder().application(&app).title("Connection log")
+                .default_width(640).default_height(360).modal(true).build();
+            window.set_transient_for(app.active_window().as_ref());
+            let view = gtk::TextView::builder().editable(false).cursor_visible(false).monospace(true)
+                .wrap_mode(gtk::WrapMode::WordChar).top_margin(16).bottom_margin(16).left_margin(16).right_margin(16).build();
+            view.buffer().set_text(&error);
+            let scroller = gtk::ScrolledWindow::builder().child(&view).vexpand(true).build();
+            let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            root.append(&adw::HeaderBar::new()); root.append(&scroller);
+            window.set_content(Some(&root)); window.present();
         });
     }
+    let retry = gtk::Button::builder().label("Retry").tooltip_text("Check this server again")
+        .visible(false).css_classes(["flat"]).build();
+    let page_for_retry = page.clone(); let retry_id = server.id.clone();
+    retry.connect_clicked(move |_| page_for_retry.reprobe_after_auth_change(&retry_id));
     // Put recovery actions below the health line. Keeping them in the card's
     // horizontal row leaves too little room for the status in narrow windows.
     let health_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     health_actions.set_halign(gtk::Align::Start);
     health_actions.append(&authenticate);
+    health_actions.append(&retry);
     health_actions.append(&copy_error);
     text.append(&health_actions);
     if server.enabled && !server.requires_review {
@@ -7027,6 +7021,7 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
                 transport: server.transport.clone(),
                 authenticate: authenticate.clone(),
                 copy_error: copy_error.clone(),
+                retry: retry.clone(),
             },
         );
         // Show the last known result immediately unless a probe is replacing it.
@@ -7041,6 +7036,8 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
             authenticate.set_label(probe_auth_action(previous));
             authenticate.set_visible(previous.auth_required);
             copy_error.set_visible(!previous.ok && previous.error.is_some());
+            health.set_tooltip_text(previous.error.as_deref());
+            retry.set_visible(!previous.ok && !previous.auth_required);
         }
     }
 
@@ -9363,7 +9360,7 @@ mod tests {
         activity.run_id = Some("0123456789abcdef0123456789abcdef".into());
         let server_page = ServerPage {
             app: app.clone(), server_count: gtk::Label::new(None), enabled_count: gtk::Label::new(None),
-            profile_count: gtk::Label::new(None), section_title: gtk::Label::new(None), posture: gtk::Label::new(None),
+            section_title: gtk::Label::new(None), posture: gtk::Label::new(None),
             search: gtk::SearchEntry::new(), feedback: gtk::Label::new(None), list: gtk::Box::new(gtk::Orientation::Vertical, 0),
             last_snapshot: Default::default(), feedback_timer: Default::default(), health_rows: Default::default(),
             rows: Default::default(), no_matches: Default::default(), off_heading: Default::default(), health: Default::default(),
@@ -9413,7 +9410,6 @@ mod tests {
             app: app.clone(),
             server_count: gtk::Label::new(None),
             enabled_count: gtk::Label::new(None),
-            profile_count: gtk::Label::new(None),
             section_title: gtk::Label::new(None),
             posture: gtk::Label::new(None),
             search: gtk::SearchEntry::new(),
@@ -10440,6 +10436,7 @@ mod tests {
             tool_count: tools,
             error: None,
             auth_required: auth,
+            failure: None,
             auth_target: None,
         };
         assert_eq!(
@@ -10448,11 +10445,11 @@ mod tests {
         );
         assert_eq!(
             probe_status_line(&probe(false, 0, true)),
-            ("Authentication required".to_string(), "review")
+            ("Needs sign-in".to_string(), "review")
         );
         assert_eq!(
             probe_status_line(&probe(false, 0, false)),
-            ("Error".to_string(), "error")
+            ("Connection failed".to_string(), "error")
         );
     }
 
@@ -10462,12 +10459,12 @@ mod tests {
         for (target, text, action) in [
             (
                 AuthTarget::Endpoint,
-                "MCP endpoint auth required",
+                "Needs sign-in",
                 "Sign in",
             ),
             (
                 AuthTarget::ServiceCredential,
-                "Service credential required",
+                "Service key required",
                 "Edit service key",
             ),
         ] {
@@ -10477,6 +10474,7 @@ mod tests {
                 tool_count: 0,
                 error: None,
                 auth_required: true,
+                failure: None,
                 auth_target: Some(target),
             };
             assert_eq!(probe_status_line(&probe), (text.into(), "review"));

@@ -1006,3 +1006,13 @@ export function setSecretReference(
 export function testSecretReference(serverId: string, reference: string): Promise<void> {
   return invoke<void>("test_secret_reference", { serverId, reference });
 }
+
+export interface TeamSyncStatus {
+  state: "synced" | "offline" | "error" | "not_checked";
+  lastSuccessMs: number | null;
+  checkedAtMs?: number;
+}
+
+export function teamSyncStatus(): Promise<TeamSyncStatus> {
+  return invoke<TeamSyncStatus>("team_sync_status");
+}

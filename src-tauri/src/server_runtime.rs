@@ -17,7 +17,41 @@ pub struct ProbeResult {
     pub tool_count: usize,
     pub error: Option<String>,
     pub auth_required: bool,
+    pub failure: Option<crate::call_failure::CallFailureKind>,
     pub auth_target: Option<crate::call_failure::AuthTarget>,
+}
+
+impl ProbeResult {
+    pub fn failure_label(&self) -> &str {
+        use crate::call_failure::{AuthTarget, CallFailureKind as K};
+        if self.auth_required {
+            return match self.auth_target {
+                Some(AuthTarget::ServiceCredential) => "Service key required",
+                _ => "Needs sign-in",
+            };
+        }
+        match self.failure.as_ref() {
+            Some(K::Auth { target: AuthTarget::Scope }) => "Permission required",
+            Some(K::Auth { .. }) => "Needs sign-in",
+            Some(K::Timeout { .. }) => "Timed out",
+            Some(K::Unavailable { .. }) => "Unreachable",
+            Some(K::ServerError { .. }) => "Server failed",
+            Some(K::Quota) => "Rate limited",
+            Some(K::Cancelled) => "Check cancelled",
+            _ => {
+                // Older/local launch errors have no transport code. This is only
+                // display text; it never changes policy or authorizes a retry.
+                let raw = self.error.as_deref().unwrap_or("");
+                if raw.contains("exited") || raw.contains("EOF") || raw.contains("closed stdout") {
+                    "Server stopped"
+                } else if raw.contains("No such file") || raw.contains("not found") {
+                    "Command or file not found"
+                } else {
+                    "Connection failed"
+                }
+            }
+        }
+    }
 }
 
 fn env_key_required(server: &ServerEntry, key: &str) -> bool {
@@ -74,6 +108,10 @@ fn environment_for_probe_with(
 }
 
 pub fn connect_server(server: &ServerEntry) -> Result<DownstreamServer, String> {
+    connect_server_classified(server).map_err(|error| error.to_string())
+}
+
+fn connect_server_classified(server: &ServerEntry) -> Result<DownstreamServer, crate::call_failure::CallFailure> {
     if let Some(command) = &server.command {
         let resolved_server =
             crate::secret_refs::resolve_server(server).map_err(|e| e.to_string())?;
@@ -95,31 +133,32 @@ pub fn connect_server(server: &ServerEntry) -> Result<DownstreamServer, String> 
         if let Some(timeout) = server.initialize_timeout()? {
             transport.set_connect_timeout(timeout);
         }
-        DownstreamServer::connect(
+        DownstreamServer::connect_classified(
             server.id.clone(),
             remote::protect_transport(server, Box::new(transport)),
         )
-        .map_err(|error| resolved.redact(error))
+        .map_err(|error| crate::call_failure::CallFailure::new(error.kind, resolved.redact(error.detail)))
     } else if server.url.is_some() {
-        remote::connect_remote(server)
+        remote::connect_remote_classified(server, None, None, None, None)
     } else {
-        Err("no command or url".to_string())
+        Err("no command or url".to_string().into())
     }
 }
 
 pub fn probe_one(server: &ServerEntry) -> ProbeResult {
-    match connect_server(server) {
+    match connect_server_classified(server) {
         Ok(connection) => ProbeResult {
             server_id: server.id.clone(),
             ok: true,
             tool_count: connection.tools.len(),
             error: None,
             auth_required: false,
+            failure: None,
             auth_target: None,
         },
         Err(error) => {
             let missing_credential = missing_secret(server);
-            let auth_rejected = remote::is_auth_error(&error);
+            let auth_rejected = remote::is_auth_error(&error.detail);
             ProbeResult {
                 server_id: server.id.clone(),
                 ok: false,
@@ -132,7 +171,8 @@ pub fn probe_one(server: &ServerEntry) -> ProbeResult {
                 } else {
                     None
                 },
-                error: Some(error),
+                failure: Some(error.kind),
+                error: Some(error.detail),
             }
         }
     }
@@ -171,6 +211,7 @@ pub fn probe_one_bounded(server: &ServerEntry) -> ProbeResult {
             tool_count: 0,
             error: Some(format!("timed out after {}s", timeout.as_secs())),
             auth_required: false,
+            failure: Some(crate::call_failure::CallFailureKind::Timeout { after_send: false }),
             auth_target: None,
         })
 }

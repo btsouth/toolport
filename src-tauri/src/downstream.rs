@@ -8210,7 +8210,15 @@ impl DownstreamServer {
     /// so the health probe (which connects to every server in one batch) stays
     /// tools-only and fast and can't stall on a slow or hanging resources/prompts
     /// endpoint. The gateway calls `load_resources_prompts` to populate them.
-    pub fn connect(id: String, mut transport: Box<dyn Transport>) -> Result<Self, String> {
+    pub fn connect(id: String, transport: Box<dyn Transport>) -> Result<Self, String> {
+        Self::connect_classified(id, transport).map_err(|error| error.to_string())
+    }
+
+    /// Preserve transport categories for health and recovery UI.
+    pub fn connect_classified(
+        id: String,
+        mut transport: Box<dyn Transport>,
+    ) -> Result<Self, crate::call_failure::CallFailure> {
         transport.set_server_id(&id);
         // Fail the handshake fast so one unresponsive server can't stall the whole
         // batch probe / router rebuild for the full live-call timeout. The transport
@@ -8251,16 +8259,16 @@ impl DownstreamServer {
                 let caps = init.get("capabilities").cloned();
                 transport
                     .notify("notifications/initialized", json!({}))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.call_failure())?;
                 (Era::Legacy { version }, caps)
             }
             // A dead or unresponsive server is not a modern server. Probing it
             // again would just double the wait before reporting the same failure.
-            Err(err) if err.is_health_failure() => return Err(err.to_string()),
+            Err(err) if err.is_health_failure() => return Err(err.call_failure()),
             // Authentication is independent of the protocol era. Probing after
             // an explicit rejection can only replace the actionable error with a
             // secondary protocol failure (#914).
-            Err(err) if err.is_auth_failure() => return Err(err.to_string()),
+            Err(err) if err.is_auth_failure() => return Err(err.call_failure()),
             Err(init_err) => {
                 // The server answered, but refused `initialize`. A modern server
                 // has no such method. Confirm with `server/discover`, which every
@@ -8311,14 +8319,14 @@ impl DownstreamServer {
                                 transport.set_protocol_meta(Some(protocol_meta_for(version)));
                                 transport
                                     .request("server/discover", json!({}))
-                                    .map_err(|e| e.to_string())?
+                                    .map_err(|e| e.call_failure())?
                             }
                             None => {
                                 return Err(format!(
                                     "server speaks MCP {offered:?}; Toolport speaks \
                                      {MODERN_PROTOCOL_VERSION} and cannot negotiate a \
                                      common version ({probe_err})"
-                                ))
+                                ).into())
                             }
                         }
                     }
@@ -8330,7 +8338,7 @@ impl DownstreamServer {
                     Err(probe_err) => {
                         return Err(format!(
                             "{init_err} (server/discover probe also failed: {probe_err})"
-                        ))
+                        ).into())
                     }
                 };
                 let version = choose_protocol_version(&discovered).ok_or_else(|| {
@@ -8373,7 +8381,7 @@ impl DownstreamServer {
             "tools",
             Some(Instant::now() + FIRST_CATALOG_TIMEOUT),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.call_failure())?;
         if let Some(warning) = &listed.warning {
             let msg = format!(
                 "server '{id}' returned a partial tool catalog ({} tool(s)): {warning}",
@@ -8399,7 +8407,7 @@ impl DownstreamServer {
                 "incomplete tool catalog for '{id}' ({} tool(s) before traversal stopped): {}",
                 listed.items.len(),
                 listed.warning.unwrap_or_default()
-            ));
+            ).into());
         }
         let modern_http = matches!(era, Era::Modern { .. }) && transport.supports_request_headers();
         let tools = if modern_http {
@@ -8428,7 +8436,7 @@ impl DownstreamServer {
                     resources_list_changed: caps_resources,
                     resource_subscriptions: Vec::new(),
                 })
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.call_failure())?;
         }
 
         Ok(DownstreamServer {

@@ -27,6 +27,9 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Callout } from "@/components/Callout";
+import { SecretsDialog } from "@/components/SecretsDialog";
+import { serverFailureLabel } from "@/lib/serverHealth";
+import type { TeamSyncStatus } from "@/lib/api";
 import { RuleStateBadge } from "@/components/RuleStateBadge";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -35,6 +38,7 @@ import {
   teamAccountLink,
   teamJoinPoll,
   teamSync,
+  teamSyncStatus,
   teamDisconnect,
   teamPushPreview,
   getRegistry,
@@ -55,7 +59,7 @@ import { TEAMS_FREE_LINE, TEAMS_PAID_LINE, TEAMS_TRIAL_DAYS } from "@/lib/teamsP
 import { openExternal } from "@/lib/openUrl";
 import { isEnabled, activeProfile } from "@/lib/types";
 import type { TeamPushPreview } from "@/lib/api";
-import type { Registry, InstructionsStatusView } from "@/lib/types";
+import type { Registry, InstructionsStatusView, ProbeResult } from "@/lib/types";
 
 interface MemberChange {
   key: string;
@@ -83,11 +87,35 @@ interface MemberReviewState {
 export function TeamsView({
   registry,
   onRegistryChange,
+  health = {},
+  onReprobe,
 }: {
   registry: Registry | null;
   onRegistryChange: (r: Registry) => void;
+  health?: Record<string, ProbeResult>;
+  onReprobe?: () => void;
 }) {
   const team = registry?.team ?? null;
+  const [syncStatus, setSyncStatus] = useState<TeamSyncStatus | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () =>
+      teamSyncStatus()
+        .then((status) => {
+          if (!cancelled) setSyncStatus(status);
+        })
+        .catch(() => {
+          if (!cancelled) setSyncStatus(null);
+        });
+    if (team) void refresh();
+    const un = listen<TeamSyncStatus>("team-sync-status", () => {
+      void refresh();
+    });
+    return () => {
+      cancelled = true;
+      void un.then((f) => f());
+    };
+  }, [team?.teamId, team?.serverUrl, team?.lastVersion]);
   const isAdmin = team?.role === "admin";
   const review = (
     team as (NonNullable<Registry["team"]> & { memberReview?: MemberReviewState }) | null
@@ -258,7 +286,11 @@ export function TeamsView({
 
   const onSync = () =>
     run("sync", async () => {
-      onRegistryChange(await teamSync());
+      try {
+        onRegistryChange(await teamSync());
+      } finally {
+        setSyncStatus(await teamSyncStatus().catch(() => null));
+      }
       setNotice("Synced with the team.");
     });
 
@@ -340,9 +372,14 @@ export function TeamsView({
     const on = registry ? isEnabled(registry, s.id) : false;
     const held = (s as typeof s & { teamHeldChange?: boolean }).teamHeldChange === true;
     const isLocal = s.transport === "stdio" || !!s.command;
+    const probe = health[s.id];
+    const credentials = [...s.env, ...(s.headerKeys ?? [])].map((e) => e.key).join(", ");
+    const credentialLine = credentials
+      ? `Local keys: ${credentials}`
+      : "Sign-in requirements are checked when this server connects.";
     const detail = s.command
-      ? `Command: ${s.command}\nArguments: ${JSON.stringify(s.args ?? [])}\nWorking directory: ${s.cwd ?? "Inherit from client"}\nCredentials required: ${s.env.map((e) => e.key).join(", ") || "None declared"}`
-      : `URL: ${s.url ?? ""}\nCredentials required: ${s.env.map((e) => e.key).join(", ") || "None declared"}`;
+      ? `Command: ${s.command}\nArguments: ${JSON.stringify(s.args ?? [])}\nWorking directory: ${s.cwd ?? "Inherit from client"}\n${credentialLine}`
+      : `URL: ${s.url ?? ""}\n${credentialLine}`;
     return (
       <li
         key={s.id}
@@ -363,6 +400,43 @@ export function TeamsView({
             </Badge>
           )}
         </div>
+        {on && (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <span className="text-xs text-muted-foreground">
+              {probe
+                ? probe.ok
+                  ? `Ready · ${probe.toolCount} tools`
+                  : serverFailureLabel(probe)
+                : "Checking connection…"}
+            </span>
+            {probe?.authRequired ? (
+              <SecretsDialog
+                server={s}
+                onSaved={onRegistryChange}
+                onChanged={onReprobe}
+                trigger={
+                  <Button variant="outline" size="sm">
+                    {probe.authTarget === "service_credential"
+                      ? "Edit service key"
+                      : "Sign in"}
+                  </Button>
+                }
+              />
+            ) : probe && !probe.ok && onReprobe ? (
+              <Button variant="outline" size="sm" onClick={onReprobe}>
+                Retry
+              </Button>
+            ) : null}
+            {probe?.error && (
+              <details className="text-xs">
+                <summary className="cursor-pointer">View log</summary>
+                <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all">
+                  {probe.error}
+                </pre>
+              </details>
+            )}
+          </div>
+        )}
         {!held && personal && registry && isEnabled(registry, personal.id) && (
           <ConfirmDialog
             trigger={
@@ -777,11 +851,26 @@ export function TeamsView({
             <div className="flex items-start justify-between gap-4">
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
-                  <span className="text-sm font-medium">Connected</span>
+                  <span className="text-sm font-medium">Linked to team</span>
                   <span className="rounded-full border px-2 py-0.5 text-xs text-muted-foreground capitalize">
                     {team.role}
                   </span>
                 </div>
+                <p className="mt-1 text-sm text-muted-foreground" role="status">
+                  {syncStatus?.state === "offline"
+                    ? "Offline: cannot reach the team server"
+                    : syncStatus?.state === "error"
+                      ? "Team sync failed. Try Sync now"
+                      : syncStatus?.state === "synced"
+                        ? "Last sync succeeded"
+                        : "Team connection has not been checked recently"}
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Last successful sync:{" "}
+                  {syncStatus?.lastSuccessMs
+                    ? new Date(syncStatus.lastSuccessMs).toLocaleString()
+                    : "not recorded yet"}
+                </p>
                 <p className="mt-1 truncate text-sm text-muted-foreground">
                   {team.serverUrl}
                 </p>
@@ -949,8 +1038,8 @@ export function TeamsView({
                   );
                 })()}
                 <p className="mt-3 text-xs text-muted-foreground">
-                  Add each server's secrets in the Servers tab, they stay in your OS
-                  keychain.
+                  Sign in or add a service key here or in Servers. Credentials stay in
+                  your OS keychain.
                 </p>
               </>
             )}

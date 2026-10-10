@@ -57,6 +57,33 @@ const registry: Registry = {
   accessUpgradeNoticeDismissed: false,
   clientScopes: { codex: "" },
 };
+const pagesTruth = new URLSearchParams(location.search).has("pages-truth");
+if (pagesTruth) {
+  registry.safetyLevel = "off";
+  registry.team = {
+    teamId: "fixture-team",
+    teamName: "Example team",
+    role: "member",
+    serverUrl: "https://teams.example.invalid",
+    lastVersion: 12,
+  };
+  servers[0] = {
+    ...servers[0],
+    name: "Team Linear",
+    transport: "http",
+    command: null,
+    url: "https://linear.example.invalid/mcp",
+    source: "team:fixture-team",
+  };
+  servers[1] = {
+    ...servers[1],
+    name: "Project tools",
+    transport: "http",
+    command: null,
+    url: "https://projects.example.invalid/mcp",
+  };
+  servers[2] = { ...servers[2], name: "Local tools", command: "/bin/false" };
+}
 const memberReviewFixture = new URLSearchParams(location.search).has("teams-review");
 if (memberReviewFixture) {
   registry.team = {
@@ -496,7 +523,39 @@ mockIPC(
             error: null,
           },
         ];
+      case "team_sync_status":
+        return { state: "offline", lastSuccessMs: 1791504000000 };
+      case "team_sync":
+        throw new Error("Team server is unreachable");
       case "probe_servers":
+        if (pagesTruth)
+          return [
+            {
+              serverId: servers[0].id,
+              ok: false,
+              toolCount: 0,
+              error: "HTTP 401 (needs authentication)",
+              authRequired: true,
+              authTarget: "endpoint",
+              failure: { kind: "auth", target: "endpoint" },
+            },
+            {
+              serverId: servers[1].id,
+              ok: false,
+              toolCount: 0,
+              error: "Connection refused",
+              authRequired: false,
+              failure: { kind: "unavailable", after_send: false },
+            },
+            {
+              serverId: servers[2].id,
+              ok: false,
+              toolCount: 0,
+              error: "Server exited with status 1",
+              authRequired: false,
+              failure: { kind: "internal" },
+            },
+          ];
         return servers.map((s, i) => ({
           serverId: s.id,
           ok: !authGuidance || i === 2,

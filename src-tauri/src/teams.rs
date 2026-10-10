@@ -1123,7 +1123,7 @@ pub enum SyncResult {
 }
 
 pub fn sync_now() -> Result<SyncResult, String> {
-    sync_inner(0)
+    sync_recorded(0)
 }
 
 /// Long-polling variant of [`sync_now`]: the config pull parks on the server for up to
@@ -1131,7 +1131,7 @@ pub fn sync_now() -> Result<SyncResult, String> {
 /// edit enforces in about a second. The membership heartbeat still runs first each cycle,
 /// so removal and role changes are caught at least once per cycle. The caller loops.
 pub fn sync_wait(wait_secs: u64) -> Result<SyncResult, String> {
-    sync_inner(wait_secs)
+    sync_recorded(wait_secs)
 }
 
 /// Bounded retry pacing for native lifecycle owners; independent of window visibility.
@@ -1144,6 +1144,17 @@ pub fn retry_delay_seconds(failures: u32) -> u64 {
 }
 
 static SYNC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn sync_recorded(wait_secs: u64) -> Result<SyncResult, String> {
+    let conn = crate::registry::load()?.team;
+    let result = sync_inner(wait_secs);
+    if let Some(conn) = conn {
+        // The status receipt is private local metadata. Keep the network failure
+        // visible even if its receipt cannot be saved.
+        crate::team_sync_status::record(&conn, result.as_ref().map(|_| ()).map_err(|e| e.as_str()))?;
+    }
+    result
+}
 
 fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
     let _sync = SYNC_LOCK

@@ -14,6 +14,7 @@ struct PendingJoin {
 pub(super) struct TeamsPage {
     pub(super) root: gtk::Box,
     app: adw::Application,
+    server_page: super::ServerPage,
     content: gtk::Box,
     feedback: gtk::Label,
     busy: Rc<Cell<bool>>,
@@ -27,7 +28,7 @@ pub(super) struct TeamsPage {
 }
 
 impl TeamsPage {
-    pub(super) fn new(app: &adw::Application) -> Self {
+    pub(super) fn new(app: &adw::Application, server_page: super::ServerPage) -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("toolport-content");
         let header = adw::HeaderBar::new();
@@ -93,6 +94,7 @@ impl TeamsPage {
         Self {
             root,
             app: app.clone(),
+            server_page,
             content,
             feedback,
             busy: Rc::new(Cell::new(false)),
@@ -109,6 +111,7 @@ impl TeamsPage {
             return;
         }
         self.feedback.set_label("Loading team status…");
+        self.server_page.reprobe_if_stale();
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(crate::registry::load).await;
@@ -165,9 +168,8 @@ impl TeamsPage {
                                 failures.get(),
                             ));
                         if page.root.is_mapped() {
-                            page.show_error(&format!(
-                                "team sync failed; retrying automatically: {error}"
-                            ));
+                            page.render_sync_status();
+                            page.feedback.set_tooltip_text(Some(&error));
                         }
                     }
                     Err(_) => {
@@ -194,6 +196,15 @@ impl TeamsPage {
         });
     }
 
+    fn render_sync_status(&self) {
+        let status = crate::team_sync_status::current();
+        let last = status.last_success_ms.and_then(|ms| gtk::glib::DateTime::from_unix_local(ms as i64 / 1000).ok())
+            .and_then(|date| date.format("%b %d, %Y at %H:%M").ok())
+            .map(|date| date.to_string()).unwrap_or_else(|| "not recorded yet".into());
+        self.set_status(&format!("{}. Last successful sync: {last}.", crate::team_sync_status::summary(&status)), false);
+        self.feedback.remove_css_class("success");
+    }
+
     fn render(&self, registry: crate::registry::Registry) {
         let notice = self.sync_notice.borrow_mut().take();
         let render_state = (
@@ -202,8 +213,7 @@ impl TeamsPage {
         );
         if notice.is_none() && self.rendered_state.borrow().as_ref() == Some(&render_state) {
             if registry.team.is_some() {
-                self.set_status("Team connection is up to date.", false);
-                self.feedback.add_css_class("success");
+                self.render_sync_status();
             } else if self.pending.borrow().is_some() {
                 self.set_status("Join request is waiting for an administrator.", false);
                 self.feedback.remove_css_class("success");
@@ -228,8 +238,7 @@ impl TeamsPage {
             return;
         }
         if let Some(team) = registry.team.clone() {
-            self.set_status("Team connection is up to date.", false);
-            self.feedback.add_css_class("success");
+            self.render_sync_status();
             self.render_connected(registry, team);
         } else {
             self.feedback.remove_css_class("success");
@@ -1085,6 +1094,15 @@ fn field(label: &str, input: &impl IsA<gtk::Widget>) -> gtk::Box {
 }
 
 fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> gtk::Box {
+    if let Ok(registry) = crate::registry::load() {
+        if registry.is_enabled(&registry.active_profile_id(), &server.id) {
+            let snapshot = super::state::RegistrySnapshot::from_registry(registry);
+            if let Some(view) = snapshot.servers.iter().find(|s| s.id == server.id) {
+                return super::server_card(view, &snapshot.active_profile_id, page.server_page.clone());
+            }
+        }
+    }
+
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.add_css_class("toolport-card");
     let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -1106,21 +1124,21 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
         .join(", ");
     let target = if let Some(command) = &server.command {
         format!(
-            "Command: {command}\nArguments: {}\nWorking directory: {}\nCredentials required: {}",
+            "Command: {command}\nArguments: {}\nWorking directory: {}\nLocal keys: {}",
             serde_json::to_string(&server.args).unwrap_or_default(),
             server.cwd.as_deref().unwrap_or("Inherit from client"),
             if credentials.is_empty() {
-                "None declared"
+                "Sign-in requirements are checked when this server connects"
             } else {
                 &credentials
             }
         )
     } else {
         format!(
-            "URL: {}\nCredentials required: {}",
+            "URL: {}\nLocal keys: {}",
             server.url.as_deref().unwrap_or("Unknown target"),
             if credentials.is_empty() {
-                "None declared"
+                "Sign-in requirements are checked when this server connects"
             } else {
                 &credentials
             }

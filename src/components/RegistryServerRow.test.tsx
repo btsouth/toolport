@@ -75,8 +75,8 @@ describe("RegistryServerRow status accessibility", () => {
   });
 
   it.each([
-    ["endpoint", "MCP endpoint auth required"],
-    ["service_credential", "Service credential required"],
+    ["endpoint", "Needs sign-in"],
+    ["service_credential", "Service key required"],
   ] as const)("shows %s auth ownership", (authTarget, text) => {
     renderRow(true, health({ authRequired: true, authTarget }));
     expect(screen.getByText(text)).toBeInTheDocument();
@@ -94,14 +94,48 @@ describe("RegistryServerRow status accessibility", () => {
     ["Server disabled", false, undefined],
     ["Checking connection", true, undefined],
     ["Ready, 2 tools", true, health({ ok: true, toolCount: 2 })],
-    ["Authentication required", true, health({ authRequired: true })],
-    ["Connection error", true, health({ error: "connection refused" })],
+    ["Needs sign-in", true, health({ authRequired: true })],
+    ["connection refused", true, health({ error: "connection refused" })],
   ] as const)("announces %s", (label, enabled, result) => {
     const view = renderRow(enabled, result);
 
     expect(screen.getByRole("status", { name: label })).toBeInTheDocument();
     view.unmount();
   });
+
+  it.each(["timeout", "unavailable", "server_error"] as const)(
+    "shows a %s reason and recovery without expansion",
+    (kind) => {
+      const onReprobe = vi.fn();
+      render(
+        <TooltipProvider>
+          <RegistryServerRow
+            server={server}
+            registry={null}
+            enabled
+            health={health({ failure: { kind }, error: "full server output" })}
+            onToggle={vi.fn()}
+            onRemove={vi.fn()}
+            onRegistryChange={vi.fn()}
+            onReprobe={onReprobe}
+          />
+        </TooltipProvider>,
+      );
+      expect(
+        screen.getByText(
+          {
+            timeout: "Timed out",
+            unavailable: "Unreachable",
+            server_error: "Server failed",
+          }[kind],
+        ),
+      ).toBeVisible();
+      screen.getByRole("button", { name: "Retry", exact: true }).click();
+      expect(onReprobe).toHaveBeenCalledOnce();
+      act(() => screen.getByRole("button", { name: "View log", exact: true }).click());
+      expect(screen.getByText("full server output", { exact: true })).toBeVisible();
+    },
+  );
 
   it("announces when a launcher package is being installed", () => {
     vi.useFakeTimers();

@@ -208,6 +208,7 @@ mod tests {
             tool_count: 1,
             error: None,
             auth_required: false,
+            failure: None,
             auth_target: None,
         }
     }

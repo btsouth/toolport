@@ -3255,15 +3255,17 @@ fn backup_generations(path: &Path) -> Vec<PathBuf> {
     };
     let mut gens: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|kind| kind.is_file()))
         .map(|e| e.path())
         .filter(|p| {
             p.file_name()
                 .and_then(|f| f.to_str())
                 .and_then(|f| f.strip_prefix(&prefix))
-                .is_some_and(|suffix| suffix.parse::<u128>().is_ok())
+                .is_some_and(|suffix| suffix.parse::<u128>().is_ok_and(|sequence| sequence.to_string() == suffix))
         })
         .collect();
-    gens.sort();
+    gens.sort_by_key(|p| p.file_name().and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(&prefix)).and_then(|suffix| suffix.parse::<u128>().ok()).unwrap_or(0));
     gens
 }
 
@@ -7718,6 +7720,28 @@ pub(crate) mod tests {
         for g in backup_generations(&path) {
             std::fs::remove_file(g).ok();
         }
+    }
+
+    #[test]
+    fn journal_retention_preserves_manual_backups_and_symlinks() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("journal-manual-copies");
+        let path = dir.join("registry.json");
+        for name in ["registry.json.bak.notes", "registry.json.pre-live-owner", "registry.json.v1-123.bak", "registry.json.bak.+1", "registry.json.bak.001"] {
+            std::fs::write(dir.join(name), "user copy").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("registry.json.bak.notes"), dir.join("registry.json.bak.1")).unwrap();
+        for sequence in [2, 3, 4, 5, 6, 7, 10] {
+            write_backup_generation(&path, "toolport copy", sequence);
+        }
+        assert_eq!(backup_generations(&path).iter().map(|p| p.file_name().unwrap().to_str().unwrap()).collect::<Vec<_>>(),
+            ["registry.json.bak.4", "registry.json.bak.5", "registry.json.bak.6", "registry.json.bak.7", "registry.json.bak.10"]);
+        for name in ["registry.json.bak.notes", "registry.json.pre-live-owner", "registry.json.v1-123.bak", "registry.json.bak.+1", "registry.json.bak.001"] {
+            assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), "user copy");
+        }
+        #[cfg(unix)]
+        assert!(dir.join("registry.json.bak.1").is_symlink());
     }
 
     #[test]
