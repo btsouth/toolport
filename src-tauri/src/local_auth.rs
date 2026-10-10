@@ -104,9 +104,15 @@ fn personal_http_owner(reg: &Registry, id: &str) -> String {
     let Some(server) = reg.servers.iter().find(|s| s.id == id && s.url.is_some()) else {
         return id.into();
     };
-    let Some(base) = server
+    let Some(base) = reg
         .unknown_fields
-        .get("personalSyncCredentialDestination")
+        .get("personalSyncCredentialDestinations")
+        .and_then(|destinations| destinations.get(id))
+        .or_else(|| {
+            server
+                .unknown_fields
+                .get("personalSyncCredentialDestination")
+        })
         .and_then(serde_json::Value::as_str)
     else {
         return id.into();

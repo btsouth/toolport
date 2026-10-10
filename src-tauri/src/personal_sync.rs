@@ -775,15 +775,27 @@ pub fn apply(
         }
         // Preserve existing sign-in only for its exact HTTP destination. New
         // destinations get an empty local vault namespace, never copied tokens.
-        let credential_destination = old
-            .as_ref()
-            .and_then(|s| s.unknown_fields.get("personalSyncCredentialDestination"))
+        let credential_destination = reg
+            .unknown_fields
+            .get("personalSyncCredentialDestinations")
+            .and_then(|destinations| destinations.get(&entry.id))
             .cloned()
+            .or_else(|| {
+                old.as_ref()
+                    .and_then(|s| s.unknown_fields.get("personalSyncCredentialDestination"))
+                    .cloned()
+            })
             .unwrap_or_else(|| {
                 json!(crate::local_auth::personal_credential_destination(
                     old.as_ref().unwrap_or(&entry)
                 ))
             });
+        reg.unknown_fields
+            .entry("personalSyncCredentialDestinations".into())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or("Local credential destinations are unreadable")?
+            .insert(entry.id.clone(), credential_destination.clone());
         entry.unknown_fields.insert(
             "personalSyncCredentialDestination".into(),
             credential_destination,
@@ -1394,6 +1406,22 @@ mod tests {
             assert!(b.servers[0].enabled);
             let new_owner = crate::local_auth::owner_in(&b, &id).unwrap();
             assert_ne!(new_owner, owner);
+            // Remove/recreate must not make an old raw namespace available to
+            // a different destination, even before the next sync round.
+            let mut recreated = b.clone();
+            let mut replacement = local(http("docs"));
+            replacement.url = Some("https://changed.example/mcp".into());
+            replacement.unknown_fields.insert(
+                "personalSyncCredentialDestination".into(),
+                json!(crate::local_auth::personal_credential_destination(
+                    &replacement
+                )),
+            );
+            recreated.servers = vec![replacement];
+            assert_eq!(
+                crate::local_auth::owner_in(&recreated, &id).unwrap(),
+                new_owner
+            );
             crate::registry::save(&b).unwrap();
             assert_eq!(
                 crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY).unwrap(),
