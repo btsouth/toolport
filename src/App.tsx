@@ -48,6 +48,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { AccessUpgradeNotice } from "@/components/AccessUpgradeNotice";
+import { RemovedFeaturesNotice } from "@/components/RemovedFeaturesNotice";
 import { AppSidebar } from "@/components/AppSidebar";
 import { ClientLogo } from "@/components/ClientLogo";
 import { PendingApprovals } from "@/components/PendingApprovals";
@@ -754,6 +755,10 @@ function App() {
         />
 
         <main className="flex min-w-0 flex-1 flex-col">
+          <RemovedFeaturesNotice
+            registry={registry}
+            onRegistryChange={applyRegistryChange}
+          />
           <AccessUpgradeNotice
             registry={registry}
             onRegistryChange={applyRegistryChange}

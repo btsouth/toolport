@@ -7188,7 +7188,10 @@ mod tests {
             receipt["forceContentDefense"], true,
             "org force makes content defense effective"
         );
-        assert_eq!(receipt["forceQuarantineOnDrift"], true);
+        assert_eq!(
+            receipt["forceQuarantineOnDrift"], false,
+            "a member's own 1.x deny never implied drift quarantine"
+        );
         assert_eq!(receipt["forceHumanApproval"], true);
         assert_eq!(
             receipt["forceBlockOnInjection"], true,

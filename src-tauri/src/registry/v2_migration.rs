@@ -65,6 +65,13 @@ pub(super) fn migrate_v1_to_v2(
     export_rules(registry, context)?;
     export_agent_permissions(registry, context)?;
     export_routines(context)?;
+    let removed = removed_features_used(registry, context);
+    if !removed.is_empty() && !registry.contains_key("removedFeaturesNotice") {
+        registry.insert(
+            "removedFeaturesNotice".to_string(),
+            serde_json::json!({ "features": removed }),
+        );
+    }
 
     let (level, kept) = safety_level(registry);
     registry.insert("safetyLevel".to_string(), Value::from(level));
@@ -105,6 +112,46 @@ pub(super) fn migrate_v1_to_v2(
         registry.remove(*key);
     }
     Ok(())
+}
+
+/// The removed 1.x features this install actually used, so only those users
+/// see the notice. Checked locally; nothing is sent anywhere.
+fn removed_features_used(
+    registry: &Map<String, Value>,
+    context: &MigrationContext,
+) -> Vec<&'static str> {
+    let on = |key: &str| registry.get(key).and_then(Value::as_bool) == Some(true);
+    let nonempty = |key: &str| match registry.get(key) {
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(Value::Object(items)) => !items.is_empty(),
+        _ => false,
+    };
+    let guard = |key: &str| {
+        registry
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode != "off")
+    };
+    let rules = array(registry, "ruleSets")
+        .iter()
+        .any(|set| !text(set, "content").trim().is_empty())
+        || nonempty("rulesTargets")
+        || nonempty("rulesProjects");
+    let permissions = on("agentPermissionsEnabled")
+        || nonempty("agentPermissionRules")
+        || guard("guardCursorMode")
+        || guard("guardClaudeMode");
+    let routines = context.data_dir.join("routines.json").is_file();
+    [
+        (rules, "agentRules"),
+        (permissions, "agentPermissions"),
+        (on("hooksEnabled"), "activityHooks"),
+        (routines, "routines"),
+        (on("allowAgentControl") || on("allowRoutineWrites"), "agentControl"),
+    ]
+    .into_iter()
+    .filter_map(|(used, id)| used.then_some(id))
+    .collect()
 }
 
 /// A level already chosen in a 2.0 preview is kept. Otherwise the upgrade keeps
@@ -979,6 +1026,27 @@ mod tests {
             migrate_v1_to_v2(&mut value, &context(&dir)).unwrap();
             assert_eq!(value["codeMode"], expected, "{flags}");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_notice_lists_only_removed_features_this_install_used() {
+        let dir = scratch_dir("removed-features");
+        let mut quiet = json!({"version": 1, "servers": [], "profiles": [],
+            "ruleSets": [{"id": "default", "name": "Default", "content": "  "}],
+            "hooksEnabled": false, "allowAgentControl": false, "guardCursorMode": "off"});
+        migrate_v1_to_v2(&mut quiet, &context(&dir)).unwrap();
+        assert!(quiet.get("removedFeaturesNotice").is_none());
+
+        std::fs::write(dir.join("routines.json"), "[]").unwrap();
+        let mut used = json!({"version": 1, "servers": [], "profiles": [],
+            "ruleSets": [{"id": "default", "name": "Default", "content": "Be brief."}],
+            "guardClaudeMode": "enforce", "hooksEnabled": true, "allowRoutineWrites": true});
+        migrate_v1_to_v2(&mut used, &context(&dir)).unwrap();
+        assert_eq!(
+            used["removedFeaturesNotice"]["features"],
+            json!(["agentRules", "agentPermissions", "activityHooks", "routines", "agentControl"])
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

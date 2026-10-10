@@ -294,13 +294,19 @@ it("shows protections kept from 1.x and drops them on request", async () => {
   render(
     <ThemeProvider>
       <SettingsView
-        registry={{ ...registry, safetyLevel: "off", keptV1Safety: { blockOnInjection: true } }}
+        registry={{
+          ...registry,
+          safetyLevel: "off",
+          keptV1Safety: { blockOnInjection: true },
+        }}
         onRegistryChange={onRegistryChange}
       />
     </ThemeProvider>,
   );
   expect(
-    screen.getByText(/Kept from 1.x: Toolport also blocks results that look like prompt injection./),
+    screen.getByText(
+      /Kept from 1.x: Toolport also blocks results that look like prompt injection./,
+    ),
   ).toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "Use standard Off" }));
   expect(setSafetyLevel).toHaveBeenCalledWith("off");

@@ -36,6 +36,9 @@
     }
   ],
   "quarantineOnDrift": false,
+  "removedFeaturesNotice": {
+    "features": ["agentRules", "activityHooks", "agentControl"]
+  },
   "safetyLevel": "off",
   "servers": [
     {

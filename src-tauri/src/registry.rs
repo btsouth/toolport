@@ -1117,6 +1117,64 @@ pub struct KeptV1Safety {
     pub block_on_injection: bool,
 }
 
+/// The name a user knew a removed 1.x feature by. The React shell keeps the
+/// same names in `src/lib/removedFeatures.ts`.
+pub fn removed_feature_label(id: &str) -> &str {
+    match id {
+        "agentRules" => "Agent rules",
+        "agentPermissions" => "Agent permissions",
+        "activityHooks" => "Agent activity hooks",
+        "routines" => "Routines",
+        "agentControl" => "Agent control",
+        other => other,
+    }
+}
+
+/// Where upgraders read how to go back to 1.24.
+pub const GO_BACK_TO_1X_URL: &str =
+    "https://github.com/btsouth/toolport/blob/main/docs/upgrading-to-2.md#go-back-to-124";
+
+/// The upgrade notice for removed features this install used. The React shell
+/// keeps the same wording in `src/lib/removedFeatures.ts`.
+pub fn removed_features_message(features: &[String]) -> String {
+    let names: Vec<&str> = features.iter().map(|id| removed_feature_label(id)).collect();
+    let list = match names.as_slice() {
+        [one] => (*one).to_string(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+        [] => String::new(),
+    };
+    format!(
+        "Toolport 2.0 no longer includes {list}, which you used in 1.x. Your settings for them are saved in the exports folder, and files Toolport wrote for them were left as they were. Tell us if you need one back, or go back to 1.24."
+    )
+}
+
+/// A new GitHub issue with only the feature names filled in.
+pub fn removed_features_issue_url(features: &[String]) -> String {
+    let names: Vec<&str> = features.iter().map(|id| removed_feature_label(id)).collect();
+    let title = format!("I need {} in Toolport 2.0", names.join(", "));
+    let body = format!(
+        "Toolport 2.0 removed: {}.\n\nWhat I used it for:\n\n",
+        names.join(", ")
+    );
+    format!(
+        "https://github.com/btsouth/toolport/issues/new?title={}&body={}",
+        url_component(&title),
+        url_component(&body)
+    )
+}
+
+fn url_component(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
 impl KeptV1Safety {
     pub fn any(self) -> bool {
         self.hold_untrusted
@@ -2176,6 +2234,33 @@ impl Registry {
             "accessUpgradeNoticeDismissed".into(),
             serde_json::Value::Bool(true),
         );
+    }
+
+    /// Removed 1.x features this install used, recorded by the upgrade, until
+    /// the user dismisses the notice.
+    pub fn removed_features_notice(&self) -> Vec<String> {
+        let Some(notice) = self.unknown_fields.get("removedFeaturesNotice") else {
+            return Vec::new();
+        };
+        if notice.get("dismissed").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Vec::new();
+        }
+        notice
+            .get("features")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect()
+    }
+
+    pub fn dismiss_removed_features_notice(&mut self) {
+        if let Some(serde_json::Value::Object(notice)) =
+            self.unknown_fields.get_mut("removedFeaturesNotice")
+        {
+            notice.insert("dismissed".into(), serde_json::Value::Bool(true));
+        }
     }
 
     pub fn all_access_id(&self) -> String {
@@ -8941,6 +9026,27 @@ mod safety_level_tests {
             SafetyLevel::Off,
             "absent floor has no effect"
         );
+    }
+
+    #[test]
+    fn the_removed_features_notice_lists_until_dismissed() {
+        let mut registry = Registry::default();
+        assert!(registry.removed_features_notice().is_empty());
+        registry.unknown_fields.insert(
+            "removedFeaturesNotice".into(),
+            serde_json::json!({ "features": ["agentRules", "routines"] }),
+        );
+        assert_eq!(registry.removed_features_notice(), ["agentRules", "routines"]);
+        assert_eq!(
+            removed_features_issue_url(&registry.removed_features_notice()),
+            "https://github.com/btsouth/toolport/issues/new?title=I%20need%20Agent%20rules%2C%20Routines%20in%20Toolport%202.0&body=Toolport%202.0%20removed%3A%20Agent%20rules%2C%20Routines.%0A%0AWhat%20I%20used%20it%20for%3A%0A%0A"
+        );
+        assert_eq!(
+            removed_features_message(&registry.removed_features_notice()),
+            "Toolport 2.0 no longer includes Agent rules and Routines, which you used in 1.x. Your settings for them are saved in the exports folder, and files Toolport wrote for them were left as they were. Tell us if you need one back, or go back to 1.24."
+        );
+        registry.dismiss_removed_features_notice();
+        assert!(registry.removed_features_notice().is_empty());
     }
 
     #[test]

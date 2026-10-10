@@ -1095,8 +1095,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         {keptSummary && (
           <div className="flex flex-col items-start gap-2 rounded-md border px-3 py-2 text-xs">
             <p>
-              {keptSummary} Choosing a level replaces these with that level's
-              protections.
+              {keptSummary} Choosing a level replaces these with that level's protections.
             </p>
             <Button
               size="sm"

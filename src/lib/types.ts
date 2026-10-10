@@ -615,6 +615,8 @@ export interface Registry {
   teamForcedDenyDestructive?: boolean;
   teamForcedQuarantineOnDrift?: boolean;
   teamForcedBlockOnInjection?: boolean;
+  /** Removed 1.x features this install used, recorded by the upgrade. */
+  removedFeaturesNotice?: { features?: string[]; dismissed?: boolean };
   /** 1.x protections the upgrade kept on top of the level, until a level is picked. */
   keptV1Safety?: KeptV1Safety;
   /** Retained legacy switch for registries without a safety level. */

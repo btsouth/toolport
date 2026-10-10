@@ -735,9 +735,9 @@ export function ServerDialog({
                 <div className="flex flex-col gap-1">
                   <Label htmlFor="srv-inherit-env">Use my shell environment</Label>
                   <p className="text-xs text-muted-foreground">
-                    Gives this server every variable from your shell, such as AWS,
-                    GitHub or kube settings. When off it gets only PATH, HOME and
-                    other basics, plus the variables you set here.
+                    Gives this server every variable from your shell, such as AWS, GitHub
+                    or kube settings. When off it gets only PATH, HOME and other basics,
+                    plus the variables you set here.
                   </p>
                 </div>
                 <Switch

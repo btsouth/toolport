@@ -394,6 +394,53 @@ fn build_window(
         notice.append(&actions);
         content_with_notice.append(&notice);
     }
+    let removed = crate::registry::load()
+        .map(|reg| reg.removed_features_notice())
+        .unwrap_or_default();
+    if !removed.is_empty() {
+        let notice = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        notice.add_css_class("toolport-setting-row");
+        notice.append(
+            &gtk::Label::builder()
+                .label(crate::registry::removed_features_message(&removed))
+                .wrap(true)
+                .xalign(0.0)
+                .build(),
+        );
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let exports = gtk::Button::with_label("Open exports folder");
+        exports.connect_clicked(|_| {
+            if let Err(error) = crate::diagnostics_controller::open_exports_dir() {
+                eprintln!("toolport: {error}");
+            }
+        });
+        actions.append(&exports);
+        let need = gtk::Button::with_label("I need this");
+        let issue = crate::registry::removed_features_issue_url(&removed);
+        need.connect_clicked(move |_| {
+            let _ = crate::oauth::open_web_url(&issue);
+        });
+        actions.append(&need);
+        let go_back = gtk::Button::with_label("Go back to 1.24");
+        go_back.connect_clicked(|_| {
+            let _ = crate::oauth::open_web_url(crate::registry::GO_BACK_TO_1X_URL);
+        });
+        actions.append(&go_back);
+        let dismiss = gtk::Button::with_label("Dismiss");
+        let notice_for_dismiss = notice.clone();
+        dismiss.connect_clicked(move |_| {
+            match crate::registry::update(|reg| {
+                reg.dismiss_removed_features_notice();
+                Ok(())
+            }) {
+                Ok(_) => notice_for_dismiss.set_visible(false),
+                Err(error) => eprintln!("toolport: could not dismiss the notice: {error}"),
+            }
+        });
+        actions.append(&dismiss);
+        notice.append(&actions);
+        content_with_notice.append(&notice);
+    }
     stack.set_vexpand(true);
     content_with_notice.append(&stack);
     split.set_content(Some(&adw::NavigationPage::new(
