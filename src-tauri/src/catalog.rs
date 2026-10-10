@@ -261,15 +261,15 @@ pub fn curated() -> Vec<CatalogEntry> {
     let mut list = vec![
         // --- Payments & commerce ---
         http("Stripe", "Payments, customers, charges, and balances.", "https://mcp.stripe.com", "https://docs.stripe.com/mcp"),
-        cmd("Stripe (Full API)", "Toolport overlay: all 587 Stripe endpoints as intent-named tools, with the full write coverage the official MCP lacks (your API key, runs locally).", "npx", &["-y", "toolport-mcp-servers@0.2.0", "stripe"], &["STRIPE_API_KEY"], "https://github.com/btsouth/toolport-mcp-servers"),
+        cmd("Stripe (Full API)", "Toolport overlay: all 587 Stripe endpoints as intent-named tools, with the full write coverage the official MCP lacks (your API key, runs locally).", "npx", &["-y", "toolport-mcp-servers@0.3.0", "stripe"], &["STRIPE_API_KEY"], "https://github.com/btsouth/toolport-mcp-servers"),
         // --- Code, deploy & infra ---
         http("GitHub", "Repos, issues, PRs, and code search.", "https://api.githubcopilot.com/mcp/", "https://github.com/github/github-mcp-server"),
         http("Vercel", "Projects, deployments, and logs on Vercel.", "https://mcp.vercel.com", "https://vercel.com/docs/mcp/vercel-mcp"),
-        cmd("Vercel (Full API)", "Toolport overlay: 333 Vercel endpoints including the writes the official MCP omits (env vars, domains/DNS, the deploy lifecycle).", "npx", &["-y", "toolport-mcp-servers@0.2.0", "vercel"], &["VERCEL_TOKEN"], "https://github.com/btsouth/toolport-mcp-servers"),
+        cmd("Vercel (Full API)", "Toolport overlay: 333 Vercel endpoints including the writes the official MCP omits (env vars, domains/DNS, the deploy lifecycle).", "npx", &["-y", "toolport-mcp-servers@0.3.0", "vercel"], &["VERCEL_TOKEN"], "https://github.com/btsouth/toolport-mcp-servers"),
         http("Sentry", "Errors, issues, and releases from Sentry.", "https://mcp.sentry.dev/mcp", "https://docs.sentry.io"),
         http("Cloudflare Docs", "Search Cloudflare's documentation.", "https://docs.mcp.cloudflare.com/mcp", "https://developers.cloudflare.com/agents/model-context-protocol/"),
-        cmd("Cloudflare (Full API)", "Toolport overlay: 357 Cloudflare control-plane endpoints as named tools (DNS, email routing, zones, WAF, SSL, cache, R2, Access) for per-tool approval.", "npx", &["-y", "toolport-mcp-servers@0.2.0", "cloudflare"], &["CLOUDFLARE_API_TOKEN"], "https://github.com/btsouth/toolport-mcp-servers"),
-        cmd("Clerk (Full API)", "Toolport overlay: 224 Clerk Backend API endpoints (users, orgs, sessions, invitations), vs the official 2-tool docs server.", "npx", &["-y", "toolport-mcp-servers@0.2.0", "clerk"], &["CLERK_SECRET_KEY"], "https://github.com/btsouth/toolport-mcp-servers"),
+        cmd("Cloudflare (Full API)", "Toolport overlay: 357 Cloudflare control-plane endpoints as named tools (DNS, email routing, zones, WAF, SSL, cache, R2, Access) for per-tool approval.", "npx", &["-y", "toolport-mcp-servers@0.3.0", "cloudflare"], &["CLOUDFLARE_API_TOKEN"], "https://github.com/btsouth/toolport-mcp-servers"),
+        cmd("Clerk (Full API)", "Toolport overlay: 224 Clerk Backend API endpoints (users, orgs, sessions, invitations), vs the official 2-tool docs server.", "npx", &["-y", "toolport-mcp-servers@0.3.0", "clerk"], &["CLERK_SECRET_KEY"], "https://github.com/btsouth/toolport-mcp-servers"),
         cmd("AWS", "AWS service APIs through the AWS Labs API MCP server.", "uvx", &["awslabs.aws-api-mcp-server@1.5.6"], &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"], "https://github.com/awslabs/mcp"),
         cmd("Kubernetes", "Inspect and manage Kubernetes clusters via your kubeconfig.", "npx", &["-y", "mcp-server-kubernetes@4.1.9"], &[], "https://github.com/Flux159/mcp-server-kubernetes"),
         cmd("Linode", "Manage Linode (Akamai) cloud: instances, volumes, NodeBalancers, databases, and networking.", "npx", &["-y", "@takashito/linode-mcp-server@0.4.0"], &["LINODE_API_TOKEN"], "https://github.com/takashito/linode-mcp-server"),
