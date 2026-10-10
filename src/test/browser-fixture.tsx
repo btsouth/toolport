@@ -1,3 +1,4 @@
+import { securityFixture } from "./security-fixture";
 // Separate development entry. Never imported by the shipping application.
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { useState } from "react";
@@ -29,6 +30,14 @@ const servers: ServerEntry[] = ["GitHub", "Linear", "Stripe"].map((name, i) => (
   url: null,
   source: "manual",
 }));
+if (new URLSearchParams(location.search).has("tool-changes")) {
+  servers.push(
+    ...[
+      ["cloudflare-full-api", "Cloudflare (Full API)"],
+      ["revenuecat", "RevenueCat"],
+    ].map(([id, name]) => ({ ...servers[0], id, name, enabled: false })),
+  );
+}
 const authGuidance = new URLSearchParams(location.search).has("auth-guidance");
 if (authGuidance) {
   servers[0] = {
@@ -156,6 +165,21 @@ if (memberReviewFixture) {
   } as NonNullable<Registry["team"]>;
 }
 
+const driftFixture = new URLSearchParams(location.search).has("tool-changes");
+const profileDriftFixture = new URLSearchParams(location.search).has("profile-drift");
+const driftEvents = profileDriftFixture
+  ? ["local", "work"].map((profile) => ({
+      ...securityFixture()[0],
+      // Reloads reread the same persisted occurrence, just like the security log.
+      ts: 1_790_000_000_000,
+      profile,
+      new_fp: "v2:profile-fixture",
+      blocked: true,
+      blocked_profiles: [profile],
+    }))
+  : driftFixture
+    ? securityFixture()
+    : [];
 const approvalFixture = new URLSearchParams(location.search).has("approvals");
 const sessionFixture = new URLSearchParams(location.search).has("sessions");
 const callerFixture = new URLSearchParams(location.search).has("caller-names");
@@ -418,7 +442,7 @@ function fixtureAdd(entry: ServerEntry) {
 }
 const calls: Record<string, number> = {};
 const missing: string[] = [];
-Object.assign(window, { toolportFixture: { calls, missing } });
+Object.assign(window, { toolportFixture: { calls, missing, driftEvents } });
 localStorage.setItem("toolport.onboarded", "1");
 
 mockIPC(
@@ -775,10 +799,21 @@ mockIPC(
       case "decide_approval":
         pendingApproval = pendingApproval.filter((approval) => approval.id !== args.id);
         return null;
+      case "get_security_events":
+        return driftEvents;
+      case "release_quarantine": {
+        const event = driftEvents.find(
+          (event) => event.profile === args.profile && event.tool === args.tool,
+        );
+        if (!event || event.new_fp !== args.expectedFingerprint)
+          throw new Error("The reviewed definition changed");
+        event.blocked = false;
+        event.blocked_profiles = [];
+        return null;
+      }
       case "clients_needing_restart":
       case "list_allowed_tools":
       case "list_quarantined":
-      case "get_security_events":
         return [];
       case "get_search_traces":
         return auditRows

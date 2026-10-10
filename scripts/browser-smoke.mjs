@@ -542,6 +542,52 @@ try {
   await expect(page.getByRole("dialog")).toContainText("Clear retained activity?");
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
+  await page.goto(`${baseURL}/fixtures/?tool-changes&profile-drift`);
+  await page.getByRole("button", { name: "Activity", exact: true }).click();
+  const profileChanges = page.getByRole("button", {
+    name: /Cloudflare \(Full API\): 1 tool/,
+  });
+  await expect(profileChanges).toHaveCount(2);
+  await page
+    .getByRole("button", { name: "Accept all for this server", exact: true })
+    .first()
+    .click();
+  await expect(profileChanges).toHaveCount(1);
+  await expect(
+    page.getByText("1 tool is blocked. Review the changes or accept them.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  const profileState = await page.evaluate(() => window.toolportFixture);
+  expect(profileState.calls.release_quarantine).toBe(1);
+  expect(
+    profileState.driftEvents.map(({ profile, blocked }) => ({ profile, blocked })),
+  ).toEqual([
+    { profile: "local", blocked: false },
+    { profile: "work", blocked: true },
+  ]);
+  await expect
+    .poll(
+      async () =>
+        (await page.evaluate(() => window.toolportFixture)).calls.get_security_events,
+    )
+    .toBeGreaterThan(profileState.calls.get_security_events);
+  await expect(profileChanges).toHaveCount(1);
+  await expect(
+    page.getByText("1 tool is blocked. Review the changes or accept them.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await page.reload();
+  await page.getByRole("button", { name: "Activity", exact: true }).click();
+  await expect(profileChanges).toHaveCount(1);
+  await expect(
+    page.getByText("1 tool is blocked. Review the changes or accept them.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
+  await page.screenshot({ path: path.join(output, "profile-review-still-blocked.png") });
   await page.goto(`${baseURL}/fixtures/?logos`);
   await expect(page.getByText("Dark logo fixture")).toBeVisible();
   await page.evaluate(() => document.fonts.ready);

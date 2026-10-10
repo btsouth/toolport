@@ -1080,7 +1080,7 @@ async fn audit_stats() -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn get_security_events(limit: usize) -> Result<Vec<serde_json::Value>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        integrity::read_recent(limit).map_err(|e| format!("Couldn't read security events: {e}"))
+        integrity::review_events(limit).map_err(|e| format!("Couldn't read security events: {e}"))
     })
     .await
     .map_err(|e| format!("security events task join failed: {e}"))?
@@ -1610,13 +1610,18 @@ fn release_quarantine(
     state: State<RegistryState>,
     profile: String,
     tool: String,
+    expected_fingerprint: Option<String>,
 ) -> Result<(), String> {
     let prof = if profile.is_empty() {
         None
     } else {
         Some(profile.as_str())
     };
-    crate::registry_controller::release_quarantine(prof, &tool)?;
+    if let Some(expected) = expected_fingerprint {
+        integrity::release_definition(prof, &tool, &expected)?;
+    } else {
+        crate::registry_controller::release_quarantine(prof, &tool)?;
+    }
     // The quarantine release lives in the separate tool-pins file; the former blind re-save
     // here was only a gateway mtime-nudge (which the no-op guard usually swallowed anyway)
     // and it could revert a concurrent gateway/team write (SOU-23). Refresh the cache

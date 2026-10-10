@@ -56,8 +56,18 @@ export interface SecurityEvent {
   type: string;
   /** Absent for events not tied to a specific tool (e.g. pins_load_failed). */
   server?: string;
+  /** Stable profile id; empty for the HTTP union. Older events may omit it. */
+  profile?: string;
   tool?: string;
   change: string;
+  changed_fields?: string[];
+  new_fp?: string;
+  /** Older unblocked records without a captured fingerprint, shown in history. */
+  historical?: boolean;
+  parameters?: { added: string[]; removed: string[]; changed: string[] };
+  /** Current quarantine status; absent/null means unavailable. */
+  blocked?: boolean | null;
+  blocked_profiles?: string[];
   /** For tool_poison_flag: which heuristic signatures matched. */
   signatures?: string[];
   /** For tool_poison_flag: a short de-obfuscated excerpt of the matched text, so the
@@ -292,8 +302,12 @@ export function listQuarantined(): Promise<QuarantinedTool[]> {
 }
 
 /** Re-approve a quarantined tool so the gateway re-exposes it on its next rebuild. */
-export function releaseQuarantine(profile: string, tool: string): Promise<void> {
-  return invoke<void>("release_quarantine", { profile, tool });
+export function releaseQuarantine(
+  profile: string,
+  tool: string,
+  expectedFingerprint?: string,
+): Promise<void> {
+  return invoke<void>("release_quarantine", { profile, tool, expectedFingerprint });
 }
 
 /** Outcome of a bulk re-approval. `skipped` names tools that stay blocked. */

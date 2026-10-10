@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, act, fireEvent } from "@testing-library/react";
+import { render, screen, act, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ActivityView } from "./ActivityView";
 import type { AuditEntry, SearchTrace } from "@/lib/types";
@@ -17,8 +17,10 @@ const getSavingsSummary = vi.fn();
 const getAuditStats = vi.fn();
 
 const clearActivityLogs = vi.fn();
+const releaseQuarantine = vi.fn();
 
 vi.mock("@/lib/api", () => ({
+  releaseQuarantine: (...a: unknown[]) => releaseQuarantine(...a),
   clearActivityLogs: (...a: unknown[]) => clearActivityLogs(...a),
   exportAuditToPath: vi.fn(),
   getAuditLog: (...a: unknown[]) => getAuditLog(...a),
@@ -692,11 +694,12 @@ describe("ActivityView security drift dismissals", () => {
       server: "srv",
       tool: "srv__read",
       change: "changed",
-      severity: "warn",
+      severity: "info",
+      blocked: false,
     };
   }
 
-  it("maps warn drift to the loud lane and re-surfaces a later rewrite after dismissal", async () => {
+  it("shows server changes and re-surfaces a later rewrite after acceptance", async () => {
     localStorage.clear();
     const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
     getSecurityEvents.mockResolvedValue([warnEvent(1_700_000_000_000)]);
@@ -704,23 +707,165 @@ describe("ActivityView security drift dismissals", () => {
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
 
-    // A warn definition-content drift is actionable: it rides the loud lane, not the
-    // quiet "New & changed tools" history.
-    expect(screen.getByText("Tool security notices")).toBeInTheDocument();
-    expect(screen.getByText("srv__read")).toBeInTheDocument();
+    // A description rewrite stays visible as a server update.
+    expect(screen.getByText("Tool changes")).toBeInTheDocument();
 
-    // Review (dismiss) this rewrite.
-    await user.click(screen.getByRole("button", { name: "Dismiss this notice" }));
+    // Accept just this tool.
+    await user.click(screen.getByRole("button", { name: /srv: 1 tool changed/ }));
+    await user.click(screen.getByText("Read"));
+    await user.click(screen.getByRole("button", { name: "Accept this tool" }));
     await act(async () => {});
-    expect(screen.queryByText("srv__read")).not.toBeInTheDocument();
+    expect(screen.queryByText("Read")).not.toBeInTheDocument();
 
-    // A later, different rewrite of the SAME tool must reappear: a warn dismissal is
+    // A later, different rewrite of the SAME tool must reappear: an accepted change is
     // per instance, not per tool identity.
     getSecurityEvents.mockResolvedValue([warnEvent(1_700_000_000_000 + 20 * 60 * 1000)]);
     await act(async () => {
       vi.advanceTimersByTime(3000);
     });
-    expect(screen.getByText("srv__read")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /srv: 1 tool changed/ }),
+    ).toBeInTheDocument();
+  });
+  it("accepts one profile while the same finding stays visible and blocked in another", async () => {
+    localStorage.clear();
+    const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
+    const blocked = new Set(["personal", "work"]);
+    const events = ["personal", "work"].map((profile) => ({
+      ...warnEvent(1_700_000_000_000),
+      profile,
+      new_fp: "v2:same-definition",
+      blocked: true,
+      blocked_profiles: [profile],
+    }));
+    getSecurityEvents.mockImplementation(async () =>
+      events.map((event) => ({
+        ...event,
+        blocked: blocked.has(event.profile),
+        blocked_profiles: blocked.has(event.profile) ? [event.profile] : [],
+      })),
+    );
+    releaseQuarantine.mockImplementation(async (profile: string) =>
+      blocked.delete(profile),
+    );
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(screen.getAllByRole("button", { name: /srv: 1 tool changed/ })).toHaveLength(
+      2,
+    );
+    await user.click(
+      screen.getAllByRole("button", { name: "Accept all for this server" })[0],
+    );
+    await act(async () => {});
+    expect(releaseQuarantine).toHaveBeenCalledExactlyOnceWith(
+      "personal",
+      "srv__read",
+      "v2:same-definition",
+    );
+    expect(blocked).toEqual(new Set(["work"]));
+    expect(screen.getAllByRole("button", { name: /srv: 1 tool changed/ })).toHaveLength(
+      1,
+    );
+    expect(screen.getByText(/1 tool is blocked/)).toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(3000));
+    expect(
+      screen.getByRole("button", { name: /srv: 1 tool changed/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/1 tool is blocked/)).toBeInTheDocument();
+  });
+
+  it("keeps older fingerprint-less records in one expandable history summary", async () => {
+    localStorage.clear();
+    getSecurityEvents.mockResolvedValue([
+      {
+        ...warnEvent(1_700_000_000_000),
+        tool: "cloudflare__update",
+        server: "cloudflare",
+      },
+      ...Array.from({ length: 1500 }, (_, i) => ({
+        ...warnEvent(1_600_000_000_000),
+        tool: `old__read${i}`,
+        server: "old",
+        historical: true,
+      })),
+    ]);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(screen.getByText(/1500 older tool-change records/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /cloudflare: 1 tool changed/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/1500 older tool-change records/).closest("details"),
+    ).not.toHaveAttribute("open");
+  });
+
+  it.each([undefined, "work"])(
+    "keeps an older unknown quarantine in the main view with profile %s",
+    async (profile) => {
+      localStorage.clear();
+      getSecurityEvents.mockResolvedValue([
+        ...Array.from({ length: 55 }, (_, i) => ({
+          ...warnEvent(1_700_000_000_000),
+          tool: `old__read${i}`,
+          server: "old",
+          historical: i >= 50,
+        })),
+        {
+          ...warnEvent(1_600_000_000_000),
+          tool: "legacy__update",
+          server: "legacy",
+          profile,
+          blocked: null,
+        },
+      ]);
+      render(<ActivityView refreshKey={0} registry={null} />);
+      await act(async () => {});
+      const row = screen.getByRole("button", { name: /legacy: 1 tool changed/ });
+      expect(row.closest("details")).toBeNull();
+      expect(screen.getByText(/5 older tool-change records/)).toBeInTheDocument();
+      expect(screen.getByText(/Settings > Quarantined tools/)).toBeInTheDocument();
+      const card = within(row.parentElement!);
+      expect(
+        card.getByRole("button", { name: "Accept all for this server" }),
+      ).toBeDisabled();
+      fireEvent.click(row);
+      const accept = card.getByRole("button", { name: "Accept this tool" });
+      expect(accept).toBeDisabled();
+      fireEvent.click(accept);
+      expect(releaseQuarantine).not.toHaveBeenCalled();
+    },
+  );
+
+  it("accepts a server update larger than the old dismissal limit", async () => {
+    localStorage.clear();
+    const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
+    const events = Array.from({ length: 600 }, (_, i) => ({
+      ...warnEvent(1_700_000_000_000),
+      tool: `srv__read${i}`,
+    }));
+    getSecurityEvents.mockResolvedValue(events);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    await user.click(screen.getByRole("button", { name: "Accept all for this server" }));
+    await act(async () => {});
+    expect(screen.queryByText("Tool changes")).not.toBeInTheDocument();
+    await act(async () => {
+      vi.advanceTimersByTime(3000);
+    });
+    expect(screen.queryByText("Tool changes")).not.toBeInTheDocument();
+  });
+
+  it("keeps separate definitions within the old duplicate window", async () => {
+    getSecurityEvents.mockResolvedValue([
+      { ...warnEvent(1_700_000_000_000), new_fp: "v2:old" },
+      { ...warnEvent(1_700_000_120_000), new_fp: "v2:new" },
+    ]);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(screen.getAllByRole("button", { name: /srv: 1 tool changed/ })).toHaveLength(
+      2,
+    );
   });
 });
 

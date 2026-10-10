@@ -1,3 +1,4 @@
+import { ToolChanges } from "./ToolChanges";
 import { activityClientName, clientIdentityTooltip } from "@/lib/clientIdentity";
 import { useWindowVisible } from "@/lib/windowVisible";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -69,32 +70,36 @@ import {
 
 /** A badge describing one security event by kind. */
 function eventBadge(e: SecurityEvent): { label: string; cls: string } {
+  const cls =
+    e.blocked || e.type === "result_injection_blocked"
+      ? "bg-destructive/15 text-destructive"
+      : "bg-muted text-muted-foreground";
   if (e.type === "result_injection_blocked") {
     return {
       label: "injection blocked",
-      cls: "bg-destructive/15 text-destructive",
+      cls,
     };
   }
   if (e.type === "result_injection") {
     return {
       label: "injected result",
-      cls: "bg-destructive/15 text-destructive",
+      cls,
     };
   }
   if (e.type === "tool_poison_flag") {
     return {
       label: "suspicious content",
-      cls: "bg-destructive/15 text-destructive",
+      cls,
     };
   }
   if (e.type === "pins_load_failed") {
     return {
       label: "integrity baseline lost",
-      cls: "bg-destructive/15 text-destructive",
+      cls,
     };
   }
   if (e.change === "changed") {
-    return { label: "changed", cls: "bg-warning/15 text-warning" };
+    return { label: "changed", cls: "bg-muted text-muted-foreground" };
   }
   return { label: "new tool", cls: "bg-owned/15 text-owned" };
 }
@@ -136,27 +141,25 @@ function severityIdentity(e: SecurityEvent): string {
  * that must still interrupt. */
 function securityKey(e: SecurityEvent): string {
   const severity = severityIdentity(e);
-  return `${e.type}:${e.server ?? ""}:${e.tool ?? ""}:${e.change}:${severity}`;
+  const identity = `${e.type}:${e.server ?? ""}:${e.tool ?? ""}:${e.change}:${severity}`;
+  return e.profile ? `${identity}:profile=${e.profile}` : identity;
 }
 
-/** Durable key written when a notice is dismissed. Mirrors the GTK shell's
- * `security_dismissal_key`: the loud/actionable tier (high AND warn, per `eventSeverity`)
- * records the instance's timestamp too, so clearing one description rewrite does not also
- * silence a later, different rewrite of the same tool. The quiet tier keeps the
- * identity-only key so ordinary vendor churn stays dismissed. */
+/** Review changes and actionable findings through their occurrence timestamp.
+ * A later definition must reappear regardless of its severity. */
 function dismissalKey(e: SecurityEvent): string {
   const identity = securityKey(e);
-  return eventSeverity(e) === "high" ? `${identity}@${e.ts}` : identity;
+  return e.type === "tool_drift" || eventSeverity(e) === "high"
+    ? `${identity}@${e.ts}`
+    : identity;
 }
 
-/** Whether the user has already reviewed `e`. Loud events are reviewed through a
- * timestamp: a recorded marker for the same identity covers this instance when it
- * reviewed that timestamp or a later one, matching the GTK shell. A genuinely later
- * rewrite (a larger `ts`) therefore reappears instead of staying permanently hidden.
- * Quiet events are dismissed by identity alone. */
+/** An acceptance marker covers this occurrence and earlier duplicate reports.
+ * Later tool changes require a new review. */
 function isDismissed(e: SecurityEvent, dismissed: Set<string>): boolean {
   const identity = securityKey(e);
-  if (eventSeverity(e) !== "high") return dismissed.has(identity);
+  if (e.type !== "tool_drift" && eventSeverity(e) !== "high")
+    return dismissed.has(identity);
   const prefix = `${identity}@`;
   for (const marker of dismissed) {
     if (!marker.startsWith(prefix)) continue;
@@ -188,9 +191,11 @@ function dedupeSecurity(events: SecurityEvent[]): SecurityEvent[] {
       (k) =>
         k.type === e.type &&
         k.server === e.server &&
+        (k.profile || "") === (e.profile || "") &&
         k.tool === e.tool &&
         k.change === e.change &&
         severityIdentity(k) === severityIdentity(e) &&
+        (e.type !== "tool_drift" || k.new_fp === e.new_fp) &&
         Math.abs(k.ts - e.ts) <= WINDOW_MS,
     );
     if (!dupe) kept.push(e);
@@ -234,8 +239,8 @@ function loadDismissed(): Set<string> {
 }
 
 /** Upper bound on remembered dismissals, so the persisted set can't grow without
- * limit across sessions. Well above any realistic count of distinct findings. */
-const MAX_DISMISSED = 500;
+ * limit across sessions. Covers the complete bounded security retention window. */
+const MAX_DISMISSED = 2000;
 
 /** Add keys to the dismissed set, cap it to the most-recent MAX_DISMISSED (Set
  * preserves insertion order, so slicing the tail keeps the newest), and persist.
@@ -299,7 +304,7 @@ function SecurityLoadNotice({
       role="alert"
       className="mb-4 flex items-center gap-3 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs"
     >
-      <AlertTriangle className="size-4 shrink-0 text-warning" />
+      <AlertTriangle className="size-4 shrink-0 text-muted-foreground" />
       <span className="text-muted-foreground">
         <span className="font-medium text-foreground">
           {stale
@@ -360,20 +365,27 @@ function SecurityNotices({
   const [open, setOpen] = useState(true);
   // One row per finding, newest first, with a recurrence count. See collapseByIdentity.
   const collapsed = collapseByIdentity(events);
+  const blocked = events.some(
+    (event) => event.blocked || event.type === "result_injection_blocked",
+  );
   return (
-    <div className="mb-4 rounded-lg border border-warning/40 bg-warning/5 p-4">
+    <div
+      className={`mb-4 rounded-lg border p-4 ${blocked ? "border-destructive/40 bg-destructive/5" : "border-border bg-muted/20"}`}
+    >
       <button
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
         className="flex w-full items-center gap-2 text-left"
       >
-        <ShieldAlert className="size-4 shrink-0 text-warning" />
-        <h3 className="text-sm font-medium text-warning">Tool security notices</h3>
-        <span className="rounded-full bg-warning/15 px-1.5 py-0.5 text-xs font-medium text-warning">
+        <ShieldAlert className="size-4 shrink-0 text-muted-foreground" />
+        <h3 className="text-sm font-medium text-muted-foreground">
+          Tool security notices
+        </h3>
+        <span className="rounded-full bg-muted px-1.5 py-0.5 text-xs font-medium text-muted-foreground">
           {collapsed.length}
         </span>
         <ChevronRight
-          className={`ml-auto size-4 text-warning/70 transition-transform ${
+          className={`ml-auto size-4 text-muted-foreground/70 transition-transform ${
             open ? "rotate-90" : ""
           }`}
         />
@@ -406,7 +418,7 @@ function SecurityNotices({
                     )}
                     {count > 1 && (
                       <span
-                        className="rounded-full bg-warning/15 px-1.5 py-0.5 font-medium text-warning"
+                        className="rounded-full bg-muted px-1.5 py-0.5 font-medium text-muted-foreground"
                         title={`Recurred in ${count} separate time windows`}
                       >
                         ×{count}
@@ -1857,7 +1869,7 @@ export function ActivityView({
           status === "ready" || status === "stale" ? "stale" : "error",
         );
       });
-    getSecurityEvents(50)
+    getSecurityEvents(2000)
       .then((s) => {
         if (!alive) return;
         setSecurity(s);
@@ -1912,11 +1924,17 @@ export function ActivityView({
     e.type !== "tool_poison_flag" &&
     e.type !== "result_injection" &&
     e.type !== "result_injection_blocked";
+  const toolChanges = liveSecurity.filter(
+    (e) => e.type === "tool_drift" && !e.historical,
+  );
+  const olderToolChanges = liveSecurity.filter(
+    (e) => e.type === "tool_drift" && e.historical,
+  );
   const highSecurity = liveSecurity.filter(
-    (e) => eventSeverity(e) === "high" && !isNewTool(e),
+    (e) => e.type !== "tool_drift" && eventSeverity(e) === "high" && !isNewTool(e),
   );
   const infoSecurity = liveSecurity.filter(
-    (e) => eventSeverity(e) !== "high" || isNewTool(e),
+    (e) => e.type !== "tool_drift" && (eventSeverity(e) !== "high" || isNewTool(e)),
   );
   const dismissSecurity = (e: SecurityEvent) => {
     setDismissed((prev) => addDismissed(prev, [dismissalKey(e)]));
@@ -1934,9 +1952,29 @@ export function ActivityView({
       {securityLoadStatus !== "ready" ? (
         <SecurityLoadNotice status={securityLoadStatus} onRetry={retryLoads} />
       ) : null}
+      {toolChanges.length > 0 ? (
+        <ToolChanges
+          events={toolChanges}
+          registry={registry}
+          onAccept={dismissAllSecurity}
+        />
+      ) : null}
+      {olderToolChanges.length > 0 ? (
+        <details className="mb-4 rounded-lg border border-border p-4">
+          <summary className="cursor-pointer text-sm">
+            {olderToolChanges.length} older tool-change records. Open history to review
+            them.
+          </summary>
+          <ToolChanges
+            events={olderToolChanges}
+            registry={registry}
+            onAccept={dismissAllSecurity}
+          />
+        </details>
+      ) : null}
       {highSecurity.length > 0 ? (
         <SecurityNotices events={highSecurity} onDismiss={dismissSecurity} />
-      ) : securityLoadStatus === "ready" ? (
+      ) : securityLoadStatus === "ready" && toolChanges.length === 0 ? (
         <SecurityResting />
       ) : null}
       {infoSecurity.length > 0 ? (
