@@ -430,9 +430,18 @@ function App() {
   useEffect(() => {
     const unlisten = listen<Registry>("team-sync-registry", (event) => {
       applyRegistryChange(event.payload);
+      if (!event.payload.team?.personalSyncState?.error)
+        toast.dismiss("personal-sync-background");
+    });
+    const unlistenErrors = listen<string>("team-sync-error", (event) => {
+      toastError("Sync needs attention", {
+        id: "personal-sync-background",
+        description: event.payload.replaceAll("team server", "sync service"),
+      });
     });
     return () => {
       void unlisten.then((stop) => stop());
+      void unlistenErrors.then((stop) => stop());
     };
   }, [applyRegistryChange]);
 
