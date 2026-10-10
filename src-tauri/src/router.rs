@@ -1679,8 +1679,9 @@ pub struct Router {
     /// Public alias -> persisted policy name. Reserved overrides keep their old
     /// policy binding even though clients now see the original namespaced alias.
     policy_names: HashMap<String, String>,
-    /// Server id -> original tool -> exposed name, for every indexed tool, blocked or not.
-    exposed_by_original: HashMap<String, HashMap<String, String>>,
+    /// Server id -> original tool -> policy name, for every indexed tool, whatever
+    /// this router's scope or block state.
+    policy_by_original: HashMap<String, HashMap<String, String>>,
     /// Server id -> original tool -> policy name in the full-length view this client
     /// view was derived from. A shorter alias budget can change which override wins
     /// a collision, but never which quarantine, pin or approval a tool answers to.
@@ -1771,6 +1772,17 @@ impl Router {
             .filter(|name| name.starts_with("toolport_"))
     }
 
+    /// The persisted policy name a tool answers to, before any scope gate.
+    fn unscoped_policy_name(&self, exposed: &str, server: &str, original: &str) -> String {
+        self.canonical_policy
+            .get(server)
+            .and_then(|tools| tools.get(original))
+            .cloned()
+            .or_else(|| self.reserved_policy_name(server, original))
+            .or_else(|| self.legacy_names.get(exposed).cloned())
+            .unwrap_or_else(|| exposed.to_string())
+    }
+
     fn bind_policy_name(&mut self, exposed: &str, server: &str, original: &str) {
         // Only tools in this view can claim a persisted policy record.
         if !self.policy.allows_server(server)
@@ -1782,14 +1794,8 @@ impl Router {
         {
             return;
         }
-        let legacy = self
-            .canonical_policy
-            .get(server)
-            .and_then(|tools| tools.get(original))
-            .cloned()
-            .or_else(|| self.reserved_policy_name(server, original))
-            .or_else(|| self.legacy_names.get(exposed).cloned());
-        let name = legacy.as_deref().unwrap_or(exposed);
+        let name = self.unscoped_policy_name(exposed, server, original);
+        let name = name.as_str();
         if name == exposed && !name.starts_with("toolport_") {
             return;
         }
@@ -2060,19 +2066,7 @@ impl Router {
         view.policy.allow = allow;
         view.alias_limit = Some(limit.clamp(16, 64));
         if self.alias_limit.unwrap_or(64) != view.alias_limit.unwrap() {
-            view.canonical_policy = self
-                .exposed_by_original
-                .iter()
-                .map(|(server, tools)| {
-                    let tools = tools
-                        .iter()
-                        .map(|(original, exposed)| {
-                            (original.clone(), self.policy_name(exposed).to_string())
-                        })
-                        .collect();
-                    (server.clone(), tools)
-                })
-                .collect();
+            view.canonical_policy = self.policy_by_original.clone();
             for candidate in &mut view.restored_candidates {
                 let canonical = candidate
                     .policy_name
@@ -2294,10 +2288,11 @@ impl Router {
             };
             self.tool_owners
                 .insert(exposed.clone(), server_id.to_string());
-            self.exposed_by_original
+            let policy_name = self.unscoped_policy_name(&exposed, server_id, orig);
+            self.policy_by_original
                 .entry(server_id.to_string())
                 .or_default()
-                .insert(orig.to_string(), exposed.clone());
+                .insert(orig.to_string(), policy_name);
             if tools.policy_metadata(idx).model_hidden {
                 self.model_hidden.insert(exposed.clone());
             }
@@ -3666,7 +3661,7 @@ impl Router {
         self.catalog_servers.clear();
         self.routes.clear();
         self.policy_names.clear();
-        self.exposed_by_original.clear();
+        self.policy_by_original.clear();
         self.schema_arguments.clear();
         self.seen.clear();
         self.legacy_seen.clear();
@@ -7009,6 +7004,74 @@ for line in sys.stdin:
         assert_eq!(fresh.exposed_tool_name("files", &medium), Some(short.as_str()));
         assert!(fresh.route_call(&short, json!({})).is_ok());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Tools the base scope hides but a client profile allows keep their reserved
+        // and pre-bounding policy names too.
+        let long = "a".repeat(70);
+        let mut narrowed = Router::with_policy(ToolPolicy {
+            allow: HashMap::from([(
+                "files".to_string(),
+                HashSet::from(["read_item".to_string()]),
+            )]),
+            ..Default::default()
+        });
+        narrowed.set_overrides(HashMap::from([(
+            "files".to_string(),
+            HashMap::from([
+                (
+                    "reserved".to_string(),
+                    ToolOverride {
+                        name: Some("toolport_foo".into()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "renamed".to_string(),
+                    ToolOverride {
+                        name: Some(long.clone()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+        )]));
+        narrowed.add(
+            DownstreamServer::connect(
+                "files".into(),
+                Box::new(Fixture(
+                    vec![
+                        json!({"name": "read_item"}),
+                        json!({"name": "reserved"}),
+                        json!({"name": "renamed"}),
+                    ],
+                    Arc::clone(&calls),
+                )),
+            )
+            .unwrap(),
+        );
+        let profile = HashMap::from([(
+            "files".to_string(),
+            HashSet::from([
+                "read_item".to_string(),
+                "reserved".to_string(),
+                "renamed".to_string(),
+            ]),
+        )]);
+        let cursor = narrowed.with_client_tool_view(profile.clone(), 52);
+        let reserved = cursor.exposed_tool_name("files", "reserved").unwrap().to_string();
+        let renamed = cursor.exposed_tool_name("files", "renamed").unwrap().to_string();
+        assert_eq!(policy_name(&cursor, &reserved), "toolport_foo");
+        assert_eq!(policy_name(&cursor, &renamed), long);
+        narrowed.requarantine(BTreeSet::from(["toolport_foo".to_string(), long.clone()]));
+        assert!(cursor
+            .recheck_live_policy(&narrowed, DispatchTarget::Tool(&reserved))
+            .is_err());
+        assert!(cursor
+            .recheck_live_policy(&narrowed, DispatchTarget::Tool(&renamed))
+            .is_err());
+        let fresh = narrowed.with_client_tool_view(profile, 52);
+        assert!(fresh.exposed_tool_name("files", "reserved").is_none());
+        assert!(fresh.exposed_tool_name("files", "renamed").is_none());
+        assert!(fresh.exposed_tool_name("files", "read_item").is_some());
     }
 
     #[test]
