@@ -23865,8 +23865,11 @@ mod tests {
     #[test]
     fn reviewed_unscoped_no_match_waits_for_first_catalog_publication() {
         let _env = DataDirTestEnv::new("reviewed-no-match-publication");
-        let router =
-            counting_cache_supervisor("publishing", Vec::new(), &Arc::new(AtomicUsize::new(0)));
+        let router = counting_cache_supervisor(
+            "publishing",
+            Vec::new(),
+            &Arc::new(AtomicUsize::new(0)),
+        );
         router.prepare_lazy_use("publishing");
         wait_for_supervisor_result(&router);
         assert!(router.any_publishing_first_catalog(|_| true));

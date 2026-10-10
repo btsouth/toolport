@@ -440,6 +440,7 @@ export interface HeaderKey {
 }
 export interface EnvVar {
   source?: SecretReference;
+  portable?: boolean;
   key: string;
   value: string | null;
   secret: boolean;
@@ -447,6 +448,7 @@ export interface EnvVar {
 
 export interface LaunchInput {
   source?: SecretReference;
+  portable?: boolean;
   key: string;
   label: string;
   secret: boolean;
@@ -476,6 +478,12 @@ export interface KeptV1Safety {
 }
 
 export interface ServerEntry {
+  syncExecutionReview?: Record<string, string>;
+  syncLocalOnly?: boolean;
+  teamOriginalId?: string;
+  personalSyncEntry?: boolean;
+  teamEnableReview?: boolean;
+  personalSyncArgsReview?: boolean;
   enabled?: boolean;
   id: string;
   name: string;
@@ -601,6 +609,7 @@ export interface Registry {
   defaultAccessProfileId?: string | null;
   defaultAccessContextId?: string | null;
   defaultAccessLegacyPolicy?: boolean;
+  accessUpgradeNoticePending?: boolean;
   accessUpgradeNoticeDismissed?: boolean;
   /** Folder -> profile auto-routing mappings. Absent/empty = no folder routing. */
   folderProfiles?: FolderProfile[];
@@ -698,6 +707,9 @@ export interface HttpClient {
 
 /** A joined Toolport Teams server (the shared config-sync layer). */
 export interface TeamConnection {
+  accountStatus?: import("./personalSync").AccountStatus | null;
+  accountStatusError?: string | null;
+  personalSyncState?: import("./personalSync").PersonalSyncState;
   managedServerIds?: Record<string, string>;
   serverUrl: string;
   teamId: string;

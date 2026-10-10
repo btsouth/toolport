@@ -1,4 +1,5 @@
-import { secretReferenceReview } from "@/lib/secretRefs";
+import { visibleExecutionText } from "@/lib/visibleExecutionText";
+import { isPersonalSync } from "@/lib/personalSync";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -80,6 +81,7 @@ const ActivityView = lazy(() =>
 const CatalogView = lazy(() =>
   import("@/components/CatalogView").then((m) => ({ default: m.CatalogView })),
 );
+const ExecutionReview = lazy(() => import("@/components/ExecutionReview"));
 const TeamsView = lazy(() =>
   import("@/components/TeamsView").then((m) => ({ default: m.TeamsView })),
 );
@@ -122,6 +124,8 @@ function App() {
   // than a couple of servers, so one menu click can't silently kill a big set.
   const [confirmDisableAll, setConfirmDisableAll] = useState(false);
   const [confirmEnableTeam, setConfirmEnableTeam] = useState<ServerEntry | null>(null);
+  const [enableReviewError, setEnableReviewError] = useState<string | null>(null);
+  const [readyEnableReview, setReadyEnableReview] = useState<ServerEntry | null>(null);
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
   const [toolsServerId, setToolsServerId] = useState<string | null>(null);
   const [view, setView] = useState<View>("servers");
@@ -429,9 +433,18 @@ function App() {
   useEffect(() => {
     const unlisten = listen<Registry>("team-sync-registry", (event) => {
       applyRegistryChange(event.payload);
+      if (!event.payload.team?.personalSyncState?.error)
+        toast.dismiss("personal-sync-background");
+    });
+    const unlistenErrors = listen<string>("team-sync-error", (event) => {
+      toastError("Sync needs attention", {
+        id: "personal-sync-background",
+        description: event.payload.replace(/team server/g, "sync service"),
+      });
     });
     return () => {
       void unlisten.then((stop) => stop());
+      void unlistenErrors.then((stop) => stop());
     };
   }, [applyRegistryChange]);
 
@@ -623,7 +636,12 @@ function App() {
           )
         : await setServerEnabled(profileId, serverId, enabled, reviewed);
       applyRegistryChange(next);
+      if (reviewed) setEnableReviewError(null);
     } catch (e) {
+      if (reviewed) {
+        setEnableReviewError(e instanceof Error ? e.message : String(e));
+        throw e;
+      }
       toastError(`Couldn't toggle: ${e}`);
     } finally {
       setBusyId(null);
@@ -634,6 +652,7 @@ function App() {
     if (enabled) {
       const server = servers.find((s) => s.id === serverId);
       if (server && needsTeamEnableReview(server)) {
+        setEnableReviewError(null);
         setConfirmEnableTeam(server);
         return;
       }
@@ -792,7 +811,9 @@ function App() {
                     : view === "catalog"
                       ? "Browse catalog"
                       : view === "teams"
-                        ? "Teams"
+                        ? !registry?.team || isPersonalSync(registry)
+                          ? "Sync"
+                          : "Teams"
                         : view === "settings"
                           ? "Settings"
                           : view === "clients"
@@ -805,7 +826,9 @@ function App() {
                     : view === "catalog"
                       ? "Add MCP servers from the registry"
                       : view === "teams"
-                        ? "Share one MCP server set across your team"
+                        ? !registry?.team || isPersonalSync(registry)
+                          ? "Your setup, on every machine"
+                          : "Share one MCP server set across your team"
                         : view === "settings"
                           ? "Global discovery and security policy"
                           : view === "clients"
@@ -988,6 +1011,7 @@ function App() {
                       onRegistryChange={applyRegistryChange}
                       health={health}
                       onReprobe={() => void reprobeAfterMutation().catch(() => {})}
+                      onOpenServers={() => selectView("servers")}
                     />
                   ) : view === "settings" ? (
                     <SettingsView
@@ -1111,23 +1135,40 @@ function App() {
       <ConfirmDialog
         open={confirmEnableTeam !== null}
         onOpenChange={(open) => {
-          if (!open) setConfirmEnableTeam(null);
+          if (!open) {
+            setEnableReviewError(null);
+            setConfirmEnableTeam(null);
+          }
         }}
         title={
-          confirmEnableTeam ? `Enable "${confirmEnableTeam.name}"?` : "Enable server?"
+          confirmEnableTeam
+            ? `Enable "${visibleExecutionText(confirmEnableTeam.name)}"?`
+            : "Enable server?"
         }
         description={
-          confirmEnableTeam
-            ? secretReferenceReview(confirmEnableTeam).join("\n") +
-              "\n" +
-              (confirmEnableTeam.transport === "stdio" || confirmEnableTeam.command
-                ? `This runs a local command on your machine: ${[confirmEnableTeam.command, ...(confirmEnableTeam.args ?? [])].join(" ")}. Only enable it if you trust your team and recognize this command.`
-                : `This connects Toolport to ${confirmEnableTeam.url ?? ""}, using its saved authentication. Verify the destination before enabling it.`)
-            : undefined
+          confirmEnableTeam ? (
+            <>
+              <Suspense fallback={<p>Loading definition...</p>}>
+                <ExecutionReview
+                  server={confirmEnableTeam}
+                  onReady={setReadyEnableReview}
+                />
+              </Suspense>
+              {enableReviewError && (
+                <p role="alert" className="mt-3 text-destructive">
+                  {enableReviewError}
+                </p>
+              )}
+            </>
+          ) : undefined
         }
+        contentClassName="sm:max-w-2xl"
         confirmLabel="Enable"
+        confirmDisabled={readyEnableReview !== confirmEnableTeam}
         onConfirm={() => {
           if (!confirmEnableTeam) return;
+          if (readyEnableReview !== confirmEnableTeam)
+            throw new Error("Wait for the definition to load before enabling.");
           // Re-check the definition against the one that was reviewed. Team sync runs
           // on a timer, so a push landing while this dialog is open would otherwise
           // enable a command or URL the member never saw - the confirmation carried
@@ -1135,11 +1176,13 @@ function App() {
           // instead of enabling it.
           const live = registry?.servers.find((s) => s.id === confirmEnableTeam.id);
           if (!live) {
+            setEnableReviewError(null);
             setConfirmEnableTeam(null);
             toastError("That server is no longer in your registry.");
             return;
           }
           if (!sameReviewedDefinition(confirmEnableTeam, live)) {
+            setEnableReviewError(null);
             setConfirmEnableTeam(live);
             toastError(
               "This server changed while you were reviewing it. Check it again.",

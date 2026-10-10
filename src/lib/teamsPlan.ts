@@ -18,7 +18,7 @@
 /** People included on the Free plan before a plan is required. New hosted teams are
  * capped here; teams created before the 2026-10 pricing change keep their old limit of 5.
  * Enforced server-side as `FREE_SEATS_LIMIT`. */
-export const TEAMS_FREE_SEATS = 2;
+export const TEAMS_FREE_SEATS = 1;
 
 /** People included in the Team plan before per-person pricing applies. */
 export const TEAMS_TEAM_SEATS = 10;
@@ -41,9 +41,13 @@ export const TEAMS_ANNUAL_PRICE = 190;
 export const TEAMS_TRIAL_DAYS = 14;
 
 /** The free tier, stated the way the pricing page states it. */
-export const TEAMS_FREE_LINE = `Free for ${TEAMS_FREE_SEATS} people. It does not expire and needs no card.`;
+export const TEAMS_FREE_LINE = `Free: ${TEAMS_FREE_SEATS} person, 1 device. No card required.`;
 
 /** The paid tier. Deliberately says what the money buys, because seats alone do not
  * explain it: the plan is a flat price for a whole team, not a per-seat charge. Quoting
  * only the per-person number would read as a seat paywall, which is not what the plan is. */
 export const TEAMS_PAID_LINE = `Team is $${TEAMS_BASE_PRICE}/month (or $${TEAMS_ANNUAL_PRICE}/year) for your whole team, up to ${TEAMS_TEAM_SEATS} people, then $${TEAMS_SEAT_PRICE}/month per additional person (or $${TEAMS_ANNUAL_SEAT_PRICE}/year on annual billing), and adds access control, rate limits, and audit. Same price hosted or self-hosted.`;
+
+export const PRO_MONTHLY_PRICE = 5;
+export const PRO_ANNUAL_PRICE = 48;
+export const PRO_LINE = `Pro is $${PRO_MONTHLY_PRICE}/month or $${PRO_ANNUAL_PRICE}/year for one person on unlimited devices. Try it free for 14 days, no card.`;

@@ -811,6 +811,10 @@ pub fn read_all() -> std::io::Result<Vec<Value>> {
 ///   error-rate numerator)
 pub fn tool_call_ok(entry: &Value) -> Option<bool> {
     let ok = entry.get("ok").and_then(Value::as_bool)?;
+    // Preview builds logged a refused sync change as a failed call.
+    if entry.get("tool").and_then(Value::as_str) == Some("sync_environment_refused") {
+        return None;
+    }
     match entry.get("kind").and_then(Value::as_str) {
         Some(
             "approval" | "routine" | "advisor" | "suggestion" | "candidate" | "telemetry_gap"

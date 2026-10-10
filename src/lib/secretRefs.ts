@@ -34,10 +34,7 @@ export function referenceProvider(reference?: string) {
   return SECRET_PROVIDERS.find((p) => reference?.startsWith(p.scheme));
 }
 
-export function secretReferenceReview(server: import("./types").ServerEntry): string[] {
-  const destination = server.command
-    ? [server.command, ...server.args].join(" ")
-    : server.url || "unknown destination";
+function referenceUses(server: import("./types").ServerEntry) {
   const uses = [
     ...server.env.map((e) => ({ field: `env:${e.key}`, ref: e.source?.ref })),
     ...(server.launch?.inputs ?? []).map((i) => ({
@@ -57,10 +54,28 @@ export function secretReferenceReview(server: import("./types").ServerEntry): st
         ref: bearer.source?.ref,
       });
   }
-  return uses
-    .filter((u) => u.ref)
-    .map(
-      (u) =>
-        `${referenceProvider(u.ref)?.name ?? "Password manager"} entry ${JSON.stringify(u.ref)} will be sent to ${destination} (${u.field})`,
-    );
+  return uses.filter((u): u is { field: string; ref: string } => !!u.ref);
+}
+function referenceLine(ref: string, destination: string, field: string): string {
+  return `${referenceProvider(ref)?.name ?? "Password manager"} entry ${JSON.stringify(ref)} will be sent to ${destination} (${field})`;
+}
+export function secretReferenceReview(server: import("./types").ServerEntry): string[] {
+  const destination = server.command
+    ? [server.command, ...server.args].join(" ")
+    : server.url || "unknown destination";
+  return referenceUses(server).map((u) => referenceLine(u.ref, destination, u.field));
+}
+/** Personal sync review: headers go to the URL, env and inputs to the command.
+ * Arguments are left out because they can hold secret values on this machine. */
+export function referenceDestinationLines(
+  server: import("./types").ServerEntry,
+): string[] {
+  return referenceUses(server)
+    .sort((a, b) => (a.field < b.field ? -1 : a.field > b.field ? 1 : 0))
+    .map((u) => {
+      const [first, second] = u.field.startsWith("header:")
+        ? [server.url, server.command]
+        : [server.command, server.url];
+      return referenceLine(u.ref, first || second || "unknown destination", u.field);
+    });
 }

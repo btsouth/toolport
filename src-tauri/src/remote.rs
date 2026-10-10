@@ -535,7 +535,10 @@ fn credential_update(server_id: &str) -> CredentialUpdate {
         .get_or_init(Mutex::default)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry((crate::registry::conduit_dir(), server_id.to_string()))
+        .entry((
+            crate::registry::conduit_dir(),
+            crate::local_auth::pinned_owner(server_id).unwrap_or_else(|| server_id.to_string()),
+        ))
         .or_default()
         .clone()
 }
@@ -547,6 +550,7 @@ fn credential_update(server_id: &str) -> CredentialUpdate {
 /// A locked/unreadable keychain returns `Err`, even with an in-memory token. Callers
 /// must propagate that storage error, not interpret it as missing auth or force an exchange.
 pub fn current_credential(server_id: &str) -> Result<Option<String>, String> {
+    let _owner = crate::local_auth::pin_personal_owner(server_id)?;
     let update = credential_update(server_id);
     let mut state = update
         .lock()
@@ -1106,12 +1110,16 @@ fn authed_transport(
     let refreshed_during_connect = Arc::new(AtomicBool::new(false));
     let refresh: Option<RefreshFn> = if token.is_some() {
         let sid = server_id.to_string();
+        let owner = crate::local_auth::pinned_owner(server_id);
         // Keep the proactive deadline in memory. This avoids a keychain read on
         // every tool call while still updating the deadline after each refresh.
         let next_refresh_at = Arc::clone(&next_refresh_at);
         let credential_update = Arc::clone(&credential_update);
         let refreshed_during_connect = Arc::clone(&refreshed_during_connect);
         Some(Box::new(move |force, rejected| {
+            let _owner = owner
+                .as_ref()
+                .map(|owner| crate::local_auth::pin_credential_owner(&sid, owner));
             let deadline = *next_refresh_at
                 .lock()
                 .map_err(|_| "OAuth refresh deadline lock poisoned".to_string())?;
@@ -1180,9 +1188,13 @@ fn authed_transport(
     {
         let sid = server_id.to_string();
         let resource = url.to_string();
+        let owner = crate::local_auth::pinned_owner(server_id);
         let next_refresh_at = Arc::clone(&next_refresh_at);
         let credential_update = Arc::clone(&credential_update);
         Some(Box::new(move |scope| {
+            let _owner = owner
+                .as_ref()
+                .map(|owner| crate::local_auth::pin_credential_owner(&sid, owner));
             let mut update = credential_update
                 .lock()
                 .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
@@ -1353,6 +1365,8 @@ pub fn connect_remote_classified(
     progress: Option<ProgressSink>,
     change_dirty: Option<Arc<AtomicU8>>,
 ) -> Result<DownstreamServer, crate::call_failure::CallFailure> {
+    let _destination =
+        crate::local_auth::pin_http_destination(&server.id, server.url.as_deref().unwrap_or(""))?;
     let (resolved, header_values) =
         crate::secret_refs::resolve_connection(server).map_err(|e| e.to_string())?;
     let server = &resolved;

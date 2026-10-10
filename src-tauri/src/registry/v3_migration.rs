@@ -84,6 +84,7 @@ pub(super) fn migrate_v2_to_v3(value: &mut Value, _: &MigrationContext) -> Resul
     );
     document.insert("defaultAccessLegacyPolicy".into(), Value::Bool(true));
     document.insert("accessUpgradeNoticeDismissed".into(), Value::Bool(false));
+    document.insert("accessUpgradeNoticePending".into(), Value::Bool(true));
     if active_set != union || active_missing {
         document.insert("defaultAccessProfileId".into(), Value::String(active));
     } else {
@@ -165,6 +166,10 @@ mod tests {
         assert_eq!(value, original);
     }
 
+    #[test]
+    fn new_install_does_not_show_an_upgrade_notice() {
+        assert!(!crate::registry::Registry::default().access_upgrade_notice_pending());
+    }
     #[test]
     fn access_review_upgrade_notice_dismissal_survives_reload() {
         let dir = std::env::temp_dir().join(format!(

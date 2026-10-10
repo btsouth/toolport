@@ -69,6 +69,12 @@ import {
 
 /** A badge describing one security event by kind. */
 function eventBadge(e: SecurityEvent): { label: string; cls: string } {
+  if (e.type === "sync_change_refused") {
+    return {
+      label: "synced change blocked",
+      cls: "bg-destructive/15 text-destructive",
+    };
+  }
   if (e.type === "result_injection_blocked") {
     return {
       label: "injection blocked",
@@ -424,6 +430,11 @@ function SecurityNotices({
                       <X className="size-3.5" />
                     </button>
                   </div>
+                  {e.detail && (
+                    <p className="ml-1 max-w-2xl text-[11px] leading-relaxed break-words text-muted-foreground">
+                      {e.detail}
+                    </p>
+                  )}
                   {e.evidence && (
                     <p className="ml-1 max-w-2xl border-l-2 border-warning/40 pl-2 font-mono text-[11px] leading-relaxed break-words text-muted-foreground">
                       <span className="mr-1 select-none font-sans text-muted-foreground/70">

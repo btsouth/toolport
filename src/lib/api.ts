@@ -64,6 +64,8 @@ export interface SecurityEvent {
    * flag is verifiable instead of an opaque label. Absent when no direct phrase matched
    * (e.g. an encoded payload) or on events written before evidence was captured. */
   evidence?: string;
+  /** For sync_change_refused: the full explanation shown to the user. */
+  detail?: string;
   /** "high" = loud/actionable (poison, destructive-tool change, safety-annotation
    * downgrade); "warn" = a read-only/definition-content change that the app shows on
    * the actionable tier and quarantine-on-drift blocks; "info" = cosmetic churn for
@@ -450,6 +452,11 @@ export function teamJoinPoll(
 }
 
 /** Pull the latest team config and re-merge it (no-op if unchanged). */
+/** Pair this machine again with its own sync account after its sign-in went missing. */
+export function reconnectSync(): Promise<void> {
+  return invoke<void>("reconnect_sync");
+}
+
 export function teamSync(): Promise<Registry> {
   return invoke<Registry>("team_sync");
 }

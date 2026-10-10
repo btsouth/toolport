@@ -162,7 +162,7 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow) {
     let choose_mcp = gtk::Button::with_label("Set up MCP servers");
     choose_mcp.add_css_class("suggested-action");
     welcome_actions.append(&choose_mcp);
-    let choose_team = gtk::Button::with_label("Join a team");
+    let choose_team = gtk::Button::with_label("Sign in to sync");
     choose_team.add_css_class("toolport-secondary-action");
     welcome_actions.append(&choose_team);
     welcome.append(&welcome_actions);
@@ -451,9 +451,14 @@ fn render_clients(list: &gtk::Box, feedback: &gtk::Label, snapshot: ClientSnapsh
                 };
                 let list = list.clone();
                 let feedback = feedback.clone();
-                super::setup::connect(&parent, client_id.clone(), None, false, move || {
-                    load_clients(&list, &feedback)
-                }, None);
+                super::setup::connect(
+                    &parent,
+                    client_id.clone(),
+                    None,
+                    false,
+                    move || load_clients(&list, &feedback),
+                    None,
+                );
             });
             row.append(&connect);
         }

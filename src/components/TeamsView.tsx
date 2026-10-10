@@ -1,4 +1,6 @@
 import { secretReferenceReview } from "@/lib/secretRefs";
+import { PersonalSyncView } from "./PersonalSyncView";
+import { isPersonalSync } from "@/lib/personalSync";
 import { TeamSharePreview } from "./TeamSharePreview";
 import { teamShareAction } from "@/lib/teamShare";
 import { useEffect, useState } from "react";
@@ -89,11 +91,13 @@ export function TeamsView({
   onRegistryChange,
   health = {},
   onReprobe,
+  onOpenServers,
 }: {
   registry: Registry | null;
   onRegistryChange: (r: Registry) => void;
   health?: Record<string, ProbeResult>;
   onReprobe?: () => void;
+  onOpenServers?: () => void;
 }) {
   const team = registry?.team ?? null;
   const teamKey = team ? `${team.serverUrl}:${team.teamId}` : null;
@@ -534,6 +538,15 @@ export function TeamsView({
     );
   }
 
+  if (!team || isPersonalSync(registry)) {
+    return (
+      <PersonalSyncView
+        registry={registry}
+        onRegistryChange={onRegistryChange}
+        onOpenServers={onOpenServers}
+      />
+    );
+  }
   return (
     // The connected view is a single column of cards and stays narrow. The
     // disconnected one runs two lanes side by side, which needs the extra width to
@@ -544,9 +557,9 @@ export function TeamsView({
         <h2 className="text-base font-semibold">Toolport Teams</h2>
       </div>
 
-      {error && (
+      {(error || team?.accountStatusError) && (
         <Callout variant="danger" className="mb-4">
-          {error}
+          {error || team?.accountStatusError}
         </Callout>
       )}
       {skipNote && (

@@ -397,20 +397,9 @@ try:
  assert 'Synthetic success' in json.dumps(result),result
 finally:p.terminate();p.wait(timeout=10)
 "#;
-    let output = Command::new("python3")
-        .args([
-            "-c",
-            client,
-            &std::env::var("ACTIVATION_GATEWAY").expect("set the candidate gateway path"),
-        ])
-        .env("TOOLPORT_DATA_DIR", &dir)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let output = Command::new("python3").args(["-c", client, &std::env::var("ACTIVATION_GATEWAY").expect("set the candidate gateway path")])
+        .env("TOOLPORT_DATA_DIR", &dir).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     teams::sync_now().unwrap();
     let activation: Value = conduit_lib::http_client::agent()
         .get(&format!("{api}/teams/{team}/activation"))

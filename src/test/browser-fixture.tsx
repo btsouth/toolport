@@ -156,6 +156,32 @@ if (memberReviewFixture) {
   } as NonNullable<Registry["team"]>;
 }
 
+const personalFixture = new URLSearchParams(location.search).get("personal-sync");
+if (personalFixture && personalFixture !== "setup") {
+  registry.team = {
+    serverUrl: "https://teams.toolport.app",
+    teamId: "personal-fixture",
+    role: "admin",
+    lastVersion: 3,
+    accountStatus: {
+      personalSync: true,
+      plan: personalFixture === "trial" ? "pro" : "free",
+      trialActive: personalFixture === "trial",
+      trialEndsAt: Date.now() + 7 * 86400000,
+      freeSyncGraceEndsAt: personalFixture === "grace" ? Date.now() + 2 * 86400000 : null,
+      deviceId: "fixture",
+      canReceiveConfig: personalFixture !== "blocked",
+      reason:
+        personalFixture === "blocked"
+          ? "Choose this device in Your account to resume sync."
+          : null,
+    },
+    personalSyncState: {
+      lastSyncedAt: Date.now(),
+      error: personalFixture === "blocked" ? "Sync is paused on this device" : null,
+    },
+  };
+}
 const approvalFixture = new URLSearchParams(location.search).has("approvals");
 const sessionFixture = new URLSearchParams(location.search).has("sessions");
 const callerFixture = new URLSearchParams(location.search).has("caller-names");
@@ -849,7 +875,7 @@ if (new URLSearchParams(location.search).has("logos")) {
       ))}
     </main>,
   );
-} else if (memberReviewFixture) {
+} else if (memberReviewFixture || personalFixture) {
   function ReviewFixture() {
     const [current, setCurrent] = useState(registry);
     return (

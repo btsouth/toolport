@@ -865,6 +865,10 @@ impl ServerEntry {
         if crate::secret_refs::is_shared(self) && crate::secret_refs::has_references(self) {
             return true;
         }
+        if self.unknown_fields.get("personalSyncEntry") == Some(&serde_json::Value::Bool(true)) {
+            return self.unknown_fields.get("teamEnableReview")
+                == Some(&serde_json::Value::Bool(true));
+        }
         let Some(src) = self.source.as_deref() else {
             return false;
         };
@@ -2225,6 +2229,8 @@ impl Registry {
 
     pub fn access_upgrade_notice_pending(&self) -> bool {
         self.version >= 3
+            && self.unknown_fields.get("accessUpgradeNoticePending")
+                == Some(&serde_json::Value::Bool(true))
             && self.unknown_fields.get("accessUpgradeNoticeDismissed")
                 != Some(&serde_json::Value::Bool(true))
     }
@@ -2363,6 +2369,17 @@ impl Registry {
             .find(|p| p.id == profile_id)
             .map(|p| p.enabled_server_ids.iter().any(|s| s == server_id))
             .unwrap_or(false)
+    }
+
+    /// The switch the Servers page shows, as React's `isEnabled` reads it. In v3
+    /// it is global and the legacy active profile's list can be stale, so asking
+    /// `is_enabled(active_profile_id())` there is wrong.
+    pub fn enabled_here(&self, server_id: &str) -> bool {
+        if self.version >= 3 {
+            self.server_enabled(server_id)
+        } else {
+            self.is_enabled(&self.active_profile_id(), server_id)
+        }
     }
 
     /// Toggle the user's global switch in v3, or legacy profile membership in v1/v2.
@@ -4461,8 +4478,16 @@ pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
     validate_server_launches(registry)?;
     let mut registry = registry.clone();
     registry.sync_legacy_safety_mirror();
-    let json = serde_json::to_string_pretty(&registry).map_err(|e| e.to_string())?;
+    if let Some(state) = registry
+        .team
+        .as_mut()
+        .and_then(|t| t.unknown_fields.get_mut("personalSyncState"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        state.remove("lastSyncedAt");
+    }
     let value = serde_json::to_value(&registry).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
     write_registry_document(path, &json, &value)
 }
 
@@ -4558,7 +4583,9 @@ fn write_registry_document(
 }
 
 pub fn load() -> Result<Registry, String> {
-    load_resolved()
+    let mut registry = load_resolved()?;
+    crate::personal_sync::attach_status(&mut registry);
+    Ok(registry)
 }
 
 pub fn save(registry: &Registry) -> Result<(), String> {
@@ -4723,7 +4750,9 @@ pub fn update<T>(
     let path = resolved_path().ok_or("Could not resolve registry path")?;
     let lock = lock_for(&path, registry_lock_timeout())?;
     let mut reg = load_from_locked(&path, &lock)?;
+    let before = reg.clone();
     let out = f(&mut reg)?;
+    crate::personal_sync::record(&before, &mut reg)?;
     // Save to the exact path we locked and loaded. Re-resolving after `f` would let a
     // runtime env override change redirect this write to a different, unlocked registry.
     save_to(&path, &reg)?;
@@ -4743,7 +4772,9 @@ pub fn update_authoritative<T>(
     if !source.is_authoritative() {
         return Err("Registry contents are not authoritative; refusing filesystem changes".into());
     }
+    let before = reg.clone();
     let out = f(&mut reg)?;
+    crate::personal_sync::record(&before, &mut reg)?;
     save_to(&path, &reg)?;
     Ok((reg, out))
 }
@@ -4771,7 +4802,9 @@ pub fn update_at<T>(
 ) -> Result<(Registry, T), String> {
     let lock = lock_for(path, registry_lock_timeout())?;
     let mut reg = load_from_locked(path, &lock)?;
+    let before = reg.clone();
     let out = f(&mut reg)?;
+    crate::personal_sync::record(&before, &mut reg)?;
     save_to(path, &reg)?;
     Ok((reg, out))
 }
@@ -5715,6 +5748,27 @@ pub(crate) mod tests {
         assert!(!r.is_tool_allowed(&new_key));
         assert!(!r.injection_block_exempt.contains_key(&sanitized_id));
         assert!(!r.result_budgets.contains_key(&sanitized_id));
+    }
+
+    #[test]
+    fn enabled_here_follows_the_switch_not_a_stale_legacy_profile() {
+        let mut r = Registry::default();
+        let id = r.add_server(sample_server("github"));
+        let legacy = r.active_profile_id();
+        r.set_server_enabled(&legacy, &id, true).unwrap();
+        // v3 enables globally, so the legacy profile list never gains the id.
+        assert!(!r.is_enabled(&legacy, &id));
+        assert!(r.enabled_here(&id));
+        r.set_server_enabled(&legacy, &id, false).unwrap();
+        assert!(!r.enabled_here(&id));
+
+        let mut old = Registry::default();
+        old.version = 2;
+        let id = old.add_server(sample_server("files"));
+        old.set_server_enabled(&legacy, &id, true).unwrap();
+        assert!(old.enabled_here(&id));
+        old.profiles[0].enabled_server_ids.clear();
+        assert!(!old.enabled_here(&id));
     }
 
     #[test]

@@ -27,6 +27,7 @@ const AUTH_LOCK_POLL_MS: u64 = 250;
 
 pub(crate) struct AuthMutationLock {
     path: std::path::PathBuf,
+    _personal_owner: Option<crate::local_auth::OwnerPin>,
 }
 
 impl Drop for AuthMutationLock {
@@ -101,6 +102,7 @@ fn try_acquire_auth_lock(path: &Path) -> Result<Option<AuthMutationLock>, String
                 .map_err(|error| format!("could not write auth mutation lock file: {error}"))?;
             Ok(Some(AuthMutationLock {
                 path: path.to_path_buf(),
+                _personal_owner: None,
             }))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -132,6 +134,7 @@ fn try_acquire_auth_lock(path: &Path) -> Result<Option<AuthMutationLock>, String
                 .map_err(|error| format!("could not flush auth mutation lock file: {error}"))?;
             Ok(Some(AuthMutationLock {
                 path: path.to_path_buf(),
+                _personal_owner: None,
             }))
         }
         Err(error) => Err(format!("could not create auth mutation lock file: {error}")),
@@ -139,7 +142,10 @@ fn try_acquire_auth_lock(path: &Path) -> Result<Option<AuthMutationLock>, String
 }
 
 pub(crate) fn acquire_auth_lock(server_id: &str) -> Result<AuthMutationLock, String> {
-    acquire_auth_owner_lock(&crate::local_auth::owner(server_id)?)
+    let pin = crate::local_auth::pin_personal_owner(server_id)?;
+    let mut lock = acquire_auth_owner_lock(&crate::local_auth::owner(server_id)?)?;
+    lock._personal_owner = pin;
+    Ok(lock)
 }
 
 /// Handoffs lock both raw namespaces before changing ownership, outside the registry lock.
@@ -162,6 +168,7 @@ pub(crate) fn acquire_auth_owner_lock(owner: &str) -> Result<AuthMutationLock, S
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerFields {
+    pub sync_local_only: bool,
     pub name: String,
     pub transport: String,
     pub command: Option<String>,
@@ -382,7 +389,11 @@ fn entry_from_fields(fields: ServerFields) -> Result<ServerEntry, String> {
         request_timeout_ms: None,
         initialize_timeout_ms: None,
         launch: None,
-        unknown_fields: serde_json::Map::new(),
+        unknown_fields: if fields.sync_local_only {
+            serde_json::Map::from_iter([("syncLocalOnly".into(), serde_json::json!(true))])
+        } else {
+            serde_json::Map::new()
+        },
     })
 }
 
@@ -871,6 +882,7 @@ pub fn add_snippet_servers_inputs(
             continue;
         }
         let entry = entry_from_fields(ServerFields {
+            sync_local_only: false,
             name: server.name,
             transport: server.transport,
             command: server.command,
@@ -940,6 +952,105 @@ pub fn add_catalog_entry(entry: crate::catalog::CatalogEntry) -> Result<Registry
 pub fn update_server_fields(server_id: &str, fields: ServerFields) -> Result<Registry, String> {
     let (registry, ()) =
         registry::update(|registry| apply_update_server_fields(registry, server_id, fields))?;
+    Ok(registry)
+}
+
+/// A plain (nonsecret) environment value as edited in a server editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainEnvEdit {
+    pub key: String,
+    pub value: String,
+    /// Set only when the user chose. Otherwise personal sync's own default
+    /// decides, so an untouched old value keeps its current behavior.
+    pub local_only: Option<bool>,
+}
+
+/// Replaces the server's plain environment values with `edits`. Secret and
+/// password manager entries are left alone; they are edited in Credentials.
+/// Existing plain entries keep their newer fields when their key stays.
+pub fn apply_plain_env(server: &mut ServerEntry, edits: Vec<PlainEnvEdit>) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut plain = Vec::new();
+    for edit in edits {
+        let key = edit.key.trim().to_string();
+        if key.is_empty() && edit.value.trim().is_empty() {
+            continue;
+        }
+        if key.is_empty() {
+            return Err("give each environment value a name".into());
+        }
+        if key.contains(|c: char| c == '=' || c == '\0' || c.is_whitespace()) {
+            return Err(format!("{key} is not a valid environment variable name"));
+        }
+        if !seen.insert(key.clone()) {
+            return Err(format!("{key} is listed more than once"));
+        }
+        if server.env.iter().any(|e| e.key == key && is_vaulted(e)) {
+            return Err(format!(
+                "{key} is a stored credential. Change it in Credentials."
+            ));
+        }
+        let mut entry = server
+            .env
+            .iter()
+            .find(|e| e.key == key && !is_vaulted(e))
+            .cloned()
+            .unwrap_or(crate::registry::EnvVar {
+                key: key.clone(),
+                value: None,
+                secret: false,
+                unknown_fields: serde_json::Map::new(),
+            });
+        entry.value = (!edit.value.is_empty()).then_some(edit.value);
+        if let Some(local_only) = edit.local_only {
+            if !local_only && crate::personal_sync::risky_sync_env(&key) {
+                return Err(format!(
+                    "{key} changes how programs run, so it stays on this machine."
+                ));
+            }
+            entry
+                .unknown_fields
+                .insert("portable".into(), serde_json::json!(!local_only));
+        }
+        plain.push(entry);
+    }
+    // Keep existing entries where they were so an unchanged list stays equal.
+    let mut env = Vec::with_capacity(server.env.len() + plain.len());
+    for existing in std::mem::take(&mut server.env) {
+        if is_vaulted(&existing) {
+            env.push(existing);
+        } else if let Some(at) = plain.iter().position(|e| e.key == existing.key) {
+            env.push(plain.remove(at));
+        }
+    }
+    env.extend(plain);
+    server.env = env;
+    Ok(())
+}
+
+fn is_vaulted(entry: &crate::registry::EnvVar) -> bool {
+    entry.secret || entry.unknown_fields.contains_key("source")
+}
+
+/// Saves the editor's fields and, when given, its plain environment values in
+/// one registry write.
+pub fn update_server_fields_and_env(
+    server_id: &str,
+    fields: ServerFields,
+    env: Option<Vec<PlainEnvEdit>>,
+) -> Result<Registry, String> {
+    let (registry, ()) = registry::update(|registry| {
+        apply_update_server_fields(registry, server_id, fields)?;
+        if let Some(env) = env {
+            let server = registry
+                .servers
+                .iter_mut()
+                .find(|server| server.id == server_id)
+                .ok_or_else(|| format!("No server with id '{server_id}'"))?;
+            apply_plain_env(server, env)?;
+        }
+        Ok(())
+    })?;
     Ok(registry)
 }
 
@@ -2432,6 +2543,24 @@ pub fn has_client_secret(server_id: &str) -> Result<bool, String> {
     Ok(crate::secrets::get_secret_result(server_id, crate::secrets::CLIENT_SECRET_KEY)?.is_some())
 }
 
+fn client_credentials_edit_owner(reg: &Registry, id: &str) -> Result<String, String> {
+    let owner = crate::local_auth::owner_in(reg, id)?;
+    // A managed alias still edits its personal original. A random personal-sync
+    // vault owner or URL-specific namespace is the server's own authentication.
+    if reg
+        .unknown_fields
+        .get("localTeamAuthentication")
+        .and_then(|v| v.get(id))
+        .is_some()
+        && owner != id
+    {
+        return Err(
+            "Edit the personal original to change the shared local sign-in configuration.".into(),
+        );
+    }
+    Ok(owner)
+}
+
 pub fn set_client_credentials(
     server_id: &str,
     client_id: &str,
@@ -2440,11 +2569,9 @@ pub fn set_client_credentials(
     scope: Option<&str>,
 ) -> Result<Registry, String> {
     let _mutation = acquire_auth_lock(server_id)?;
-    if crate::local_auth::owner(server_id)? != server_id {
-        return Err(
-            "Edit the personal original to change the shared local sign-in configuration.".into(),
-        );
-    }
+    let current = read_registry_exact()?;
+    let owner = client_credentials_edit_owner(&current, server_id)?;
+    let _owner_pin = crate::local_auth::pin_credential_owner(server_id, &owner);
     let client_id = client_id.trim().to_string();
     if client_id.is_empty() {
         return Err("a client id is required for client-credentials auth".into());
@@ -2466,7 +2593,6 @@ pub fn set_client_credentials(
             ));
         }
     }
-    let current = read_registry_exact()?;
     if !current.servers.iter().any(|server| server.id == server_id) {
         return Err(format!("no server with id {server_id:?}"));
     }
@@ -2476,6 +2602,9 @@ pub fn set_client_credentials(
     }
     crate::remote::reset_client_credentials(server_id)?;
     let (registry, ()) = registry::update(|registry| {
+        if client_credentials_edit_owner(registry, server_id)? != owner {
+            return Err("The destination changed. Review authentication again.".into());
+        }
         let Some(server) = registry
             .servers
             .iter_mut()
@@ -2502,13 +2631,14 @@ pub fn set_client_credentials(
 
 pub fn clear_client_credentials(server_id: &str) -> Result<Registry, String> {
     let _mutation = acquire_auth_lock(server_id)?;
-    if crate::local_auth::owner(server_id)? != server_id {
-        return Err(
-            "Edit the personal original to change the shared local sign-in configuration.".into(),
-        );
-    }
+    let current = read_registry_exact()?;
+    let owner = client_credentials_edit_owner(&current, server_id)?;
+    let _owner_pin = crate::local_auth::pin_credential_owner(server_id, &owner);
     crate::remote::reset_client_credentials(server_id)?;
     let (registry, ()) = registry::update(|registry| {
+        if client_credentials_edit_owner(registry, server_id)? != owner {
+            return Err("The destination changed. Review authentication again.".into());
+        }
         let Some(server) = registry
             .servers
             .iter_mut()
@@ -2545,9 +2675,23 @@ pub fn apply_secret_declaration(
         .iter_mut()
         .find(|server| server.id == server_id)
         .ok_or_else(|| format!("No server with id '{server_id}'"))?;
-    if let Some(overrides) = server.unknown_fields.get_mut("memberSecretRefs").and_then(serde_json::Value::as_object_mut) { overrides.remove(&format!("env:{key}")); overrides.remove(&format!("header:{key}")); }
-    if let Some(header) = server.unknown_fields.get_mut("headerKeys").and_then(serde_json::Value::as_array_mut).and_then(|hs| hs.iter_mut().find(|h| h["key"] == key)) {
-        if let Some(object) = header.as_object_mut() { object.remove("source"); }
+    if let Some(overrides) = server
+        .unknown_fields
+        .get_mut("memberSecretRefs")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        overrides.remove(&format!("env:{key}"));
+        overrides.remove(&format!("header:{key}"));
+    }
+    if let Some(header) = server
+        .unknown_fields
+        .get_mut("headerKeys")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|hs| hs.iter_mut().find(|h| h["key"] == key))
+    {
+        if let Some(object) = header.as_object_mut() {
+            object.remove("source");
+        }
         registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
         return Ok(());
     }
@@ -2578,7 +2722,14 @@ pub fn apply_secret_removal(
         .iter_mut()
         .find(|server| server.id == server_id)
         .ok_or_else(|| format!("No server with id '{server_id}'"))?;
-    if let Some(overrides) = server.unknown_fields.get_mut("memberSecretRefs").and_then(serde_json::Value::as_object_mut) { overrides.remove(&format!("env:{key}")); overrides.remove(&format!("header:{key}")); }
+    if let Some(overrides) = server
+        .unknown_fields
+        .get_mut("memberSecretRefs")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        overrides.remove(&format!("env:{key}"));
+        overrides.remove(&format!("header:{key}"));
+    }
     server.env.retain(|entry| entry.key != key);
     registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
     Ok(())
@@ -2806,7 +2957,13 @@ pub fn apply_launch_secret_generation(
         .iter_mut()
         .find(|server| server.id == server_id)
         .ok_or_else(|| format!("No server with id '{server_id}'"))?;
-    if let Some(overrides) = server.unknown_fields.get_mut("memberSecretRefs").and_then(serde_json::Value::as_object_mut) { overrides.remove(&format!("input:{key}")); }
+    if let Some(overrides) = server
+        .unknown_fields
+        .get_mut("memberSecretRefs")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        overrides.remove(&format!("input:{key}"));
+    }
     if !server.launch.as_ref().is_some_and(|launch| {
         launch
             .inputs
@@ -2815,7 +2972,13 @@ pub fn apply_launch_secret_generation(
     }) {
         return Err("not a declared secret launch input".into());
     }
-    if let Some(input) = server.launch.as_mut().and_then(|l| l.inputs.iter_mut().find(|i| i.key == key)) { input.unknown_fields.remove("source"); }
+    if let Some(input) = server
+        .launch
+        .as_mut()
+        .and_then(|l| l.inputs.iter_mut().find(|i| i.key == key))
+    {
+        input.unknown_fields.remove("source");
+    }
     registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
     Ok(())
 }
@@ -2838,6 +3001,17 @@ pub fn apply_server_enabled(
     if enabled && crate::teams::server_change_held(registry, server_id) {
         return Err("Review this change in Teams before enabling it.".into());
     }
+    if enabled
+        && registry
+            .servers
+            .iter()
+            .any(|s| s.id == server_id && !crate::personal_sync::missing_secret_args(s).is_empty())
+    {
+        return Err(
+            "Edit this server and enter its secret argument on this machine before enabling it."
+                .into(),
+        );
+    }
     if !enabled {
         crate::teams::remember_held_disable(registry, profile_id, server_id)?;
     }
@@ -2857,6 +3031,36 @@ pub fn apply_server_enabled(
             if reviewed {
                 crate::secret_refs::approve_server(server).map_err(|e| e.to_string())?;
             }
+        }
+    }
+    if crate::personal_sync::is_personal(registry) {
+        if let Some(server) = registry.servers.iter_mut().find(|s| s.id == server_id) {
+            server.unknown_fields.insert(
+                "personalSyncDesiredEnabled".into(),
+                serde_json::json!(enabled),
+            );
+        }
+    }
+    if enabled && reviewed && crate::personal_sync::is_personal(registry) {
+        if let Some(server) = registry.servers.iter_mut().find(|s| s.id == server_id) {
+            server.unknown_fields.remove("teamEnableReview");
+            server.unknown_fields.remove("personalSyncArgsReview");
+            // Approving kept local arguments covers the synced layout that could
+            // not be matched, so the next poll does not hold the server again.
+            if let Some(incoming) = server.unknown_fields.remove("personalSyncArgsIncoming") {
+                server
+                    .unknown_fields
+                    .insert("personalSyncArgsApproved".into(), incoming);
+            }
+            let identity =
+                crate::personal_sync::command_identity(&crate::personal_sync::export(server));
+            let fields = crate::personal_sync::execution_review_fields(server);
+            server
+                .unknown_fields
+                .insert("syncExecutionReview".into(), serde_json::json!(fields));
+            server
+                .unknown_fields
+                .insert("syncCommandConsent".into(), identity);
         }
     }
     if registry.version >= 3 {
@@ -2894,7 +3098,7 @@ pub fn set_server_enabled_after_reference_review(
             .iter()
             .find(|s| s.id == reviewed.id)
             .ok_or("Server no longer exists")?;
-        crate::secret_refs::check_reviewed_definition(current, Some(reviewed))?;
+        crate::personal_sync::check_review(registry, current, Some(reviewed))?;
         apply_server_enabled(registry, profile_id, &reviewed.id, true, true)
     })?;
     Ok(registry)
@@ -3030,6 +3234,42 @@ mod tests {
         )
     }
 
+    #[test]
+    fn personal_sync_client_credentials_work_for_received_and_changed_urls() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut reg = Registry::default();
+            reg.team = Some(serde_json::from_value(serde_json::json!({"serverUrl":"https://example.com","teamId":"solo","role":"admin","accountStatus":{"personalSync":true}})).unwrap());
+            crate::personal_sync::apply(&mut reg, &serde_json::json!({"servers":[{"id":"received","name":"Received","transport":"http","url":"https://first.example/mcp"}]}), 1).unwrap();
+            let id = reg.servers[0].id.clone();
+            registry::save(&reg).unwrap();
+            assert_ne!(crate::local_auth::owner(&id).unwrap(), id);
+            set_client_credentials(&id, "client", Some("first-secret".into()), None, None).unwrap();
+            assert!(has_client_secret(&id).unwrap());
+            clear_client_credentials(&id).unwrap();
+            assert!(!has_client_secret(&id).unwrap());
+            set_client_credentials(&id, "client", Some("first-secret".into()), None, None).unwrap();
+            crate::personal_sync::remote_update(|| {
+                registry::update(|r| {
+                    r.servers[0].url = Some("https://second.example/mcp".into());
+                    Ok(())
+                })
+            })
+            .unwrap();
+            assert!(!has_client_secret(&id).unwrap());
+            set_client_credentials(&id, "other", Some("second-secret".into()), None, None).unwrap();
+            assert!(has_client_secret(&id).unwrap());
+            clear_client_credentials(&id).unwrap();
+            assert!(!has_client_secret(&id).unwrap());
+            crate::personal_sync::remote_update(|| {
+                registry::update(|r| {
+                    r.servers[0].url = Some("https://first.example/mcp".into());
+                    Ok(())
+                })
+            })
+            .unwrap();
+            assert!(has_client_secret(&id).unwrap());
+        });
+    }
     #[test]
     fn reviewed_bulk_import_shows_unsupported_and_uses_storage_choices() {
         let fixture = MoveFixture::new(&Registry::default());
@@ -4160,6 +4400,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn plain_env_edits_keep_credentials_order_and_unchosen_sync_flags() {
+        let mut entry = server("plain");
+        entry.env = serde_json::from_value(serde_json::json!([
+            {"key":"TOKEN","secret":true},
+            {"key":"REGION","secret":false,"value":"west","portable":true,"extra":1},
+            {"key":"OLD","secret":false,"value":"x"},
+            {"key":"OP","secret":true,"source":{"ref":"op://v/i/f"}}
+        ]))
+        .unwrap();
+        let edit = |key: &str, value: &str, local_only| PlainEnvEdit {
+            key: key.into(),
+            value: value.into(),
+            local_only,
+        };
+        apply_plain_env(
+            &mut entry,
+            vec![
+                edit(" REGION ", "east", None),
+                edit("MODE", "fast", Some(true)),
+                edit("", "", None),
+            ],
+        )
+        .unwrap();
+        let env = serde_json::to_value(&entry.env).unwrap();
+        assert_eq!(
+            env,
+            serde_json::json!([
+                {"key":"TOKEN","secret":true},
+                {"key":"REGION","secret":false,"value":"east","portable":true,"extra":1},
+                {"key":"OP","secret":true,"source":{"ref":"op://v/i/f"}},
+                {"key":"MODE","secret":false,"value":"fast","portable":false}
+            ])
+        );
+        // Saving the same list again changes nothing.
+        let before = entry.env.clone();
+        apply_plain_env(
+            &mut entry,
+            vec![edit("REGION", "east", None), edit("MODE", "fast", None)],
+        )
+        .unwrap();
+        assert_eq!(entry.env, before);
+    }
+
+    #[test]
+    fn plain_env_edits_refuse_bad_names_credentials_and_portable_overrides() {
+        let mut entry = server("plain");
+        entry.env = serde_json::from_value(serde_json::json!([{"key":"TOKEN","secret":true}]))
+            .unwrap();
+        let before = entry.env.clone();
+        for (key, local_only) in [
+            ("BAD NAME", None),
+            ("A=B", None),
+            ("TOKEN", None),
+            ("NODE_OPTIONS", Some(false)),
+        ] {
+            let edits = vec![PlainEnvEdit {
+                key: key.into(),
+                value: "v".into(),
+                local_only,
+            }];
+            assert!(apply_plain_env(&mut entry, edits).is_err(), "{key} accepted");
+        }
+        let dup = |key: &str| PlainEnvEdit {
+            key: key.into(),
+            value: "v".into(),
+            local_only: None,
+        };
+        assert!(apply_plain_env(&mut entry, vec![dup("X"), dup("X")]).is_err());
+        assert!(apply_plain_env(&mut entry, vec![dup("")]).is_err());
+        assert_eq!(entry.env, before);
+    }
+
     fn server(id: &str) -> ServerEntry {
         ServerEntry {
             enabled: false,
@@ -4184,6 +4497,7 @@ mod tests {
 
     fn fields(name: &str, transport: &str) -> ServerFields {
         ServerFields {
+            sync_local_only: false,
             name: name.into(),
             transport: transport.into(),
             command: (transport == "stdio").then(|| "npx".into()),
@@ -4478,6 +4792,7 @@ mod tests {
         });
         registry.servers.push(existing);
         let same = ServerFields {
+            sync_local_only: false,
             name: "Renamed".into(),
             transport: "stdio".into(),
             command: Some("npx".into()),
@@ -4520,6 +4835,7 @@ mod tests {
                 registry,
                 "one",
                 ServerFields {
+                    sync_local_only: false,
                     name: "Broken".into(),
                     transport: "http".into(),
                     command: None,
@@ -5374,14 +5690,29 @@ pub fn apply_secret_reference(
     reference: &str,
 ) -> Result<(), String> {
     let key = normalize_secret_key(key)?;
+    let personal = crate::personal_sync::is_personal(reg);
     let server = reg
         .servers
         .iter_mut()
         .find(|s| s.id == server_id)
         .ok_or("Server not found")?;
     crate::secret_refs::check_policy(server, reference).map_err(|e| e.to_string())?;
-    let location = if server.launch.iter().flat_map(|l| &l.inputs).any(|i| i.key == key) { "input" }
-        else if crate::secret_refs::headers(server).map_err(|e| e.to_string())?.iter().any(|h| h.key == key) { "header" } else { "env" };
+    let location = if server
+        .launch
+        .iter()
+        .flat_map(|l| &l.inputs)
+        .any(|i| i.key == key)
+    {
+        "input"
+    } else if crate::secret_refs::headers(server)
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|h| h.key == key)
+    {
+        "header"
+    } else {
+        "env"
+    };
     if let Some(input) = server
         .launch
         .as_mut()
@@ -5416,8 +5747,21 @@ pub fn apply_secret_reference(
             .insert("source".into(), serde_json::json!({"ref": reference}));
     }
     crate::secret_refs::validate_server(server).map_err(|e| e.to_string())?;
-    if crate::secret_refs::is_shared(server) {
-        let overrides = server.unknown_fields.entry("memberSecretRefs").or_insert_with(|| serde_json::json!({}));
+    if personal {
+        // Every machine on a personal account is the owner's, so the reference
+        // is the synced definition, not a local override that export holds back.
+        if let Some(overrides) = server
+            .unknown_fields
+            .get_mut("memberSecretRefs")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            overrides.remove(&format!("{location}:{key}"));
+        }
+    } else if crate::secret_refs::is_shared(server) {
+        let overrides = server
+            .unknown_fields
+            .entry("memberSecretRefs")
+            .or_insert_with(|| serde_json::json!({}));
         overrides[format!("{location}:{key}")] = serde_json::json!(reference);
     }
     reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
@@ -5429,7 +5773,19 @@ pub fn set_secret_reference(
     reference: &str,
 ) -> Result<Registry, String> {
     let (reg, ()) = registry::update(|reg| apply_secret_reference(reg, server_id, key, reference))?;
+    approve_own_reference(&reg, server_id)?;
     Ok(reg)
+}
+/// On a personal account the reference is now part of the synced definition,
+/// which other machines must approve. Saving it here is this machine's approval.
+pub fn approve_own_reference(reg: &Registry, server_id: &str) -> Result<(), String> {
+    if !crate::personal_sync::is_personal(reg) {
+        return Ok(());
+    }
+    match reg.servers.iter().find(|s| s.id == server_id) {
+        Some(server) => crate::secret_refs::approve_server(server).map_err(|e| e.to_string()),
+        None => Ok(()),
+    }
 }
 pub fn test_secret_reference(
     server_id: &str,

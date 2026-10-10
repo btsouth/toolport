@@ -5,6 +5,102 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const FIELD: &str = "localTeamAuthentication";
+thread_local! {
+    static PINNED: std::cell::RefCell<BTreeMap<String, String>> = const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+pub(crate) struct OwnerPin {
+    id: String,
+    previous: Option<String>,
+    _thread: std::marker::PhantomData<*const ()>,
+}
+impl Drop for OwnerPin {
+    fn drop(&mut self) {
+        PINNED.with(|pins| {
+            let mut pins = pins.borrow_mut();
+            if let Some(previous) = self.previous.take() {
+                pins.insert(self.id.clone(), previous);
+            } else {
+                pins.remove(&self.id);
+            }
+        });
+    }
+}
+pub(crate) fn pinned_owner(id: &str) -> Option<String> {
+    PINNED.with(|pins| pins.borrow().get(id).cloned())
+}
+pub(crate) fn pin_credential_owner(id: &str, owner: &str) -> OwnerPin {
+    OwnerPin {
+        id: id.into(),
+        previous: PINNED.with(|pins| pins.borrow_mut().insert(id.into(), owner.into())),
+        _thread: std::marker::PhantomData,
+    }
+}
+fn snapshot() -> Result<Option<Registry>, String> {
+    let Some(path) = crate::registry::resolved_path() else {
+        return Ok(None);
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("Cannot verify local authentication ownership".into()),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| "Cannot verify local authentication ownership".into())
+}
+pub(crate) fn pin_http_destination(id: &str, url: &str) -> Result<Option<OwnerPin>, String> {
+    let Some(reg) = snapshot()? else {
+        return Ok(None);
+    };
+    if bindings(&reg)?.contains_key(id) {
+        return Ok(None);
+    }
+    let Some(base) = reg
+        .unknown_fields
+        .get("personalSyncCredentialDestinations")
+        .and_then(|destinations| destinations.get(id))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    use sha2::{Digest, Sha256};
+    let destination = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&Some(url)).expect("URL serialization"))
+    );
+    let owner = reg
+        .unknown_fields
+        .get("personalSyncCredentialOwners")
+        .and_then(|owners| owners.get(id))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Local credential ownership is unreadable. Sync and sign in again.")?;
+    let owner = if destination == base {
+        owner.into()
+    } else {
+        format!("{owner}-sync-{destination}")
+    };
+    Ok(Some(pin_credential_owner(id, &owner)))
+}
+pub(crate) fn pin_personal_owner(id: &str) -> Result<Option<OwnerPin>, String> {
+    if let Some(owner) = pinned_owner(id) {
+        return Ok(Some(pin_credential_owner(id, &owner)));
+    }
+    let Some(reg) = snapshot()? else {
+        return Ok(None);
+    };
+    if bindings(&reg)?.contains_key(id) {
+        return Ok(None);
+    }
+    if reg
+        .unknown_fields
+        .get("personalSyncCredentialDestinations")
+        .and_then(|destinations| destinations.get(id))
+        .is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(pin_credential_owner(id, &owner_in(&reg, id)?)))
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,7 +162,7 @@ pub(crate) fn bind(
 pub(crate) fn owner_in(reg: &Registry, id: &str) -> Result<String, String> {
     let entries = bindings(reg)?;
     let Some(binding) = entries.get(id) else {
-        return Ok(id.into());
+        return personal_http_owner(reg, id);
     };
     let valid = reg.team.as_ref().is_some_and(|team| {
         team.team_id == binding.team_id
@@ -92,6 +188,45 @@ pub(crate) fn owner_in(reg: &Registry, id: &str) -> Result<String, String> {
     Ok(binding.personal_id.clone())
 }
 
+pub(crate) fn personal_credential_destination(server: &ServerEntry) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&server.url).expect("URL serialization"))
+    )
+}
+
+fn personal_http_owner(reg: &Registry, id: &str) -> Result<String, String> {
+    let Some(server) = reg.servers.iter().find(|s| s.id == id) else {
+        return Ok(id.into());
+    };
+    let Some(base) = reg
+        .unknown_fields
+        .get("personalSyncCredentialDestinations")
+        .and_then(|destinations| destinations.get(id))
+        .or_else(|| {
+            server
+                .unknown_fields
+                .get("personalSyncCredentialDestination")
+        })
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(id.into());
+    };
+    let owner = reg
+        .unknown_fields
+        .get("personalSyncCredentialOwners")
+        .and_then(|owners| owners.get(id))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Local credential ownership is unreadable. Sync and sign in again.")?;
+    let destination = personal_credential_destination(server);
+    if server.url.is_none() || base == destination {
+        Ok(owner.into())
+    } else {
+        Ok(format!("{owner}-sync-{destination}"))
+    }
+}
+
 /// Explicitly reviewing a changed definition drops its old local binding.
 /// Authentication then belongs to the managed identity; the original stays untouched.
 pub(crate) fn detach_changed(reg: &mut Registry, id: &str) -> Result<(), String> {
@@ -109,7 +244,7 @@ pub(crate) fn detach_changed(reg: &mut Registry, id: &str) -> Result<(), String>
 /// Whether an earlier handoff bound a Team copy of this connection to `personal`,
 /// and that copy is enabled in `profile`. The original may have changed since:
 /// that change is what re-sharing publishes, and the handoff checks it again.
-pub(crate) fn bound_copy_enabled(reg: &Registry, profile: &str, personal: &str) -> bool {
+pub(crate) fn bound_copy_enabled(reg: &Registry, personal: &str) -> bool {
     let Some(team) = reg.team.as_ref() else {
         return false;
     };
@@ -120,7 +255,7 @@ pub(crate) fn bound_copy_enabled(reg: &Registry, profile: &str, personal: &str) 
                 && binding.origin == team.server_url
                 && binding.device_id == team.reporting_device_id
                 && team.managed_server_ids.get(managed) == Some(&binding.personal_id)
-                && reg.is_enabled(profile, managed)
+                && reg.enabled_here(managed)
         })
     })
 }
@@ -151,6 +286,9 @@ pub(crate) fn ensure_unconfigured(reg: &Registry, managed: &ServerEntry) -> Resu
 /// Vault operations also occur inside registry updates, so calling registry::load
 /// here would deadlock. Never recover or rewrite files from this read path.
 pub(crate) fn owner(id: &str) -> Result<String, String> {
+    if let Some(owner) = pinned_owner(id) {
+        return Ok(owner);
+    }
     let Some(path) = crate::registry::resolved_path() else {
         return Ok(id.into());
     };
@@ -266,4 +404,58 @@ fn restore_routes(reg: &mut Registry, team_id: &str, only: Option<&str>) {
     if let Ok(value) = serde_json::to_value(entries) {
         reg.unknown_fields.insert(FIELD.into(), value);
     }
+}
+
+/// Consolidate a previously adopted copy onto its existing credential identity.
+/// Only exact, still-valid bindings qualify; no credentials are read or copied.
+pub(crate) fn adopt_personal_sync_routes(reg: &mut Registry) -> Result<(), String> {
+    let mut entries = bindings(reg)?;
+    for (managed_id, binding) in entries.clone() {
+        if owner_in(reg, &managed_id).ok().as_deref() != Some(&binding.personal_id) {
+            continue;
+        }
+        let Some(mut managed) = reg.servers.iter().find(|s| s.id == managed_id).cloned() else {
+            continue;
+        };
+        managed.id = binding.personal_id.clone();
+        managed.unknown_fields.insert(
+            "teamOriginalId".into(),
+            serde_json::json!(binding.personal_id),
+        );
+        reg.servers
+            .retain(|s| s.id != managed_id && s.id != binding.personal_id);
+        for profile in &mut reg.profiles {
+            for id in &mut profile.enabled_server_ids {
+                if *id == managed_id {
+                    *id = binding.personal_id.clone();
+                }
+            }
+            profile.enabled_server_ids.sort();
+            profile.enabled_server_ids.dedup();
+            if let Some(scope) = profile.tool_scope.remove(&managed_id) {
+                let scope = match profile.tool_scope.get(&binding.personal_id) {
+                    Some(personal_scope) => scope
+                        .into_iter()
+                        .filter(|tool| personal_scope.contains(tool))
+                        .collect(),
+                    None => scope,
+                };
+                profile
+                    .tool_scope
+                    .insert(binding.personal_id.clone(), scope);
+            }
+        }
+        if let Some(team) = &mut reg.team {
+            team.managed_server_ids.remove(&managed_id);
+            team.managed_server_ids
+                .insert(binding.personal_id.clone(), binding.personal_id.clone());
+        }
+        reg.servers.push(managed);
+        entries.remove(&managed_id);
+    }
+    reg.unknown_fields.insert(
+        FIELD.into(),
+        serde_json::to_value(entries).map_err(|e| e.to_string())?,
+    );
+    Ok(())
 }

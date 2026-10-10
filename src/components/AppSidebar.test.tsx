@@ -76,6 +76,8 @@ function fakeUpdate(version = "1.1.0") {
  * ProfileBar renders, and a team connection so Team is a top-level row. */
 function pairedRegistry(): Registry {
   return {
+    version: 3,
+    servers: [],
     profiles: [{ id: "default", name: "Default" }],
     activeProfileId: "default",
     team: { teamId: "team-1" },
@@ -129,7 +131,7 @@ describe("AppSidebar accessibility", () => {
     );
   });
 
-  it("shows the four top-level views and hides Team until paired", async () => {
+  it("shows sign in before pairing and team navigation after pairing", async () => {
     const onSelectView = vi.fn();
     const { rerender } = render(
       <TooltipProvider>
@@ -149,7 +151,7 @@ describe("AppSidebar accessibility", () => {
       within(nav)
         .getAllByRole("button")
         .map((b) => b.textContent),
-    ).toEqual(["Servers", "Clients", "Activity", "Settings"]);
+    ).toEqual(["Servers", "Clients", "Activity", "Settings", "Sign in to sync"]);
     // Catalog, Playground, Agent rules, Agent activity and Team are not top-level.
     for (const name of [
       "Browse catalog",

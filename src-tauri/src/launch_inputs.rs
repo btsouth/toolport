@@ -31,6 +31,34 @@ impl ResolvedArgs {
     }
 }
 
+/// What a person calls a launch input. Inputs created from pasted arguments
+/// carry a generated label, so name them after the flag they follow instead.
+pub fn input_display_name(
+    args: &[String],
+    launch: &crate::registry::LaunchConfig,
+    key: &str,
+) -> String {
+    let label = launch
+        .inputs
+        .iter()
+        .find(|input| input.key == key)
+        .map_or(key, |input| input.label.as_str());
+    if !label.starts_with("Imported argument") {
+        return label.to_string();
+    }
+    let index = launch.bindings.iter().find_map(|binding| {
+        matches!(binding.parts.as_slice(), [ArgPart::Input { key: k, .. }] if k == key)
+            .then_some(binding.index)
+    });
+    match index {
+        Some(i) if i > 0 && args.get(i - 1).is_some_and(|flag| flag.starts_with('-')) => {
+            format!("Value for {} (argument {})", args[i - 1], i + 1)
+        }
+        Some(i) => format!("Secret argument {}", i + 1),
+        None => label.to_string(),
+    }
+}
+
 pub fn resolve_args(server: &ServerEntry) -> Result<ResolvedArgs, String> {
     let args = resolve_args_for_prewarm(server)?;
     if let Some(launch) = &server.launch {
@@ -121,6 +149,14 @@ pub fn resolve_args_with(
                     };
                     let resolved = match resolved.filter(|v| !v.trim().is_empty()) {
                         Some(v) => v,
+                        None if input.required && input.secret => {
+                            return Err(format!(
+                                "{} needs {}. Add it in Servers > {} > Credentials.",
+                                server.name,
+                                input_display_name(&server.args, launch, &input.key),
+                                server.name
+                            ))
+                        }
                         None if input.required => {
                             return Err(format!(
                                 "{} needs {}. Open server setup to add it.",

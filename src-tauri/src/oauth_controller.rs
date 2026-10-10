@@ -414,6 +414,7 @@ pub(crate) fn authenticate_with(
         &oauth_lock_path(server_id, url)?,
         || crate::oauth::authenticate_cancellable(url, None, &attempt.cancellation),
         |result| {
+            let _destination = crate::local_auth::pin_http_destination(server_id, url)?;
             let _mutation = crate::registry_controller::acquire_auth_lock(server_id)?;
             crate::remote::store_oauth_state(
                 server_id,

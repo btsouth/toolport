@@ -384,6 +384,25 @@ pub fn review_lines(server: &ServerEntry) -> Vec<String> {
         })
         .collect()
 }
+/// Personal sync review: which reference reaches which destination. Headers go
+/// to the URL; env and launch inputs go to the launched command. Arguments are
+/// left out because they can hold secret values on this machine.
+pub fn destination_lines(server: &ServerEntry) -> Vec<String> {
+    reference_uses(server)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(field, r)| {
+            let provider = parse(&r).map_or("Password manager", |p| p.name);
+            let (first, second) = if field.starts_with("header:") {
+                (server.url.as_deref(), server.command.as_deref())
+            } else {
+                (server.command.as_deref(), server.url.as_deref())
+            };
+            let destination = first.or(second).unwrap_or("unknown destination");
+            format!("{provider} entry {r:?} will be sent to {destination} ({field})")
+        })
+        .collect()
+}
 
 pub fn check_policy(server: &ServerEntry, reference: &str) -> Result<(), ResolveError> {
     parse(reference)?;
@@ -1829,6 +1848,10 @@ mod review_regressions {
                     ])
                     .env("TOOLPORT_APPROVAL_TEST_PATH", &path)
                     .env("TOOLPORT_APPROVAL_TEST_ID", format!("writer-{id}"))
+                    // The test checks for lost writes, not lock latency. Six cold
+                    // test processes can exceed the 5 s production deadline on
+                    // slow Windows runners.
+                    .env("TOOLPORT_LOCK_TIMEOUT_MS", "60000")
                     .stdout(Stdio::null())
                     .spawn()
                     .unwrap()
