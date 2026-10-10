@@ -1691,7 +1691,7 @@ fn http_transport_io_error(error: ureq::Error) -> TransportError {
             error.to_string(),
         )),
         ureq::Error::Io(_) => http_read_error(error.into_io()),
-        _ => TransportError::Fatal(error.to_string()),
+        _ => TransportError::Fatal(crate::http_client::transport_error_message(&error)),
     }
 }
 
@@ -7686,7 +7686,10 @@ impl HttpTransport {
                 Err(crate::http_client::Error::Transport(t)) if is_retryable_transport(&t) => {
                     return Err(TransportError::Retry {
                         retry_after: None,
-                        message: format!("transport error (retryable): {t}"),
+                        message: format!(
+                            "transport error (retryable): {}",
+                            crate::http_client::transport_error_message(&t)
+                        ),
                     });
                 }
                 Err(crate::http_client::Error::Transport(t)) => {

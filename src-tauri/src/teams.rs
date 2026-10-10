@@ -876,13 +876,28 @@ fn post_usage_day(
     }
 }
 
+#[cfg(test)]
+#[test]
+fn connect_errors_keep_socket_wording_in_team_messages() {
+    let io = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+    let expected = format!("could not reach the team server: {io}");
+    let error = crate::http_client::mark_connect_failure(ureq::Error::Io(io));
+    assert_eq!(
+        stringify(crate::http_client::Error::Transport(error)),
+        expected
+    );
+}
+
 fn stringify(e: crate::http_client::Error) -> String {
     match e {
         crate::http_client::Error::Status(code, resp) => {
             let msg = resp.into_body().read_to_string().unwrap_or_default();
             format!("server returned {code}: {}", msg.trim())
         }
-        crate::http_client::Error::Transport(t) => format!("could not reach the team server: {t}"),
+        crate::http_client::Error::Transport(t) => format!(
+            "could not reach the team server: {}",
+            crate::http_client::transport_error_message(&t)
+        ),
     }
 }
 

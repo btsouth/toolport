@@ -35,10 +35,29 @@ struct ConnectFailure(ureq::Error);
 
 impl std::fmt::Display for ConnectFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        match &self.0 {
+            ureq::Error::Io(error) => error.fmt(f),
+            error => error.fmt(f),
+        }
     }
 }
 impl std::error::Error for ConnectFailure {}
+
+pub(crate) fn mark_connect_failure(error: ureq::Error) -> ureq::Error {
+    ureq::Error::Other(Box::new(ConnectFailure(error)))
+}
+
+/// Hide the internal phase marker while preserving the original socket detail.
+pub(crate) fn transport_error_message(error: &ureq::Error) -> String {
+    if let Some(connect) = connect_error(error) {
+        match connect {
+            ureq::Error::Io(io) => io.to_string(),
+            _ => connect.to_string(),
+        }
+    } else {
+        error.to_string()
+    }
+}
 
 pub(crate) fn connect_error(error: &ureq::Error) -> Option<&ureq::Error> {
     match error {
@@ -98,7 +117,7 @@ impl ureq::unversioned::transport::Connector for ConnectPhaseConnector {
                     inner: Box::new(inner),
                 })
             })
-            .map_err(|error| ureq::Error::Other(Box::new(ConnectFailure(error))))
+            .map_err(mark_connect_failure)
     }
 }
 
@@ -208,7 +227,7 @@ impl std::fmt::Display for Error {
                 }
                 Ok(())
             }
-            Self::Transport(error) => error.fmt(f),
+            Self::Transport(error) => f.write_str(&transport_error_message(error)),
         }
     }
 }
@@ -496,9 +515,13 @@ mod tests {
             .build()
             .call()
             .unwrap_err();
-        assert!(
-            matches!(connect_error(&error), Some(ureq::Error::Io(io)) if io.kind() == std::io::ErrorKind::ConnectionRefused)
-        );
+        let Some(ureq::Error::Io(io)) = connect_error(&error) else {
+            panic!("connection phase was lost: {error}");
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::ConnectionRefused);
+        let expected = io.to_string();
+        assert_eq!(transport_error_message(&error), expected);
+        assert_eq!(Error::Transport(error).to_string(), expected);
     }
 
     #[test]
