@@ -4241,6 +4241,46 @@ fn protocol_lane_unknown_names_never_request_approval_or_leak_hidden_matches() {
 }
 
 #[test]
+fn protocol_lane_cursor_name_budget_routes_the_same_tools_as_claude() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (_fixture, dir) = Fixture::new("protocol-client-name-budget");
+    let medium = format!("read_{}", "x".repeat(49));
+    let long = format!("read_{}", "item_".repeat(20));
+    let tools = [protocol_lane_tool(&medium, false), protocol_lane_tool(&long, false)];
+    write_registry(&dir, vec![protocol_lane_server(&dir, "files", &tools)], vec![]);
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).unwrap();
+    for client in ["cursor", "claude-code"] { reg.set_client_discovery(client, Some("full")); }
+    registry::save_to(&path, &reg).unwrap();
+    let default_aliases = conduit_lib::router::Router::server_tool_aliases("files", &tools, Default::default());
+    for (client_id, budget) in [("cursor", 52), ("claude-code", 64)] {
+        let mut client = spawn_adapter(&dir, &AdapterOptions {
+            client_id: Some(client_id), ..Default::default()
+        });
+        client.initialize(client_id);
+        client.wait_for_tool_where("client budget catalog", |name| name.starts_with("files__"), Duration::from_secs(30));
+        let listed = client.request("tools/list", json!({}));
+        let aliases: Vec<_> = listed["result"]["tools"].as_array().unwrap().iter()
+            .filter_map(|tool| tool["name"].as_str()).filter(|name| name.starts_with("files__"))
+            .map(str::to_string).collect();
+        assert_eq!(aliases.len(), 2, "{listed}");
+        assert!(aliases.iter().all(|name| name.len() <= budget), "{aliases:?}");
+        let mut originals = Vec::new();
+        for alias in aliases {
+            let response = client.call_tool(&alias, json!({}));
+            originals.push(text_of(&response));
+            if client_id == "claude-code" {
+                assert!(default_aliases.values().any(|name| name == &alias));
+            }
+        }
+        originals.sort();
+        let mut expected = vec![medium.clone(), long.clone()];
+        expected.sort();
+        assert_eq!(originals, expected);
+    }
+}
+
+#[test]
 fn protocol_lane_policy_refusals_explain_the_reason_and_fix() {
     let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     for case in [

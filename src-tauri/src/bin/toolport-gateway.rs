@@ -12865,15 +12865,36 @@ impl HostState {
         reg: &Registry,
         profile: &str,
     ) -> (Arc<Router>, Arc<CatalogSnapshot>) {
-        let resolved = reg.resolve_profile_id(profile);
-        if !resolved.starts_with("@all-enabled:") && reg.access_profile(&resolved).is_none() {
+        self.router_for_client_view(base, reg, Some(profile), None)
+    }
+
+    fn router_for_client_view(
+        &self,
+        base: Arc<Router>,
+        reg: &Registry,
+        profile: Option<&str>,
+        client: Option<&str>,
+    ) -> (Arc<Router>, Arc<CatalogSnapshot>) {
+        let resolved = profile
+            .map(|profile| reg.resolve_profile_id(profile))
+            .unwrap_or_default();
+        let limit = clients::client_tool_name_limit(client, clients::GATEWAY_ENTRY_NAME);
+        if limit == 64
+            && !resolved.starts_with("@all-enabled:")
+            && reg.access_profile(&resolved).is_none()
+        {
             let catalog = Arc::new(CatalogSnapshot::new(base.shared_tools()));
             return (base, catalog);
         }
-        let allow: HashMap<String, HashSet<String>> = adapter_tool_scope(reg, &resolved)
-            .into_iter()
-            .map(|(server, tools)| (server, tools.into_iter().collect()))
-            .collect();
+        let allow: HashMap<String, HashSet<String>> = if profile.is_some() {
+            adapter_tool_scope(reg, &resolved)
+                .into_iter()
+                .map(|(server, tools)| (server, tools.into_iter().collect()))
+                .collect()
+        } else {
+            base.registry_policy().allow
+        };
+        let view_key = format!("{resolved}:{limit}");
         let live = self
             .router
             .lock()
@@ -12893,7 +12914,7 @@ impl HostState {
         if !Arc::ptr_eq(&live, &base) && !rooted_live {
             // A rebuild won after this request took its snapshot. Keep serving
             // that snapshot, but never pin its old downstream slots in the host.
-            let view = Arc::new(base.with_tool_allow(allow));
+            let view = Arc::new(base.with_client_tool_view(allow, limit));
             let catalog = Arc::new(CatalogSnapshot::new(view.shared_tools()));
             return (view, catalog);
         }
@@ -12908,15 +12929,15 @@ impl HostState {
             by_profile: HashMap::new(),
         });
         debug_assert!(Arc::ptr_eq(&scoped.base, &base));
-        if let Some(view) = scoped.by_profile.get(&resolved) {
+        if let Some(view) = scoped.by_profile.get(&view_key) {
             if view.allow == allow {
                 return (Arc::clone(&view.router), Arc::clone(&view.catalog));
             }
         }
-        let router = Arc::new(base.with_tool_allow(allow.clone()));
+        let router = Arc::new(base.with_client_tool_view(allow.clone(), limit));
         let catalog = Arc::new(CatalogSnapshot::new(router.shared_tools()));
         scoped.by_profile.insert(
-            resolved,
+            view_key,
             ProfileToolView {
                 allow,
                 router: Arc::clone(&router),
@@ -15311,6 +15332,7 @@ fn adapter_live_view(
             })
         })
     };
+    let client = client.map(str::to_string);
     let host = Arc::clone(host);
     let resolve = Arc::new(move || {
         let (profile, root) = &*expected;
@@ -15334,7 +15356,10 @@ fn adapter_live_view(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let rooted = host.router_for_root(base, &current, root.as_deref(), Some(&scope));
-        let mut view = (*host.router_for_adapter_profile(rooted, &current, profile).0).clone();
+        let mut view = (*host
+            .router_for_client_view(rooted, &current, Some(profile), client.as_deref())
+            .0)
+            .clone();
         // Post-HITL owner/fingerprint checks need the current adapter visibility,
         // not the host's union of profiles. Preserve the live quarantine state.
         view.apply_registry_policy(registry_policy(&current, Some(profile), false, false));
@@ -15540,17 +15565,9 @@ fn process_request_wire(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let reg = state
-            .registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        base.any_missing_catalog(|id| {
-            allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
-        }) || state
-            .cached_tools
-            .lock()
-            .map(|c| !has_scoped_tools(&c.tools, allowed, &base, &reg))
-            .unwrap_or(true)
+        let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        base.any_missing_catalog(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
+            || state.cached_tools.lock().map(|c| !has_scoped_tools(&c.tools, allowed, &base, &reg)).unwrap_or(true)
     };
     let started = Instant::now();
     let mut response = process_request_wire_inner(
@@ -15571,13 +15588,7 @@ fn process_request_wire(
             started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             cold,
             client,
-            response.as_ref().is_some_and(|r| {
-                r.envelope.get("error").is_none()
-                    && r.envelope
-                        .pointer("/result/isError")
-                        .and_then(Value::as_bool)
-                        != Some(true)
-            }),
+            response.as_ref().is_some_and(|r| r.envelope.get("error").is_none() && r.envelope.pointer("/result/isError").and_then(Value::as_bool) != Some(true)),
         );
     }
     // One-way HTTP messages finish here rather than at a JSON-RPC reply write.
@@ -15699,8 +15710,9 @@ fn process_request_wire_inner(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             let (view, cached) = if state.daemon_mode.load(Ordering::SeqCst) {
-                adapter_profile
-                    .map(|profile| state.router_for_adapter_profile(base.clone(), &reg, profile))
+                adapter_profile.map(|profile| {
+                    state.router_for_client_view(base.clone(), &reg, Some(profile), client)
+                })
             } else {
                 None
             }
@@ -15942,8 +15954,20 @@ fn process_request_wire_inner(
         // clients need their own tool scope, including when deciding coldness.
         if state.daemon_mode.load(Ordering::SeqCst) {
             if let Some(profile) = adapter_profile {
-                return state.router_for_adapter_profile(rooted, &reg, profile);
+                return state.router_for_client_view(rooted, &reg, Some(profile), client);
             }
+        }
+        if clients::client_tool_name_limit(
+            client.or(state.client_id.as_deref()),
+            clients::GATEWAY_ENTRY_NAME,
+        ) < 64
+        {
+            return state.router_for_client_view(
+                rooted,
+                &reg,
+                None,
+                client.or(state.client_id.as_deref()),
+            );
         }
         let cached = state
             .cached_tools
@@ -16079,6 +16103,30 @@ fn process_request_wire_inner(
     let live_view: Option<LiveRouterResolver> = if state.daemon_mode.load(Ordering::SeqCst) {
         adapter_profile.map(|profile| {
             adapter_live_view(&state.host, &reg, profile, adapter_root.clone(), client)
+        })
+    } else if clients::client_tool_name_limit(
+        client.or(state.client_id.as_deref()),
+        clients::GATEWAY_ENTRY_NAME,
+    ) < 64
+    {
+        let host = Arc::clone(&state.host);
+        let client = client.or(state.client_id.as_deref()).map(str::to_string);
+        Some(LiveRouterResolver {
+            stale: Arc::new(|_, _| false),
+            resolve: Arc::new(move || {
+                let base = host
+                    .router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let reg = host
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                host.router_for_client_view(base, &reg, None, client.as_deref())
+                    .0
+            }),
         })
     } else {
         None
@@ -17152,7 +17200,12 @@ fn handle_mcp_http(
                     .filter(|_| state.daemon_mode.load(Ordering::SeqCst))
                     .map(|profile| {
                         state
-                            .router_for_adapter_profile(rooted.clone(), &reg, profile)
+                            .router_for_client_view(
+                                rooted.clone(),
+                                &reg,
+                                Some(profile),
+                                session_owner.map(|owner| owner.identity.as_str()),
+                            )
                             .0
                     })
                     .unwrap_or(rooted);
@@ -28715,6 +28768,113 @@ mod tests {
             tools_per_server(&after_recovery).get("atlassian").copied(),
             Some(40),
             "the recovery reset the streak, so this collapse is held again"
+        );
+    }
+
+    #[test]
+    fn client_name_budgets_share_canonical_policy_and_routes() {
+        let _env = DataDirTestEnv::new("client-name-budgets");
+        let host = dispatch_host(false);
+        let mut reg = Registry::default();
+        reg.servers.push(stub_server("files", "Files"));
+        reg.profiles[0].enabled_server_ids.push("files".into());
+        let medium = format!("read_{}", "x".repeat(49));
+        let long = format!("read_{}", "item_".repeat(20));
+        let tools = vec![
+            json!({"name":medium}),
+            json!({"name":long}),
+            json!({"name":"echo"}),
+        ];
+        let mut base = Router::new();
+        base.set_overrides(HashMap::from([(
+            "files".into(),
+            HashMap::from([(
+                long.clone(),
+                registry::ToolOverride {
+                    name: Some(format!("renamed_{}", "x".repeat(70))),
+                    ..Default::default()
+                },
+            )]),
+        )]));
+        base.add(DownstreamServer::connect("files".into(), Box::new(MockRoute { tools })).unwrap());
+        let base = Arc::new(base);
+        *host.router.lock().unwrap() = Arc::clone(&base);
+        let view = |client| {
+            host.router_for_client_view(Arc::clone(&base), &reg, Some("default"), Some(client))
+        };
+        let (cursor, cursor_tools) = view("adapter:cursor");
+        let (claude, claude_tools) = view("adapter:claude-code");
+        assert!(cursor_tools
+            .tools
+            .iter()
+            .all(|tool| tool["name"].as_str().unwrap().len() <= 52));
+        assert_eq!(claude_tools.tools.to_vec(), base.shared_tools().to_vec());
+        assert_eq!(
+            claude.exposed_tool_name("files", &medium).unwrap(),
+            format!("files__{medium}")
+        );
+        assert!(Arc::ptr_eq(&cursor, &view("adapter:cursor").0));
+        for original in [&medium, &long] {
+            let a = cursor.exposed_tool_name("files", original).unwrap();
+            let b = claude.exposed_tool_name("files", original).unwrap();
+            assert_ne!(a, b);
+            assert_eq!(cursor.route_of(a), claude.route_of(b));
+            let def = |router: &Router, name: &str| {
+                let tools = router.shared_tools();
+                let definition = router
+                    .policy_definition(tools.iter().find(|tool| tool["name"] == name).unwrap())
+                    .into_owned();
+                definition
+            };
+            let canonical = def(&cursor, a);
+            assert_eq!(canonical, def(&claude, b));
+            assert_eq!(
+                integrity::fingerprint(&canonical),
+                integrity::fingerprint(&def(&claude, b))
+            );
+            integrity::check(Some("shared-name-budget"), &vec![canonical.clone()]).unwrap();
+            assert!(
+                integrity::check_staged(Some("shared-name-budget"), &vec![def(&claude, b)])
+                    .unwrap()
+                    .is_empty()
+            );
+            let mut quarantined = (*base).clone();
+            quarantined.requarantine(BTreeSet::from([canonical["name"].as_str().unwrap().into()]));
+            for limit in [52, 64] {
+                let blocked = quarantined.with_client_tool_view(HashMap::new(), limit);
+                assert!(blocked.exposed_tool_name("files", original).is_none());
+                let mut disabled = (*base).clone();
+                disabled.apply_registry_policy(RegistryPolicy {
+                    disabled: HashMap::from([(
+                        "files".into(),
+                        HashSet::from([original.to_string()]),
+                    )]),
+                    ..Default::default()
+                });
+                assert!(disabled
+                    .with_client_tool_view(HashMap::new(), limit)
+                    .exposed_tool_name("files", original)
+                    .is_none());
+                assert!(base
+                    .with_client_tool_view(
+                        HashMap::from([("files".into(), HashSet::from(["echo".into()]))]),
+                        limit
+                    )
+                    .exposed_tool_name("files", original)
+                    .is_none());
+            }
+        }
+        assert_eq!(
+            clients::client_tool_name_limit(Some("cursor"), "toolport"),
+            52
+        );
+        assert_eq!(
+            clients::client_tool_name_limit(Some("adapter:client:cursor"), "tp"),
+            58
+        );
+        assert_eq!(
+            clients::client_tool_name_limit(Some("claude-code"), "toolport"),
+            64
         );
     }
 

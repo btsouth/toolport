@@ -169,8 +169,13 @@ pub fn sanitize_segment(s: &str) -> String {
 }
 
 /// Keep the established short spelling; hash the raw identity for long aliases.
-fn bounded_alias(name: &str, identity: &impl serde::Serialize, namespace: Option<&str>) -> String {
-    if name.len() <= 64 {
+fn bounded_alias(
+    name: &str,
+    identity: &impl serde::Serialize,
+    namespace: Option<&str>,
+    limit: usize,
+) -> String {
+    if name.len() <= limit {
         return name.to_string();
     }
     let hash = content_digest(identity);
@@ -180,12 +185,13 @@ fn bounded_alias(name: &str, identity: &impl serde::Serialize, namespace: Option
         name.strip_prefix(&format!("{server}__"))
             .map(|tool| (server, tool))
     });
+    let prefix_budget = limit - 13;
     let prefix = if let Some((server, tool)) = parts {
-        let server = &server[..server.len().min(24)];
-        let tool = &tool[..tool.len().min(51 - server.len() - 2)];
+        let server = &server[..server.len().min(24).min(prefix_budget - 2)];
+        let tool = &tool[..tool.len().min(prefix_budget - server.len() - 2)];
         format!("{server}__{tool}")
     } else {
-        name[..51].to_string()
+        name[..prefix_budget].to_string()
     };
     format!("{prefix}_{suffix}")
 }
@@ -1657,6 +1663,7 @@ pub struct Router {
     legacy_names: HashMap<String, String>,
     tool_owners: HashMap<String, String>,
     model_hidden: HashSet<String>,
+    alias_limit: Option<usize>,
     /// What may be exposed; applied as each server is added.
     policy: ToolPolicy,
     /// Per-tool exposure overrides (rename / re-describe), keyed by server id then ORIGINAL
@@ -2019,6 +2026,52 @@ impl Router {
         view
     }
 
+    /// Reuse canonical policy bindings while publishing aliases for one client budget.
+    pub fn with_client_tool_view(
+        &self,
+        allow: HashMap<String, HashSet<String>>,
+        limit: usize,
+    ) -> Self {
+        let mut view = self.clone();
+        view.policy.allow = allow;
+        view.alias_limit = Some(limit.clamp(16, 64));
+        if self.alias_limit.unwrap_or(64) != view.alias_limit.unwrap() {
+            for candidate in &mut view.restored_candidates {
+                let canonical = candidate
+                    .policy_name
+                    .clone()
+                    .unwrap_or_else(|| candidate.exposed.clone());
+                let override_name = view
+                    .overrides
+                    .get(&candidate.server)
+                    .and_then(|tools| tools.get(&candidate.original))
+                    .and_then(|tool| tool.name.as_ref());
+                candidate.exposed = match override_name
+                    .filter(|name| !sanitize_segment(name).starts_with("toolport_"))
+                {
+                    Some(name) => bounded_alias(
+                        &canonical,
+                        &(&candidate.server, &candidate.original, name),
+                        None,
+                        view.alias_limit.unwrap(),
+                    ),
+                    None => bounded_alias(
+                        &canonical,
+                        &(&candidate.server, &candidate.original),
+                        Some(&candidate.server),
+                        view.alias_limit.unwrap(),
+                    ),
+                };
+                candidate.policy_name = Some(canonical);
+                let mut definition = (*candidate.definition).clone();
+                definition["name"] = json!(candidate.exposed);
+                candidate.definition = Arc::new(ToolDefinition::new(definition));
+            }
+        }
+        view.rebuild_preserving_restored();
+        view
+    }
+
     /// The registry-derived half of the policy this router enforces.
     pub fn registry_policy(&self) -> RegistryPolicy {
         RegistryPolicy {
@@ -2180,7 +2233,12 @@ impl Router {
             let exposed = match ov_name {
                 Some(new) => {
                     let legacy = sanitize_segment(&new);
-                    let cand = bounded_alias(&legacy, &(server_id, orig, &new), None);
+                    let cand = bounded_alias(
+                        &legacy,
+                        &(server_id, orig, &new),
+                        None,
+                        self.alias_limit.unwrap_or(64),
+                    );
                     // The gateway owns the toolport_* helper/core namespace.
                     // Keep the original alias when an override would shadow it.
                     if !cand.is_empty()
@@ -2949,7 +3007,11 @@ impl Router {
                 legacy[i] = Some(self.legacy_exposed_name(server_id, orig));
             }
         }
-        order.sort_by_key(|&i| legacy[i].as_ref().is_some_and(|name| name.len() > 64));
+        order.sort_by_key(|&i| {
+            legacy[i]
+                .as_ref()
+                .is_some_and(|name| name.len() > self.alias_limit.unwrap_or(64))
+        });
         for i in order {
             if let (Some(orig), Some(legacy)) = (names[i], legacy[i].as_ref()) {
                 out[i] = Some(self.exposed_name(server_id, orig, legacy));
@@ -2976,12 +3038,22 @@ impl Router {
     }
 
     fn exposed_name(&mut self, server_id: &str, tool: &str, legacy: &str) -> String {
-        let mut name = bounded_alias(legacy, &(server_id, tool), Some(server_id));
+        let mut name = bounded_alias(
+            legacy,
+            &(server_id, tool),
+            Some(server_id),
+            self.alias_limit.unwrap_or(64),
+        );
         let mut attempt = 0u64;
         while !self.seen.insert(name.clone()) {
             attempt += 1;
             let candidate = format!("{legacy}_{attempt}");
-            name = bounded_alias(&candidate, &(server_id, tool, attempt), Some(server_id));
+            name = bounded_alias(
+                &candidate,
+                &(server_id, tool, attempt),
+                Some(server_id),
+                self.alias_limit.unwrap_or(64),
+            );
         }
         if name != legacy {
             self.legacy_names.insert(name.clone(), legacy.to_string());
@@ -6721,7 +6793,7 @@ for line in sys.stdin:
     #[test]
     fn bounded_aliases_keep_short_names_and_resolve_hash_collisions() {
         let long = format!("read_{}", "item_".repeat(20));
-        let collision = bounded_alias(&format!("s__{long}"), &("s", long.as_str()), Some("s"));
+        let collision = bounded_alias(&format!("s__{long}"), &("s", long.as_str()), Some("s"), 64);
         let short = collision.strip_prefix("s__").unwrap();
         let tools = vec![
             json!({"name":long}),
@@ -6761,6 +6833,38 @@ for line in sys.stdin:
             router.no_route_message("s__private_export").as_bytes(),
             unknown.as_bytes()
         );
+    }
+
+    #[test]
+    fn shorter_alias_budget_handles_hash_and_sanitization_collisions() {
+        let long = format!("read_{}", "item_".repeat(20));
+        let collision = bounded_alias(&format!("s__{long}"), &("s", long.as_str()), Some("s"), 52);
+        let short = collision.strip_prefix("s__").unwrap();
+        let tools = vec![
+            json!({"name":long}),
+            json!({"name":short}),
+            json!({"name":format!("{}-x", "a".repeat(48))}),
+            json!({"name":format!("{}_x", "a".repeat(48))}),
+        ];
+        let build = |tools: Vec<Value>| {
+            let mut router = Router::new().with_client_tool_view(HashMap::new(), 52);
+            router.index_server("s", &tools.into(), &[], &[], &[], false, &Mutex::default());
+            router
+        };
+        let router = build(tools.clone());
+        assert_eq!(
+            router.exposed_tool_name("s", short),
+            Some(collision.as_str())
+        );
+        assert_ne!(
+            router.exposed_tool_name("s", &long),
+            Some(collision.as_str())
+        );
+        assert_eq!(router.routes.len(), 4);
+        assert!(router.routes.keys().all(|name| name.len() <= 52));
+        let mut reversed = tools;
+        reversed.reverse();
+        assert_eq!(router.routes, build(reversed).routes);
     }
 
     #[test]
