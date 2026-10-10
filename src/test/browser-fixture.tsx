@@ -562,6 +562,12 @@ mockIPC(
       case "dismiss_access_upgrade_notice":
         registry.accessUpgradeNoticeDismissed = true;
         return registry;
+      case "dismiss_removed_features_notice":
+        if (registry.removedFeaturesNotice)
+          registry.removedFeaturesNotice.dismissed = true;
+        return registry;
+      case "open_exports_dir":
+        return null;
       case "set_default_access":
         registry.defaultAccessProfileId = args.profile as string | null;
         return registry;

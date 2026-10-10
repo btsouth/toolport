@@ -44,6 +44,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -100,6 +101,7 @@ export function ServerDialog({
     args: formatArgs(initial?.args ?? []),
     url: initial?.url ?? "",
     cwd: initial?.cwd ?? "",
+    inheritEnv: initial?.inheritEnv ?? false,
     initializeTimeoutSeconds:
       initial?.initializeTimeoutMs == null
         ? ""
@@ -176,6 +178,7 @@ export function ServerDialog({
         args: formatArgs(initial?.args ?? []),
         url: initial?.url ?? "",
         cwd: initial?.cwd ?? "",
+        inheritEnv: initial?.inheritEnv ?? false,
         initializeTimeoutSeconds:
           initial?.initializeTimeoutMs == null
             ? ""
@@ -251,6 +254,7 @@ export function ServerDialog({
         args: formatArgs(s.args),
         url: s.url ?? "",
         cwd: "",
+        inheritEnv: false,
         initializeTimeoutSeconds: "",
       });
       setEnvRows(
@@ -280,6 +284,9 @@ export function ServerDialog({
   function buildEntry(withSecretValues: boolean): ServerEntry {
     const declared = envRows.filter((r) => r.key.trim());
     return {
+      // Saving replaces the whole entry, so an edit starts from the saved one
+      // and keeps what this dialog doesn't show, like switched-off tools.
+      ...(editing ? initial : undefined),
       id: currentEditId ?? "",
       enabled: initial?.enabled ?? false,
       name: form.name.trim(),
@@ -316,6 +323,7 @@ export function ServerDialog({
       url: isStdio ? null : form.url.trim() || null,
       source: bindingCleared ? "manual" : (initial?.source ?? "manual"),
       cwd: isStdio ? form.cwd.trim() || null : null,
+      inheritEnv: isStdio && form.inheritEnv,
       requestTimeoutMs:
         isStdio || initialUsesLocalCommand ? null : initial?.requestTimeoutMs,
       initializeTimeoutMs: form.initializeTimeoutSeconds.trim()
@@ -722,6 +730,21 @@ export function ServerDialog({
                   server). <code className="font-mono">~</code> and{" "}
                   <code className="font-mono">{"${VAR}"}</code> are expanded.
                 </p>
+              </div>
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex flex-col gap-1">
+                  <Label htmlFor="srv-inherit-env">Use my shell environment</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Gives this server every variable from your shell, such as AWS, GitHub
+                    or kube settings. When off it gets only PATH, HOME and other basics,
+                    plus the variables you set here.
+                  </p>
+                </div>
+                <Switch
+                  id="srv-inherit-env"
+                  checked={form.inheritEnv}
+                  onCheckedChange={(checked) => set("inheritEnv", checked)}
+                />
               </div>
             </>
           ) : (

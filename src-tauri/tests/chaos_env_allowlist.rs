@@ -98,7 +98,10 @@ fn inherit_env_uses_one_login_snapshot_until_registry_reload() {
         );
         let env = scratch.read(&format!("{id}.env"));
         assert!(env.contains("LOGIN_KEY=first"));
-        assert!(!env.contains("AMBIENT_SECRET"));
+        assert!(
+            env.contains("AMBIENT_SECRET=daemon-only"),
+            "an opted-in server also gets names only the client set, as in 1.x"
+        );
     }
     assert_eq!(scratch.read("shell-count").lines().count(), 1);
     std::fs::write(&value, "second").unwrap();
@@ -110,4 +113,48 @@ fn inherit_env_uses_one_login_snapshot_until_registry_reload() {
     );
     assert!(scratch.read("three.env").contains("LOGIN_KEY=second"));
     assert_eq!(scratch.read("shell-count").lines().count(), 2);
+}
+
+/// Daemon mode as a real client runs it: the adapter starts the daemon. An
+/// opted-in server sees a variable the client was launched with; a server that
+/// did not opt in still gets only the allowlist.
+#[test]
+fn an_adapter_started_daemon_passes_client_env_only_to_opted_in_servers() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("client-env");
+    let entries: Vec<_> = [("inherits", true), ("filtered", false)]
+        .iter()
+        .map(|(id, inherit)| {
+            let launcher = scratch.join(&format!("{id}.sh"));
+            std::fs::write(
+                &launcher,
+                format!(
+                    "#!/bin/sh\nenv > '{}'\nexec '{}'\n",
+                    scratch.join(&format!("{id}.env")).display(),
+                    MOCK
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+            json!({ "id": id, "name": id, "transport": "stdio", "command": launcher.display().to_string(), "args": [], "env": [], "inheritEnv": inherit, "source": "manual", "disabledTools": [] })
+        })
+        .collect();
+    write_registry(scratch.path(), &entries, &["inherits", "filtered"]);
+    let mut client = Client::start_with_env(
+        scratch.path(),
+        "client-env",
+        &[("SHELL", "/nonexistent-shell"), ("CLIENT_ONLY_KEY", "from-client")],
+    );
+    for id in ["inherits", "filtered"] {
+        assert!(
+            client.wait_for_tool(&format!("{id}__echo"), Duration::from_secs(60)),
+            "{}",
+            client.diagnostics()
+        );
+    }
+    assert!(
+        scratch.read("inherits.env").contains("CLIENT_ONLY_KEY=from-client"),
+        "the daemon dropped the client's environment"
+    );
+    assert!(!scratch.read("filtered.env").contains("CLIENT_ONLY_KEY"));
 }

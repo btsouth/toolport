@@ -248,6 +248,65 @@ describe("ServerDialog", () => {
     );
   });
 
+  it("keeps fields the dialog does not show and saves the shell environment switch", async () => {
+    const initial = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+      disabledTools: ["delete_everything"],
+      inheritEnv: true,
+      futureField: "kept",
+    } as ServerEntry;
+    api.updateServer.mockResolvedValue(savedRegistry("local"));
+    const user = userEvent.setup();
+
+    render(<ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />);
+    const inherit = screen.getByRole("switch", { name: "Use my shell environment" });
+    expect(inherit).toBeChecked();
+    await user.type(screen.getByLabelText("Name"), " renamed");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
+    expect(api.updateServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "Local renamed",
+        disabledTools: ["delete_everything"],
+        inheritEnv: true,
+        futureField: "kept",
+      }),
+    );
+  });
+
+  it("turns the shell environment off for a server", async () => {
+    const initial: ServerEntry = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+      inheritEnv: true,
+    };
+    api.updateServer.mockResolvedValue(savedRegistry("local"));
+    const user = userEvent.setup();
+
+    render(<ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("switch", { name: "Use my shell environment" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
+    expect(api.updateServer).toHaveBeenCalledWith(
+      expect.objectContaining({ inheritEnv: false }),
+    );
+  });
+
   it("saves the startup timeout in milliseconds", async () => {
     const initial: ServerEntry = {
       id: "remote",

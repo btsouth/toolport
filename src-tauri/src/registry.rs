@@ -1100,11 +1100,118 @@ impl Default for SafetyLevel {
     }
 }
 
+/// 1.x protections an upgrader had on that their 2.0 level does not include.
+/// Set only by the v1 migration and cleared when the user picks a level, so an
+/// upgrade never quietly loosens or tightens what they chose.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeptV1Safety {
+    /// 1.x approval also held calls from shared or registry servers.
+    #[serde(default)]
+    pub hold_untrusted: bool,
+    #[serde(default)]
+    pub deny_destructive: bool,
+    #[serde(default)]
+    pub quarantine_on_drift: bool,
+    #[serde(default)]
+    pub block_on_injection: bool,
+}
+
+/// The name a user knew a removed 1.x feature by. The React shell keeps the
+/// same names in `src/lib/removedFeatures.ts`.
+pub fn removed_feature_label(id: &str) -> &str {
+    match id {
+        "agentRules" => "Agent rules",
+        "agentPermissions" => "Agent permissions",
+        "activityHooks" => "Agent activity hooks",
+        "routines" => "Routines",
+        "agentControl" => "Agent control",
+        other => other,
+    }
+}
+
+/// Where upgraders read how to go back to 1.24.
+pub const GO_BACK_TO_1X_URL: &str =
+    "https://github.com/btsouth/toolport/blob/main/docs/upgrading-to-2.md#go-back-to-124";
+
+/// The upgrade notice for removed features this install used. The React shell
+/// keeps the same wording in `src/lib/removedFeatures.ts`.
+pub fn removed_features_message(features: &[String]) -> String {
+    let names: Vec<&str> = features.iter().map(|id| removed_feature_label(id)).collect();
+    let list = match names.as_slice() {
+        [one] => (*one).to_string(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+        [] => String::new(),
+    };
+    format!(
+        "Toolport 2.0 no longer includes {list}, which you used in 1.x. Your settings for them are saved in the exports folder, and files Toolport wrote for them were left as they were. Tell us if you need one back, or go back to 1.24."
+    )
+}
+
+/// A new GitHub issue with only the feature names filled in.
+pub fn removed_features_issue_url(features: &[String]) -> String {
+    let names: Vec<&str> = features.iter().map(|id| removed_feature_label(id)).collect();
+    let title = format!("I need {} in Toolport 2.0", names.join(", "));
+    let body = format!(
+        "Toolport 2.0 removed: {}.\n\nWhat I used it for:\n\n",
+        names.join(", ")
+    );
+    format!(
+        "https://github.com/btsouth/toolport/issues/new?title={}&body={}",
+        url_component(&title),
+        url_component(&body)
+    )
+}
+
+fn url_component(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+impl KeptV1Safety {
+    pub fn any(self) -> bool {
+        self.hold_untrusted
+            || self.deny_destructive
+            || self.quarantine_on_drift
+            || self.block_on_injection
+    }
+
+    /// What each kept protection does, for Settings. The React shell keeps the
+    /// same wording in `src/lib/keptSafety.ts`.
+    pub fn summary(self) -> Option<String> {
+        let parts: Vec<&str> = [
+            (self.hold_untrusted, "asks before calls from shared or registry servers"),
+            (self.deny_destructive, "hides destructive tools"),
+            (self.quarantine_on_drift, "pauses tools whose definitions change"),
+            (self.block_on_injection, "blocks results that look like prompt injection"),
+        ]
+        .into_iter()
+        .filter_map(|(on, text)| on.then_some(text))
+        .collect();
+        let list = match parts.as_slice() {
+            [] => return None,
+            [one] => (*one).to_string(),
+            [first, second] => format!("{first} and {second}"),
+            [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+        };
+        Some(format!("Kept from 1.x: Toolport also {list}."))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Registry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safety_level: Option<SafetyLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_v1_safety: Option<KeptV1Safety>,
     /// Schema version. Historically optional; a document with no `version` is a
     /// v1 file, which is what [`legacy_registry_version`] supplies.
     #[serde(default = "legacy_registry_version")]
@@ -1553,6 +1660,7 @@ impl Default for Registry {
             default_access_context_id: None,
             default_access_legacy_policy: false,
             safety_level: Some(SafetyLevel::Ask),
+            kept_v1_safety: None,
             deny_destructive: false,
             confirm_destructive: false,
             human_approval: false,
@@ -2128,6 +2236,33 @@ impl Registry {
         );
     }
 
+    /// Removed 1.x features this install used, recorded by the upgrade, until
+    /// the user dismisses the notice.
+    pub fn removed_features_notice(&self) -> Vec<String> {
+        let Some(notice) = self.unknown_fields.get("removedFeaturesNotice") else {
+            return Vec::new();
+        };
+        if notice.get("dismissed").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Vec::new();
+        }
+        notice
+            .get("features")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect()
+    }
+
+    pub fn dismiss_removed_features_notice(&mut self) {
+        if let Some(serde_json::Value::Object(notice)) =
+            self.unknown_fields.get_mut("removedFeaturesNotice")
+        {
+            notice.insert("dismissed".into(), serde_json::Value::Bool(true));
+        }
+    }
+
     pub fn all_access_id(&self) -> String {
         format!(
             "@all-enabled:{}",
@@ -2419,12 +2554,10 @@ impl Registry {
         if self.version >= 2 {
             return self.safety_level.unwrap_or_default();
         }
-        // Legacy blocking flags map to Strict, approval/confirmation to Ask,
-        // and no blocking gates to Off. Labeling and recording never block.
+        // Approval or confirmation is Ask and nothing is Off. The 1.x blocking
+        // flags apply on their own (see `kept`), as they did in 1.x.
         self.safety_level.unwrap_or_else(|| {
-            if self.deny_destructive || self.quarantine_on_drift || self.block_on_injection {
-                SafetyLevel::Strict
-            } else if self.human_approval || self.confirm_destructive {
+            if self.human_approval || self.confirm_destructive {
                 SafetyLevel::Ask
             } else {
                 SafetyLevel::Off
@@ -2455,6 +2588,8 @@ impl Registry {
 
     pub fn set_safety_level(&mut self, level: SafetyLevel) {
         self.safety_level = Some(level);
+        // Choosing a level replaces any 1.x protections kept by the upgrade.
+        self.kept_v1_safety = None;
         self.sync_legacy_safety_mirror();
     }
 
@@ -2468,17 +2603,35 @@ impl Registry {
         }
         let level = self.safety_level_selected();
         let strict = level == SafetyLevel::Strict;
-        self.deny_destructive = strict;
-        self.quarantine_on_drift = strict;
-        self.block_on_injection = strict;
+        let kept = self.kept();
+        self.deny_destructive = strict || kept.deny_destructive;
+        self.quarantine_on_drift = strict || kept.quarantine_on_drift;
+        self.block_on_injection = strict || kept.block_on_injection;
         self.human_approval = level >= SafetyLevel::Ask;
         self.confirm_destructive = false;
     }
 
+    /// 1.x protections applied on top of the level: saved by the migration, or
+    /// read straight from the toggles of a v1 registry that has not migrated yet.
+    pub fn kept(&self) -> KeptV1Safety {
+        if self.version < 2 && self.safety_level.is_none() {
+            return KeptV1Safety {
+                hold_untrusted: self.human_approval,
+                deny_destructive: self.deny_destructive,
+                quarantine_on_drift: self.quarantine_on_drift,
+                block_on_injection: self.block_on_injection,
+            };
+        }
+        self.kept_v1_safety.unwrap_or_default()
+    }
+
     pub fn requires_human_approval(&self, destructive: bool, untrusted: bool) -> bool {
+        // 1.x approval, kept by the upgrade or forced by a team, also held
+        // calls from untrusted servers.
+        let hold_untrusted = self.kept().hold_untrusted || self.team_forced_human_approval;
         match self.safety_level_effective() {
             SafetyLevel::Off => false,
-            SafetyLevel::Ask => destructive,
+            SafetyLevel::Ask => destructive || (untrusted && hold_untrusted),
             SafetyLevel::Strict => destructive || untrusted,
         }
     }
@@ -2490,7 +2643,7 @@ impl Registry {
     /// Effective (member's own OR team-forced) values for the other tighten-only safety flags,
     /// so an org lock is releasable on leave instead of permanently overwriting the member's own.
     pub fn deny_destructive_effective(&self) -> bool {
-        self.safety_level_effective() == SafetyLevel::Strict
+        self.safety_level_effective() == SafetyLevel::Strict || self.kept().deny_destructive
     }
     pub fn content_defense_effective(&self) -> bool {
         true
@@ -2500,11 +2653,15 @@ impl Registry {
         self.pii_redaction || self.team_forced_pii_redaction
     }
     pub fn quarantine_on_drift_effective(&self) -> bool {
-        self.safety_level_effective() == SafetyLevel::Strict || self.team_forced_quarantine_on_drift
+        self.safety_level_effective() == SafetyLevel::Strict
+            || self.team_forced_quarantine_on_drift
+            || self.kept().quarantine_on_drift
     }
     /// Member's own OR team-forced fail-closed injection block (SOU-345).
     pub fn block_on_injection_effective(&self) -> bool {
-        self.safety_level_effective() == SafetyLevel::Strict || self.team_forced_block_on_injection
+        self.safety_level_effective() == SafetyLevel::Strict
+            || self.team_forced_block_on_injection
+            || self.kept().block_on_injection
     }
     /// Whether this server should fail closed on a high-confidence injection hit:
     /// block mode effective, and the server is not on the exempt list.
@@ -2785,6 +2942,14 @@ impl Registry {
                 self.client_discovery.remove(client_id);
             }
         }
+    }
+
+    /// The global discovery mode only when the user picked one. 1.x wrote
+    /// `lazyDiscovery: true` by default, so only `false` there was a choice.
+    pub fn chosen_global_discovery_mode(&self) -> Option<&str> {
+        self.discovery_mode
+            .as_deref()
+            .or((!self.lazy_discovery).then_some("full"))
     }
 
     /// This client's discovery-mode override, if any (`None` = inherit the global mode).
@@ -8803,9 +8968,10 @@ mod safety_level_tests {
                         r.requires_human_approval(true, false),
                         expected >= SafetyLevel::Ask
                     );
+                    // Team-forced approval held untrusted calls in 1.x and still does.
                     assert_eq!(
                         r.requires_human_approval(false, true),
-                        expected == SafetyLevel::Strict
+                        expected == SafetyLevel::Strict || legacy
                     );
                     assert_eq!(r.safety_level_selected(), member);
                     for choice in [SafetyLevel::Off, SafetyLevel::Ask, SafetyLevel::Strict] {
@@ -8862,22 +9028,100 @@ mod safety_level_tests {
     }
 
     #[test]
+    fn the_removed_features_notice_lists_until_dismissed() {
+        let mut registry = Registry::default();
+        assert!(registry.removed_features_notice().is_empty());
+        registry.unknown_fields.insert(
+            "removedFeaturesNotice".into(),
+            serde_json::json!({ "features": ["agentRules", "routines"] }),
+        );
+        assert_eq!(registry.removed_features_notice(), ["agentRules", "routines"]);
+        assert_eq!(
+            removed_features_issue_url(&registry.removed_features_notice()),
+            "https://github.com/btsouth/toolport/issues/new?title=I%20need%20Agent%20rules%2C%20Routines%20in%20Toolport%202.0&body=Toolport%202.0%20removed%3A%20Agent%20rules%2C%20Routines.%0A%0AWhat%20I%20used%20it%20for%3A%0A%0A"
+        );
+        assert_eq!(
+            removed_features_message(&registry.removed_features_notice()),
+            "Toolport 2.0 no longer includes Agent rules and Routines, which you used in 1.x. Your settings for them are saved in the exports folder, and files Toolport wrote for them were left as they were. Tell us if you need one back, or go back to 1.24."
+        );
+        registry.dismiss_removed_features_notice();
+        assert!(registry.removed_features_notice().is_empty());
+    }
+
+    #[test]
+    fn kept_v1_protections_are_summarized_for_settings() {
+        assert_eq!(KeptV1Safety::default().summary(), None);
+        let one = KeptV1Safety { hold_untrusted: true, ..Default::default() };
+        assert_eq!(
+            one.summary().unwrap(),
+            "Kept from 1.x: Toolport also asks before calls from shared or registry servers."
+        );
+        let two = KeptV1Safety { hold_untrusted: true, block_on_injection: true, ..Default::default() };
+        assert_eq!(
+            two.summary().unwrap(),
+            "Kept from 1.x: Toolport also asks before calls from shared or registry servers and blocks results that look like prompt injection."
+        );
+    }
+
+    #[test]
+    fn kept_v1_protections_apply_until_the_user_picks_a_level() {
+        let mut r = Registry::default();
+        r.safety_level = Some(SafetyLevel::Off);
+        r.kept_v1_safety = Some(KeptV1Safety {
+            quarantine_on_drift: true,
+            ..Default::default()
+        });
+        assert!(r.quarantine_on_drift_effective());
+        assert!(!r.deny_destructive_effective());
+        assert!(!r.requires_human_approval(true, true));
+        r.safety_level = Some(SafetyLevel::Ask);
+        r.kept_v1_safety = Some(KeptV1Safety {
+            hold_untrusted: true,
+            ..Default::default()
+        });
+        assert!(r.requires_human_approval(false, true));
+        assert!(r.requires_human_approval(true, false));
+        assert!(!r.requires_human_approval(false, false));
+        r.set_safety_level(SafetyLevel::Ask);
+        assert_eq!(r.kept_v1_safety, None);
+        assert!(!r.requires_human_approval(false, true));
+    }
+
+    #[test]
     fn legacy_fields_derive_nearest_level_and_new_registry_asks() {
         assert_eq!(
             Registry::default().safety_level_effective(),
             SafetyLevel::Ask
         );
+        // A v1 registry behaves as 1.x did: each toggle on its own, no Strict.
         for (field, level) in [
-            ("denyDestructive", SafetyLevel::Strict),
-            ("quarantineOnDrift", SafetyLevel::Strict),
-            ("blockOnInjection", SafetyLevel::Strict),
+            ("denyDestructive", SafetyLevel::Off),
+            ("quarantineOnDrift", SafetyLevel::Off),
+            ("blockOnInjection", SafetyLevel::Off),
             ("humanApproval", SafetyLevel::Ask),
             ("confirmDestructive", SafetyLevel::Ask),
         ] {
             let mut value = serde_json::json!({"servers": [], "profiles": []});
             value[field] = serde_json::json!(true);
             let registry: Registry = serde_json::from_value(value).unwrap();
-            assert_eq!(registry.safety_level_effective(), level);
+            assert_eq!(registry.safety_level_effective(), level, "{field}");
+            assert_eq!(registry.deny_destructive_effective(), field == "denyDestructive");
+            assert_eq!(
+                registry.quarantine_on_drift_effective(),
+                field == "quarantineOnDrift"
+            );
+            assert_eq!(
+                registry.block_on_injection_effective(),
+                field == "blockOnInjection"
+            );
+            assert_eq!(
+                registry.requires_human_approval(false, true),
+                field == "humanApproval"
+            );
+            assert_eq!(
+                registry.requires_human_approval(true, false),
+                level == SafetyLevel::Ask
+            );
         }
         let registry: Registry =
             serde_json::from_value(serde_json::json!({"servers": [], "profiles": []})).unwrap();

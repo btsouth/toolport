@@ -71,6 +71,7 @@ import {
 } from "@/lib/api";
 import type { AllowedTool, FolderProfile, Profile, Registry } from "@/lib/types";
 import { isGatewayServer } from "@/lib/types";
+import { keptSafetySummary } from "@/lib/keptSafety";
 import { useTheme, type Theme } from "@/lib/theme";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -572,13 +573,9 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     registry?.safetyLevel ??
     (registry && registry.version >= 2
       ? "ask"
-      : registry?.denyDestructive ||
-          registry?.quarantineOnDrift ||
-          registry?.blockOnInjection
-        ? "strict"
-        : registry?.humanApproval || registry?.confirmDestructive
-          ? "ask"
-          : "off");
+      : registry?.humanApproval || registry?.confirmDestructive
+        ? "ask"
+        : "off");
   const effectiveLevel =
     safetyLevels[
       Math.max(safetyLevels.indexOf(memberLevel), safetyLevels.indexOf(teamFloor))
@@ -591,6 +588,28 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   useEffect(() => {
     latestRegistry.current = registry;
   }, [registry]);
+  const keptSummary = keptSafetySummary(registry?.keptV1Safety);
+  const levelLabel = { off: "Off", ask: "Ask", strict: "Strict" } as const;
+  // Picking a level, even the current one, also drops protections kept from 1.x.
+  async function chooseSafety(level: "off" | "ask" | "strict") {
+    setSafetyBusy(true);
+    try {
+      const updated = await setSafetyLevel(level);
+      const reconciled = latestRegistry.current
+        ? {
+            ...latestRegistry.current,
+            safetyLevel: updated.safetyLevel,
+            keptV1Safety: updated.keptV1Safety,
+          }
+        : updated;
+      latestRegistry.current = reconciled;
+      onRegistryChange(reconciled);
+    } catch (error) {
+      toastError(`Couldn't update safety: ${error}`);
+    } finally {
+      setSafetyBusy(false);
+    }
+  }
   // Profile cards collapse so a big Default profile doesn't dump every server (and its
   // per-server tool rows) onto the page. Collapsed by default; the comma summary still shows.
   const [openProfiles, setOpenProfiles] = useState<Set<string>>(new Set());
@@ -1045,23 +1064,9 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             aria-label="Safety"
             disabled={safetyBusy}
             value={effectiveLevel}
-            onChange={async (event) => {
-              setSafetyBusy(true);
-              try {
-                const updated = await setSafetyLevel(
-                  event.target.value as "off" | "ask" | "strict",
-                );
-                const reconciled = latestRegistry.current
-                  ? { ...latestRegistry.current, safetyLevel: updated.safetyLevel }
-                  : updated;
-                latestRegistry.current = reconciled;
-                onRegistryChange(reconciled);
-              } catch (error) {
-                toastError(`Couldn't update safety: ${error}`);
-              } finally {
-                setSafetyBusy(false);
-              }
-            }}
+            onChange={(event) =>
+              chooseSafety(event.target.value as "off" | "ask" | "strict")
+            }
           >
             <option value="off" disabled={teamFloor !== "off"}>
               Off
@@ -1087,6 +1092,21 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               ? "Safety is set to Ask. Destructive calls need your approval before they run."
               : "Safety is set to Strict. Destructive tools are hidden and untrusted calls need your approval."}
         </p>
+        {keptSummary && (
+          <div className="flex flex-col items-start gap-2 rounded-md border px-3 py-2 text-xs">
+            <p>
+              {keptSummary} Choosing a level replaces these with that level's protections.
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={safetyBusy}
+              onClick={() => chooseSafety(effectiveLevel)}
+            >
+              Use standard {levelLabel[effectiveLevel]}
+            </Button>
+          </div>
+        )}
         {teamFloor !== "off" && (
           <p className="text-xs">
             Team minimum safety level: {teamFloor === "ask" ? "Ask" : "Strict"}. Choices

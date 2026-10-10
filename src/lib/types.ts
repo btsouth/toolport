@@ -468,6 +468,13 @@ export interface LaunchConfig {
   revision?: number | null;
 }
 
+export interface KeptV1Safety {
+  holdUntrusted?: boolean;
+  denyDestructive?: boolean;
+  quarantineOnDrift?: boolean;
+  blockOnInjection?: boolean;
+}
+
 export interface ServerEntry {
   enabled?: boolean;
   id: string;
@@ -488,6 +495,9 @@ export interface ServerEntry {
   /** Working directory for a stdio server. Unset = inherit the gateway's cwd.
    * `~` and `${VAR}` are expanded. Lets a server run in a project dir (#239). */
   cwd?: string | null;
+  /** Pass the user's whole shell environment to this stdio server instead of
+   * the default allowlist. Servers migrated from 1.x start with it on. */
+  inheritEnv?: boolean;
   /** Headless outbound OAuth (SBS-524). Present = this server uses the
    * client-credentials flow instead of the interactive browser one. */
   clientCredentials?: ClientCredentials | null;
@@ -605,6 +615,10 @@ export interface Registry {
   teamForcedDenyDestructive?: boolean;
   teamForcedQuarantineOnDrift?: boolean;
   teamForcedBlockOnInjection?: boolean;
+  /** Removed 1.x features this install used, recorded by the upgrade. */
+  removedFeaturesNotice?: { features?: string[]; dismissed?: boolean };
+  /** 1.x protections the upgrade kept on top of the level, until a level is picked. */
+  keptV1Safety?: KeptV1Safety;
   /** Retained legacy switch for registries without a safety level. */
   denyDestructive?: boolean;
   /** Per-call confirmation: intercept destructive tools with a preview + token. */

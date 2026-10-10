@@ -22,6 +22,10 @@ pub(super) struct SettingsPage {
     safety_level: gtk::DropDown,
     safety_floor: Rc<Cell<crate::registry::SafetyLevel>>,
     safety_policy: gtk::Label,
+    safety_kept: gtk::Box,
+    safety_kept_note: gtk::Label,
+    safety_kept_reset: gtk::Button,
+    safety_current: Rc<Cell<crate::registry::SafetyLevel>>,
     lazy_discovery: gtk::Switch,
     pinned_section: gtk::Box,
     pinned_list: gtk::Box,
@@ -230,6 +234,18 @@ impl SettingsPage {
         safety_policy.set_wrap(true);
         safety_policy.add_css_class("dim-label");
         safety.append(&safety_policy);
+        let safety_kept = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        safety_kept.set_margin_top(8);
+        let safety_kept_note = gtk::Label::new(None);
+        safety_kept_note.set_xalign(0.0);
+        safety_kept_note.set_wrap(true);
+        safety_kept.append(&safety_kept_note);
+        let safety_kept_reset = gtk::Button::builder()
+            .halign(gtk::Align::Start)
+            .build();
+        safety_kept.append(&safety_kept_reset);
+        safety_kept.set_visible(false);
+        safety.append(&safety_kept);
         page.append(&safety);
         page.append(&settings_heading(
             "Advanced",
@@ -526,6 +542,10 @@ impl SettingsPage {
             safety_level,
             safety_floor: Rc::new(Cell::new(crate::registry::SafetyLevel::Off)),
             safety_policy,
+            safety_kept,
+            safety_kept_note,
+            safety_kept_reset,
+            safety_current: Rc::new(Cell::new(crate::registry::SafetyLevel::Off)),
             lazy_discovery,
             pinned_section,
             pinned_list,
@@ -1414,6 +1434,26 @@ impl SettingsPage {
 
     fn connect_switches(&self) {
         let page = self.clone();
+        self.safety_kept_reset.connect_clicked(move |button| {
+            let level = page.safety_current.get();
+            page.begin_mutation();
+            button.set_sensitive(false);
+            let page = page.clone();
+            gtk::glib::spawn_future_local(async move {
+                let result = super::run_user_action(move || {
+                    crate::registry_controller::set_safety_level(level)
+                })
+                .await;
+                page.begin_mutation();
+                match result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => page.show_error(&error),
+                    Err(_) => page.show_error("the safety update stopped unexpectedly"),
+                }
+                page.refresh();
+            });
+        });
+        let page = self.clone();
         self.safety_level.connect_selected_notify(move |control| {
             if page.updating.get() {
                 return;
@@ -1718,6 +1758,17 @@ impl SettingsPage {
                 || settings.block_on_injection_forced,
         );
         self.safety_level.set_sensitive(true);
+        self.safety_current.set(settings.safety_level);
+        let kept = settings.kept_v1_safety.summary();
+        self.safety_kept.set_visible(kept.is_some());
+        if let Some(kept) = kept {
+            self.safety_kept_note.set_label(&format!(
+                "{kept} Choosing a level replaces these with that level's protections."
+            ));
+            self.safety_kept_reset
+                .set_label(&format!("Use standard {}", level_name(settings.safety_level)));
+            self.safety_kept_reset.set_sensitive(true);
+        }
         set_switch(&self.pii_redaction, settings.pii_redaction);
         set_team_managed(&self.pii_redaction, settings.pii_redaction_forced);
         self.updating.set(false);
@@ -2445,6 +2496,14 @@ fn http_access_choice(
     }
 }
 
+fn level_name(level: crate::registry::SafetyLevel) -> &'static str {
+    match level {
+        crate::registry::SafetyLevel::Off => "Off",
+        crate::registry::SafetyLevel::Ask => "Ask",
+        crate::registry::SafetyLevel::Strict => "Strict",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2556,3 +2615,4 @@ mod tests {
         assert!(is_error);
     }
 }
+

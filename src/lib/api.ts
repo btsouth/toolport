@@ -916,6 +916,15 @@ export function dismissAccessUpgradeNotice(): Promise<Registry> {
   return invoke<Registry>("dismiss_access_upgrade_notice");
 }
 
+export function dismissRemovedFeaturesNotice(): Promise<Registry> {
+  return invoke<Registry>("dismiss_removed_features_notice");
+}
+
+/** Open the folder where the 2.0 upgrade saved settings for removed features. */
+export function openExportsDir(): Promise<void> {
+  return invoke<void>("open_exports_dir");
+}
+
 /** Set (or clear with `null`) a profile's tool-granular scope for one server (SOU-189):
  * the only original tool names that profile exposes on that server. `null`/empty = all. */
 export function setProfileServerTools(

@@ -5028,15 +5028,33 @@ fn inherited_environment() -> std::collections::BTreeMap<String, String> {
     return process_env_map();
     #[cfg(not(windows))]
     {
+        let process = process_env_map();
         let mut cached = LOGIN_ENV
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cached
-            .get_or_insert_with(|| {
-                login_environment_or_process(&process_env_map(), Duration::from_secs(5))
-            })
-            .clone()
+        let login = cached
+            .get_or_insert_with(|| login_environment_or_process(&process, Duration::from_secs(5)))
+            .clone();
+        with_client_environment(login, &process)
     }
+}
+
+/// The login environment, plus any name only the client's environment has.
+/// 1.x children inherited the client's environment, so variables a user
+/// exported in the terminal that started the client keep working. Login values
+/// win where both define a name, so a GUI client's bare PATH cannot hide the
+/// user's shell PATH.
+#[cfg(not(windows))]
+fn with_client_environment(
+    mut login: std::collections::BTreeMap<String, String>,
+    process: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    for (name, value) in process {
+        login
+            .entry(name.clone())
+            .or_insert_with(|| value.clone());
+    }
+    login
 }
 
 #[cfg(not(windows))]
@@ -18242,6 +18260,24 @@ mod login_environment_tests {
         );
         assert!(!env.contains_key("AMBIENT_SECRET"));
         assert!(!env.contains_key("TOOLPORT_SECRET_KEY"));
+    }
+
+    #[test]
+    fn inherited_environment_adds_client_only_names_under_login_values() {
+        let login = BTreeMap::from([
+            ("PATH".to_string(), "/home/u/.local/bin:/usr/bin".to_string()),
+            ("LOGIN_KEY".to_string(), "login".to_string()),
+        ]);
+        let process = BTreeMap::from([
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("AWS_PROFILE".to_string(), "work".to_string()),
+        ]);
+        let env = with_client_environment(login, &process);
+        assert_eq!(env["PATH"], "/home/u/.local/bin:/usr/bin");
+        assert_eq!(env["LOGIN_KEY"], "login");
+        assert_eq!(env["AWS_PROFILE"], "work");
+        let child: BTreeMap<_, _> = child_environment(&env, &[], false).into_iter().collect();
+        assert!(!child.contains_key("AWS_PROFILE"), "opt-out servers keep the allowlist");
     }
 
     #[test]

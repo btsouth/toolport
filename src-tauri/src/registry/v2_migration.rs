@@ -65,41 +65,126 @@ pub(super) fn migrate_v1_to_v2(
     export_rules(registry, context)?;
     export_agent_permissions(registry, context)?;
     export_routines(context)?;
+    let removed = removed_features_used(registry, context);
+    if !removed.is_empty() && !registry.contains_key("removedFeaturesNotice") {
+        registry.insert(
+            "removedFeaturesNotice".to_string(),
+            serde_json::json!({ "features": removed }),
+        );
+    }
 
-    let level = safety_level(registry);
+    let (level, kept) = safety_level(registry);
     registry.insert("safetyLevel".to_string(), Value::from(level));
     // The 1.x mirror of the level; see `Registry::sync_legacy_safety_mirror`.
     let strict = level == "strict";
-    for key in ["denyDestructive", "quarantineOnDrift", "blockOnInjection"] {
-        registry.insert(key.to_string(), Value::Bool(strict));
+    let kept_on = |key: &str| kept.get(key).and_then(Value::as_bool).unwrap_or(false);
+    for (key, kept_key) in [
+        ("denyDestructive", "denyDestructive"),
+        ("quarantineOnDrift", "quarantineOnDrift"),
+        ("blockOnInjection", "blockOnInjection"),
+    ] {
+        registry.insert(key.to_string(), Value::Bool(strict || kept_on(kept_key)));
     }
     registry.insert("humanApproval".to_string(), Value::Bool(level != "off"));
     registry.insert("confirmDestructive".to_string(), Value::Bool(false));
-    // Code Mode is opt-in in 2.0, including for existing users.
-    // TOOLPORT_CODE_MODE=1 still forces it on.
-    registry.insert("codeMode".to_string(), Value::Bool(false));
+    if !kept.is_empty() {
+        registry.insert("keptV1Safety".to_string(), Value::Object(kept));
+    }
+    // Code Mode keeps the 1.x choice; 1.x had it on unless turned off. New
+    // installs start with it off.
+    let code_mode = registry
+        .get("codeMode")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    registry.insert("codeMode".to_string(), Value::Bool(code_mode));
+    // 1.x local servers inherited the whole environment. New servers get the
+    // allowlist; existing ones keep working with what they had.
+    if let Some(servers) = registry.get_mut("servers").and_then(Value::as_array_mut) {
+        for server in servers.iter_mut().filter_map(Value::as_object_mut) {
+            let local = server.get("transport").and_then(Value::as_str) == Some("stdio")
+                || server.get("command").is_some_and(|command| !command.is_null());
+            if local && !server.contains_key("inheritEnv") {
+                server.insert("inheritEnv".to_string(), Value::Bool(true));
+            }
+        }
+    }
     for key in DROPPED_KEYS {
         registry.remove(*key);
     }
     Ok(())
 }
 
-/// A level already chosen in a 2.0 preview is kept. Otherwise any v1 blocking flag
-/// means Strict, and everything else gets the 2.0 default, Ask. Team-forced flags
+/// The removed 1.x features this install actually used, so only those users
+/// see the notice. Checked locally; nothing is sent anywhere.
+fn removed_features_used(
+    registry: &Map<String, Value>,
+    context: &MigrationContext,
+) -> Vec<&'static str> {
+    let on = |key: &str| registry.get(key).and_then(Value::as_bool) == Some(true);
+    let nonempty = |key: &str| match registry.get(key) {
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(Value::Object(items)) => !items.is_empty(),
+        _ => false,
+    };
+    let guard = |key: &str| {
+        registry
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode != "off")
+    };
+    let rules = array(registry, "ruleSets")
+        .iter()
+        .any(|set| !text(set, "content").trim().is_empty())
+        || nonempty("rulesTargets")
+        || nonempty("rulesProjects");
+    let permissions = on("agentPermissionsEnabled")
+        || nonempty("agentPermissionRules")
+        || guard("guardCursorMode")
+        || guard("guardClaudeMode");
+    let routines = context.data_dir.join("routines.json").is_file();
+    [
+        (rules, "agentRules"),
+        (permissions, "agentPermissions"),
+        (on("hooksEnabled"), "activityHooks"),
+        (routines, "routines"),
+        (on("allowAgentControl") || on("allowRoutineWrites"), "agentControl"),
+    ]
+    .into_iter()
+    .filter_map(|(used, id)| used.then_some(id))
+    .collect()
+}
+
+/// A level already chosen in a 2.0 preview is kept. Otherwise the upgrade keeps
+/// exactly what 1.x did: nothing on means Off, approval or confirmation means Ask,
+/// and each 1.x protection the level lacks is kept on its own. 1.x approval also
+/// held calls from untrusted servers, which Ask alone does not. Team-forced flags
 /// are not read here: team policy arrives from the service.
-fn safety_level(registry: &Map<String, Value>) -> &'static str {
+fn safety_level(registry: &Map<String, Value>) -> (&'static str, Map<String, Value>) {
     match registry.get("safetyLevel").and_then(Value::as_str) {
-        Some("off") => return "off",
-        Some("ask") => return "ask",
-        Some("strict") => return "strict",
+        Some("off") => return ("off", Map::new()),
+        Some("ask") => return ("ask", Map::new()),
+        Some("strict") => return ("strict", Map::new()),
         _ => {}
     }
     let on = |key: &str| registry.get(key).and_then(Value::as_bool).unwrap_or(false);
-    if on("denyDestructive") || on("quarantineOnDrift") || on("blockOnInjection") {
-        "strict"
-    } else {
+    let approval = on("humanApproval");
+    let level = if approval || on("confirmDestructive") {
         "ask"
+    } else {
+        "off"
+    };
+    let mut kept = Map::new();
+    for (flag, key) in [
+        (approval, "holdUntrusted"),
+        (on("denyDestructive"), "denyDestructive"),
+        (on("quarantineOnDrift"), "quarantineOnDrift"),
+        (on("blockOnInjection"), "blockOnInjection"),
+    ] {
+        if flag {
+            kept.insert(key.to_string(), Value::Bool(true));
+        }
     }
+    (level, kept)
 }
 
 fn array<'a>(registry: &'a Map<String, Value>, key: &str) -> &'a [Value] {
@@ -589,17 +674,19 @@ mod tests {
         let v2 = read_json(&path);
         assert_eq!(v2["version"], 2);
         assert_eq!(registry.version, REGISTRY_VERSION);
-        // No blocking flag was on, so the 2.0 default applies.
-        assert_eq!(v2["safetyLevel"], "ask");
-        assert_eq!(registry.safety_level, Some(SafetyLevel::Ask));
-        assert_eq!(v2["codeMode"], false);
-        assert!(!registry.code_mode);
+        // Nothing was on in 1.x, so nothing is held after the upgrade either,
+        // and Code Mode stays on as it was.
+        assert_eq!(v2["safetyLevel"], "off");
+        assert_eq!(registry.safety_level, Some(SafetyLevel::Off));
+        assert!(v2.get("keptV1Safety").is_none());
+        assert_eq!(v2["codeMode"], true);
+        assert!(registry.code_mode);
         for key in DROPPED_KEYS {
             assert!(v2.get(*key).is_none(), "{key} survived the migration");
             assert!(!registry.unknown_fields.contains_key(*key), "{key}");
         }
-        // The 1.x mirror of Ask: approval on, nothing blocked.
-        assert_eq!(v2["humanApproval"], true);
+        // The 1.x mirror of Off: nothing held, nothing blocked.
+        assert_eq!(v2["humanApproval"], false);
         for key in [
             "denyDestructive",
             "quarantineOnDrift",
@@ -616,9 +703,14 @@ mod tests {
             "keep-entry"
         );
 
+        // Servers are unchanged apart from keeping the 1.x environment.
+        let mut servers = v2["servers"].clone();
+        assert_eq!(servers[0]["inheritEnv"], true, "local github server");
+        assert!(servers[1].get("inheritEnv").is_none(), "remote linear server");
+        servers[0].as_object_mut().unwrap().remove("inheritEnv");
+        assert_eq!(servers, v1["servers"]);
         // Kept exactly as they were.
         for key in [
-            "servers",
             "activeProfileId",
             "humanApprovalAllow",
             "teamForcedHumanApproval",
@@ -862,35 +954,52 @@ mod tests {
     }
 
     #[test]
-    fn safety_level_follows_the_v1_flags() {
+    fn safety_follows_the_v1_flags_exactly() {
         let dir = scratch_dir("safety");
-        let cases: [(Value, &str); 9] = [
-            (json!({}), "ask"),
-            (json!({"denyDestructive": true}), "strict"),
-            (json!({"quarantineOnDrift": true}), "strict"),
-            (json!({"blockOnInjection": true}), "strict"),
-            (json!({"humanApproval": true}), "ask"),
-            (json!({"confirmDestructive": true}), "ask"),
+        let cases: [(Value, &str, Value); 9] = [
+            // Nothing on in 1.x stays Off: no new approval prompts.
+            (json!({}), "off", json!(null)),
+            (json!({"denyDestructive": true}), "off", json!({"denyDestructive": true})),
+            (
+                json!({"quarantineOnDrift": true}),
+                "off",
+                json!({"quarantineOnDrift": true}),
+            ),
+            (
+                json!({"blockOnInjection": true}),
+                "off",
+                json!({"blockOnInjection": true}),
+            ),
+            // 1.x approval also held untrusted servers' calls.
+            (json!({"humanApproval": true}), "ask", json!({"holdUntrusted": true})),
+            (json!({"confirmDestructive": true}), "ask", json!(null)),
             // Team locks are not the member's choice and stay as they were.
-            (json!({"teamForcedDenyDestructive": true}), "ask"),
+            (json!({"teamForcedDenyDestructive": true}), "off", json!(null)),
             // A level picked in a 2.0 preview wins over the old flags.
             (
                 json!({"safetyLevel": "off", "denyDestructive": true}),
                 "off",
+                json!(null),
             ),
             (
                 json!({"safetyLevel": "bogus", "blockOnInjection": true}),
-                "strict",
+                "off",
+                json!({"blockOnInjection": true}),
             ),
         ];
-        for (flags, expected) in cases {
+        for (flags, expected, kept) in cases {
             let mut value = json!({"version": 1, "servers": [], "profiles": []});
             for (key, flag) in flags.as_object().unwrap() {
                 value[key] = flag.clone();
             }
             migrate_v1_to_v2(&mut value, &context(&dir)).unwrap();
             assert_eq!(value["safetyLevel"], expected, "{flags}");
+            assert_eq!(value.get("keptV1Safety").cloned().unwrap_or(json!(null)), kept, "{flags}");
             assert_eq!(level_name(as_1x_reader(&value)), expected, "{flags}");
+            // The 1.x mirror still enforces the same protections.
+            for key in ["denyDestructive", "quarantineOnDrift", "blockOnInjection"] {
+                assert_eq!(value[key], kept.get(key).is_some(), "{flags} {key}");
+            }
             if flags.get("teamForcedDenyDestructive").is_some() {
                 assert_eq!(value["teamForcedDenyDestructive"], true);
             }
@@ -900,6 +1009,63 @@ mod tests {
             "nothing to export, nothing written"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn code_mode_keeps_the_1x_choice() {
+        let dir = scratch_dir("code-mode");
+        for (flags, expected) in [
+            (json!({}), true),
+            (json!({"codeMode": true}), true),
+            (json!({"codeMode": false}), false),
+        ] {
+            let mut value = json!({"version": 1, "servers": [], "profiles": []});
+            for (key, flag) in flags.as_object().unwrap() {
+                value[key] = flag.clone();
+            }
+            migrate_v1_to_v2(&mut value, &context(&dir)).unwrap();
+            assert_eq!(value["codeMode"], expected, "{flags}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_notice_lists_only_removed_features_this_install_used() {
+        let dir = scratch_dir("removed-features");
+        let mut quiet = json!({"version": 1, "servers": [], "profiles": [],
+            "ruleSets": [{"id": "default", "name": "Default", "content": "  "}],
+            "hooksEnabled": false, "allowAgentControl": false, "guardCursorMode": "off"});
+        migrate_v1_to_v2(&mut quiet, &context(&dir)).unwrap();
+        assert!(quiet.get("removedFeaturesNotice").is_none());
+
+        std::fs::write(dir.join("routines.json"), "[]").unwrap();
+        let mut used = json!({"version": 1, "servers": [], "profiles": [],
+            "ruleSets": [{"id": "default", "name": "Default", "content": "Be brief."}],
+            "guardClaudeMode": "enforce", "hooksEnabled": true, "allowRoutineWrites": true});
+        migrate_v1_to_v2(&mut used, &context(&dir)).unwrap();
+        assert_eq!(
+            used["removedFeaturesNotice"]["features"],
+            json!(["agentRules", "agentPermissions", "activityHooks", "routines", "agentControl"])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn local_1x_servers_keep_the_whole_environment() {
+        let mut value = json!({"version": 1, "profiles": [], "servers": [
+            {"id": "local", "transport": "stdio", "command": "npx"},
+            {"id": "legacy", "command": "uvx"},
+            {"id": "remote", "transport": "http", "url": "https://example.invalid/mcp"},
+            {"id": "chosen", "transport": "stdio", "command": "npx", "inheritEnv": false}
+        ]});
+        let dir = scratch_dir("inherit-env");
+        migrate_v1_to_v2(&mut value, &context(&dir)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let servers = value["servers"].as_array().unwrap();
+        assert_eq!(servers[0]["inheritEnv"], true);
+        assert_eq!(servers[1]["inheritEnv"], true);
+        assert!(servers[2].get("inheritEnv").is_none());
+        assert_eq!(servers[3]["inheritEnv"], false);
     }
 
     #[test]
@@ -1048,11 +1214,12 @@ mod tests {
             "../../tests/fixtures/registry-v1-to-v2/v2.json"
         ))
         .unwrap();
-        assert_eq!(level_name(as_1x_reader(&fixture)), "ask");
+        assert_eq!(level_name(as_1x_reader(&fixture)), "off");
 
         for (flags, level) in [
-            (json!({"denyDestructive": true}), "strict"),
-            (json!({}), "ask"),
+            (json!({"denyDestructive": true}), "off"),
+            (json!({"humanApproval": true}), "ask"),
+            (json!({}), "off"),
             (json!({"safetyLevel": "off"}), "off"),
         ] {
             let mut v1 = brandon_v1(&dir);
@@ -1066,7 +1233,10 @@ mod tests {
             let reader = as_1x_reader(&on_disk);
             assert_eq!(level_name(reader.clone()), level, "{flags}");
             // 1.x enforces the matching gates.
-            assert_eq!(reader.deny_destructive, level == "strict");
+            assert_eq!(
+                reader.deny_destructive,
+                flags.get("denyDestructive").is_some()
+            );
             assert_eq!(reader.human_approval, level != "off");
 
             // 1.24 reads `version` without checking it and keeps unknown fields, so its
@@ -1088,7 +1258,11 @@ mod tests {
         crate::registry::save_to(&path, &registry).unwrap();
         let on_disk = read_json(&path);
         assert_eq!(on_disk["denyDestructive"], true);
-        assert_eq!(level_name(as_1x_reader(&on_disk)), "strict");
+        assert!(on_disk.get("keptV1Safety").is_none());
+        let reader = as_1x_reader(&on_disk);
+        assert!(reader.deny_destructive_effective());
+        assert!(reader.quarantine_on_drift_effective());
+        assert!(reader.requires_human_approval(false, true));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1106,11 +1280,12 @@ mod tests {
         // The mirror is never read from v2 on, even when a 1.x process changed it.
         registry.deny_destructive = true;
         assert_eq!(registry.safety_level_selected(), SafetyLevel::Ask);
-        // A v1 registry still derives its level from the toggles.
+        // A v1 registry still reads its toggles, each on its own as in 1.x.
         registry.version = 1;
-        assert_eq!(registry.safety_level_selected(), SafetyLevel::Strict);
-        registry.deny_destructive = false;
         assert_eq!(registry.safety_level_selected(), SafetyLevel::Off);
+        assert!(registry.deny_destructive_effective());
+        registry.deny_destructive = false;
+        assert!(!registry.deny_destructive_effective());
     }
 
     /// The preview rollback test restores `v1.json` over `v2.json`. This keeps

@@ -1,4 +1,5 @@
 {
+  "accessUpgradeNoticeDismissed": false,
   "activeProfileId": "default",
   "blockOnInjection": false,
   "clientManagedEntries": {
@@ -16,12 +17,12 @@
   "clientScopes": {
     "cursor": "default"
   },
-  "codeMode": false,
+  "codeMode": true,
   "confirmDestructive": false,
   "defaultAccessContextId": "default",
   "defaultAccessLegacyPolicy": true,
   "denyDestructive": false,
-  "humanApproval": true,
+  "humanApproval": false,
   "humanApprovalAllow": ["github/search_code"],
   "lazyDiscovery": true,
   "pinnedTools": {
@@ -38,7 +39,10 @@
     }
   ],
   "quarantineOnDrift": false,
-  "safetyLevel": "ask",
+  "removedFeaturesNotice": {
+    "features": ["agentRules", "activityHooks", "agentControl"]
+  },
+  "safetyLevel": "off",
   "servers": [
     {
       "args": ["-y", "@modelcontextprotocol/server-github"],
@@ -52,6 +56,7 @@
         }
       ],
       "id": "github",
+      "inheritEnv": true,
       "name": "GitHub",
       "source": "manual",
       "transport": "stdio"
@@ -64,6 +69,5 @@
       }
     }
   },
-  "version": 3,
-  "accessUpgradeNoticeDismissed": false
+  "version": 3
 }

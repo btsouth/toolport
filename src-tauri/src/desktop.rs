@@ -2378,6 +2378,20 @@ fn open_data_dir() -> Result<(), String> {
     crate::diagnostics_controller::open_data_dir()
 }
 
+#[tauri::command]
+fn open_exports_dir() -> Result<(), String> {
+    crate::diagnostics_controller::open_exports_dir()
+}
+
+#[tauri::command]
+fn dismiss_removed_features_notice(state: State<RegistryState>) -> Result<Registry, String> {
+    let (reg, _) = write_registry(state.inner(), |reg| {
+        reg.dismiss_removed_features_notice();
+        Ok(())
+    })?;
+    Ok(reg)
+}
+
 /// Serialize the user's servers into a shareable setup (server definitions only,
 /// never secret values). A teammate imports this and adds their own keys, so a
 /// curated server set can be shared without leaking any credentials. An optional
@@ -4070,6 +4084,8 @@ pub fn run() {
             set_access_server,
             delete_profile,
             dismiss_access_upgrade_notice,
+            dismiss_removed_features_notice,
+            open_exports_dir,
             set_folder_profiles,
             set_profile_server_tools,
             install_gateway,

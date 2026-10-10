@@ -197,8 +197,18 @@ pub fn export_audit(path: &std::path::Path, format: &str) -> Result<(), String> 
 
 pub fn open_data_dir() -> Result<(), String> {
     let directory = registry::conduit_dir().ok_or("could not resolve the data directory")?;
+    open_directory(directory, "data directory")
+}
+
+/// Where the 2.0 upgrade saved settings for removed 1.x features.
+pub fn open_exports_dir() -> Result<(), String> {
+    let directory = registry::conduit_dir().ok_or("could not resolve the data directory")?;
+    open_directory(directory.join("exports"), "exports folder")
+}
+
+fn open_directory(directory: std::path::PathBuf, what: &str) -> Result<(), String> {
     std::fs::create_dir_all(&directory)
-        .map_err(|error| format!("could not create the data directory: {error}"))?;
+        .map_err(|error| format!("could not create the {what}: {error}"))?;
     #[cfg(target_os = "windows")]
     let program = "explorer";
     #[cfg(target_os = "macos")]
@@ -210,7 +220,7 @@ pub fn open_data_dir() -> Result<(), String> {
     command
         .arg(directory)
         .spawn()
-        .map_err(|error| format!("could not open the data directory: {error}"))?;
+        .map_err(|error| format!("could not open the {what}: {error}"))?;
     Ok(())
 }
 
