@@ -104,6 +104,7 @@ export function assertManifest(paths, kind) {
     .filter(Boolean);
   if (!files.includes(shell) || !files.includes(gateway))
     throw new Error(`Missing intended shell or gateway in ${kind} package`);
+  const unexpected = [];
   for (const path of files) {
     if (
       /(?:^|\/)(?:mock-mcp-server|search_eval_scale|toolport-live-client-task|deps|examples)(?:[./-]|$)/i.test(
@@ -130,7 +131,7 @@ export function assertManifest(paths, kind) {
         );
     } else if (kind === "appimage") {
       allowed =
-        /^(?:AppRun|\.DirIcon|apprun-hooks\/linuxdeploy-plugin-gtk\.sh|(?:[Tt]oolport|conduit)\.(?:desktop|png)|usr\/bin\/(?:conduit|toolport-gateway|xdg-mime))$/.test(
+        /^(?:AppRun(?:\.wrapped)?|\.DirIcon|apprun-hooks\/linuxdeploy-plugin-gtk\.sh|(?:[Tt]oolport|conduit)\.(?:desktop|png)|usr\/bin\/(?:conduit|toolport-gateway|xdg-mime))$/.test(
           path,
         ) ||
         /^(?:usr|usr\/bin|usr\/lib|usr\/lib64|usr\/share)$/.test(path) ||
@@ -143,9 +144,13 @@ export function assertManifest(paths, kind) {
         /^usr\/lib(?:64)?\/(?:gio|gdk-pixbuf-2\.0|gtk-3\.0|gtk-4\.0|webkit2gtk-4\.1|webkitgtk-6\.0)\//.test(
           path,
         ) ||
-        /^usr\/lib\/girepository-1\.0\/[A-Za-z0-9]+-[0-9]+\.[0-9]+\.typelib$/.test(
+        /^usr\/lib\/girepository-1\.0\/[A-Za-z0-9]+-[0-9]+(?:\.[0-9]+)?\.typelib$/.test(
           path,
         ) ||
+        /^usr\/lib\/im-(?:am-et|broadway|cedilla|cyrillic-translit|inuktitut|ipa|multipress|thai|ti-er|ti-et|viqr|wayland|xim)\.so$/.test(
+          path,
+        ) ||
+        /^usr\/share\/doc\/lib[A-Za-z0-9+.-]+\/copyright$/.test(path) ||
         /^usr\/share\/(?:glib-2\.0\/schemas|mime|themes|icons|locale)\//.test(path);
       // Runtime directories themselves appear in the archive listing too.
       if (!allowed && files.some((file) => file.startsWith(`${path}/`))) allowed = true;
@@ -155,7 +160,9 @@ export function assertManifest(paths, kind) {
           path,
         ) || files.some((file) => file.startsWith(`${path}/`));
     } else throw new Error(`Unknown package kind: ${kind}`);
-    if (!allowed) throw new Error(`Unexpected ${kind} payload: ${path}`);
+    if (!allowed) unexpected.push(path);
   }
+  if (unexpected.length)
+    throw new Error(`Unexpected ${kind} payload:\n${unexpected.join("\n")}`);
   return files;
 }
