@@ -1490,7 +1490,72 @@ pub fn known_adapter_name(id: &str) -> Option<String> {
         .map(|def| def.name.to_string())
 }
 
+/// Resolve a whole Activity pass against one snapshot of caller names.
+pub struct CallerNames(HashMap<String, String>);
+
+impl CallerNames {
+    pub fn for_entries(entries: &[serde_json::Value]) -> Self {
+        Self::for_entries_with(entries, || crate::registry::load().ok())
+    }
+
+    fn for_entries_with(
+        entries: &[serde_json::Value],
+        load: impl FnOnce() -> Option<crate::registry::Registry>,
+    ) -> Self {
+        let mut names: HashMap<String, String> = defs()
+            .into_iter()
+            .map(|def| (format!("adapter:{}", def.id), def.name.to_string()))
+            .collect();
+        names.insert(
+            "adapter:claude-code-secondary".into(),
+            "Claude Code (secondary)".into(),
+        );
+        if entries.iter().any(|entry| {
+            entry["client"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("client:"))
+        }) {
+            if let Some(registry) = load() {
+                for client in registry.http_clients {
+                    names.insert(format!("client:{}", client.id), client.label);
+                }
+            }
+        }
+        Self(names)
+    }
+
+    pub fn trusted_name(&self, client: Option<&str>, recorded_name: Option<&str>) -> String {
+        trusted_client_name_with(client, recorded_name, |id| self.0.get(id).cloned())
+    }
+}
+
 pub fn trusted_client_name(client: Option<&str>, recorded_name: Option<&str>) -> String {
+    trusted_client_name_with(client, recorded_name, |client| {
+        if let Some(id) = client.strip_prefix("adapter:") {
+            known_adapter_name(id)
+        } else {
+            let id = client.strip_prefix("client:")?;
+            crate::registry::load()
+                .ok()?
+                .http_clients
+                .into_iter()
+                .find(|client| client.id == id)
+                .map(|client| client.label)
+        }
+    })
+}
+
+/// Write-time fallback uses only identity already in the request context.
+/// Registered labels are resolved at session setup or when reading Activity.
+pub(crate) fn unresolved_client_name(client: Option<&str>) -> String {
+    trusted_client_name_with(client, None, |_| None)
+}
+
+fn trusted_client_name_with(
+    client: Option<&str>,
+    recorded_name: Option<&str>,
+    lookup: impl FnOnce(&str) -> Option<String>,
+) -> String {
     if let Some(name) = recorded_name.filter(|name| {
         !name.is_empty()
             && !matches!(
@@ -1503,21 +1568,14 @@ pub fn trusted_client_name(client: Option<&str>, recorded_name: Option<&str>) ->
         return crate::session_observability::display_label(name)
             .unwrap_or_else(|| "Unknown client".into());
     }
+    if let Some(name) = client.and_then(lookup) {
+        return crate::session_observability::display_label(&name)
+            .unwrap_or_else(|| "Unknown client".into());
+    }
     if let Some(id) = client.and_then(|client| client.strip_prefix("adapter:")) {
-        if let Some(name) = known_adapter_name(id) {
-            return name;
-        }
         if !id.starts_with("adapter-pid-") {
             if let Some(name) = crate::session_observability::display_label(id) {
                 return name;
-            }
-        }
-    }
-    if let Some(id) = client.and_then(|client| client.strip_prefix("client:")) {
-        if let Ok(registry) = crate::registry::load() {
-            if let Some(client) = registry.http_clients.iter().find(|client| client.id == id) {
-                return crate::session_observability::display_label(&client.label)
-                    .unwrap_or_else(|| "Unknown client".into());
             }
         }
     }
@@ -8109,7 +8167,10 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::write(&current, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
             std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755)).unwrap();
-            assert_eq!(std::fs::metadata(&unused).unwrap().permissions().mode() & 0o777, 0o755);
+            assert_eq!(
+                std::fs::metadata(&unused).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
             let plain_output = std::process::Command::new(&unused)
                 .args(["unsupported caller", "$literal"])
                 .output()
@@ -8151,6 +8212,44 @@ mod tests {
                 .is_symlink());
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn activity_names_load_one_registry_snapshot_for_the_whole_pass() {
+        let entries = vec![serde_json::json!({"client":"client:real"}); 1000];
+        let mut loads = 0;
+        let names = CallerNames::for_entries_with(&entries, || {
+            loads += 1;
+            let mut registry = crate::registry::Registry::default();
+            registry.http_clients.push(crate::registry::HttpClient {
+                id: "real".into(),
+                label: "My assistant".into(),
+                token_sha256: "unused".into(),
+                profile: String::new(),
+                unknown_fields: Default::default(),
+            });
+            Some(registry)
+        });
+        for entry in entries {
+            assert_eq!(
+                names.trusted_name(entry["client"].as_str(), None),
+                "My assistant"
+            );
+            assert_eq!(
+                names.trusted_name(Some("adapter:claude-code"), None),
+                "Claude Code"
+            );
+            assert_eq!(names.trusted_name(Some("adapter:inbox"), None), "inbox");
+            assert_eq!(
+                names.trusted_name(Some("client:real"), Some("Recorded name")),
+                "Recorded name"
+            );
+        }
+        assert_eq!(loads, 1);
+        let _ =
+            CallerNames::for_entries_with(&[serde_json::json!({"client":"adapter:inbox"})], || {
+                panic!("adapter rows must not load the registry")
+            });
     }
 
     #[test]

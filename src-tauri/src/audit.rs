@@ -515,6 +515,7 @@ fn client_activity_from_entries(
     limit: usize,
     since_ms: Option<u64>,
 ) -> Vec<Value> {
+    let names = crate::clients::CallerNames::for_entries(&entries);
     let mut groups =
         std::collections::BTreeMap::<String, (Value, std::collections::HashSet<String>)>::new();
     for entry in entries {
@@ -527,7 +528,7 @@ fn client_activity_from_entries(
         {
             continue;
         }
-        let entry = activity_client_name(entry);
+        let entry = activity_client_name(entry, &names);
         let name = crate::clients::display_caller_name(
             entry["clientName"].as_str(),
             entry["clientLabel"].as_str(),
@@ -658,22 +659,26 @@ fn read_recent_matching(
     // first let an unparseable line consume a slot, so one corrupt row among the
     // newest entries returned a short page and dropped older valid history that
     // should have filled it.
-    Ok(content
+    let entries: Vec<_> = content
         .lines()
         .rev()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(visible)
         .take(limit)
-        .map(activity_client_name)
+        .collect();
+    let names = crate::clients::CallerNames::for_entries(&entries);
+    Ok(entries
+        .into_iter()
+        .map(|entry| activity_client_name(entry, &names))
         .collect())
 }
 
-pub fn activity_client_name(mut entry: Value) -> Value {
+pub fn activity_client_name(mut entry: Value, names: &crate::clients::CallerNames) -> Value {
     if !entry.is_object() {
         return entry;
     }
     if entry.get("client").is_some() || entry.get("clientName").is_some() {
-        entry["clientName"] = json!(crate::clients::trusted_client_name(
+        entry["clientName"] = json!(names.trusted_name(
             entry.get("client").and_then(Value::as_str),
             entry.get("clientName").and_then(Value::as_str),
         ));
@@ -1055,12 +1060,18 @@ mod tests {
     #[test]
     fn f6_historical_caller_fields_are_private_on_display_only() {
         let stored = json!({"client":"adapter:/home/private/customer.env", "clientLabel":"private/customer.env", "ok":true});
-        let displayed = activity_client_name(stored.clone());
+        let displayed = activity_client_name(
+            stored.clone(),
+            &crate::clients::CallerNames::for_entries(&[]),
+        );
         assert_eq!(displayed["clientName"], "[private]");
         assert_eq!(displayed["clientLabel"], "[private]");
         assert!(displayed.get("client").is_none());
         assert_eq!(stored["client"], "adapter:/home/private/customer.env");
-        let reported = activity_client_name(json!({"clientLabel":"private/customer.env", "ok":true}));
+        let reported = activity_client_name(
+            json!({"clientLabel":"private/customer.env", "ok":true}),
+            &crate::clients::CallerNames::for_entries(&[]),
+        );
         assert!(reported.get("clientName").is_none());
         assert_eq!(reported["clientLabel"], "[private]");
     }
@@ -1109,7 +1120,10 @@ mod tests {
                 assert_eq!(row["client"], "adapter:inbox");
             }
         }
-        let legacy = activity_client_name(json!({"ok":true,"tool":"legacy"}));
+        let legacy = activity_client_name(
+            json!({"ok":true,"tool":"legacy"}),
+            &crate::clients::CallerNames::for_entries(&[]),
+        );
         assert!(legacy.get("clientName").is_none());
     }
 

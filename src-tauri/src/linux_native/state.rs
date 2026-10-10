@@ -81,8 +81,9 @@ impl ActivitySnapshot {
         let mut call_count = 0usize;
         let mut calls = Vec::new();
 
+        let names = crate::clients::CallerNames::for_entries(&entries);
         for entry in entries {
-            let entry = crate::audit::activity_client_name(entry);
+            let entry = crate::audit::activity_client_name(entry, &names);
             let call_ok = crate::audit::tool_call_ok(&entry);
             let is_approval = entry["kind"] == "approval";
             if call_ok.is_none() && !is_approval && entry["kind"] != "internal" {
@@ -114,10 +115,7 @@ impl ActivitySnapshot {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("Unknown tool")
                         .to_string(),
-                    client: (entry.get("client").is_some() || entry.get("clientName").is_some()).then(|| crate::clients::trusted_client_name(
-                        entry.get("client").and_then(serde_json::Value::as_str),
-                        entry.get("clientName").and_then(serde_json::Value::as_str),
-                    )),
+                    client: entry["clientName"].as_str().map(str::to_string),
                     client_id: entry
                         .get("client")
                         .and_then(serde_json::Value::as_str)

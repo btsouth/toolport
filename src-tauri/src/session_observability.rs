@@ -165,7 +165,7 @@ pub fn enrich(entry: &mut Value) {
     if entry["clientName"].as_str().is_none() {
         // Newly written calls always record attribution, even outside a gateway
         // request. Missing caller fields remain meaningful on legacy rows only.
-        let name = crate::clients::trusted_client_name(entry["client"].as_str(), None);
+        let name = crate::clients::unresolved_client_name(entry["client"].as_str());
         entry["clientName"] = json!(if name == "Unrecorded client" {
             "Unknown client"
         } else {
@@ -618,6 +618,31 @@ mod tests {
             std::time::Duration::from_secs(5)
         ));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn enrichment_does_not_load_registered_labels_on_the_request_path() {
+        let data = crate::registry::DataDirTestEnv::new("enrich-no-registry-load");
+        let mut registry = crate::registry::Registry::default();
+        registry.http_clients.push(crate::registry::HttpClient {
+            id: "real".into(),
+            label: "My assistant".into(),
+            token_sha256: "unused".into(),
+            profile: String::new(),
+            unknown_fields: Default::default(),
+        });
+        crate::registry::save(&registry).unwrap();
+        let _guard = ContextGuard::enter(Context::default());
+        let mut row = json!({"client":"client:real", "ok":true});
+        enrich(&mut row);
+        assert_eq!(row["clientName"], "Unknown client");
+        assert_eq!(row["client"], "client:real");
+        let names = crate::clients::CallerNames::for_entries(&[row.clone()]);
+        assert_eq!(
+            crate::audit::activity_client_name(row, &names)["clientName"],
+            "My assistant"
+        );
+        drop(data);
     }
 
     #[test]
