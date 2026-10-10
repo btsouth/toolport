@@ -39,6 +39,18 @@ export function activityClientName(
 ): string {
   const name = trustedClientName(client);
   const label = client.clientLabel;
-  if (!hasTrustedName(client.clientName) || !label || label === name) return name;
+  if (!hasTrustedName(client.clientName) || !label || reportsOnlyVersion(name, label)) {
+    return name;
+  }
   return `${name} (reports "${label}")`;
+}
+
+/** "inbox 1" or "Claude Code 2.1" adds nothing to the name it follows. */
+function reportsOnlyVersion(name: string, label: string): boolean {
+  const lower = label.toLowerCase();
+  const prefix = name.toLowerCase();
+  return (
+    lower === prefix ||
+    (lower.startsWith(`${prefix} `) && !lower.slice(prefix.length + 1).includes(" "))
+  );
 }

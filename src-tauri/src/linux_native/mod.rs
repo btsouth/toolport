@@ -4993,13 +4993,32 @@ fn format_duration(ms: u64) -> String {
     }
 }
 
+/// Run a quick user action on its own thread. Slow startup work (server probes,
+/// gateway cleanup) can fill GLib's shared pool, and a settings toggle queued
+/// behind it took about 20 seconds to save.
+pub(super) async fn run_user_action<T: Send + 'static>(
+    action: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ()> {
+    let (sender, receiver) = futures_channel::oneshot::channel();
+    std::thread::Builder::new()
+        .name("toolport-action".into())
+        .spawn(move || {
+            let _ = sender.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)));
+        })
+        .map_err(|_| ())?;
+    match receiver.await {
+        Ok(Ok(value)) => Ok(value),
+        _ => Err(()),
+    }
+}
+
 fn activity_client_name(activity: &state::ActivityView) -> String {
     let name = crate::clients::display_caller_name(activity.client.as_deref(), activity.client_label.as_deref());
     if name.ends_with(" (reported)") { return name; }
     match activity
         .client_label
         .as_deref()
-        .filter(|label| *label != name)
+        .filter(|label| !crate::clients::label_only_adds_version(&name, label))
     {
         Some(label) => format!("{name} (reports \"{label}\")"),
         None => name.to_string(),
@@ -10974,7 +10993,7 @@ mod p10c_r1_presentation_tests {
             pii_replaced: None,
             pii_incomplete: false,
         };
-        assert_eq!(activity_client_name(&row), "Claude Code (reports \"Claude Code 2.1\")");
+        assert_eq!(activity_client_name(&row), "Claude Code");
         row.client_label = Some("Someone else".into());
         assert_eq!(
             activity_client_name(&row),

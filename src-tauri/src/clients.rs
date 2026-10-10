@@ -1589,7 +1589,24 @@ fn recorded_client_name<'a>(
             )
             && !name.starts_with("adapter-pid-")
             && !client.is_some_and(|c| c.strip_prefix("adapter:") == Some(*name))
+            // A process guess loses to the client ID the caller was configured with.
+            && !(name.starts_with("Unknown app") && client.is_some_and(configured_adapter))
     })
+}
+
+/// "inbox 1" or "Claude Code 2.1" adds nothing to the name it follows.
+pub fn label_only_adds_version(name: &str, label: &str) -> bool {
+    let (name, label) = (name.to_lowercase(), label.to_lowercase());
+    label == name
+        || label
+            .strip_prefix(&format!("{name} "))
+            .is_some_and(|version| !version.contains(' '))
+}
+
+fn configured_adapter(client: &str) -> bool {
+    client
+        .strip_prefix("adapter:")
+        .is_some_and(|id| !id.is_empty() && !id.starts_with("adapter-pid-"))
 }
 
 fn trusted_client_name_with(
@@ -8391,6 +8408,19 @@ mod tests {
     #[test]
     fn f6_configured_names_are_display_only_and_private() {
         assert_eq!(trusted_client_name(Some("adapter:inbox"), None), "inbox");
+        // Preview.6 recorded a process guess; the configured client ID wins.
+        assert_eq!(
+            trusted_client_name(Some("adapter:inbox"), Some("Unknown app (via python3.14)")),
+            "inbox"
+        );
+        assert_eq!(
+            trusted_client_name(None, Some("Unknown app (via python3.14)")),
+            "Unknown app (via python3.14)"
+        );
+        assert!(label_only_adds_version("inbox", "inbox 1"));
+        assert!(label_only_adds_version("Claude Code", "claude code 2.1"));
+        assert!(!label_only_adds_version("Codex", "codex-mcp-client 0.162.1"));
+        assert!(!label_only_adds_version("inbox", "inbox but not really"));
         assert_eq!(
             trusted_client_name(Some("adapter:/private/customer.env"), None),
             "[private]"

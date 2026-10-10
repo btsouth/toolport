@@ -543,10 +543,11 @@ pub fn recent_client_activity(limit: usize, since_ms: Option<u64>) -> std::io::R
 }
 
 fn client_activity_from_entries(
-    entries: Vec<Value>,
+    mut entries: Vec<Value>,
     limit: usize,
     since_ms: Option<u64>,
 ) -> Vec<Value> {
+    fill_session_clients(&mut entries);
     let names = crate::clients::CallerNames::for_entries(&entries);
     let mut groups =
         std::collections::BTreeMap::<String, (Value, std::collections::HashSet<String>)>::new();
@@ -691,18 +692,45 @@ fn read_recent_matching(
     // first let an unparseable line consume a slot, so one corrupt row among the
     // newest entries returned a short page and dropped older valid history that
     // should have filled it.
-    let entries: Vec<_> = content
+    let mut entries: Vec<_> = content
         .lines()
         .rev()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(visible)
         .take(limit)
         .collect();
+    fill_session_clients(&mut entries);
     let names = crate::clients::CallerNames::for_entries(&entries);
     Ok(entries
         .into_iter()
         .map(|entry| activity_client_name(entry, &names))
         .collect())
+}
+
+/// Older gateways recorded the caller's client ID on calls but not on session
+/// rows. Give each session row the ID its own calls carry.
+fn fill_session_clients(entries: &mut [Value]) {
+    let mut by_session = std::collections::HashMap::new();
+    for entry in entries.iter() {
+        if let (Some(session), Some(client)) =
+            (entry["sessionId"].as_str(), entry["client"].as_str())
+        {
+            by_session
+                .entry(session.to_string())
+                .or_insert_with(|| client.to_string());
+        }
+    }
+    for entry in entries.iter_mut() {
+        if entry.get("client").is_some_and(|client| !client.is_null()) {
+            continue;
+        }
+        if let Some(client) = entry["sessionId"]
+            .as_str()
+            .and_then(|session| by_session.get(session))
+        {
+            entry["client"] = json!(client);
+        }
+    }
 }
 
 pub fn activity_client_name(mut entry: Value, names: &crate::clients::CallerNames) -> Value {
@@ -1232,6 +1260,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn session_rows_take_the_client_id_their_calls_carry() {
+        let mut entries = vec![
+            json!({"kind":"session","sessionId":"s1","clientName":"Unknown app (via python3.14)","clientLabel":"inbox 1"}),
+            json!({"sessionId":"s1","client":"adapter:inbox","clientName":"Unknown app (via python3.14)","tool":"t","ok":true}),
+            json!({"kind":"session","sessionId":"s2","clientName":"Unknown app (via node)"}),
+        ];
+        fill_session_clients(&mut entries);
+        assert_eq!(entries[0]["client"], "adapter:inbox");
+        assert!(entries[2].get("client").is_none());
+        let names = crate::clients::CallerNames::for_entries(&entries);
+        assert_eq!(activity_client_name(entries[0].clone(), &names)["clientName"], "inbox");
+        assert_eq!(
+            activity_client_name(entries[2].clone(), &names)["clientName"],
+            "Unknown app (via node)"
+        );
+    }
 
     fn oversized_audit_content() -> String {
         let padding = "x".repeat(420);
