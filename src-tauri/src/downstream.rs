@@ -8326,7 +8326,8 @@ impl DownstreamServer {
                                     "server speaks MCP {offered:?}; Toolport speaks \
                                      {MODERN_PROTOCOL_VERSION} and cannot negotiate a \
                                      common version ({probe_err})"
-                                ).into())
+                                )
+                                .into())
                             }
                         }
                     }
@@ -8338,7 +8339,8 @@ impl DownstreamServer {
                     Err(probe_err) => {
                         return Err(format!(
                             "{init_err} (server/discover probe also failed: {probe_err})"
-                        ).into())
+                        )
+                        .into())
                     }
                 };
                 let version = choose_protocol_version(&discovered).ok_or_else(|| {
@@ -8407,7 +8409,8 @@ impl DownstreamServer {
                 "incomplete tool catalog for '{id}' ({} tool(s) before traversal stopped): {}",
                 listed.items.len(),
                 listed.warning.unwrap_or_default()
-            ).into());
+            )
+            .into());
         }
         let modern_http = matches!(era, Era::Modern { .. }) && transport.supports_request_headers();
         let tools = if modern_http {
@@ -9626,6 +9629,40 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn classified_connect_preserves_auth_and_timeout_categories() {
+        use crate::call_failure::CallFailureKind as K;
+        struct Reject(K);
+        impl Transport for Reject {
+            fn request(&mut self, _: &str, _: Value) -> Result<Value, TransportError> {
+                Err(TransportError::Classified(
+                    self.0.clone(),
+                    "untrusted detail".into(),
+                ))
+            }
+            fn notify(&mut self, _: &str, _: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+        for kind in [
+            K::Auth {
+                target: crate::call_failure::AuthTarget::Endpoint,
+            },
+            K::Timeout { after_send: false },
+            K::Unavailable { after_send: false },
+        ] {
+            let failure = match DownstreamServer::connect_classified(
+                "fixture".into(),
+                Box::new(Reject(kind.clone())),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("connection should fail"),
+            };
+            assert_eq!(failure.kind, kind);
+            assert_eq!(failure.detail, "untrusted detail");
+        }
+    }
 
     #[test]
     fn reviewed_debug_trace_redacts_endpoint_errors() {

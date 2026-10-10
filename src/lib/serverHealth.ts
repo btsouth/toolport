@@ -6,6 +6,7 @@ export function serverFailureLabel(health: ProbeResult): string {
     return health.authTarget === "service_credential"
       ? "Service key required"
       : "Needs sign-in";
+  if (health.error?.includes("downstream server exited")) return "Server stopped";
   switch (health.failure?.kind) {
     case "auth":
       return health.failure.target === "scope" ? "Permission required" : "Needs sign-in";

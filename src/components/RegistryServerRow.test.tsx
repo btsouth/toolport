@@ -130,10 +130,14 @@ describe("RegistryServerRow status accessibility", () => {
           }[kind],
         ),
       ).toBeVisible();
-      screen.getByRole("button", { name: "Retry", exact: true }).click();
+      screen.getByRole("button", { name: "Retry" }).click();
       expect(onReprobe).toHaveBeenCalledOnce();
-      act(() => screen.getByRole("button", { name: "View log", exact: true }).click());
-      expect(screen.getByText("full server output", { exact: true })).toBeVisible();
+      act(() => screen.getByRole("button", { name: "View log" }).click());
+      expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(screen.getAllByText("full server output", { exact: true })).toHaveLength(2);
     },
   );
 

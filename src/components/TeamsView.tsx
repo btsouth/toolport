@@ -392,7 +392,7 @@ export function TeamsView({
           </span>
           {on ? (
             <Badge variant="success" className="ml-auto shrink-0">
-              <ShieldCheck className="size-3" /> on
+              <ShieldCheck className="size-3" /> enabled
             </Badge>
           ) : (
             <Badge variant="warning" className="ml-auto shrink-0">
@@ -848,8 +848,8 @@ export function TeamsView({
       ) : (
         <div className="grid gap-4">
           <div className="rounded-xl border bg-card p-5">
-            <div className="flex items-start justify-between gap-4">
-              <div className="min-w-0">
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div className="min-w-0 flex-1 basis-64">
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium">Linked to team</span>
                   <span className="rounded-full border px-2 py-0.5 text-xs text-muted-foreground capitalize">
@@ -1027,7 +1027,7 @@ export function TeamsView({
                       {active.length > 0 && (
                         <div className="mt-4">
                           <div className="flex items-center gap-1.5 text-xs font-medium text-success">
-                            <ShieldCheck className="size-3.5" /> Active ({active.length})
+                            <ShieldCheck className="size-3.5" /> Enabled ({active.length})
                           </div>
                           <ul className="mt-2 grid gap-2">
                             {active.map(renderTeamServer)}

@@ -926,7 +926,7 @@ it("shows an offline result with the last successful sync, and sign-in for a tea
     id: "team-linear",
     name: "Team Linear",
     source: "team:team-1",
-    transport: "http",
+    transport: "http" as const,
     command: null,
     url: "https://linear.example/mcp",
     enabled: true,
@@ -953,6 +953,6 @@ it("shows an offline result with the last successful sync, and sign-in for a tea
     new Date(1791504000000).toLocaleString(),
   );
   expect(screen.getByText("Needs sign-in")).toBeVisible();
-  expect(screen.getByRole("button", { name: "Sign in", exact: true })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Sign in" })).toBeVisible();
   expect(screen.queryByText(/None declared/)).not.toBeInTheDocument();
 });

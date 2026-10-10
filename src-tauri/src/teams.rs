@@ -1146,20 +1146,23 @@ pub fn retry_delay_seconds(failures: u32) -> u64 {
 static SYNC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn sync_recorded(wait_secs: u64) -> Result<SyncResult, String> {
+    let _sync = SYNC_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let conn = crate::registry::load()?.team;
     let result = sync_inner(wait_secs);
     if let Some(conn) = conn {
         // The status receipt is private local metadata. Keep the network failure
         // visible even if its receipt cannot be saved.
-        crate::team_sync_status::record(&conn, result.as_ref().map(|_| ()).map_err(|e| e.as_str()))?;
+        crate::team_sync_status::record(
+            &conn,
+            result.as_ref().map(|_| ()).map_err(|e| e.as_str()),
+        )?;
     }
     result
 }
 
 fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
-    let _sync = SYNC_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // One-time migration for clients connected before operational receipts existed.
     crate::registry::update(|reg| {
         if let Some(team) = &mut reg.team {

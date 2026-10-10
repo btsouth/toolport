@@ -198,10 +198,19 @@ impl TeamsPage {
 
     fn render_sync_status(&self) {
         let status = crate::team_sync_status::current();
-        let last = status.last_success_ms.and_then(|ms| gtk::glib::DateTime::from_unix_local(ms as i64 / 1000).ok())
+        let last = status
+            .last_success_ms
+            .and_then(|ms| gtk::glib::DateTime::from_unix_local(ms as i64 / 1000).ok())
             .and_then(|date| date.format("%b %d, %Y at %H:%M").ok())
-            .map(|date| date.to_string()).unwrap_or_else(|| "not recorded yet".into());
-        self.set_status(&format!("{}. Last successful sync: {last}.", crate::team_sync_status::summary(&status)), false);
+            .map(|date| date.to_string())
+            .unwrap_or_else(|| "not recorded yet".into());
+        self.set_status(
+            &format!(
+                "{}. Last successful sync: {last}.",
+                crate::team_sync_status::summary(&status)
+            ),
+            false,
+        );
         self.feedback.remove_css_class("success");
     }
 
@@ -1098,7 +1107,11 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
         if registry.is_enabled(&registry.active_profile_id(), &server.id) {
             let snapshot = super::state::RegistrySnapshot::from_registry(registry);
             if let Some(view) = snapshot.servers.iter().find(|s| s.id == server.id) {
-                return super::server_card(view, &snapshot.active_profile_id, page.server_page.clone());
+                return super::server_card(
+                    view,
+                    &snapshot.active_profile_id,
+                    page.server_page.clone(),
+                );
             }
         }
     }
@@ -1658,7 +1671,8 @@ mod tests {
         let review = crate::teams::member_review(&reg).unwrap();
         let parent = adw::ApplicationWindow::builder().build();
         let app = adw::Application::builder().application_id("app.toolport.ReviewFixture").build();
-        let page = super::TeamsPage::new(&app);
+        let (_, server_page, _) = super::super::build_content(&app, crate::approval_broker::start_native());
+        let page = super::TeamsPage::new(&app, server_page);
         let dialog = super::member_review_dialog(&parent, &review);
         let content = dialog.extra_child().unwrap();
         super::connect_member_decisions(&content, &review, &page, &dialog);

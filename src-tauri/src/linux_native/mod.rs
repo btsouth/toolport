@@ -1525,7 +1525,7 @@ struct ServerPage {
     feedback_timer: std::rc::Rc<std::cell::RefCell<Option<gtk::glib::SourceId>>>,
     /// Per-row health widgets for the rows currently on screen, keyed by server
     /// id, so probe results can land on live labels without a re-render.
-    health_rows: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, HealthRow>>>,
+    health_rows: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Vec<HealthRow>>>>,
     /// Every rendered card with the server it shows, so search can hide and show
     /// rows without rebuilding them.
     rows: std::rc::Rc<std::cell::RefCell<Vec<(state::ServerView, gtk::Box)>>>,
@@ -1625,7 +1625,10 @@ impl ServerPage {
 
     fn render_server_list(&self, snapshot: &state::RegistrySnapshot) {
         self.clear_server_list();
-        self.health_rows.borrow_mut().clear();
+        self.health_rows.borrow_mut().retain(|_, rows| {
+            rows.retain(|row| row.label.root().is_some());
+            !rows.is_empty()
+        });
         self.section_title.set_label("Servers");
         if snapshot.servers.is_empty() {
             self.posture.set_visible(false);
@@ -1732,7 +1735,13 @@ impl ServerPage {
             .borrow_mut()
             .plan(&enabled, reason, std::time::Instant::now());
         for ticket in tickets {
-            if let Some(row) = self.health_rows.borrow().get(&ticket.server_id) {
+            for row in self
+                .health_rows
+                .borrow()
+                .get(&ticket.server_id)
+                .into_iter()
+                .flatten()
+            {
                 row.label
                     .set_label(&format!("{} · Checking…", row.transport));
                 for class in ["success", "error", "review"] {
@@ -1793,7 +1802,13 @@ impl ServerPage {
     }
 
     fn apply_probe(&self, server_id: &str, probe: &crate::server_runtime::ProbeResult) {
-        if let Some(row) = self.health_rows.borrow().get(server_id) {
+        for row in self
+            .health_rows
+            .borrow()
+            .get(server_id)
+            .into_iter()
+            .flatten()
+        {
             let (status, class) = probe_status_line(&probe);
             row.label
                 .set_label(&format!("{} · {status}", row.transport));
@@ -5761,10 +5776,7 @@ fn build_content(
     summary.set_column_spacing(10);
     summary.set_column_homogeneous(true);
     let mut values = Vec::new();
-    for (column, (value, label)) in [("0", "Servers"), ("0", "Enabled")]
-        .into_iter()
-        .enumerate()
-    {
+    for (column, (value, label)) in [("0", "Servers"), ("0", "Enabled")].into_iter().enumerate() {
         let (item, value) = summary_item(value, label);
         item.set_size_request(0, -1);
         item.set_hexpand(true);
@@ -6772,7 +6784,14 @@ fn probe_status_line(probe: &crate::server_runtime::ProbeResult) -> (String, &'s
             "success",
         )
     } else {
-        (probe.failure_label().to_string(), if probe.auth_required { "review" } else { "error" })
+        (
+            probe.failure_label().to_string(),
+            if probe.auth_required {
+                "review"
+            } else {
+                "error"
+            },
+        )
     }
 }
 
@@ -6988,22 +7007,47 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
         let health_for_log = health.clone();
         let app = page.app.clone();
         copy_error.connect_clicked(move |_| {
-            let Some(error) = health_for_log.tooltip_text() else { return; };
-            let window = adw::Window::builder().application(&app).title("Connection log")
-                .default_width(640).default_height(360).modal(true).build();
+            let Some(error) = health_for_log.tooltip_text() else {
+                return;
+            };
+            let window = adw::Window::builder()
+                .application(&app)
+                .title("Connection log")
+                .default_width(640)
+                .default_height(360)
+                .modal(true)
+                .build();
             window.set_transient_for(app.active_window().as_ref());
-            let view = gtk::TextView::builder().editable(false).cursor_visible(false).monospace(true)
-                .wrap_mode(gtk::WrapMode::WordChar).top_margin(16).bottom_margin(16).left_margin(16).right_margin(16).build();
+            let view = gtk::TextView::builder()
+                .editable(false)
+                .cursor_visible(false)
+                .monospace(true)
+                .wrap_mode(gtk::WrapMode::WordChar)
+                .top_margin(16)
+                .bottom_margin(16)
+                .left_margin(16)
+                .right_margin(16)
+                .build();
             view.buffer().set_text(&error);
-            let scroller = gtk::ScrolledWindow::builder().child(&view).vexpand(true).build();
+            let scroller = gtk::ScrolledWindow::builder()
+                .child(&view)
+                .vexpand(true)
+                .build();
             let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            root.append(&adw::HeaderBar::new()); root.append(&scroller);
-            window.set_content(Some(&root)); window.present();
+            root.append(&adw::HeaderBar::new());
+            root.append(&scroller);
+            window.set_content(Some(&root));
+            window.present();
         });
     }
-    let retry = gtk::Button::builder().label("Retry").tooltip_text("Check this server again")
-        .visible(false).css_classes(["flat"]).build();
-    let page_for_retry = page.clone(); let retry_id = server.id.clone();
+    let retry = gtk::Button::builder()
+        .label("Retry")
+        .tooltip_text("Check this server again")
+        .visible(false)
+        .css_classes(["flat"])
+        .build();
+    let page_for_retry = page.clone();
+    let retry_id = server.id.clone();
     retry.connect_clicked(move |_| page_for_retry.reprobe_after_auth_change(&retry_id));
     // Put recovery actions below the health line. Keeping them in the card's
     // horizontal row leaves too little room for the status in narrow windows.
@@ -7014,16 +7058,17 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
     health_actions.append(&copy_error);
     text.append(&health_actions);
     if server.enabled && !server.requires_review {
-        page.health_rows.borrow_mut().insert(
-            server.id.clone(),
-            HealthRow {
-                label: health.clone(),
-                transport: server.transport.clone(),
-                authenticate: authenticate.clone(),
-                copy_error: copy_error.clone(),
-                retry: retry.clone(),
-            },
-        );
+        let mut all_rows = page.health_rows.borrow_mut();
+        let rows = all_rows.entry(server.id.clone()).or_default();
+        rows.retain(|row| row.label.root().is_some());
+        rows.push(HealthRow {
+            label: health.clone(),
+            transport: server.transport.clone(),
+            authenticate: authenticate.clone(),
+            copy_error: copy_error.clone(),
+            retry: retry.clone(),
+        });
+        drop(all_rows);
         // Show the last known result immediately unless a probe is replacing it.
         let cache = page.health.borrow();
         if let Some(previous) = cache
@@ -9359,11 +9404,21 @@ mod tests {
         activity.failure_kind = Some("downstream_failure".into());
         activity.run_id = Some("0123456789abcdef0123456789abcdef".into());
         let server_page = ServerPage {
-            app: app.clone(), server_count: gtk::Label::new(None), enabled_count: gtk::Label::new(None),
-            section_title: gtk::Label::new(None), posture: gtk::Label::new(None),
-            search: gtk::SearchEntry::new(), feedback: gtk::Label::new(None), list: gtk::Box::new(gtk::Orientation::Vertical, 0),
-            last_snapshot: Default::default(), feedback_timer: Default::default(), health_rows: Default::default(),
-            rows: Default::default(), no_matches: Default::default(), off_heading: Default::default(), health: Default::default(),
+            app: app.clone(),
+            server_count: gtk::Label::new(None),
+            enabled_count: gtk::Label::new(None),
+            section_title: gtk::Label::new(None),
+            posture: gtk::Label::new(None),
+            search: gtk::SearchEntry::new(),
+            feedback: gtk::Label::new(None),
+            list: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            last_snapshot: Default::default(),
+            feedback_timer: Default::default(),
+            health_rows: Default::default(),
+            rows: Default::default(),
+            no_matches: Default::default(),
+            off_heading: Default::default(),
+            health: Default::default(),
         };
         let clients = ClientPage::new(&app, server_page);
         clients.render(state::ClientSnapshot { clients: Vec::new(), profiles: Vec::new(), sessions_error: false, sessions: vec![serde_json::json!({
@@ -10457,11 +10512,7 @@ mod tests {
     fn probe_auth_ownership_is_visible() {
         use crate::call_failure::AuthTarget;
         for (target, text, action) in [
-            (
-                AuthTarget::Endpoint,
-                "Needs sign-in",
-                "Sign in",
-            ),
+            (AuthTarget::Endpoint, "Needs sign-in", "Sign in"),
             (
                 AuthTarget::ServiceCredential,
                 "Service key required",

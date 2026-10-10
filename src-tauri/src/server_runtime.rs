@@ -30,8 +30,17 @@ impl ProbeResult {
                 _ => "Needs sign-in",
             };
         }
+        if self
+            .error
+            .as_deref()
+            .is_some_and(|raw| raw.contains("downstream server exited"))
+        {
+            return "Server stopped";
+        }
         match self.failure.as_ref() {
-            Some(K::Auth { target: AuthTarget::Scope }) => "Permission required",
+            Some(K::Auth {
+                target: AuthTarget::Scope,
+            }) => "Permission required",
             Some(K::Auth { .. }) => "Needs sign-in",
             Some(K::Timeout { .. }) => "Timed out",
             Some(K::Unavailable { .. }) => "Unreachable",
@@ -111,7 +120,9 @@ pub fn connect_server(server: &ServerEntry) -> Result<DownstreamServer, String> 
     connect_server_classified(server).map_err(|error| error.to_string())
 }
 
-fn connect_server_classified(server: &ServerEntry) -> Result<DownstreamServer, crate::call_failure::CallFailure> {
+fn connect_server_classified(
+    server: &ServerEntry,
+) -> Result<DownstreamServer, crate::call_failure::CallFailure> {
     if let Some(command) = &server.command {
         let resolved_server =
             crate::secret_refs::resolve_server(server).map_err(|e| e.to_string())?;
@@ -137,7 +148,9 @@ fn connect_server_classified(server: &ServerEntry) -> Result<DownstreamServer, c
             server.id.clone(),
             remote::protect_transport(server, Box::new(transport)),
         )
-        .map_err(|error| crate::call_failure::CallFailure::new(error.kind, resolved.redact(error.detail)))
+        .map_err(|error| {
+            crate::call_failure::CallFailure::new(error.kind, resolved.redact(error.detail))
+        })
     } else if server.url.is_some() {
         remote::connect_remote_classified(server, None, None, None, None)
     } else {

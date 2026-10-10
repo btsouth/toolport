@@ -1667,7 +1667,9 @@ impl SettingsPage {
         self.posture.set_label(&line);
         self.posture.remove_css_class("success");
         self.posture.remove_css_class("error");
-        if guarded { self.posture.add_css_class("success"); }
+        if guarded {
+            self.posture.add_css_class("success");
+        }
         self.posture.set_visible(true);
         self.updating.set(true);
         set_switch(&self.lazy_discovery, settings.lazy_discovery);
@@ -1819,7 +1821,9 @@ fn posture_summary(settings: &crate::registry_controller::EssentialSettings) -> 
         SafetyLevel::Strict => ("Safety is set to Strict. Destructive tools are hidden and untrusted calls need your approval.".to_string(), true),
     };
     if settings.quarantine_on_drift_forced || settings.block_on_injection_forced {
-        line.push_str(" Your team also requires protection against risky tool changes or injection.");
+        line.push_str(
+            " Your team also requires protection against risky tool changes or injection.",
+        );
     }
     (line, guarded)
 }
@@ -2480,10 +2484,14 @@ mod tests {
         settings.confirm_destructive = true;
         assert_eq!(posture_summary(&settings).0, line);
         settings.safety_level = crate::registry::SafetyLevel::Ask;
-        assert!(posture_summary(&settings).0.contains("Destructive calls need your approval"));
+        assert!(posture_summary(&settings)
+            .0
+            .contains("Destructive calls need your approval"));
         assert!(posture_summary(&settings).1);
         settings.quarantine_on_drift_forced = true;
-        assert!(posture_summary(&settings).0.contains("Your team also requires"));
+        assert!(posture_summary(&settings)
+            .0
+            .contains("Your team also requires"));
     }
 
     #[test]
