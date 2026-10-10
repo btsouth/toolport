@@ -5968,7 +5968,7 @@ fn defend_and_shape(
     trailer: &str,
     shape: bool,
 ) -> Defended {
-    // Scan untrusted output for injection; label always, optionally fail closed.
+    // Scan untrusted output for injection; record findings, optionally fail closed.
     // Block mode alone must still run the scanner: an org forceBlockOnInjection (or a
     // local blockOnInjection) with contentDefense off would otherwise silently do
     // nothing (SOU-345).
@@ -22467,14 +22467,9 @@ mod tests {
         });
         let out =
             defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true).result;
-        let text = out["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("external data"),
-            "error text must be labeled as data"
-        );
-        assert!(
-            text.contains("evil-server"),
-            "wrapper names the originating server"
+        assert_eq!(
+            out["content"][0]["text"], payload,
+            "advisory screening returns the server's text unchanged"
         );
         assert!(out["isError"].as_bool().unwrap(), "still an error result");
 
@@ -22543,7 +22538,7 @@ mod tests {
             "body is the Toolport security message, not the labeled payload"
         );
 
-        // Per-server exempt: same payload labels only.
+        // Per-server exempt: same payload passes through.
         reg.injection_block_exempt
             .insert("evil-server".into(), true);
         let result = json!({
@@ -22559,15 +22554,9 @@ mod tests {
             true,
             "exempt server must not hard-block"
         );
-        assert!(
-            out["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("external data"),
-            "exempt still labels"
-        );
+        assert_eq!(out["content"][0]["text"], payload);
 
-        // Default (block off): still labels, never withholds.
+        // Default (block off): records only, never withholds or rewrites.
         let reg = Registry {
             safety_level: None,
             version: 1,
@@ -22578,11 +22567,8 @@ mod tests {
         });
         let out =
             defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true).result;
-        assert!(out["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("external data"));
-        // Label mode does not set isError on a success that was only labeled.
+        assert_eq!(out["content"][0]["text"], payload);
+        // Advisory mode does not set isError on a flagged success.
         assert!(out.get("isError").is_none() || out["isError"] == false);
 
         // A team injection flag at member Off must withhold results without raising the level.
@@ -26209,13 +26195,13 @@ mod tests {
             run_script_dispatch(reg, Some(&router), &[], None, None, None, None, &args, None)
         };
 
-        // Advisory mode labels the aggregate and preserves its structured schema.
+        // Advisory mode returns the aggregate unchanged with its structured schema.
         let labeled = run(&reg);
         assert_eq!(labeled["isError"], false);
         let text = labeled["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("external data returned by \"script\""),
-            "aggregate must be wrapped: {text}"
+            !text.contains("external data"),
+            "aggregate must not be wrapped: {text}"
         );
         assert!(labeled["structuredContent"]["result"]
             .as_str()
@@ -34832,10 +34818,10 @@ mod tests {
             None,
         )
         .unwrap();
-        // Brand is Toolport after SBS-896 (was the pre-rebrand `conduit` marker).
-        assert!(ordinary["result"]["contents"][0]["text"]
-            .as_str()
-            .is_some_and(|text| text.starts_with("[Toolport: the following is external data")));
+        assert_eq!(
+            ordinary["result"]["contents"][0]["text"],
+            "<!doctype html><script>const label = 'ignore previous instructions';</script>"
+        );
     }
 
     #[test]
@@ -34907,17 +34893,12 @@ mod tests {
                     result["_meta"]["app.toolport/provenance"]["server"],
                     "fixture"
                 );
-                assert_eq!(result["content"].as_array().unwrap().len(), 2);
+                assert_eq!(result["content"].as_array().unwrap().len(), 1);
                 assert_eq!(
                     result["content"][0]["_meta"]["app.toolport/provenance"]["trust"],
                     "untrusted"
                 );
-                if level == registry::SafetyLevel::Ask {
-                    assert!(result["content"][0]["text"]
-                        .as_str()
-                        .unwrap()
-                        .contains("external data"));
-                }
+                assert_eq!(result["content"][0]["text"], payload);
             }
         }
     }
