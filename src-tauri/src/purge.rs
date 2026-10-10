@@ -129,7 +129,7 @@ pub fn plan() -> Result<Plan, String> {
         "Toolport's daemon for this data directory, after all active sessions have closed".into(),
     ];
     #[cfg(target_os = "windows")]
-    resources.extend(AUTOSTART_NAMES.iter().map(|name| format!("HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\{name} and StartupApproved\\Run\\{name} (only Toolport commands)")));
+    resources.extend(AUTOSTART_NAMES.iter().map(|name| format!("HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\{name} and HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run\\{name} (only Toolport commands)")));
     #[cfg(not(target_os = "windows"))]
     resources.extend(
         autostart_files(&home)

@@ -248,6 +248,8 @@ test("macOS manifest includes the signed gateway helper and provisioning profile
     "Toolport.app/Contents/MacOS/toolport-gateway",
     "Toolport.app/Contents/MacOS/conduit-gateway",
     "Toolport.app/Contents/embedded.provisionprofile",
+    "Toolport.app/Contents/Helpers/ToolportGateway.app/",
+    "Toolport.app/Contents/Helpers/ToolportGateway.app/Contents/",
     "Toolport.app/Contents/Helpers/ToolportGateway.app/Contents/MacOS/toolport-gateway",
     "Toolport.app/Contents/Helpers/ToolportGateway.app/Contents/embedded.provisionprofile",
   ];

@@ -93,7 +93,8 @@ export function assertManifest(paths, kind) {
           return path
             .split(/\.app\/?/)
             .slice(1)
-            .join(".app/");
+            .join(".app/")
+            .replace(/\/$/, "");
         return path;
       }
       return path;
