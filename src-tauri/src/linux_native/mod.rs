@@ -10261,17 +10261,25 @@ mod tests {
 
     #[test]
     fn client_activity_and_internal_calls_use_plain_language() {
-        let detail = client_activity_detail(&serde_json::json!({"callsToday":12,"firstCatalogSize":1711}));
-        assert_eq!(detail, "Last active time unavailable · 12 calls today · Last saw 1,711 tools");
+        let detail =
+            client_activity_detail(&serde_json::json!({"callsToday":12,"firstCatalogSize":1711}));
+        assert_eq!(
+            detail,
+            "Last active time unavailable · 12 calls today · Last saw 1,711 tools"
+        );
         let mut row = call("toolport", true);
         row.internal = true;
-        for (tool, title) in [("search", "Searched tools"), ("describe", "Looked up a tool"), ("status", "Checked Toolport status"), ("fetch", "Fetched tool details")] {
+        for (tool, title) in [
+            ("search", "Searched tools"),
+            ("describe", "Looked up a tool"),
+            ("status", "Checked Toolport status"),
+            ("fetch", "Fetched tool details"),
+        ] {
             row.tool = tool.into();
             assert_eq!(activity_title(&row), title);
         }
         assert_eq!(pii_badge(Some(1), false).unwrap().0, "1 value masked");
     }
-
     #[test]
     fn pii_badges_stay_silent_until_the_pass_did_something_and_warn_on_fail_open() {
         assert_eq!(pii_badge(None, false), None);

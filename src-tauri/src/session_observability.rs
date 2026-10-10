@@ -55,7 +55,9 @@ pub fn display_label(label: &str) -> Option<String> {
 
 /// Retain registered HTTP IDs and privacy-safe configured adapter IDs.
 pub fn telemetry_principal(client: &str) -> Option<&str> {
-    ((!client.contains(':') && !client.starts_with("adapter-pid-") && display_client_id(client) == client)
+    ((!client.contains(':')
+        && !client.starts_with("adapter-pid-")
+        && display_client_id(client) == client)
         || client.starts_with("client:")
         || client
             .strip_prefix("adapter:")
@@ -488,10 +490,25 @@ mod tests {
     #[test]
     fn private_paths_never_reach_session_or_correlated_audit_rows() {
         let data = crate::registry::DataDirTestEnv::new("f3-label-paths");
-        for path in ["/home/private/customer.env", "C:\\private\\customer.env", "~/private/customer.env", "\\\\server\\private\\customer.env", "file:///home/private/customer.env", "file:///home/private/my customer.env", "../private/customer.env", "private/customer.env", "/home/private/my customer.env", "C:\\private\\my customer.env", "\\\\server\\private folder\\customer.env"] {
+        for path in [
+            "/home/private/customer.env",
+            "C:\\private\\customer.env",
+            "~/private/customer.env",
+            "\\\\server\\private\\customer.env",
+            "file:///home/private/customer.env",
+            "file:///home/private/my customer.env",
+            "../private/customer.env",
+            "private/customer.env",
+            "/home/private/my customer.env",
+            "C:\\private\\my customer.env",
+            "\\\\server\\private folder\\customer.env",
+        ] {
             let label = format!("review {path} sk-live-abcdefghijk123456789");
             let session = Session::start(None, None, Some(&label), "stdio", "initialize");
-            let _context = ContextGuard::enter(Context {run_id:Some("opaque".into()), ..session.context()});
+            let _context = ContextGuard::enter(Context {
+                run_id: Some("opaque".into()),
+                ..session.context()
+            });
             let mut row = json!({"tool":"run_script", "ok":false});
             enrich(&mut row);
             assert!(!row.to_string().contains("customer.env"), "{row}");
@@ -503,7 +520,10 @@ mod tests {
         let audit = std::fs::read_to_string(data.dir.join("audit.jsonl")).unwrap();
         assert!(!audit.contains("customer.env"), "{audit}");
         assert!(!audit.contains("sk-live-abcdefghijk123456789"));
-        assert_eq!(display_label("Claude Code 1.2.3-beta"), Some("Claude Code 1.2.3-beta".into()));
+        assert_eq!(
+            display_label("Claude Code 1.2.3-beta"),
+            Some("Claude Code 1.2.3-beta".into())
+        );
     }
 
     #[test]

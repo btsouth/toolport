@@ -462,6 +462,38 @@ try {
   ).toHaveAttribute("title", /Older Toolport versions did not record callers/);
   await page.screenshot({ path: path.join(output, "caller-clients.png") });
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
+  await page.goto(`${baseURL}/fixtures/?sessions&dogfood`);
+  await page.getByRole("button", { name: "Clients", exact: true }).click();
+  const groupedClients = page.getByRole("region", { name: "Recent client activity" });
+  await expect(groupedClients.getByRole("button")).toHaveAttribute(
+    "aria-expanded",
+    "false",
+  );
+  await groupedClients.getByRole("button").click();
+  await expect(groupedClients.getByText("Codex", { exact: true })).toHaveCount(1);
+  await expect(
+    groupedClients.getByText(/60 calls today.*Last saw 1,711 tools/),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Activity", exact: true }).click();
+  await page.getByRole("button", { name: /Recent calls and approvals/ }).click();
+  for (const label of [
+    "Searched tools",
+    "Looked up a tool",
+    "Checked Toolport status",
+    "Fetched tool details",
+  ])
+    await expect(page.getByText(label, { exact: true })).toBeVisible();
+  await expect(page.getByText("1 value masked", { exact: true })).toHaveAttribute(
+    "title",
+    /before reaching the model/,
+  );
+  await expect(page.getByText(/5,225 tool calls retained/)).toContainText(
+    "Showing 5 of the latest 5 events",
+  );
+  await page.getByRole("button", { name: "Clear", exact: true }).click();
+  await expect(page.getByRole("dialog")).toContainText("Clear retained activity?");
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   await page.goto(`${baseURL}/fixtures/?logos`);
   await expect(page.getByText("Dark logo fixture")).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
