@@ -17,6 +17,7 @@
 //!   `toolport_search_tools`, `toolport_call_tool`, `toolport_fetch_result`) instead of the full catalog; the
 //!   model searches and calls on demand, keeping context flat.
 //! - Records every tool call to a local audit log.
+use conduit_lib::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -19129,13 +19130,17 @@ impl HttpProxyState {
             descriptor.endpoint,
             conduit_lib::daemon::HTTP_SERVICE_LEASE_PATH
         );
-        ureq::post(&url)
-            .timeout(Duration::from_secs(3))
-            .set("Authorization", &format!("Bearer {}", descriptor.token))
+        conduit_lib::http_client::agent()
+            .post(&url)
+            .config()
+            .timeout_global(Some(Duration::from_secs(3)))
+            .build()
+            .set_header("Authorization", &format!("Bearer {}", descriptor.token))
             .send_json(json!({
                 "tokenSha256": self.token_sha256,
                 "bindHost": self.bind_host
             }))
+            .retain_status_body()
             .map_err(|error| format!("could not renew the daemon HTTP service lease: {error}"))?;
         *self
             .latest_descriptor
@@ -19160,13 +19165,18 @@ impl HttpProxyState {
             descriptor.endpoint,
             conduit_lib::daemon::HTTP_SERVICE_LEASE_PATH
         );
-        let _ = ureq::delete(&url)
-            .timeout(Duration::from_secs(2))
-            .set("Authorization", &format!("Bearer {}", descriptor.token))
+        let _ = conduit_lib::http_client::agent()
+            .delete(&url)
+            .config()
+            .timeout_global(Some(Duration::from_secs(2)))
+            .build()
+            .set_header("Authorization", &format!("Bearer {}", descriptor.token))
+            .force_send_body()
             .send_json(json!({
                 "tokenSha256": self.token_sha256,
                 "bindHost": self.bind_host
-            }));
+            }))
+            .retain_status_body();
     }
 }
 
