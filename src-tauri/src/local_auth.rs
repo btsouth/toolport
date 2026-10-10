@@ -65,10 +65,16 @@ pub(crate) fn pin_http_destination(id: &str, url: &str) -> Result<Option<OwnerPi
         "{:x}",
         Sha256::digest(serde_json::to_vec(&Some(url)).expect("URL serialization"))
     );
+    let owner = reg
+        .unknown_fields
+        .get("personalSyncCredentialOwners")
+        .and_then(|owners| owners.get(id))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Local credential ownership is unreadable. Sync and sign in again.")?;
     let owner = if destination == base {
-        id.into()
+        owner.into()
     } else {
-        format!("{id}-sync-{destination}")
+        format!("{owner}-sync-{destination}")
     };
     Ok(Some(pin_credential_owner(id, &owner)))
 }
@@ -150,7 +156,7 @@ pub(crate) fn bind(
 pub(crate) fn owner_in(reg: &Registry, id: &str) -> Result<String, String> {
     let entries = bindings(reg)?;
     let Some(binding) = entries.get(id) else {
-        return Ok(personal_http_owner(reg, id));
+        return personal_http_owner(reg, id);
     };
     let valid = reg.team.as_ref().is_some_and(|team| {
         team.team_id == binding.team_id
@@ -184,9 +190,9 @@ pub(crate) fn personal_credential_destination(server: &ServerEntry) -> String {
     )
 }
 
-fn personal_http_owner(reg: &Registry, id: &str) -> String {
-    let Some(server) = reg.servers.iter().find(|s| s.id == id && s.url.is_some()) else {
-        return id.into();
+fn personal_http_owner(reg: &Registry, id: &str) -> Result<String, String> {
+    let Some(server) = reg.servers.iter().find(|s| s.id == id) else {
+        return Ok(id.into());
     };
     let Some(base) = reg
         .unknown_fields
@@ -199,13 +205,19 @@ fn personal_http_owner(reg: &Registry, id: &str) -> String {
         })
         .and_then(serde_json::Value::as_str)
     else {
-        return id.into();
+        return Ok(id.into());
     };
+    let owner = reg
+        .unknown_fields
+        .get("personalSyncCredentialOwners")
+        .and_then(|owners| owners.get(id))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Local credential ownership is unreadable. Sync and sign in again.")?;
     let destination = personal_credential_destination(server);
-    if base == destination {
-        id.into()
+    if server.url.is_none() || base == destination {
+        Ok(owner.into())
     } else {
-        format!("{id}-sync-{destination}")
+        Ok(format!("{owner}-sync-{destination}"))
     }
 }
 

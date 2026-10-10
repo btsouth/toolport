@@ -16575,6 +16575,10 @@ for line in sys.stdin:
             let mut reg = crate::registry::Registry::default();
             let server: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({"id":"scoped","name":"scoped","transport":"http","url":"https://old.example/mcp"})).unwrap();
             reg.unknown_fields.insert("personalSyncCredentialDestinations".into(), serde_json::json!({"scoped":crate::local_auth::personal_credential_destination(&server)}));
+            reg.unknown_fields.insert(
+                "personalSyncCredentialOwners".into(),
+                serde_json::json!({"scoped":"scoped"}),
+            );
             reg.servers.push(server);
             crate::registry::save(&reg).unwrap();
             crate::secrets::set_secret("scoped", crate::secrets::HTTP_AUTH_KEY, "old").unwrap();

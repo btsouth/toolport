@@ -775,6 +775,37 @@ pub fn apply(
         }
         // Preserve existing sign-in only for its exact HTTP destination. New
         // destinations get an empty local vault namespace, never copied tokens.
+        let credential_owner = reg
+            .unknown_fields
+            .get("personalSyncCredentialOwners")
+            .and_then(|owners| owners.get(&entry.id))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                old.as_ref()
+                    .filter(|s| {
+                        !s.unknown_fields
+                            .contains_key("personalSyncCredentialDestination")
+                    })
+                    .map(|s| s.id.clone())
+            });
+        let credential_owner = if let Some(owner) = credential_owner {
+            owner
+        } else {
+            let mut bytes = [0u8; 32];
+            getrandom::getrandom(&mut bytes)
+                .map_err(|_| "Could not create local sync credentials")?;
+            format!(
+                "sync-credential-{}",
+                bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            )
+        };
+        reg.unknown_fields
+            .entry("personalSyncCredentialOwners")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or("Local credential ownership is unreadable")?
+            .insert(entry.id.clone(), json!(credential_owner));
         let credential_destination = reg
             .unknown_fields
             .get("personalSyncCredentialDestinations")
@@ -1392,11 +1423,18 @@ mod tests {
         crate::secrets::tests::with_isolated_vault(|| {
             let mut b = machine();
             let original = config(vec![http("docs")]);
+            // Cloud identities cannot select a leftover machine-local vault.
+            crate::secrets::set_secret("docs", crate::secrets::HTTP_AUTH_KEY, "synthetic-orphan")
+                .unwrap();
             apply(&mut b, &original, 1).unwrap();
             let id = b.servers[0].id.clone();
             let owner = crate::local_auth::owner_in(&b, &id).unwrap();
-            assert_eq!(owner, id);
+            assert_ne!(owner, id);
             crate::registry::save(&b).unwrap();
+            assert_eq!(
+                crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY).unwrap(),
+                None
+            );
             crate::secrets::set_secret(&id, crate::secrets::HTTP_AUTH_KEY, "synthetic-old-token")
                 .unwrap();
             assert_eq!(
