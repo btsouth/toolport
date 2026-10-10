@@ -1153,7 +1153,7 @@ pub fn apply(
                 && st.pending.get(*id) == Some(*sent)
                 && reg.servers.iter().any(|s| {
                     s.id == sent.local_id
-                        && !s.needs_team_enable_review()
+                        && s.unknown_fields.get("teamEnableReview") != Some(&json!(true))
                         && same(Some(&export(s)), sent.after.as_ref())
                         && crate::secret_refs::check_approval(s).is_ok()
                 })
@@ -1499,9 +1499,9 @@ pub fn apply(
                 .as_deref()
                 .and_then(crate::oauth::host_of_url)
                 .is_some_and(|host| crate::teams::team_host_is_private(&host))
-            && old
-                .as_ref()
-                .is_none_or(|s| s.url != entry.url || s.needs_team_enable_review());
+            && old.as_ref().is_none_or(|s| {
+                s.url != entry.url || s.unknown_fields.get("teamEnableReview") == Some(&json!(true))
+            });
         let review = entry.unknown_fields.get("personalSyncArgsReview") == Some(&json!(true))
             || private_url_review
             || (changed && !command_approved)
@@ -2096,34 +2096,45 @@ mod tests {
     #[test]
     fn own_publication_carries_reference_approval_without_approving_received_changes() {
         let _data = crate::registry::DataDirTestEnv::new("sync-own-reference");
-        let mut r = machine();
-        apply(&mut r, &config(vec![]), 0).unwrap();
-        let before = r.clone();
-        let mut row = command("ref");
-        row["env"] =
-            json!([{"key":"TOKEN","secret":true,"source":{"ref":"op://Private/Item/key"}}]);
-        let mut server = local(row);
-        server.enabled = true;
-        server.source = Some("manual".into());
-        crate::secret_refs::approve_server(&server).unwrap();
-        r.servers.push(server);
-        record(&before, &mut r).unwrap();
-        let mut st = state(&r).unwrap();
-        st.pending.get_mut("ref").unwrap().at = 0;
-        let wire = prepare_publication(&mut st, &config(vec![])).unwrap();
-        save(&mut r, &st).unwrap();
-        apply(&mut r, &wire, 1).unwrap();
-        assert!(r.servers[0].enabled);
-        assert_ne!(
-            r.servers[0].unknown_fields.get("teamEnableReview"),
-            Some(&json!(true))
-        );
-        assert!(crate::secret_refs::check_approval(&r.servers[0]).is_ok());
-        let mut changed = wire;
-        changed["servers"][0]["env"][0]["source"]["ref"] = json!("op://Other/Item/key");
-        apply(&mut r, &changed, 2).unwrap();
-        assert!(r.servers[0].needs_team_enable_review());
-        assert!(crate::secret_refs::check_approval(&r.servers[0]).is_err());
+        for private_http in [false, true] {
+            let mut r = machine();
+            apply(&mut r, &config(vec![]), 0).unwrap();
+            let before = r.clone();
+            let mut row = if private_http {
+                http("ref")
+            } else {
+                command("ref")
+            };
+            if private_http {
+                row["url"] = json!("http://127.0.0.1/mcp");
+            }
+            row["env"] =
+                json!([{"key":"TOKEN","secret":true,"source":{"ref":"op://Private/Item/key"}}]);
+            let mut server = local(row);
+            server.enabled = true;
+            server.source = Some("manual".into());
+            crate::secret_refs::approve_server(&server).unwrap();
+            r.servers.push(server);
+            record(&before, &mut r).unwrap();
+            let mut st = state(&r).unwrap();
+            st.pending.get_mut("ref").unwrap().at = 0;
+            let wire = prepare_publication(&mut st, &config(vec![])).unwrap();
+            save(&mut r, &st).unwrap();
+            for version in 1..=3 {
+                apply(&mut r, &wire, version).unwrap();
+            }
+            assert!(r.servers[0].enabled, "private HTTP: {private_http}");
+            assert_ne!(
+                r.servers[0].unknown_fields.get("teamEnableReview"),
+                Some(&json!(true))
+            );
+            assert!(crate::secret_refs::check_approval(&r.servers[0]).is_ok());
+            let mut changed = wire;
+            changed["servers"][0]["env"][0]["source"]["ref"] = json!("op://Other/Item/key");
+            apply(&mut r, &changed, 4).unwrap();
+            assert!(r.servers[0].needs_team_enable_review());
+            assert!(crate::secret_refs::check_approval(&r.servers[0]).is_err());
+        }
     }
     #[test]
     fn shifted_masked_arguments_follow_flags_and_ambiguous_edits_stay_local() {
