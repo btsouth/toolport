@@ -1047,6 +1047,39 @@ it("uses the chosen sync service for browser sign-in", async () => {
   );
 });
 
+it("names servers waiting for review and opens Servers to review them", async () => {
+  const personal = structuredClone(registry);
+  personal.team!.accountStatus = {
+    personalSync: true,
+    plan: "pro",
+    trialActive: false,
+    trialEndsAt: null,
+    freeSyncGraceEndsAt: null,
+    deviceId: "d",
+    canReceiveConfig: true,
+    reason: null,
+  };
+  personal.team!.personalSyncState = { lastSyncedAt: Date.parse("2026-10-10T21:17:48Z") };
+  personal.servers = [
+    { ...personal.servers[0], id: "a", enabled: false, teamEnableReview: true },
+    { ...personal.servers[0], id: "b", enabled: false, teamEnableReview: true },
+    { ...personal.servers[0], id: "c", enabled: true },
+  ];
+  const onOpenServers = vi.fn();
+  render(
+    <TeamsView
+      registry={personal}
+      onRegistryChange={vi.fn()}
+      onOpenServers={onOpenServers}
+    />,
+  );
+  expect(
+    screen.getByText("2 servers are waiting for review on this machine."),
+  ).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Review in Servers" }));
+  expect(onOpenServers).toHaveBeenCalled();
+});
+
 it("shows refused environment warnings and treats a missing sign-in plan as saved", async () => {
   const personal = structuredClone(registry);
   personal.team!.role = "admin";

@@ -1004,6 +1004,7 @@ function App() {
                       onRegistryChange={applyRegistryChange}
                       health={health}
                       onReprobe={() => void reprobeAfterMutation().catch(() => {})}
+                      onOpenServers={() => selectView("servers")}
                     />
                   ) : view === "settings" ? (
                     <SettingsView

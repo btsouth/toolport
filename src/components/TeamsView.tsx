@@ -91,11 +91,13 @@ export function TeamsView({
   onRegistryChange,
   health = {},
   onReprobe,
+  onOpenServers,
 }: {
   registry: Registry | null;
   onRegistryChange: (r: Registry) => void;
   health?: Record<string, ProbeResult>;
   onReprobe?: () => void;
+  onOpenServers?: () => void;
 }) {
   const team = registry?.team ?? null;
   const teamKey = team ? `${team.serverUrl}:${team.teamId}` : null;
@@ -537,7 +539,13 @@ export function TeamsView({
   }
 
   if (!team || isPersonalSync(registry)) {
-    return <PersonalSyncView registry={registry} onRegistryChange={onRegistryChange} />;
+    return (
+      <PersonalSyncView
+        registry={registry}
+        onRegistryChange={onRegistryChange}
+        onOpenServers={onOpenServers}
+      />
+    );
   }
   return (
     // The connected view is a single column of cards and stays narrow. The

@@ -107,9 +107,11 @@ function ConflictVersions({ local, remote }: { local: unknown; remote: unknown }
 export function PersonalSyncView({
   registry,
   onRegistryChange,
+  onOpenServers,
 }: {
   registry: Registry;
   onRegistryChange: (r: Registry) => void;
+  onOpenServers?: () => void;
 }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -147,6 +149,11 @@ export function PersonalSyncView({
   const team = registry.team;
   const status = team?.accountStatus;
   const sync = team?.personalSyncState;
+  // The sidebar badge counts these, so name them here and point to where the
+  // review happens.
+  const waiting = registry.servers.filter(
+    (s) => s.teamEnableReview === true && !s.enabled,
+  ).length;
   async function run(work: () => Promise<void>) {
     setBusy(true);
     setError(null);
@@ -268,6 +275,13 @@ export function PersonalSyncView({
             {!!Object.keys(sync?.pending ?? {}).length && (
               <p className="text-sm">Changes waiting to sync</p>
             )}
+            {waiting > 0 && (
+              <p className="text-sm">
+                {waiting === 1
+                  ? "1 server is waiting for review on this machine."
+                  : `${waiting} servers are waiting for review on this machine.`}
+              </p>
+            )}
             <div className="flex gap-2">
               {sync?.signInRequired ? (
                 // Sync cannot succeed without sign-in. Sign out stays: it clears
@@ -286,6 +300,11 @@ export function PersonalSyncView({
                   }
                 >
                   Sync now
+                </Button>
+              )}
+              {waiting > 0 && onOpenServers && (
+                <Button variant="outline" onClick={onOpenServers}>
+                  Review in Servers
                 </Button>
               )}
               <Button
