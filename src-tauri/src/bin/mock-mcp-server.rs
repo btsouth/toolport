@@ -25,7 +25,7 @@
 //!   object per line. This is what lets a test assert exactly what bytes the
 //!   gateway sent downstream, which is the regression net for the envelope
 //!   transparency work (SOU-444).
-//! - `MOCK_MCP_WIRE_TRACE` — timestamped receive and response-flush events for
+//! - `MOCK_MCP_WIRE_TRACE`: timestamped receive and response-flush events for
 //!   concurrent fixtures, separate from the request transcript.
 //! - `MOCK_MCP_FAIL_STARTS=<n>` with `MOCK_MCP_START_COUNTER=<path>` — the first
 //!   `n` starts exit before the handshake, like a server launched before the
@@ -985,6 +985,7 @@ fn serve_concurrent(cfg: Config, state: State) {
                 }
             }
             let flushed = out.flush();
+            drop(out);
             if let Some(response) = resp.as_ref() {
                 trace(
                     &cfg,
