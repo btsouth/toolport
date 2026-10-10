@@ -31675,7 +31675,8 @@ mod tests {
     #[test]
     fn execute_call_reports_an_unknown_tool_the_same_with_or_without_scope() {
         let _data_env = DataDirTestEnv::new("execute_call_reports_an_unknown_tool");
-        let reg = Registry::default();
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Ask);
         let router = twin_router();
         let cached = router.aggregated_tools();
         let personal = personal_scope();
@@ -31704,6 +31705,33 @@ mod tests {
             "Unknown tool: no_such_tool\nUse toolport_search_tools to find tools.",
             "an unknown tool is not a scope denial for an empty server id"
         );
+        let unscoped = execute_call(
+            &reg,
+            &router,
+            &cached,
+            Some("open-webui"),
+            None,
+            None,
+            None,
+            "no_such_tool",
+            json!({}),
+            None,
+            None,
+            CallOpts {
+                direct: true,
+                shape: false,
+                allow_app_only: true,
+            },
+            None,
+        );
+        assert_eq!(
+            unscoped, unknown,
+            "an unscoped unknown call must not reach approval"
+        );
+        assert!(audit::read_all()
+            .unwrap()
+            .iter()
+            .all(|row| row["kind"] != "approval"));
 
         // A client-side alias is resolved only to a tool the caller may call, so
         // the hint cannot confirm that an out-of-scope tool exists.
