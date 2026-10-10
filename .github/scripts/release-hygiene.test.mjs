@@ -199,7 +199,13 @@ test("complete payload manifests reject extra resources and require both binarie
       ],
     ],
     ["nsis", ["conduit.exe", "toolport-gateway.exe"]],
-    ["msi", ["conduit.exe", "toolport-gateway.exe"]],
+    [
+      "msi",
+      [
+        "ProgramFiles64Folder/Toolport/conduit.exe",
+        "ProgramFiles64Folder/Toolport/toolport-gateway.exe",
+      ],
+    ],
     [
       "appimage",
       ["squashfs-root/usr/bin/conduit", "squashfs-root/usr/bin/toolport-gateway"],
@@ -207,12 +213,13 @@ test("complete payload manifests reject extra resources and require both binarie
   ]) {
     assertManifest(files, kind);
     assert.throws(() => assertManifest(files.slice(0, 1), kind), /Missing intended/);
+    const prefix = kind === "msi" ? "ProgramFiles64Folder/Toolport/" : "";
     assert.throws(
-      () => assertManifest([...files, "unexpected-notes.txt"], kind),
+      () => assertManifest([...files, `${prefix}unexpected-notes.txt`], kind),
       /Unexpected/,
     );
     assert.throws(
-      () => assertManifest([...files, "mock-mcp-server"], kind),
+      () => assertManifest([...files, `${prefix}mock-mcp-server`], kind),
       /Test artifact/,
     );
   }
@@ -220,6 +227,10 @@ test("complete payload manifests reject extra resources and require both binarie
 
 test("MSI validates full installation paths before normalizing its app directory", async () => {
   const { assertManifest } = await import("./package-manifest.mjs");
+  assert.throws(
+    () => assertManifest(["conduit.exe", "toolport-gateway.exe"], "msi"),
+    /Unexpected msi installation path/,
+  );
   assertManifest(
     [
       "ProgramFiles64Folder/Toolport/conduit.exe",

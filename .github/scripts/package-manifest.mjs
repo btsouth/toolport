@@ -83,6 +83,8 @@ export function assertManifest(paths, kind) {
   const files = normalized
     .map((path) => {
       if (kind === "msi") {
+        if (!/^(?:ProgramFiles(?:64)?Folder|LocalAppDataFolder)\/Toolport\//.test(path))
+          throw new Error(`Unexpected msi installation path: ${path}`);
         return path.replace(
           /^(?:ProgramFiles(?:64)?Folder|LocalAppDataFolder)\/Toolport\//,
           "",
