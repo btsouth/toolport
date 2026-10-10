@@ -10730,10 +10730,11 @@ mod tests {
                 .is_some_and(|error| error.contains("pin store")),
             "a lost pin baseline must not look like an empty identity panel: {activity:?}"
         );
-        let mut unblocked_events = events;
-        unblocked_events[0]["blocked"] = serde_json::json!(false);
-        unblocked_events[0]["blocked_profiles"] = serde_json::json!([]);
-        assert_eq!(activity.security_events, unblocked_events);
+        assert!(
+            crate::integrity::all_quarantined().is_err(),
+            "a lost trust store cannot establish that nothing is blocked"
+        );
+        assert_eq!(activity.security_events, unknown_events);
     }
 
     #[test]
