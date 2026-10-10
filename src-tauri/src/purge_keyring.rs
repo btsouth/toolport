@@ -127,6 +127,7 @@ pub(crate) fn remove() -> Result<Vec<Leftover>, String> {
     use security_framework_sys::item::*;
     #[link(name = "Security", kind = "framework")]
     extern "C" {
+        static kSecUseDataProtectionKeychain: CFTypeRef;
         fn SecItemDelete(query: CFTypeRef) -> i32;
         fn SecItemCopyMatching(query: CFTypeRef, result: *mut CFTypeRef) -> i32;
     }
@@ -171,7 +172,7 @@ pub(crate) fn remove() -> Result<Vec<Leftover>, String> {
                 };
                 let status = unsafe {
                     security_framework_sys::keychain_item::SecKeychainItemDelete(
-                        (*reference).cast(),
+                        (*reference).cast_mut().cast(),
                     )
                 };
                 if status != 0 {
