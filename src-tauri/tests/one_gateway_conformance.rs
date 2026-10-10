@@ -4083,3 +4083,372 @@ fn matrix_routing_server_request_is_refused_while_another_client_has_a_call_in_f
     assert_eq!(origin.elicitation_queries.load(Ordering::Relaxed), 0);
     assert_eq!(other.elicitation_queries.load(Ordering::Relaxed), 0);
 }
+
+// Protocol lane: every call below crosses the real adapter and daemon boundary.
+fn protocol_lane_tool(name: &str, destructive: bool) -> Value {
+    json!({"name":name, "description":"Protocol fixture tool.",
+        "annotations":{"destructiveHint":destructive},
+        "inputSchema":{"type":"object","properties":{}}})
+}
+
+fn protocol_lane_server(dir: &Path, id: &str, tools: &[Value]) -> ServerEntry {
+    let catalog = dir.join(format!("catalog-{}.json", registry::sha256_hex(id)));
+    std::fs::write(&catalog, serde_json::to_vec(tools).unwrap()).unwrap();
+    let mut server = mock_server_entry(id, &dir.join(format!("transcript-{id}.jsonl")), None);
+    server.env.push(EnvVar {
+        key: "MOCK_MCP_TOOLS_FILE".into(),
+        value: Some(catalog.display().to_string()),
+        secret: false,
+        unknown_fields: Default::default(),
+    });
+    server
+}
+
+fn protocol_lane_error(result: &Value, expected: &str) -> String {
+    assert_eq!(result["isError"], true, "{result}");
+    let text = text_of(result);
+    assert!(text.contains(expected), "expected {expected:?}, got {text}");
+    let tokens = conduit_lib::savings::count_tokens(&text);
+    assert!(tokens <= 140, "error grew to {tokens} tokens: {text}");
+    println!("PROTOCOL_ERROR tokens={tokens} text={text:?}");
+    text
+}
+
+#[test]
+fn protocol_lane_unknown_names_never_request_approval_or_leak_hidden_matches() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (_fixture, dir) = Fixture::new("protocol-unknown");
+    let tools = [
+        protocol_lane_tool("read_item", false),
+        protocol_lane_tool("read_items", false),
+        protocol_lane_tool("read_itam", false),
+        protocol_lane_tool("delete_item", true),
+    ];
+    let mut scoped = profile("visible", &["files"]);
+    scoped.tool_scope.insert(
+        "files".into(),
+        vec!["read_item".into(), "delete_item".into()],
+    );
+    write_registry(
+        &dir,
+        vec![protocol_lane_server(&dir, "files", &tools)],
+        vec![scoped],
+    );
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("visible"),
+            ..Default::default()
+        },
+    );
+    client.initialize("protocol-unknown");
+    client.wait_for_tool("__read_item", Duration::from_secs(30));
+    let message = protocol_lane_error(
+        &client.call_tool("files__read_itm", json!({})),
+        "Unknown tool: files__read_itm",
+    );
+    assert!(
+        message.contains("Close matches: files__read_item"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("read_items") && !message.contains("read_itam"),
+        "{message}"
+    );
+    assert!(message.contains("toolport_search_tools"));
+    protocol_lane_error(
+        &client.call_tool(
+            "toolport_call_tool",
+            json!({"name":"invented","arguments":{}}),
+        ),
+        "Unknown tool: invented",
+    );
+    let audit = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(
+        !audit.contains("\"kind\":\"approval\""),
+        "unknown call raised approval: {audit}"
+    );
+    // A known destructive tool still fails closed without a broker.
+    protocol_lane_error(
+        &client.call_tool("files__delete_item", json!({})),
+        "approval",
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let rows = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
+        if let Some(row) = rows
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|row| row["decision"] == "requested")
+        {
+            assert_eq!(row["safetyLevel"], "ask");
+            assert_eq!(row["safetySource"], "personal");
+            assert_eq!(row["gatewayVersion"], env!("CARGO_PKG_VERSION"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no approval safety snapshot: {rows}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn protocol_lane_policy_refusals_explain_the_reason_and_fix() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for case in [
+        "strict",
+        "client",
+        "disabled",
+        "quarantine",
+        "reserved",
+        "team",
+    ] {
+        let (_fixture, dir) = Fixture::new(&format!("protocol-{case}"));
+        let tools = [
+            protocol_lane_tool("read_item", false),
+            protocol_lane_tool("delete_item", true),
+        ];
+        write_registry(
+            &dir,
+            vec![protocol_lane_server(&dir, "files", &tools)],
+            vec![],
+        );
+        let path = dir.join("registry.json");
+        let mut reg = registry::load_from(&path).unwrap();
+        let profile_id = reg.active_profile_id.clone().unwrap();
+        let (name, reason, fix) = match case {
+            "strict" => {
+                reg.set_safety_level(registry::SafetyLevel::Strict);
+                ("files__delete_item", "Strict safety", "Toolport > Safety")
+            }
+            "team" => {
+                reg.set_safety_level(registry::SafetyLevel::Off);
+                reg.team_min_safety_level = registry::SafetyLevel::Strict;
+                ("files__delete_item", "team's Strict safety", "team admin")
+            }
+            "client" => {
+                reg.profiles
+                    .iter_mut()
+                    .find(|p| p.id == profile_id)
+                    .unwrap()
+                    .tool_scope
+                    .insert("files".into(), vec!["read_item".into()]);
+                (
+                    "files__delete_item",
+                    "turned off for this client",
+                    "Toolport > Clients",
+                )
+            }
+            "disabled" => {
+                reg.servers[0].disabled_tools.push("delete_item".into());
+                ("files__delete_item", "turned off", "Toolport > Servers")
+            }
+            _ => {
+                let legacy = if case == "reserved" {
+                    reg.tool_overrides.insert(
+                        "files".into(),
+                        std::collections::HashMap::from([(
+                            "delete_item".into(),
+                            registry::ToolOverride {
+                                name: Some("toolport_old_delete".into()),
+                                description: None,
+                                unknown_fields: Default::default(),
+                            },
+                        )]),
+                    );
+                    "toolport_old_delete"
+                } else {
+                    "files__delete_item"
+                };
+                reg.quarantine_on_drift = true;
+                for store in [
+                    dir.join("quarantine.json"),
+                    dir.join(format!(
+                        "quarantine-v2-{}.json",
+                        registry::profile_store_key(&profile_id)
+                    )),
+                ] {
+                    std::fs::write(store, json!({(legacy):{"server":"files","tool":"delete_item","change":"changed"}}).to_string()).unwrap();
+                }
+                (
+                    "files__delete_item",
+                    "quarantined after a tool change",
+                    "Toolport > Activity",
+                )
+            }
+        };
+        registry::save_to(&path, &reg).unwrap();
+        let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+        client.initialize(&format!("protocol-{case}"));
+        client.wait_for_tool("__read_item", Duration::from_secs(30));
+        for result in [
+            client.call_tool(name, json!({})),
+            client.call_tool("toolport_call_tool", json!({"name":name,"arguments":{}})),
+        ] {
+            let text = protocol_lane_error(&result, "Blocked by Toolport:");
+            assert!(
+                text.contains(reason) && text.contains(fix),
+                "{case}: {text}"
+            );
+        }
+        assert_eq!(
+            transcript_method_count(&dir.join("transcript-files.jsonl"), "tools/call"),
+            0
+        );
+    }
+}
+
+#[test]
+fn protocol_lane_cold_calls_wait_for_catalog_or_report_starting() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for delay in [400, 4000] {
+        let (_fixture, dir) = Fixture::new("protocol-cold");
+        let mut server =
+            protocol_lane_server(&dir, "files", &[protocol_lane_tool("read_item", false)]);
+        server.args.push(format!("--start-delay-ms={delay}"));
+        write_registry(&dir, vec![server], vec![]);
+        let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+        client.initialize("protocol-cold");
+        let started = Instant::now();
+        let result = client.call_tool("files__read_item", json!({}));
+        if delay == 400 {
+            assert_eq!(text_of(&result), "read_item", "{result}");
+            assert_ne!(result["isError"], true);
+        } else {
+            let text = protocol_lane_error(&result, "has not connected yet");
+            assert!(
+                text.contains("connecting") && !text.contains("approval"),
+                "{text}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(4),
+                "first catalog budget was exceeded"
+            );
+            client.wait_for_tool("__read_item", Duration::from_secs(30));
+            assert_eq!(
+                text_of(&client.call_tool("files__read_item", json!({}))),
+                "read_item"
+            );
+        }
+        let audit = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
+        assert!(
+            !audit.contains("\"kind\":\"approval\""),
+            "cold read raised approval: {audit}"
+        );
+    }
+}
+
+#[test]
+fn protocol_lane_long_aliases_route_and_survive_reorder_restart_and_old_policy() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _data_lock = registry::data_dir_test_lock();
+    let (_fixture, dir) = Fixture::new("protocol-long");
+    let _data_dir = registry::DataDirOverride::set(&dir);
+    let long = format!("read_{}", "customer_account_details_".repeat(4));
+    let twin = long.replace('_', "-");
+    let unicode = format!("read_{}", "用戶".repeat(40));
+    let override_name = format!("custom_{}", "account_".repeat(12));
+    let tools = [
+        protocol_lane_tool(&long, false),
+        protocol_lane_tool(&twin, false),
+        protocol_lane_tool(&unicode, false),
+        protocol_lane_tool("short", false),
+        protocol_lane_tool("renamed", false),
+    ];
+    write_registry(
+        &dir,
+        vec![protocol_lane_server(&dir, "files", &tools)],
+        vec![],
+    );
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).unwrap();
+    reg.set_safety_level(registry::SafetyLevel::Strict);
+    reg.tool_overrides.insert(
+        "files".into(),
+        std::collections::HashMap::from([(
+            "renamed".into(),
+            registry::ToolOverride {
+                name: Some(override_name.clone()),
+                description: None,
+                unknown_fields: Default::default(),
+            },
+        )]),
+    );
+    registry::save_to(&path, &reg).unwrap();
+    let profile = reg.active_profile_id.as_deref();
+    // Seed pins using the exact old client-facing definitions. Bounding the name
+    // must keep these records and fingerprints rather than silently re-pin them.
+    let mut old_tools = tools.to_vec();
+    for tool in &mut old_tools {
+        let original = tool["name"].as_str().unwrap();
+        let old_name = if original == "renamed" {
+            override_name.clone()
+        } else {
+            let suffix = if original == long { "_2" } else { "" };
+            format!(
+                "files__{}{suffix}",
+                conduit_lib::router::sanitize_segment(original)
+            )
+        };
+        tool["name"] = json!(old_name);
+        conduit_lib::router::normalize_tool_schema(&mut tool["inputSchema"]);
+    }
+    conduit_lib::integrity::check(profile, &old_tools).unwrap();
+    let old_pins = serde_json::to_value(conduit_lib::integrity::baselines(profile)).unwrap();
+    let aliases = conduit_lib::router::Router::server_tool_aliases(
+        "files",
+        &tools,
+        reg.tool_overrides.clone(),
+    );
+    assert_eq!(aliases["short"], "files__short");
+    assert_eq!(aliases.len(), tools.len());
+    assert_ne!(aliases[&long], aliases[&twin]);
+    assert!(aliases.values().all(
+        |name| name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    ));
+    for restart in 0..2 {
+        let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+        client.initialize("protocol-long");
+        client.wait_for_tool("__short", Duration::from_secs(30));
+        let names = client.tool_names();
+        for (original, alias) in &aliases {
+            assert!(names.contains(alias), "alias missing: {alias}: {names:?}");
+            assert_eq!(text_of(&client.call_tool(alias, json!({}))), *original);
+        }
+        assert_eq!(
+            serde_json::to_value(conduit_lib::integrity::baselines(profile)).unwrap(),
+            old_pins,
+            "alias change rewrote old pins"
+        );
+        drop(client);
+        kill_daemons(&dir);
+        if restart == 0 {
+            let mut reversed = tools.to_vec();
+            reversed.reverse();
+            protocol_lane_server(&dir, "files", &reversed);
+        }
+    }
+    // Existing quarantine names still block their bounded aliases after restart.
+    let legacy = format!("files__{}_2", conduit_lib::router::sanitize_segment(&long));
+    for store in [
+        dir.join("quarantine.json"),
+        dir.join(format!(
+            "quarantine-v2-{}.json",
+            registry::profile_store_key(profile.unwrap())
+        )),
+    ] {
+        std::fs::write(store, json!({(legacy):{"server":"files","tool":long,"change":"changed"}, (override_name):{"server":"files","tool":"renamed","change":"changed"}}).to_string()).unwrap();
+    }
+    let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+    client.initialize("protocol-long-quarantine");
+    client.wait_for_tool("__short", Duration::from_secs(30));
+    for original in [&long, &"renamed".to_string()] {
+        protocol_lane_error(
+            &client.call_tool(&aliases[original], json!({})),
+            "quarantined after a tool change",
+        );
+    }
+    assert_eq!(text_of(&client.call_tool(&aliases[&twin], json!({}))), twin);
+}
