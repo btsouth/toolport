@@ -1259,6 +1259,24 @@ mod tests {
     }
 
     #[test]
+    fn retained_capacity_triggers_the_byte_cap() {
+        let mut body = String::with_capacity(4096);
+        body.push_str("short text");
+        let size = retained_size(&body, None);
+        assert!(
+            size >= 4096,
+            "retained capacity, not text length, must be charged"
+        );
+        let mut store = SessionStore::new(CACHE_TTL, MAX_CACHE_ENTRIES);
+        store.insert("oldest", cached_entry(MAX_CACHE_BYTES - 4096));
+        evict_to_fit(&mut store, size);
+        assert!(
+            store.is_empty(),
+            "the retained buffer must trigger eviction"
+        );
+    }
+
+    #[test]
     fn raw_projections_match_value_serialization() {
         let value = json!({"": 7, "rows": [{"escaped\"": "é🙂\n\\", "empty": [], "nested": {"number": -1.5}}, 4, null, true]});
         let body = value.to_string();
