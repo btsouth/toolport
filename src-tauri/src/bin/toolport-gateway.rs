@@ -18565,6 +18565,7 @@ struct HttpIngressGuard {
     close: Arc<AtomicBool>,
     wake: SocketAddr,
     accept_thread: Option<std::thread::JoinHandle<()>>,
+    overload_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for HttpIngressGuard {
@@ -18572,6 +18573,9 @@ impl Drop for HttpIngressGuard {
         self.close.store(true, Ordering::Release);
         let _ = TcpStream::connect_timeout(&self.wake, Duration::from_secs(1));
         if let Some(thread) = self.accept_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.overload_thread.take() {
             let _ = thread.join();
         }
     }
@@ -18646,7 +18650,17 @@ fn spawn_http_overload_responder(
         let mut disconnected = false;
         while !close.load(Ordering::Acquire) {
             if !disconnected && pending.len() < 64 {
-                match receiver.recv_timeout(Duration::from_millis(2)) {
+                // The accept thread owns the sender and drops it on shutdown,
+                // waking an idle responder without periodic polling. Pending
+                // sockets retain the existing cadence for reads and deadlines.
+                let received = if pending.is_empty() {
+                    receiver
+                        .recv()
+                        .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                } else {
+                    receiver.recv_timeout(Duration::from_millis(2))
+                };
+                match received {
                     Ok(client) => {
                         let _ = client.set_nonblocking(true);
                         pending.push(RejectedHttpRequest {
@@ -18702,7 +18716,7 @@ fn bind_deadline_http_server<A: ToSocketAddrs>(
     let backend_addr = backend_listener.local_addr()?;
     let server = tiny_http::Server::from_listener(backend_listener, None)?;
     let close = Arc::new(AtomicBool::new(false));
-    let (overloaded, _overload_worker) = spawn_http_overload_responder(deadlines, close.clone());
+    let (overloaded, overload_worker) = spawn_http_overload_responder(deadlines, close.clone());
     let accept_close = Arc::clone(&close);
     let connections = Arc::new(AtomicUsize::new(0));
     let accept_thread = std::thread::spawn(move || {
@@ -18749,6 +18763,7 @@ fn bind_deadline_http_server<A: ToSocketAddrs>(
                 public_addr
             },
             accept_thread: Some(accept_thread),
+            overload_thread: Some(overload_worker),
         },
         public_addr,
     ))
@@ -37104,6 +37119,45 @@ mod tests {
     }
 
     #[test]
+    fn http_overload_responder_exits_on_shutdown_idle_or_pending() {
+        for pending in [false, true] {
+            let close = Arc::new(AtomicBool::new(false));
+            let (sender, worker) =
+                spawn_http_overload_responder(HttpReadDeadlines::default(), close.clone());
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let _client = if pending {
+                let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                sender.send(listener.accept().unwrap().0).unwrap();
+                Some(client)
+            } else {
+                None
+            };
+            close.store(true, Ordering::Release);
+            // Ingress shutdown joins the accept thread, dropping its sender.
+            drop(sender);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || done_tx.send(worker.join()).unwrap());
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn http_ingress_shutdown_joins_idle_responder() {
+        let (server, ingress, _) =
+            bind_deadline_http_server("127.0.0.1:0", HttpReadDeadlines::default()).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(ingress);
+            done_tx.send(()).unwrap();
+        });
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(server);
+    }
+
+    #[test]
     fn p08_stalled_rejected_request_does_not_delay_other_503s() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut stalled = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -37116,6 +37170,8 @@ mod tests {
             },
             Arc::new(AtomicBool::new(false)),
         );
+        // Let the empty responder park before the first rejected connection.
+        std::thread::sleep(Duration::from_millis(20));
         stalled
             .write_all(b"POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\nx")
             .unwrap();
@@ -37128,14 +37184,18 @@ mod tests {
         ready
             .write_all(b"GET /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .unwrap();
+        let started = Instant::now();
         sender.send(socket).unwrap();
         let mut response = String::new();
         let result = ready.read_to_string(&mut response);
+        let elapsed = started.elapsed();
         drop(stalled);
         drop(sender);
         worker.join().unwrap();
         result.unwrap();
         assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.contains("Retry-After: 1"), "{response}");
+        assert!(elapsed < Duration::from_secs(1), "503 took {elapsed:?}");
     }
 
     #[test]
