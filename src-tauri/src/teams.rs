@@ -4504,6 +4504,23 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
         }
     }
 
+    // The governed delivery view can omit disabled personal definitions. During
+    // the mode handoff keep their installed setup as an off, local-only copy,
+    // instead of destroying arguments, setup values and credential ownership.
+    let transitioning = reg.team.as_mut().is_some_and(|t| t.unknown_fields.remove("personalSyncGovernanceTransition") == Some(json!(true)));
+    if transitioning {
+        for old in previous.iter().filter(|old| old.unknown_fields.get("personalSyncEntry") == Some(&json!(true))) {
+            if !reg.servers.iter().any(|s| s.id == old.id) {
+                let mut kept = old.clone();
+                kept.source = Some("shared".into()); kept.enabled = false;
+                kept.unknown_fields.insert("syncLocalOnly".into(), json!(true));
+                kept.require_team_enable_review();
+                for p in &mut reg.profiles { p.enabled_server_ids.retain(|id| id != &kept.id); p.tool_scope.remove(&kept.id); }
+                reg.servers.push(kept);
+            }
+        }
+    }
+
     // Only rows that exist keep a mapping. A definition deleted from the Team and
     // shared again later can get a new local id; its old mapping must not linger
     // beside the new one for the same original.

@@ -1552,6 +1552,19 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     #[test]
+    fn personal_execution_review_includes_setup_values_and_visible_controls() {
+        let server: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({"id":"review","name":"Review","transport":"stdio","command":"npx\u{202e}","args":["-y","package"],"cwd":"/work\u{200b}","inheritEnv":false,"env":[{"key":"REGION","secret":false,"value":"west"},{"key":"TOKEN","secret":true,"value":"hidden"}],"launch":{"inputs":[{"key":"project","label":"Project","secret":false,"value":"folder"}],"bindings":[{"index":1,"parts":[{"kind":"input","key":"project"}]}]}})).unwrap();
+        let text = crate::personal_sync::execution_review_lines(&server).join("\n");
+        assert!(text.contains("Environment [0] REGION: west"));
+        assert!(text.contains("Environment [1] TOKEN: <masked secret>"));
+        assert!(text.contains("Launch input [0] project: folder"));
+        assert!(text.contains("Launch bindings:"));
+        assert!(text.contains("Working directory: /work\\u{200B}"));
+        assert!(text.contains("Command: npx\\u{202E}"));
+        assert!(text.contains("inheritEnv: false"));
+        assert!(!text.contains("hidden"));
+    }
+    #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn member_review_native_shows_diff_labels_and_both_decisions() {
         adw::init().unwrap();

@@ -101,6 +101,8 @@ pub(crate) fn mode_changed(reg: &mut Registry, was_personal: bool) -> Result<(),
         // Force a governed pull even when the cloud version did not change.
         if let Some(t) = &mut reg.team {
             t.last_etag = Some("\"mode-transition\"".into());
+            t.unknown_fields
+                .insert("personalSyncGovernanceTransition".into(), json!(true));
             t.unknown_fields.remove("memberReview");
         }
     }
@@ -1139,7 +1141,7 @@ pub(crate) fn check_review(
     if is_personal(reg) && current.needs_team_enable_review() {
         if reviewed.is_none_or(|s| {
             s.id != current.id
-                || command_identity(&export(s)) != command_identity(&export(current))
+                || command_identity(&json!(s)) != command_identity(&json!(current))
                 || execution_review_fields(s) != execution_review_fields(current)
         }) {
             return Err(
@@ -1725,6 +1727,23 @@ mod tests {
             .servers
             .iter()
             .any(|s| s.id == ids[0] && s.args[1] == "local-argument-secret"));
+    }
+    #[test]
+    fn governance_transition_retains_disabled_personal_definitions_locally() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-mode-disabled");
+        let mut r = machine();
+        let mut row = http("off");
+        row["disabled"] = json!(true);
+        apply(&mut r, &config(vec![row]), 1).unwrap();
+        let id = r.servers[0].id.clone();
+        let owner = crate::local_auth::owner_in(&r, &id).unwrap();
+        r.team.as_mut().unwrap().unknown_fields["accountStatus"]["personalSync"] = json!(false);
+        mode_changed(&mut r, true).unwrap();
+        crate::teams::stage_team_config(&mut r, "solo", &config(vec![]), 2, &[]).unwrap();
+        assert_eq!(r.servers[0].id, id);
+        assert!(!r.servers[0].enabled);
+        assert!(keep_local(&r.servers[0]));
+        assert_eq!(crate::local_auth::owner_in(&r, &id).unwrap(), owner);
     }
     #[test]
     fn name_matching_never_gives_two_local_servers_one_cloud_id() {
