@@ -4164,11 +4164,24 @@ fn tool_change_group_card(
         .and_then(|event| event["server_name"].as_str())
         .filter(|name| !name.is_empty())
         .unwrap_or(&group.server);
-    let heading = gtk::Button::with_label(&format!(
-        "{name}: {}, {}",
-        crate::integrity::tool_change_summary(&group.tools),
-        relative_activity_time(group.ts)
-    ));
+    let heading = gtk::Button::new();
+    let heading_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let arrow = gtk::Image::from_icon_name("pan-end-symbolic");
+    heading_row.append(&arrow);
+    heading_row.append(
+        &gtk::Label::builder()
+            .label(format!(
+                "{name}: {}, {}",
+                crate::integrity::tool_change_summary(&group.tools),
+                relative_activity_time(group.ts)
+            ))
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .css_classes(["heading"])
+            .build(),
+    );
+    heading.set_child(Some(&heading_row));
     heading.add_css_class("flat");
     heading.set_halign(gtk::Align::Fill);
     heading.set_tooltip_text(Some("Expand to review the changed tools"));
@@ -4182,10 +4195,20 @@ fn tool_change_group_card(
     let expansion_key = format!("security:server:{}:{}", group.server, group.ts);
     let expanded_rows = page.expanded_activity_rows.clone();
     reveal.set_reveal_child(expanded_rows.borrow().contains(&expansion_key));
+    arrow.set_icon_name(Some(if reveal.reveals_child() {
+        "pan-down-symbolic"
+    } else {
+        "pan-end-symbolic"
+    }));
     let reveal_for_toggle = reveal.clone();
     heading.connect_clicked(move |_| {
         let expanded = !reveal_for_toggle.reveals_child();
         reveal_for_toggle.set_reveal_child(expanded);
+        arrow.set_icon_name(Some(if expanded {
+            "pan-down-symbolic"
+        } else {
+            "pan-end-symbolic"
+        }));
         remember_activity_expansion(&mut expanded_rows.borrow_mut(), &expansion_key, expanded);
     });
     card.append(&heading);
