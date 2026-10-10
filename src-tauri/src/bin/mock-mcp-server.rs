@@ -562,7 +562,10 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
                 .and_then(|p| p.get("arguments"))
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            if fixture_tools().is_some_and(|tools| tools.iter().any(|tool| tool["name"] == name)) {
+            // Keep echo's argument behavior in custom catalogs too.
+            if name != "echo"
+                && fixture_tools().is_some_and(|tools| tools.iter().any(|tool| tool["name"] == name))
+            {
                 return Some(success(
                     id,
                     decorate(

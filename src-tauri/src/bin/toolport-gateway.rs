@@ -3892,7 +3892,7 @@ fn tool_is_destructive_fail_closed(name: &str, cached: &dyn ToolCatalog, router:
         tools
             .iter()
             .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
-            .map(|tool| is_destructive(&router.policy_definition(tool)))
+            .map(|tool| is_destructive(&router.safety_definition(tool)))
     };
     if let Some(d) = lookup(cached) {
         return d;
@@ -7144,7 +7144,7 @@ fn build_tool_surfaces(
             (snapshot.tools.is_empty()
                 || name.is_none_or(|name| {
                     !router.is_blocked(name)
-                        && !(deny_destructive && cached_tool_is_destructive(tool, name))
+                        && !(deny_destructive && cached_tool_is_destructive(tool, name, router))
                 }))
                 && allowed.is_none_or(|scope| {
                     name.is_some_and(|name| {
@@ -10636,7 +10636,7 @@ fn drop_blocked_from_cache(
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
             return true;
         };
-        if deny_destructive && cached_tool_is_destructive(tool, name) {
+        if deny_destructive && cached_tool_is_destructive(tool, name, router) {
             return false;
         }
         !router.is_blocked(name)
@@ -10653,14 +10653,19 @@ fn drop_blocked_from_cache(
 /// name lets the SERVER prefix decide: every read-only tool on a server called
 /// `create_hub` or `send_grid` would be dropped. Restore the original name
 /// before asking.
-fn cached_tool_is_destructive(tool: &Value, exposed: &str) -> bool {
+fn cached_tool_is_destructive(tool: &Value, exposed: &str, router: &Router) -> bool {
+    if router.route_of(exposed).is_some() {
+        return is_destructive(&router.safety_definition(tool));
+    }
+    let definition = router.policy_definition(tool);
+    let exposed = definition["name"].as_str().unwrap_or(exposed);
     match conduit_lib::codemode::split_exposed_name(exposed) {
         Some((_, original)) => {
-            let mut probe = tool.clone();
+            let mut probe = (*definition).clone();
             probe["name"] = Value::String(original.to_string());
             is_destructive(&probe)
         }
-        None => is_destructive(tool),
+        None => is_destructive(&definition),
     }
 }
 
@@ -15539,9 +15544,17 @@ fn process_request_wire(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        base.any_missing_catalog(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
-            || state.cached_tools.lock().map(|c| !has_scoped_tools(&c.tools, allowed, &base, &reg)).unwrap_or(true)
+        let reg = state
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        base.any_missing_catalog(|id| {
+            allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
+        }) || state
+            .cached_tools
+            .lock()
+            .map(|c| !has_scoped_tools(&c.tools, allowed, &base, &reg))
+            .unwrap_or(true)
     };
     let started = Instant::now();
     let mut response = process_request_wire_inner(
@@ -15562,7 +15575,13 @@ fn process_request_wire(
             started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             cold,
             client,
-            response.as_ref().is_some_and(|r| r.envelope.get("error").is_none() && r.envelope.pointer("/result/isError").and_then(Value::as_bool) != Some(true)),
+            response.as_ref().is_some_and(|r| {
+                r.envelope.get("error").is_none()
+                    && r.envelope
+                        .pointer("/result/isError")
+                        .and_then(Value::as_bool)
+                        != Some(true)
+            }),
         );
     }
     // One-way HTTP messages finish here rather than at a JSON-RPC reply write.
@@ -28701,6 +28720,91 @@ mod tests {
             Some(40),
             "the recovery reset the streak, so this collapse is held again"
         );
+    }
+
+    #[test]
+    fn long_alias_off_to_strict_prepare_dispatch_uses_original_safety() {
+        let _env = DataDirTestEnv::new("long-alias-strict-race");
+        struct LongRoute {
+            name: String,
+            inner: CountingRoute,
+        }
+        impl Transport for LongRoute {
+            fn request(
+                &mut self,
+                method: &str,
+                params: Value,
+            ) -> Result<Value, downstream::TransportError> {
+                if method == "tools/list" {
+                    return Ok(
+                        json!({"tools":[{"name":self.name,"inputSchema":{"type":"object"}}]}),
+                    );
+                }
+                self.inner.request(method, params)
+            }
+            fn notify(
+                &mut self,
+                method: &str,
+                params: Value,
+            ) -> Result<(), downstream::TransportError> {
+                self.inner.notify(method, params)
+            }
+        }
+        for rename in [false, true] {
+            let original = format!("{}_delete", "account_".repeat(12));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut snapshot = Router::new();
+            if rename {
+                snapshot.set_overrides(HashMap::from([(
+                    "files".into(),
+                    HashMap::from([(
+                        original.clone(),
+                        registry::ToolOverride {
+                            name: Some("read_alias".into()),
+                            ..Default::default()
+                        },
+                    )]),
+                )]));
+            }
+            snapshot.add(
+                DownstreamServer::connect(
+                    "files".into(),
+                    Box::new(LongRoute {
+                        name: original.clone(),
+                        inner: CountingRoute {
+                            calls: Arc::clone(&calls),
+                            destructive: false,
+                        },
+                    }),
+                )
+                .unwrap(),
+            );
+            let name = snapshot
+                .exposed_tool_name("files", &original)
+                .unwrap()
+                .to_string();
+            assert!(!name.contains("delete"));
+            let cached = snapshot.shared_tools();
+            assert!(tool_is_destructive_fail_closed(&name, &cached, &snapshot));
+            assert!(cached_tool_is_destructive(&cached[0], &name, &snapshot));
+            let mut live = snapshot.clone();
+            live.apply_registry_policy(RegistryPolicy {
+                deny_destructive: true,
+                ..Default::default()
+            });
+            assert!(live.is_blocked(&name));
+            let slot = Arc::new(Mutex::new(Arc::new(live)));
+            let result = prepare_dispatch(
+                &snapshot,
+                Some(&slot),
+                DispatchTarget::Tool(&name),
+                None,
+                false,
+            )
+            .and_then(|()| snapshot.route_call(&name, json!({})));
+            assert!(result.unwrap_err().contains("Strict safety"));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]

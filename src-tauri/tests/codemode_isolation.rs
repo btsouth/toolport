@@ -493,19 +493,19 @@ fn mock_registry(reg: &mut Registry, dir: &Path) {
         std::env::var_os("TOOLPORT_TEST_MOCK")
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_mock-mcp-server").into()),
     );
+    let catalog = dir.join("tools.json");
+    std::fs::write(&catalog, json!([
+        {"name":"echo", "inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}, "annotations":{"destructiveHint":false}},
+        {"name":"delete_item", "inputSchema":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}}}, "annotations":{"destructiveHint":true}}
+    ]).to_string()).unwrap();
     reg.servers.push(serde_json::from_value(json!({
         "id": "s", "name": "Fixture", "transport": "stdio", "command": mock, "enabled": true,
-        "env": [{ "key": "MOCK_MCP_TRANSCRIPT", "value": dir.join("downstream.jsonl"), "secret": false }]
+        "env": [
+            { "key": "MOCK_MCP_TRANSCRIPT", "value": dir.join("downstream.jsonl"), "secret": false },
+            { "key": "MOCK_MCP_TOOLS_FILE", "value": catalog, "secret": false }
+        ]
     })).unwrap());
     reg.profiles[0].enabled_server_ids.push("s".into());
-    reg.tool_overrides.entry("s".into()).or_default().insert(
-        "add".into(),
-        registry::ToolOverride {
-            name: Some("s__delete_item".into()),
-            description: None,
-            unknown_fields: Default::default(),
-        },
-    );
 }
 
 #[test]

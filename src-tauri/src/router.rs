@@ -1812,6 +1812,22 @@ impl Router {
         std::borrow::Cow::Owned(definition)
     }
 
+    /// Safety always judges the downstream name and annotations, never an exposure alias.
+    pub fn safety_definition<'a>(&self, tool: &'a Value) -> std::borrow::Cow<'a, Value> {
+        let original = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| self.route_of(name).map(|(_, original)| original));
+        match original {
+            Some(original) => {
+                let mut definition = tool.clone();
+                definition["name"] = json!(original);
+                std::borrow::Cow::Owned(definition)
+            }
+            None => self.policy_definition(tool),
+        }
+    }
+
     pub fn policy_catalog(&self, tools: &SharedTools) -> SharedTools {
         SharedTools(
             tools
@@ -2087,14 +2103,14 @@ impl Router {
                         exposed,
                         server_id,
                         orig,
-                        ToolPolicyMetadata::from(definition),
+                        ToolPolicyMetadata::from(&*self.safety_definition(definition)),
                     )
                     .or_else(|| {
                         live.policy.blocked_reason_unscoped(
                             self.policy_name(exposed),
                             server_id,
                             orig,
-                            ToolPolicyMetadata::from(definition),
+                            ToolPolicyMetadata::from(&*self.safety_definition(definition)),
                         )
                     }) {
                     Some(reason) => Err(blocked_tool_message(exposed, reason)),
@@ -3470,7 +3486,11 @@ impl Router {
                 &candidate.exposed,
                 &candidate.server,
                 &candidate.original,
-                ToolPolicyMetadata::from(&**candidate.definition),
+                ToolPolicyMetadata::from(&{
+                    let mut definition = (**candidate.definition).clone();
+                    definition["name"] = json!(candidate.original);
+                    definition
+                }),
             ) {
                 self.blocked
                     .insert(candidate.exposed.clone(), reason.to_string());
