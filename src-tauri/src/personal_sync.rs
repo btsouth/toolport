@@ -662,6 +662,29 @@ pub fn apply(
         }
         st.initialized = true;
     }
+    // A conflict preserves the edited definition, not permission to keep a
+    // remotely revoked route running. An explicit conflict choice may restore it.
+    for (id, mutation) in &st.pending {
+        let revoked = remote
+            .get(id)
+            .map_or(mutation.before.is_some(), |v| v["disabled"] == true);
+        if revoked
+            && reg
+                .servers
+                .iter()
+                .any(|s| s.id == mutation.local_id && !keep_local(s))
+        {
+            crate::local_auth::revoke_personal_route(reg, &team_id, &mutation.local_id);
+            if let Some(server) = reg.servers.iter_mut().find(|s| s.id == mutation.local_id) {
+                server.enabled = false;
+            }
+            for profile in &mut reg.profiles {
+                profile
+                    .enabled_server_ids
+                    .retain(|id| id != &mutation.local_id);
+            }
+        }
+    }
     let deleted: Vec<_> = st
         .baseline
         .keys()
@@ -1528,6 +1551,38 @@ mod tests {
         apply(&mut b, &config(vec![v]), 2).unwrap();
         assert_eq!(b.servers.len(), 1);
         assert!(!b.servers[0].enabled);
+    }
+    #[test]
+    fn remote_delete_or_disable_stops_a_route_even_with_a_pending_local_edit() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-conflict-revocation");
+        for delete in [false, true] {
+            let mut b = machine();
+            let initial = config(vec![http("docs")]);
+            apply(&mut b, &initial, 1).unwrap();
+            let before = b.clone();
+            b.servers[0].name = "Local edit".into();
+            record(&before, &mut b).unwrap();
+            let mut remote = if delete {
+                config(vec![])
+            } else {
+                initial.clone()
+            };
+            if !delete {
+                remote["servers"][0]["disabled"] = json!(true);
+            }
+            apply(&mut b, &remote, 2).unwrap();
+            assert_eq!(b.servers[0].name, "Local edit");
+            assert!(!b.servers[0].enabled);
+            assert!(state(&b).unwrap().pending.contains_key("docs"));
+            assert!(merge(&remote, &state(&b).unwrap().pending)
+                .unwrap()
+                .1
+                .contains_key("docs"));
+            assert!(!b
+                .profiles
+                .iter()
+                .any(|p| p.enabled_server_ids.contains(&b.servers[0].id)));
+        }
     }
     #[test]
     fn conflict_resolution_checks_the_exact_remote_generation() {
