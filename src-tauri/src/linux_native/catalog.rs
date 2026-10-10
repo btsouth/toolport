@@ -637,6 +637,7 @@ fn configure_self_hosted(entry: &crate::catalog::CatalogEntry, hint: &str, page:
         client_credentials: None,
         enabled: false,
         requires_review: false,
+        team_route_removed: false,
         probe_fingerprint: 0,
     };
     let editor =

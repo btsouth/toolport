@@ -424,6 +424,8 @@ export interface ServerEntry {
   env: EnvVar[];
   url: string | null;
   source: string | null;
+  /** A remote removal or disable kept this saved personal original off. */
+  teamRouteRemoved?: boolean;
   /** Original tool names switched off; hidden from clients by the gateway. */
   disabledTools?: string[];
   /** Working directory for a stdio server. Unset = inherit the gateway's cwd.

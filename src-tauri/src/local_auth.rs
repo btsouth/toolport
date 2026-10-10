@@ -43,6 +43,9 @@ pub(crate) fn bind(
         return Err("The shared definition changed. Review its local setup separately.".into());
     }
     let mut entries = bindings(reg)?;
+    if let Some(original) = reg.servers.iter_mut().find(|s| s.id == personal.id) {
+        original.unknown_fields.remove("teamRouteRemoved");
+    }
     entries.insert(
         managed.id.clone(),
         Binding {
@@ -199,9 +202,30 @@ pub(crate) fn restore_personal_routes(reg: &mut Registry, team_id: &str) {
     restore_routes(reg, team_id, None);
 }
 
-/// A removed managed definition returns only its own explicitly bound route.
-pub(crate) fn restore_personal_route(reg: &mut Registry, team_id: &str, managed: &str) {
-    restore_routes(reg, team_id, Some(managed));
+/// Remote removal, disablement or access revocation stops the saved original too.
+/// Forget the binding so a later disconnect cannot undo this tightening.
+pub(crate) fn revoke_personal_route(reg: &mut Registry, team_id: &str, managed: &str) {
+    let Ok(mut entries) = bindings(reg) else {
+        return;
+    };
+    let Some(binding) = entries.get(managed).filter(|b| b.team_id == team_id) else {
+        return;
+    };
+    if let Some(personal) = reg.servers.iter_mut().find(|s| s.id == binding.personal_id) {
+        personal.enabled = false;
+        personal
+            .unknown_fields
+            .insert("teamRouteRemoved".into(), serde_json::Value::Bool(true));
+    }
+    for profile in &mut reg.profiles {
+        profile
+            .enabled_server_ids
+            .retain(|id| id != &binding.personal_id);
+    }
+    entries.remove(managed);
+    if let Ok(value) = serde_json::to_value(entries) {
+        reg.unknown_fields.insert(FIELD.into(), value);
+    }
 }
 
 fn restore_routes(reg: &mut Registry, team_id: &str, only: Option<&str>) {

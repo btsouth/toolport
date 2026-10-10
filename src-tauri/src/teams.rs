@@ -361,15 +361,15 @@ const STALE_PUSH_MESSAGE: &str =
     "The team config changed before this update could be saved. Sync to review the latest settings, then try again; nothing was overwritten.";
 
 /// Fetch the complete current config before an admin replaces its server list. Unlike the
-/// sync pull, this request is intentionally unconditional: the caller needs the full object so
-/// instructions, policies, and future top-level fields can be round-tripped unchanged.
+/// sync pull, this request uses the management view and is unconditional: disabled
+/// entries, dashboard metadata, policies and future fields must survive publishing.
 fn fetch_config_for_update(
     server_url: &str,
     team_id: &str,
     token: &str,
 ) -> Result<(i64, Value), String> {
     require_secure_team_url(server_url)?;
-    let url = format!("{}/teams/{}/config", base(server_url), team_id);
+    let url = format!("{}/teams/{}/config?manage=1", base(server_url), team_id);
     match agent(server_url)
         .get(&url)
         .set("authorization", &format!("Bearer {token}"))
@@ -2532,7 +2532,15 @@ fn stage_publisher_handoffs(
         // because its Team copy is in use. Re-sharing a change must keep that route.
         let using_team_copy =
             !personal_on && crate::local_auth::bound_copy_enabled(before, &profile, id);
-        let (outcome, message) = if !personal_on && !using_team_copy {
+        // Sync may revoke this route after the share was confirmed. A stale
+        // handoff snapshot must not turn its personal original back on.
+        let removed_shared_route = using_team_copy && managed_copy_of(reg, id).is_err();
+        let (outcome, message) = if removed_shared_route {
+            (
+                HandoffOutcome::NotEnabled,
+                "Removed or disabled by the team. Your personal server stays off.".to_string(),
+            )
+        } else if !personal_on && !using_team_copy {
             (
                 HandoffOutcome::NotEnabled,
                 if predicted {
@@ -2645,6 +2653,11 @@ fn same_display_name(a: &str, b: &str) -> bool {
 /// whether a different Team server has the same name. The React picker applies
 /// the same rules.
 pub fn personal_share_hint(reg: &Registry, personal: &ServerEntry) -> Option<&'static str> {
+    if personal.unknown_fields.get("teamRouteRemoved") == Some(&json!(true))
+        && !reg.is_enabled(&reg.active_profile_id(), &personal.id)
+    {
+        return Some("Removed or disabled by the team. Your personal server stays off.");
+    }
     if let Ok(copy) = managed_copy_of(reg, &personal.id) {
         return Some(if reg.is_enabled(&reg.active_profile_id(), &copy) {
             "Shared. The Team copy is in use in this profile."
@@ -2673,6 +2686,7 @@ fn share_selections(
 ) -> Result<Vec<ShareSelectionPreview>, String> {
     let team_id = reg.team.as_ref().ok_or("not connected to a team")?.team_id.clone();
     let remote = server_index(remote)?;
+    let published_servers = server_index(&published["servers"])?;
     let selected = server_index(selected)?;
     let ids: Vec<String> = selected.keys().cloned().collect();
     let mut simulated = reg.clone();
@@ -2686,7 +2700,7 @@ fn share_selections(
             let name = preview_name(server, id);
             let (team_change, team_detail) = match remote.get(id) {
                 None => ("New", "Adds a new Team definition."),
-                Some(current) if !same_definition(current, server) => (
+                Some(current) if !same_definition(current, published_servers[id]) => (
                     "Update",
                     "Replaces the Team definition with the same server ID. Members review the change before it runs for them.",
                 ),
@@ -2725,7 +2739,14 @@ fn additive_server_set(remote: &Value, selected: &Value) -> Result<Value, String
         .map(|(id, s)| (id, s.clone()))
         .collect();
     for (id, server) in server_index(selected)? {
-        merged.insert(id, server.clone());
+        // The desktop owns only the fields in its export. Keep dashboard notes,
+        // disablement and future metadata even when updating this same identity.
+        let mut definition = merged.remove(&id).unwrap_or_else(|| json!({}));
+        definition
+            .as_object_mut()
+            .unwrap()
+            .extend(server.as_object().unwrap().clone());
+        merged.insert(id, definition);
     }
     Ok(Value::Array(merged.into_values().collect()))
 }
@@ -3464,7 +3485,7 @@ pub fn stage_team_config(
                 })
                 .map(|server| server.id.clone())
             {
-                crate::local_auth::restore_personal_route(reg, team_id, &managed);
+                crate::local_auth::revoke_personal_route(reg, team_id, &managed);
             }
             review.accepted.remove(&key);
             review.rejected.remove(&key);
@@ -4470,6 +4491,10 @@ fn team_host_is_private(host: &str) -> bool {
 }
 
 fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
+    // Management views include these rows; they must never become runtime routes.
+    if s.get("disabled").and_then(Value::as_bool) == Some(true) {
+        return TeamClass::Skip;
+    }
     let str_field = |k: &str| s.get(k).and_then(Value::as_str).filter(|x| !x.is_empty());
     let orig_id = str_field("id");
     let name = match str_field("name").or(orig_id) {
@@ -4767,7 +4792,9 @@ mod tests {
         let updated = json!([{"id":"unrelated","name":"Updated"}, {"id":"second","name":"Second"}]);
         let merged = additive_server_set(&remote, &updated).unwrap();
         assert_eq!(merged.as_array().unwrap().len(), 2);
-        assert!(merged.as_array().unwrap().contains(&updated[0]));
+        let indexed = server_index(&merged).unwrap();
+        assert_eq!(indexed["unrelated"]["name"], updated[0]["name"]);
+        assert_eq!(indexed["unrelated"]["url"], remote[0]["url"]);
     }
 
     #[test]
@@ -8446,6 +8473,220 @@ mod tests {
 mod member_review_tests {
     use super::*;
 
+    #[test]
+    fn sync_regression_publish_preserves_disabled_servers_and_metadata() {
+        let complete = json!({"servers":[
+            {"id":"paused", "name":"Paused", "transport":"http", "url":"https://1.2.3.4/mcp",
+             "disabled":true, "note":"Keep until renewal", "future":{"owner":"ops"}},
+            {"id":"existing", "name":"Existing", "transport":"http", "url":"https://1.2.3.4/old",
+             "note":"Dashboard notes", "future":{"owner":"finance"}}
+        ], "futurePolicy":{"keep":true}});
+        let fixture = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", fixture.server_addr());
+        let stored = complete.clone();
+        let server = std::thread::spawn(move || {
+            let request = fixture
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            let mut view = stored;
+            if !request.url().ends_with("?manage=1") {
+                view["servers"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|s| s["disabled"] != true);
+                for entry in view["servers"].as_array_mut().unwrap() {
+                    entry.as_object_mut().unwrap().remove("note");
+                }
+            }
+            request
+                .respond(tiny_http::Response::from_string(
+                    json!({"version":4,"config":view}).to_string(),
+                ))
+                .unwrap();
+            let mut request = fixture
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body).unwrap();
+            request
+                .respond(tiny_http::Response::from_string(
+                    json!({"version":5}).to_string(),
+                ))
+                .unwrap();
+            serde_json::from_str::<Value>(&body).unwrap()
+        });
+        let (version, config) =
+            fetch_config_for_update(&url, "review-team", "fixture-token").unwrap();
+        let selected = json!([
+            {"id":"new", "name":"New", "transport":"http", "url":"https://1.2.3.4/new"},
+            {"id":"existing", "name":"Edited", "transport":"http", "url":"https://1.2.3.4/edited"}
+        ]);
+        let servers = additive_server_set(&config["servers"], &selected).unwrap();
+        let config = replace_server_set(config, servers).unwrap();
+        push_config(&url, "review-team", "fixture-token", &config, version).unwrap();
+        let published = server.join().unwrap();
+        let index = server_index(&published["config"]["servers"]).unwrap();
+        assert_eq!(index.get("paused"), Some(&&complete["servers"][0]));
+        assert_eq!(index["existing"]["note"], complete["servers"][1]["note"]);
+        assert_eq!(
+            index["existing"]["future"],
+            complete["servers"][1]["future"]
+        );
+        assert_eq!(index["existing"]["url"], selected[1]["url"]);
+        assert!(index.contains_key("new"));
+        assert_eq!(
+            published["config"]["futurePolicy"],
+            complete["futurePolicy"]
+        );
+        assert_eq!(published["base_version"], 4);
+    }
+
+    #[test]
+    fn sync_regression_editing_disabled_definition_keeps_it_disabled() {
+        let mut reg = bound_personal_registry();
+        let before = reg.clone();
+        let selected = selected_export(&reg, &["remote".into()]).unwrap();
+        let mut remote = selected.clone();
+        remote[0]["disabled"] = json!(true);
+        remote[0]["note"] = json!("Paused in dashboard");
+        let merged = additive_server_set(&remote, &selected).unwrap();
+        assert_eq!(merged, remote);
+        let preview =
+            share_selections(&reg, &remote, &selected, &json!({"servers":merged})).unwrap();
+        assert_eq!(preview[0].team_change, "Already shared");
+        assert_eq!(preview[0].local.outcome, HandoffOutcome::NotEnabled);
+        assert_eq!(
+            preview[0].local.message,
+            "Removed or disabled by the team. Your personal server stays off."
+        );
+        let mut edited = selected;
+        edited[0]["url"] = json!("https://1.2.3.4/edited");
+        let merged = additive_server_set(&remote, &edited).unwrap();
+        assert_eq!(merged[0]["disabled"], true);
+        assert_eq!(merged[0]["note"], remote[0]["note"]);
+        assert_eq!(merged[0]["url"], edited[0]["url"]);
+        stage_team_config(&mut reg, "review-team", &json!({"servers":merged}), 3, &[])
+            .unwrap();
+        assert!(reg
+            .servers
+            .iter()
+            .all(|s| s.source.as_deref() != Some("team:review-team")));
+        let handoffs = stage_publisher_handoffs(&mut reg, &before, &["remote".into()], false);
+        assert_eq!(handoffs[0].outcome, HandoffOutcome::NotEnabled);
+        assert!(!reg.server_enabled("remote"));
+    }
+
+    fn bound_personal_registry() -> Registry {
+        let mut reg = registry();
+        reg.version = 3;
+        stage_team_config(&mut reg, "review-team", &config("first"), 1, &[]).unwrap();
+        decide(&mut reg, "server:remote", true);
+        let managed = reg
+            .servers
+            .iter()
+            .find(|s| s.id == remote_id(&reg))
+            .unwrap()
+            .clone();
+        let mut personal = managed.clone();
+        personal.id = "remote".into();
+        personal.source = None;
+        personal.unknown_fields.remove(TEAM_ORIGINAL_ID_FIELD);
+        personal.enabled = false;
+        reg.servers.push(personal.clone());
+        crate::local_auth::bind(&mut reg, &managed, &personal).unwrap();
+        reg
+    }
+
+    #[test]
+    fn sync_regression_remote_delete_or_disable_keeps_personal_off() {
+        for role in ["admin", "member"] {
+            // A dashboard disable is absent from the runtime view, just like deletion.
+            // Also accept a full management payload without importing a disabled row.
+            let mut disabled = config("first");
+            disabled["servers"][1]["disabled"] = json!(true);
+            for removed in [json!({"servers":[]}), disabled] {
+                let mut reg = bound_personal_registry();
+                reg.team.as_mut().unwrap().role = role.into();
+                let mut other = reg.profiles[0].clone();
+                other.id = "other".into();
+                other.enabled_server_ids.push("remote".into());
+                reg.profiles.push(other);
+                stage_team_config(&mut reg, "review-team", &removed, 2, &[]).unwrap();
+                assert!(!reg.server_enabled("remote"), "role={role}");
+                assert!(reg
+                    .profiles
+                    .iter()
+                    .all(|p| !p.enabled_server_ids.contains(&"remote".into())));
+                assert!(reg
+                    .servers
+                    .iter()
+                    .all(|s| saved_team_original_id(s) != Some("remote")));
+                assert_eq!(
+                    reg.servers
+                        .iter()
+                        .find(|s| s.id == "remote")
+                        .unwrap()
+                        .url
+                        .as_deref(),
+                    Some("https://1.2.3.4/mcp")
+                );
+                let personal = reg.servers.iter().find(|s| s.id == "remote").unwrap();
+                assert_eq!(
+                    personal_share_hint(&reg, personal),
+                    Some("Removed or disabled by the team. Your personal server stays off.")
+                );
+                // The off state and its explanation survive a registry round trip.
+                reg = serde_json::from_value(json!(reg)).unwrap();
+                stage_team_config(&mut reg, "review-team", &removed, 3, &[]).unwrap();
+                // Re-enable from the dashboard needs fresh review, with neither route running.
+                stage_team_config(&mut reg, "review-team", &config("first"), 4, &[]).unwrap();
+                let id = remote_id(&reg);
+                assert!(server_change_held(&reg, &id));
+                assert!(!reg.server_enabled(&id));
+                assert!(!reg.server_enabled("remote"));
+                decide(&mut reg, "server:remote", true);
+                assert!(reg.server_enabled(&id));
+                assert!(!reg.server_enabled("remote"));
+                // An old binding must not resurrect the revoked original when leaving later.
+                remove_team(&mut reg, "review-team");
+                assert!(!reg.server_enabled("remote"));
+            }
+        }
+    }
+
+    #[test]
+    fn sync_regression_disconnect_restores_bound_personal_route() {
+        let mut reg = bound_personal_registry();
+        remove_team(&mut reg, "review-team");
+        assert!(reg.server_enabled("remote"));
+        assert!(reg.is_enabled("default", "remote"));
+    }
+
+    #[test]
+    fn sync_regression_member_cannot_publish_management_config() {
+        // This helper holds the data-dir test lock and installs DataDirOverride.
+        crate::secrets::tests::with_isolated_vault(|| {
+            crate::registry::save(&registry()).unwrap();
+            assert_eq!(
+                preview_push_selected(&["remote".into()]).unwrap_err(),
+                "only a team admin can share servers"
+            );
+            assert_eq!(
+                push_selected(&["remote".into()], 1, "unused").unwrap_err(),
+                "only a team admin can share servers"
+            );
+            assert_eq!(
+                preview_push_current().unwrap_err(),
+                "only a team admin can push the shared config"
+            );
+            assert_eq!(
+                push_current(1, "unused").unwrap_err(),
+                "only a team admin can push the shared config"
+            );
+        });
+    }
     fn registry() -> Registry {
         let mut reg = Registry::default();
         reg.team = Some(serde_json::from_value(json!({"teamId":"review-team", "serverUrl":"https://teams.toolport.app", "role":"member"})).unwrap());
@@ -8511,7 +8752,7 @@ mod member_review_tests {
                 .servers
                 .iter()
                 .all(|s| s.source.as_deref() != Some("team:review-team")));
-            assert!(reg.server_enabled("remote") && reg.is_enabled("default", "remote"));
+            assert!(!reg.server_enabled("remote") && !reg.is_enabled("default", "remote"));
             assert_eq!(
                 reg.servers.iter().find(|s| s.id == "remote").unwrap().url,
                 personal.url

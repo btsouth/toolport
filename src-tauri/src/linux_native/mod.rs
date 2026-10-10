@@ -6867,6 +6867,17 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
         .css_classes(["toolport-muted"])
         .build();
     text.append(&health);
+    if server.team_route_removed {
+        text.append(
+            &gtk::Label::builder()
+                .label("Removed or disabled by the team. Your personal server stays off.")
+                .halign(gtk::Align::Start)
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["toolport-muted"])
+                .build(),
+        );
+    }
     card.append(&text);
 
     let authenticate = gtk::Button::with_label("Sign in");
@@ -10210,6 +10221,7 @@ mod tests {
             client_credentials: None,
             enabled: true,
             requires_review: false,
+            team_route_removed: false,
             probe_fingerprint: 0,
         }
     }

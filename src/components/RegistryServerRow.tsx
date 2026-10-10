@@ -244,6 +244,12 @@ export function RegistryServerRow({
         </span>
       </div>
 
+      {!enabled && server.teamRouteRemoved && (
+        <p className="px-3.5 pb-2 pl-12 text-xs text-muted-foreground">
+          Removed or disabled by the team. Your personal server stays off.
+        </p>
+      )}
+
       {expanded && (
         <div className="flex flex-col gap-2.5 px-3.5 pt-0.5 pb-3 pl-12">
           <div
