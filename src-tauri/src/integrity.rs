@@ -3850,9 +3850,79 @@ pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
         .collect())
 }
 
+#[derive(PartialEq)]
+struct ReviewStamp {
+    dir: PathBuf,
+    files: BTreeMap<PathBuf, (SystemTime, u64)>,
+}
+
+struct ReviewCache {
+    stamp: ReviewStamp,
+    limit: usize,
+    events: Vec<Value>,
+}
+
+static REVIEW_CACHE: Mutex<Option<ReviewCache>> = Mutex::new(None);
+
+/// Metadata only: do not reload the registry or parse every profile store on an
+/// unchanged Activity tick. Include pins because missing quarantine is fail closed
+/// for established profiles, plus the scope index and registry for store discovery.
+fn review_stamp() -> Option<ReviewStamp> {
+    let dir = crate::registry::conduit_dir()?;
+    let mut files = BTreeMap::new();
+    for entry in std::fs::read_dir(&dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        if name.ends_with(".lock")
+            || !(name == "security.jsonl"
+                || name.starts_with("registry.")
+                || name.starts_with("quarantine")
+                || name.starts_with("tool-pins")
+                || name.starts_with("root-integrity-scopes"))
+        {
+            continue;
+        }
+        let metadata = entry.metadata().ok()?;
+        files.insert(entry.path(), (metadata.modified().ok()?, metadata.len()));
+    }
+    Some(ReviewStamp { dir, files })
+}
+
 /// Attach current blocking state to retained findings. A damaged quarantine store is
 /// unknown, never a false "not blocked". Result blocks describe a past intercepted result.
 pub fn review_events(limit: usize) -> std::io::Result<Vec<Value>> {
+    review_events_cached(limit, || review_events_uncached(limit))
+}
+
+fn review_events_cached(
+    limit: usize,
+    read: impl FnOnce() -> std::io::Result<Vec<Value>>,
+) -> std::io::Result<Vec<Value>> {
+    let stamp = review_stamp();
+    let mut cache = REVIEW_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let (Some(stamp), Some(cached)) = (&stamp, &*cache) {
+        if *stamp == cached.stamp && limit == cached.limit {
+            return Ok(cached.events.clone());
+        }
+    }
+    *cache = None;
+    let events = read()?;
+    // A migration or concurrent writer can change the stores during the read. Do
+    // not freeze that mixed snapshot into the next refresh's cache.
+    if let Some(stamp) = stamp.filter(|stamp| review_stamp().as_ref() == Some(stamp)) {
+        *cache = Some(ReviewCache {
+            stamp,
+            limit,
+            events: events.clone(),
+        });
+    }
+    Ok(events)
+}
+
+fn review_events_uncached(limit: usize) -> std::io::Result<Vec<Value>> {
     let mut events = read_recent(limit.min(KEEP_LINES))?;
     let quarantines = all_quarantined();
     for event in &mut events {
@@ -4464,6 +4534,52 @@ mod tests {
         assert_eq!(review_events(2000).unwrap()[0]["blocked"], true);
         std::fs::write(quarantine_path(None).unwrap(), "{broken").unwrap();
         assert!(review_events(2000).unwrap()[0]["blocked"].is_null());
+    }
+
+    #[test]
+    fn review_cache_skips_unchanged_reads_and_invalidates_all_inputs() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data = TestDataDir::new("review-cache");
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok(vec![json!({"ts":reads.get()})])
+        };
+        assert_eq!(review_events_cached(2000, read).unwrap()[0]["ts"], 1);
+        assert_eq!(review_events_cached(2000, read).unwrap()[0]["ts"], 1);
+        assert_eq!(reads.get(), 1);
+        for name in [
+            "security.jsonl",
+            "quarantine.json",
+            "tool-pins-v2-profile.json",
+            "registry.json",
+            "root-integrity-scopes.json",
+        ] {
+            let path = data.path.join(name);
+            std::fs::write(&path, "one").unwrap();
+            review_events_cached(2000, read).unwrap();
+            let after_create = reads.get();
+            review_events_cached(2000, read).unwrap();
+            assert_eq!(reads.get(), after_create);
+            // Equal-length rewrite must invalidate by mtime, not just size.
+            std::fs::write(&path, "two").unwrap();
+            let stamp = std::fs::File::options().write(true).open(&path).unwrap();
+            stamp
+                .set_modified(
+                    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(after_create as u64),
+                )
+                .unwrap();
+            review_events_cached(2000, read).unwrap();
+            assert_eq!(reads.get(), after_create + 1);
+            std::fs::remove_file(path).unwrap();
+            review_events_cached(2000, read).unwrap();
+            assert_eq!(reads.get(), after_create + 2);
+        }
+        review_events_cached(25, read).unwrap();
+        let count = reads.get();
+        assert!(review_events_cached(26, || Err(std::io::Error::other("unreadable"))).is_err());
+        review_events_cached(25, read).unwrap();
+        assert_eq!(reads.get(), count + 1, "errors discard cached success");
     }
 
     #[test]
