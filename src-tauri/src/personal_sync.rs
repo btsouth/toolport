@@ -932,6 +932,7 @@ pub fn resolve_conflict(id: &str, expected: &Value, keep_mine: bool) -> Result<R
                 .ok_or("The conflict is no longer pending")?;
             if keep_mine {
                 m.before = (!expected.is_null()).then(|| expected.clone());
+                m.initial_conflict = false;
                 m.at = 0;
             } else {
                 if let Some(m) = st.pending.remove(id) {
@@ -1505,13 +1506,25 @@ mod tests {
         let mut r = machine();
         let remote = http("a");
         let mut st = SyncState::default();
-        st.pending.insert("a".into(), Mutation::default());
+        st.pending.insert(
+            "a".into(),
+            Mutation {
+                initial_conflict: true,
+                after: Some(http("mine")),
+                ..Mutation::default()
+            },
+        );
         st.conflicts.insert("a".into(), remote.clone());
         save(&mut r, &st).unwrap();
         crate::registry::save(&r).unwrap();
         assert!(resolve_conflict("a", &http("b"), true).is_err());
         let r = resolve_conflict("a", &remote, true).unwrap();
-        assert_eq!(state(&r).unwrap().pending["a"].before, Some(remote));
+        let pending = state(&r).unwrap().pending;
+        assert_eq!(pending["a"].before, Some(remote.clone()));
+        assert!(!pending["a"].initial_conflict);
+        let (merged, conflicts) = merge(&config(vec![remote]), &pending).unwrap();
+        assert!(conflicts.is_empty());
+        assert_eq!(merged["servers"][0], http("mine"));
     }
     #[test]
     fn local_journal_and_ack_do_not_drop_newer_edits() {
