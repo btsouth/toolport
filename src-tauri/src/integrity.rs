@@ -816,7 +816,8 @@ fn check_inner_with(
             // Freeze instead of treating a lost baseline as first run. The tamper event
             // drives mandatory quarantine of the live catalog; re-approving a captured
             // tool establishes its pin before the router exposes it again.
-            let event = pins_tamper_event();
+            let mut event = pins_tamper_event();
+            event["profile"] = json!(profile.unwrap_or(""));
             record_event(&event);
             return Ok(vec![event]);
         }
@@ -981,7 +982,8 @@ fn check_inner_with(
     }
     // Record the detected drift even when the pin-store update fails. The gateway will
     // fail closed on that error, and the security log must still explain why it did so.
-    for e in &events {
+    for e in &mut events {
+        e["profile"] = json!(profile.unwrap_or(""));
         record_event(e);
     }
     if updated != persisted_pins {
@@ -3752,8 +3754,10 @@ fn recently_recorded(event: &Value, path: &Path) -> bool {
         if prev.get("type").and_then(Value::as_str) == Some(ty)
             && prev.get("server").and_then(Value::as_str) == server
             && prev.get("tool").and_then(Value::as_str) == tool
+            && prev["profile"].as_str().unwrap_or("") == event["profile"].as_str().unwrap_or("")
             && prev.get("change").and_then(Value::as_str) == change
             && prev.get("severity").and_then(Value::as_str) == severity
+            && prev["new_fp"] == event["new_fp"]
         {
             let prev_ts = prev.get("ts").and_then(Value::as_u64).unwrap_or(0);
             return now_ts.saturating_sub(prev_ts) <= DEDUP_WINDOW_MS;
@@ -3840,14 +3844,25 @@ pub fn review_events(limit: usize) -> std::io::Result<Vec<Value>> {
                 let profiles: Vec<&str> = records
                     .iter()
                     .filter(|record| {
-                        record["tool"].as_str().is_some() && record["tool"] == event["tool"]
+                        record["tool"].as_str().is_some()
+                            && record["tool"] == event["tool"]
+                            && record["profile"].as_str().unwrap_or("")
+                                == event["profile"].as_str().unwrap_or("")
+                            && event["new_fp"].as_str().is_some_and(|fp| {
+                                record["pending_pin"]["fp"]
+                                    .as_str()
+                                    .or_else(|| record["definition_fp"].as_str())
+                                    == Some(fp)
+                            })
                     })
                     .filter_map(|record| record["profile"].as_str())
                     .collect();
                 event["blocked"] = json!(
                     !profiles.is_empty()
                         || (event["type"] == "pins_load_failed"
-                            && records.iter().any(|record| record["change"] == "tamper"))
+                            && records.iter().any(|record| record["change"] == "tamper"
+                                && record["profile"].as_str().unwrap_or("")
+                                    == event["profile"].as_str().unwrap_or("")))
                 );
                 event["blocked_profiles"] = json!(profiles);
             }
@@ -3877,6 +3892,8 @@ fn attach_drift_poison_signatures(events: &mut [Value]) {
                     event["type"] == "tool_poison_flag"
                         && event["tool"] == tool["tool"]
                         && event["server"] == tool["server"]
+                        && event["profile"].as_str().unwrap_or("")
+                            == tool["profile"].as_str().unwrap_or("")
                         && event["ts"].as_u64().unwrap_or(0) >= start
                 })
                 .collect();
@@ -3900,6 +3917,7 @@ fn attach_drift_poison_signatures(events: &mut [Value]) {
 #[derive(Debug, PartialEq)]
 pub struct ToolChangeGroup {
     pub server: String,
+    pub profile: String,
     pub ts: u64,
     pub tools: Vec<Value>,
 }
@@ -3915,17 +3933,20 @@ pub fn group_tool_changes(events: &[Value]) -> Vec<ToolChangeGroup> {
     let mut groups: Vec<ToolChangeGroup> = Vec::new();
     for event in ordered {
         let server = event["server"].as_str().unwrap_or("Unknown server");
+        let profile = event["profile"].as_str().unwrap_or("");
         let ts = event["ts"].as_u64().unwrap_or(0);
-        if let Some(group) = groups
-            .iter_mut()
-            .find(|group| group.server == server && group.ts.saturating_sub(ts) <= 60_000)
-        {
+        if let Some(group) = groups.iter_mut().find(|group| {
+            group.server == server
+                && group.profile == profile
+                && group.ts.saturating_sub(ts) <= 60_000
+        }) {
             if !group.tools.iter().any(|tool| tool["tool"] == event["tool"]) {
                 group.tools.push(event.clone());
             }
         } else {
             groups.push(ToolChangeGroup {
                 server: server.to_string(),
+                profile: profile.to_string(),
                 ts,
                 tools: vec![event.clone()],
             });
@@ -4359,20 +4380,64 @@ mod tests {
         let _data_dir_lock = crate::registry::data_dir_test_lock();
         let _data = TestDataDir::new("review-blocking-status");
         record_event(
-            &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv", "change":"changed", "ts":1}),
+            &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv", "change":"changed", "new_fp":"v2:current", "ts":1}),
         );
         assert_eq!(review_events(2000).unwrap()[0]["blocked"], false);
         save_quarantine(
             None,
             &BTreeMap::from([(
                 "srv__update".to_string(),
-                json!({"tool":"srv__update", "change":"changed"}),
+                json!({"tool":"srv__update", "change":"changed", "definition_fp":"v2:current"}),
             )]),
         )
         .unwrap();
         assert_eq!(review_events(2000).unwrap()[0]["blocked"], true);
         std::fs::write(quarantine_path(None).unwrap(), "{broken").unwrap();
         assert!(review_events(2000).unwrap()[0]["blocked"].is_null());
+    }
+
+    #[test]
+    fn review_matches_the_profile_and_displayed_fingerprint() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data = TestDataDir::new("review-identity");
+        let current =
+            json!({"tool":"srv__update", "change":"changed", "pending_pin":{"fp":"v2:new"}});
+        save_quarantine(
+            None,
+            &BTreeMap::from([("srv__update".into(), current.clone())]),
+        )
+        .unwrap();
+        record_event(
+            &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv", "new_fp":"v2:old", "ts":1}),
+        );
+        record_event(
+            &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv", "profile":"other", "new_fp":"v2:new", "ts":100_000}),
+        );
+        record_event(
+            &json!({"type":"tool_drift", "tool":"srv__update", "server":"srv", "profile":"", "new_fp":"v2:new", "ts":200_000}),
+        );
+        let events = review_events(2000).unwrap();
+        assert_eq!(events[0]["blocked_profiles"], json!([""]));
+        assert_eq!(events[1]["blocked"], false);
+        assert_eq!(events[2]["blocked"], false);
+        let mut durable = current;
+        durable.as_object_mut().unwrap().remove("pending_pin");
+        durable["definition_fp"] = json!("v2:new");
+        save_quarantine(None, &BTreeMap::from([("srv__update".into(), durable)])).unwrap();
+        assert_eq!(review_events(2000).unwrap()[0]["blocked"], true);
+        let tool = json!({"name":"srv__read", "description":"Before"});
+        check(Some("profile-id"), &vec![tool.clone()]).unwrap();
+        let mut changed = tool;
+        changed["description"] = json!("After");
+        assert_eq!(
+            check(Some("profile-id"), &vec![changed]).unwrap()[0]["profile"],
+            "profile-id"
+        );
+        let groups = group_tool_changes(&[
+            json!({"type":"tool_drift", "server":"srv", "tool":"srv__update", "profile":"a", "ts":1}),
+            json!({"type":"tool_drift", "server":"srv", "tool":"srv__update", "profile":"b", "ts":1}),
+        ]);
+        assert_eq!(groups.len(), 2);
     }
 
     #[test]
@@ -4383,6 +4448,7 @@ mod tests {
             json!({"type":"tool_drift", "server":"srv", "tool":"srv__read", "ts":102}),
             json!({"type":"tool_poison_flag", "server":"srv", "tool":"srv__update", "ts":101, "signatures":["instruction_override"]}),
             json!({"type":"tool_poison_flag", "server":"srv", "tool":"srv__read", "ts":99, "signatures":["old_signal"]}),
+            json!({"type":"tool_poison_flag", "server":"srv", "tool":"srv__read", "profile":"other", "ts":200, "signatures":["other_profile"]}),
         ];
         attach_drift_poison_signatures(&mut events);
         assert_eq!(events[0]["signatures"], json!(["instruction_override"]));

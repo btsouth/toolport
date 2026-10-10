@@ -5,15 +5,24 @@ import type { Registry } from "@/lib/types";
 import { toastError } from "@/lib/toast";
 
 export function groupToolChanges(events: SecurityEvent[]) {
-  const groups: { server: string; ts: number; tools: SecurityEvent[] }[] = [];
+  const groups: {
+    server: string;
+    profile: string;
+    ts: number;
+    tools: SecurityEvent[];
+  }[] = [];
   for (const event of [...events].sort((a, b) => b.ts - a.ts)) {
     const server = event.server || "Unknown server";
+    const profile = event.profile || "";
     const group = groups.find(
-      (group) => group.server === server && group.ts - event.ts <= 60_000,
+      (group) =>
+        group.server === server &&
+        group.profile === profile &&
+        group.ts - event.ts <= 60_000,
     );
     if (group) {
       if (!group.tools.some((tool) => tool.tool === event.tool)) group.tools.push(event);
-    } else groups.push({ server, ts: event.ts, tools: [event] });
+    } else groups.push({ server, profile, ts: event.ts, tools: [event] });
   }
   return groups;
 }
@@ -91,7 +100,7 @@ export function ToolChanges({
             group.tools.every(
               (tool) => !tool.blocked || (tool.blocked_profiles?.length && tool.new_fp),
             );
-          const key = `${group.server}:${group.ts}`;
+          const key = `${group.profile}:${group.server}:${group.ts}`;
           const open = expanded.has(key);
           return (
             <div

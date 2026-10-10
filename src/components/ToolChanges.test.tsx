@@ -24,6 +24,15 @@ describe("server tool changes", () => {
       groupToolChanges([...events, { ...events[0], ts: events[0].ts + 120_000 }]),
     ).toHaveLength(3);
   });
+  it("keeps profiles separate for the same server and tool", () => {
+    const event = securityFixture()[0];
+    expect(
+      groupToolChanges([
+        { ...event, profile: "a" },
+        { ...event, profile: "b" },
+      ]),
+    ).toHaveLength(2);
+  });
   it("shows plain summaries and parameter deltas with neutral styling when unblocked", () => {
     render(
       <ToolChanges events={securityFixture()} registry={registry} onAccept={vi.fn()} />,

@@ -56,6 +56,8 @@ export interface SecurityEvent {
   type: string;
   /** Absent for events not tied to a specific tool (e.g. pins_load_failed). */
   server?: string;
+  /** Stable profile id; empty for the HTTP union. Older events may omit it. */
+  profile?: string;
   tool?: string;
   change: string;
   changed_fields?: string[];

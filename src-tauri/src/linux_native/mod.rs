@@ -4199,7 +4199,10 @@ fn tool_change_group_card(
     }
     let reveal = gtk::Revealer::new();
     reveal.set_child(Some(&tools));
-    let expansion_key = format!("security:server:{}:{}", group.server, group.ts);
+    let expansion_key = format!(
+        "security:server:{}:{}:{}",
+        group.profile, group.server, group.ts
+    );
     let expanded_rows = page.expanded_activity_rows.clone();
     reveal.set_reveal_child(expanded_rows.borrow().contains(&expansion_key));
     arrow.set_icon_name(Some(if reveal.reveals_child() {
