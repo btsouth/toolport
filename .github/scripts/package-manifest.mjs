@@ -38,6 +38,15 @@ const mac = new Set([
   "Contents/PkgInfo",
   "Contents/MacOS/conduit",
   "Contents/MacOS/toolport-gateway",
+  "Contents/MacOS/conduit-gateway",
+  "Contents/embedded.provisionprofile",
+  ...[
+    "Info.plist",
+    "PkgInfo",
+    "MacOS/toolport-gateway",
+    "embedded.provisionprofile",
+    "_CodeSignature/CodeResources",
+  ].map((path) => `Contents/Helpers/ToolportGateway.app/Contents/${path}`),
   "Contents/Resources/icon.icns",
   "Contents/_CodeSignature/CodeResources",
 ]);

@@ -12,6 +12,7 @@ const allowed = new Set([
   "Toolport",
   "toolport-gtk",
   "toolport-gateway",
+  "conduit-gateway",
   "conduit.exe",
   "toolport-gateway.exe",
   "uninstall.exe",

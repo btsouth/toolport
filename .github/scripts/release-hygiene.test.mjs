@@ -222,3 +222,27 @@ test("MSI validates full installation paths before normalizing its app directory
     /Unexpected/,
   );
 });
+
+test("macOS manifest includes the signed gateway helper and provisioning profiles", async () => {
+  const { assertManifest } = await import("./package-manifest.mjs");
+  const files = [
+    "Toolport.app/Contents/MacOS/conduit",
+    "Toolport.app/Contents/MacOS/toolport-gateway",
+    "Toolport.app/Contents/MacOS/conduit-gateway",
+    "Toolport.app/Contents/embedded.provisionprofile",
+    "Toolport.app/Contents/Helpers/ToolportGateway.app/Contents/MacOS/toolport-gateway",
+    "Toolport.app/Contents/Helpers/ToolportGateway.app/Contents/embedded.provisionprofile",
+  ];
+  assertManifest(files, "mac");
+  assert.throws(
+    () =>
+      assertManifest(
+        [
+          ...files,
+          "Toolport.app/Contents/Helpers/Unknown.app/Contents/MacOS/toolport-gateway",
+        ],
+        "mac",
+      ),
+    /Unexpected/,
+  );
+});
