@@ -1688,6 +1688,7 @@ struct RestoredTool {
     exposed: String,
     server: String,
     original: String,
+    policy_name: Option<String>,
     source_revision: u64,
     schema_arguments: Option<Arc<crate::schema_compat::ArgumentMap>>,
 }
@@ -1923,27 +1924,18 @@ impl Router {
                 status.describe()
             ),
             None => {
-                let mut matches: Vec<_> = self
-                    .routes
-                    .iter()
-                    .filter(|(name, (server, _))| {
-                        visible(server)
-                            && self.tools.iter().any(|tool| {
-                                tool["name"].as_str() == Some(name.as_str())
-                                    && match tool.pointer("/_meta/ui/visibility") {
-                                        None => true,
-                                        Some(Value::Array(audiences)) => {
-                                            audiences.iter().any(|a| a == "model")
-                                        }
-                                        Some(_) => false,
-                                    }
-                            })
-                    })
-                    .filter_map(|(name, _)| {
-                        let distance = alias_distance(exposed_name, name);
-                        (distance <= 3).then_some((distance, name))
-                    })
-                    .collect();
+                let mut matches: Vec<_> = self.tools.iter().filter_map(|tool| {
+                    let name = tool["name"].as_str()?;
+                    let (server, _) = self.route_of(name)?;
+                    let model_visible = match tool.pointer("/_meta/ui/visibility") {
+                        None => true,
+                        Some(Value::Array(audiences)) => audiences.iter().any(|a| a == "model"),
+                        Some(_) => false,
+                    };
+                    if !visible(server) || !model_visible { return None; }
+                    let distance = alias_distance(exposed_name, name);
+                    (distance <= 3).then_some((distance, name))
+                }).collect();
                 matches.sort();
                 matches.truncate(3);
                 let hint = if matches.is_empty() {
@@ -1953,7 +1945,7 @@ impl Router {
                         "\nClose matches: {}",
                         matches
                             .iter()
-                            .map(|(_, n)| n.as_str())
+                            .map(|(_, n)| *n)
                             .collect::<Vec<_>>()
                             .join(", ")
                     )
@@ -2049,7 +2041,7 @@ impl Router {
                     .get(exposed)
                     .filter(|reason| reason.as_str() == "ambiguous persisted tool policy binding")
                 {
-                    return Err(format!("tool '{exposed}' is {reason}"));
+                    return Err(blocked_tool_message(exposed, reason));
                 }
                 // Only the destructive switch reads the definition; skip the scan
                 // on the common path.
@@ -2077,7 +2069,7 @@ impl Router {
                             ToolPolicyMetadata::from(definition),
                         )
                     }) {
-                    Some(reason) => Err(format!("tool '{exposed}' is {reason}")),
+                    Some(reason) => Err(blocked_tool_message(exposed, reason)),
                     None => Ok(()),
                 }
             }
@@ -3362,6 +3354,7 @@ impl Router {
                     exposed: exposed.to_string(),
                     server: server_id.to_string(),
                     original: original.to_string(),
+                    policy_name: previous.policy_names.get(exposed).cloned(),
                     source_revision: self.tool_revision(server_id).unwrap_or(0),
                     schema_arguments: previous.schema_arguments.get(exposed).cloned(),
                 });
@@ -3413,6 +3406,7 @@ impl Router {
                         exposed: exposed.to_string(),
                         server: server_id.to_string(),
                         original: original.to_string(),
+                        policy_name: unrestricted.policy_names.get(exposed).cloned(),
                         source_revision: self.tool_revision(server_id).unwrap_or(0),
                         schema_arguments: unrestricted.schema_arguments.get(exposed).cloned(),
                     });
@@ -3436,8 +3430,8 @@ impl Router {
             // quarantine must still block it (review on #717).
             self.tool_owners
                 .insert(candidate.exposed.clone(), candidate.server.clone());
-            if let Some(legacy) = self.legacy_names.get(&candidate.exposed).cloned() {
-                self.policy_names.insert(candidate.exposed.clone(), legacy);
+            if let Some(legacy) = &candidate.policy_name {
+                self.legacy_names.insert(candidate.exposed.clone(), legacy.clone());
             }
             self.bind_policy_name(&candidate.exposed, &candidate.server, &candidate.original);
             if self.blocked.contains_key(&candidate.exposed) {
@@ -6657,6 +6651,22 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn bounded_aliases_keep_short_names_and_resolve_hash_collisions() {
+        let long = format!("read_{}", "item_".repeat(20));
+        let collision = bounded_alias(&format!("s__{long}"), &("s", long.as_str()));
+        let short = collision.strip_prefix("s__").unwrap();
+        let tools = vec![json!({"name":long}), json!({"name":short}),
+            json!({"name":format!("{}-x", "a".repeat(59))}),
+            json!({"name":format!("{}_x", "a".repeat(59))})];
+        let aliases = Router::server_tool_aliases("s", &tools, HashMap::new());
+        assert_eq!(aliases[short], collision);
+        assert_ne!(aliases[&long], collision);
+        assert!(aliases.values().all(|name| name.len() <= 64));
+        let mut reversed = tools.clone(); reversed.reverse();
+        assert_eq!(aliases, Router::server_tool_aliases("s", &reversed, HashMap::new()));
+    }
+
+    #[test]
     fn aggregates_and_namespaces_tools() {
         let mut router = Router::new();
         router.add(mock_server("github"));
@@ -7971,9 +7981,7 @@ for line in sys.stdin:
 
     #[test]
     fn requarantine_restores_a_re_approved_tool_without_a_rebuild() {
-        let _data = crate::registry::DataDirTestEnv::new(
-            "f3-requarantine-restores-a-re-approved-tool-without-a-rebuild",
-        );
+        let _data = crate::registry::DataDirTestEnv::new("f3-requarantine-restores-a-re-approved-tool-without-a-rebuild");
         // Regression for SOU-292: re-approving a quarantined tool left it blocked in the
         // running gateway. The refresh path could ADD to the quarantine set but never
         // REMOVE from it, and because `route_call` reads the materialized `blocked` map,

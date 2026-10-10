@@ -4439,7 +4439,7 @@ fn protocol_lane_long_aliases_route_and_survive_reorder_restart_and_old_policy()
             registry::profile_store_key(profile.unwrap())
         )),
     ] {
-        std::fs::write(store, json!({(legacy):{"server":"files","tool":long,"change":"changed"}, (override_name):{"server":"files","tool":"renamed","change":"changed"}}).to_string()).unwrap();
+        std::fs::write(store, json!({(legacy.clone()):{"server":"files","tool":long,"change":"changed"}, (override_name.clone()):{"server":"files","tool":"renamed","change":"changed"}}).to_string()).unwrap();
     }
     let mut client = spawn_adapter(&dir, &AdapterOptions::default());
     client.initialize("protocol-long-quarantine");

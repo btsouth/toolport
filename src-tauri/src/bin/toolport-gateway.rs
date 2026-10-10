@@ -15486,17 +15486,9 @@ fn process_request_wire(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let reg = state
-            .registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        base.any_missing_catalog(|id| {
-            allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
-        }) || state
-            .cached_tools
-            .lock()
-            .map(|c| !has_scoped_tools(&c.tools, allowed, &base, &reg))
-            .unwrap_or(true)
+        let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        base.any_missing_catalog(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
+            || state.cached_tools.lock().map(|c| !has_scoped_tools(&c.tools, allowed, &base, &reg)).unwrap_or(true)
     };
     let started = Instant::now();
     let mut response = process_request_wire_inner(
@@ -15517,13 +15509,7 @@ fn process_request_wire(
             started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             cold,
             client,
-            response.as_ref().is_some_and(|r| {
-                r.envelope.get("error").is_none()
-                    && r.envelope
-                        .pointer("/result/isError")
-                        .and_then(Value::as_bool)
-                        != Some(true)
-            }),
+            response.as_ref().is_some_and(|r| r.envelope.get("error").is_none() && r.envelope.pointer("/result/isError").and_then(Value::as_bool) != Some(true)),
         );
     }
     // One-way HTTP messages finish here rather than at a JSON-RPC reply write.
