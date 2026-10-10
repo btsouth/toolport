@@ -453,6 +453,12 @@ dropdown popover row:selected {{
   border: 1px solid alpha(@toolport_fg, 0.10);
 }}
 
+/* Holds its place so rows and open menus do not jump, but shows nothing. */
+.toolport-feedback.idle {{
+  background-color: transparent;
+  border-color: transparent;
+}}
+
 .toolport-feedback.success {{
   color: @toolport_success;
   border-color: alpha(@toolport_success, 0.22);

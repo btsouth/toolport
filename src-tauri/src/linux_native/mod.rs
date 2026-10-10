@@ -1969,6 +1969,7 @@ impl ServerPage {
 
     fn show_feedback(&self, message: &str, error: bool) {
         self.cancel_feedback_timer();
+        self.feedback.remove_css_class("idle");
         self.feedback.set_label(message);
         if error {
             self.feedback.add_css_class("error");
@@ -1988,6 +1989,9 @@ impl ServerPage {
             gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(4), move || {
                 feedback.set_visible(true);
                 feedback.set_label("");
+                feedback.remove_css_class("success");
+                feedback.remove_css_class("error");
+                feedback.add_css_class("idle");
                 feedback_timer.borrow_mut().take();
             });
         *self.feedback_timer.borrow_mut() = Some(timer);
@@ -1997,6 +2001,9 @@ impl ServerPage {
         self.cancel_feedback_timer();
         self.feedback.set_visible(true);
         self.feedback.set_label("");
+        self.feedback.remove_css_class("success");
+        self.feedback.remove_css_class("error");
+        self.feedback.add_css_class("idle");
     }
 
     fn cancel_feedback_timer(&self) {
@@ -6045,7 +6052,7 @@ fn build_content(
         .xalign(0.0)
         .wrap(true)
         .height_request(48)
-        .css_classes(["toolport-feedback"])
+        .css_classes(["toolport-feedback", "idle"])
         .build();
     page.append(&feedback);
 
