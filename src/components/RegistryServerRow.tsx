@@ -20,7 +20,7 @@ import { toast } from "sonner";
 import type { ProbeResult, Registry, ServerEntry } from "@/lib/types";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { SecretsDialog } from "@/components/SecretsDialog";
+import { LazySecretsDialog as SecretsDialog } from "@/components/LazySecretsDialog";
 import { ServerDialog } from "@/components/ServerDialog";
 import { LaunchSetupDialog } from "@/components/LaunchSetupDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";

@@ -22,7 +22,7 @@ import {
   setSecret,
   setSecretReference,
 } from "@/lib/api";
-import { inputDisplayName } from "@/lib/executionReview";
+import { inputDisplayName } from "@/lib/inputDisplayName";
 import type { AuthInfo, Registry, ServerEntry } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -47,7 +47,7 @@ function secretErrorMessage(e: unknown): string {
   return msg;
 }
 
-interface Props {
+export interface SecretsDialogProps {
   server: ServerEntry;
   onSaved: (registry: Registry) => void;
   /** Custom trigger (defaults to the key icon). Use for a prominent "Authenticate" button. */
@@ -91,7 +91,12 @@ function vendorFromKey(key: string): string {
   return head.charAt(0).toUpperCase() + head.slice(1).toLowerCase();
 }
 
-export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
+export function SecretsDialog({
+  server,
+  onSaved,
+  trigger,
+  onChanged,
+}: SecretsDialogProps) {
   const [open, setOpen] = useState(false);
   const [vaulted, setVaulted] = useState<Record<string, boolean>>({});
   // Whether the `secretStatus` probe succeeded. Failure must stay unknown
