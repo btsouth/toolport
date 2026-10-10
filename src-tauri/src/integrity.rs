@@ -1092,8 +1092,10 @@ fn accept_quarantined_pins_with(
 
         // Pins are durable now. Clear the recovery markers second; if this write fails or the
         // process exits, the markers remain and the next retry repeats the idempotent pin merge.
-        for (name, _) in &pending {
+        for (name, pin) in &pending {
             if let Some(record) = quarantine.get_mut(name).and_then(Value::as_object_mut) {
+                // Keep the reviewed identity after clearing the durable recovery payload.
+                record.insert("definition_fp".into(), json!(pin.fp));
                 record.remove("pending_pin");
             }
         }
@@ -1987,7 +1989,10 @@ pub fn release_definition(
     with_store_lock(&path, || {
         let quarantine = load_quarantine(profile)?;
         if let Some(record) = quarantine.get(tool) {
-            if record["pending_pin"]["fp"].as_str() != Some(expected_fp) {
+            let captured = record["pending_pin"]["fp"]
+                .as_str()
+                .or_else(|| record["definition_fp"].as_str());
+            if captured != Some(expected_fp) {
                 return Err(
                     "The tool changed again. Refresh and review its latest definition.".to_string(),
                 );
@@ -4157,6 +4162,10 @@ mod tests {
             load_quarantine(None).unwrap()["srv__update"]["pending_pin"]["fp"],
             fingerprint(&raw)
         );
+        accept_quarantined_pins(None).unwrap();
+        let durable = load_quarantine(None).unwrap();
+        assert!(durable["srv__update"].get("pending_pin").is_none());
+        assert_eq!(durable["srv__update"]["definition_fp"], fingerprint(&raw));
         assert!(release_definition(None, "srv__update", &fingerprint(&raw)).unwrap());
         assert_eq!(
             baselines(None)["srv__update"].fingerprint,
@@ -4184,6 +4193,9 @@ mod tests {
                 .unwrap_err()
                 .contains("changed again")
         );
+        assert!(quarantined(None).unwrap().contains("srv__update"));
+        accept_quarantined_pins(None).unwrap();
+        assert!(release_definition(None, "srv__update", "v2:older-definition").is_err());
         assert!(quarantined(None).unwrap().contains("srv__update"));
         assert!(release_definition(None, "srv__update", &fingerprint(&tool)).unwrap());
         assert!(!quarantined(None).unwrap().contains("srv__update"));
