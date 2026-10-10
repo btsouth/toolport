@@ -1,9 +1,8 @@
 //! Result-shaping: keep oversized tool results from blowing the model's context
-//! WITHOUT losing data. When a downstream tool returns a result larger than the
-//! byte budget, the full body is cached in-process and the model gets a truncated
-//! head plus a Toolport-stamped marker carrying a cursor. `toolport_fetch_result`
-//! pages through the cached full result. Lossless: nothing is dropped, only
-//! deferred while the entry fits the retained-memory cap and has not expired.
+//! within a byte budget. Retained bodies can be paged with `toolport_fetch_result`
+//! until expiry or eviction. Very large entries retain only text when that fits;
+//! structured projections are then unavailable. If even text exceeds the cache
+//! cap, the truncated reply asks for a narrower call and offers no cursor.
 //!
 //! This is the "other half" of the token story: lazy discovery trims tool
 //! DEFINITION bloat; this trims tool RESULT bloat (a 10k-row response that would
@@ -31,8 +30,8 @@ const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_CACHE_ENTRIES: usize = 64;
 
 /// Cap on estimated retained bytes, including parsed JSON allocations. Evict
-/// oldest until a new body fits. A single over-cap entry is not retained; its
-/// cursor uses the same unknown-or-expired response as an evicted entry.
+/// oldest until a new body fits. Over-cap entries fall back to text alone; if
+/// that still exceeds the cap, no cursor is offered.
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn resolve_budget(value: Option<&str>) -> (usize, Option<String>) {
@@ -62,6 +61,7 @@ struct Cached {
     server: Option<String>,
     body: String,
     structured: Option<Value>,
+    projections_unavailable: bool,
     /// Estimated retained allocations, computed once at insertion.
     size: usize,
     /// The client the result belongs to (a registered HTTP client's label), or None
@@ -167,7 +167,12 @@ fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) {
     }
 }
 
-fn retain_in(store: &mut SessionStore<Cached>, cursor: &str, entry: Cached) -> bool {
+fn retain_in(store: &mut SessionStore<Cached>, cursor: &str, mut entry: Cached) -> bool {
+    if entry.size > MAX_CACHE_BYTES && entry.structured.is_some() {
+        entry.structured = None;
+        entry.projections_unavailable = true;
+        entry.size = retained_size(&entry.body, None);
+    }
     if entry.size > MAX_CACHE_BYTES {
         return false;
     }
@@ -177,13 +182,14 @@ fn retain_in(store: &mut SessionStore<Cached>, cursor: &str, entry: Cached) -> b
     true
 }
 
-fn retain(cursor: &str, entry: Cached) {
+fn retain(cursor: &str, entry: Cached) -> bool {
     let size = entry.size;
     let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
-    retain_in(&mut store, cursor, entry);
+    let retained = retain_in(&mut store, cursor, entry);
     if size >= 1024 * 1024 {
         TRIM_PENDING.store(true, Ordering::Relaxed);
     }
+    retained
 }
 
 // Process conformance tests seed an already expired entry, then observe a tick
@@ -198,6 +204,7 @@ pub fn seed_cache_maintenance_probe() {
             server: None,
             body: "x".repeat(1024 * 1024),
             structured: None,
+            projections_unavailable: false,
             size: 1024 * 1024,
             owner: None,
         },
@@ -310,7 +317,7 @@ fn is_text_representable(result: &Value) -> bool {
 }
 
 /// If `result` serializes to more than `budget` bytes, cache its full body, replace
-/// it with a truncated head + a stamped cursor marker, and return `true` (shaped).
+/// it with a truncated head and retention notice, and return `true` (shaped).
 /// A `budget` of 0 disables shaping. The full body stays fetchable via
 /// [`fetch_result`] while retained within the memory cap and insertion TTL.
 pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> bool {
@@ -350,10 +357,8 @@ pub fn shape_result_preserving_prefix(
         return false;
     }
 
-    // Only shape what we can represent losslessly as a text head. If the result has
-    // non-text blocks, or its size is dominated by non-body envelope (the text
-    // projection captures under half the bytes), shaping would drop data and its
-    // "nothing was lost" claim would be false. Pass those through untouched.
+    // Only shape text-representable results. Pass through non-text blocks and
+    // results dominated by envelope fields that the text body cannot capture.
     let (body, source_bytes) = extract_body(result);
     if !is_text_representable(result) || source_bytes < size / 2 {
         return false;
@@ -403,13 +408,30 @@ pub fn shape_result_preserving_prefix(
     let cursor = next_cursor();
     let new_entry_size = retained_size(&body, structured.as_ref());
 
+    let body_bytes = body.len();
+    let retained = retain(
+        &cursor,
+        Cached {
+            server: result
+                .pointer("/_meta/app.toolport~1provenance/server")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            body,
+            structured,
+            projections_unavailable: false,
+            size: new_entry_size,
+            owner: owner.map(str::to_string),
+        },
+    );
+
     // Build the shaped result for a given head, then measure it. The marker's own
     // length varies with the head length it reports, and the preserved envelope is
     // whatever the server sent, so the only reliable way to honour the budget is
     // to measure the finished value rather than predict it.
     let build = |head: &str| -> Value {
         let head_chars = head.chars().count();
-        let marker = format!(
+        let marker = if retained {
+            format!(
             "\n\n[Toolport shaped this result: ~{} KB exceeds {} KB budget. Showing first {} of {} \
              characters. Continue with toolport_fetch_result {{\"cursor\":\"{}\",\"offset\":{}}}. \
              If the cursor expired, re-run the original tool call.]",
@@ -419,9 +441,12 @@ pub fn shape_result_preserving_prefix(
             total,
             cursor,
             head_chars
-        );
+        )
+        } else {
+            not_retained_notice(body_bytes)
+        };
         // Shaping deliberately rewrites `content` and stashes `structuredContent`
-        // in the cache (both retrievable via the cursor). Every other top-level
+        // in the cache when admitted. Every other top-level
         // field belongs to the downstream server, not to us: `_meta`, and whatever
         // a future revision or extension adds. Carry them across so shaping stays a
         // truncation of the body rather than a rewrite of the envelope (SOU-444).
@@ -453,34 +478,21 @@ pub fn shape_result_preserving_prefix(
         head_byte_limit = head_byte_limit
             .saturating_sub(overage.max(1))
             .max(min_head_bytes);
-        head = head_within_bytes(&body, head_byte_limit).to_string();
+        head = head_within_bytes(&head, head_byte_limit).to_string();
         shaped = build(&head);
     }
 
     // An empty head that still overflows means the marker and envelope alone
     // exceed the budget, so no truncation can honour the contract. Returning
     // `true` there would be the same false claim the head floor used to make.
-    // Bail BEFORE caching, so a result we decline to shape leaves no orphaned
-    // cursor entry behind.
+    // Remove any admitted entry when we decline to shape.
     if serde_json::to_string(&shaped).map(|s| s.len()).unwrap_or(0) > budget {
+        cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&cursor);
         return false;
     }
-
-    // Admission affects retention only; the first reply and its marker stay the
-    // same even when the full result exceeds the cache's memory ceiling.
-    retain(
-        &cursor,
-        Cached {
-            server: result
-                .pointer("/_meta/app.toolport~1provenance/server")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            body,
-            structured,
-            size: new_entry_size,
-            owner: owner.map(str::to_string),
-        },
-    );
 
     *result = shaped;
     if size >= 1024 * 1024 {
@@ -489,24 +501,37 @@ pub fn shape_result_preserving_prefix(
     true
 }
 
-/// Stash a Toolport-authored payload and return a cursor readable through
+fn not_retained_notice(body_bytes: usize) -> String {
+    format!(
+        "\n\n[Toolport: full result ({:.1} MB) was too large to keep for paging. Re-run the tool with narrower arguments.]",
+        body_bytes as f64 / 1_000_000.0
+    )
+}
+
+/// Stash a Toolport-authored payload and return an admitted cursor readable through
 /// `toolport_fetch_result`, with the same owner scoping, TTL, and bounds as shaped
 /// results. This lets a small marker in a tool result point at bulkier material
-/// without inflating the result it rides on.
-pub fn stash_payload(body: String, structured: Option<Value>, owner: Option<&str>) -> String {
+/// without inflating the result it rides on. `None` means the caller must report
+/// that paging is unavailable instead of advertising a fetch marker.
+pub fn stash_payload(
+    body: String,
+    structured: Option<Value>,
+    owner: Option<&str>,
+) -> Option<String> {
     let cursor = next_cursor();
     let size = retained_size(&body, structured.as_ref());
-    retain(
+    let retained = retain(
         &cursor,
         Cached {
             server: None,
             body,
             structured,
+            projections_unavailable: false,
             size,
             owner: owner.map(str::to_string),
         },
     );
-    cursor
+    retained.then_some(cursor)
 }
 
 /// Return the next slice of a cached shaped result, by cursor + character offset.
@@ -543,7 +568,11 @@ pub fn fetch_result(
             Some(value) => value,
             None => {
                 return text_result(
-                    "[Toolport: this cached result has no structuredContent.]".to_string(),
+                    if c.projections_unavailable {
+                        "[Toolport: projections aren't available for this very large result. Page the text or narrow the call.]"
+                    } else {
+                        "[Toolport: this cached result has no structuredContent.]"
+                    }.to_string(),
                     true,
                 );
             }
@@ -659,7 +688,7 @@ mod tests {
             value_size(&result) <= 2048,
             "notice must fit within the original budget"
         );
-        let cursor = stash_payload("Toolport-owned data".into(), None, None);
+        let cursor = stash_payload("Toolport-owned data".into(), None, None).unwrap();
         let fetched = fetch_result(&cursor, 0, 100, None, None);
         assert!(fetched.get("_meta").is_none());
     }
@@ -1135,6 +1164,7 @@ mod tests {
             server: None,
             body: String::new(),
             structured: None,
+            projections_unavailable: false,
             size,
             owner: None,
         }
@@ -1201,19 +1231,12 @@ mod tests {
     }
 
     #[test]
-    fn over_cap_payload_cursor_uses_the_existing_rerun_error() {
-        // Reserved capacity exercises real admission without a huge text reply.
-        let cursor = stash_payload(String::with_capacity(MAX_CACHE_BYTES), None, None);
-        let reply = fetch_result(&cursor, 0, 1, None, None);
-        assert_eq!(reply["isError"], true);
-        assert!(reply["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("unknown or expired"));
+    fn over_cap_payload_reports_no_cursor() {
+        assert!(stash_payload(String::with_capacity(MAX_CACHE_BYTES), None, None).is_none());
     }
 
     #[test]
-    fn over_cap_shaping_keeps_the_first_response_contract() {
+    fn over_cap_shaping_reports_unavailable_paging_without_a_cursor() {
         let mut result = json!({
             "content": [{"type": "text", "text": "x".repeat(MAX_CACHE_BYTES)}],
             "isError": false,
@@ -1223,16 +1246,64 @@ mod tests {
         assert!(value_size(&result) <= 2048);
         assert_eq!(result["isError"], false);
         assert_eq!(result["_meta"]["fixture"], true);
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("xxx"));
-        let reply = fetch_result(&cursor_of(&result), 0, 1, None, None);
-        assert_eq!(reply["isError"], true);
-        assert!(reply["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("unknown or expired"));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("xxx"));
+        assert!(text.ends_with("[Toolport: full result (67.1 MB) was too large to keep for paging. Re-run the tool with narrower arguments.]"));
+        assert!(!text.contains("cursor"));
+        assert!(!text.contains("toolport_fetch_result"));
+        assert!(not_retained_notice(MAX_CACHE_BYTES).len() < 128);
+    }
+
+    #[test]
+    fn over_cap_tree_retains_text_pages_but_refuses_projections() {
+        let structured =
+            json!({"rows": (0..100_000).map(|i| json!({"id": i, "ok": true})).collect::<Vec<_>>()});
+        let text = structured.to_string();
+        assert!(retained_size(&text, Some(&structured)) > MAX_CACHE_BYTES);
+        assert!(retained_size(&text, None) < MAX_CACHE_BYTES);
+        let mut result = json!({"structuredContent": structured});
+        assert!(shape_result(&mut result, 2048, Some("alice")));
+        let cursor = cursor_of(&result);
+        let page = fetch_result(&cursor, text.len() - 100, 100, Some("alice"), None);
+        assert_eq!(
+            page,
+            text_result(
+                format!(
+                    "{}\n\n[Toolport: end of result ({} characters).]",
+                    &text[text.len() - 100..],
+                    text.len()
+                ),
+                false
+            )
+        );
+        let projection = fetch_result(&cursor, 0, 100, Some("alice"), Some("rows.0"));
+        assert_eq!(projection, text_result("[Toolport: projections aren't available for this very large result. Page the text or narrow the call.]".into(), true));
+        assert_eq!(
+            fetch_result(&cursor, 0, 100, Some("bob"), Some("rows.0"))["isError"],
+            true
+        );
+        let store = cache().lock().unwrap_or_else(|e| e.into_inner());
+        let entry = store.get(&cursor).unwrap();
+        assert!(entry.structured.is_none());
+        assert!(entry.size <= MAX_CACHE_BYTES);
+    }
+
+    #[test]
+    fn normal_first_reply_and_pages_preserve_wire_bytes() {
+        let mut result = big_text_result(10_000);
+        assert!(shape_result(&mut result, 2048, None));
+        let cursor = cursor_of(&result);
+        let expected = text_result(format!("{}\n\n[Toolport shaped this result: ~9 KB exceeds 2 KB budget. Showing first 1536 of 10000 characters. Continue with toolport_fetch_result {{\"cursor\":\"{}\",\"offset\":1536}}. If the cursor expired, re-run the original tool call.]", "x".repeat(1536), cursor), false);
+        assert_eq!(
+            serde_json::to_vec(&result).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        let page = fetch_result(&cursor, 1536, 100, None, None);
+        let expected = text_result(format!("{}\n\n[Toolport: characters 1536..1636 of 10000. 8364 remain, call toolport_fetch_result with offset=1636 for the next slice.]", "x".repeat(100)), false);
+        assert_eq!(
+            serde_json::to_vec(&page).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
     }
 
     #[test]
