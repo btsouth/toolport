@@ -20393,7 +20393,7 @@ fn main() {
                         "{}",
                         json!({"leftovers":[{"path":"desktop-exit pipe", "error":error.to_string()}]})
                     );
-                    std::process::exit(1);
+                    conduit_lib::purge::exit_after_removal(1);
                 }
             }
             if dry_run || !confirmed {
@@ -20404,13 +20404,13 @@ fn main() {
                     ),
                     Err(error) => {
                         eprintln!("{error}");
-                        std::process::exit(1);
+                        conduit_lib::purge::exit_after_removal(1);
                     }
                 }
                 if !dry_run {
                     eprintln!("Nothing was removed. Close Toolport, then repeat with --confirm to remove the listed data.");
                 }
-                std::process::exit(if dry_run { 0 } else { 2 });
+                conduit_lib::purge::exit_after_removal(if dry_run { 0 } else { 2 });
             }
             match conduit_lib::purge::run() {
                 Ok(report) => {
@@ -20418,14 +20418,14 @@ fn main() {
                         "{}",
                         serde_json::to_string_pretty(&report).expect("serializable removal report")
                     );
-                    std::process::exit(if report.leftovers.is_empty() { 0 } else { 1 });
+                    conduit_lib::purge::exit_after_removal(if report.leftovers.is_empty() { 0 } else { 1 });
                 }
                 Err(error) => {
                     println!(
                         "{}",
                         json!({"removed":[], "leftovers":[{"path":conduit_lib::registry::conduit_dir().map(|path| path.display().to_string()), "error":error}]})
                     );
-                    std::process::exit(1);
+                    conduit_lib::purge::exit_after_removal(1);
                 }
             }
         }

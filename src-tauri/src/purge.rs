@@ -26,6 +26,11 @@ pub struct Report {
 
 const AUTOSTART_NAMES: &[&str] = &["Toolport", "Conduit", "conduit", "ToolportNativePreview"];
 
+/// Removal never flushes telemetry: doing so could recreate the deleted logs.
+pub fn exit_after_removal(status: i32) -> ! {
+    std::process::exit(status)
+}
+
 fn data_dir() -> Result<PathBuf, String> {
     let dir =
         crate::registry::conduit_dir().ok_or("Could not resolve Toolport's data directory")?;
