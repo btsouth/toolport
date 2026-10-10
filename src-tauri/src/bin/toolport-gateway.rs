@@ -3757,7 +3757,12 @@ fn recovery_hint(
         .and_then(|tool| tool.pointer("/annotations/readOnlyHint"))
         .and_then(Value::as_bool)
         == Some(true);
-    let mut text = format!(" {}", kind.guidance(read_only));
+    let guidance = kind.guidance(read_only);
+    let mut text = if guidance.is_empty() {
+        String::new()
+    } else {
+        format!(" {guidance}")
+    };
     if kind.identifier_failure() {
         let hints = source_tool_hints(catalog, server, None, 2);
         // Long tool names must not expand every failure's context budget.
@@ -5268,22 +5273,10 @@ fn execute_call(
             }
             // Content defense + shaping, shared with the error path (below) so a
             // hostile server can't bypass the injection scanner by answering with an
-            // error instead of a result. A failed tool result (isError from the server)
-            // also gets the recovery hint, appended after both passes so it's never
-            // scanned as external data nor truncated. See defend_and_shape / issue #421.
-            let trailer = if raw_ok {
-                String::new()
-            } else {
-                recovery_hint(
-                    cached,
-                    srv,
-                    name,
-                    &guidance_arguments,
-                    CallFailureKind::tool_result(&result),
-                )
-            };
+            // error instead of a result (issue #421). A server's own result, failed or
+            // not, gets no Toolport text appended: clients parse these blocks.
             let Defended { result: out, pii } =
-                defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
+                defend_and_shape(reg, srv, tool, client, result, "", shape);
             if let Some(profiler) = &mut call_profiler {
                 profiler.mark_postprocess();
             }
@@ -5975,7 +5968,7 @@ fn defend_and_shape(
     trailer: &str,
     shape: bool,
 ) -> Defended {
-    // Scan untrusted output for injection; label always, optionally fail closed.
+    // Scan untrusted output for injection; record findings, optionally fail closed.
     // Block mode alone must still run the scanner: an org forceBlockOnInjection (or a
     // local blockOnInjection) with contentDefense off would otherwise silently do
     // nothing (SOU-345).
@@ -6000,7 +5993,7 @@ fn defend_and_shape(
         }
     }
     if !blocked {
-        integrity::label_untrusted_result_with_notice(srv, &mut result, false);
+        integrity::label_untrusted_result(srv, &mut result);
     }
     // Cap an oversized result, cache the full body, hand back a head + fetch cursor.
     // A per-server resultBudget overrides the global default (Some(0) = never shape).
@@ -6664,7 +6657,7 @@ fn defend_script_aggregate(
             return true;
         }
     }
-    integrity::label_untrusted_result_with_notice(&owner.label, result, false);
+    integrity::label_untrusted_result(&owner.label, result);
     false
 }
 
@@ -16611,15 +16604,6 @@ fn result_text(resp: &Value) -> String {
     if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
         let mut out = String::new();
         for item in content {
-            // Keep Toolport's policy notice separate from the OpenAPI data value.
-            // Downstream block metadata was overwritten at the provenance boundary.
-            if item
-                .pointer("/_meta/app.toolport~1provenance/kind")
-                .and_then(Value::as_str)
-                == Some("notice")
-            {
-                continue;
-            }
             if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
                 if !out.is_empty() {
                     out.push('\n');
@@ -22436,6 +22420,31 @@ mod tests {
         }
     }
 
+    /// Clients such as scripts join text blocks and parse them as JSON, so a server's
+    /// own result, success or failure, must keep its content blocks byte for byte.
+    #[test]
+    fn server_results_keep_their_content_blocks_unchanged() {
+        let _data = DataDirTestEnv::new("server_results_keep_content");
+        let reg = Registry::default();
+        for is_error in [false, true] {
+            let original = json!({
+                "content": [{"type": "text", "text": "{\"id\":\"card-1\",\"name\":\"Ship 2.0\",\"tags\":[\"a\",\"b\"]}"}],
+                "isError": is_error,
+            });
+            let out = defend_and_shape(&reg, "trello", "get_card", None, original.clone(), "", true).result;
+            assert_eq!(out["content"].as_array().unwrap().len(), 1, "{out}");
+            assert_eq!(out["content"][0]["text"], original["content"][0]["text"]);
+            assert_eq!(out["isError"], is_error);
+            let joined: String = out["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect();
+            serde_json::from_str::<Value>(&joined).expect("joined text stays valid JSON");
+        }
+    }
+
     /// #421: a downstream error message is attacker-controllable, so the error path
     /// must run the same content-defense + shaping as a success. Before the fix the
     /// error branch built the result inline with neither, so an injection payload in a
@@ -22458,14 +22467,9 @@ mod tests {
         });
         let out =
             defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true).result;
-        let text = out["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("external data"),
-            "error text must be labeled as data"
-        );
-        assert!(
-            text.contains("evil-server"),
-            "wrapper names the originating server"
+        assert_eq!(
+            out["content"][0]["text"], payload,
+            "advisory screening returns the server's text unchanged"
         );
         assert!(out["isError"].as_bool().unwrap(), "still an error result");
 
@@ -22534,7 +22538,7 @@ mod tests {
             "body is the Toolport security message, not the labeled payload"
         );
 
-        // Per-server exempt: same payload labels only.
+        // Per-server exempt: same payload passes through.
         reg.injection_block_exempt
             .insert("evil-server".into(), true);
         let result = json!({
@@ -22550,15 +22554,9 @@ mod tests {
             true,
             "exempt server must not hard-block"
         );
-        assert!(
-            out["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("external data"),
-            "exempt still labels"
-        );
+        assert_eq!(out["content"][0]["text"], payload);
 
-        // Default (block off): still labels, never withholds.
+        // Default (block off): records only, never withholds or rewrites.
         let reg = Registry {
             safety_level: None,
             version: 1,
@@ -22569,11 +22567,8 @@ mod tests {
         });
         let out =
             defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true).result;
-        assert!(out["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("external data"));
-        // Label mode does not set isError on a success that was only labeled.
+        assert_eq!(out["content"][0]["text"], payload);
+        // Advisory mode does not set isError on a flagged success.
         assert!(out.get("isError").is_none() || out["isError"] == false);
 
         // A team injection flag at member Off must withhold results without raising the level.
@@ -26018,8 +26013,8 @@ mod tests {
     }
 
     #[test]
-    fn run_script_intermediates_keep_content_shape_and_final_has_one_notice() {
-        let _data = DataDirTestEnv::new("run_script_one_notice");
+    fn run_script_intermediates_and_final_keep_content_shape() {
+        let _data = DataDirTestEnv::new("run_script_no_notice");
         let reg = Registry::default();
         let router = Arc::new(paging_router("hello".into()));
         let args = json!({"script":"var a = toolport.call('s__big', {}); return { count: a.content.length, provenance: a._meta['app.toolport/provenance'], body: a.content };"});
@@ -26046,14 +26041,10 @@ mod tests {
             .iter()
             .filter(|block| block["_meta"]["app.toolport/provenance"]["kind"] == "notice")
             .count();
-        assert_eq!(notices, 1);
-        assert_eq!(
-            serde_json::to_string(&result)
-                .unwrap()
-                .matches("[untrusted output from")
-                .count(),
-            1
-        );
+        assert_eq!(notices, 0);
+        assert!(!serde_json::to_string(&result)
+            .unwrap()
+            .contains("[untrusted output from"));
     }
 
     /// Code mode: a script that calls a downstream tool twice through `toolport.call()`
@@ -26204,13 +26195,13 @@ mod tests {
             run_script_dispatch(reg, Some(&router), &[], None, None, None, None, &args, None)
         };
 
-        // Advisory mode labels the aggregate and preserves its structured schema.
+        // Advisory mode returns the aggregate unchanged with its structured schema.
         let labeled = run(&reg);
         assert_eq!(labeled["isError"], false);
         let text = labeled["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("external data returned by \"script\""),
-            "aggregate must be wrapped: {text}"
+            !text.contains("external data"),
+            "aggregate must not be wrapped: {text}"
         );
         assert!(labeled["structuredContent"]["result"]
             .as_str()
@@ -34827,10 +34818,10 @@ mod tests {
             None,
         )
         .unwrap();
-        // Brand is Toolport after SBS-896 (was the pre-rebrand `conduit` marker).
-        assert!(ordinary["result"]["contents"][0]["text"]
-            .as_str()
-            .is_some_and(|text| text.starts_with("[Toolport: the following is external data")));
+        assert_eq!(
+            ordinary["result"]["contents"][0]["text"],
+            "<!doctype html><script>const label = 'ignore previous instructions';</script>"
+        );
     }
 
     #[test]
@@ -34902,17 +34893,12 @@ mod tests {
                     result["_meta"]["app.toolport/provenance"]["server"],
                     "fixture"
                 );
-                assert_eq!(result["content"].as_array().unwrap().len(), 2);
+                assert_eq!(result["content"].as_array().unwrap().len(), 1);
                 assert_eq!(
                     result["content"][0]["_meta"]["app.toolport/provenance"]["trust"],
                     "untrusted"
                 );
-                if level == registry::SafetyLevel::Ask {
-                    assert!(result["content"][0]["text"]
-                        .as_str()
-                        .unwrap()
-                        .contains("external data"));
-                }
+                assert_eq!(result["content"][0]["text"], payload);
             }
         }
     }

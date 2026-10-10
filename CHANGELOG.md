@@ -6,6 +6,10 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+- Tool results reach your AI clients exactly as the server sent them. Toolport no
+  longer adds a notice block, a generic failure line, or a wrapper around flagged
+  text, so clients that parse results keep working. Injection findings still show in
+  Activity, and Strict mode still blocks high-confidence ones.
 - After upgrading to client access sets, use Stop old gateways and restart any apps
   still running a 1.x gateway so they use the new access controls.
 
