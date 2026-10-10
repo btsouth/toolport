@@ -183,6 +183,7 @@ impl SettingsPage {
             "Code mode",
             "Let agents combine several tool calls in one script to reduce back-and-forth. Each call follows your access and approval settings. Scripts run in a restricted environment, but this does not replace those settings.",
         );
+        code_row.set_tooltip_text(Some("A gateway started with TOOLPORT_CODE_MODE=1 can keep scripts available even when this setting is off."));
         page.append(&capabilities);
 
         let pinned_section = gtk::Box::new(gtk::Orientation::Vertical, 8);

@@ -5720,7 +5720,7 @@ fn build_content(
     menu_popover.set_child(Some(&menu_content));
     let menu_button = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
-        .tooltip_text("Help and setup menu (Ctrl+Q to quit)")
+        .tooltip_text("Import, export and setup")
         .build();
     menu_button.set_popover(Some(&menu_popover));
     header.pack_end(&menu_button);
@@ -5793,7 +5793,7 @@ fn build_content(
     short.add_setter(&summary, "visible", Some(&false.to_value()));
     let profile_actions = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
-        .tooltip_text("Server actions")
+        .tooltip_text("Enable or disable all servers")
         .build();
     profile_actions.add_css_class("flat");
     let profile_popover = toolport_menu_popover();
