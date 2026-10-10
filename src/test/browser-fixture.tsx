@@ -262,7 +262,7 @@ if (callerFixture) {
   sessionRows.splice(
     0,
     sessionRows.length,
-    ...identities.map((identity, index) => ({
+    ...identities.map<ClientSession>((identity, index) => ({
       sessionId: `caller-fixture-${index}`,
       clientType: "unknown",
       gatewayVersion: "2.0.0-preview.6",

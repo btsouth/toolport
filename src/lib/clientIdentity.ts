@@ -1,7 +1,7 @@
 export const UNRECORDED_CLIENT_TOOLTIP =
   "Older Toolport versions did not record callers for these rows.";
 
-function hasTrustedName(name?: string | null): name is string {
+function hasTrustedName(name?: string | null): boolean {
   return (
     !!name && !["An AI client", "Unknown client", "Unrecorded client"].includes(name)
   );
@@ -13,7 +13,7 @@ export function trustedClientName(client: {
   clientLabel?: string | null;
   client?: string | null;
 }): string {
-  if (hasTrustedName(client.clientName)) return client.clientName;
+  if (hasTrustedName(client.clientName) && client.clientName) return client.clientName;
   if (client.clientLabel) return `${client.clientLabel} (reported)`;
   return client.client || client.clientName === "Unknown client"
     ? "Unknown client"
