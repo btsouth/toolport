@@ -20387,8 +20387,7 @@ fn main() {
             after_exit,
         } => {
             if after_exit {
-                if let Err(error) = std::io::copy(&mut std::io::stdin(), &mut std::io::sink())
-                {
+                if let Err(error) = conduit_lib::purge::wait_for_desktop_exit() {
                     println!(
                         "{}",
                         json!({"leftovers":[{"path":"desktop-exit pipe", "error":error.to_string()}]})

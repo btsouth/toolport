@@ -31,6 +31,29 @@ pub fn exit_after_removal(status: i32) -> ! {
     std::process::exit(status)
 }
 
+pub fn wait_for_desktop_exit() -> Result<(), String> {
+    wait_for_exit_pipe(std::io::stdin(), std::time::Duration::from_secs(30))
+}
+
+fn wait_for_exit_pipe(
+    mut input: impl std::io::Read + Send + 'static,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("purge-desktop-exit".into())
+        .spawn(move || {
+            let result = std::io::copy(&mut input, &mut std::io::sink())
+                .map(|_| ())
+                .map_err(|error| format!("Desktop exit pipe: {error}"));
+            let _ = sender.send(result);
+        })
+        .map_err(|error| error.to_string())?;
+    receiver.recv_timeout(timeout).map_err(|error| {
+        format!("Toolport did not close within {} seconds ({error}). Nothing was removed. Close Toolport and retry.", timeout.as_secs())
+    })?
+}
+
 fn data_dir() -> Result<PathBuf, String> {
     let dir =
         crate::registry::conduit_dir().ok_or("Could not resolve Toolport's data directory")?;
@@ -416,6 +439,26 @@ fn remove_autostart(report: &mut Report) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn desktop_handoff_observes_eof_and_reports_a_stuck_parent() {
+        assert!(wait_for_exit_pipe(
+            std::io::Cursor::new(Vec::<u8>::new()),
+            std::time::Duration::from_secs(5)
+        )
+        .is_ok());
+        struct Pending(std::sync::mpsc::Receiver<()>);
+        impl std::io::Read for Pending {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(0)
+            }
+        }
+        let (release, pending) = std::sync::mpsc::channel();
+        let error =
+            wait_for_exit_pipe(Pending(pending), std::time::Duration::from_millis(20)).unwrap_err();
+        assert!(error.contains("Nothing was removed. Close Toolport and retry."));
+        drop(release);
+    }
     #[test]
     fn purge_temp_data_never_follows_symlinks_or_touches_native_client_data() {
         let env = crate::registry::DataDirTestEnv::new("purge_temp_data");
