@@ -1,8 +1,8 @@
 {
   "npx:toolport-mcp-servers": {
-    "version": "0.2.0",
-    "integrity": "sha512-oCVm65Pnw+X0jY3+JrOP5gSAQfyQ4cJlwS2FOphwONrjYRfKiWmUWvv1QVnvyrumN8F6krJcCnd7XpG+/+Vz3A==",
-    "url": "https://registry.npmjs.org/toolport-mcp-servers/-/toolport-mcp-servers-0.2.0.tgz"
+    "version": "0.3.0",
+    "integrity": "sha512-Kesbt3f4/lKEitGQs3wYwE4eL8wA6bomg0ZLT4nSvAcVR0tD1Y7U5GESlRuJccBqKDpgxFeTQvZW0CFCfWZgNQ==",
+    "url": "https://registry.npmjs.org/toolport-mcp-servers/-/toolport-mcp-servers-0.3.0.tgz"
   },
   "uvx:awslabs.aws-api-mcp-server": {
     "version": "1.5.6",
