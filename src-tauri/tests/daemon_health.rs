@@ -240,7 +240,7 @@ impl Client {
             command.env("TOOLPORT_GATEWAY_TOPOLOGY", "daemon");
         }
         let mut child = command
-            .env("ADAPTER_AMBIENT_CREDENTIAL", "must-not-leak")
+            .env("ADAPTER_AMBIENT_CREDENTIAL", "from-client")
             // Force the inherit-env fallback to expose the gateway process boundary.
             .env("SHELL", dir.join("missing-login-shell"))
             .env("TOOLPORT_CLIENT_ID", client_id)
@@ -646,9 +646,11 @@ fn a_wedged_daemon_moves_clients_to_their_own_gateways() {
     assert!(explicit.echo("explicit").contains("explicit"));
     assert!(explicit.status().contains("private gateway"));
     let dumped = std::fs::read_to_string(&dump).unwrap();
+    // The server opted into inheritEnv, so like 1.x it sees the variables its
+    // own client was started with. This private gateway serves only that client.
     assert!(
-        !dumped.contains("ADAPTER_AMBIENT_CREDENTIAL"),
-        "private gateway child inherited adapter credentials"
+        dumped.contains("ADAPTER_AMBIENT_CREDENTIAL"),
+        "an opted-in server lost its client's environment"
     );
     assert!(
         dumped.contains("MOCK_MCP_TRANSCRIPT="),
