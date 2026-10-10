@@ -10716,7 +10716,9 @@ mod tests {
                 .is_some_and(|error| error.contains("quarantine")),
             "the identity panel must say why it is unknown: {activity:?}"
         );
-        assert_eq!(activity.security_events, events);
+        let mut unknown_events = events.clone();
+        unknown_events[0]["blocked"] = serde_json::Value::Null;
+        assert_eq!(activity.security_events, unknown_events);
 
         std::fs::write(dir.join("quarantine.json"), "{}").unwrap();
         std::fs::write(dir.join("tool-pins.json"), "{ not json").unwrap();
@@ -10728,7 +10730,10 @@ mod tests {
                 .is_some_and(|error| error.contains("pin store")),
             "a lost pin baseline must not look like an empty identity panel: {activity:?}"
         );
-        assert_eq!(activity.security_events, events);
+        let mut unblocked_events = events;
+        unblocked_events[0]["blocked"] = serde_json::json!(false);
+        unblocked_events[0]["blocked_profiles"] = serde_json::json!([]);
+        assert_eq!(activity.security_events, unblocked_events);
     }
 
     #[test]
