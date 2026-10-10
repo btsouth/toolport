@@ -290,11 +290,19 @@ impl SerializedCatalog {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ToolPolicyMetadata {
     pub destructive: bool,
+    pub model_hidden: bool,
 }
 impl From<&Value> for ToolPolicyMetadata {
     fn from(tool: &Value) -> Self {
         Self {
             destructive: crate::router::is_destructive(tool),
+            model_hidden: tool
+                .pointer("/_meta/ui/visibility")
+                .is_some_and(|visibility| {
+                    visibility
+                        .as_array()
+                        .is_none_or(|audiences| !audiences.iter().any(|a| a == "model"))
+                }),
         }
     }
 }

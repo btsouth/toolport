@@ -4652,9 +4652,7 @@ fn execute_call(
             .collect()
     };
     if !candidates.is_empty() && candidates.iter().all(|owner| !visible(owner)) {
-        return json!({"content": [{"type": "text", "text": format!(
-            "Blocked by Toolport: {name} is turned off for this client. Change it in Toolport > Clients."
-        )}], "isError": true});
+        return json!({"content": [{"type": "text", "text": view.no_route_message_within(name, visible)}], "isError": true});
     }
     // An owner outside this request's original scope was already off, rather
     // than becoming stale during dispatch. Scope loss after capture still fails
@@ -4722,6 +4720,13 @@ fn execute_call(
         .map(|tools| tools as &dyn ToolCatalog)
         .unwrap_or(cached);
     let visible = |server: &str| allowed.is_none_or(|set| server_in_allowed_scope(server, set));
+    if !opts.allow_app_only
+        && (router.tool_is_model_hidden(name)
+            || (router.route_of(name).is_some()
+                && !named_tool_is_model_visible(name, cached, router)))
+    {
+        return json!({"content":[{"type":"text","text":router.no_route_message_within(name, visible)}],"isError":true});
+    }
     if let Some(owner) = router.tool_owner(name) {
         if visible(owner) {
             if let Err(mut message) = router.authorize(DispatchTarget::Tool(name)) {
@@ -4747,12 +4752,6 @@ fn execute_call(
     }
     let mut confirmed = false;
     let shape = opts.shape;
-    if !opts.allow_app_only && !named_tool_is_model_visible(name, cached, router) {
-        return json!({
-            "content": [{ "type": "text", "text": format!("Toolport: '{name}' is available only to its MCP App.") }],
-            "isError": true
-        });
-    }
     // Direct modern calls can use MRTR even on their first round, before any
     // requestState exists. Code-mode steps deliberately keep the legacy broker
     // because they cannot surface an intermediate result to the upstream client.
@@ -4780,11 +4779,8 @@ fn execute_call(
         if !server_in_allowed_scope(server_id, set) {
             // A name with no route belongs to no server. Say so, as an unscoped
             // caller would hear, rather than calling an empty server id out of scope.
-            let text = if server_id.is_empty() {
-                router.no_route_message_within(name, |server| server_in_allowed_scope(server, set))
-            } else {
-                format!("Toolport: '{srv}' is not available to this client.")
-            };
+            let text =
+                router.no_route_message_within(name, |server| server_in_allowed_scope(server, set));
             return json!({
                 "content": [{ "type": "text", "text": text }],
                 "isError": true
@@ -26350,7 +26346,7 @@ mod tests {
         assert!(call_result["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("turned off for this client"));
+            .contains("Unknown tool:"));
     }
 
     /// Typed stubs only list tools on servers the client is scoped to; out-of-scope
@@ -28723,6 +28719,76 @@ mod tests {
     }
 
     #[test]
+    fn hidden_tool_errors_match_unknown_catalog_byte_for_byte() {
+        let _env = DataDirTestEnv::new("hidden-tool-error-parity");
+        let reg = Registry::default();
+        let build = |tools: Vec<Value>| {
+            let mut router = Router::new();
+            router.add(
+                DownstreamServer::connect("files".into(), Box::new(MockRoute { tools })).unwrap(),
+            );
+            router
+        };
+        let read = json!({"name":"private_exports","inputSchema":{"type":"object"}});
+        let hidden = json!({"name":"private_export","inputSchema":{"type":"object"}});
+        let absent = build(vec![read.clone()]);
+        for kind in ["tool", "server", "team", "app", "app-strict"] {
+            let mut definition = hidden.clone();
+            if kind.starts_with("app") {
+                definition["_meta"] = json!({"ui":{"visibility":["app"]}});
+                definition["annotations"] = json!({"destructiveHint":true});
+            }
+            let mut present = build(vec![read.clone(), definition]);
+            if kind == "tool" {
+                present = present.with_tool_allow(HashMap::from([(
+                    "files".into(),
+                    HashSet::from(["private_exports".into()]),
+                )]));
+            }
+            if kind == "app-strict" {
+                present.apply_registry_policy(RegistryPolicy {
+                    deny_destructive: true,
+                    ..Default::default()
+                });
+            }
+            let scope = HashSet::from(["other".into()]);
+            let allowed = matches!(kind, "server" | "team").then_some(&scope);
+            for query in [
+                "files__private_export",
+                "files__private_expor",
+                "mcp__toolport__files__private_export",
+            ] {
+                let run = |router: &Router| {
+                    execute_call(
+                        &reg,
+                        router,
+                        &router.shared_tools(),
+                        None,
+                        None,
+                        allowed,
+                        None,
+                        query,
+                        json!({}),
+                        None,
+                        None,
+                        CallOpts {
+                            direct: true,
+                            shape: false,
+                            allow_app_only: false,
+                        },
+                        None,
+                    )
+                };
+                assert_eq!(
+                    serde_json::to_vec(&run(&present)).unwrap(),
+                    serde_json::to_vec(&run(&absent)).unwrap(),
+                    "{kind}: {query}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn long_alias_off_to_strict_prepare_dispatch_uses_original_safety() {
         let _env = DataDirTestEnv::new("long-alias-strict-race");
         struct LongRoute {
@@ -29145,7 +29211,7 @@ mod tests {
             Some(&denied_scope),
             Some(&caller),
         );
-        assert!(reply.body.contains("turned off for this client"), "{}", reply.body);
+        assert!(reply.body.contains("Unknown tool:"), "{}", reply.body);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -29499,10 +29565,7 @@ mod tests {
             .and_then(|b| b.get("text"))
             .and_then(|t| t.as_str())
             .unwrap_or("");
-        assert!(
-            text.contains("resend__send is turned off for this client"),
-            "got {text}"
-        );
+        assert!(text.contains("Unknown tool: resend__send"), "got {text}");
         // An in-scope call passes the scope guard (it then fails at routing since
         // no server is connected, but NOT with the scope-refusal message).
         let req_ok = json!({
@@ -31380,7 +31443,7 @@ mod tests {
         let text = denied["content"][0]["text"].as_str().unwrap_or("");
         assert_eq!(denied["isError"], true);
         assert!(
-            text.contains("turned off for this client"),
+            text.contains("Unknown tool:"),
             "team twin must be a scope denial, got {denied}"
         );
         let allowed_call = execute_call(
@@ -34504,7 +34567,7 @@ mod tests {
         assert!(nested["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("available only to its MCP App"));
+            .contains("Unknown tool: apps__app_only"));
 
         let direct = handle_request(
             &host,

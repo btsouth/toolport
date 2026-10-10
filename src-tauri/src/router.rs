@@ -1656,6 +1656,7 @@ pub struct Router {
     legacy_seen: HashSet<String>,
     legacy_names: HashMap<String, String>,
     tool_owners: HashMap<String, String>,
+    model_hidden: HashSet<String>,
     /// What may be exposed; applied as each server is added.
     policy: ToolPolicy,
     /// Per-tool exposure overrides (rename / re-describe), keyed by server id then ORIGINAL
@@ -1904,6 +1905,10 @@ impl Router {
             .or_else(|| self.route_of(name).map(|(server, _)| server))
     }
 
+    pub fn tool_is_model_hidden(&self, name: &str) -> bool {
+        self.model_hidden.contains(name)
+    }
+
     /// Why a call to `exposed_name` cannot be routed.
     pub fn no_route_message(&self, exposed_name: &str) -> String {
         self.no_route_message_within(exposed_name, |_| true)
@@ -1918,7 +1923,10 @@ impl Router {
         visible: impl Fn(&str) -> bool,
     ) -> String {
         if self.tool_owner(exposed_name).is_some_and(&visible) {
-            if let Some(reason) = self.blocked.get(exposed_name) {
+            if let Some(reason) = self.blocked.get(exposed_name).filter(|reason| {
+                reason.as_str() != "outside this client's tool scope"
+                    && !self.model_hidden.contains(exposed_name)
+            }) {
                 return blocked_tool_message(exposed_name, reason);
             }
         }
@@ -2048,7 +2056,11 @@ impl Router {
         match target {
             DispatchTarget::Tool(exposed) => {
                 if let Some(reason) = self.blocked.get(exposed) {
-                    return Err(blocked_tool_message(exposed, reason));
+                    return Err(if reason == "outside this client's tool scope" {
+                        self.no_route_message(exposed)
+                    } else {
+                        blocked_tool_message(exposed, reason)
+                    });
                 }
                 match self.routes.get(exposed) {
                     Some((server_id, _)) => self.authorize(DispatchTarget::Server(server_id)),
@@ -2189,6 +2201,9 @@ impl Router {
             };
             self.tool_owners
                 .insert(exposed.clone(), server_id.to_string());
+            if tools.policy_metadata(idx).model_hidden {
+                self.model_hidden.insert(exposed.clone());
+            }
             self.bind_policy_name(&exposed, server_id, orig);
             if self.blocked.contains_key(&exposed) {
                 continue;
@@ -3474,6 +3489,9 @@ impl Router {
             // quarantine must still block it (review on #717).
             self.tool_owners
                 .insert(candidate.exposed.clone(), candidate.server.clone());
+            if ToolPolicyMetadata::from(&**candidate.definition).model_hidden {
+                self.model_hidden.insert(candidate.exposed.clone());
+            }
             if let Some(legacy) = &candidate.policy_name {
                 self.legacy_names
                     .insert(candidate.exposed.clone(), legacy.clone());
@@ -3542,6 +3560,7 @@ impl Router {
         self.legacy_seen.clear();
         self.legacy_names.clear();
         self.tool_owners.clear();
+        self.model_hidden.clear();
         // A restored route keeps its exposed name until a fresh tool catalog
         // confirms its removal. Reserve that name before indexing new slots,
         // otherwise a later colliding tool can silently inherit the old route.
@@ -6723,6 +6742,28 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn restored_app_only_tool_refusals_do_not_reveal_policy_blocks() {
+        let mut router = Router::with_policy(ToolPolicy {
+            deny_destructive: true,
+            ..Default::default()
+        });
+        router.add(mock_server("s"));
+        let unknown = router.no_route_message("s__private_export");
+        let revision = router.tool_revision("s").unwrap();
+        router.restored_candidates.push(RestoredTool {
+            definition: Arc::new(ToolDefinition::new(json!({"name":"s__private_export", "annotations":{"destructiveHint":true}, "_meta":{"ui":{"visibility":["app"]}}}))),
+            exposed: "s__private_export".into(), server: "s".into(), original: "private_export".into(),
+            policy_name: None, source_revision: revision, schema_arguments: None,
+        });
+        router.rebuild_preserving_restored();
+        assert!(router.is_blocked("s__private_export"));
+        assert_eq!(
+            router.no_route_message("s__private_export").as_bytes(),
+            unknown.as_bytes()
+        );
+    }
+
+    #[test]
     fn aggregates_and_namespaces_tools() {
         let mut router = Router::new();
         router.add(mock_server("github"));
@@ -6869,7 +6910,7 @@ for line in sys.stdin:
             assert!(denied
                 .route_call(exposed, json!({}))
                 .unwrap_err()
-                .contains("turned off for this client"));
+                .contains("Unknown tool:"));
             let allowed = router.with_tool_allow(HashMap::from([(
                 "s".into(),
                 HashSet::from(["echo".into()]),
@@ -8533,10 +8574,7 @@ for line in sys.stdin:
 
         // Hidden, and also blocked on a direct call (not merely invisible).
         let err = router.route_call("db__add", json!({})).unwrap_err();
-        assert!(
-            err.contains("turned off for this client"),
-            "unexpected: {err}"
-        );
+        assert!(err.contains("Unknown tool:"), "unexpected: {err}");
         assert!(router.route_call("db__echo", json!({})).is_ok());
     }
 

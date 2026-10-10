@@ -4180,10 +4180,10 @@ fn protocol_lane_unknown_names_never_request_approval_or_leak_hidden_matches() {
     for name in ["files__read_item", "files__private_guessed"] {
         let text = protocol_lane_error(
             &none.call_tool(name, json!({})),
-            "turned off for this client",
+            "Unknown tool:",
         );
         assert!(
-            text.contains("Toolport > Clients") && !text.contains("Mock files"),
+            text.contains("toolport_search_tools") && !text.contains("Mock files"),
             "{text}"
         );
     }
@@ -4283,8 +4283,8 @@ fn protocol_lane_policy_refusals_explain_the_reason_and_fix() {
                     .insert("files".into(), vec!["read_item".into()]);
                 (
                     "files__delete_item",
-                    "turned off for this client",
-                    "Toolport > Clients",
+                    "Unknown tool:",
+                    "toolport_search_tools",
                 )
             }
             "disabled" => {
@@ -4339,7 +4339,7 @@ fn protocol_lane_policy_refusals_explain_the_reason_and_fix() {
             client.call_tool(name, json!({})),
             client.call_tool("toolport_call_tool", json!({"name":name,"arguments":{}})),
         ] {
-            let text = protocol_lane_error(&result, "Blocked by Toolport:");
+            let text = protocol_lane_error(&result, if case == "client" { "Unknown tool:" } else { "Blocked by Toolport:" });
             assert!(
                 text.contains(reason) && text.contains(fix),
                 "{case}: {text}"
@@ -4710,9 +4710,9 @@ fn protocol_lane_long_server_aliases_keep_both_identity_parts_and_cached_routes(
         none.initialize("protocol-long-server-no-access");
         let refused = protocol_lane_error(
             &none.call_tool(alias, json!({})),
-            "turned off for this client",
+            "Unknown tool:",
         );
-        assert!(refused.contains("Toolport > Clients"), "{refused}");
+        assert!(refused.contains("toolport_search_tools"), "{refused}");
         assert_eq!(
             transcript_method_count(
                 &dir.join(format!("transcript-{server}.jsonl")),

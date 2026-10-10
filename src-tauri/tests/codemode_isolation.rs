@@ -689,10 +689,10 @@ fn http_client_memory_failure_does_not_stop_other_clients_and_scope_stays_enforc
         }),
     );
     assert!(
-        scoped.to_string().contains("turned off for this client"),
+        scoped.to_string().contains("Unknown tool:"),
         "{scoped}"
     );
-    assert!(scoped.to_string().contains("Toolport > Clients"), "{scoped}");
+    assert!(scoped.to_string().contains("toolport_search_tools"), "{scoped}");
     let normal = gateway.http_call(
         "client-b",
         "toolport_run_script",
