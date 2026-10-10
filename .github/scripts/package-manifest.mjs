@@ -130,7 +130,7 @@ export function assertManifest(paths, kind) {
         );
     } else if (kind === "appimage") {
       allowed =
-        /^(?:AppRun|\.DirIcon|(?:[Tt]oolport|conduit)\.(?:desktop|png)|usr\/bin\/(?:conduit|toolport-gateway))$/.test(
+        /^(?:AppRun|\.DirIcon|apprun-hooks\/linuxdeploy-plugin-gtk\.sh|(?:[Tt]oolport|conduit)\.(?:desktop|png)|usr\/bin\/(?:conduit|toolport-gateway|xdg-mime))$/.test(
           path,
         ) ||
         /^(?:usr|usr\/bin|usr\/lib|usr\/lib64|usr\/share)$/.test(path) ||
@@ -141,6 +141,9 @@ export function assertManifest(paths, kind) {
           path,
         ) ||
         /^usr\/lib(?:64)?\/(?:gio|gdk-pixbuf-2\.0|gtk-3\.0|gtk-4\.0|webkit2gtk-4\.1|webkitgtk-6\.0)\//.test(
+          path,
+        ) ||
+        /^usr\/lib\/girepository-1\.0\/[A-Za-z0-9]+-[0-9]+\.[0-9]+\.typelib$/.test(
           path,
         ) ||
         /^usr\/share\/(?:glib-2\.0\/schemas|mime|themes|icons|locale)\//.test(path);

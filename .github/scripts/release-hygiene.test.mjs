@@ -277,3 +277,26 @@ test("macOS manifest includes the signed gateway helper and provisioning profile
     /Unexpected/,
   );
 });
+
+test("AppImage permits its declared deep-link and GTK runtime resources", async () => {
+  const { assertManifest } = await import("./package-manifest.mjs");
+  const paths = [
+    "squashfs-root/usr/bin/conduit",
+    "squashfs-root/usr/bin/toolport-gateway",
+    "squashfs-root/usr/bin/xdg-mime",
+    "squashfs-root/apprun-hooks/linuxdeploy-plugin-gtk.sh",
+    "squashfs-root/usr/lib/girepository-1.0/Gtk-3.0.typelib",
+  ];
+  assertContents(paths, { appImage: true });
+  assertManifest(paths, "appimage");
+  assert.throws(() => assertContents(paths), /Unexpected packaged binary/);
+  assert.throws(
+    () => assertManifest([...paths, "squashfs-root/usr/bin/other-helper"], "appimage"),
+    /Unexpected/,
+  );
+  assert.throws(
+    () =>
+      assertManifest([...paths, "squashfs-root/apprun-hooks/test-helper.sh"], "appimage"),
+    /Unexpected/,
+  );
+});
