@@ -550,7 +550,10 @@ try {
   await expect(purgeDialog).toContainText("/fixture/home/.config/Toolport");
   await expect(purgeDialog).toContainText("conduit-mcp");
   await expect(purgeDialog).toContainText("Toolport-removal-report.json");
-  await page.screenshot({ path: path.join(output, "settings-purge-confirmation.png") });
+  await page.screenshot({
+    path: path.join(output, "settings-purge-confirmation.png"),
+    animations: "disabled",
+  });
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   await page.goto(`${baseURL}/fixtures/?logos`);
