@@ -192,6 +192,20 @@ fn publish_error(value: &Value) -> Option<String> {
     if value["url"].as_str().is_some_and(credential_url) {
         return Some("This URL contains credentials. Use local authentication or keep this server on this machine only. The URL has not been changed.".into());
     }
+    let args: Vec<String> = value["args"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    let known = credential_arg_mask(&args);
+    if let Some(index) = args
+        .iter()
+        .enumerate()
+        .find_map(|(i, arg)| (!known[i] && crate::registry::arg_looks_secret(arg)).then_some(i))
+    {
+        return Some(format!("Argument {} may contain a credential. Review it or keep this server on this machine only. Its value has not been changed.", index + 1));
+    }
     if env_references(value) {
         return Some("env: references cannot sync. Choose a password manager reference or keep this server on this machine only.".into());
     }
@@ -350,6 +364,75 @@ fn credential_url(text: &str) -> bool {
             })
     })
 }
+// Personal sync cannot use the deliberately broad sharing mask: its false
+// positives would become installed values on another machine.
+fn credential_arg_mask(args: &[String]) -> Vec<bool> {
+    let credential_name = |name: &str| {
+        matches!(
+            name.trim_start_matches('-').to_ascii_lowercase().as_str(),
+            "api-key"
+                | "apikey"
+                | "api_key"
+                | "token"
+                | "auth"
+                | "auth-token"
+                | "auth_token"
+                | "access-token"
+                | "access_token"
+                | "password"
+                | "pwd"
+                | "secret"
+                | "bearer"
+                | "client-secret"
+                | "client_secret"
+                | "credential"
+                | "accountkey"
+        )
+    };
+    let header = |value: &str| {
+        value.split_once(':').is_some_and(|(name, value)| {
+            !value.trim().is_empty()
+                && matches!(
+                    name.trim().to_ascii_lowercase().as_str(),
+                    "authorization"
+                        | "proxy-authorization"
+                        | "x-api-key"
+                        | "x-auth-token"
+                        | "x-goog-api-key"
+                        | "api-key"
+                        | "cookie"
+                        | "private-token"
+                )
+        })
+    };
+    let header_flag = |name: &str| {
+        name == "-H" || matches!(name.to_ascii_lowercase().as_str(), "--header" | "--headers")
+    };
+    let mut mask = vec![false; args.len()];
+    for (index, arg) in args.iter().enumerate() {
+        let arg = arg.trim();
+        let (name, value) = arg
+            .split_once('=')
+            .map_or((arg, None), |(name, value)| (name, Some(value)));
+        if header(arg) || credential_url(arg) {
+            mask[index] = true;
+        }
+        if credential_name(name) {
+            if value.is_some_and(|v| !v.is_empty()) {
+                mask[index] = true;
+            } else if arg.starts_with('-') && index + 1 < args.len() {
+                mask[index + 1] = true;
+            }
+        } else if header_flag(name) {
+            if let Some(value) = value {
+                mask[index] |= header(value);
+            } else if let Some(value) = args.get(index + 1) {
+                mask[index + 1] |= header(value);
+            }
+        }
+    }
+    mask
+}
 fn portable(value: &Value) -> bool {
     value["secret"] == false && value["portable"] == true && reference(value).is_none()
 }
@@ -387,7 +470,7 @@ pub fn export(s: &ServerEntry) -> Value {
     let args: Vec<_> = s
         .args
         .iter()
-        .zip(crate::registry::secret_arg_mask(&s.args))
+        .zip(credential_arg_mask(&s.args))
         .map(|(arg, secret)| {
             if secret && arg != "<launch-input>" {
                 "<redacted>".to_string()
@@ -477,7 +560,7 @@ pub fn export(s: &ServerEntry) -> Value {
                 *i = text.clone();
             }
         }
-        let mask = crate::registry::secret_arg_mask(&effective);
+        let mask = credential_arg_mask(&effective);
         for b in bindings {
             let only_literals = b["parts"]
                 .as_array()
@@ -769,9 +852,28 @@ pub(crate) fn restore_local(entry: &mut ServerEntry, old: &ServerEntry) {
                                          // boundary, not permission to erase the owner's installed setup.
     let old_wire = export(old);
     for (index, arg) in entry.args.iter_mut().enumerate() {
-        if old_wire["args"][index].as_str() == Some(arg.as_str()) {
+        if arg == "<redacted>" || old_wire["args"][index].as_str() == Some(arg.as_str()) {
             if let Some(local) = old.args.get(index) {
                 *arg = local.clone();
+            }
+        }
+    }
+    if let (Some(installed), Some(previous)) = (&mut entry.launch, &old.launch) {
+        for binding in &mut installed.bindings {
+            if let Some(old_binding) = previous.bindings.iter().find(|b| b.index == binding.index) {
+                for (part, old_part) in binding.parts.iter_mut().zip(&old_binding.parts) {
+                    if let (
+                        crate::registry::ArgPart::Literal { value, .. },
+                        crate::registry::ArgPart::Literal {
+                            value: old_value, ..
+                        },
+                    ) = (part, old_part)
+                    {
+                        if value == "<redacted>" {
+                            *value = old_value.clone();
+                        }
+                    }
+                }
             }
         }
     }
@@ -1701,10 +1803,49 @@ pub fn record_error(error: Option<&str>) {
 mod tests {
     use super::*;
     #[test]
+    fn broad_argument_hints_warn_without_rewriting_values_or_legacy_local_args() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-argument-hints");
+        let args = vec![
+            "--header",
+            "Content-Type: application/json",
+            "--label",
+            "access-key-documentation",
+            "--header=X-Version:Toolport2026",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let server: ServerEntry = serde_json::from_value(json!({"id":"docs","name":"Docs","transport":"stdio","command":"echo","args":args,"env":[]})).unwrap();
+        let wire = export(&server);
+        assert_eq!(wire["args"], json!(args));
+        assert!(publish_error(&wire)
+            .unwrap()
+            .contains("may contain a credential"));
+        let mut safe = wire.clone();
+        safe["args"] = json!([
+            "--header",
+            "Content-Type: application/json",
+            "--header=X-Version:Toolport2026"
+        ]);
+        assert_eq!(publish_error(&safe), None);
+        let mut reg = machine();
+        reg.servers.push(server.clone());
+        apply(&mut reg, &config(vec![wire.clone()]), 1).unwrap();
+        let mut legacy = wire;
+        legacy["args"][3] = json!("<redacted>");
+        apply(&mut reg, &config(vec![legacy]), 2).unwrap();
+        crate::registry::save(&reg).unwrap();
+        assert_eq!(crate::registry::load().unwrap().servers[0].args, args);
+        let known: ServerEntry = serde_json::from_value(json!({"id":"auth","name":"Auth","transport":"stdio","command":"echo","args":["--token","actual-secret","--header","Authorization: Bearer actual-secret"],"env":[]})).unwrap();
+        assert!(!export(&known).to_string().contains("actual-secret"));
+    }
+    #[test]
     fn missing_sync_sign_in_gives_account_guidance_without_claiming_success() {
         crate::secrets::tests::with_isolated_vault(|| {
             crate::registry::save(&machine()).unwrap();
-            let error = crate::teams::sync_now().err().expect("missing sign-in must fail");
+            let error = crate::teams::sync_now()
+                .err()
+                .expect("missing sign-in must fail");
             assert!(error.contains("Sign in again"));
             assert!(!error.contains("team token"));
             let reg = crate::registry::load().unwrap();
@@ -1837,7 +1978,8 @@ mod tests {
         save(&mut r, &st).unwrap();
         let mut s: ServerEntry = serde_json::from_value(http("docs")).unwrap();
         s.require_team_enable_review();
-        s.unknown_fields.insert("personalSyncEntry".into(), json!(true));
+        s.unknown_fields
+            .insert("personalSyncEntry".into(), json!(true));
         r.servers.push(s);
         assert_eq!(
             banner(&r),
