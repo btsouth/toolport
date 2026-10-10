@@ -4777,7 +4777,7 @@ fn activity_title(activity: &state::ActivityView) -> String {
             "search" => "Searched tools",
             "describe" => "Looked up a tool",
             "status" => "Checked Toolport status",
-            "fetch" => "Fetched tool details",
+            "fetch" => "Retrieved a tool result",
             _ => "Used Toolport",
         }
         .into()
@@ -10273,7 +10273,7 @@ mod tests {
             ("search", "Searched tools"),
             ("describe", "Looked up a tool"),
             ("status", "Checked Toolport status"),
-            ("fetch", "Fetched tool details"),
+            ("fetch", "Retrieved a tool result"),
         ] {
             row.tool = tool.into();
             assert_eq!(activity_title(&row), title);

@@ -764,7 +764,7 @@ function internalActivityLabel(tool: string): string {
         search: "Searched tools",
         describe: "Looked up a tool",
         status: "Checked Toolport status",
-        fetch: "Fetched tool details",
+        fetch: "Retrieved a tool result",
       } as Record<string, string>
     )[tool] ?? "Used Toolport"
   );

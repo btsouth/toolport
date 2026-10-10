@@ -478,7 +478,7 @@ try {
     "Searched tools",
     "Looked up a tool",
     "Checked Toolport status",
-    "Fetched tool details",
+    "Retrieved a tool result",
   ])
     await expect(page.getByText(label, { exact: true })).toBeVisible();
   await expect(page.getByText("1 value masked", { exact: true })).toHaveAttribute(
