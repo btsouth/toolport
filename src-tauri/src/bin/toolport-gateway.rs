@@ -20387,8 +20387,7 @@ fn main() {
             after_exit,
         } => {
             if after_exit {
-                let mut ignored = Vec::new();
-                if let Err(error) = std::io::Read::read_to_end(&mut std::io::stdin(), &mut ignored)
+                if let Err(error) = std::io::copy(&mut std::io::stdin(), &mut std::io::sink())
                 {
                     println!(
                         "{}",

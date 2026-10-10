@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn purge_temp_data_never_follows_symlinks_or_touches_native_client_data() {
         let env = crate::registry::DataDirTestEnv::new("purge_temp_data");
-        let dir = crate::registry::conduit_dir().unwrap();
+        let dir = env.dir.join("data");
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("bin/toolport-gateway"), "fixture").unwrap();
         std::fs::write(dir.join("registry.json"), "fixture").unwrap();
@@ -467,11 +467,7 @@ mod tests {
     #[test]
     fn temp_home_autostart_inventory_does_not_include_native_clients() {
         let _env = crate::registry::DataDirTestEnv::new("purge_temp_home");
-        let home = crate::registry::conduit_dir()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("home");
+        let home = _env.dir.join("home");
         let files = autostart_files(&home);
         assert_eq!(files.len(), AUTOSTART_NAMES.len());
         assert!(files.iter().all(|file| file.starts_with(&home)));
