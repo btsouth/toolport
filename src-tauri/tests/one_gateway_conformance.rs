@@ -4149,6 +4149,13 @@ fn protocol_lane_unknown_names_never_request_approval_or_leak_hidden_matches() {
     );
     client.initialize("protocol-unknown");
     client.wait_for_tool("__read_item", Duration::from_secs(30));
+    protocol_lane_error(
+        &client.call_tool(
+            "toolport_call_tool",
+            json!({"name":"invented","arguments":{}}),
+        ),
+        "Unknown tool: invented",
+    );
     let message = protocol_lane_error(
         &client.call_tool("files__read_itm", json!({})),
         "Unknown tool: files__read_itm",
@@ -4162,13 +4169,6 @@ fn protocol_lane_unknown_names_never_request_approval_or_leak_hidden_matches() {
         "{message}"
     );
     assert!(message.contains("toolport_search_tools"));
-    protocol_lane_error(
-        &client.call_tool(
-            "toolport_call_tool",
-            json!({"name":"invented","arguments":{}}),
-        ),
-        "Unknown tool: invented",
-    );
     let audit = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
     assert!(
         !audit.contains("\"kind\":\"approval\""),

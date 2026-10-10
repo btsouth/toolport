@@ -23176,7 +23176,13 @@ mod tests {
                 pointer
             );
         }
-        for version in [json!(null), json!(2), json!(4), json!("3")] {
+        for version in [
+            json!(null),
+            json!(2),
+            json!(3),
+            json!(TOOL_CACHE_VERSION + 1),
+            json!(TOOL_CACHE_VERSION.to_string()),
+        ] {
             assert!(cached_field(json!({"version":version,"tools":[]}), "tools").is_none());
         }
         assert!(cached_field(json!({"version":TOOL_CACHE_VERSION}), "tools").is_none());
@@ -29023,7 +29029,7 @@ mod tests {
             Some(&denied_scope),
             Some(&caller),
         );
-        assert!(reply.body.contains("not available"), "{}", reply.body);
+        assert!(reply.body.contains("turned off for this client"), "{}", reply.body);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -36903,9 +36909,15 @@ mod tests {
             .get("result")
             .is_some());
         broker.join().unwrap();
-        let entries: Vec<_> = audit::read_all().unwrap().into_iter().filter(|row| row["kind"] == "approval").collect();
-        assert_eq!(entries.len(), 1, "{entries:?}");
-        assert_eq!(entries[0]["decision"], "withdrawn");
+        let entries: Vec<_> = audit::read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row["kind"] == "approval")
+            .collect();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0]["decision"], "requested");
+        assert_eq!(entries[0]["gatewayVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(entries[1]["decision"], "withdrawn");
         assert_eq!(audit::stats().unwrap()["total"], 0);
     }
 
@@ -37029,10 +37041,12 @@ mod tests {
         let result = p10c_r1_resume(&reg, &router, args, Some(&retry));
         assert!(result["isError"].as_bool().unwrap());
         let rows = audit::read_all().unwrap();
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert_eq!(rows[0]["decision"], "no_response");
-        assert_eq!(rows[0]["server"], "team_slack");
-        assert_eq!(rows[0]["serverId"], "team-slack");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["decision"], "requested");
+        assert_eq!(rows[0]["gatewayVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(rows[1]["decision"], "no_response");
+        assert_eq!(rows[1]["server"], "team_slack");
+        assert_eq!(rows[1]["serverId"], "team-slack");
     }
 
     #[test]
@@ -37063,10 +37077,12 @@ mod tests {
             expired.reap_expired();
         }
         let rows = audit::read_all().unwrap();
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert_eq!(rows[0]["decision"], "stale_state");
-        assert_eq!(rows[0]["reason"], "destructive");
-        assert!(rows[0]["heldMs"].as_u64().unwrap() >= 1500);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["decision"], "requested");
+        assert_eq!(rows[0]["gatewayVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(rows[1]["decision"], "stale_state");
+        assert_eq!(rows[1]["reason"], "destructive");
+        assert!(rows[1]["heldMs"].as_u64().unwrap() >= 1500);
     }
 
     #[test]
