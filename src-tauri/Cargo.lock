@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "conduit"
-version = "2.0.0-preview.5"
+version = "2.0.0-preview.6"
 dependencies = [
  "base64 0.22.1",
  "boa_engine",
