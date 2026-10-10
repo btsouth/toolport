@@ -25,6 +25,8 @@
 //!   object per line. This is what lets a test assert exactly what bytes the
 //!   gateway sent downstream, which is the regression net for the envelope
 //!   transparency work (SOU-444).
+//! - `MOCK_MCP_WIRE_TRACE` — timestamped receive and response-flush events for
+//!   concurrent fixtures, separate from the request transcript.
 //! - `MOCK_MCP_FAIL_STARTS=<n>` with `MOCK_MCP_START_COUNTER=<path>` — the first
 //!   `n` starts exit before the handshake, like a server launched before the
 //!   network is up. The counter file records every start, so a test can also
@@ -123,6 +125,7 @@ struct Config {
     revision: Revision,
     strict: bool,
     transcript: Option<String>,
+    wire_trace: Option<String>,
     call_delay: Option<std::time::Duration>,
     start_delay: Option<std::time::Duration>,
     garbage_stdout: Option<std::time::Duration>,
@@ -138,6 +141,9 @@ impl Config {
             revision: Revision::from_env(),
             strict: std::env::var("MOCK_MCP_STRICT").as_deref() == Ok("1"),
             transcript: std::env::var("MOCK_MCP_TRANSCRIPT")
+                .ok()
+                .filter(|p| !p.is_empty()),
+            wire_trace: std::env::var("MOCK_MCP_WIRE_TRACE")
                 .ok()
                 .filter(|p| !p.is_empty()),
             call_delay: std::env::var("MOCK_MCP_CALL_DELAY_MS")
@@ -210,6 +216,28 @@ fn record(cfg: &Config, req: &Value) {
         let line = format!("{req}\n");
         let _ = f.write_all(line.as_bytes());
         let _ = f.flush();
+    }
+}
+
+// Optional concurrent-fixture diagnostics, separate from the request transcript.
+fn trace(cfg: &Config, event: &str, message: &Value) {
+    let Some(path) = cfg.wire_trace.as_deref() else {
+        return;
+    };
+    let entry = json!({
+        "pid": std::process::id(),
+        "timeUs": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_micros(),
+        "event": event,
+        "message": message,
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(format!("{entry}\n").as_bytes());
     }
 }
 
@@ -902,6 +930,7 @@ fn serve_concurrent(cfg: Config, state: State) {
             continue;
         };
         record(&cfg, &req);
+        trace(&cfg, "received", &req);
         let (cfg, state, out) = (Arc::clone(&cfg), Arc::clone(&state), Arc::clone(&out));
         let barrier = barrier.clone();
         std::thread::spawn(move || {
@@ -940,8 +969,11 @@ fn serve_concurrent(cfg: Config, state: State) {
                 (resp, state.grown && !was_grown)
             };
             let mut out = out.lock().unwrap_or_else(|e| e.into_inner());
+            let mut write_error = None;
             for message in pre.iter().chain(resp.as_ref()) {
-                let _ = writeln!(out, "{message}");
+                if let Err(error) = writeln!(out, "{message}") {
+                    write_error = Some(error.to_string());
+                }
             }
             if grew {
                 for method in [
@@ -952,7 +984,15 @@ fn serve_concurrent(cfg: Config, state: State) {
                     let _ = writeln!(out, "{}", json!({"jsonrpc":"2.0","method":method}));
                 }
             }
-            let _ = out.flush();
+            let flushed = out.flush();
+            if let Some(response) = resp.as_ref() {
+                trace(
+                    &cfg,
+                    "response-flush",
+                    &json!({"response": response, "writeError": write_error,
+                        "flushError": flushed.err().map(|e| e.to_string())}),
+                );
+            }
         });
     }
 }

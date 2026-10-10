@@ -222,8 +222,17 @@ impl Client {
     /// `explicit` runs `--stdio-adapter`; otherwise the registry-selected role a
     /// real client gets, pinned to the daemon topology.
     fn spawn(dir: &Path, explicit: bool) -> Self {
+        let client_id = Self::prepare(dir);
+        Self::spawn_prepared(dir, explicit, client_id)
+    }
+
+    fn prepare(dir: &Path) -> String {
         let client_id = format!("health-{}", NEXT.fetch_add(1, Ordering::Relaxed));
         discovery_support::select_full(dir, &client_id);
+        client_id
+    }
+
+    fn spawn_prepared(dir: &Path, explicit: bool, client_id: String) -> Self {
         let mut command = gateway(dir);
         if explicit {
             command.arg("--stdio-adapter");
@@ -581,18 +590,25 @@ fn a_wedged_daemon_moves_clients_to_their_own_gateways() {
     reg.servers[0].inherit_env = true;
     registry::save_to(&path, &reg).unwrap();
 
-    let mut attached = Client::spawn(&fixture.dir, false);
+    // Complete discovery writes before a stopped daemon can own the registry
+    // lock. Starting a client must not mutate fixture policy after SIGSTOP.
+    let attached_id = Client::prepare(&fixture.dir);
+    let fresh_id = Client::prepare(&fixture.dir);
+    let explicit_id = Client::prepare(&fixture.dir);
+    let mut attached = Client::spawn_prepared(&fixture.dir, false, attached_id);
     attached.initialize();
     attached.echo("before");
     let descriptor = fixture.wait_for_descriptor();
     let daemon_pid = descriptor["pid"].as_u64().expect("daemon pid");
 
+    // Reproduce a daemon wedged while holding this lock on every platform.
+    let _registry_lock = registry::lock_at(&path).expect("hold wedged registry lock");
     signal(daemon_pid, "-STOP");
 
     // A new client in the default role falls back to its own in-process gateway
     // instead of failing to start.
     let started = Instant::now();
-    let mut fresh = Client::spawn(&fixture.dir, false);
+    let mut fresh = Client::spawn_prepared(&fixture.dir, false, fresh_id);
     fresh.initialize();
     assert!(
         started.elapsed() < Duration::from_secs(45),
@@ -612,7 +628,7 @@ fn a_wedged_daemon_moves_clients_to_their_own_gateways() {
         .contains("using its own in-process gateway"));
 
     // An explicit adapter starts a private gateway instead.
-    let mut explicit = Client::spawn(&fixture.dir, true);
+    let mut explicit = Client::spawn_prepared(&fixture.dir, true, explicit_id);
     explicit.initialize();
     assert!(explicit.echo("explicit").contains("explicit"));
     assert!(explicit.status().contains("private gateway"));

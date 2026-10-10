@@ -128,15 +128,18 @@ fn editing_one_server_preserves_the_other_pid_and_in_flight_call() {
     let a_pids = scratch.join("a.pids");
     let b_pids = scratch.join("b.pids");
     let transcript = scratch.join("b.requests");
+    let trace = scratch.join("b.wire.jsonl");
     let a_path = a_pids.to_string_lossy();
     let b_path = b_pids.to_string_lossy();
     let transcript_path = transcript.to_string_lossy();
+    let trace_path = trace.to_string_lossy();
     let mut a = mock_entry("a", &[("MOCK_MCP_PID_FILE", &a_path)]);
     let b = mock_entry(
         "b",
         &[
             ("MOCK_MCP_PID_FILE", &b_path),
             ("MOCK_MCP_TRANSCRIPT", &transcript_path),
+            ("MOCK_MCP_WIRE_TRACE", &trace_path),
             ("MOCK_MCP_CONCURRENT", "1"),
         ],
     );
@@ -176,7 +179,41 @@ fn editing_one_server_preserves_the_other_pid_and_in_flight_call() {
     let list_started = std::time::Instant::now();
     assert!(client.tool_names().contains(&"b__sleep".to_string()));
     assert!(list_started.elapsed() < Duration::from_secs(2));
-    let reply = worker.wait_for_id(call, Duration::from_secs(15));
+    let reply = worker.wait_for_id_with_diagnostics(call, Duration::from_secs(15), || {
+        let mut state = format!("observer:\n{}\n", client.diagnostics());
+        let mut pids: Vec<_> = live_daemon_pid(scratch.path())
+            .into_iter()
+            .map(|pid| pid.to_string())
+            .collect();
+        for name in [
+            "a.pids",
+            "b.pids",
+            "b.requests",
+            "b.wire.jsonl",
+            "registry.json",
+        ] {
+            let raw = scratch.read(name);
+            if name.ends_with(".pids") {
+                pids.extend(
+                    raw.lines()
+                        .filter(|line| line.parse::<u32>().is_ok())
+                        .map(str::to_string),
+                );
+            }
+            let lines: Vec<_> = raw.lines().collect();
+            state.push_str(&format!(
+                "{name}:\n{}\n",
+                lines[lines.len().saturating_sub(64)..].join("\n")
+            ));
+        }
+        if let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "pid,ppid,stat,etime,pcpu,comm", "-p", &pids.join(",")])
+            .output()
+        {
+            state.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+        state
+    });
     assert!(
         !reply["result"]["isError"].as_bool().unwrap_or(false),
         "B's call failed: {reply}"
