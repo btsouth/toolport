@@ -168,6 +168,50 @@ pub fn sanitize_segment(s: &str) -> String {
         .collect()
 }
 
+/// Keep the established short spelling; hash the raw identity for long aliases.
+fn bounded_alias(name: &str, identity: &impl serde::Serialize) -> String {
+    if name.len() <= 64 {
+        return name.to_string();
+    }
+    let hash = content_digest(identity);
+    let suffix: String = hash[..6].iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{}_{}", &name[..51], suffix)
+}
+
+fn blocked_tool_message(name: &str, reason: &str) -> String {
+    let (why, where_to) = match reason {
+        "outside this client's tool scope" => ("turned off for this client", "Clients"),
+        "disabled" => ("turned off", "Servers"),
+        "on a server that is turned off" => ("on a server that is turned off", "Clients"),
+        "blocked by the destructive-tool policy" => ("blocked by Strict safety", "Safety"),
+        "quarantined after a high-risk change; re-approve to restore" => (
+            "quarantined after a tool change",
+            "Activity to review and approve it",
+        ),
+        _ => (reason, "Safety"),
+    };
+    format!("Blocked by Toolport: {name} is {why}. Change it in Toolport > {where_to}.")
+}
+
+fn alias_distance(a: &str, b: &str) -> usize {
+    if a.len().abs_diff(b.len()) > 3 || a.len() > 128 || b.len() > 128 {
+        return usize::MAX;
+    }
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, left) in a.bytes().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, right) in b.bytes().enumerate() {
+            let previous = row[j + 1];
+            row[j + 1] = (diagonal + usize::from(left != right))
+                .min(row[j] + 1)
+                .min(previous + 1);
+            diagonal = previous;
+        }
+    }
+    row[b.len()]
+}
+
 /// Bound URI/template matching so a hostile client URI cannot blow the stack
 /// or dominate the request thread with pathological backtracking.
 const MAX_URI_MATCH_LEN: usize = 8_192;
@@ -1594,6 +1638,10 @@ pub struct Router {
     restored_candidates: Vec<RestoredTool>,
     /// Exposed names already handed out, for collision disambiguation.
     seen: HashSet<String>,
+    /// Pre-bounding aliases preserve existing integrity and quarantine bindings.
+    legacy_seen: HashSet<String>,
+    legacy_names: HashMap<String, String>,
+    tool_owners: HashMap<String, String>,
     /// What may be exposed; applied as each server is added.
     policy: ToolPolicy,
     /// Per-tool exposure overrides (rename / re-describe), keyed by server id then ORIGINAL
@@ -1700,9 +1748,11 @@ impl Router {
         {
             return;
         }
-        let legacy = self.reserved_policy_name(server, original);
+        let legacy = self
+            .reserved_policy_name(server, original)
+            .or_else(|| self.legacy_names.get(exposed).cloned());
         let name = legacy.as_deref().unwrap_or(exposed);
-        if !name.starts_with("toolport_") {
+        if name == exposed && !name.starts_with("toolport_") {
             return;
         }
         let collisions: Vec<_> = self
@@ -1816,6 +1866,13 @@ impl Router {
             .map(|(s, t)| (s.as_str(), t.as_str()))
     }
 
+    pub fn tool_owner(&self, name: &str) -> Option<&str> {
+        self.tool_owners
+            .get(name)
+            .map(String::as_str)
+            .or_else(|| self.route_of(name).map(|(server, _)| server))
+    }
+
     /// Why a call to `exposed_name` cannot be routed.
     pub fn no_route_message(&self, exposed_name: &str) -> String {
         self.no_route_message_within(exposed_name, |_| true)
@@ -1829,6 +1886,11 @@ impl Router {
         exposed_name: &str,
         visible: impl Fn(&str) -> bool,
     ) -> String {
+        if self.tool_owner(exposed_name).is_some_and(&visible) {
+            if let Some(reason) = self.blocked.get(exposed_name) {
+                return blocked_tool_message(exposed_name, reason);
+            }
+        }
         // Several client harnesses expose gateway tools to their model as
         // `mcp__<gateway-alias>__<tool>`; models then reuse that spelling inside
         // toolport_run_script and land here (observed with Codex, 2026-08-13).
@@ -1860,7 +1922,34 @@ impl Router {
                 status.id,
                 status.describe()
             ),
-            None => format!("no route for tool '{exposed_name}'"),
+            None => {
+                let mut matches: Vec<_> = self
+                    .routes
+                    .iter()
+                    .filter(|(_, (server, _))| visible(server))
+                    .filter_map(|(name, _)| {
+                        let distance = alias_distance(exposed_name, name);
+                        (distance <= 3).then_some((distance, name))
+                    })
+                    .collect();
+                matches.sort();
+                matches.truncate(3);
+                let hint = if matches.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\nClose matches: {}",
+                        matches
+                            .iter()
+                            .map(|(_, n)| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                format!(
+                    "Unknown tool: {exposed_name}{hint}\nUse toolport_search_tools to find tools."
+                )
+            }
         }
     }
 
@@ -1911,7 +2000,7 @@ impl Router {
         match target {
             DispatchTarget::Tool(exposed) => {
                 if let Some(reason) = self.blocked.get(exposed) {
-                    return Err(format!("tool '{exposed}' is {reason}"));
+                    return Err(blocked_tool_message(exposed, reason));
                 }
                 match self.routes.get(exposed) {
                     Some((server_id, _)) => self.authorize(DispatchTarget::Server(server_id)),
@@ -2030,13 +2119,19 @@ impl Router {
             let ov_desc = ov.and_then(|o| o.description.clone());
             let exposed = match ov_name {
                 Some(new) => {
-                    let cand = sanitize_segment(&new);
+                    let legacy = sanitize_segment(&new);
+                    let cand = bounded_alias(&legacy, &(server_id, orig, &new));
                     // The gateway owns the toolport_* helper/core namespace.
                     // Keep the original alias when an override would shadow it.
                     if !cand.is_empty()
                         && !cand.starts_with("toolport_")
+                        && !self.legacy_seen.contains(&legacy)
                         && self.seen.insert(cand.clone())
                     {
+                        self.legacy_seen.insert(legacy.clone());
+                        if cand != legacy {
+                            self.legacy_names.insert(cand.clone(), legacy);
+                        }
                         cand
                     } else {
                         base
@@ -2044,6 +2139,8 @@ impl Router {
                 }
                 None => base,
             };
+            self.tool_owners
+                .insert(exposed.clone(), server_id.to_string());
             self.bind_policy_name(&exposed, server_id, orig);
             if self.blocked.contains_key(&exposed) {
                 continue;
@@ -2799,11 +2896,21 @@ impl Router {
             sanitize_segment(server_id),
             sanitize_segment(tool)
         );
-        let mut name = base.clone();
+        let mut legacy = base.clone();
         let mut i = 2;
-        while !self.seen.insert(name.clone()) {
-            name = format!("{base}_{i}");
+        while !self.legacy_seen.insert(legacy.clone()) {
+            legacy = format!("{base}_{i}");
             i += 1;
+        }
+        let mut name = bounded_alias(&legacy, &(server_id, tool));
+        let mut attempt = 0u64;
+        while !self.seen.insert(name.clone()) {
+            attempt += 1;
+            let candidate = format!("{legacy}_{attempt}");
+            name = bounded_alias(&candidate, &(server_id, tool, attempt));
+        }
+        if name != legacy {
+            self.legacy_names.insert(name.clone(), legacy);
         }
         name
     }
@@ -3361,6 +3468,9 @@ impl Router {
         self.policy_names.clear();
         self.schema_arguments.clear();
         self.seen.clear();
+        self.legacy_seen.clear();
+        self.legacy_names.clear();
+        self.tool_owners.clear();
         // A restored route keeps its exposed name until a fresh tool catalog
         // confirms its removal. Reserve that name before indexing new slots,
         // otherwise a later colliding tool can silently inherit the old route.
@@ -3378,6 +3488,7 @@ impl Router {
                 });
             if !still_advertised {
                 self.seen.insert(candidate.exposed.clone());
+                self.legacy_seen.insert(candidate.exposed.clone());
             }
         }
         self.blocked.clear();
@@ -4554,7 +4665,9 @@ mod tests {
 
     #[test]
     fn unrouted_client_prefixed_alias_error_names_the_real_tool() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-unrouted-client-prefixed-alias-error-names-the-real-tool");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-unrouted-client-prefixed-alias-error-names-the-real-tool",
+        );
         let mut router = Router::new();
         router.routes.insert(
             "deepwiki__read".to_string(),
@@ -5211,7 +5324,9 @@ mod tests {
 
     #[test]
     fn task_handles_bind_owner_and_route_poll_update_and_cancel() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-task-handles-bind-owner-and-route-poll-update-and-cancel");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-task-handles-bind-owner-and-route-poll-update-and-cancel",
+        );
         let alpha_seen = Arc::new(Mutex::new(Vec::new()));
         let beta_seen = Arc::new(Mutex::new(Vec::new()));
         let mut router = Router::new();
@@ -5319,7 +5434,9 @@ mod tests {
 
     #[test]
     fn task_results_require_both_sides_to_advertise_the_extension() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-task-results-require-both-sides-to-advertise-the-extension");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-task-results-require-both-sides-to-advertise-the-extension",
+        );
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut router = Router::new();
         router.add(task_server("tasks", Arc::clone(&seen)));
@@ -5533,7 +5650,9 @@ mod tests {
 
     #[test]
     fn a_probe_timeout_does_not_respawn_while_other_calls_succeed() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-a-probe-timeout-does-not-respawn-while-other-calls-succeed");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-a-probe-timeout-does-not-respawn-while-other-calls-succeed",
+        );
         let (router, gate, spawns) = gated_router(true);
         let slot = router.slot_for("s").unwrap();
         // The breaker's cooldown has elapsed: the next calls are half-open probes.
@@ -5556,7 +5675,9 @@ mod tests {
 
     #[test]
     fn a_probe_timeout_leaves_a_sibling_call_that_is_still_running() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-a-probe-timeout-leaves-a-sibling-call-that-is-still-running");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-a-probe-timeout-leaves-a-sibling-call-that-is-still-running",
+        );
         let (router, gate, late, spawns) = gated_router_with_late(true);
         let slot = router.slot_for("s").unwrap();
         slot.breaker.lock().unwrap().consecutive_failures = BREAKER_FAILURE_THRESHOLD;
@@ -5591,7 +5712,9 @@ mod tests {
 
     #[test]
     fn a_server_that_answers_during_its_respawn_is_kept() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-a-server-that-answers-during-its-respawn-is-kept");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-a-server-that-answers-during-its-respawn-is-kept",
+        );
         let gate = closed_gate();
         open_gate(&gate);
         let (spawning_tx, spawning_rx) = std::sync::mpsc::channel();
@@ -5639,7 +5762,9 @@ mod tests {
 
     #[test]
     fn a_probe_timeout_respawns_a_connection_nothing_got_through() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-a-probe-timeout-respawns-a-connection-nothing-got-through");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-a-probe-timeout-respawns-a-connection-nothing-got-through",
+        );
         let (router, gate, spawns) = gated_router(true);
         let slot = router.slot_for("s").unwrap();
         slot.breaker.lock().unwrap().consecutive_failures = BREAKER_FAILURE_THRESHOLD;
@@ -5651,7 +5776,9 @@ mod tests {
 
     #[test]
     fn concurrent_timeouts_count_as_one_breaker_failure() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-concurrent-timeouts-count-as-one-breaker-failure");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-concurrent-timeouts-count-as-one-breaker-failure",
+        );
         let (router, gate, spawns) = gated_router(true);
         let slot = router.slot_for("s").unwrap();
         let calls: Vec<_> = (0..BREAKER_FAILURE_THRESHOLD)
@@ -5736,7 +5863,9 @@ mod tests {
 
     #[test]
     fn a_slow_concurrent_call_does_not_hold_the_slot_lock() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-a-slow-concurrent-call-does-not-hold-the-slot-lock");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-a-slow-concurrent-call-does-not-hold-the-slot-lock",
+        );
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let mut router = Router::new();
         router.add(
@@ -5801,7 +5930,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn p09_rejected_frame_never_replays_and_next_call_reconnects() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-p09-rejected-frame-never-replays-and-next-call-reconnects");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-p09-rejected-frame-never-replays-and-next-call-reconnects",
+        );
         struct Scratch(std::path::PathBuf);
         impl Drop for Scratch {
             fn drop(&mut self) {
@@ -5974,7 +6105,9 @@ for line in sys.stdin:
     #[cfg(unix)]
     #[test]
     fn p09_always_oversized_server_trips_breaker_until_cooldown() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-p09-always-oversized-server-trips-breaker-until-cooldown");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-p09-always-oversized-server-trips-breaker-until-cooldown",
+        );
         struct Scratch(std::path::PathBuf);
         impl Drop for Scratch {
             fn drop(&mut self) {
@@ -6345,7 +6478,9 @@ for line in sys.stdin:
 
     #[test]
     fn replay_policy_preserves_classified_retry_for_tool_calls() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-replay-policy-preserves-classified-retry-for-tool-calls");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-replay-policy-preserves-classified-retry-for-tool-calls",
+        );
         let (server, attempts) = retry_server_inspectable("retry", 1);
         let mut router = Router::new();
         router.add(server);
@@ -6420,7 +6555,9 @@ for line in sys.stdin:
 
     #[test]
     fn replay_policy_uncertain_mutation_keeps_failure_when_factory_is_missing_or_fails() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-replay-policy-uncertain-mutation-keeps-failure-when-factory-is-missing-or-fails");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-replay-policy-uncertain-mutation-keeps-failure-when-factory-is-missing-or-fails",
+        );
         for failed_factory in [false, true] {
             let effects = Arc::new(AtomicU32::new(0));
             let reconnect: Option<Reconnect> = if failed_factory {
@@ -6445,7 +6582,9 @@ for line in sys.stdin:
 
     #[test]
     fn replay_policy_cancellation_during_uncertain_reconnect_does_not_emit_another_effect() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-replay-policy-cancellation-during-uncertain-reconnect-does-not-emit-another-effect");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-replay-policy-cancellation-during-uncertain-reconnect-does-not-emit-another-effect",
+        );
         let effects = Arc::new(AtomicU32::new(0));
         let fresh_effects = Arc::clone(&effects);
         let cancellations = CancelRegistry::new();
@@ -7086,7 +7225,9 @@ for line in sys.stdin:
 
     #[test]
     fn replacing_a_root_slot_shares_unrelated_connections_and_rebuilds_its_catalog() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-replacing-a-root-slot-shares-unrelated-connections-and-rebuilds-its-catalog");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-replacing-a-root-slot-shares-unrelated-connections-and-rebuilds-its-catalog",
+        );
         let mut base = Router::new();
         base.add(mock_server("ordinary"));
         base.add(mock_server("rooted"));
@@ -7179,7 +7320,9 @@ for line in sys.stdin:
 
     #[test]
     fn quarantine_follows_a_renamed_tool_by_its_exposed_name() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-quarantine-follows-a-renamed-tool-by-its-exposed-name");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-quarantine-follows-a-renamed-tool-by-its-exposed-name",
+        );
         // #423: quarantine is keyed by the client-facing (exposed) name. A tool renamed
         // via an override must be quarantined under its RENAMED name, and blocking must
         // key on that same name. The old code evaluated the policy on the pre-rename base
@@ -7219,7 +7362,9 @@ for line in sys.stdin:
 
     #[test]
     fn a_stale_pre_rename_quarantine_entry_does_not_block_the_renamed_tool() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-a-stale-pre-rename-quarantine-entry-does-not-block-the-renamed-tool");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-a-stale-pre-rename-quarantine-entry-does-not-block-the-renamed-tool",
+        );
         // The mirror of the above: quarantining the OLD exposed name (srv__echo) must NOT
         // block the tool now exposed as "say", so the fix doesn't just swap which name is
         // wrong. A stale entry from before a rename is inert, not a silent block.
@@ -7466,7 +7611,9 @@ for line in sys.stdin:
 
     #[test]
     fn adopt_restored_routes_reroutes_a_guarded_rebuild() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-adopt-restored-routes-reroutes-a-guarded-rebuild");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-adopt-restored-routes-reroutes-a-guarded-rebuild",
+        );
         // A rebuild guard keeps the previous catalog for a server whose fresh
         // connect implausibly shrank (40 -> 3). The rebuilt router was indexed
         // from the degraded connect, so route_of misses the 37 restored tools
@@ -7829,7 +7976,9 @@ for line in sys.stdin:
 
     #[test]
     fn requarantine_restores_a_re_approved_tool_without_a_rebuild() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-requarantine-restores-a-re-approved-tool-without-a-rebuild");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-requarantine-restores-a-re-approved-tool-without-a-rebuild",
+        );
         // Regression for SOU-292: re-approving a quarantined tool left it blocked in the
         // running gateway. The refresh path could ADD to the quarantine set but never
         // REMOVE from it, and because `route_call` reads the materialized `blocked` map,
@@ -7889,7 +8038,9 @@ for line in sys.stdin:
 
     #[test]
     fn sbs871_fail_closed_catalog_hides_every_tool_until_requarantine() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-sbs871-fail-closed-catalog-hides-every-tool-until-requarantine");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-sbs871-fail-closed-catalog-hides-every-tool-until-requarantine",
+        );
         // SBS-871: a cold-start store Err has no prior live set, so the whole
         // catalog stays hidden until a later successful read installs a set.
         let mut policy = ToolPolicy::default();
@@ -8155,7 +8306,9 @@ for line in sys.stdin:
 
     #[test]
     fn route_call_passes_cancel_context_to_transport() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-route-call-passes-cancel-context-to-transport");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-route-call-passes-cancel-context-to-transport",
+        );
         struct CancelAware {
             saw_cancel: Arc<AtomicBool>,
         }
@@ -8241,7 +8394,9 @@ for line in sys.stdin:
 
     #[test]
     fn team_feature_protections_keep_destructive_tools_exposed_and_callable() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-team-feature-protections-keep-destructive-tools-exposed-and-callable");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-team-feature-protections-keep-destructive-tools-exposed-and-callable",
+        );
         for policy in [
             serde_json::json!({"forceQuarantineOnDrift": true}),
             serde_json::json!({"forceBlockOnInjection": true}),
@@ -8300,7 +8455,9 @@ for line in sys.stdin:
 
     #[test]
     fn tool_scope_allow_list_hides_and_blocks_non_listed_tools() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-tool-scope-allow-list-hides-and-blocks-non-listed-tools");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-tool-scope-allow-list-hides-and-blocks-non-listed-tools",
+        );
         // A profile's per-server allow-list ("FeatureSet"): the server exposes ONLY the
         // listed tool; the rest are both hidden from the catalog and blocked on a direct call.
         let mut allow = HashMap::new();
@@ -8640,7 +8797,9 @@ for line in sys.stdin:
     /// and call B to the SAME server would block until A's retry completed.
     #[test]
     fn same_server_lock_released_during_backoff_sleep() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-same-server-lock-released-during-backoff-sleep");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-same-server-lock-released-during-backoff-sleep",
+        );
         let (server, entries) = retry_server_inspectable("srv", 1);
         let mut router = Router::new();
         router.add(server);
@@ -8676,7 +8835,9 @@ for line in sys.stdin:
 
     #[test]
     fn cancellation_during_backoff_prevents_the_retry_attempt() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-cancellation-during-backoff-prevents-the-retry-attempt");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-cancellation-during-backoff-prevents-the-retry-attempt",
+        );
         let (server, entries) = retry_server_inspectable("cancel-retry", 1);
         let mut router = Router::new();
         router.add(server);
@@ -9191,7 +9352,9 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_busy_inner_never_blocks_degrade_or_lifecycle_inspection() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-busy-inner-never-blocks-degrade-or-lifecycle-inspection");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-supervisor-busy-inner-never-blocks-degrade-or-lifecycle-inspection",
+        );
         let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
         router.prepare_lazy_use("s");
         ready_supervisor(&mut router);
@@ -9234,7 +9397,9 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_demand_shortens_long_backoff_and_ready_resets_failures() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-demand-shortens-long-backoff-and-ready-resets-failures");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-supervisor-demand-shortens-long-backoff-and-ready-resets-failures",
+        );
         let calls = Arc::new(AtomicU64::new(0));
         let mut router = supervised_fixture(flaky_connect("s", 1, Arc::clone(&calls)));
         let slot = Arc::clone(&router.servers[0]);
@@ -9262,7 +9427,9 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_every_dispatch_waits_after_idle_stop_including_approved_tools() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-every-dispatch-waits-after-idle-stop-including-approved-tools");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-supervisor-every-dispatch-waits-after-idle-stop-including-approved-tools",
+        );
         let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
         router.prepare_lazy_use("s");
         ready_supervisor(&mut router);
@@ -9301,7 +9468,9 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_subscriptions_keep_idle_connections_warm_until_last_holder_leaves() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-subscriptions-keep-idle-connections-warm-until-last-holder-leaves");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-supervisor-subscriptions-keep-idle-connections-warm-until-last-holder-leaves",
+        );
         let subscribed = Arc::new(AtomicBool::new(true));
         let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
         let used = Arc::clone(&subscribed);
@@ -9330,12 +9499,17 @@ for line in sys.stdin:
         let inner = router.servers[0].inner.lock().unwrap();
         assert!(router.raw_catalogs().is_none());
         drop(inner);
-        assert_eq!(router.raw_catalogs().unwrap()["s"].materialize(0)["name"], "echo");
+        assert_eq!(
+            router.raw_catalogs().unwrap()["s"].materialize(0)["name"],
+            "echo"
+        );
     }
 
     #[test]
     fn supervisor_background_and_connect_auth_retry_after_backoff() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-background-and-connect-auth-retry-after-backoff");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-supervisor-background-and-connect-auth-retry-after-backoff",
+        );
         let calls = Arc::new(AtomicU64::new(0));
         let mut router = supervised_fixture(flaky_connect("s", 1, Arc::clone(&calls)));
         router.servers[0].start(true);
@@ -9419,7 +9593,9 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_idle_stop_keeps_catalog_and_active_calls_keep_it_warm() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-idle-stop-keeps-catalog-and-active-calls-keep-it-warm");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-supervisor-idle-stop-keeps-catalog-and-active-calls-keep-it-warm",
+        );
         let calls = Arc::new(AtomicU64::new(0));
         let mut router = supervised_fixture(flaky_connect("s", 0, Arc::clone(&calls)));
         router.servers[0].start(true);
@@ -9526,7 +9702,9 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_waiter_on_a_replaced_start_fails_fast_and_discards_its_result() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-waiter-on-a-replaced-start-fails-fast-and-discards-its-result");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-supervisor-waiter-on-a-replaced-start-fails-fast-and-discards-its-result",
+        );
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = Arc::new(Mutex::new(release_rx));
         let calls = Arc::new(AtomicU64::new(0));
@@ -9592,7 +9770,9 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_results_wait_for_integrity_publication_and_removed_starts_are_discarded() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-results-wait-for-integrity-publication-and-removed-starts-are-discarded");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-supervisor-results-wait-for-integrity-publication-and-removed-starts-are-discarded",
+        );
         let mut router = supervised_fixture(flaky_connect("s", 0, Arc::new(AtomicU64::new(0))));
         router.servers[0].start(true);
         assert!(wait_until(|| router.has_ready_reconnects()));
@@ -9629,7 +9809,9 @@ for line in sys.stdin:
 
     #[test]
     fn supervisor_recovers_an_uncertain_call_without_replaying_its_effect() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-supervisor-recovers-an-uncertain-call-without-replaying-its-effect");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-supervisor-recovers-an-uncertain-call-without-replaying-its-effect",
+        );
         let effects = Arc::new(AtomicU32::new(0));
         let fresh_effects = Arc::clone(&effects);
         let connect: Connect = Arc::new(move || {
@@ -9752,7 +9934,9 @@ for line in sys.stdin:
 
     #[test]
     fn an_auth_failure_is_never_retried_on_a_schedule_or_by_demand() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-an-auth-failure-is-never-retried-on-a-schedule-or-by-demand");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-an-auth-failure-is-never-retried-on-a-schedule-or-by-demand",
+        );
         let calls = Arc::new(AtomicU64::new(0));
         let counted = Arc::clone(&calls);
         let connect: Connect = Arc::new(move || {
@@ -9785,7 +9969,9 @@ for line in sys.stdin:
 
     #[test]
     fn a_pending_server_joins_the_catalog_in_build_order_after_retries() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-a-pending-server-joins-the-catalog-in-build-order-after-retries");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-a-pending-server-joins-the-catalog-in-build-order-after-retries",
+        );
         let calls = Arc::new(AtomicU64::new(0));
         let mut router = Router::new();
         router.add(mock_server("alpha"));
@@ -9937,7 +10123,9 @@ for line in sys.stdin:
     /// and completions alike. Unsubscribe cleanup still reaches it.
     #[test]
     fn authorize_refuses_every_dispatch_to_a_server_outside_the_policy() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-authorize-refuses-every-dispatch-to-a-server-outside-the-policy");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-authorize-refuses-every-dispatch-to-a-server-outside-the-policy",
+        );
         let mut router = Router::with_policy(ToolPolicy {
             servers: Some(HashSet::from(["a".to_string()])),
             ..Default::default()
@@ -9981,7 +10169,9 @@ for line in sys.stdin:
     /// the connections it already holds, with no rebuild, and leaves quarantine alone.
     #[test]
     fn republished_registry_policy_applies_without_reconnecting() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-republished-registry-policy-applies-without-reconnecting");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-republished-registry-policy-applies-without-reconnecting",
+        );
         let mut router = Router::with_policy(ToolPolicy {
             servers: Some(HashSet::from(["db".to_string()])),
             ..Default::default()
@@ -10069,7 +10259,9 @@ for line in sys.stdin:
     /// updated, but it can still be cancelled, like unsubscribe cleanup.
     #[test]
     fn task_cancel_still_reaches_a_server_that_was_turned_off() {
-        let _data = crate::registry::DataDirTestEnv::new("f3-task-cancel-still-reaches-a-server-that-was-turned-off");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "f3-task-cancel-still-reaches-a-server-that-was-turned-off",
+        );
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut router = Router::with_policy(ToolPolicy {
             servers: Some(HashSet::from(["alpha".to_string()])),

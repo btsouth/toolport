@@ -4638,20 +4638,44 @@ fn execute_call(
     {
         return json!({"content": [{"type": "text", "text": STALE_LIVE_VIEW}], "isError": true});
     }
-    // Resolve a cold owner only through the collision-safe registry map. Scope
-    // and tool policy are checked before demand so a rejected call cannot spawn
-    // a server; a blocked tool falls through to the usual policy refusal.
+    // Resolve existence before the approval gate. A cold name can demand only
+    // its visible owner, and catalog publication stays within the first-list budget.
     let mut fresh = clone_live_router(live_router);
-    if let Some(view) = &fresh {
-        if let Some(owner) = owner_of_exposed_tool(Some(view), &unique_prefix_owners(reg), name) {
-            if allowed.is_some_and(|set| !server_in_allowed_scope(&owner, set)) {
-                return json!({"content": [{"type": "text", "text": format!(
-                    "Toolport: '{}' is not available to this client.", sanitize_segment(&owner)
-                )}], "isError": true});
-            }
-            if view.authorize(DispatchTarget::Tool(name)).is_ok() {
-                if let Err(message) = view.wait_for_server(&owner, cancel.as_ref(), false) {
-                    return json!({"content": [{"type": "text", "text": format!("Toolport: {message}")}], "isError": true});
+    let view = fresh.as_deref().unwrap_or(router);
+    let owners = unique_prefix_owners(reg);
+    if let Some(owner) = owner_of_exposed_tool(Some(view), &owners, name) {
+        let in_scope = allowed.is_none_or(|set| server_in_allowed_scope(&owner, set));
+        if !in_scope && view.tool_owner(name).is_some() {
+            return json!({"content": [{"type": "text", "text": format!(
+                "Blocked by Toolport: {name} is turned off for this client. Change it in Toolport > Clients."
+            )}], "isError": true});
+        }
+        if in_scope && view.authorize(DispatchTarget::Tool(name)).is_ok() {
+            view.prepare_lazy_use(&owner);
+            view.kick_pending(name, |id| id == owner);
+            if view.route_of(name).is_none() && fresh.is_some() {
+                let deadline = Instant::now() + FIRST_CATALOG_WAIT;
+                let mut seen = started_supervisors();
+                loop {
+                    let view = fresh.as_deref().unwrap_or(router);
+                    let loading = view.any_discovering(|id| id == owner)
+                        || view.any_publishing_first_catalog(|id| id == owner)
+                        || view.kick_pending(name, |id| id == owner).is_some();
+                    if view.route_of(name).is_some()
+                        || view.is_blocked(name)
+                        || !loading
+                        || Instant::now() >= deadline
+                        || cancel
+                            .as_ref()
+                            .is_some_and(downstream::CancelContext::is_cancelled)
+                    {
+                        break;
+                    }
+                    seen = wait_for_started_supervisor(
+                        seen,
+                        deadline.min(Instant::now() + Duration::from_millis(25)),
+                    );
+                    fresh = clone_live_router(live_router);
                 }
                 fresh = clone_live_router(live_router);
             }
@@ -4663,6 +4687,23 @@ fn execute_call(
         .as_ref()
         .map(|tools| tools as &dyn ToolCatalog)
         .unwrap_or(cached);
+    let visible = |server: &str| allowed.is_none_or(|set| server_in_allowed_scope(server, set));
+    if let Some(owner) = router.tool_owner(name) {
+        if visible(owner) {
+            if let Err(mut message) = router.authorize(DispatchTarget::Tool(name)) {
+                if message.contains("Strict safety")
+                    && reg.safety_level_team_floor() == registry::SafetyLevel::Strict
+                {
+                    message = format!("Blocked by Toolport: {name} is blocked by your team's Strict safety policy. Ask your team admin to change it.");
+                }
+                return json!({"content": [{"type": "text", "text": message}], "isError": true});
+            }
+        }
+    }
+    if router.route_of(name).is_none() {
+        let message = router.no_route_message_within(name, visible);
+        return json!({"content": [{"type": "text", "text": message}], "isError": true});
+    }
     let mut confirmed = false;
     let shape = opts.shape;
     if !opts.allow_app_only && !named_tool_is_model_visible(name, cached, router) {
@@ -4780,7 +4821,7 @@ fn execute_call(
     // Fail-closed (no broker / no answer / timeout all deny). Skipped once `confirmed`.
     if (reg.human_approval_effective() || resuming_modern_hitl) && !confirmed {
         // Resolve destructiveness robustly: cache, then live router, else
-        // fail-closed (an unknown tool must not skip the human gate).
+        // fail-closed for known tools whose metadata is unavailable.
         let is_dest = tool_is_destructive_fail_closed(name, cached, router);
         // Untrusted provenance = the same shared/registry signal the SSRF guard
         // uses. Match on the REAL server id from `route_of` (not the sanitized
@@ -4820,6 +4861,16 @@ fn execute_call(
                     .flatten()
             });
         if let Some(reason) = gate_reason {
+            if !resuming_modern_hitl {
+                audit::record_approval_raised(
+                    reg,
+                    server_id,
+                    tool,
+                    client,
+                    approval_reason_token(reason),
+                    &arguments,
+                );
+            }
             // The exact call being approved, content-bound: the bytes that RUN must
             // hash-match these. Modern clients park the decision behind an opaque
             // requestState and re-enter after elicitation; legacy clients retain the
@@ -8307,7 +8358,7 @@ fn owner_of_exposed_tool(
     owners: &HashMap<String, String>,
     name: &str,
 ) -> Option<String> {
-    if let Some((server, _)) = router.and_then(|r| r.route_of(name)) {
+    if let Some(server) = router.and_then(|r| r.tool_owner(name)) {
         return Some(server.to_string());
     }
     let prefix = match grouped_help_target(name) {
@@ -10115,8 +10166,9 @@ type IntegrityCheckFailure = (String, BTreeSet<String>);
 /// prove the drifted definition is never published in the first place. Registered and
 /// consumed on one thread, so a parallel test's gate cannot trigger it.
 #[cfg(test)]
-static INTEGRITY_GATE_OBSERVER: Mutex<Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>> =
-    Mutex::new(None);
+static INTEGRITY_GATE_OBSERVER: Mutex<
+    Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>,
+> = Mutex::new(None);
 
 #[cfg(test)]
 fn observe_integrity_gate() {
@@ -15434,9 +15486,17 @@ fn process_request_wire(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let reg = state.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        base.any_missing_catalog(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
-            || state.cached_tools.lock().map(|c| !has_scoped_tools(&c.tools, allowed, &base, &reg)).unwrap_or(true)
+        let reg = state
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        base.any_missing_catalog(|id| {
+            allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
+        }) || state
+            .cached_tools
+            .lock()
+            .map(|c| !has_scoped_tools(&c.tools, allowed, &base, &reg))
+            .unwrap_or(true)
     };
     let started = Instant::now();
     let mut response = process_request_wire_inner(
@@ -15457,7 +15517,13 @@ fn process_request_wire(
             started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             cold,
             client,
-            response.as_ref().is_some_and(|r| r.envelope.get("error").is_none() && r.envelope.pointer("/result/isError").and_then(Value::as_bool) != Some(true)),
+            response.as_ref().is_some_and(|r| {
+                r.envelope.get("error").is_none()
+                    && r.envelope
+                        .pointer("/result/isError")
+                        .and_then(Value::as_bool)
+                        != Some(true)
+            }),
         );
     }
     // One-way HTTP messages finish here rather than at a JSON-RPC reply write.
@@ -19242,12 +19308,7 @@ fn proxy_public_http_connection(
     }
     // The daemon detects the public caller's full socket close. Keep the write
     // side open during the relay so waiting callers do not appear abandoned.
-    let _ = relay_http_response(
-        &mut client,
-        &mut upstream,
-        Arc::new(|| {}),
-        Arc::new(|| {}),
-    );
+    let _ = relay_http_response(&mut client, &mut upstream, Arc::new(|| {}), Arc::new(|| {}));
 }
 
 /// The desktop keeps this lightweight public listener as its child. The heavy
@@ -20091,7 +20152,10 @@ fn handle_connection(
         ),
         (b"Access-Control-Allow-Headers", allow_headers.as_bytes()),
         // Browser clients need session identity and untrusted-data provenance.
-        (b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()),
+        (
+            b"Access-Control-Expose-Headers",
+            EXPOSED_HTTP_HEADERS.as_bytes(),
+        ),
     ];
     for (name, value) in cors {
         // Skip a header that won't encode rather than panicking the thread.
@@ -20381,11 +20445,13 @@ fn main() {
                         "{}",
                         serde_json::to_string(&results).expect("serializable disconnect results")
                     );
-                    conduit_lib::telemetry::exit_with(if results.iter().any(|result| result.error.is_some()) {
-                        1
-                    } else {
-                        0
-                    });
+                    conduit_lib::telemetry::exit_with(
+                        if results.iter().any(|result| result.error.is_some()) {
+                            1
+                        } else {
+                            0
+                        },
+                    );
                 }
                 Err(error) => {
                     eprintln!("toolport-gateway --disconnect-all: {error}");
@@ -24431,13 +24497,20 @@ mod tests {
         let reference = "op://v/rooted-restart/key";
         let mut server = stub_server("root-ref", "Root ref");
         server.cwd = Some("${ROOT}".into());
-        server.env.push(serde_json::from_value(json!({"key":"TOKEN","secret":true,"source":{"ref":reference}})).unwrap());
+        server.env.push(
+            serde_json::from_value(json!({"key":"TOKEN","secret":true,"source":{"ref":reference}}))
+                .unwrap(),
+        );
         let cached = |value| conduit_lib::secret_refs::test_cached_value(reference, value);
         let mut pool = RootLaunchPool::default();
         pool.refresh_specs(vec![server.clone()], 0);
         assert_eq!(cached("old"), "old");
         pool.refresh_specs(vec![server.clone()], 0);
-        assert_eq!(cached("unchanged"), "old", "unchanged startup specs reuse their read");
+        assert_eq!(
+            cached("unchanged"),
+            "old",
+            "unchanged startup specs reuse their read"
+        );
         let mut changed = server.clone();
         changed.args.push("--changed".into());
         pool.refresh_specs(vec![changed], 0);
@@ -24455,12 +24528,15 @@ mod tests {
         let root = _env.dir.display().to_string();
         let key = root_launch_keys(&[server.clone()], &root, 0).remove(0);
         let view = readonly_router(&server.id, "Root cache");
-        state.root_launch_pool.lock().unwrap().launches.insert(key, RootLaunch {
-            slot: view.server_slot(&server.id).unwrap(),
-            subscriptions: Arc::new(Mutex::new(ResourceSubscriptionTable::default())),
-            subscription_key: (server.id.clone(), root),
-            active: Arc::new(AtomicBool::new(true)),
-        });
+        state.root_launch_pool.lock().unwrap().launches.insert(
+            key,
+            RootLaunch {
+                slot: view.server_slot(&server.id).unwrap(),
+                subscriptions: Arc::new(Mutex::new(ResourceSubscriptionTable::default())),
+                subscription_key: (server.id.clone(), root),
+                active: Arc::new(AtomicBool::new(true)),
+            },
+        );
         state.reap_root_launches();
         assert!(state.root_launch_pool.lock().unwrap().launches.is_empty());
         assert_eq!(cached("after-idle"), "after-idle");
@@ -25886,7 +25962,14 @@ mod tests {
             assert!(row["clientLabel"].is_string());
         }
         let retained = serde_json::to_string(&rows).unwrap();
-        for private in ["f3-private-argument", "f3-private-thrown", "throw new Error", "toolport.call"] { assert!(!retained.contains(private), "{retained}"); }
+        for private in [
+            "f3-private-argument",
+            "f3-private-thrown",
+            "throw new Error",
+            "toolport.call",
+        ] {
+            assert!(!retained.contains(private), "{retained}");
+        }
     }
 
     #[test]
@@ -27633,7 +27716,9 @@ mod tests {
     /// rebuild and let the loser's Drop kill mid-flight work.
     #[test]
     fn one_host_backs_every_session_with_the_same_router_and_registry() {
-        let _data = DataDirTestEnv::new("f3-one-host-backs-every-session-with-the-same-router-and-registry");
+        let _data = DataDirTestEnv::new(
+            "f3-one-host-backs-every-session-with-the-same-router-and-registry",
+        );
         let first = http_state(true);
         let second = first.clone();
 
@@ -28095,14 +28180,7 @@ mod tests {
 
         let listener_inflight = Arc::clone(&inflight);
         std::thread::spawn(move || {
-            serve_http_loop_with_inflight(
-                server,
-                state,
-                None,
-                search,
-                true,
-                listener_inflight,
-            )
+            serve_http_loop_with_inflight(server, state, None, search, true, listener_inflight)
         });
         std::thread::sleep(Duration::from_millis(50));
 
@@ -29511,10 +29589,19 @@ mod tests {
     #[test]
     fn session_notifications_count_only_complete_successful_flushes() {
         let _data = DataDirTestEnv::new("session-notification-delivery");
-        let observed = observation::Session::start(None, Some("Unknown app (via Cursor)"), Some("kt 1"), "http", "initialize");
+        let observed = observation::Session::start(
+            None,
+            Some("Unknown app (via Cursor)"),
+            Some("kt 1"),
+            "http",
+            "initialize",
+        );
         let session = Arc::new(SessionState::new_http(None));
         *session.observation.lock().unwrap() = Some(observed.clone());
-        assert!(session.push_message(json!({"jsonrpc":"2.0", "method":"notifications/tools/list_changed"}).to_string(), None));
+        assert!(session.push_message(
+            json!({"jsonrpc":"2.0", "method":"notifications/tools/list_changed"}).to_string(),
+            None
+        ));
         assert_eq!(audit::recent_sessions(1).unwrap()[0]["listChangedCount"], 0);
         let mut reader = McpSseReader::new(session.clone());
         let mut bytes = [0; 8192];
@@ -29522,18 +29609,33 @@ mod tests {
         assert_eq!(audit::recent_sessions(1).unwrap()[0]["listChangedCount"], 0);
         struct Failing;
         impl Write for Failing {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { Err(std::io::ErrorKind::BrokenPipe.into()) }
-            fn flush(&mut self) -> std::io::Result<()> { Err(std::io::ErrorKind::BrokenPipe.into()) }
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
         }
-        let mut failed = DeliveryWriter { inner: Failing, session: session.clone(), pending: reader.pending_deliveries.clone() };
+        let mut failed = DeliveryWriter {
+            inner: Failing,
+            session: session.clone(),
+            pending: reader.pending_deliveries.clone(),
+        };
         assert!(failed.flush().is_err());
         assert_eq!(audit::recent_sessions(1).unwrap()[0]["listChangedCount"], 0);
-        let mut successful = DeliveryWriter { inner: Vec::<u8>::new(), session: session.clone(), pending: reader.pending_deliveries.clone() };
+        let mut successful = DeliveryWriter {
+            inner: Vec::<u8>::new(),
+            session: session.clone(),
+            pending: reader.pending_deliveries.clone(),
+        };
         successful.flush().unwrap();
         successful.flush().unwrap();
         assert_eq!(audit::recent_sessions(1).unwrap()[0]["listChangedCount"], 1);
         session.close();
-        assert_eq!(audit::recent_sessions(1).unwrap()[0]["reason"], "client_disconnect");
+        assert_eq!(
+            audit::recent_sessions(1).unwrap()[0]["reason"],
+            "client_disconnect"
+        );
     }
 
     #[test]
@@ -29580,7 +29682,17 @@ mod tests {
         let guard = SearchGuard::default();
         let init = handle_http(&state, &guard, "POST", "/mcp", &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"kt","version":"1"},"capabilities":{}}}).to_string(), None, None, None, None);
         let sid = mcp_session_of(&init);
-        let list = handle_http(&state, &guard, "POST", "/mcp", &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}).to_string(), Some(&sid), None, None, None);
+        let list = handle_http(
+            &state,
+            &guard,
+            "POST",
+            "/mcp",
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}).to_string(),
+            Some(&sid),
+            None,
+            None,
+            None,
+        );
         assert_eq!(audit::recent_sessions(1).unwrap()[0]["toolsListCount"], 0);
         let (session, delivery) = list.catalog_delivery.unwrap();
         session.list_delivered(delivery);
@@ -29588,7 +29700,17 @@ mod tests {
         assert_eq!(rows[0]["clientLabel"], "kt 1");
         assert_eq!(rows[0]["toolsListCount"], 1);
         assert!(rows[0]["firstCatalogSize"].as_u64().unwrap() > 0);
-        let delete = handle_http(&state, &guard, "DELETE", "/mcp", "", Some(&sid), None, None, None);
+        let delete = handle_http(
+            &state,
+            &guard,
+            "DELETE",
+            "/mcp",
+            "",
+            Some(&sid),
+            None,
+            None,
+            None,
+        );
         assert_eq!(delete.status, 204);
         let closed = audit::recent_sessions(1).unwrap();
         assert_eq!(closed[0]["sessionId"], rows[0]["sessionId"]);
@@ -30030,7 +30152,9 @@ mod tests {
 
     #[test]
     fn modern_http_transport_headers_gate_dispatch_and_map_protocol_statuses() {
-        let _data = DataDirTestEnv::new("f3-modern-http-transport-headers-gate-dispatch-and-map-protocol-statuses");
+        let _data = DataDirTestEnv::new(
+            "f3-modern-http-transport-headers-gate-dispatch-and-map-protocol-statuses",
+        );
         let state = http_state(true);
         let body = modern_http_body(1, "tools/list", json!({}));
 
@@ -30253,7 +30377,9 @@ mod tests {
 
     #[test]
     fn modern_http_scope_is_resolved_per_request_not_from_session_state() {
-        let _data = DataDirTestEnv::new("f3-modern-http-scope-is-resolved-per-request-not-from-session-state");
+        let _data = DataDirTestEnv::new(
+            "f3-modern-http-scope-is-resolved-per-request-not-from-session-state",
+        );
         let state = http_state(false);
         {
             let mut reg = state.registry.lock().unwrap();
@@ -30525,7 +30651,9 @@ mod tests {
 
     #[test]
     fn modern_http_subscription_listen_is_sessionless_tagged_and_filtered() {
-        let _data = DataDirTestEnv::new("f3-modern-http-subscription-listen-is-sessionless-tagged-and-filtered");
+        let _data = DataDirTestEnv::new(
+            "f3-modern-http-subscription-listen-is-sessionless-tagged-and-filtered",
+        );
         let state = http_state(true);
         let search = SearchGuard::default();
         let caller = test_caller("client:modern", None);
@@ -30674,7 +30802,9 @@ mod tests {
 
     #[test]
     fn modern_subscription_listen_rejects_bad_filters_without_a_session() {
-        let _data = DataDirTestEnv::new("f3-modern-subscription-listen-rejects-bad-filters-without-a-session");
+        let _data = DataDirTestEnv::new(
+            "f3-modern-subscription-listen-rejects-bad-filters-without-a-session",
+        );
         let state = http_state(true);
         let out = handle_http_with_headers(
             &state,
@@ -30702,7 +30832,9 @@ mod tests {
 
     #[test]
     fn modern_http_listeners_do_not_collide_across_instances_of_one_client() {
-        let _data = DataDirTestEnv::new("f3-modern-http-listeners-do-not-collide-across-instances-of-one-client");
+        let _data = DataDirTestEnv::new(
+            "f3-modern-http-listeners-do-not-collide-across-instances-of-one-client",
+        );
         let state = http_state(true);
         let caller = test_caller("client:shared-token", None);
         let body = modern_http_body(
@@ -30750,7 +30882,9 @@ mod tests {
 
     #[test]
     fn cancelling_modern_stdio_listener_releases_its_resource_subscriptions() {
-        let _data = DataDirTestEnv::new("f3-cancelling-modern-stdio-listener-releases-its-resource-subscriptions");
+        let _data = DataDirTestEnv::new(
+            "f3-cancelling-modern-stdio-listener-releases-its-resource-subscriptions",
+        );
         let state = http_state(true);
         let id = json!("listen-1");
         let key = modern_subscription_key(None, &id, ModernSubscriptionTransport::Stdio);
@@ -31599,7 +31733,8 @@ mod tests {
         );
         assert_eq!(unknown["isError"], true, "got {unknown}");
         assert_eq!(
-            unknown["content"][0]["text"], "no route for tool 'no_such_tool'",
+            unknown["content"][0]["text"],
+            "Unknown tool: no_such_tool\nUse toolport_search_tools to find tools.",
             "an unknown tool is not a scope denial for an empty server id"
         );
 
@@ -31638,7 +31773,7 @@ mod tests {
         let out_of_scope = format!("mcp__toolport__{team_name}");
         assert_eq!(
             alias_text(&out_of_scope),
-            format!("no route for tool '{out_of_scope}'")
+            format!("Unknown tool: {out_of_scope}\nUse toolport_search_tools to find tools.")
         );
     }
 
@@ -31983,7 +32118,9 @@ mod tests {
 
     #[test]
     fn http_roots_refresh_updates_only_its_session_and_keeps_adapter_cwd_fallback() {
-        let _data = DataDirTestEnv::new("f3-http-roots-refresh-updates-only-its-session-and-keeps-adapter-cwd-fallback");
+        let _data = DataDirTestEnv::new(
+            "f3-http-roots-refresh-updates-only-its-session-and-keeps-adapter-cwd-fallback",
+        );
         let state = http_state(false);
         state.daemon_mode.store(true, Ordering::SeqCst);
         let owner_a = McpSessionOwner {
@@ -32072,7 +32209,9 @@ mod tests {
 
     #[test]
     fn adapter_initialize_seeds_its_session_root_without_changing_other_sessions() {
-        let _data = DataDirTestEnv::new("f3-adapter-initialize-seeds-its-session-root-without-changing-other-sessions");
+        let _data = DataDirTestEnv::new(
+            "f3-adapter-initialize-seeds-its-session-root-without-changing-other-sessions",
+        );
         let state = http_state(false);
         state.daemon_mode.store(true, Ordering::SeqCst);
         let caller = test_caller("adapter:root-test", None);
@@ -33006,7 +33145,9 @@ mod tests {
 
     #[test]
     fn cancelled_modern_registration_rolls_back_earlier_resource_joins() {
-        let _data = DataDirTestEnv::new("f3-cancelled-modern-registration-rolls-back-earlier-resource-joins");
+        let _data = DataDirTestEnv::new(
+            "f3-cancelled-modern-registration-rolls-back-earlier-resource-joins",
+        );
         let state = http_state(false);
         let router = cache_router();
         let id = json!(77);
@@ -33195,7 +33336,9 @@ mod tests {
 
     #[test]
     fn deliver_resource_updated_reaches_only_subscribed_http_sessions() {
-        let _data = DataDirTestEnv::new("f3-deliver-resource-updated-reaches-only-subscribed-http-sessions");
+        let _data = DataDirTestEnv::new(
+            "f3-deliver-resource-updated-reaches-only-subscribed-http-sessions",
+        );
         let state = http_state(false);
         let s1 = match mint_mcp_session(&state, None) {
             Ok(s) => s,
@@ -36405,7 +36548,9 @@ mod tests {
 
     #[test]
     fn p08_lifetime_delete_releases_sessions_lock_before_cancel_hooks() {
-        let _data = DataDirTestEnv::new("f3-p08-lifetime-delete-releases-sessions-lock-before-cancel-hooks");
+        let _data = DataDirTestEnv::new(
+            "f3-p08-lifetime-delete-releases-sessions-lock-before-cancel-hooks",
+        );
         let state = http_state(false);
         let caller = test_caller("adapter:p08-delete-lock", None);
         let key = "adapter-lifetime:p08-delete-lock".to_string();
@@ -36466,7 +36611,9 @@ mod tests {
 
     #[test]
     fn p08_sessionless_same_owner_can_start_the_same_id_on_two_connections() {
-        let _data = DataDirTestEnv::new("f3-p08-sessionless-same-owner-can-start-the-same-id-on-two-connections");
+        let _data = DataDirTestEnv::new(
+            "f3-p08-sessionless-same-owner-can-start-the-same-id-on-two-connections",
+        );
         let state = http_state(false);
         let owner = test_caller("client:shared-token", None).session_owner;
         let first = downstream::CancelRegistry::new();
@@ -37481,7 +37628,11 @@ mod tests {
             (**guard).clone()
         };
 
-        fail_closed_integrity_catalog(&mut live, Some("sbs714-gateway"), set_of(&["srv__new_drift"]));
+        fail_closed_integrity_catalog(
+            &mut live,
+            Some("sbs714-gateway"),
+            set_of(&["srv__new_drift"]),
+        );
 
         assert_eq!(
             live.quarantined(),
@@ -40935,7 +41086,15 @@ mod tests {
             let mut session_ids = Vec::new();
             for query in ["work", "s__work"] {
                 let response = run(search_name, json!({"query":query}));
-                session_ids.push(response.observation.as_ref().unwrap().context().session_id.unwrap());
+                session_ids.push(
+                    response
+                        .observation
+                        .as_ref()
+                        .unwrap()
+                        .context()
+                        .session_id
+                        .unwrap(),
+                );
                 let text = response.envelope["result"]["content"][0]["text"]
                     .as_str()
                     .unwrap();
@@ -40943,20 +41102,35 @@ mod tests {
                 assert_eq!(response.envelope["result"]["isError"], false);
             }
             let response = if observation::telemetry_principal(client).is_some() {
-                let response = run("toolport_call_tool", json!({"name":"s__work", "arguments":{}}));
+                let response = run(
+                    "toolport_call_tool",
+                    json!({"name":"s__work", "arguments":{}}),
+                );
                 assert_eq!(response.envelope["result"]["isError"], false);
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
                 response
             } else {
                 run(search_name, json!({"query":"work"}))
             };
-            session_ids.push(response.observation.as_ref().unwrap().context().session_id.unwrap());
-            assert!(conduit_lib::telemetry::flush_for_test(Duration::from_secs(5)));
+            session_ids.push(
+                response
+                    .observation
+                    .as_ref()
+                    .unwrap()
+                    .context()
+                    .session_id
+                    .unwrap(),
+            );
+            assert!(conduit_lib::telemetry::flush_for_test(Duration::from_secs(
+                5
+            )));
             let rows: Vec<_> = audit::read_all()
                 .unwrap()
                 .into_iter()
                 .filter(|row| {
-                    row["sessionId"].as_str().is_some_and(|id| session_ids.iter().any(|session| session == id))
+                    row["sessionId"]
+                        .as_str()
+                        .is_some_and(|id| session_ids.iter().any(|session| session == id))
                         && (row["kind"] == "internal" || row["tool"] == "work")
                 })
                 .collect();
