@@ -1679,6 +1679,12 @@ pub struct Router {
     /// Public alias -> persisted policy name. Reserved overrides keep their old
     /// policy binding even though clients now see the original namespaced alias.
     policy_names: HashMap<String, String>,
+    /// Server id -> original tool -> exposed name, for every indexed tool, blocked or not.
+    exposed_by_original: HashMap<String, HashMap<String, String>>,
+    /// Server id -> original tool -> policy name in the full-length view this client
+    /// view was derived from. A shorter alias budget can change which override wins
+    /// a collision, but never which quarantine, pin or approval a tool answers to.
+    canonical_policy: HashMap<String, HashMap<String, String>>,
     /// Exposed name -> why it's hidden, for a clear message if a hidden tool is
     /// still called by name (e.g. via toolport_call_tool).
     blocked: HashMap<String, String>,
@@ -1777,7 +1783,11 @@ impl Router {
             return;
         }
         let legacy = self
-            .reserved_policy_name(server, original)
+            .canonical_policy
+            .get(server)
+            .and_then(|tools| tools.get(original))
+            .cloned()
+            .or_else(|| self.reserved_policy_name(server, original))
             .or_else(|| self.legacy_names.get(exposed).cloned());
         let name = legacy.as_deref().unwrap_or(exposed);
         if name == exposed && !name.starts_with("toolport_") {
@@ -1861,12 +1871,21 @@ impl Router {
         original: &str,
         metadata: ToolPolicyMetadata,
     ) -> Option<&'static str> {
+        let name = self.policy_name(exposed);
+        if self.has_canonical_policy(server, original) {
+            return self.policy.blocked_reason(name, server, original, metadata);
+        }
         self.policy
             .blocked_reason(exposed, server, original, metadata)
-            .or_else(|| {
-                self.policy
-                    .blocked_reason(self.policy_name(exposed), server, original, metadata)
-            })
+            .or_else(|| self.policy.blocked_reason(name, server, original, metadata))
+    }
+
+    /// In a shorter client view the public alias can equal another tool's
+    /// canonical identity, so only the canonical policy name may be checked.
+    fn has_canonical_policy(&self, server: &str, original: &str) -> bool {
+        self.canonical_policy
+            .get(server)
+            .is_some_and(|tools| tools.contains_key(original))
     }
 
     /// Preview one server's aliases using the same collision and override rules as dispatch.
@@ -2041,6 +2060,19 @@ impl Router {
         view.policy.allow = allow;
         view.alias_limit = Some(limit.clamp(16, 64));
         if self.alias_limit.unwrap_or(64) != view.alias_limit.unwrap() {
+            view.canonical_policy = self
+                .exposed_by_original
+                .iter()
+                .map(|(server, tools)| {
+                    let tools = tools
+                        .iter()
+                        .map(|(original, exposed)| {
+                            (original.clone(), self.policy_name(exposed).to_string())
+                        })
+                        .collect();
+                    (server.clone(), tools)
+                })
+                .collect();
             for candidate in &mut view.restored_candidates {
                 let canonical = candidate
                     .policy_name
@@ -2167,22 +2199,20 @@ impl Router {
                 } else {
                     &Value::Null
                 };
-                match live
-                    .policy
-                    .blocked_reason_unscoped(
-                        exposed,
-                        server_id,
-                        orig,
-                        ToolPolicyMetadata::from(&*self.safety_definition(definition)),
-                    )
-                    .or_else(|| {
-                        live.policy.blocked_reason_unscoped(
-                            self.policy_name(exposed),
-                            server_id,
-                            orig,
-                            ToolPolicyMetadata::from(&*self.safety_definition(definition)),
-                        )
-                    }) {
+                let metadata = ToolPolicyMetadata::from(&*self.safety_definition(definition));
+                let name = self.policy_name(exposed);
+                let reason = if self.has_canonical_policy(server_id, orig) {
+                    live.policy
+                        .blocked_reason_unscoped(name, server_id, orig, metadata)
+                } else {
+                    live.policy
+                        .blocked_reason_unscoped(exposed, server_id, orig, metadata)
+                        .or_else(|| {
+                            live.policy
+                                .blocked_reason_unscoped(name, server_id, orig, metadata)
+                        })
+                };
+                match reason {
                     Some(reason) => Err(blocked_tool_message(exposed, reason)),
                     None => Ok(()),
                 }
@@ -2264,6 +2294,10 @@ impl Router {
             };
             self.tool_owners
                 .insert(exposed.clone(), server_id.to_string());
+            self.exposed_by_original
+                .entry(server_id.to_string())
+                .or_default()
+                .insert(orig.to_string(), exposed.clone());
             if tools.policy_metadata(idx).model_hidden {
                 self.model_hidden.insert(exposed.clone());
             }
@@ -3632,6 +3666,7 @@ impl Router {
         self.catalog_servers.clear();
         self.routes.clear();
         self.policy_names.clear();
+        self.exposed_by_original.clear();
         self.schema_arguments.clear();
         self.seen.clear();
         self.legacy_seen.clear();
@@ -6883,6 +6918,97 @@ for line in sys.stdin:
         let mut reversed = tools;
         reversed.reverse();
         assert_eq!(router.routes, build(reversed).routes);
+    }
+
+    /// A rename accepted in the full-length view can collide in a shorter client
+    /// view and fall back to the base alias. Quarantine, pins and approvals must
+    /// still bind the tool's canonical identity there (review on #1126).
+    #[test]
+    fn shorter_view_override_collision_keeps_canonical_policy() {
+        let _data = crate::registry::DataDirTestEnv::new("shorter_view_override_collision");
+        struct Fixture(Vec<Value>, Arc<AtomicU32>);
+        impl Transport for Fixture {
+            fn request(&mut self, method: &str, _: Value) -> Result<Value, TransportError> {
+                match method {
+                    "initialize" => Ok(json!({"protocolVersion":"2025-06-18"})),
+                    "tools/list" => Ok(json!({"tools": self.0})),
+                    "tools/call" => {
+                        self.1.fetch_add(1, Ordering::SeqCst);
+                        Ok(json!({"content":[{"type":"text","text":"dispatched"}]}))
+                    }
+                    other => Err(TransportError::Fatal(format!("unexpected {other}"))),
+                }
+            }
+            fn notify(&mut self, _: &str, _: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+        let calls = Arc::new(AtomicU32::new(0));
+        let medium = format!("read_{}", "x".repeat(49));
+        let tools = vec![json!({"name": medium}), json!({"name": "private_export"})];
+        let server = || {
+            DownstreamServer::connect(
+                "files".into(),
+                Box::new(Fixture(tools.clone(), Arc::clone(&calls))),
+            )
+            .unwrap()
+        };
+        let mut seed = Router::new();
+        seed.add(server());
+        let short = seed
+            .with_client_tool_view(HashMap::new(), 52)
+            .exposed_tool_name("files", &medium)
+            .unwrap()
+            .to_string();
+        let mut base = Router::new();
+        base.set_overrides(HashMap::from([(
+            "files".to_string(),
+            HashMap::from([(
+                "private_export".to_string(),
+                ToolOverride {
+                    name: Some(short.clone()),
+                    ..Default::default()
+                },
+            )]),
+        )]));
+        base.add(server());
+        let medium_full = format!("files__{medium}");
+        assert_eq!(base.exposed_tool_name("files", "private_export"), Some(short.as_str()));
+        assert_eq!(base.exposed_tool_name("files", &medium), Some(medium_full.as_str()));
+
+        let cursor = base.with_client_tool_view(HashMap::new(), 52);
+        assert_eq!(cursor.exposed_tool_name("files", &medium), Some(short.as_str()));
+        assert_eq!(
+            cursor.exposed_tool_name("files", "private_export"),
+            Some("files__private_export")
+        );
+        let policy_name = |router: &Router, exposed: &str| {
+            let tool = router
+                .aggregated_tools()
+                .into_iter()
+                .find(|tool| tool["name"] == exposed)
+                .unwrap();
+            router.policy_definition(&tool)["name"].as_str().unwrap().to_string()
+        };
+        assert_eq!(policy_name(&cursor, "files__private_export"), short);
+        assert_eq!(policy_name(&cursor, &short), medium_full);
+
+        base.requarantine(BTreeSet::from([short.clone()]));
+        assert!(base.exposed_tool_name("files", "private_export").is_none());
+        // A request that took the older Cursor view is refused by the live recheck.
+        assert!(cursor
+            .recheck_live_policy(&base, DispatchTarget::Tool("files__private_export"))
+            .is_err());
+        assert!(cursor
+            .recheck_live_policy(&base, DispatchTarget::Tool(&short))
+            .is_ok());
+        let fresh = base.with_client_tool_view(HashMap::new(), 52);
+        assert!(fresh.exposed_tool_name("files", "private_export").is_none());
+        assert!(fresh.route_call("files__private_export", json!({})).is_err());
+        // The sibling whose short alias equals the quarantined identity stays callable.
+        assert_eq!(fresh.exposed_tool_name("files", &medium), Some(short.as_str()));
+        assert!(fresh.route_call(&short, json!({})).is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
