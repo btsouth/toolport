@@ -1570,14 +1570,7 @@ pub fn apply(
             let name = visible_text(value["name"].as_str().unwrap_or(id));
             let warning = format!("A synced change tried to set {} on {name}. Toolport ignored it. If you didn't make this change, sign out of other devices and change your password.", risky.join(", "));
             if st.warnings.get(id) != Some(&warning) {
-                crate::audit::record_timed(
-                    id,
-                    "sync_environment_refused",
-                    false,
-                    None,
-                    Some(&warning),
-                    Some("personal-sync"),
-                );
+                crate::integrity::record_sync_refusal(&name, &warning);
                 st.warnings.insert(id.clone(), warning);
             }
         }
@@ -2687,11 +2680,14 @@ mod tests {
         let warning = state(&r).unwrap().warnings["mock"].clone();
         assert!(warning.contains("npm_config_registry on Mock Tools"));
         assert!(warning.contains("change your password"));
-        crate::telemetry::flush();
-        let log = std::fs::read_to_string(crate::audit::audit_path().unwrap()).unwrap();
+        // A security finding, recorded once across repeated polls; never a call.
+        let log = std::fs::read_to_string(crate::integrity::security_path().unwrap()).unwrap();
         assert_eq!(log.lines().count(), 1);
-        assert!(log.contains("sync_environment_refused"));
+        assert!(log.contains("sync_change_refused"));
         assert!(!log.contains("DO_NOT_LOG_THIS"));
+        crate::telemetry::flush();
+        let calls = std::fs::read_to_string(crate::audit::audit_path().unwrap()).unwrap_or_default();
+        assert!(!calls.contains("sync"));
         for key in [
             "JAVA_TOOL_OPTIONS",
             "_JAVA_OPTIONS",

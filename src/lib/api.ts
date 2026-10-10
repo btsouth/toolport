@@ -64,6 +64,8 @@ export interface SecurityEvent {
    * flag is verifiable instead of an opaque label. Absent when no direct phrase matched
    * (e.g. an encoded payload) or on events written before evidence was captured. */
   evidence?: string;
+  /** For sync_change_refused: the full explanation shown to the user. */
+  detail?: string;
   /** "high" = loud/actionable (poison, destructive-tool change, safety-annotation
    * downgrade); "warn" = a read-only/definition-content change that the app shows on
    * the actionable tier and quarantine-on-drift blocks; "info" = cosmetic churn for

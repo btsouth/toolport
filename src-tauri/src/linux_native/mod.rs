@@ -4181,6 +4181,7 @@ fn security_event_kind(event: &serde_json::Value) -> &'static str {
         Some("tool_poison_flag") => "Toolport found suspicious content in a tool definition",
         Some("pins_load_failed") => "The tool integrity baseline could not be verified",
         Some("tool_drift") => "A previously known tool definition changed",
+        Some("sync_change_refused") => "Toolport blocked a synced change",
         _ => "A security finding was recorded",
     }
 }
@@ -4299,11 +4300,10 @@ fn security_notice_card(
     card.add_css_class("toolport-card");
     card.set_tooltip_text(Some("Click to review what changed"));
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let kind = event
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("security_event")
-        .replace('_', " ");
+    let kind = match event.get("type").and_then(serde_json::Value::as_str) {
+        Some("sync_change_refused") => "synced change blocked".to_string(),
+        other => other.unwrap_or("security_event").replace('_', " "),
+    };
     let badge = gtk::Label::new(Some(&kind));
     badge.add_css_class("toolport-badge");
     badge.set_valign(gtk::Align::Center);
@@ -4314,10 +4314,10 @@ fn security_notice_card(
         "review"
     });
     row.append(&badge);
-    let subject = event
-        .get("tool")
-        .or_else(|| event.get("server"))
-        .and_then(serde_json::Value::as_str)
+    let subject = ["tool", "server"]
+        .into_iter()
+        .filter_map(|field| event.get(field).and_then(serde_json::Value::as_str))
+        .find(|value| !value.is_empty())
         .unwrap_or("integrity baseline");
     row.append(
         &gtk::Label::builder()
@@ -4451,6 +4451,13 @@ fn security_review_lines(event: &serde_json::Value) -> Vec<String> {
         }
         ("pins_load_failed", _) => lines.push(
             "Toolport could not read the trusted definition baseline and failed closed."
+                .to_string(),
+        ),
+        ("sync_change_refused", _) => lines.push(
+            event
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("A synced change was blocked.")
                 .to_string(),
         ),
         _ => lines.push("Toolport retained this security event for review.".to_string()),

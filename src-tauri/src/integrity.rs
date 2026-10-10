@@ -3524,6 +3524,20 @@ fn recently_recorded(event: &Value, path: &Path) -> bool {
     false
 }
 
+/// A synced change that Toolport refused to apply. It is a security finding,
+/// not a tool call, so it belongs here rather than in the call log.
+pub fn record_sync_refusal(server: &str, detail: &str) {
+    record_event(&json!({
+        "ts": epoch_millis(),
+        "type": "sync_change_refused",
+        "server": server,
+        "tool": "",
+        "change": "sync",
+        "detail": detail,
+        "severity": SEV_HIGH,
+    }));
+}
+
 fn record_event(event: &Value) {
     if let Some(path) = security_path() {
         if let Some(parent) = path.parent() {
