@@ -201,6 +201,52 @@ pub fn export(s: &ServerEntry) -> Value {
             *input = input_export(input.clone());
         }
     }
+    if let Some(bindings) = v
+        .pointer_mut("/launch/bindings")
+        .and_then(Value::as_array_mut)
+    {
+        let rendered: Vec<String> = bindings
+            .iter()
+            .map(|b| {
+                b["parts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|p| {
+                        if p["kind"] == "literal" {
+                            p["value"].as_str().unwrap_or("").to_string()
+                        } else {
+                            "<launch-input>".into()
+                        }
+                    })
+                    .collect::<String>()
+            })
+            .collect();
+        let mut effective = s.args.clone();
+        for (b, text) in bindings.iter().zip(&rendered) {
+            if let Some(i) = b["index"]
+                .as_u64()
+                .and_then(|i| effective.get_mut(i as usize))
+            {
+                *i = text.clone();
+            }
+        }
+        let mask = crate::registry::secret_arg_mask(&effective);
+        for b in bindings {
+            let only_literals = b["parts"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().all(|p| p["kind"] == "literal"));
+            if only_literals
+                && b["index"]
+                    .as_u64()
+                    .is_some_and(|i| mask.get(i as usize) == Some(&true))
+            {
+                for part in b["parts"].as_array_mut().into_iter().flatten() {
+                    part["value"] = json!("<redacted>");
+                }
+            }
+        }
+    }
     if let Some(headers) = v.get_mut("headerKeys").and_then(Value::as_array_mut) {
         for h in headers {
             if let Some(m) = h.as_object_mut() {
@@ -899,6 +945,13 @@ pub(crate) fn sync(
         .into_iter()
         .filter(|(_, m)| now() - m.at >= 750)
         .collect();
+    if ready
+        .values()
+        .filter_map(|m| m.after.as_ref())
+        .any(env_references)
+    {
+        return Err("env: key references cannot be synced. Choose a password-manager reference or keep this server on this machine only.".into());
+    }
     for attempt in 0..2 {
         let (merged, conflicts) = merge(&latest.1, &ready)?;
         remote_update(|| {
@@ -921,7 +974,13 @@ pub(crate) fn sync(
                 applied: None,
             });
         }
-        match crate::teams::push_personal_config(&conn.server_url, &conn.team_id, token, &merged, latest.0) {
+        match crate::teams::push_personal_config(
+            &conn.server_url,
+            &conn.team_id,
+            token,
+            &merged,
+            latest.0,
+        ) {
             Ok(crate::teams::PushOutcome::Published(_)) => {
                 latest =
                     crate::teams::fetch_personal_config(&conn.server_url, &conn.team_id, token)?;
@@ -1092,6 +1151,24 @@ mod tests {
         assert_eq!(apply(&mut b, &changed, 2).unwrap().review, 1);
         assert!(!b.servers[0].enabled);
         assert!(check_review(&b, &b.servers[0], Some(&reviewed)).is_err());
+    }
+    #[test]
+    fn literal_launch_credentials_are_not_exported() {
+        let mut s = local(command("tool"));
+        s.args = vec!["<launch-input>".into()];
+        s.launch = Some(serde_json::from_value(json!({"inputs":[],"bindings":[{"index":0,"parts":[{"kind":"literal","value":"--token=synthetic-private-token"}]}]})).unwrap());
+        let wire = export(&s).to_string();
+        assert!(!wire.contains("synthetic-private-token"));
+        assert!(wire.contains("<redacted>"));
+    }
+    #[test]
+    fn native_status_copy_covers_trial_grace_and_blocked_delivery() {
+        let status = json!({"plan":"pro","trialActive":true,"trialEndsAt":7*86_400_000,"freeSyncGraceEndsAt":2*86_400_000,"canReceiveConfig":false,"reason":"Choose this device"});
+        let lines = status_lines_at(&status, Some(0), 0);
+        assert!(lines.iter().any(|s| s == "7 trial days left"));
+        assert!(lines.iter().any(|s| s.contains("2 more days")));
+        assert!(lines.iter().any(|s| s == "Choose this device"));
+        assert!(lines.iter().any(|s| s == "Last synced just now"));
     }
     #[test]
     fn review_hold_is_local_and_does_not_publish_disable() {
