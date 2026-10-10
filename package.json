@@ -1,7 +1,7 @@
 {
   "name": "toolport",
   "private": true,
-  "version": "2.0.0-preview.6",
+  "version": "2.0.0-preview.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
