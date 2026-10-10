@@ -18,9 +18,11 @@ import {
   probeAuth,
   secretStatus,
   setAuthToken,
+  setLaunchSecret,
   setSecret,
   setSecretReference,
 } from "@/lib/api";
+import { inputDisplayName } from "@/lib/executionReview";
 import type { AuthInfo, Registry, ServerEntry } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -509,6 +511,25 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       setVaulted((v) => ({ ...v, [key]: true }));
       setInputs((i) => ({ ...i, [key]: "" }));
       toast.success(`Saved ${key}`);
+      onChanged?.();
+    } catch (e) {
+      toastError(secretErrorMessage(e));
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  // Secret command arguments are vaulted like keys but are not environment
+  // variables, so they save through the launch-input path.
+  const launchSecrets = (server.launch?.inputs ?? []).filter((input) => input.secret);
+  async function saveLaunch(key: string) {
+    const value = inputs[`launch:${key}`] ?? "";
+    if (!value) return;
+    setBusyKey(`launch:${key}`);
+    try {
+      onSaved(await setLaunchSecret(server.id, key, value));
+      setInputs((i) => ({ ...i, [`launch:${key}`]: "" }));
+      toast.success(`Saved ${inputDisplayName(server, key)}`);
       onChanged?.();
     } catch (e) {
       toastError(secretErrorMessage(e));
@@ -1013,7 +1034,36 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
             </div>
           )}
 
-          {secretKeys.length === 0 && !isRemote && (
+          {launchSecrets.map((input) => (
+            <div key={input.key} className="flex flex-col gap-1.5">
+              <Label className="text-sm font-medium">
+                {inputDisplayName(server, input.key)}
+              </Label>
+              <div className="flex items-center gap-2">
+                <Input
+                  type="password"
+                  aria-label={inputDisplayName(server, input.key)}
+                  placeholder="Enter the value for this machine"
+                  value={inputs[`launch:${input.key}`] ?? ""}
+                  onChange={(e) =>
+                    setInputs((i) => ({ ...i, [`launch:${input.key}`]: e.target.value }))
+                  }
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void saveLaunch(input.key);
+                  }}
+                />
+                <Button
+                  size="sm"
+                  disabled={busyKey !== null || !(inputs[`launch:${input.key}`] ?? "")}
+                  onClick={() => void saveLaunch(input.key)}
+                >
+                  {busyKey === `launch:${input.key}` ? "Saving…" : "Save"}
+                </Button>
+              </div>
+            </div>
+          ))}
+
+          {secretKeys.length === 0 && launchSecrets.length === 0 && !isRemote && (
             <p className="text-sm text-muted-foreground">
               This server didn't declare an API key. If it needs one, add it as an
               environment variable below.

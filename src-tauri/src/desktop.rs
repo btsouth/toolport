@@ -737,6 +737,7 @@ async fn set_secret_reference(
         let (reg, ()) = write_registry(state.inner(), |reg| {
             crate::registry_controller::apply_secret_reference(reg, &server_id, &key, &reference)
         })?;
+        crate::registry_controller::approve_own_reference(&reg, &server_id)?;
         Ok(reg)
     })
     .await

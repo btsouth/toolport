@@ -606,7 +606,9 @@ impl RegistrySnapshot {
                             )
                         }) {
                             "Sync conflict".into()
-                        } else if server.needs_team_enable_review() {
+                        } else if !enabled && server.needs_team_enable_review() {
+                            // Approved and on means reviewed, even though the
+                            // gate would apply again to turning it back on.
                             "Needs review".into()
                         } else {
                             "Synced".into()

@@ -29,6 +29,9 @@ pub(super) struct TeamsPage {
     /// next render so the async refresh cannot overwrite it.
     sync_notice: Rc<RefCell<Option<(String, bool)>>>,
     rendered_state: Rc<RefCell<Option<(String, bool)>>>,
+    /// The last failed action. Polls redraw the status line every few seconds,
+    /// so without this an error vanished before anyone could read it.
+    action_error: Rc<RefCell<Option<(String, std::time::Instant)>>>,
 }
 
 impl TeamsPage {
@@ -98,6 +101,7 @@ impl TeamsPage {
             poll_timer: Rc::new(RefCell::new(None)),
             sync_notice: Rc::new(RefCell::new(None)),
             rendered_state: Rc::new(RefCell::new(None)),
+            action_error: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -300,6 +304,13 @@ impl TeamsPage {
 
     fn show_sync_status(&self, registry: &crate::registry::Registry) {
         if !crate::personal_sync::is_personal(registry) { self.render_sync_status(); return; }
+        let recent_error = self.action_error.borrow().as_ref().and_then(|(error, at)| {
+            (at.elapsed() < std::time::Duration::from_secs(30)).then(|| error.clone())
+        });
+        if let Some(error) = recent_error {
+            self.show_error(&error);
+            return;
+        }
         let (message, healthy) = crate::personal_sync::banner(registry);
         self.set_status(&message, false);
         if healthy {
@@ -1065,6 +1076,13 @@ impl TeamsPage {
     }
 
     fn show_error(&self, error: &str) {
+        let now = std::time::Instant::now();
+        let mut last = self.action_error.borrow_mut();
+        // Re-showing the same error keeps its original deadline.
+        if last.as_ref().is_none_or(|(previous, _)| previous != error) {
+            *last = Some((error.to_string(), now));
+        }
+        drop(last);
         self.feedback.set_label(&format!("Sync error: {error}"));
         self.feedback.set_visible(true);
         self.feedback.remove_css_class("success");
@@ -1234,7 +1252,7 @@ pub(super) fn execution_review_content(server: &crate::registry::ServerEntry) ->
     if previous.is_some() {
         let full = gtk::Box::new(gtk::Orientation::Vertical, 8);
         for (key, value) in crate::personal_sync::execution_review_fields(server) {
-            full.append(&gtk::Label::builder().label(crate::personal_sync::review_field_line(&key, &value))
+            full.append(&gtk::Label::builder().label(crate::personal_sync::review_display(server, &crate::personal_sync::review_field_line(&key, &value)))
                 .wrap(true).wrap_mode(gtk::pango::WrapMode::WordChar).selectable(true).xalign(0.0).build());
         }
         content.append(&gtk::Expander::builder().label("Show full definition").child(&full).build());
@@ -1362,6 +1380,7 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
                 button.set_sensitive(false);
                 let page = page.clone();
                 let reviewed_entry = reviewed_entry.clone();
+                let button = button.clone();
                 gtk::glib::spawn_future_local(async move {
                     let result = gtk::gio::spawn_blocking(move || {
                         let registry = crate::registry::load()?;
@@ -1369,9 +1388,20 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
                     })
                     .await;
                     match result {
-                        Ok(Ok(_)) => page.refresh(),
-                        Ok(Err(error)) => page.show_error(&error),
-                        Err(_) => page.show_error("the review update stopped unexpectedly"),
+                        Ok(Ok(_)) => {
+                            page.action_error.replace(None);
+                            page.refresh();
+                        }
+                        // Usually a secret this machine still needs; leave the
+                        // button usable for after it has been added.
+                        Ok(Err(error)) => {
+                            button.set_sensitive(true);
+                            page.show_error(&error);
+                        }
+                        Err(_) => {
+                            button.set_sensitive(true);
+                            page.show_error("the review update stopped unexpectedly");
+                        }
                     }
                 });
             }

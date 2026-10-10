@@ -480,7 +480,38 @@ pub fn review_field_line(key: &str, value: &str) -> String {
         format!("{key}: {value}")
     }
 }
+/// Display only: consent compares `execution_review_fields`, so naming secret
+/// arguments after their flag here never changes what was approved.
+pub fn review_display(server: &ServerEntry, line: &str) -> String {
+    let mut out = line.replace("<launch-input>", "<secret>");
+    let Some(launch) = &server.launch else {
+        return out;
+    };
+    // Only generated names are renamed; a label someone chose is already readable.
+    for input in launch
+        .inputs
+        .iter()
+        .filter(|input| input.secret && input.label.starts_with("Imported argument"))
+    {
+        let key = visible_text(&input.key);
+        let name = crate::launch_inputs::input_display_name(&server.args, launch, &input.key);
+        out = out
+            .replace(
+                &format!("Input: {key} = <masked secret>"),
+                &format!("{name} = secret, entered on each machine"),
+            )
+            .replace(&format!("Input: {key} ="), &format!("{name} ="))
+            .replace(&format!("{{{key}}}"), &format!("<{name}>"));
+    }
+    out
+}
 pub fn execution_review_lines(server: &ServerEntry) -> Vec<String> {
+    execution_review_raw_lines(server)
+        .iter()
+        .map(|line| review_display(server, line))
+        .collect()
+}
+fn execution_review_raw_lines(server: &ServerEntry) -> Vec<String> {
     let previous = server
         .unknown_fields
         .get("syncExecutionReview")
@@ -3645,6 +3676,10 @@ mod tests {
         let st = state(&r).unwrap();
         let after = st.pending["refs"].after.as_ref().unwrap();
         assert_eq!(after["env"][0]["source"]["ref"], "op://Private/Item/key");
+        // The machine that saved it does not have to review its own reference.
+        assert!(crate::secret_refs::check_approval(&r.servers[0]).is_err());
+        crate::registry_controller::approve_own_reference(&r, &id).unwrap();
+        assert!(crate::secret_refs::check_approval(&r.servers[0]).is_ok());
     }
     #[test]
     fn review_hold_is_local_and_does_not_publish_disable() {

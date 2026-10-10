@@ -5601,7 +5601,19 @@ pub fn set_secret_reference(
     reference: &str,
 ) -> Result<Registry, String> {
     let (reg, ()) = registry::update(|reg| apply_secret_reference(reg, server_id, key, reference))?;
+    approve_own_reference(&reg, server_id)?;
     Ok(reg)
+}
+/// On a personal account the reference is now part of the synced definition,
+/// which other machines must approve. Saving it here is this machine's approval.
+pub fn approve_own_reference(reg: &Registry, server_id: &str) -> Result<(), String> {
+    if !crate::personal_sync::is_personal(reg) {
+        return Ok(());
+    }
+    match reg.servers.iter().find(|s| s.id == server_id) {
+        Some(server) => crate::secret_refs::approve_server(server).map_err(|e| e.to_string()),
+        None => Ok(()),
+    }
 }
 pub fn test_secret_reference(
     server_id: &str,

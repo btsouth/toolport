@@ -123,7 +123,52 @@ export function executionReviewFieldLine(key: string, value: string): string {
     ? `${key} = ${value}`
     : `${key}: ${value}`;
 }
+/** What a person calls a launch input. Inputs created from pasted arguments
+ * carry a generated label, so name them after the flag they follow. Mirrors
+ * `launch_inputs::input_display_name`. */
+export function inputDisplayName(server: ServerEntry, key: string): string {
+  const launch = server.launch;
+  const label = launch?.inputs.find((input) => input.key === key)?.label ?? key;
+  if (!launch || !label.startsWith("Imported argument")) return label;
+  const index = launch.bindings.find(
+    (binding) =>
+      binding.parts.length === 1 &&
+      binding.parts[0].kind === "input" &&
+      binding.parts[0].key === key,
+  )?.index;
+  if (index === undefined) return label;
+  const flag = server.args[index - 1];
+  return index > 0 && flag?.startsWith("-")
+    ? `Value for ${flag} (argument ${index + 1})`
+    : `Secret argument ${index + 1}`;
+}
+/** Display only: consent compares `executionReviewFields`, so naming secret
+ * arguments after their flag never changes what was approved. */
+export function reviewDisplay(server: ServerEntry, line: string): string {
+  const swap = (text: string, from: string, to: string) => text.split(from).join(to);
+  let out = swap(line, "<launch-input>", "<secret>");
+  const launch = server.launch;
+  if (!launch) return out;
+  const pasted = launch.inputs.filter(
+    (input) => input.secret && input.label.startsWith("Imported argument"),
+  );
+  for (const input of pasted) {
+    const key = show(input.key);
+    const name = inputDisplayName(server, input.key);
+    out = swap(
+      out,
+      `Input: ${key} = <masked secret>`,
+      `${name} = secret, entered on each machine`,
+    );
+    out = swap(out, `Input: ${key} =`, `${name} =`);
+    out = swap(out, `{${key}}`, `<${name}>`);
+  }
+  return out;
+}
 export function executionReviewLines(server: ServerEntry): string[] {
+  return executionReviewRawLines(server).map((line) => reviewDisplay(server, line));
+}
+function executionReviewRawLines(server: ServerEntry): string[] {
   const fields = executionReviewFields(server);
   const previous = server.syncExecutionReview
     ? reviewBaseline(server.syncExecutionReview)

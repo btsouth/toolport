@@ -4,6 +4,7 @@ import {
   executionReviewLines,
   executionReviewFields,
   executionReviewFieldLine,
+  reviewDisplay,
 } from "@/lib/executionReview";
 
 export default function ExecutionReview({
@@ -34,7 +35,7 @@ export default function ExecutionReview({
           <summary>Show full definition</summary>
           {Object.entries(executionReviewFields(server)).map(([key, value]) => (
             <p key={key} className="whitespace-pre-wrap">
-              {executionReviewFieldLine(key, value)}
+              {reviewDisplay(server, executionReviewFieldLine(key, value))}
             </p>
           ))}
         </details>

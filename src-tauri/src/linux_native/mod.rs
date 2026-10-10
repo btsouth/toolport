@@ -8376,7 +8376,21 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
         "Stored credentials",
         "Enter a new value only when you want to replace one.",
     ));
-    if server.secret_keys.is_empty() {
+    // Secret command arguments are vaulted like keys but are not environment
+    // variables, so they save through the launch-input path.
+    let launch_secrets: Vec<(String, String)> = server
+        .launch
+        .iter()
+        .flat_map(|launch| {
+            launch.inputs.iter().filter(|input| input.secret).map(|input| {
+                (
+                    input.key.clone(),
+                    crate::launch_inputs::input_display_name(&server.args, launch, &input.key),
+                )
+            })
+        })
+        .collect();
+    if server.secret_keys.is_empty() && launch_secrets.is_empty() {
         stored.append(
             &gtk::Label::builder()
                 .label("No credential keys are declared for this server.")
@@ -8485,6 +8499,82 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
                 feedback_for_remove.clone(),
                 button.clone(),
             );
+        });
+    }
+    for (key, name) in &launch_secrets {
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        row.add_css_class("toolport-credential-row");
+        row.append(
+            &gtk::Label::builder()
+                .label(name)
+                .halign(gtk::Align::Start)
+                .wrap(true)
+                .css_classes(["heading"])
+                .build(),
+        );
+        let save_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let value = gtk::PasswordEntry::builder()
+            .placeholder_text("Enter the value for this machine")
+            .show_peek_icon(true)
+            .hexpand(true)
+            .css_classes(["toolport-input"])
+            .build();
+        save_row.append(&value);
+        let save = gtk::Button::with_label("Save");
+        save.add_css_class("toolport-secondary-action");
+        save_row.append(&save);
+        let (source_choice, reference_box) = secret_reference_controls(
+            &server.id,
+            key,
+            server.secret_references.get(key).map(String::as_str),
+            &page,
+            &editor,
+            &feedback,
+        );
+        save_row.set_visible(source_choice.selected() == 0);
+        let paste_row = save_row.clone();
+        source_choice
+            .connect_selected_notify(move |choice| paste_row.set_visible(choice.selected() == 0));
+        row.append(&source_choice);
+        row.append(&save_row);
+        row.append(&reference_box);
+        stored.append(&row);
+
+        let server_id = server.id.clone();
+        let key = key.clone();
+        let feedback = feedback.clone();
+        let page = page.clone();
+        let editor = editor.clone();
+        save.connect_clicked(move |button| {
+            let secret = value.text().to_string();
+            if secret.is_empty() {
+                feedback.set_label("Enter a value first.");
+                feedback.set_visible(true);
+                return;
+            }
+            button.set_sensitive(false);
+            let server_id = server_id.clone();
+            let reprobe_id = server_id.clone();
+            let key = key.clone();
+            let page = page.clone();
+            let editor = editor.clone();
+            let feedback = feedback.clone();
+            let button = button.clone();
+            gtk::glib::spawn_future_local(async move {
+                let result = gtk::gio::spawn_blocking(move || {
+                    crate::registry_controller::set_launch_secret(&server_id, &key, &secret)
+                })
+                .await;
+                finish_credential_update(
+                    result,
+                    &reprobe_id,
+                    &page,
+                    &editor,
+                    &feedback,
+                    &button,
+                    "Updated",
+                );
+            });
         });
     }
     content.append(&stored);

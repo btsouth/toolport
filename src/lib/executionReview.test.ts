@@ -4,6 +4,7 @@ import {
   ARGS_REVIEW_LINE,
   executionReviewFields,
   executionReviewLines,
+  inputDisplayName,
   missingSecretArgs,
   visibleExecutionText,
 } from "./executionReview";
@@ -198,5 +199,42 @@ describe("execution review", () => {
         "\n",
       ),
     ).toContain("Command: node\\u{202E}");
+  });
+});
+
+describe("secret argument names", () => {
+  const pasted = {
+    ...server,
+    command: "mock",
+    args: ["--token", "<launch-input>"],
+    env: [],
+    launch: {
+      inputs: [
+        {
+          key: "IMPORTED_ARG_1",
+          label: "Imported argument 2",
+          secret: true,
+          required: true,
+        },
+      ],
+      bindings: [
+        { index: 1, parts: [{ kind: "input" as const, key: "IMPORTED_ARG_1" }] },
+      ],
+    },
+  } as ServerEntry;
+
+  it("names a pasted secret after the flag it follows", () => {
+    expect(inputDisplayName(pasted, "IMPORTED_ARG_1")).toBe(
+      "Value for --token (argument 2)",
+    );
+  });
+
+  it("never shows internal placeholders in the review", () => {
+    const text = executionReviewLines(pasted).join("\n");
+    expect(text).not.toContain("IMPORTED_ARG");
+    expect(text).not.toContain("<launch-input>");
+    expect(text).toContain(
+      "Value for --token (argument 2) = secret, entered on each machine",
+    );
   });
 });
