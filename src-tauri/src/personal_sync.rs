@@ -199,12 +199,16 @@ fn publish_error(value: &Value) -> Option<String> {
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
     let known = credential_arg_mask(&args);
-    if let Some(index) = args
-        .iter()
-        .enumerate()
-        .find_map(|(i, arg)| let text = arg.split_once('=').filter(|(name, _)| *name == "-H" || matches!(name.to_ascii_lowercase().as_str(), "--header" | "--headers")).map_or(arg.as_str(), |(_, value)| value);
-        (!known[i] && crate::registry::arg_looks_secret(text)).then_some(i))
-    {
+    if let Some(index) = args.iter().enumerate().find_map(|(i, arg)| {
+        let text = arg
+            .split_once('=')
+            .filter(|(name, _)| {
+                *name == "-H"
+                    || matches!(name.to_ascii_lowercase().as_str(), "--header" | "--headers")
+            })
+            .map_or(arg.as_str(), |(_, value)| value);
+        (!known[i] && crate::registry::arg_looks_secret(text)).then_some(i)
+    }) {
         return Some(format!("Argument {} may contain a credential. Review it or keep this server on this machine only. Its value has not been changed.", index + 1));
     }
     if env_references(value) {
@@ -2002,7 +2006,9 @@ mod tests {
     }
     #[test]
     fn new_local_only_server_never_enters_the_sync_journal() {
-        let _data = crate::registry::DataDirTestEnv::new("new_local_only_server_never_enters_the_sync_journal");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "new_local_only_server_never_enters_the_sync_journal",
+        );
         let mut before = machine();
         apply(&mut before, &config(vec![]), 1).unwrap();
         let mut after = before.clone();
@@ -2840,7 +2846,9 @@ mod tests {
     }
     #[test]
     fn keep_local_and_portable_values_never_export_secrets_or_approvals() {
-        let _data = crate::registry::DataDirTestEnv::new("keep_local_and_portable_values_never_export_secrets_or_approvals");
+        let _data = crate::registry::DataDirTestEnv::new(
+            "keep_local_and_portable_values_never_export_secrets_or_approvals",
+        );
         let mut a = machine();
         let before = a.clone();
         let mut s = local(command("local"));
@@ -3065,7 +3073,8 @@ mod tests {
     }
     #[test]
     fn local_journal_and_ack_do_not_drop_newer_edits() {
-        let _data = crate::registry::DataDirTestEnv::new("local_journal_and_ack_do_not_drop_newer_edits");
+        let _data =
+            crate::registry::DataDirTestEnv::new("local_journal_and_ack_do_not_drop_newer_edits");
         let mut r = machine();
         let mut st = SyncState::default();
         st.initialized = true;
