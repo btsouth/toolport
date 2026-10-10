@@ -8128,15 +8128,16 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "linux"))]
     fn legacy_cleanup_leaves_published_and_bundled_gateways_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let current = dir.path().join("toolport-gateway-2.0.0.exe");
-        let cached = dir.path().join("toolport-gateway-1.23.0.exe");
-        let plain = dir.path().join("toolport-gateway.exe");
+        let data = crate::registry::DataDirTestEnv::new("legacy-cleanup-non-linux");
+        let dir = &data.dir;
+        let current = dir.join("toolport-gateway-2.0.0.exe");
+        let cached = dir.join("toolport-gateway-1.23.0.exe");
+        let plain = dir.join("toolport-gateway.exe");
         let old = b"MZtoolport-gateway\0TOOLPORT_CLIENT_ID\0tools/call";
         for path in [&cached, &plain] {
             std::fs::write(path, old).unwrap();
         }
-        cleanup_legacy_gateway_copies(&current, dir.path(), Some(&[]));
+        cleanup_legacy_gateway_copies(&current, dir, Some(&[]));
         for path in [&cached, &plain] {
             assert_eq!(std::fs::read(path).unwrap(), old);
         }
@@ -8233,11 +8234,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn legacy_gateway_shims_follow_install_moves_and_are_idempotent() {
         use std::os::unix::fs::MetadataExt;
-        let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join("bin");
+        let root = crate::registry::DataDirTestEnv::new("legacy-shim-move");
+        let dir = root.dir.join("bin");
         std::fs::create_dir(&dir).unwrap();
-        let first = root.path().join("old install/toolport-gateway");
-        let second = root.path().join("new 'install'/toolport-gateway");
+        let first = root.dir.join("old install/toolport-gateway");
+        let second = root.dir.join("new 'install'/toolport-gateway");
         for current in [&first, &second] {
             std::fs::create_dir_all(current.parent().unwrap()).unwrap();
             std::fs::write(current, "#!/bin/sh\nprintf '%s\n' \"$@\"\n").unwrap();
