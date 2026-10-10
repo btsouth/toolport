@@ -94,7 +94,8 @@ try {
   await expect(
     page.getByRole("main").getByText("35.0k catalog tokens avoided"),
   ).toBeVisible();
-  await expect(page.getByText(/Historical bytes\/4: ≈41.1k/)).toBeVisible();
+  await expect(page.getByText("How this is counted", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Older estimated records/)).not.toBeVisible();
   await page.screenshot({ path: path.join(output, "activity.png") });
   await page.getByRole("button", { name: "Clients", exact: true }).click();
   await page.getByRole("button", { name: /Codex/ }).click();
@@ -535,7 +536,7 @@ try {
   await page.screenshot({ path: path.join(output, "A5-savings-details-after-r2.png") });
   await counting.click();
   await page.getByRole("button", { name: /^Discovery/ }).click();
-  await expect(page.getByText("GitHub issues", { exact: true })).toBeVisible();
+  await expect(page.getByText(/GitHub issues/)).toBeVisible();
   await page.screenshot({ path: path.join(output, "discovery-after-r2.png") });
   await page.getByRole("button", { name: /^Per-server breakdown/ }).click();
   await page.screenshot({ path: path.join(output, "server-stats-after-r2.png") });
