@@ -2954,7 +2954,7 @@ impl ActivityPage {
         );
         page.append(
             &gtk::Label::builder()
-                .label("Toolport records outcomes and timing, never tool arguments or result data. Recent events are shown below; export includes all retained history.")
+                .label("Toolport records outcomes and timing, never tool arguments or result data. Recent activity is shown below; export includes all saved history.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
@@ -2967,7 +2967,7 @@ impl ActivityPage {
             .wrap(true)
             .css_classes(["toolport-feedback"])
             .build();
-        feedback.set_label("Open Activity to load retained events.");
+        feedback.set_label("Open Activity to load saved activity.");
         page.append(&feedback);
 
         let summary = gtk::FlowBox::new();
@@ -3538,7 +3538,7 @@ impl ActivityPage {
         if traces_changed {
             if snapshot.search_traces.is_empty() {
                 self.search_list.append(&empty_activity_label(
-                    if snapshot.recent.iter().any(|row| row.internal && row.tool == "search") { "Recent activity includes tool searches; detailed search records are no longer available." } else { "Nothing searched yet." },
+                    if snapshot.recent.iter().any(|row| row.internal && row.tool == "search") { "Recent activity includes tool searches; detailed search records are not available." } else { "Nothing searched yet." },
                 ));
             } else {
                 for trace in &snapshot.search_traces {
@@ -3860,12 +3860,12 @@ impl ActivityPage {
         let errors_only = self.errors_only.is_active();
         let filtered = filter_calls(&snapshot.recent, server.as_deref(), errors_only);
         if filtered.is_empty() {
-            self.filter_count.set_label("0 matching events");
+            self.filter_count.set_label("0 matching rows");
             self.show_more_calls.set_visible(false);
             self.list.append(&state_card(
                 "edit-find-symbolic",
-                "No matching events",
-                "No retained event matches the current filter.",
+                "No matching activity",
+                "Nothing saved matches the current filter.",
                 false,
             ));
             return;
@@ -3876,22 +3876,13 @@ impl ActivityPage {
         } else {
             match_count.min(RECENT_CALL_PREVIEW_LIMIT)
         };
-        self.filter_count.set_label(&format!(
-            "{} calls saved on this computer. Showing {visible_count} of the latest {}{}.",
-            grouped_number(snapshot.call_count as u64),
-            snapshot.recent.len(),
-            if match_count != snapshot.recent.len() {
-                " (filtered)"
-            } else {
-                ""
-            }
-        ));
+        self.filter_count.set_label(&activity_count_summary(snapshot.call_count, visible_count, snapshot.recent.len(), match_count != snapshot.recent.len()));
         self.show_more_calls
             .set_visible(match_count > RECENT_CALL_PREVIEW_LIMIT);
         let show_more_label = if self.show_all_recent.get() {
             "Show fewer".to_string()
         } else {
-            format!("Show all {match_count} events")
+            format!("Show all {match_count} rows")
         };
         self.show_more_calls.set_label(&show_more_label);
         for activity in filtered.into_iter().take(visible_count) {
@@ -4694,6 +4685,17 @@ fn savings_title(loads: u64) -> &'static str {
     } else {
         "Catalog text avoided"
     }
+}
+
+fn activity_count_summary(total: usize, visible: usize, recent: usize, filtered: bool) -> String {
+    let shown = if filtered {
+        format!("Showing {visible} matching rows from the latest {recent}.")
+    } else if visible == recent {
+        format!("Showing the latest {visible}.")
+    } else {
+        format!("Showing {visible} of the latest {recent}.")
+    };
+    format!("{} calls saved on this computer. {shown}", grouped_number(total as u64))
 }
 
 fn format_saved_tokens(tokens_saved: i64) -> String {
@@ -9511,6 +9513,9 @@ mod tests {
         snapshot.savings_exposed_bytes = 15600;
         snapshot.savings_avoided_bytes = 164400;
         snapshot.savings_since_ts = now-86400000;
+        assert_eq!(snapshot.call_count, 1);
+        assert_eq!(snapshot.server_stats.len(), 1);
+        assert_eq!(snapshot.server_stats[0]["calls"], 1);
         activity.render(snapshot);
         let counting = activity.savings_detail.parent().unwrap().downcast::<gtk::Expander>().unwrap();
         assert!(!counting.is_expanded());
@@ -9524,7 +9529,13 @@ mod tests {
             rows: Default::default(), no_matches: Default::default(), off_heading: Default::default(), health: Default::default(),
         };
         let clients = ClientPage::new(&app, server_page);
-        clients.render(state::ClientSnapshot { clients: Vec::new(), profiles: Vec::new(), sessions_error: false, sessions: vec![serde_json::json!({"clientName":"Codex","clientType":"codex","sessionCount":5,"callsToday":60,"lastActiveMs":now-180000,"firstCatalogSize":1711})] });
+        let fixture_clients = [("codex", "Codex", state::ClientGatewayState::Connected), ("cursor", "Cursor", state::ClientGatewayState::Disconnected), ("claude-code", "Claude Code", state::ClientGatewayState::Customized)].into_iter().map(|(id, name, gateway_state)| state::ClientView {
+            id: id.into(), name: name.into(), app_present: true, config_exists: true,
+            uses_connectors: false, server_count: 2, movable_server_count: 0, gateway_state,
+            shared_http: false, legacy_bearer_argv: false, scope_id: None, scope_name: None,
+            discovery_mode: Some("lazy".into()), config_error: false,
+        }).collect();
+        clients.render(state::ClientSnapshot { clients: fixture_clients, profiles: Vec::new(), sessions_error: false, sessions: vec![serde_json::json!({"clientName":"Codex","clientType":"codex","sessionCount":5,"callsToday":60,"lastActiveMs":now-180000,"firstCatalogSize":1711})] });
         let approvals = gtk::Box::new(gtk::Orientation::Vertical, 12);
         approvals.set_margin_top(20); approvals.set_margin_bottom(20); approvals.set_margin_start(20); approvals.set_margin_end(20);
         approvals.append(&gtk::Label::builder().label("Action required").xalign(0.0).css_classes(["title-2"]).build());
@@ -10245,6 +10256,13 @@ mod tests {
             duplicate_server_name("odd (name", &existing),
             "odd (name (2)"
         );
+    }
+
+    #[test]
+    fn saved_call_summary_uses_plain_counts() {
+        assert_eq!(activity_count_summary(5225, 5, 5, false), "5,225 calls saved on this computer. Showing the latest 5.");
+        assert_eq!(activity_count_summary(5225, 10, 100, false), "5,225 calls saved on this computer. Showing 10 of the latest 100.");
+        assert_eq!(activity_count_summary(5225, 2, 5, true), "5,225 calls saved on this computer. Showing 2 matching rows from the latest 5.");
     }
 
     #[test]

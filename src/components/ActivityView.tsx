@@ -1351,7 +1351,7 @@ function DiscoveryTraces({
           <span className="font-medium text-foreground/80">Discovery</span>
         </div>
         {searches > 0
-          ? `${searches} searches in recent activity; detailed search records are no longer available.`
+          ? `${searches} searches in recent activity; detailed search records are not available.`
           : "Nothing searched yet."}
       </div>
     );
@@ -2087,7 +2087,7 @@ export function ActivityView({
           />
           Recent calls and approvals
           <span className="text-xs font-normal text-muted-foreground/70">
-            last {entries.length} {entries.length === 1 ? "event" : "events"}
+            latest {entries.length}
           </span>
         </button>
         <button
@@ -2119,7 +2119,9 @@ export function ActivityView({
       <p className="mb-2 text-xs text-muted-foreground">
         {stats ? `${stats.total.toLocaleString()} calls saved on this computer. ` : ""}
         {logOpen
-          ? `Showing ${visible.length === entries.length ? "the latest" : ""} ${visible.length.toLocaleString()}${visible.length !== entries.length ? ` matching rows from the latest ${entries.length}` : ""}.`
+          ? visible.length === entries.length
+            ? `Showing the latest ${visible.length.toLocaleString()}.`
+            : `Showing ${visible.length.toLocaleString()} matching rows from the latest ${entries.length.toLocaleString()}.`
           : `Latest ${entries.length.toLocaleString()} available.`}
       </p>
 
