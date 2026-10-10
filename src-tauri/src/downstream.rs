@@ -5906,6 +5906,7 @@ pub struct HttpTransport {
     refresh: Option<Arc<RefreshFn>>,
     /// Read only after a bearer rejection, to adopt another process's credential.
     auth_owner: Option<String>,
+    auth_credential_owner: Option<String>,
     /// Separate from token refresh: `insufficient_scope` requires interactive
     /// consent and a new authorization, not another token from the old grant.
     scope_reauthorize: Option<Arc<ScopeReauthorizeFn>>,
@@ -6519,6 +6520,7 @@ impl HttpTransport {
             auth: Arc::new(Mutex::new(auth)),
             refresh: refresh.map(Arc::new),
             auth_owner: None,
+            auth_credential_owner: None,
             scope_reauthorize: None,
             scope_upgrade_attempts: Arc::new(Mutex::new(HashSet::new())),
             forced_refresh_token: Arc::new(Mutex::new(None)),
@@ -6663,6 +6665,7 @@ impl HttpTransport {
             auth: Arc::clone(&self.auth),
             refresh: self.refresh.clone(),
             auth_owner: self.auth_owner.clone(),
+            auth_credential_owner: self.auth_credential_owner.clone(),
             scope_reauthorize: self.scope_reauthorize.clone(),
             scope_upgrade_attempts: Arc::clone(&self.scope_upgrade_attempts),
             forced_refresh_token: Arc::clone(&self.forced_refresh_token),
@@ -6955,6 +6958,10 @@ impl HttpTransport {
         let Some(owner) = &self.auth_owner else {
             return Ok(false);
         };
+        let _owner = self
+            .auth_credential_owner
+            .as_ref()
+            .map(|physical| crate::local_auth::pin_credential_owner(owner, physical));
         let stored = match rejected.as_deref() {
             Some(rejected) => crate::remote::newer_credential(owner, rejected),
             None => crate::remote::current_credential(owner),
@@ -7804,6 +7811,7 @@ impl Transport for HttpTransport {
 
     fn set_server_id(&mut self, id: &str) {
         self.auth_owner = Some(id.to_string());
+        self.auth_credential_owner = crate::local_auth::pinned_owner(id);
     }
 
     fn connection_closed(&self) -> Option<bool> {
@@ -16562,6 +16570,35 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn old_http_transport_cannot_adopt_the_new_destinations_credential() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut reg = crate::registry::Registry::default();
+            let server: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({"id":"scoped","name":"scoped","transport":"http","url":"https://old.example/mcp"})).unwrap();
+            reg.unknown_fields.insert("personalSyncCredentialDestinations".into(), serde_json::json!({"scoped":crate::local_auth::personal_credential_destination(&server)}));
+            reg.servers.push(server);
+            crate::registry::save(&reg).unwrap();
+            crate::secrets::set_secret("scoped", crate::secrets::HTTP_AUTH_KEY, "old").unwrap();
+            let mut old = HttpTransport::with_auth("https://old.example/mcp", Some("old".into()));
+            {
+                let _scope =
+                    crate::local_auth::pin_http_destination("scoped", "https://old.example/mcp")
+                        .unwrap();
+                old.set_server_id("scoped");
+            }
+            reg.servers[0].url = Some("https://new.example/mcp".into());
+            crate::registry::save(&reg).unwrap();
+            crate::secrets::set_secret("scoped", crate::secrets::HTTP_AUTH_KEY, "new").unwrap();
+            assert!(!old.reuse_stored_auth(&Some("old".into())).unwrap());
+            assert_eq!(old.auth.lock().unwrap().as_deref(), Some("old"));
+            assert_eq!(
+                crate::remote::current_credential("scoped")
+                    .unwrap()
+                    .as_deref(),
+                Some("new")
+            );
+        });
+    }
+    #[test]
     fn http_refresh_failure_rereads_the_vault_before_retrying_callbacks() {
         use crate::secrets;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17108,9 +17145,12 @@ for line in sys.stdin:
         handle.join().unwrap();
 
         assert!(error.to_string().contains("HTTP 401"));
-        assert_eq!(error.call_failure().kind, crate::call_failure::CallFailureKind::Auth {
-            target: crate::call_failure::AuthTarget::Scope,
-        });
+        assert_eq!(
+            error.call_failure().kind,
+            crate::call_failure::CallFailureKind::Auth {
+                target: crate::call_failure::AuthTarget::Scope,
+            }
+        );
         assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
     }
 

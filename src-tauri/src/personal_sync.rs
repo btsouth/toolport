@@ -791,7 +791,7 @@ pub fn apply(
                 ))
             });
         reg.unknown_fields
-            .entry("personalSyncCredentialDestinations".into())
+            .entry("personalSyncCredentialDestinations")
             .or_insert_with(|| json!({}))
             .as_object_mut()
             .ok_or("Local credential destinations are unreadable")?
@@ -1399,6 +1399,10 @@ mod tests {
             crate::registry::save(&b).unwrap();
             crate::secrets::set_secret(&id, crate::secrets::HTTP_AUTH_KEY, "synthetic-old-token")
                 .unwrap();
+            assert_eq!(
+                crate::remote::current_credential(&id).unwrap().as_deref(),
+                Some("synthetic-old-token")
+            );
             let mut changed = original.clone();
             changed["servers"][0]["url"] = json!("https://changed.example/mcp");
             assert_eq!(apply(&mut b, &changed, 2).unwrap().review, 0);
@@ -1427,6 +1431,7 @@ mod tests {
                 crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY).unwrap(),
                 None
             );
+            assert_eq!(crate::remote::current_credential(&id).unwrap(), None);
             crate::secrets::set_secret(&id, crate::secrets::HTTP_AUTH_KEY, "synthetic-new-token")
                 .unwrap();
             apply(&mut b, &changed, 2).unwrap();
@@ -1436,6 +1441,36 @@ mod tests {
                 crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY)
                     .unwrap()
                     .as_deref(),
+                Some("synthetic-new-token")
+            );
+            assert_eq!(
+                crate::remote::current_credential(&id).unwrap().as_deref(),
+                Some("synthetic-new-token")
+            );
+            {
+                let _old_request = crate::local_auth::pin_http_destination(
+                    &id,
+                    original["servers"][0]["url"].as_str().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    crate::remote::current_credential(&id).unwrap().as_deref(),
+                    Some("synthetic-old-token")
+                );
+                // An old refresh finishing late writes only to its old scope.
+                crate::secrets::set_secret(
+                    &id,
+                    crate::secrets::HTTP_AUTH_KEY,
+                    "synthetic-old-rotated",
+                )
+                .unwrap();
+                assert_eq!(
+                    crate::remote::current_credential(&id).unwrap().as_deref(),
+                    Some("synthetic-old-rotated")
+                );
+            }
+            assert_eq!(
+                crate::remote::current_credential(&id).unwrap().as_deref(),
                 Some("synthetic-new-token")
             );
             assert!(export(&b.servers[0])
@@ -1448,7 +1483,7 @@ mod tests {
                 crate::secrets::get_secret_result(&id, crate::secrets::HTTP_AUTH_KEY)
                     .unwrap()
                     .as_deref(),
-                Some("synthetic-old-token")
+                Some("synthetic-old-rotated")
             );
         });
     }

@@ -5,6 +5,90 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const FIELD: &str = "localTeamAuthentication";
+thread_local! {
+    static PINNED: std::cell::RefCell<BTreeMap<String, String>> = const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+pub(crate) struct OwnerPin {
+    id: String,
+    previous: Option<String>,
+    _thread: std::marker::PhantomData<*const ()>,
+}
+impl Drop for OwnerPin {
+    fn drop(&mut self) {
+        PINNED.with(|pins| {
+            let mut pins = pins.borrow_mut();
+            if let Some(previous) = self.previous.take() {
+                pins.insert(self.id.clone(), previous);
+            } else {
+                pins.remove(&self.id);
+            }
+        });
+    }
+}
+pub(crate) fn pinned_owner(id: &str) -> Option<String> {
+    PINNED.with(|pins| pins.borrow().get(id).cloned())
+}
+pub(crate) fn pin_credential_owner(id: &str, owner: &str) -> OwnerPin {
+    OwnerPin {
+        id: id.into(),
+        previous: PINNED.with(|pins| pins.borrow_mut().insert(id.into(), owner.into())),
+        _thread: std::marker::PhantomData,
+    }
+}
+fn snapshot() -> Result<Option<Registry>, String> {
+    let Some(path) = crate::registry::resolved_path() else {
+        return Ok(None);
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("Cannot verify local authentication ownership".into()),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| "Cannot verify local authentication ownership".into())
+}
+pub(crate) fn pin_http_destination(id: &str, url: &str) -> Result<Option<OwnerPin>, String> {
+    let Some(reg) = snapshot()? else {
+        return Ok(None);
+    };
+    let Some(base) = reg
+        .unknown_fields
+        .get("personalSyncCredentialDestinations")
+        .and_then(|destinations| destinations.get(id))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    use sha2::{Digest, Sha256};
+    let destination = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&Some(url)).expect("URL serialization"))
+    );
+    let owner = if destination == base {
+        id.into()
+    } else {
+        format!("{id}-sync-{destination}")
+    };
+    Ok(Some(pin_credential_owner(id, &owner)))
+}
+pub(crate) fn pin_personal_owner(id: &str) -> Result<Option<OwnerPin>, String> {
+    if let Some(owner) = pinned_owner(id) {
+        return Ok(Some(pin_credential_owner(id, &owner)));
+    }
+    let Some(reg) = snapshot()? else {
+        return Ok(None);
+    };
+    if reg
+        .unknown_fields
+        .get("personalSyncCredentialDestinations")
+        .and_then(|destinations| destinations.get(id))
+        .is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(pin_credential_owner(id, &owner_in(&reg, id)?)))
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -184,6 +268,9 @@ pub(crate) fn ensure_unconfigured(reg: &Registry, managed: &ServerEntry) -> Resu
 /// Vault operations also occur inside registry updates, so calling registry::load
 /// here would deadlock. Never recover or rewrite files from this read path.
 pub(crate) fn owner(id: &str) -> Result<String, String> {
+    if let Some(owner) = pinned_owner(id) {
+        return Ok(owner);
+    }
     let Some(path) = crate::registry::resolved_path() else {
         return Ok(id.into());
     };

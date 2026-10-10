@@ -27,6 +27,7 @@ const AUTH_LOCK_POLL_MS: u64 = 250;
 
 pub(crate) struct AuthMutationLock {
     path: std::path::PathBuf,
+    _personal_owner: Option<crate::local_auth::OwnerPin>,
 }
 
 impl Drop for AuthMutationLock {
@@ -101,6 +102,7 @@ fn try_acquire_auth_lock(path: &Path) -> Result<Option<AuthMutationLock>, String
                 .map_err(|error| format!("could not write auth mutation lock file: {error}"))?;
             Ok(Some(AuthMutationLock {
                 path: path.to_path_buf(),
+                _personal_owner: None,
             }))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -132,6 +134,7 @@ fn try_acquire_auth_lock(path: &Path) -> Result<Option<AuthMutationLock>, String
                 .map_err(|error| format!("could not flush auth mutation lock file: {error}"))?;
             Ok(Some(AuthMutationLock {
                 path: path.to_path_buf(),
+                _personal_owner: None,
             }))
         }
         Err(error) => Err(format!("could not create auth mutation lock file: {error}")),
@@ -139,7 +142,10 @@ fn try_acquire_auth_lock(path: &Path) -> Result<Option<AuthMutationLock>, String
 }
 
 pub(crate) fn acquire_auth_lock(server_id: &str) -> Result<AuthMutationLock, String> {
-    acquire_auth_owner_lock(&crate::local_auth::owner(server_id)?)
+    let pin = crate::local_auth::pin_personal_owner(server_id)?;
+    let mut lock = acquire_auth_owner_lock(&crate::local_auth::owner(server_id)?)?;
+    lock._personal_owner = pin;
+    Ok(lock)
 }
 
 /// Handoffs lock both raw namespaces before changing ownership, outside the registry lock.
