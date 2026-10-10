@@ -517,7 +517,7 @@ function QuietDriftHistory({
 
 /** Catalog exposure: exact serialized bytes with a provider-independent estimate. */
 function SavingsBanner({ savings }: { savings: SavingsSummary }) {
-  const hasCatalog = savings.listLoads > 0;
+  const hasCatalog = (savings.tokenizedLoads ?? 0) > 0;
   const measured = (savings.measuredLoads ?? 0) > 0;
   const discovered = (savings.discoveryCount ?? 0) > 0;
   const avoided = savings.avoidedSurfaceBytes ?? 0;
@@ -538,7 +538,7 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
 
   const share = async () => {
     const text = hasCatalog
-      ? `Toolport recorded ${fmtTokens(savings.tokensSaved)} tokens saved, net of discovery responses. Counted with cl100k_base once per session and catalog hash, not model billing. toolport.app`
+      ? `Toolport counted ${fmtTokens(savings.tokensSaved)} catalog tokens avoided after discovery text. Counted with cl100k_base once per session and catalog hash, not model usage or billing. toolport.app`
       : `Toolport recorded ${savings.discoveryCount ?? 0} discovery searches returning ${fmtBytes(savings.discoveryResponseBytes ?? 0)} of text at its MCP boundary. toolport.app`;
     try {
       await navigator.clipboard.writeText(text);
@@ -553,9 +553,7 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
       <div className="flex items-center gap-2">
         <Sparkles className="size-4 text-success" />
         <span className="text-sm font-medium text-muted-foreground">
-          {hasCatalog
-            ? "Tool definitions kept out of your agent's context"
-            : "Discovery payload returned"}
+          {hasCatalog ? "Catalog text avoided" : "Discovery payload returned"}
         </span>
       </div>
       <div className="mt-2 flex flex-wrap items-end gap-x-6 gap-y-1">
@@ -564,10 +562,16 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
             ? fmtTokens(savings.tokensSaved)
             : fmtBytes(savings.discoveryResponseBytes ?? 0)}{" "}
           <span className="text-base font-normal text-muted-foreground">
-            {hasCatalog ? "tokens saved" : "discovery text"}
+            {hasCatalog ? "catalog tokens avoided" : "discovery text"}
           </span>
         </span>
       </div>
+      {hasCatalog && (
+        <p className="mt-2 text-xs text-muted-foreground">
+          Counts tool-definition text with cl100k_base, after discovery text. This does
+          not measure model usage or billing.
+        </p>
+      )}
       {(savings.latestCatalogTs ?? 0) > 0 && (
         <div className="mt-2 text-sm text-muted-foreground">
           Latest load: {fmtBytes(savings.latestFullSurfaceBytes ?? 0)} /{" "}
@@ -734,10 +738,10 @@ function PiiBadge({ entry }: { entry: AuditEntry }) {
     return (
       <span
         className="flex shrink-0 items-center gap-1 rounded bg-warning/15 px-1.5 py-0.5 text-[10px] text-warning"
-        title={`${replaced} value${replaced === 1 ? "" : "s"} pseudonymized, but the pass did not fully apply — some values reached the model in the clear (the session map was full, or the result exceeded the scan cap).`}
+        title={`${replaced} value${replaced === 1 ? "" : "s"} masked, but the pass did not fully apply: some values reached the model in the clear (the session map was full, or the result exceeded the scan cap).`}
       >
         <ShieldAlert aria-hidden="true" className="size-3" />
-        {replaced} pseudonymized, incomplete
+        {replaced} {replaced === 1 ? "value" : "values"} masked, incomplete
       </span>
     );
   }
@@ -745,11 +749,24 @@ function PiiBadge({ entry }: { entry: AuditEntry }) {
   return (
     <span
       className="flex shrink-0 items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
-      title={`${replaced} value${replaced === 1 ? "" : "s"} in this result were replaced with pseudonyms before the model saw them. The values themselves are never logged.`}
+      title="Personal values in this result were replaced before reaching the model. The values themselves are never logged."
     >
       <ShieldCheck aria-hidden="true" className="size-3" />
-      {replaced} pseudonymized
+      {replaced} {replaced === 1 ? "value" : "values"} masked
     </span>
+  );
+}
+
+function internalActivityLabel(tool: string): string {
+  return (
+    (
+      {
+        search: "Searched tools",
+        describe: "Looked up a tool",
+        status: "Checked a tool request",
+        fetch: "Retrieved a tool result",
+      } as Record<string, string>
+    )[tool] ?? "Used Toolport"
   );
 }
 
@@ -772,16 +789,16 @@ function CallRow({ e }: { e: AuditEntry }) {
   const meta = [
     activityClientName(e),
     fmtAgo(e.ts),
-    ...(e.cold == null ? [] : [e.cold ? "cold catalog" : "warm catalog"]),
     ...(e.failureKind ? [e.failureKind.replace(/_/g, " ")] : []),
-    ...(e.dispatchMs == null ? [] : [`dispatch ${fmtMs(e.dispatchMs)}`]),
     ...(duration == null
       ? []
       : [approvalOutcome ? `waited ${fmtMs(duration)}` : fmtMs(duration)]),
   ].join(" · ");
   const hasDetail = !approvalOutcome && !e.ok && (!!e.error || !!e.runId);
   return (
-    <div className="rounded-md border border-border/50 text-sm">
+    <div
+      className={`rounded-md border border-border/50 text-sm ${e.kind === "internal" ? "bg-muted/30" : ""}`}
+    >
       <div
         className={`flex items-center gap-3 rounded-md px-3 py-2 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none ${
           hasDetail ? "cursor-pointer hover:bg-muted/30" : ""
@@ -812,14 +829,18 @@ function CallRow({ e }: { e: AuditEntry }) {
           <span className="inline-block size-3.5 shrink-0" />
         )}
         <RowIcon
-          className={`size-4 shrink-0 ${approvalOutcome?.iconClass ?? (e.held ? "text-warning" : e.ok ? "text-success" : "text-destructive")}`}
+          className={`size-4 shrink-0 ${approvalOutcome?.iconClass ?? (e.kind === "internal" && e.ok ? "text-muted-foreground" : e.held ? "text-warning" : e.ok ? "text-success" : "text-destructive")}`}
         />
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 items-center gap-2">
-            <span className="min-w-0 truncate font-medium">{e.server}</span>
-            <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
-              {e.tool}
+            <span className="min-w-0 truncate font-medium">
+              {e.kind === "internal" ? internalActivityLabel(e.tool) : e.server}
             </span>
+            {e.kind !== "internal" && (
+              <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
+                {e.tool}
+              </span>
+            )}
           </div>
           <div
             className="mt-1 truncate text-xs text-muted-foreground"
@@ -829,6 +850,9 @@ function CallRow({ e }: { e: AuditEntry }) {
               e.client && `Client: ${e.client}`,
               e.sessionId && `Session: ${e.sessionId}`,
               e.runId && `Run: ${e.runId}`,
+              e.cold != null && (e.cold ? "cold catalog" : "warm catalog"),
+              e.dispatchMs != null && `dispatch ${fmtMs(e.dispatchMs)}`,
+              e.kind === "internal" && `Toolport: ${e.tool}`,
             ]
               .filter(Boolean)
               .join(" · ")}
@@ -959,7 +983,7 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
       <div className="grid grid-cols-3 gap-3">
         <div className="rounded-lg border p-3">
           <div className="text-2xl font-semibold tabular-nums">{stats.total}</div>
-          <div className="text-xs text-muted-foreground">calls logged</div>
+          <div className="text-xs text-muted-foreground">tool calls retained</div>
         </div>
         <div
           className={`rounded-lg border p-3 ${stats.errors > 0 ? "border-destructive/40 bg-destructive/[0.04]" : ""}`}
@@ -2080,6 +2104,12 @@ export function ActivityView({
           onConfirm={clearActivity}
         />
       </div>
+
+      <p className="mb-2 text-xs text-muted-foreground">
+        {stats ? `${stats.total.toLocaleString()} tool calls retained · ` : ""}Showing{" "}
+        {visible.length.toLocaleString()} of the latest {entries.length.toLocaleString()}{" "}
+        events. Events include calls, approvals and Toolport lookups.
+      </p>
 
       {logOpen && (
         <>

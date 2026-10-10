@@ -505,7 +505,62 @@ pub fn record_code_mode(
     write_line(&entry);
 }
 
-/// Last summary per session, bounded by the retained audit and a small UI cap.
+/// One display summary per client, with calls counted from the full retained audit.
+pub fn recent_client_activity(limit: usize, since_ms: Option<u64>) -> std::io::Result<Vec<Value>> {
+    Ok(client_activity_from_entries(read_all()?, limit, since_ms))
+}
+
+fn client_activity_from_entries(
+    entries: Vec<Value>,
+    limit: usize,
+    since_ms: Option<u64>,
+) -> Vec<Value> {
+    let mut groups =
+        std::collections::BTreeMap::<String, (Value, std::collections::HashSet<String>)>::new();
+    for entry in entries {
+        let call = tool_call_ok(&entry).is_some();
+        if !call
+            && !matches!(
+                entry["kind"].as_str(),
+                Some("session" | "internal" | "approval")
+            )
+        {
+            continue;
+        }
+        let entry = activity_client_name(entry);
+        let name = crate::clients::display_caller_name(
+            entry["clientName"].as_str(),
+            entry["clientLabel"].as_str(),
+        );
+        let ts = entry["ts"].as_u64().unwrap_or(0);
+        let (summary, sessions) = groups.entry(name).or_insert_with(|| (json!({
+            "client":entry["client"], "clientName":entry["clientName"], "clientLabel":entry["clientLabel"],
+            "lastActiveMs":0, "callsToday": if since_ms.is_some() { json!(0) } else { Value::Null }
+        }), Default::default()));
+        summary["lastActiveMs"] = json!(summary["lastActiveMs"].as_u64().unwrap_or(0).max(ts));
+        if call && since_ms.is_some_and(|since| ts >= since) {
+            summary["callsToday"] = json!(summary["callsToday"].as_u64().unwrap_or(0) + 1);
+        }
+        if let Some(id) = entry["sessionId"].as_str() {
+            sessions.insert(id.to_string());
+        }
+        if summary.get("firstCatalogSize").is_none() && entry["firstCatalogSize"].is_u64() {
+            summary["firstCatalogSize"] = entry["firstCatalogSize"].clone();
+        }
+    }
+    let mut rows: Vec<Value> = groups
+        .into_values()
+        .map(|(mut row, sessions)| {
+            row["sessionCount"] = json!(sessions.len());
+            row
+        })
+        .collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row["lastActiveMs"].as_u64().unwrap_or(0)));
+    rows.truncate(limit.min(64));
+    rows
+}
+
+/// Last lifecycle summary per session, for protocol observability.
 pub fn recent_sessions(limit: usize) -> std::io::Result<Vec<Value>> {
     let mut seen = std::collections::HashSet::new();
     Ok(
@@ -945,6 +1000,42 @@ fn csv_cell(value: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn client_activity_groups_sessions_and_counts_only_todays_server_calls() {
+        let rows = client_activity_from_entries(
+            vec![
+                json!({"kind":"session","sessionId":"c2","clientName":"Codex","ts":300,"firstCatalogSize":1711}),
+                json!({"kind":"approval","clientName":"Codex","ts":290,"ok":true}),
+                json!({"kind":"internal","clientName":"Codex","ts":280,"ok":true}),
+                json!({"clientName":"Codex","ts":250,"ok":false}),
+                json!({"clientName":"Codex","ts":240,"ok":true}),
+                json!({"kind":"session","sessionId":"c1","clientName":"Codex","ts":220}),
+                json!({"clientName":"Codex","ts":50,"ok":true}),
+                json!({"clientName":"Unknown client","clientLabel":"inbox","ts":30,"ok":true}),
+            ],
+            64,
+            Some(100),
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["clientName"], "Codex");
+        assert_eq!(rows[0]["sessionCount"], 2);
+        assert_eq!(rows[0]["callsToday"], 2);
+        assert_eq!(rows[0]["lastActiveMs"], 300);
+        assert_eq!(rows[0]["firstCatalogSize"], 1711);
+        assert_eq!(rows[1]["callsToday"], 0);
+        assert_eq!(
+            crate::clients::display_caller_name(
+                rows[1]["clientName"].as_str(),
+                rows[1]["clientLabel"].as_str()
+            ),
+            "inbox (reported)"
+        );
+        assert!(
+            client_activity_from_entries(vec![json!({"ok":true,"ts":1})], 1, None)[0]["callsToday"]
+                .is_null()
+        );
+    }
 
     #[test]
     fn f6_every_new_call_path_records_caller_identity() {

@@ -412,16 +412,15 @@ try {
   await expect(calls).toBeVisible();
   if ((await calls.getAttribute("aria-expanded")) === "false") await calls.click();
   await expect(page.getByText(/Unknown app \(via Cursor\).*reports.*kt 1/)).toBeVisible();
-  await expect(page.getByText(/dispatch 3 ms/)).toBeVisible();
+  await expect(page.getByText(/dispatch 3 ms/)).toHaveCount(0);
   await page.screenshot({ path: path.join(output, "session-activity.png") });
   await page.getByRole("button", { name: "Clients", exact: true }).click();
-  const sessions = page.getByRole("region", { name: "Recent client sessions" });
+  const sessions = page.getByRole("region", { name: "Recent client activity" });
+  await sessions.getByRole("button", { name: /Recent client activity/ }).click();
   await expect(sessions.getByText("Unknown app (via Cursor)")).toBeVisible();
-  await expect(sessions.getByText("Reports itself as: kt 1")).toBeVisible();
   await expect(
-    sessions.getByText(/3 tool lists.*1 list changes delivered/),
+    sessions.getByText(/Last active.*12 calls today.*Last saw 4 tools/),
   ).toBeVisible();
-  await expect(sessions.getByRole("button")).toHaveCount(0);
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   await page.screenshot({ path: path.join(output, "session-clients.png") });
   await page.goto(`${baseURL}/fixtures/?sessions&caller-names`);
@@ -450,7 +449,8 @@ try {
   }
   await page.screenshot({ path: path.join(output, "caller-activity.png") });
   await page.getByRole("button", { name: "Clients", exact: true }).click();
-  const callerSessions = page.getByRole("region", { name: "Recent client sessions" });
+  const callerSessions = page.getByRole("region", { name: "Recent client activity" });
+  await callerSessions.getByRole("button", { name: /Recent client activity/ }).click();
   for (const name of ["inbox", "inbox (reported)", "Unrecorded client", "[private]"]) {
     await expect(callerSessions.getByText(name, { exact: true })).toBeVisible();
   }

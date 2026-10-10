@@ -45,15 +45,19 @@ describe("ClientsView", () => {
       },
     ]);
     render(<ClientsView clients={[]} registry={null} onSelectClient={vi.fn()} />);
-    const heading = await screen.findByText("Unknown app (via Cursor)");
-    const row = heading.parentElement!;
-    expect(row).toHaveTextContent("Reports itself as: kt 1");
-    expect(row.textContent!.indexOf("Unknown app")).toBeLessThan(
-      row.textContent!.indexOf("kt 1"),
+    const toggle = await screen.findByRole("button", { name: /Recent client activity/ });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Unknown app (via Cursor)")).not.toBeInTheDocument();
+    await userEvent.click(toggle);
+    const heading = screen.getByText("Unknown app (via Cursor)");
+    expect(heading).toHaveAttribute(
+      "title",
+      expect.stringContaining("Reports itself as: kt 1"),
     );
-    expect(row).toHaveTextContent("3 tool lists");
-    expect(row).toHaveTextContent("1 list changes delivered");
-    expect(row.querySelector("button")).toBeNull();
+    expect(screen.getByText(/Last active time unavailable/)).toHaveTextContent(
+      "Last saw 4 tools",
+    );
+    expect(screen.queryByText(/tool lists/)).not.toBeInTheDocument();
   });
   it("reports session history read failures", async () => {
     vi.mocked(getClientSessions).mockRejectedValueOnce(new Error("failed"));

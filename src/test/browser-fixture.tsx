@@ -8,6 +8,7 @@ import { ServerLogo } from "@/components/ServerLogo";
 import type {
   AuditEntry,
   ClientSession,
+  ClientActivity,
   PendingApproval,
   Registry,
   SavingsSummary,
@@ -631,7 +632,12 @@ mockIPC(
       case "plugin:app|version":
         return "1.18.0-fixture";
       case "get_client_sessions":
-        return sessionRows;
+        return sessionRows.map<ClientActivity>((row) => ({
+          ...row,
+          lastActiveMs: Date.now() - 180000,
+          callsToday: 12,
+          sessionCount: 3,
+        }));
       case "get_audit_log":
         return auditRows;
       case "audit_stats":

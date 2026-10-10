@@ -10,6 +10,7 @@ use crate::registry::{self, Registry};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ActivityView {
     pub(super) timestamp_ms: u64,
+    pub(super) internal: bool,
     pub(super) server: String,
     pub(super) tool: String,
     pub(super) client: Option<String>,
@@ -45,6 +46,7 @@ pub(super) struct ActivitySnapshot {
     /// Exact MCP surface bytes are recorded separately; provider usage is unknown.
     pub(super) tokens_saved: i64,
     pub(super) savings_list_loads: u64,
+    pub(super) savings_tokenized_loads: u64,
     pub(super) savings_peak_catalog: u64,
     pub(super) savings_since_ts: u64,
     pub(super) savings_full_bytes: u64,
@@ -100,6 +102,7 @@ impl ActivitySnapshot {
             }
             if calls.len() < recent_limit {
                 calls.push(ActivityView {
+                    internal: entry["kind"] == "internal",
                     timestamp_ms: entry
                         .get("ts")
                         .and_then(serde_json::Value::as_u64)
@@ -158,6 +161,7 @@ impl ActivitySnapshot {
             average_duration_ms: (duration_count > 0).then(|| duration_total / duration_count),
             tokens_saved: 0,
             savings_list_loads: 0,
+            savings_tokenized_loads: 0,
             savings_peak_catalog: 0,
             savings_since_ts: 0,
             savings_full_bytes: 0,
@@ -316,6 +320,7 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(0);
     snapshot.savings_list_loads = savings_number("listLoads");
+    snapshot.savings_tokenized_loads = savings_number("tokenizedLoads");
     snapshot.savings_peak_catalog = savings_number("peakCatalog");
     snapshot.savings_since_ts = savings_number("sinceTs");
     snapshot.savings_full_bytes = savings_number("fullSurfaceBytes");
@@ -448,7 +453,21 @@ fn client_access_options(registry: &Registry) -> Vec<ProfileView> {
 }
 
 fn client_session_history() -> (Vec<serde_json::Value>, bool) {
-    match crate::audit::recent_sessions(12) {
+    let since = gtk::glib::DateTime::now_local()
+        .and_then(|now| {
+            gtk::glib::DateTime::new(
+                &now.timezone(),
+                now.year(),
+                now.month(),
+                now.day_of_month(),
+                0,
+                0,
+                0.0,
+            )
+        })
+        .ok()
+        .map(|day| day.to_unix().max(0) as u64 * 1000);
+    match crate::audit::recent_client_activity(64, since) {
         Ok(sessions) => (sessions, false),
         Err(_) => (Vec::new(), true),
     }

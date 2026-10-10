@@ -28901,9 +28901,15 @@ mod tests {
             let (_, caller) = resolve_adapter_caller(&reg, id, None, None);
             assert_eq!(caller.session_owner.identity, format!("adapter:{id}"));
             assert_eq!(caller.profile, Some(profile));
-            assert_eq!(caller.audit_label.as_deref(), Some("Unknown client"));
-            assert_eq!(conduit_lib::session_observability::display_client_id(id), "[private]");
-            assert!(conduit_lib::session_observability::telemetry_principal(&caller.session_owner.identity).is_none());
+            assert_eq!(caller.audit_label.as_deref(), Some("[private]"));
+            assert_eq!(
+                conduit_lib::session_observability::display_client_id(id),
+                "[private]"
+            );
+            assert!(conduit_lib::session_observability::telemetry_principal(
+                &caller.session_owner.identity
+            )
+            .is_none());
         }
     }
 

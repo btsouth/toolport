@@ -99,8 +99,8 @@ it("p10c shows approval outcomes without treating them as call errors", async ()
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   await user.click(await screen.findByRole("button", { name: /recent calls/i }));
-  expect(screen.getByText("calls logged").parentElement).toHaveTextContent(
-    /2\s*calls logged/,
+  expect(screen.getByText("tool calls retained").parentElement).toHaveTextContent(
+    /2\s*tool calls retained/,
   );
   expect(screen.getByText("errors (50%)").parentElement).toHaveTextContent(/1\s*errors/);
   for (const [, label] of outcomes) expect(screen.getByText(label)).toBeInTheDocument();
@@ -120,7 +120,7 @@ it("p10c shows an approval-only history even when no tools ran", async () => {
   await user.click(await screen.findByRole("button", { name: /recent calls/i }));
   expect(screen.getByText("Withdrawn")).toBeInTheDocument();
   expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
-  expect(screen.queryByText("calls logged")).not.toBeInTheDocument();
+  expect(screen.queryByText("tool calls retained")).not.toBeInTheDocument();
 });
 
 it("pauses Activity polling while hidden and resumes when visible", async () => {
@@ -402,11 +402,11 @@ describe("ActivityView recent calls", () => {
     await act(async () => {});
     await user.click(screen.getByRole("button", { name: /recent calls/i }));
 
-    expect(screen.getByText("3 pseudonymized")).toBeInTheDocument();
+    expect(screen.getByText("3 values masked")).toBeInTheDocument();
 
     // The fail-open case has to read as a warning, not as a tidy count: values reached
     // the model in the clear even though redaction was on.
-    const incomplete = screen.getByText("2 pseudonymized, incomplete");
+    const incomplete = screen.getByText("2 values masked, incomplete");
     expect(incomplete).toBeInTheDocument();
     expect(incomplete).toHaveAttribute(
       "title",
@@ -415,8 +415,8 @@ describe("ActivityView recent calls", () => {
 
     // A pass that matched nothing, and a call made with redaction off, both stay silent —
     // a badge on every row would bury the two cases above.
-    expect(screen.queryByText(/0 pseudonymized/)).not.toBeInTheDocument();
-    expect(screen.getAllByText(/pseudonymized/)).toHaveLength(2);
+    expect(screen.queryByText(/0 values masked/)).not.toBeInTheDocument();
+    expect(screen.getAllByText(/values masked/)).toHaveLength(2);
 
     // The values are the point of the feature and must never reach this view.
     expect(document.body.textContent).not.toMatch(/@example\.com/);
@@ -525,7 +525,7 @@ it("distinguishes measured bytes from legacy estimates in catalog savings", asyn
   });
   render(<ActivityView refreshKey={0} registry={null} />);
   await act(async () => {});
-  expect(screen.getByText(/923/)).toHaveTextContent("tokens saved");
+  expect(screen.getByText(/923/)).toHaveTextContent("catalog tokens avoided");
   expect(screen.getByText(/923/)).toHaveAttribute(
     "title",
     expect.stringContaining("net of discovery"),
@@ -548,6 +548,7 @@ it("shares a token savings statement without a billing claim", async () => {
   });
   getSavingsSummary.mockResolvedValue({
     tokensSaved: -123,
+    tokenizedLoads: 1,
     listLoads: 2751,
     peakCatalog: 1725,
     sinceTs: 1700000000000,
@@ -556,9 +557,9 @@ it("shares a token savings statement without a billing claim", async () => {
   await act(async () => {});
   await user.click(screen.getByRole("button", { name: "Share" }));
   expect(writeText).toHaveBeenCalledWith(
-    expect.stringContaining("-123 tokens saved, net of discovery responses"),
+    expect.stringContaining("-123 catalog tokens avoided after discovery text"),
   );
-  expect(writeText.mock.calls[0][0]).toContain("not model billing");
+  expect(writeText.mock.calls[0][0]).toContain("not model usage or billing");
   expect(writeText.mock.calls[0][0]).toContain("once per session and catalog hash");
   expect(writeText.mock.calls[0][0]).toContain("cl100k_base");
   expect(writeText.mock.calls[0][0]).not.toMatch(/billed tokens|money saved/i);
@@ -587,9 +588,7 @@ it("reports unavailable catalog telemetry without showing an empty measurement",
   render(<ActivityView refreshKey={0} registry={null} />);
   await act(async () => {});
   expect(screen.getByRole("alert")).toHaveTextContent("Catalog telemetry unavailable");
-  expect(
-    screen.queryByText("Tool definitions kept out of your agent's context"),
-  ).not.toBeInTheDocument();
+  expect(screen.queryByText("Catalog text avoided")).not.toBeInTheDocument();
 });
 
 it("keeps last-loaded catalog telemetry visibly stale after a failed refresh", async () => {
@@ -597,6 +596,7 @@ it("keeps last-loaded catalog telemetry visibly stale after a failed refresh", a
     .mockResolvedValueOnce({
       tokensSaved: 100,
       listLoads: 1,
+      tokenizedLoads: 1,
       peakCatalog: 3,
       sinceTs: 1700000000000,
     })
@@ -605,9 +605,7 @@ it("keeps last-loaded catalog telemetry visibly stale after a failed refresh", a
   await act(async () => {});
   view.rerender(<ActivityView refreshKey={1} registry={null} />);
   await act(async () => {});
-  expect(
-    screen.getByText("Tool definitions kept out of your agent's context"),
-  ).toBeInTheDocument();
+  expect(screen.getByText("Catalog text avoided")).toBeInTheDocument();
   expect(screen.getByRole("alert")).toHaveTextContent("last loaded measurements");
 });
 

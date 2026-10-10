@@ -2099,21 +2099,6 @@ impl ClientPage {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
-        if snapshot.sessions_error {
-            self.list.append(&gtk::Label::builder().label("Client session history could not be read.").halign(gtk::Align::Start).wrap(true).css_classes(["toolport-muted"]).build());
-        }
-        if !sessions.is_empty() {
-            self.list.append(&client_section_title("Recent client sessions", sessions.len()));
-            for session in sessions {
-                let card = gtk::Box::new(gtk::Orientation::Vertical, 3);
-                card.add_css_class("toolport-card");
-                card.append(&gtk::Label::builder().label(crate::clients::display_caller_name(session["clientName"].as_str(), session["clientLabel"].as_str())).halign(gtk::Align::Start).wrap(true).css_classes(["heading"]).build());
-                if let Some(label) = session["clientLabel"].as_str().filter(|_| !crate::clients::display_caller_name(session["clientName"].as_str(), session["clientLabel"].as_str()).ends_with(" (reported)")) { card.append(&gtk::Label::builder().label(format!("Reports itself as: {label}")).halign(gtk::Align::Start).wrap(true).css_classes(["toolport-muted"]).build()); }
-                let first = session["firstCatalogSize"].as_u64().map(|n| format!("{n} tools at first list")).unwrap_or_else(|| "No catalog delivered".into());
-                card.append(&gtk::Label::builder().label(format!("{} · {} tool lists · {} list changes delivered · {first} · {}", if session["phase"] == "close" { "Closed" } else { "Last observed" }, session["toolsListCount"].as_u64().unwrap_or(0), session["listChangedCount"].as_u64().unwrap_or(0), if session["contentChanged"] == true { "Catalog changed" } else { "Catalog unchanged" })).halign(gtk::Align::Start).wrap(true).css_classes(["toolport-muted"]).build());
-                self.list.append(&card);
-            }
-        }
         let installed = clients
             .iter()
             .filter(|client| client.app_present || client.config_exists)
@@ -2133,12 +2118,12 @@ impl ClientPage {
         self.connected_count
             .set_label(&connected_clients.len().to_string());
         self.configured_count.set_label(&configured.to_string());
-        let confirmation = self
-            .pending_confirmation
-            .borrow_mut()
-            .take()
-            .unwrap_or_else(|| format!("Scanned {} supported clients", clients.len()));
-        self.show_confirmation(&confirmation);
+        if let Some(confirmation) = self.pending_confirmation.borrow_mut().take() {
+            self.show_confirmation(&confirmation);
+        } else {
+            self.cancel_feedback_timer();
+            self.feedback.set_visible(false);
+        }
 
         let absent = clients
             .iter()
@@ -2152,15 +2137,6 @@ impl ClientPage {
                 false,
             ));
         }
-        if !available_clients.is_empty() {
-            self.list.append(&client_section_title(
-                "Available to connect",
-                available_clients.len(),
-            ));
-        }
-        for client in available_clients {
-            self.list.append(&client_card(client, self.clone()));
-        }
         if !connected_clients.is_empty() {
             self.list.append(&client_section_title(
                 "Connected to Toolport",
@@ -2168,6 +2144,15 @@ impl ClientPage {
             ));
         }
         for client in connected_clients {
+            self.list.append(&client_card(client, self.clone()));
+        }
+        if !available_clients.is_empty() {
+            self.list.append(&client_section_title(
+                "Available to connect",
+                available_clients.len(),
+            ));
+        }
+        for client in available_clients {
             self.list.append(&client_card(client, self.clone()));
         }
         // Supported-but-absent clients: collapsed so they don't crowd the real
@@ -2198,6 +2183,52 @@ impl ClientPage {
                 .css_classes(["toolport-muted"])
                 .build();
             expander.set_child(Some(&names));
+            self.list.append(&expander);
+        }
+        if snapshot.sessions_error {
+            self.list.append(
+                &gtk::Label::builder()
+                    .label("Client activity could not be read.")
+                    .halign(gtk::Align::Start)
+                    .wrap(true)
+                    .css_classes(["toolport-muted"])
+                    .build(),
+            );
+        }
+        if !sessions.is_empty() {
+            let expander = gtk::Expander::new(Some(&format!(
+                "Recent client activity · {}",
+                sessions.len()
+            )));
+            expander.add_css_class("toolport-card");
+            let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            for client in sessions {
+                let row = gtk::Box::new(gtk::Orientation::Vertical, 3);
+                let name = crate::clients::display_caller_name(
+                    client["clientName"].as_str(),
+                    client["clientLabel"].as_str(),
+                );
+                let tooltip = if name == "Unrecorded client" {
+                    crate::clients::UNRECORDED_CLIENT_TOOLTIP.to_string()
+                } else {
+                    format!(
+                        "{} recorded sessions. Reports itself as: {}",
+                        client["sessionCount"].as_u64().unwrap_or(1),
+                        client["clientLabel"].as_str().unwrap_or("not provided")
+                    )
+                };
+                row.append(
+                    &gtk::Label::builder()
+                        .label(name)
+                        .tooltip_text(tooltip)
+                        .halign(gtk::Align::Start)
+                        .css_classes(["heading"])
+                        .build(),
+                );
+                row.append(&gtk::Label::builder().label(client_activity_detail(&client)).tooltip_text("Calls today counts retained server calls since local midnight. Older calls may no longer be retained.").halign(gtk::Align::Start).wrap(true).css_classes(["toolport-muted"]).build());
+                rows.append(&row);
+            }
+            expander.set_child(Some(&rows));
             self.list.append(&expander);
         }
     }
@@ -2246,6 +2277,38 @@ impl ClientPage {
             timer.remove();
         }
     }
+}
+
+fn client_activity_detail(client: &serde_json::Value) -> String {
+    let mut details = vec![client["lastActiveMs"]
+        .as_u64()
+        .map(|ts| format!("Last active {}", relative_activity_time(ts)))
+        .unwrap_or_else(|| "Last active time unavailable".into())];
+    if let Some(calls) = client["callsToday"].as_u64() {
+        details.push(format!(
+            "{} {} today",
+            grouped_number(calls),
+            if calls == 1 { "call" } else { "calls" }
+        ));
+    }
+    if let Some(tools) = client["firstCatalogSize"].as_u64() {
+        details.push(format!("Last saw {} tools", grouped_number(tools)));
+    }
+    details.join(" · ")
+}
+
+fn grouped_number(n: u64) -> String {
+    let digits = n.to_string();
+    digits
+        .chars()
+        .enumerate()
+        .fold(String::new(), |mut s, (i, c)| {
+            if i > 0 && (digits.len() - i) % 3 == 0 {
+                s.push(',');
+            }
+            s.push(c);
+            s
+        })
 }
 
 fn client_section_title(title: &str, count: usize) -> gtk::Box {
@@ -2890,7 +2953,7 @@ impl ActivityPage {
         );
         page.append(
             &gtk::Label::builder()
-                .label("Toolport records outcomes and timing, never tool arguments or result data. The latest 10 events are shown first; up to 100 remain available.")
+                .label("Toolport records outcomes and timing, never tool arguments or result data. Recent events are shown below; export includes all retained history.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
@@ -2919,7 +2982,7 @@ impl ActivityPage {
             ("–", "Retained calls"),
             ("–", "Success rate"),
             ("–", "Average latency"),
-            ("–", "Tokens saved (est.)"),
+            ("–", "Catalog tokens avoided"),
         ] {
             let (item, value) = summary_item(value, label);
             values.push(value);
@@ -3673,26 +3736,26 @@ impl ActivityPage {
             return;
         };
         if !savings_banner_visible(
-            snapshot.savings_list_loads,
+            snapshot.savings_tokenized_loads,
             snapshot.savings_discovery_count,
         ) {
             self.savings_banner.set_visible(false);
             return;
         }
         self.savings_banner.set_visible(true);
-        let has_catalog = snapshot.savings_list_loads > 0;
+        let has_catalog = snapshot.savings_tokenized_loads > 0;
         self.savings_title
-            .set_label(savings_title(snapshot.savings_list_loads));
+            .set_label(savings_title(snapshot.savings_tokenized_loads));
         let (primary, unit) = savings_primary_display(
             snapshot.tokens_saved,
-            snapshot.savings_list_loads,
+            snapshot.savings_tokenized_loads,
             snapshot.savings_discovery_bytes,
         );
         self.savings_value.set_label(&primary);
         self.savings_unit.set_label(unit);
         let mut detail = if has_catalog {
             savings_detail_line(
-                snapshot.savings_list_loads,
+                snapshot.savings_tokenized_loads,
                 snapshot.savings_peak_catalog,
                 savings_since_date(snapshot.savings_since_ts),
             )
@@ -3739,6 +3802,7 @@ impl ActivityPage {
             ));
         }
         if has_catalog {
+            detail.push_str("\nCounts tool-definition text with cl100k_base, after discovery text. Does not measure model usage or billing.");
             self.savings_value.set_tooltip_text(Some("cl100k_base tokenizer; net of discovery responses and extra catalog exposure; counted once per session and scoped full/exposed catalog hash (sessionless HTTP: per listener/client). Historical estimates excluded. Client transformations and caching mean this is not model billing."));
         } else {
             detail.push_str(
@@ -3806,14 +3870,16 @@ impl ActivityPage {
         } else {
             match_count.min(RECENT_CALL_PREVIEW_LIMIT)
         };
-        self.filter_count
-            .set_label(&if visible_count < match_count {
-                format!("Showing {visible_count} of {match_count} events")
-            } else if match_count == snapshot.recent.len() {
-                format!("{match_count} events")
+        self.filter_count.set_label(&format!(
+            "{} tool calls retained · showing {visible_count} of the latest {} events{}",
+            grouped_number(snapshot.call_count as u64),
+            snapshot.recent.len(),
+            if match_count != snapshot.recent.len() {
+                " (filtered)"
             } else {
-                format!("{match_count} of {} events", snapshot.recent.len())
-            });
+                ""
+            }
+        ));
         self.show_more_calls
             .set_visible(match_count > RECENT_CALL_PREVIEW_LIMIT);
         let show_more_label = if self.show_all_recent.get() {
@@ -4620,7 +4686,7 @@ fn savings_title(loads: u64) -> &'static str {
     if loads == 0 {
         "Discovery payload returned"
     } else {
-        "Tool definitions kept out of your agent's context"
+        "Catalog text avoided"
     }
 }
 
@@ -4643,14 +4709,14 @@ fn savings_primary_display(
             "discovery text returned",
         );
     }
-    (format_saved_tokens(tokens_saved), "tokens saved")
+    (format_saved_tokens(tokens_saved), "catalog tokens avoided")
 }
 
 fn savings_share_line(tokens_saved: i64, loads: u64, searches: u64, bytes: u64) -> String {
     if loads == 0 {
         return format!("Toolport recorded {searches} discovery searches returning {} of text at its MCP boundary. toolport.app", format_byte_count(bytes));
     }
-    format!("Toolport recorded {}{} tokens saved, net of discovery responses. Counted with cl100k_base once per session and catalog hash, not model billing. toolport.app", if tokens_saved < 0 { "-" } else { "" }, state::format_token_count(tokens_saved.unsigned_abs()))
+    format!("Toolport recorded {}{} catalog tokens avoided after discovery text. Counted with cl100k_base once per session and catalog hash, not model billing. toolport.app", if tokens_saved < 0 { "-" } else { "" }, state::format_token_count(tokens_saved.unsigned_abs()))
 }
 
 fn format_byte_count(bytes: u64) -> String {
@@ -4690,7 +4756,7 @@ fn pii_badge(
     let replaced = replaced?;
     if incomplete {
         return Some((
-            format!("{replaced} pseudonymized, incomplete"),
+            format!("{replaced} values masked, incomplete"),
             "review",
             "The pseudonymization pass did not fully apply - some values reached the model in the clear (the session map was full, or the result exceeded the scan cap).",
         ));
@@ -4699,10 +4765,25 @@ fn pii_badge(
         return None;
     }
     Some((
-        format!("{replaced} pseudonymized"),
+        format!("{replaced} {} masked", if replaced == 1 { "value" } else { "values" }),
         "success",
-        "Values in this result were replaced with pseudonyms before the model saw them. The values themselves are never logged.",
+        "Personal values in this result were replaced before reaching the model. The values themselves are never logged.",
     ))
+}
+
+fn activity_title(activity: &state::ActivityView) -> String {
+    if activity.internal {
+        match activity.tool.as_str() {
+            "search" => "Searched tools",
+            "describe" => "Looked up a tool",
+            "status" => "Checked Toolport status",
+            "fetch" => "Fetched tool details",
+            _ => "Used Toolport",
+        }
+        .into()
+    } else {
+        format!("{} / {}", activity.server, activity.tool)
+    }
 }
 
 fn activity_card(activity: &state::ActivityView) -> gtk::Box {
@@ -4710,7 +4791,9 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     card.add_css_class("toolport-card");
     let outcome = activity.approval_decision.as_deref().map(approval_outcome);
     let icon = gtk::Image::from_icon_name(outcome.map(|(_, icon, _, _)| icon).unwrap_or(
-        if activity.ok {
+        if activity.internal {
+            "edit-find-symbolic"
+        } else if activity.ok {
             "emblem-ok-symbolic"
         } else {
             "dialog-error-symbolic"
@@ -4740,7 +4823,8 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     copy.set_hexpand(true);
     copy.append(
         &gtk::Label::builder()
-            .label(format!("{} / {}", activity.server, activity.tool))
+            .label(activity_title(activity))
+            .tooltip_text(format!("{} / {}", activity.server, activity.tool))
             .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
@@ -4751,9 +4835,11 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
         activity_client_name(activity),
         relative_activity_time(activity.timestamp_ms),
     ];
-    if let Some(cold) = activity.cold { detail.push(if cold { "cold catalog" } else { "warm catalog" }.into()); }
-    if let Some(kind) = &activity.failure_kind { detail.push(kind.replace('_', " ")); }
-    if let Some(ms) = activity.dispatch_ms { detail.push(format!("dispatch {}", format_duration(ms))); }
+
+    if let Some(kind) = &activity.failure_kind {
+        detail.push(kind.replace('_', " "));
+    }
+
     if let Some(duration) = activity.duration_ms {
         detail.push(if outcome.is_some() {
             format!("waited {}", format_duration(duration))
@@ -4764,7 +4850,31 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     copy.append(
         &gtk::Label::builder()
             .label(detail.join(" · "))
-            .tooltip_text(format!("{}{}", if activity_client_name(activity) == "Unrecorded client" { crate::clients::UNRECORDED_CLIENT_TOOLTIP } else { activity.client_id.as_deref().unwrap_or("") }, activity.run_id.as_ref().map(|id| format!("\nRun: {id}")).unwrap_or_default()))
+            .tooltip_text(format!(
+                "{}{}{}{}",
+                if activity_client_name(activity) == "Unrecorded client" {
+                    crate::clients::UNRECORDED_CLIENT_TOOLTIP
+                } else {
+                    activity.client_id.as_deref().unwrap_or("")
+                },
+                activity
+                    .run_id
+                    .as_ref()
+                    .map(|id| format!("\nRun: {id}"))
+                    .unwrap_or_default(),
+                activity
+                    .cold
+                    .map(|cold| if cold {
+                        "\nCold catalog"
+                    } else {
+                        "\nWarm catalog"
+                    })
+                    .unwrap_or(""),
+                activity
+                    .dispatch_ms
+                    .map(|ms| format!("\nDispatch: {}", format_duration(ms)))
+                    .unwrap_or_default()
+            ))
             .halign(gtk::Align::Fill)
             .xalign(0.0)
             .single_line_mode(true)
@@ -9934,6 +10044,7 @@ mod tests {
 
     fn call(server: &str, ok: bool) -> state::ActivityView {
         state::ActivityView {
+            internal: false,
             timestamp_ms: 0,
             server: server.to_string(),
             tool: "tool".to_string(),
@@ -10067,7 +10178,7 @@ mod tests {
     fn savings_detail_and_share_describe_net_tokenized_exposure() {
         assert_eq!(
             savings_primary_display(-123, 1, 0),
-            ("-123".into(), "tokens saved")
+            ("-123".into(), "catalog tokens avoided")
         );
         assert!(!savings_banner_visible(0, 0));
         assert!(
@@ -10077,16 +10188,13 @@ mod tests {
         assert!(savings_banner_visible(1, 0));
         assert_eq!(
             savings_primary_display(41_100, 12, 0),
-            ("41.1k".into(), "tokens saved")
+            ("41.1k".into(), "catalog tokens avoided")
         );
         assert_eq!(
             savings_primary_display(0, 0, 12_340),
             ("12.3 KB".into(), "discovery text returned")
         );
-        assert_eq!(
-            savings_title(12),
-            "Tool definitions kept out of your agent's context"
-        );
+        assert_eq!(savings_title(12), "Catalog text avoided");
         assert_eq!(savings_title(0), "Discovery payload returned");
         assert_eq!(format_byte_count(999_949), "999.9 KB");
         assert_eq!(format_byte_count(999_999), "1.0 MB");
@@ -10100,7 +10208,7 @@ mod tests {
         assert_eq!(savings_detail_line(1, 3, None), "1 catalog load");
         assert_eq!(
             savings_share_line(41_100, 12, 0, 0),
-            "Toolport recorded 41.1k tokens saved, net of discovery responses. Counted with cl100k_base once per session and catalog hash, not model billing. toolport.app"
+            "Toolport recorded 41.1k catalog tokens avoided after discovery text. Counted with cl100k_base once per session and catalog hash, not model billing. toolport.app"
         );
         assert_eq!(savings_share_line(0, 0, 3, 12_340), "Toolport recorded 3 discovery searches returning 12.3 KB of text at its MCP boundary. toolport.app");
     }
@@ -10156,17 +10264,17 @@ mod tests {
         assert_eq!(pii_badge(None, false), None);
         assert_eq!(pii_badge(Some(0), false), None);
         let (label, class, _) = pii_badge(Some(3), false).unwrap();
-        assert_eq!((label.as_str(), class), ("3 pseudonymized", "success"));
+        assert_eq!((label.as_str(), class), ("3 values masked", "success"));
         let (label, class, _) = pii_badge(Some(2), true).unwrap();
         assert_eq!(
             (label.as_str(), class),
-            ("2 pseudonymized, incomplete", "review")
+            ("2 values masked, incomplete", "review")
         );
         // Fail-open with zero replacements still warns: values reached the model.
         let (label, class, _) = pii_badge(Some(0), true).unwrap();
         assert_eq!(
             (label.as_str(), class),
-            ("0 pseudonymized, incomplete", "review")
+            ("0 values masked, incomplete", "review")
         );
     }
 
@@ -10733,6 +10841,7 @@ mod p10c_r1_presentation_tests {
             assert_eq!(format_duration(ms), text);
         }
         let mut row = state::ActivityView {
+            internal: false,
             timestamp_ms: 0,
             server: "team_slack".into(),
             tool: "delete".into(),
