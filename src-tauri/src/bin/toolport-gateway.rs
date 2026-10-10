@@ -1465,7 +1465,7 @@ fn search_tool_def() -> Value {
             "properties": {
                 "query": { "type": "string", "maxLength": MAX_SEARCH_QUERY_CHARS, "description": "Keywords for the capability you need, e.g. \"list emails\". An empty value with `server` lists that server's tools." },
                 "server": { "type": "string", "description": "Optional: limit to this server by name/prefix." },
-                "limit": { "type": "integer", "description": "Compatibility only. Always up to 10 candidates." }
+                "limit": { "type": "integer", "maximum": MAX_SEARCH_RESULTS, "description": "Candidates to return, 10 to 50 (default 10)." }
             },
             "required": ["query"],
             "additionalProperties": false
@@ -2634,6 +2634,18 @@ fn search_catalog_with(
 /// fallbacks may omit `index`; in that case a temporary index is built so behavior
 /// remains identical and there is only one ranking implementation.
 const DEFAULT_SEARCH_RESULTS: usize = 10;
+const MAX_SEARCH_RESULTS: usize = 50;
+
+/// The requested candidate count. Smaller requests still get the full
+/// 10-row menu so a low limit never hides the right tool.
+fn requested_search_limit(arguments: &Value) -> usize {
+    arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(DEFAULT_SEARCH_RESULTS, |limit| {
+            (limit.min(MAX_SEARCH_RESULTS as u64) as usize).max(DEFAULT_SEARCH_RESULTS)
+        })
+}
 
 #[cfg(test)]
 fn search_catalog_indexed(
@@ -7517,7 +7529,7 @@ fn handle_request_with_cancel(
                     ));
                 }
                 let server = arguments.get("server").and_then(|v| v.as_str());
-                let limit = DEFAULT_SEARCH_RESULTS;
+                let limit = requested_search_limit(&arguments);
                 // Prefer the cached catalog (instant); on a cold cache fall back to
                 // the live router so a first-time search doesn't return 0 results.
                 let live;
@@ -39658,6 +39670,33 @@ mod tests {
         server.join().unwrap();
         drop(_data_dir);
         std::fs::remove_dir_all(&path).ok();
+    }
+
+    #[test]
+    fn search_raises_the_menu_to_a_requested_limit_up_to_fifty() {
+        assert_eq!(requested_search_limit(&json!({})), 10);
+        assert_eq!(requested_search_limit(&json!({ "limit": 1 })), 10);
+        assert_eq!(requested_search_limit(&json!({ "limit": 30 })), 30);
+        assert_eq!(requested_search_limit(&json!({ "limit": 500 })), 50);
+        assert_eq!(requested_search_limit(&json!({ "limit": "many" })), 10);
+        assert_eq!(
+            search_tool_def()["inputSchema"]["properties"]["limit"]["maximum"],
+            MAX_SEARCH_RESULTS
+        );
+
+        let cat: Vec<Value> = (0..60)
+            .map(|i| {
+                json!({
+                    "name": format!("crm__list_invoices_{i}"),
+                    "description": "List invoices",
+                    "inputSchema": {}
+                })
+            })
+            .collect();
+        for (limit, expected) in [(10, 10), (30, 30), (50, 50)] {
+            let outcome = search_catalog_with(&cat, "list invoices", None, limit, None);
+            assert_eq!(outcome.matches.len(), expected, "limit {limit}");
+        }
     }
 
     #[test]
