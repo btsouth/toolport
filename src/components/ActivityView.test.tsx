@@ -577,6 +577,21 @@ it("distinguishes measured bytes from legacy estimates in catalog savings", asyn
   expect(screen.getByText(/searches returned 2\.5 KB/)).toBeInTheDocument();
 });
 
+it("does not promote historical estimates into a catalog token headline", async () => {
+  getSavingsSummary.mockResolvedValue({
+    tokensSaved: 0,
+    listLoads: 2751,
+    peakCatalog: 1725,
+    sinceTs: 1700000000000,
+    legacyEstimatedTokensAvoided: 52_800_000,
+    tokenizedLoads: 0,
+  });
+  render(<ActivityView refreshKey={0} registry={null} />);
+  await act(async () => {});
+  expect(screen.queryByText("Catalog text avoided")).not.toBeInTheDocument();
+  expect(screen.queryByText(/52.8M/)).not.toBeInTheDocument();
+});
+
 it("shares a token savings statement without a billing claim", async () => {
   const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
   const writeText = vi.fn().mockResolvedValue(undefined);
