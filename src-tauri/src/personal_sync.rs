@@ -815,16 +815,22 @@ pub fn apply(
         for local in reg.servers.iter_mut().filter(|s| {
             eligible(s) && s.unknown_fields.get("teamRouteRemoved") != Some(&json!(true))
         }) {
-            let matches: Vec<_> = remote
-                .iter()
-                .filter(|(id, _)| owners.get(*id).is_none_or(|owner| owner == &local.id))
-                .filter(|(id, v)| {
-                    id.as_str() == original(local)
-                        || v["name"]
+            let exact = remote
+                .get_key_value(original(local))
+                .filter(|(id, _)| owners.get(*id) == Some(&local.id));
+            let matches: Vec<_> = if let Some(exact) = exact {
+                vec![exact]
+            } else {
+                remote
+                    .iter()
+                    .filter(|(id, _)| owners.get(*id).is_none_or(|owner| owner == &local.id))
+                    .filter(|(_, v)| {
+                        v["name"]
                             .as_str()
                             .is_some_and(|n| n.eq_ignore_ascii_case(&local.name))
-                })
-                .collect();
+                    })
+                    .collect()
+            };
             if matches.len() == 1 && !linked.contains(matches[0].0) {
                 if matches[0].1["disabled"] == true {
                     local.enabled = false;
@@ -1794,6 +1800,19 @@ mod tests {
             "private"
         );
         assert_eq!(definitions(&r).len(), 2);
+        let mut explicit = machine();
+        let mut bound = local(http("cloud"));
+        bound.name = "Same name".into();
+        explicit.servers.push(bound);
+        let mut a = http("cloud");
+        a["name"] = json!("Same name");
+        let mut b = http("other");
+        b["name"] = json!("Same name");
+        apply(&mut explicit, &config(vec![a, b]), 1).unwrap();
+        assert_eq!(
+            original(explicit.servers.iter().find(|s| s.id == "cloud").unwrap()),
+            "cloud"
+        );
     }
     #[test]
     fn full_review_rejects_inputs_or_inheritance_changed_while_open() {
