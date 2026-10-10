@@ -309,6 +309,38 @@ fn decision_entry(
     entry
 }
 
+/// Snapshot why approval was requested before the registry can change during a hold.
+pub fn record_approval_raised(
+    reg: &crate::registry::Registry,
+    server: &str,
+    tool: &str,
+    client: Option<&str>,
+    reason: &str,
+    args: &Value,
+) {
+    let mut entry = decision_entry(
+        server,
+        tool,
+        client,
+        reason,
+        "requested",
+        &args_hash(args),
+        None,
+    );
+    // The final decision records held status. This snapshot must not count it twice.
+    entry["held"] = json!(false);
+    entry["safetyLevel"] = json!(reg.safety_level_effective());
+    entry["safetySource"] = json!(
+        if reg.safety_level_team_floor() > reg.safety_level_selected() {
+            "team_floor"
+        } else {
+            "personal"
+        }
+    );
+    entry["gatewayVersion"] = json!(env!("CARGO_PKG_VERSION"));
+    write_line(&entry);
+}
+
 /// Record a gated HITL decision (the human approved/denied it, it timed out, or the
 /// broker was unreachable). Replaces the flat `record_held` on the approval path so the
 /// audit can distinguish the outcomes. Hashes the arguments; never stores them raw.

@@ -270,9 +270,19 @@ fn decorate(cfg: &Config, method: &str, mut result: Value) -> Value {
     result
 }
 
+/// Optional disposable catalog for gateway call-resolution regressions.
+fn fixture_tools() -> Option<Vec<Value>> {
+    let path = std::env::var_os("MOCK_MCP_TOOLS_FILE")?;
+    serde_json::from_slice(&std::fs::read(path).expect("read fixture tools"))
+        .expect("valid fixture tool catalog")
+}
+
 /// The advertised tool list. `greet` only appears once the server has "grown"
 /// (after a `grow` call), modeling a runtime tool-set change.
 fn tool_list(cfg: &Config, grown: bool) -> Value {
+    if let Some(tools) = fixture_tools() {
+        return json!({"tools": tools});
+    }
     let mut tools = vec![
         json!({ "name": "echo", "description": "Echo back the text argument.",
                 "inputSchema": { "type": "object", "properties": { "text": { "type": "string" } } } }),
@@ -552,6 +562,19 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
                 .and_then(|p| p.get("arguments"))
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            // Keep echo's argument behavior in custom catalogs too.
+            if name != "echo"
+                && fixture_tools().is_some_and(|tools| tools.iter().any(|tool| tool["name"] == name))
+            {
+                return Some(success(
+                    id,
+                    decorate(
+                        cfg,
+                        method,
+                        json!({"content": [{"type": "text", "text": name}]}),
+                    ),
+                ));
+            }
             // `echo_meta` reflects the request's `_meta` back as structured
             // content so a test can assert end-to-end propagation through the
             // gateway without reading the transcript file.

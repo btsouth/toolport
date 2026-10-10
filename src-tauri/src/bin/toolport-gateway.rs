@@ -3893,7 +3893,7 @@ fn tool_is_destructive_fail_closed(name: &str, cached: &dyn ToolCatalog, router:
         tools
             .iter()
             .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
-            .map(is_destructive)
+            .map(|tool| is_destructive(&router.safety_definition(tool)))
     };
     if let Some(d) = lookup(cached) {
         return d;
@@ -4634,28 +4634,84 @@ fn execute_call(
             allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
         }));
     let _approval_cancel = ApprovalCancelGuard::enter(cancel.clone());
+    // Resolve existence before approval. A bounded namespace may identify several
+    // cold owners; only visible candidates can start, and only an exact route runs.
+    let mut fresh = clone_live_router(live_router);
+    let view = fresh.as_deref().unwrap_or(router);
+    let owners = unique_prefix_owners(reg);
+    let visible = |id: &str| allowed.is_none_or(|set| server_in_allowed_scope(id, set));
+    let candidates = if let Some(owner) = owner_of_exposed_tool(Some(view), &owners, name) {
+        vec![owner]
+    } else {
+        reg.servers
+            .iter()
+            .filter_map(|server| {
+                let prefix = sanitize_segment(&server.id);
+                (prefix.len() > 24 && name.starts_with(&format!("{}__", &prefix[..24])))
+                    .then(|| server.id.clone())
+            })
+            .collect()
+    };
+    if !candidates.is_empty() && candidates.iter().all(|owner| !visible(owner)) {
+        return json!({"content": [{"type": "text", "text": view.no_route_message_within(name, visible)}], "isError": true});
+    }
+    // An owner outside this request's original scope was already off, rather
+    // than becoming stale during dispatch. Scope loss after capture still fails
+    // the live check before startup or approval.
     if active_live_router_resolver()
         .is_some_and(|view| (view.stale)(router, DispatchTarget::Tool(name)))
     {
         return json!({"content": [{"type": "text", "text": STALE_LIVE_VIEW}], "isError": true});
     }
-    // Resolve a cold owner only through the collision-safe registry map. Scope
-    // and tool policy are checked before demand so a rejected call cannot spawn
-    // a server; a blocked tool falls through to the usual policy refusal.
-    let mut fresh = clone_live_router(live_router);
-    if let Some(view) = &fresh {
-        if let Some(owner) = owner_of_exposed_tool(Some(view), &unique_prefix_owners(reg), name) {
-            if allowed.is_some_and(|set| !server_in_allowed_scope(&owner, set)) {
-                return json!({"content": [{"type": "text", "text": format!(
-                    "Toolport: '{}' is not available to this client.", sanitize_segment(&owner)
-                )}], "isError": true});
-            }
-            if view.authorize(DispatchTarget::Tool(name)).is_ok() {
-                if let Err(message) = view.wait_for_server(&owner, cancel.as_ref(), false) {
+    let candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|id| visible(id) && view.authorize(DispatchTarget::Server(id)).is_ok())
+        .collect();
+    let catalog_visible = |id: &str| {
+        visible(id) && (candidates.is_empty() || candidates.iter().any(|owner| owner == id))
+    };
+    if view.authorize(DispatchTarget::Tool(name)).is_ok() {
+        for owner in &candidates {
+            view.prepare_lazy_use(owner);
+            view.kick_pending(owner, |id| id == owner);
+        }
+        if view.route_of(name).is_some() {
+            // A cached route proves identity, not current safety metadata. Keep
+            // the existing readiness wait before classifying a known call.
+            for owner in &candidates {
+                if let Err(message) = view.wait_for_server(owner, cancel.as_ref(), false) {
                     return json!({"content": [{"type": "text", "text": format!("Toolport: {message}")}], "isError": true});
                 }
+            }
+            fresh = clone_live_router(live_router);
+        } else if fresh.is_some() {
+            let deadline = Instant::now() + FIRST_CATALOG_WAIT;
+            let mut seen = started_supervisors();
+            loop {
+                let view = fresh.as_deref().unwrap_or(router);
+                let loading = view.any_discovering(catalog_visible)
+                    || view.any_publishing_first_catalog(catalog_visible)
+                    || candidates.iter().any(|owner| {
+                        view.kick_pending(owner, |id| id == owner)
+                            .is_some_and(|status| status.connecting)
+                    });
+                if view.route_of(name).is_some()
+                    || view.is_blocked(name)
+                    || !loading
+                    || Instant::now() >= deadline
+                    || cancel
+                        .as_ref()
+                        .is_some_and(downstream::CancelContext::is_cancelled)
+                {
+                    break;
+                }
+                seen = wait_for_started_supervisor(
+                    seen,
+                    deadline.min(Instant::now() + Duration::from_millis(25)),
+                );
                 fresh = clone_live_router(live_router);
             }
+            fresh = clone_live_router(live_router);
         }
     }
     let router = fresh.as_deref().unwrap_or(router);
@@ -4664,14 +4720,39 @@ fn execute_call(
         .as_ref()
         .map(|tools| tools as &dyn ToolCatalog)
         .unwrap_or(cached);
+    let visible = |server: &str| allowed.is_none_or(|set| server_in_allowed_scope(server, set));
+    if !opts.allow_app_only
+        && (router.tool_is_model_hidden(name)
+            || (router.route_of(name).is_some()
+                && !named_tool_is_model_visible(name, cached, router)))
+    {
+        return json!({"content":[{"type":"text","text":router.no_route_message_within(name, visible)}],"isError":true});
+    }
+    if let Some(owner) = router.tool_owner(name) {
+        if visible(owner) {
+            if let Err(mut message) = router.authorize(DispatchTarget::Tool(name)) {
+                if message.contains("Strict safety")
+                    && reg.safety_level_team_floor() == registry::SafetyLevel::Strict
+                {
+                    message = format!("Blocked by Toolport: {name} is destructive and blocked by your team's Strict safety policy. Ask your team admin to change it.");
+                }
+                return json!({"content": [{"type": "text", "text": message}], "isError": true});
+            }
+        }
+    }
+    if router.route_of(name).is_none() {
+        let mut message = router.no_route_message_within(name, visible);
+        if message.starts_with("Unknown tool:")
+            && (router.any_discovering(catalog_visible)
+                || router.any_publishing_first_catalog(catalog_visible))
+        {
+            message =
+                "Servers are still connecting. Retry shortly or check toolport_status.".into();
+        }
+        return json!({"content": [{"type": "text", "text": message}], "isError": true});
+    }
     let mut confirmed = false;
     let shape = opts.shape;
-    if !opts.allow_app_only && !named_tool_is_model_visible(name, cached, router) {
-        return json!({
-            "content": [{ "type": "text", "text": format!("Toolport: '{name}' is available only to its MCP App.") }],
-            "isError": true
-        });
-    }
     // Direct modern calls can use MRTR even on their first round, before any
     // requestState exists. Code-mode steps deliberately keep the legacy broker
     // because they cannot surface an intermediate result to the upstream client.
@@ -4699,11 +4780,8 @@ fn execute_call(
         if !server_in_allowed_scope(server_id, set) {
             // A name with no route belongs to no server. Say so, as an unscoped
             // caller would hear, rather than calling an empty server id out of scope.
-            let text = if server_id.is_empty() {
-                router.no_route_message_within(name, |server| server_in_allowed_scope(server, set))
-            } else {
-                format!("Toolport: '{srv}' is not available to this client.")
-            };
+            let text =
+                router.no_route_message_within(name, |server| server_in_allowed_scope(server, set));
             return json!({
                 "content": [{ "type": "text", "text": text }],
                 "isError": true
@@ -4781,7 +4859,7 @@ fn execute_call(
     // Fail-closed (no broker / no answer / timeout all deny). Skipped once `confirmed`.
     if (reg.human_approval_effective() || resuming_modern_hitl) && !confirmed {
         // Resolve destructiveness robustly: cache, then live router, else
-        // fail-closed (an unknown tool must not skip the human gate).
+        // fail-closed for known tools whose metadata is unavailable.
         let is_dest = tool_is_destructive_fail_closed(name, cached, router);
         // Untrusted provenance = the same shared/registry signal the SSRF guard
         // uses. Match on the REAL server id from `route_of` (not the sanitized
@@ -4821,6 +4899,16 @@ fn execute_call(
                     .flatten()
             });
         if let Some(reason) = gate_reason {
+            if !resuming_modern_hitl {
+                audit::record_approval_raised(
+                    reg,
+                    server_id,
+                    tool,
+                    client,
+                    approval_reason_token(reason),
+                    &arguments,
+                );
+            }
             // The exact call being approved, content-bound: the bytes that RUN must
             // hash-match these. Modern clients park the decision behind an opaque
             // requestState and re-enter after elicitation; legacy clients retain the
@@ -7053,7 +7141,7 @@ fn build_tool_surfaces(
             (snapshot.tools.is_empty()
                 || name.is_none_or(|name| {
                     !router.is_blocked(name)
-                        && !(deny_destructive && cached_tool_is_destructive(tool, name))
+                        && !(deny_destructive && cached_tool_is_destructive(tool, name, router))
                 }))
                 && allowed.is_none_or(|scope| {
                     name.is_some_and(|name| {
@@ -7447,13 +7535,25 @@ fn handle_request_with_cancel(
                 // must never appear in its results even for an Apps-capable
                 // host. Such tools are exposed separately for the host/view.
                 let owners = unique_prefix_owners(reg);
+                // A bounded alias no longer contains the full server id. Resolve
+                // explicit server selectors through ownership before ranking.
+                let server_owner = server.and_then(|selector| {
+                    reg.servers
+                        .iter()
+                        .find(|entry| entry.id == selector)
+                        .map(|entry| entry.id.as_str())
+                        .or_else(|| owners.get(&selector.to_lowercase()).map(String::as_str))
+                });
                 let visible = |tool: &Value| {
                     mcp_app_tool_is_model_visible(tool)
                         && tool
                             .get("name")
                             .and_then(Value::as_str)
                             .is_some_and(|name| {
-                                allowed.is_none_or(|allowed| {
+                                server_owner.is_none_or(|owner| {
+                                    owner_of_exposed_tool(Some(router), &owners, name).as_deref()
+                                        == Some(owner)
+                                }) && allowed.is_none_or(|allowed| {
                                     tool_in_scope(name, allowed, &|name| {
                                         owner_of_exposed_tool(Some(router), &owners, name)
                                     })
@@ -7484,7 +7584,7 @@ fn handle_request_with_cancel(
                 let outcome = search_catalog_filtered(
                     base,
                     query,
-                    server,
+                    server.filter(|_| server_owner.is_none()),
                     limit,
                     Some(&sem_cfg),
                     search_index,
@@ -8308,7 +8408,7 @@ fn owner_of_exposed_tool(
     owners: &HashMap<String, String>,
     name: &str,
 ) -> Option<String> {
-    if let Some((server, _)) = router.and_then(|r| r.route_of(name)) {
+    if let Some(server) = router.and_then(|r| r.tool_owner(name)) {
         return Some(server.to_string());
     }
     let prefix = match grouped_help_target(name) {
@@ -10533,7 +10633,7 @@ fn drop_blocked_from_cache(
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
             return true;
         };
-        if deny_destructive && cached_tool_is_destructive(tool, name) {
+        if deny_destructive && cached_tool_is_destructive(tool, name, router) {
             return false;
         }
         !router.is_blocked(name)
@@ -10550,14 +10650,19 @@ fn drop_blocked_from_cache(
 /// name lets the SERVER prefix decide: every read-only tool on a server called
 /// `create_hub` or `send_grid` would be dropped. Restore the original name
 /// before asking.
-fn cached_tool_is_destructive(tool: &Value, exposed: &str) -> bool {
+fn cached_tool_is_destructive(tool: &Value, exposed: &str, router: &Router) -> bool {
+    if router.route_of(exposed).is_some() {
+        return is_destructive(&router.safety_definition(tool));
+    }
+    let definition = router.policy_definition(tool);
+    let exposed = definition["name"].as_str().unwrap_or(exposed);
     match conduit_lib::codemode::split_exposed_name(exposed) {
         Some((_, original)) => {
-            let mut probe = tool.clone();
+            let mut probe = (*definition).clone();
             probe["name"] = Value::String(original.to_string());
             is_destructive(&probe)
         }
-        None => is_destructive(tool),
+        None => is_destructive(&definition),
     }
 }
 
@@ -10740,7 +10845,8 @@ fn tool_cache_path(profile: Option<&str>) -> Option<PathBuf> {
 /// schema handling), so a stale on-disk cache from an older build is discarded and
 /// rebuilt rather than served verbatim until the next server toggle.
 // Version 1 has no per-server launch identity; version 2 may contain gateway-owned aliases.
-const TOOL_CACHE_VERSION: u64 = 3;
+// Version 4 bounds public aliases while preserving their persisted policy names.
+const TOOL_CACHE_VERSION: u64 = 4;
 
 fn cached_field(mut cache: Value, field: &str) -> Option<Value> {
     if cache.get("version")?.as_u64()? != TOOL_CACHE_VERSION {
@@ -12760,15 +12866,36 @@ impl HostState {
         reg: &Registry,
         profile: &str,
     ) -> (Arc<Router>, Arc<CatalogSnapshot>) {
-        let resolved = reg.resolve_profile_id(profile);
-        if !resolved.starts_with("@all-enabled:") && reg.access_profile(&resolved).is_none() {
+        self.router_for_client_view(base, reg, Some(profile), None)
+    }
+
+    fn router_for_client_view(
+        &self,
+        base: Arc<Router>,
+        reg: &Registry,
+        profile: Option<&str>,
+        client: Option<&str>,
+    ) -> (Arc<Router>, Arc<CatalogSnapshot>) {
+        let resolved = profile
+            .map(|profile| reg.resolve_profile_id(profile))
+            .unwrap_or_default();
+        let limit = clients::client_tool_name_limit(client, clients::GATEWAY_ENTRY_NAME);
+        if limit == 64
+            && !resolved.starts_with("@all-enabled:")
+            && reg.access_profile(&resolved).is_none()
+        {
             let catalog = Arc::new(CatalogSnapshot::new(base.shared_tools()));
             return (base, catalog);
         }
-        let allow: HashMap<String, HashSet<String>> = adapter_tool_scope(reg, &resolved)
-            .into_iter()
-            .map(|(server, tools)| (server, tools.into_iter().collect()))
-            .collect();
+        let allow: HashMap<String, HashSet<String>> = if profile.is_some() {
+            adapter_tool_scope(reg, &resolved)
+                .into_iter()
+                .map(|(server, tools)| (server, tools.into_iter().collect()))
+                .collect()
+        } else {
+            base.registry_policy().allow
+        };
+        let view_key = format!("{resolved}:{limit}");
         let live = self
             .router
             .lock()
@@ -12788,7 +12915,7 @@ impl HostState {
         if !Arc::ptr_eq(&live, &base) && !rooted_live {
             // A rebuild won after this request took its snapshot. Keep serving
             // that snapshot, but never pin its old downstream slots in the host.
-            let view = Arc::new(base.with_tool_allow(allow));
+            let view = Arc::new(base.with_client_tool_view(allow, limit));
             let catalog = Arc::new(CatalogSnapshot::new(view.shared_tools()));
             return (view, catalog);
         }
@@ -12803,15 +12930,15 @@ impl HostState {
             by_profile: HashMap::new(),
         });
         debug_assert!(Arc::ptr_eq(&scoped.base, &base));
-        if let Some(view) = scoped.by_profile.get(&resolved) {
+        if let Some(view) = scoped.by_profile.get(&view_key) {
             if view.allow == allow {
                 return (Arc::clone(&view.router), Arc::clone(&view.catalog));
             }
         }
-        let router = Arc::new(base.with_tool_allow(allow.clone()));
+        let router = Arc::new(base.with_client_tool_view(allow.clone(), limit));
         let catalog = Arc::new(CatalogSnapshot::new(router.shared_tools()));
         scoped.by_profile.insert(
-            resolved,
+            view_key,
             ProfileToolView {
                 allow,
                 router: Arc::clone(&router),
@@ -15206,6 +15333,7 @@ fn adapter_live_view(
             })
         })
     };
+    let client = client.map(str::to_string);
     let host = Arc::clone(host);
     let resolve = Arc::new(move || {
         let (profile, root) = &*expected;
@@ -15229,7 +15357,10 @@ fn adapter_live_view(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let rooted = host.router_for_root(base, &current, root.as_deref(), Some(&scope));
-        let mut view = (*host.router_for_adapter_profile(rooted, &current, profile).0).clone();
+        let mut view = (*host
+            .router_for_client_view(rooted, &current, Some(profile), client.as_deref())
+            .0)
+            .clone();
         // Post-HITL owner/fingerprint checks need the current adapter visibility,
         // not the host's union of profiles. Preserve the live quarantine state.
         view.apply_registry_policy(registry_policy(&current, Some(profile), false, false));
@@ -15580,8 +15711,9 @@ fn process_request_wire_inner(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             let (view, cached) = if state.daemon_mode.load(Ordering::SeqCst) {
-                adapter_profile
-                    .map(|profile| state.router_for_adapter_profile(base.clone(), &reg, profile))
+                adapter_profile.map(|profile| {
+                    state.router_for_client_view(base.clone(), &reg, Some(profile), client)
+                })
             } else {
                 None
             }
@@ -15823,8 +15955,20 @@ fn process_request_wire_inner(
         // clients need their own tool scope, including when deciding coldness.
         if state.daemon_mode.load(Ordering::SeqCst) {
             if let Some(profile) = adapter_profile {
-                return state.router_for_adapter_profile(rooted, &reg, profile);
+                return state.router_for_client_view(rooted, &reg, Some(profile), client);
             }
+        }
+        if clients::client_tool_name_limit(
+            client.or(state.client_id.as_deref()),
+            clients::GATEWAY_ENTRY_NAME,
+        ) < 64
+        {
+            return state.router_for_client_view(
+                rooted,
+                &reg,
+                None,
+                client.or(state.client_id.as_deref()),
+            );
         }
         let cached = state
             .cached_tools
@@ -15960,6 +16104,30 @@ fn process_request_wire_inner(
     let live_view: Option<LiveRouterResolver> = if state.daemon_mode.load(Ordering::SeqCst) {
         adapter_profile.map(|profile| {
             adapter_live_view(&state.host, &reg, profile, adapter_root.clone(), client)
+        })
+    } else if clients::client_tool_name_limit(
+        client.or(state.client_id.as_deref()),
+        clients::GATEWAY_ENTRY_NAME,
+    ) < 64
+    {
+        let host = Arc::clone(&state.host);
+        let client = client.or(state.client_id.as_deref()).map(str::to_string);
+        Some(LiveRouterResolver {
+            stale: Arc::new(|_, _| false),
+            resolve: Arc::new(move || {
+                let base = host
+                    .router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let reg = host
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                host.router_for_client_view(base, &reg, None, client.as_deref())
+                    .0
+            }),
         })
     } else {
         None
@@ -17033,7 +17201,12 @@ fn handle_mcp_http(
                     .filter(|_| state.daemon_mode.load(Ordering::SeqCst))
                     .map(|profile| {
                         state
-                            .router_for_adapter_profile(rooted.clone(), &reg, profile)
+                            .router_for_client_view(
+                                rooted.clone(),
+                                &reg,
+                                Some(profile),
+                                session_owner.map(|owner| owner.identity.as_str()),
+                            )
                             .0
                     })
                     .unwrap_or(rooted);
@@ -23097,7 +23270,13 @@ mod tests {
                 pointer
             );
         }
-        for version in [json!(null), json!(2), json!(4), json!("3")] {
+        for version in [
+            json!(null),
+            json!(2),
+            json!(3),
+            json!(TOOL_CACHE_VERSION + 1),
+            json!(TOOL_CACHE_VERSION.to_string()),
+        ] {
             assert!(cached_field(json!({"version":version,"tools":[]}), "tools").is_none());
         }
         assert!(cached_field(json!({"version":TOOL_CACHE_VERSION}), "tools").is_none());
@@ -24248,7 +24427,12 @@ mod tests {
                 Some(&live),
             );
             assert_eq!(reply["isError"], true, "got {reply}");
-            assert!(reply.to_string().contains(reason), "got {reply}");
+            let expected = if reason == "disabled" {
+                "turned off"
+            } else {
+                reason
+            };
+            assert!(reply.to_string().contains(expected), "got {reply}");
             assert!(
                 !snapshot.any_starting(|_| true),
                 "{reason} call started the server"
@@ -26229,7 +26413,7 @@ mod tests {
         assert!(call_result["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("not available to this client"));
+            .contains("Unknown tool:"));
     }
 
     /// Typed stubs only list tools on servers the client is scoped to; out-of-scope
@@ -28602,6 +28786,268 @@ mod tests {
     }
 
     #[test]
+    fn client_name_budgets_share_canonical_policy_and_routes() {
+        let _env = DataDirTestEnv::new("client-name-budgets");
+        let host = dispatch_host(false);
+        let mut reg = Registry::default();
+        reg.servers.push(stub_server("files", "Files"));
+        reg.profiles[0].enabled_server_ids.push("files".into());
+        let medium = format!("read_{}", "x".repeat(49));
+        let long = format!("read_{}", "item_".repeat(20));
+        let tools = vec![
+            json!({"name":medium}),
+            json!({"name":long}),
+            json!({"name":"echo"}),
+        ];
+        let mut base = Router::new();
+        base.set_overrides(HashMap::from([(
+            "files".into(),
+            HashMap::from([(
+                long.clone(),
+                registry::ToolOverride {
+                    name: Some(format!("renamed_{}", "x".repeat(70))),
+                    ..Default::default()
+                },
+            )]),
+        )]));
+        base.add(DownstreamServer::connect("files".into(), Box::new(MockRoute { tools })).unwrap());
+        let base = Arc::new(base);
+        *host.router.lock().unwrap() = Arc::clone(&base);
+        let view = |client| {
+            host.router_for_client_view(Arc::clone(&base), &reg, Some("default"), Some(client))
+        };
+        let (cursor, cursor_tools) = view("adapter:cursor");
+        let (claude, claude_tools) = view("adapter:claude-code");
+        assert!(cursor_tools
+            .tools
+            .iter()
+            .all(|tool| tool["name"].as_str().unwrap().len() <= 52));
+        assert_eq!(claude_tools.tools.to_vec(), base.shared_tools().to_vec());
+        assert_eq!(
+            claude.exposed_tool_name("files", &medium).unwrap(),
+            format!("files__{medium}")
+        );
+        assert!(Arc::ptr_eq(&cursor, &view("adapter:cursor").0));
+        for original in [&medium, &long] {
+            let a = cursor.exposed_tool_name("files", original).unwrap();
+            let b = claude.exposed_tool_name("files", original).unwrap();
+            assert_ne!(a, b);
+            assert_eq!(cursor.route_of(a), claude.route_of(b));
+            let def = |router: &Router, name: &str| {
+                let tools = router.shared_tools();
+                let definition = router
+                    .policy_definition(tools.iter().find(|tool| tool["name"] == name).unwrap())
+                    .into_owned();
+                definition
+            };
+            let canonical = def(&cursor, a);
+            assert_eq!(canonical, def(&claude, b));
+            assert_eq!(
+                integrity::fingerprint(&canonical),
+                integrity::fingerprint(&def(&claude, b))
+            );
+            integrity::check(Some("shared-name-budget"), &vec![canonical.clone()]).unwrap();
+            assert!(
+                integrity::check_staged(Some("shared-name-budget"), &vec![def(&claude, b)])
+                    .unwrap()
+                    .is_empty()
+            );
+            let mut quarantined = (*base).clone();
+            quarantined.requarantine(BTreeSet::from([canonical["name"].as_str().unwrap().into()]));
+            for limit in [52, 64] {
+                let blocked = quarantined.with_client_tool_view(HashMap::new(), limit);
+                assert!(blocked.exposed_tool_name("files", original).is_none());
+                let mut disabled = (*base).clone();
+                disabled.apply_registry_policy(RegistryPolicy {
+                    disabled: HashMap::from([(
+                        "files".into(),
+                        HashSet::from([original.to_string()]),
+                    )]),
+                    ..Default::default()
+                });
+                assert!(disabled
+                    .with_client_tool_view(HashMap::new(), limit)
+                    .exposed_tool_name("files", original)
+                    .is_none());
+                assert!(base
+                    .with_client_tool_view(
+                        HashMap::from([("files".into(), HashSet::from(["echo".into()]))]),
+                        limit
+                    )
+                    .exposed_tool_name("files", original)
+                    .is_none());
+            }
+        }
+        assert_eq!(
+            clients::client_tool_name_limit(Some("cursor"), "toolport"),
+            52
+        );
+        assert_eq!(
+            clients::client_tool_name_limit(Some("adapter:client:cursor"), "tp"),
+            58
+        );
+        assert_eq!(
+            clients::client_tool_name_limit(Some("claude-code"), "toolport"),
+            64
+        );
+    }
+
+    #[test]
+    fn hidden_tool_errors_match_unknown_catalog_byte_for_byte() {
+        let _env = DataDirTestEnv::new("hidden-tool-error-parity");
+        let reg = Registry::default();
+        let build = |tools: Vec<Value>| {
+            let mut router = Router::new();
+            router.add(
+                DownstreamServer::connect("files".into(), Box::new(MockRoute { tools })).unwrap(),
+            );
+            router
+        };
+        let read = json!({"name":"private_exports","inputSchema":{"type":"object"}});
+        let hidden = json!({"name":"private_export","inputSchema":{"type":"object"}});
+        let absent = build(vec![read.clone()]);
+        for kind in ["tool", "server", "team", "app", "app-strict"] {
+            let mut definition = hidden.clone();
+            if kind.starts_with("app") {
+                definition["_meta"] = json!({"ui":{"visibility":["app"]}});
+                definition["annotations"] = json!({"destructiveHint":true});
+            }
+            let mut present = build(vec![read.clone(), definition]);
+            if kind == "tool" {
+                present = present.with_tool_allow(HashMap::from([(
+                    "files".into(),
+                    HashSet::from(["private_exports".into()]),
+                )]));
+            }
+            if kind == "app-strict" {
+                present.apply_registry_policy(RegistryPolicy {
+                    deny_destructive: true,
+                    ..Default::default()
+                });
+            }
+            let scope = HashSet::from(["other".into()]);
+            let allowed = matches!(kind, "server" | "team").then_some(&scope);
+            for query in [
+                "files__private_export",
+                "files__private_expor",
+                "mcp__toolport__files__private_export",
+            ] {
+                let run = |router: &Router| {
+                    execute_call(
+                        &reg,
+                        router,
+                        &router.shared_tools(),
+                        None,
+                        None,
+                        allowed,
+                        None,
+                        query,
+                        json!({}),
+                        None,
+                        None,
+                        CallOpts {
+                            direct: true,
+                            shape: false,
+                            allow_app_only: false,
+                        },
+                        None,
+                    )
+                };
+                assert_eq!(
+                    serde_json::to_vec(&run(&present)).unwrap(),
+                    serde_json::to_vec(&run(&absent)).unwrap(),
+                    "{kind}: {query}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_alias_off_to_strict_prepare_dispatch_uses_original_safety() {
+        let _env = DataDirTestEnv::new("long-alias-strict-race");
+        struct LongRoute {
+            name: String,
+            inner: CountingRoute,
+        }
+        impl Transport for LongRoute {
+            fn request(
+                &mut self,
+                method: &str,
+                params: Value,
+            ) -> Result<Value, downstream::TransportError> {
+                if method == "tools/list" {
+                    return Ok(
+                        json!({"tools":[{"name":self.name,"inputSchema":{"type":"object"}}]}),
+                    );
+                }
+                self.inner.request(method, params)
+            }
+            fn notify(
+                &mut self,
+                method: &str,
+                params: Value,
+            ) -> Result<(), downstream::TransportError> {
+                self.inner.notify(method, params)
+            }
+        }
+        for rename in [false, true] {
+            let original = format!("{}_delete", "account_".repeat(12));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut snapshot = Router::new();
+            if rename {
+                snapshot.set_overrides(HashMap::from([(
+                    "files".into(),
+                    HashMap::from([(
+                        original.clone(),
+                        registry::ToolOverride {
+                            name: Some("read_alias".into()),
+                            ..Default::default()
+                        },
+                    )]),
+                )]));
+            }
+            snapshot.add(
+                DownstreamServer::connect(
+                    "files".into(),
+                    Box::new(LongRoute {
+                        name: original.clone(),
+                        inner: CountingRoute {
+                            calls: Arc::clone(&calls),
+                            destructive: false,
+                        },
+                    }),
+                )
+                .unwrap(),
+            );
+            let name = snapshot
+                .exposed_tool_name("files", &original)
+                .unwrap()
+                .to_string();
+            assert!(!name.contains("delete"));
+            let cached = snapshot.shared_tools();
+            assert!(tool_is_destructive_fail_closed(&name, &cached, &snapshot));
+            assert!(cached_tool_is_destructive(&cached[0], &name, &snapshot));
+            let mut live = snapshot.clone();
+            live.apply_registry_policy(RegistryPolicy {
+                deny_destructive: true,
+                ..Default::default()
+            });
+            assert!(live.is_blocked(&name));
+            let slot = Arc::new(Mutex::new(Arc::new(live)));
+            let result = prepare_dispatch(
+                &snapshot,
+                Some(&slot),
+                DispatchTarget::Tool(&name),
+                None,
+                false,
+            )
+            .and_then(|()| snapshot.route_call(&name, json!({})));
+            assert!(result.unwrap_err().contains("Strict safety"));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
     fn destructive_check_resolves_then_fails_closed() {
         let cached = vec![
             json!({ "name": "s__del", "annotations": { "destructiveHint": true } }),
@@ -28939,7 +29385,7 @@ mod tests {
             Some(&denied_scope),
             Some(&caller),
         );
-        assert!(reply.body.contains("not available"), "{}", reply.body);
+        assert!(reply.body.contains("Unknown tool:"), "{}", reply.body);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -29293,10 +29739,7 @@ mod tests {
             .and_then(|b| b.get("text"))
             .and_then(|t| t.as_str())
             .unwrap_or("");
-        assert!(
-            text.contains("'resend' is not available to this client"),
-            "got {text}"
-        );
+        assert!(text.contains("Unknown tool: resend__send"), "got {text}");
         // An in-scope call passes the scope guard (it then fails at routing since
         // no server is connected, but NOT with the scope-refusal message).
         let req_ok = json!({
@@ -31174,7 +31617,7 @@ mod tests {
         let text = denied["content"][0]["text"].as_str().unwrap_or("");
         assert_eq!(denied["isError"], true);
         assert!(
-            text.contains("not available to this client"),
+            text.contains("Unknown tool:"),
             "team twin must be a scope denial, got {denied}"
         );
         let allowed_call = execute_call(
@@ -31261,10 +31704,7 @@ mod tests {
 
         let denied = call("db__work");
         assert_eq!(denied["isError"], true, "got {denied}");
-        assert!(
-            denied.to_string().contains("destructive-tool policy"),
-            "got {denied}"
-        );
+        assert!(denied.to_string().contains("Strict safety"), "got {denied}");
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -31588,7 +32028,8 @@ mod tests {
     #[test]
     fn execute_call_reports_an_unknown_tool_the_same_with_or_without_scope() {
         let _data_env = DataDirTestEnv::new("execute_call_reports_an_unknown_tool");
-        let reg = Registry::default();
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Ask);
         let router = twin_router();
         let cached = router.aggregated_tools();
         let personal = personal_scope();
@@ -31613,9 +32054,37 @@ mod tests {
         );
         assert_eq!(unknown["isError"], true, "got {unknown}");
         assert_eq!(
-            unknown["content"][0]["text"], "no route for tool 'no_such_tool'",
+            unknown["content"][0]["text"],
+            "Unknown tool: no_such_tool\nUse toolport_search_tools to find tools.",
             "an unknown tool is not a scope denial for an empty server id"
         );
+        let unscoped = execute_call(
+            &reg,
+            &router,
+            &cached,
+            Some("open-webui"),
+            None,
+            None,
+            None,
+            "no_such_tool",
+            json!({}),
+            None,
+            None,
+            CallOpts {
+                direct: true,
+                shape: false,
+                allow_app_only: true,
+            },
+            None,
+        );
+        assert_eq!(
+            unscoped, unknown,
+            "an unscoped unknown call must not reach approval"
+        );
+        assert!(audit::read_all()
+            .unwrap()
+            .iter()
+            .all(|row| row["kind"] != "approval"));
 
         // A client-side alias is resolved only to a tool the caller may call, so
         // the hint cannot confirm that an out-of-scope tool exists.
@@ -31652,7 +32121,7 @@ mod tests {
         let out_of_scope = format!("mcp__toolport__{team_name}");
         assert_eq!(
             alias_text(&out_of_scope),
-            format!("no route for tool '{out_of_scope}'")
+            format!("Unknown tool: {out_of_scope}\nUse toolport_search_tools to find tools.")
         );
     }
 
@@ -34272,7 +34741,7 @@ mod tests {
         assert!(nested["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("available only to its MCP App"));
+            .contains("Unknown tool: apps__app_only"));
 
         let direct = handle_request(
             &host,
@@ -36821,8 +37290,14 @@ mod tests {
             .get("result")
             .is_some());
         broker.join().unwrap();
-        let entries: Vec<_> = audit::read_all().unwrap().into_iter().filter(|row| row["kind"] == "approval").collect();
-        assert_eq!(entries.len(), 1, "{entries:?}");
+        let entries: Vec<_> = audit::read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row["kind"] == "approval")
+            .collect();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[1]["decision"], "requested");
+        assert_eq!(entries[1]["gatewayVersion"], env!("CARGO_PKG_VERSION"));
         assert_eq!(entries[0]["decision"], "withdrawn");
         assert_eq!(audit::stats().unwrap()["total"], 0);
     }
@@ -36947,7 +37422,9 @@ mod tests {
         let result = p10c_r1_resume(&reg, &router, args, Some(&retry));
         assert!(result["isError"].as_bool().unwrap());
         let rows = audit::read_all().unwrap();
-        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1]["decision"], "requested");
+        assert_eq!(rows[1]["gatewayVersion"], env!("CARGO_PKG_VERSION"));
         assert_eq!(rows[0]["decision"], "no_response");
         assert_eq!(rows[0]["server"], "team_slack");
         assert_eq!(rows[0]["serverId"], "team-slack");
@@ -36981,7 +37458,9 @@ mod tests {
             expired.reap_expired();
         }
         let rows = audit::read_all().unwrap();
-        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1]["decision"], "requested");
+        assert_eq!(rows[1]["gatewayVersion"], env!("CARGO_PKG_VERSION"));
         assert_eq!(rows[0]["decision"], "stale_state");
         assert_eq!(rows[0]["reason"], "destructive");
         assert!(rows[0]["heldMs"].as_u64().unwrap() >= 1500);

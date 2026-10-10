@@ -168,6 +168,75 @@ pub fn sanitize_segment(s: &str) -> String {
         .collect()
 }
 
+/// Keep the established short spelling; hash the raw identity for long aliases.
+fn bounded_alias(
+    name: &str,
+    identity: &impl serde::Serialize,
+    namespace: Option<&str>,
+    limit: usize,
+) -> String {
+    if name.len() <= limit {
+        return name.to_string();
+    }
+    let hash = content_digest(identity);
+    let suffix: String = hash[..6].iter().map(|byte| format!("{byte:02x}")).collect();
+    let namespace = namespace.map(sanitize_segment);
+    let parts = namespace.as_deref().and_then(|server| {
+        name.strip_prefix(&format!("{server}__"))
+            .map(|tool| (server, tool))
+    });
+    let prefix_budget = limit - 13;
+    let prefix = if let Some((server, tool)) = parts {
+        let server = &server[..server.len().min(24).min(prefix_budget - 2)];
+        let tool = &tool[..tool.len().min(prefix_budget - server.len() - 2)];
+        format!("{server}__{tool}")
+    } else {
+        name[..prefix_budget].to_string()
+    };
+    format!("{prefix}_{suffix}")
+}
+
+fn blocked_tool_message(name: &str, reason: &str) -> String {
+    let (why, where_to) = match reason {
+        "outside this client's tool scope" => ("turned off for this client", "Clients"),
+        "disabled" => ("turned off", "Servers"),
+        "on a server that is turned off" => ("on a server that is turned off", "Servers"),
+        "blocked by the destructive-tool policy" => {
+            ("destructive and blocked by Strict safety", "Settings")
+        }
+        "quarantined after a high-risk change; re-approve to restore" => (
+            "quarantined after a tool change",
+            "Settings > Quarantined tools",
+        ),
+        _ => (reason, "Settings"),
+    };
+    let action = if where_to == "Settings > Quarantined tools" {
+        "Review it"
+    } else {
+        "Change it"
+    };
+    format!("Blocked by Toolport: {name} is {why}. {action} in Toolport > {where_to}.")
+}
+
+fn alias_distance(a: &str, b: &str) -> usize {
+    if a.len().abs_diff(b.len()) > 3 || a.len() > 128 || b.len() > 128 {
+        return usize::MAX;
+    }
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, left) in a.bytes().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, right) in b.bytes().enumerate() {
+            let previous = row[j + 1];
+            row[j + 1] = (diagonal + usize::from(left != right))
+                .min(row[j] + 1)
+                .min(previous + 1);
+            diagonal = previous;
+        }
+    }
+    row[b.len()]
+}
+
 /// Bound URI/template matching so a hostile client URI cannot blow the stack
 /// or dominate the request thread with pathological backtracking.
 const MAX_URI_MATCH_LEN: usize = 8_192;
@@ -1597,6 +1666,12 @@ pub struct Router {
     restored_candidates: Vec<RestoredTool>,
     /// Exposed names already handed out, for collision disambiguation.
     seen: HashSet<String>,
+    /// Pre-bounding aliases preserve existing integrity and quarantine bindings.
+    legacy_seen: HashSet<String>,
+    legacy_names: HashMap<String, String>,
+    tool_owners: HashMap<String, String>,
+    model_hidden: HashSet<String>,
+    alias_limit: Option<usize>,
     /// What may be exposed; applied as each server is added.
     policy: ToolPolicy,
     /// Per-tool exposure overrides (rename / re-describe), keyed by server id then ORIGINAL
@@ -1607,6 +1682,13 @@ pub struct Router {
     /// Public alias -> persisted policy name. Reserved overrides keep their old
     /// policy binding even though clients now see the original namespaced alias.
     policy_names: HashMap<String, String>,
+    /// Server id -> original tool -> policy name, for every indexed tool, whatever
+    /// this router's scope or block state.
+    policy_by_original: HashMap<String, HashMap<String, String>>,
+    /// Server id -> original tool -> policy name in the full-length view this client
+    /// view was derived from. A shorter alias budget can change which override wins
+    /// a collision, but never which quarantine, pin or approval a tool answers to.
+    canonical_policy: HashMap<String, HashMap<String, String>>,
     /// Exposed name -> why it's hidden, for a clear message if a hidden tool is
     /// still called by name (e.g. via toolport_call_tool).
     blocked: HashMap<String, String>,
@@ -1643,6 +1725,7 @@ struct RestoredTool {
     exposed: String,
     server: String,
     original: String,
+    policy_name: Option<String>,
     source_revision: u64,
     schema_arguments: Option<Arc<crate::schema_compat::ArgumentMap>>,
 }
@@ -1692,6 +1775,17 @@ impl Router {
             .filter(|name| name.starts_with("toolport_"))
     }
 
+    /// The persisted policy name a tool answers to, before any scope gate.
+    fn unscoped_policy_name(&self, exposed: &str, server: &str, original: &str) -> String {
+        self.canonical_policy
+            .get(server)
+            .and_then(|tools| tools.get(original))
+            .cloned()
+            .or_else(|| self.reserved_policy_name(server, original))
+            .or_else(|| self.legacy_names.get(exposed).cloned())
+            .unwrap_or_else(|| exposed.to_string())
+    }
+
     fn bind_policy_name(&mut self, exposed: &str, server: &str, original: &str) {
         // Only tools in this view can claim a persisted policy record.
         if !self.policy.allows_server(server)
@@ -1703,9 +1797,9 @@ impl Router {
         {
             return;
         }
-        let legacy = self.reserved_policy_name(server, original);
-        let name = legacy.as_deref().unwrap_or(exposed);
-        if !name.starts_with("toolport_") {
+        let name = self.unscoped_policy_name(exposed, server, original);
+        let name = name.as_str();
+        if name == exposed && !name.starts_with("toolport_") {
             return;
         }
         let collisions: Vec<_> = self
@@ -1750,6 +1844,22 @@ impl Router {
         std::borrow::Cow::Owned(definition)
     }
 
+    /// Safety always judges the downstream name and annotations, never an exposure alias.
+    pub fn safety_definition<'a>(&self, tool: &'a Value) -> std::borrow::Cow<'a, Value> {
+        let original = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| self.route_of(name).map(|(_, original)| original));
+        match original {
+            Some(original) => {
+                let mut definition = tool.clone();
+                definition["name"] = json!(original);
+                std::borrow::Cow::Owned(definition)
+            }
+            None => self.policy_definition(tool),
+        }
+    }
+
     pub fn policy_catalog(&self, tools: &SharedTools) -> SharedTools {
         SharedTools(
             tools
@@ -1770,12 +1880,21 @@ impl Router {
         original: &str,
         metadata: ToolPolicyMetadata,
     ) -> Option<&'static str> {
+        let name = self.policy_name(exposed);
+        if self.has_canonical_policy(server, original) {
+            return self.policy.blocked_reason(name, server, original, metadata);
+        }
         self.policy
             .blocked_reason(exposed, server, original, metadata)
-            .or_else(|| {
-                self.policy
-                    .blocked_reason(self.policy_name(exposed), server, original, metadata)
-            })
+            .or_else(|| self.policy.blocked_reason(name, server, original, metadata))
+    }
+
+    /// In a shorter client view the public alias can equal another tool's
+    /// canonical identity, so only the canonical policy name may be checked.
+    fn has_canonical_policy(&self, server: &str, original: &str) -> bool {
+        self.canonical_policy
+            .get(server)
+            .is_some_and(|tools| tools.contains_key(original))
     }
 
     /// Preview one server's aliases using the same collision and override rules as dispatch.
@@ -1819,6 +1938,17 @@ impl Router {
             .map(|(s, t)| (s.as_str(), t.as_str()))
     }
 
+    pub fn tool_owner(&self, name: &str) -> Option<&str> {
+        self.tool_owners
+            .get(name)
+            .map(String::as_str)
+            .or_else(|| self.route_of(name).map(|(server, _)| server))
+    }
+
+    pub fn tool_is_model_hidden(&self, name: &str) -> bool {
+        self.model_hidden.contains(name)
+    }
+
     /// Why a call to `exposed_name` cannot be routed.
     pub fn no_route_message(&self, exposed_name: &str) -> String {
         self.no_route_message_within(exposed_name, |_| true)
@@ -1832,6 +1962,14 @@ impl Router {
         exposed_name: &str,
         visible: impl Fn(&str) -> bool,
     ) -> String {
+        if self.tool_owner(exposed_name).is_some_and(&visible) {
+            if let Some(reason) = self.blocked.get(exposed_name).filter(|reason| {
+                reason.as_str() != "outside this client's tool scope"
+                    && !self.model_hidden.contains(exposed_name)
+            }) {
+                return blocked_tool_message(exposed_name, reason);
+            }
+        }
         // Several client harnesses expose gateway tools to their model as
         // `mcp__<gateway-alias>__<tool>`; models then reuse that spelling inside
         // toolport_run_script and land here (observed with Codex, 2026-08-13).
@@ -1844,11 +1982,19 @@ impl Router {
                 self.routes
                     .get(*candidate)
                     .is_some_and(|(server, _)| visible(server))
+                    && self
+                        .tools
+                        .iter()
+                        .find(|tool| tool["name"] == *candidate)
+                        .is_none_or(|tool| match tool.pointer("/_meta/ui/visibility") {
+                            None => true,
+                            Some(Value::Array(audiences)) => audiences.iter().any(|a| a == "model"),
+                            Some(_) => false,
+                        })
             });
         if let Some(real) = client_prefixed {
             return format!(
-                "no route for tool '{exposed_name}'; that looks like a client-side alias - \
-                 inside Toolport the tool is named '{real}', call that instead"
+                "Unknown tool: {exposed_name}\nThis client-side alias is named '{real}' inside Toolport.\nUse toolport_search_tools to find tools."
             );
         }
         match self.kick_pending(exposed_name, &visible) {
@@ -1863,7 +2009,43 @@ impl Router {
                 status.id,
                 status.describe()
             ),
-            None => format!("no route for tool '{exposed_name}'"),
+            None => {
+                let mut matches: Vec<_> = self
+                    .tools
+                    .iter()
+                    .filter_map(|tool| {
+                        let name = tool["name"].as_str()?;
+                        let (server, _) = self.route_of(name)?;
+                        let model_visible = match tool.pointer("/_meta/ui/visibility") {
+                            None => true,
+                            Some(Value::Array(audiences)) => audiences.iter().any(|a| a == "model"),
+                            Some(_) => false,
+                        };
+                        if !visible(server) || !model_visible {
+                            return None;
+                        }
+                        let distance = alias_distance(exposed_name, name);
+                        (distance <= 3).then_some((distance, name))
+                    })
+                    .collect();
+                matches.sort();
+                matches.truncate(3);
+                let hint = if matches.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\nClose matches: {}",
+                        matches
+                            .iter()
+                            .map(|(_, n)| *n)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                format!(
+                    "Unknown tool: {exposed_name}{hint}\nUse toolport_search_tools to find tools."
+                )
+            }
         }
     }
 
@@ -1873,6 +2055,53 @@ impl Router {
     pub fn with_tool_allow(&self, allow: HashMap<String, HashSet<String>>) -> Self {
         let mut view = self.clone();
         view.policy.allow = allow;
+        view.rebuild_preserving_restored();
+        view
+    }
+
+    /// Reuse canonical policy bindings while publishing aliases for one client budget.
+    pub fn with_client_tool_view(
+        &self,
+        allow: HashMap<String, HashSet<String>>,
+        limit: usize,
+    ) -> Self {
+        let mut view = self.clone();
+        view.policy.allow = allow;
+        view.alias_limit = Some(limit.clamp(16, 64));
+        if self.alias_limit.unwrap_or(64) != view.alias_limit.unwrap() {
+            view.canonical_policy = self.policy_by_original.clone();
+            for candidate in &mut view.restored_candidates {
+                let canonical = candidate
+                    .policy_name
+                    .clone()
+                    .unwrap_or_else(|| candidate.exposed.clone());
+                let override_name = view
+                    .overrides
+                    .get(&candidate.server)
+                    .and_then(|tools| tools.get(&candidate.original))
+                    .and_then(|tool| tool.name.as_ref());
+                candidate.exposed = match override_name
+                    .filter(|name| !sanitize_segment(name).starts_with("toolport_"))
+                {
+                    Some(name) => bounded_alias(
+                        &canonical,
+                        &(&candidate.server, &candidate.original, name),
+                        None,
+                        view.alias_limit.unwrap(),
+                    ),
+                    None => bounded_alias(
+                        &canonical,
+                        &(&candidate.server, &candidate.original),
+                        Some(&candidate.server),
+                        view.alias_limit.unwrap(),
+                    ),
+                };
+                candidate.policy_name = Some(canonical);
+                let mut definition = (*candidate.definition).clone();
+                definition["name"] = json!(candidate.exposed);
+                candidate.definition = Arc::new(ToolDefinition::new(definition));
+            }
+        }
         view.rebuild_preserving_restored();
         view
     }
@@ -1914,7 +2143,11 @@ impl Router {
         match target {
             DispatchTarget::Tool(exposed) => {
                 if let Some(reason) = self.blocked.get(exposed) {
-                    return Err(format!("tool '{exposed}' is {reason}"));
+                    return Err(if reason == "outside this client's tool scope" {
+                        self.no_route_message(exposed)
+                    } else {
+                        blocked_tool_message(exposed, reason)
+                    });
                 }
                 match self.routes.get(exposed) {
                     Some((server_id, _)) => self.authorize(DispatchTarget::Server(server_id)),
@@ -1951,7 +2184,7 @@ impl Router {
                     .get(exposed)
                     .filter(|reason| reason.as_str() == "ambiguous persisted tool policy binding")
                 {
-                    return Err(format!("tool '{exposed}' is {reason}"));
+                    return Err(blocked_tool_message(exposed, reason));
                 }
                 // Only the destructive switch reads the definition; skip the scan
                 // on the common path.
@@ -1963,23 +2196,21 @@ impl Router {
                 } else {
                     &Value::Null
                 };
-                match live
-                    .policy
-                    .blocked_reason_unscoped(
-                        exposed,
-                        server_id,
-                        orig,
-                        ToolPolicyMetadata::from(definition),
-                    )
-                    .or_else(|| {
-                        live.policy.blocked_reason_unscoped(
-                            self.policy_name(exposed),
-                            server_id,
-                            orig,
-                            ToolPolicyMetadata::from(definition),
-                        )
-                    }) {
-                    Some(reason) => Err(format!("tool '{exposed}' is {reason}")),
+                let metadata = ToolPolicyMetadata::from(&*self.safety_definition(definition));
+                let name = self.policy_name(exposed);
+                let reason = if self.has_canonical_policy(server_id, orig) {
+                    live.policy
+                        .blocked_reason_unscoped(name, server_id, orig, metadata)
+                } else {
+                    live.policy
+                        .blocked_reason_unscoped(exposed, server_id, orig, metadata)
+                        .or_else(|| {
+                            live.policy
+                                .blocked_reason_unscoped(name, server_id, orig, metadata)
+                        })
+                };
+                match reason {
+                    Some(reason) => Err(blocked_tool_message(exposed, reason)),
                     None => Ok(()),
                 }
             }
@@ -2033,13 +2264,24 @@ impl Router {
             let ov_desc = ov.and_then(|o| o.description.clone());
             let exposed = match ov_name {
                 Some(new) => {
-                    let cand = sanitize_segment(&new);
+                    let legacy = sanitize_segment(&new);
+                    let cand = bounded_alias(
+                        &legacy,
+                        &(server_id, orig, &new),
+                        None,
+                        self.alias_limit.unwrap_or(64),
+                    );
                     // The gateway owns the toolport_* helper/core namespace.
                     // Keep the original alias when an override would shadow it.
                     if !cand.is_empty()
                         && !cand.starts_with("toolport_")
+                        && !self.legacy_seen.contains(&legacy)
                         && self.seen.insert(cand.clone())
                     {
+                        self.legacy_seen.insert(legacy.clone());
+                        if cand != legacy {
+                            self.legacy_names.insert(cand.clone(), legacy);
+                        }
                         cand
                     } else {
                         base
@@ -2047,6 +2289,16 @@ impl Router {
                 }
                 None => base,
             };
+            self.tool_owners
+                .insert(exposed.clone(), server_id.to_string());
+            let policy_name = self.unscoped_policy_name(&exposed, server_id, orig);
+            self.policy_by_original
+                .entry(server_id.to_string())
+                .or_default()
+                .insert(orig.to_string(), policy_name);
+            if tools.policy_metadata(idx).model_hidden {
+                self.model_hidden.insert(exposed.clone());
+            }
             self.bind_policy_name(&exposed, server_id, orig);
             if self.blocked.contains_key(&exposed) {
                 continue;
@@ -2786,9 +3038,20 @@ impl Router {
         let mut order: Vec<usize> = (0..names.len()).collect();
         order.sort_by(|&a, &b| names[a].cmp(&names[b]).then(a.cmp(&b)));
         let mut out = vec![None; names.len()];
-        for i in order {
+        let mut legacy = vec![None; names.len()];
+        for &i in &order {
             if let Some(orig) = names[i] {
-                out[i] = Some(self.exposed_name(server_id, orig));
+                legacy[i] = Some(self.legacy_exposed_name(server_id, orig));
+            }
+        }
+        order.sort_by_key(|&i| {
+            legacy[i]
+                .as_ref()
+                .is_some_and(|name| name.len() > self.alias_limit.unwrap_or(64))
+        });
+        for i in order {
+            if let (Some(orig), Some(legacy)) = (names[i], legacy[i].as_ref()) {
+                out[i] = Some(self.exposed_name(server_id, orig, legacy));
             }
         }
         out
@@ -2796,17 +3059,41 @@ impl Router {
 
     /// Allocate a unique exposed name for `server_id`'s `tool`, sanitizing both
     /// halves and suffixing `_2`, `_3`, ... if two distinct tools would collide.
-    fn exposed_name(&mut self, server_id: &str, tool: &str) -> String {
+    fn legacy_exposed_name(&mut self, server_id: &str, tool: &str) -> String {
         let base = format!(
             "{}__{}",
             sanitize_segment(server_id),
             sanitize_segment(tool)
         );
-        let mut name = base.clone();
+        let mut legacy = base.clone();
         let mut i = 2;
-        while !self.seen.insert(name.clone()) {
-            name = format!("{base}_{i}");
+        while !self.legacy_seen.insert(legacy.clone()) {
+            legacy = format!("{base}_{i}");
             i += 1;
+        }
+        legacy
+    }
+
+    fn exposed_name(&mut self, server_id: &str, tool: &str, legacy: &str) -> String {
+        let mut name = bounded_alias(
+            legacy,
+            &(server_id, tool),
+            Some(server_id),
+            self.alias_limit.unwrap_or(64),
+        );
+        let mut attempt = 0u64;
+        while !self.seen.insert(name.clone()) {
+            attempt += 1;
+            let candidate = format!("{legacy}_{attempt}");
+            name = bounded_alias(
+                &candidate,
+                &(server_id, tool, attempt),
+                Some(server_id),
+                self.alias_limit.unwrap_or(64),
+            );
+        }
+        if name != legacy {
+            self.legacy_names.insert(name.clone(), legacy.to_string());
         }
         name
     }
@@ -3235,6 +3522,7 @@ impl Router {
                     exposed: exposed.to_string(),
                     server: server_id.to_string(),
                     original: original.to_string(),
+                    policy_name: previous.policy_names.get(exposed).cloned(),
                     source_revision: self.tool_revision(server_id).unwrap_or(0),
                     schema_arguments: previous.schema_arguments.get(exposed).cloned(),
                 });
@@ -3286,6 +3574,7 @@ impl Router {
                         exposed: exposed.to_string(),
                         server: server_id.to_string(),
                         original: original.to_string(),
+                        policy_name: unrestricted.policy_names.get(exposed).cloned(),
                         source_revision: self.tool_revision(server_id).unwrap_or(0),
                         schema_arguments: unrestricted.schema_arguments.get(exposed).cloned(),
                     });
@@ -3307,6 +3596,15 @@ impl Router {
             // Re-evaluate every candidate under this router's current policy.
             // A profile can allow a tool the host intersection hid, while a new
             // quarantine must still block it (review on #717).
+            self.tool_owners
+                .insert(candidate.exposed.clone(), candidate.server.clone());
+            if ToolPolicyMetadata::from(&**candidate.definition).model_hidden {
+                self.model_hidden.insert(candidate.exposed.clone());
+            }
+            if let Some(legacy) = &candidate.policy_name {
+                self.legacy_names
+                    .insert(candidate.exposed.clone(), legacy.clone());
+            }
             self.bind_policy_name(&candidate.exposed, &candidate.server, &candidate.original);
             if self.blocked.contains_key(&candidate.exposed) {
                 continue;
@@ -3315,7 +3613,11 @@ impl Router {
                 &candidate.exposed,
                 &candidate.server,
                 &candidate.original,
-                ToolPolicyMetadata::from(&**candidate.definition),
+                ToolPolicyMetadata::from(&{
+                    let mut definition = (**candidate.definition).clone();
+                    definition["name"] = json!(candidate.original);
+                    definition
+                }),
             ) {
                 self.blocked
                     .insert(candidate.exposed.clone(), reason.to_string());
@@ -3362,8 +3664,13 @@ impl Router {
         self.catalog_servers.clear();
         self.routes.clear();
         self.policy_names.clear();
+        self.policy_by_original.clear();
         self.schema_arguments.clear();
         self.seen.clear();
+        self.legacy_seen.clear();
+        self.legacy_names.clear();
+        self.tool_owners.clear();
+        self.model_hidden.clear();
         // A restored route keeps its exposed name until a fresh tool catalog
         // confirms its removal. Reserve that name before indexing new slots,
         // otherwise a later colliding tool can silently inherit the old route.
@@ -3381,6 +3688,7 @@ impl Router {
                 });
             if !still_advertised {
                 self.seen.insert(candidate.exposed.clone());
+                self.legacy_seen.insert(candidate.exposed.clone());
             }
         }
         self.blocked.clear();
@@ -4578,7 +4886,10 @@ mod tests {
         let plain = router
             .route_call_with_cancel("mcp__unknown__tool", serde_json::json!({}), None, None)
             .unwrap_err();
-        assert_eq!(plain, "no route for tool 'mcp__unknown__tool'");
+        assert_eq!(
+            plain,
+            "Unknown tool: mcp__unknown__tool\nUse toolport_search_tools to find tools."
+        );
     }
 
     #[test]
@@ -6518,6 +6829,255 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn bounded_aliases_keep_short_names_and_resolve_hash_collisions() {
+        let long = format!("read_{}", "item_".repeat(20));
+        let collision = bounded_alias(&format!("s__{long}"), &("s", long.as_str()), Some("s"), 64);
+        let short = collision.strip_prefix("s__").unwrap();
+        let tools = vec![
+            json!({"name":long}),
+            json!({"name":short}),
+            json!({"name":format!("{}-x", "a".repeat(59))}),
+            json!({"name":format!("{}_x", "a".repeat(59))}),
+        ];
+        let aliases = Router::server_tool_aliases("s", &tools, HashMap::new());
+        assert_eq!(aliases[short], collision);
+        assert_ne!(aliases[&long], collision);
+        assert!(aliases.values().all(|name| name.len() <= 64));
+        let mut reversed = tools.clone();
+        reversed.reverse();
+        assert_eq!(
+            aliases,
+            Router::server_tool_aliases("s", &reversed, HashMap::new())
+        );
+    }
+
+    #[test]
+    fn restored_app_only_tool_refusals_do_not_reveal_policy_blocks() {
+        let mut router = Router::with_policy(ToolPolicy {
+            deny_destructive: true,
+            ..Default::default()
+        });
+        router.add(mock_server("s"));
+        let unknown = router.no_route_message("s__private_export");
+        let revision = router.tool_revision("s").unwrap();
+        router.restored_candidates.push(RestoredTool {
+            definition: Arc::new(ToolDefinition::new(json!({"name":"s__private_export", "annotations":{"destructiveHint":true}, "_meta":{"ui":{"visibility":["app"]}}}))),
+            exposed: "s__private_export".into(), server: "s".into(), original: "private_export".into(),
+            policy_name: None, source_revision: revision, schema_arguments: None,
+        });
+        router.rebuild_preserving_restored();
+        assert!(router.is_blocked("s__private_export"));
+        assert_eq!(
+            router.no_route_message("s__private_export").as_bytes(),
+            unknown.as_bytes()
+        );
+    }
+
+    #[test]
+    fn refusal_recovery_paths_match_settings_and_servers() {
+        for (reason, expected) in [
+            ("blocked by the destructive-tool policy", "Blocked by Toolport: files__delete is destructive and blocked by Strict safety. Change it in Toolport > Settings."),
+            ("quarantined after a high-risk change; re-approve to restore", "Blocked by Toolport: files__delete is quarantined after a tool change. Review it in Toolport > Settings > Quarantined tools."),
+            ("on a server that is turned off", "Blocked by Toolport: files__delete is on a server that is turned off. Change it in Toolport > Servers."),
+            ("disabled", "Blocked by Toolport: files__delete is turned off. Change it in Toolport > Servers."),
+            ("outside this client's tool scope", "Blocked by Toolport: files__delete is turned off for this client. Change it in Toolport > Clients."),
+        ] {
+            assert_eq!(blocked_tool_message("files__delete", reason), expected);
+        }
+    }
+
+    #[test]
+    fn shorter_alias_budget_handles_hash_and_sanitization_collisions() {
+        let long = format!("read_{}", "item_".repeat(20));
+        let collision = bounded_alias(&format!("s__{long}"), &("s", long.as_str()), Some("s"), 52);
+        let short = collision.strip_prefix("s__").unwrap();
+        let tools = vec![
+            json!({"name":long}),
+            json!({"name":short}),
+            json!({"name":format!("{}-x", "a".repeat(48))}),
+            json!({"name":format!("{}_x", "a".repeat(48))}),
+        ];
+        let build = |tools: Vec<Value>| {
+            let mut router = Router::new().with_client_tool_view(HashMap::new(), 52);
+            router.index_server("s", &tools.into(), &[], &[], &[], false, &Mutex::default());
+            router
+        };
+        let router = build(tools.clone());
+        assert_eq!(
+            router.exposed_tool_name("s", short),
+            Some(collision.as_str())
+        );
+        assert_ne!(
+            router.exposed_tool_name("s", &long),
+            Some(collision.as_str())
+        );
+        assert_eq!(router.routes.len(), 4);
+        assert!(router.routes.keys().all(|name| name.len() <= 52));
+        let mut reversed = tools;
+        reversed.reverse();
+        assert_eq!(router.routes, build(reversed).routes);
+    }
+
+    /// A rename accepted in the full-length view can collide in a shorter client
+    /// view and fall back to the base alias. Quarantine, pins and approvals must
+    /// still bind the tool's canonical identity there (review on #1126).
+    #[test]
+    fn shorter_view_override_collision_keeps_canonical_policy() {
+        let _data = crate::registry::DataDirTestEnv::new("shorter_view_override_collision");
+        struct Fixture(Vec<Value>, Arc<AtomicU32>);
+        impl Transport for Fixture {
+            fn request(&mut self, method: &str, _: Value) -> Result<Value, TransportError> {
+                match method {
+                    "initialize" => Ok(json!({"protocolVersion":"2025-06-18"})),
+                    "tools/list" => Ok(json!({"tools": self.0})),
+                    "tools/call" => {
+                        self.1.fetch_add(1, Ordering::SeqCst);
+                        Ok(json!({"content":[{"type":"text","text":"dispatched"}]}))
+                    }
+                    other => Err(TransportError::Fatal(format!("unexpected {other}"))),
+                }
+            }
+            fn notify(&mut self, _: &str, _: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+        let calls = Arc::new(AtomicU32::new(0));
+        let medium = format!("read_{}", "x".repeat(49));
+        let tools = vec![json!({"name": medium}), json!({"name": "private_export"})];
+        let server = || {
+            DownstreamServer::connect(
+                "files".into(),
+                Box::new(Fixture(tools.clone(), Arc::clone(&calls))),
+            )
+            .unwrap()
+        };
+        let mut seed = Router::new();
+        seed.add(server());
+        let short = seed
+            .with_client_tool_view(HashMap::new(), 52)
+            .exposed_tool_name("files", &medium)
+            .unwrap()
+            .to_string();
+        let mut base = Router::new();
+        base.set_overrides(HashMap::from([(
+            "files".to_string(),
+            HashMap::from([(
+                "private_export".to_string(),
+                ToolOverride {
+                    name: Some(short.clone()),
+                    ..Default::default()
+                },
+            )]),
+        )]));
+        base.add(server());
+        let medium_full = format!("files__{medium}");
+        assert_eq!(base.exposed_tool_name("files", "private_export"), Some(short.as_str()));
+        assert_eq!(base.exposed_tool_name("files", &medium), Some(medium_full.as_str()));
+
+        let cursor = base.with_client_tool_view(HashMap::new(), 52);
+        assert_eq!(cursor.exposed_tool_name("files", &medium), Some(short.as_str()));
+        assert_eq!(
+            cursor.exposed_tool_name("files", "private_export"),
+            Some("files__private_export")
+        );
+        let policy_name = |router: &Router, exposed: &str| {
+            let tool = router
+                .aggregated_tools()
+                .into_iter()
+                .find(|tool| tool["name"] == exposed)
+                .unwrap();
+            router.policy_definition(&tool)["name"].as_str().unwrap().to_string()
+        };
+        assert_eq!(policy_name(&cursor, "files__private_export"), short);
+        assert_eq!(policy_name(&cursor, &short), medium_full);
+
+        base.requarantine(BTreeSet::from([short.clone()]));
+        assert!(base.exposed_tool_name("files", "private_export").is_none());
+        // A request that took the older Cursor view is refused by the live recheck.
+        assert!(cursor
+            .recheck_live_policy(&base, DispatchTarget::Tool("files__private_export"))
+            .is_err());
+        assert!(cursor
+            .recheck_live_policy(&base, DispatchTarget::Tool(&short))
+            .is_ok());
+        let fresh = base.with_client_tool_view(HashMap::new(), 52);
+        assert!(fresh.exposed_tool_name("files", "private_export").is_none());
+        assert!(fresh.route_call("files__private_export", json!({})).is_err());
+        // The sibling whose short alias equals the quarantined identity stays callable.
+        assert_eq!(fresh.exposed_tool_name("files", &medium), Some(short.as_str()));
+        assert!(fresh.route_call(&short, json!({})).is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Tools the base scope hides but a client profile allows keep their reserved
+        // and pre-bounding policy names too.
+        let long = "a".repeat(70);
+        let mut narrowed = Router::with_policy(ToolPolicy {
+            allow: HashMap::from([(
+                "files".to_string(),
+                HashSet::from(["read_item".to_string()]),
+            )]),
+            ..Default::default()
+        });
+        narrowed.set_overrides(HashMap::from([(
+            "files".to_string(),
+            HashMap::from([
+                (
+                    "reserved".to_string(),
+                    ToolOverride {
+                        name: Some("toolport_foo".into()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "renamed".to_string(),
+                    ToolOverride {
+                        name: Some(long.clone()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+        )]));
+        narrowed.add(
+            DownstreamServer::connect(
+                "files".into(),
+                Box::new(Fixture(
+                    vec![
+                        json!({"name": "read_item"}),
+                        json!({"name": "reserved"}),
+                        json!({"name": "renamed"}),
+                    ],
+                    Arc::clone(&calls),
+                )),
+            )
+            .unwrap(),
+        );
+        let profile = HashMap::from([(
+            "files".to_string(),
+            HashSet::from([
+                "read_item".to_string(),
+                "reserved".to_string(),
+                "renamed".to_string(),
+            ]),
+        )]);
+        let cursor = narrowed.with_client_tool_view(profile.clone(), 52);
+        let reserved = cursor.exposed_tool_name("files", "reserved").unwrap().to_string();
+        let renamed = cursor.exposed_tool_name("files", "renamed").unwrap().to_string();
+        assert_eq!(policy_name(&cursor, &reserved), "toolport_foo");
+        assert_eq!(policy_name(&cursor, &renamed), long);
+        narrowed.requarantine(BTreeSet::from(["toolport_foo".to_string(), long.clone()]));
+        assert!(cursor
+            .recheck_live_policy(&narrowed, DispatchTarget::Tool(&reserved))
+            .is_err());
+        assert!(cursor
+            .recheck_live_policy(&narrowed, DispatchTarget::Tool(&renamed))
+            .is_err());
+        let fresh = narrowed.with_client_tool_view(profile, 52);
+        assert!(fresh.exposed_tool_name("files", "reserved").is_none());
+        assert!(fresh.exposed_tool_name("files", "renamed").is_none());
+        assert!(fresh.exposed_tool_name("files", "read_item").is_some());
+    }
+
+    #[test]
     fn aggregates_and_namespaces_tools() {
         let mut router = Router::new();
         router.add(mock_server("github"));
@@ -6664,7 +7224,7 @@ for line in sys.stdin:
             assert!(denied
                 .route_call(exposed, json!({}))
                 .unwrap_err()
-                .contains("scope"));
+                .contains("Unknown tool:"));
             let allowed = router.with_tool_allow(HashMap::from([(
                 "s".into(),
                 HashSet::from(["echo".into()]),
@@ -6679,7 +7239,7 @@ for line in sys.stdin:
             assert!(router
                 .route_call(exposed, json!({}))
                 .unwrap_err()
-                .contains("disabled"));
+                .contains("turned off"));
         }
     }
 
@@ -7825,7 +8385,7 @@ for line in sys.stdin:
 
         // Calling the hidden tool by name gives a clear policy error.
         let err = router.route_call("github__echo", json!({})).unwrap_err();
-        assert!(err.contains("disabled"), "unexpected: {err}");
+        assert!(err.contains("turned off"), "unexpected: {err}");
         // The allowed tool still routes.
         assert!(router.route_call("github__add", json!({})).is_ok());
     }
@@ -8328,10 +8888,7 @@ for line in sys.stdin:
 
         // Hidden, and also blocked on a direct call (not merely invisible).
         let err = router.route_call("db__add", json!({})).unwrap_err();
-        assert!(
-            err.contains("outside this client's tool scope"),
-            "unexpected: {err}"
-        );
+        assert!(err.contains("Unknown tool:"), "unexpected: {err}");
         assert!(router.route_call("db__echo", json!({})).is_ok());
     }
 
@@ -9867,7 +10424,10 @@ for line in sys.stdin:
             .kick_pending("secret_team__x", |server| server != "secret-team")
             .is_none());
         let err = router.no_route_message_within("secret_team__x", |_| false);
-        assert_eq!(err, "no route for tool 'secret_team__x'");
+        assert_eq!(
+            err,
+            "Unknown tool: secret_team__x\nUse toolport_search_tools to find tools."
+        );
         assert!(router.kick_pending("secret_team__x", |_| true).is_some());
         assert!(router.kick_pending("secret-team", |_| true).is_some());
     }
@@ -10010,7 +10570,7 @@ for line in sys.stdin:
         );
 
         let err = router.route_call("db__drop_table", json!({})).unwrap_err();
-        assert!(err.contains("destructive-tool policy"), "{err}");
+        assert!(err.contains("Strict safety"), "{err}");
         assert!(!exposed_names(&router).contains(&"db__drop_table".to_string()));
         assert!(
             router.route_call("db__list_tables", json!({})).is_err(),
@@ -10046,7 +10606,7 @@ for line in sys.stdin:
         let err = snapshot
             .recheck_live_policy(&live, DispatchTarget::Tool("db__drop_table"))
             .unwrap_err();
-        assert!(err.contains("destructive-tool policy"), "{err}");
+        assert!(err.contains("Strict safety"), "{err}");
         assert!(snapshot
             .recheck_live_policy(&live, DispatchTarget::Tool("db__list_tables"))
             .is_ok());
