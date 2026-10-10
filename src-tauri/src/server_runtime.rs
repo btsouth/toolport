@@ -171,7 +171,11 @@ pub fn probe_one(server: &ServerEntry) -> ProbeResult {
         },
         Err(error) => {
             let missing_credential = missing_secret(server);
-            let auth_rejected = remote::is_auth_error(&error.detail);
+            let typed_auth = match error.kind {
+                crate::call_failure::CallFailureKind::Auth { target } => Some(target),
+                _ => None,
+            };
+            let auth_rejected = typed_auth.is_some() || remote::is_auth_error(&error.detail);
             ProbeResult {
                 server_id: server.id.clone(),
                 ok: false,
@@ -179,6 +183,8 @@ pub fn probe_one(server: &ServerEntry) -> ProbeResult {
                 auth_required: auth_rejected || missing_credential,
                 auth_target: if missing_credential {
                     Some(crate::call_failure::AuthTarget::ServiceCredential)
+                } else if let Some(target) = typed_auth {
+                    Some(target)
                 } else if auth_rejected && server.url.is_some() {
                     Some(crate::call_failure::AuthTarget::Endpoint)
                 } else {
