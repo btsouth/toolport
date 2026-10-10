@@ -11,7 +11,9 @@ it("keeps raw IDs out of names and keeps version reports explicitly untrusted", 
   expect(
     activityClientName({ clientName: "Claude Code", clientLabel: "Claude Code 2.1" }),
   ).toBe("Claude Code");
-  expect(activityClientName({ clientName: "inbox", clientLabel: "inbox 1" })).toBe("inbox");
+  expect(activityClientName({ clientName: "inbox", clientLabel: "inbox 1" })).toBe(
+    "inbox",
+  );
   expect(
     activityClientName({ clientName: "Codex", clientLabel: "codex-mcp-client 0.162.1" }),
   ).toBe('Codex (reports "codex-mcp-client 0.162.1")');

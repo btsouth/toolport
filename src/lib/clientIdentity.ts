@@ -49,5 +49,8 @@ export function activityClientName(
 function reportsOnlyVersion(name: string, label: string): boolean {
   const lower = label.toLowerCase();
   const prefix = name.toLowerCase();
-  return lower === prefix || (lower.startsWith(`${prefix} `) && !lower.slice(prefix.length + 1).includes(" "));
+  return (
+    lower === prefix ||
+    (lower.startsWith(`${prefix} `) && !lower.slice(prefix.length + 1).includes(" "))
+  );
 }
