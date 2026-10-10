@@ -666,16 +666,10 @@ mod tests {
                 fetched["_meta"]["app.toolport/provenance"]["server"],
                 "github"
             );
-            assert!(fetched["content"][1]["text"]
-                .as_str()
-                .unwrap()
-                .contains("from github;"));
+            assert_eq!(fetched["content"].as_array().unwrap().len(), 1);
         }
         crate::integrity::label_untrusted_result("github", &mut result);
-        assert!(
-            value_size(&result) <= 2048,
-            "notice must fit within the original budget"
-        );
+        assert!(value_size(&result) <= 2048);
         let cursor = stash_payload("Toolport-owned data".into(), None, None).unwrap();
         let fetched = fetch_result(&cursor, 0, 100, None, None);
         assert!(fetched.get("_meta").is_none());
