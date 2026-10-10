@@ -672,7 +672,7 @@ pub fn apply(
         let ids: Vec<_> = reg
             .servers
             .iter()
-            .filter(|s| s.source.as_deref() == Some(&tag) && original(s) == id)
+            .filter(|s| !keep_local(s) && s.source.as_deref() == Some(&tag) && original(s) == id)
             .map(|s| s.id.clone())
             .collect();
         for id in ids {
@@ -685,7 +685,12 @@ pub fn apply(
         }
     }
     for (id, value) in &remote {
-        if st.pending.contains_key(id) {
+        if st.pending.contains_key(id)
+            || reg
+                .servers
+                .iter()
+                .any(|s| keep_local(s) && original(s) == id)
+        {
             continue;
         }
         if env_references(value) {
@@ -1445,6 +1450,29 @@ mod tests {
         assert!(!out.to_string().contains("synthetic-secret"));
         assert!(!out.to_string().contains("approval"));
         assert!(!out.to_string().contains("private-reference"));
+    }
+    #[test]
+    fn keep_local_does_not_receive_or_duplicate_its_cloud_definition() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-local-receive");
+        let mut a = machine();
+        let mut local = local(http("docs"));
+        local.enabled = true;
+        local.source = Some("team:solo".into());
+        local
+            .unknown_fields
+            .insert("syncLocalOnly".into(), json!(true));
+        local.url = Some("https://local.example/mcp".into());
+        a.servers.push(local);
+        apply(&mut a, &config(vec![http("docs")]), 1).unwrap();
+        assert_eq!(a.servers.len(), 1);
+        assert_eq!(
+            a.servers[0].url.as_deref(),
+            Some("https://local.example/mcp")
+        );
+        assert!(a.servers[0].enabled);
+        apply(&mut a, &config(vec![]), 2).unwrap();
+        assert_eq!(a.servers.len(), 1);
+        assert!(state(&a).unwrap().pending.is_empty());
     }
     #[test]
     fn portable_values_apply_while_unmarked_values_remain_local() {
