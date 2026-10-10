@@ -4645,11 +4645,6 @@ fn execute_call(
     let owners = unique_prefix_owners(reg);
     let visible = |id: &str| allowed.is_none_or(|set| server_in_allowed_scope(id, set));
     let candidates = if let Some(owner) = owner_of_exposed_tool(Some(view), &owners, name) {
-        if !visible(&owner) {
-            return json!({"content": [{"type": "text", "text": format!(
-                "Blocked by Toolport: {name} is turned off for this client. Change it in Toolport > Clients."
-            )}], "isError": true});
-        }
         vec![owner]
     } else {
         reg.servers
@@ -4661,6 +4656,11 @@ fn execute_call(
             })
             .collect()
     };
+    if !candidates.is_empty() && candidates.iter().all(|owner| !visible(owner)) {
+        return json!({"content": [{"type": "text", "text": format!(
+            "Blocked by Toolport: {name} is turned off for this client. Change it in Toolport > Clients."
+        )}], "isError": true});
+    }
     let candidates: Vec<_> = candidates
         .into_iter()
         .filter(|id| visible(id) && view.authorize(DispatchTarget::Server(id)).is_ok())

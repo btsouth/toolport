@@ -4677,6 +4677,10 @@ fn protocol_lane_long_server_aliases_keep_both_identity_parts_and_cached_routes(
             vec![protocol_lane_server(&dir, &server, &tools)],
             vec![],
         );
+        let registry_path = dir.join("registry.json");
+        let mut reg = registry::load_from(&registry_path).unwrap();
+        reg.profiles.push(profile("none", &[]));
+        registry::save_to(&registry_path, &reg).unwrap();
         let mut first = spawn_adapter(&dir, &AdapterOptions::default());
         first.initialize("protocol-long-server");
         first.wait_for_tool_where(
@@ -4692,6 +4696,31 @@ fn protocol_lane_long_server_aliases_keep_both_identity_parts_and_cached_routes(
         for (original, alias) in &aliases {
             assert_eq!(text_of(&first.call_tool(alias, json!({}))), *original);
         }
+        let calls_before = transcript_method_count(
+            &dir.join(format!("transcript-{server}.jsonl")),
+            "tools/call",
+        );
+        let mut none = spawn_adapter(
+            &dir,
+            &AdapterOptions {
+                profile: Some("none"),
+                ..Default::default()
+            },
+        );
+        none.initialize("protocol-long-server-no-access");
+        let refused = protocol_lane_error(
+            &none.call_tool(alias, json!({})),
+            "turned off for this client",
+        );
+        assert!(refused.contains("Toolport > Clients"), "{refused}");
+        assert_eq!(
+            transcript_method_count(
+                &dir.join(format!("transcript-{server}.jsonl")),
+                "tools/call"
+            ),
+            calls_before
+        );
+        drop(none);
         drop(first);
         kill_daemons(&dir);
         let mut second = spawn_adapter(&dir, &AdapterOptions::default());
