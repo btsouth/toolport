@@ -2611,9 +2611,8 @@ impl Registry {
         self.confirm_destructive = false;
     }
 
-    /// 1.x protections outside the level: saved by the migration, or read
-    /// straight from the toggles of a v1 registry that has not migrated yet.
-    /// 1.x protections still applied on top of the level.
+    /// 1.x protections applied on top of the level: saved by the migration, or
+    /// read straight from the toggles of a v1 registry that has not migrated yet.
     pub fn kept(&self) -> KeptV1Safety {
         if self.version < 2 && self.safety_level.is_none() {
             return KeptV1Safety {
