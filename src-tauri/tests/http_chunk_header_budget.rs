@@ -134,8 +134,10 @@ fn http_chunk_headers_stay_within_allocation_budget_and_next_call_works() {
                 || largest > 16 * 1024 * 1024
                 || !error.to_string().contains(if metadata == "fields" {
                     "too many header fields"
-                } else {
+                } else if metadata == "header" {
                     "response headers exceeded the 65536-byte limit"
+                } else {
+                    "malformed or unsupported chunked framing from the server"
                 })
             {
                 failures.push(format!(

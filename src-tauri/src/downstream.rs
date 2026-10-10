@@ -1655,7 +1655,7 @@ fn http_read_error(error: std::io::Error) -> TransportError {
         .and_then(|cause| cause.downcast_ref::<ureq::Error>())
     {
         if http_metadata_rejected(ureq) {
-            return http_metadata_error(ureq);
+            return http_metadata_error(ureq, true);
         }
         if matches!(ureq, ureq::Error::Timeout(_)) {
             return TransportError::Classified(
@@ -1683,7 +1683,7 @@ fn http_read_error(error: std::io::Error) -> TransportError {
 
 fn http_transport_io_error(error: ureq::Error) -> TransportError {
     if http_metadata_rejected(&error) {
-        return http_metadata_error(&error);
+        return http_metadata_error(&error, false);
     }
     match error {
         ureq::Error::Timeout(_) => http_read_error(std::io::Error::new(
@@ -1705,8 +1705,17 @@ fn http_metadata_rejected(error: &ureq::Error) -> bool {
             if matches!(error, ureq_proto::Error::ChunkExpectedCrLf | ureq_proto::Error::HttpParseTooManyHeaders))
 }
 
-fn http_metadata_error(error: &ureq::Error) -> TransportError {
-    let message = if matches!(error, ureq::Error::Protocol(ureq_proto::Error::HttpParseTooManyHeaders)) {
+fn http_metadata_error(error: &ureq::Error, response_body: bool) -> TransportError {
+    let message = if matches!(
+        error,
+        ureq::Error::Protocol(ureq_proto::Error::ChunkExpectedCrLf)
+    ) || (response_body && matches!(error, ureq::Error::BodyStalled))
+    {
+        "malformed or unsupported chunked framing from the server".to_string()
+    } else if matches!(
+        error,
+        ureq::Error::Protocol(ureq_proto::Error::HttpParseTooManyHeaders)
+    ) {
         "downstream response contained too many header fields".to_string()
     } else {
         format!("downstream response headers exceeded the {HTTP_METADATA_BYTES}-byte limit")
