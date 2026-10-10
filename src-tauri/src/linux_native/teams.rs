@@ -16,6 +16,10 @@ pub(super) struct TeamsPage {
     app: adw::Application,
     server_page: super::ServerPage,
     content: gtk::Box,
+    header_title: gtk::Label,
+    heading: gtk::Label,
+    plan_badge: gtk::Label,
+    intro: gtk::Label,
     feedback: gtk::Label,
     busy: Rc<Cell<bool>>,
     pending: Rc<RefCell<Option<PendingJoin>>>,
@@ -34,12 +38,8 @@ impl TeamsPage {
         let header = adw::HeaderBar::new();
         header.add_css_class("toolport-header");
         header.set_show_back_button(true);
-        header.set_title_widget(Some(
-            &gtk::Label::builder()
-                .label("Sync")
-                .css_classes(["title"])
-                .build(),
-        ));
+        let header_title = gtk::Label::builder().label("Sync").css_classes(["title"]).build();
+        header.set_title_widget(Some(&header_title));
         root.append(&header);
         let scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -52,33 +52,13 @@ impl TeamsPage {
         page.set_margin_start(20);
         page.set_margin_end(20);
         let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        title_row.append(
-            &gtk::Label::builder()
-                .label("Sync")
-                .halign(gtk::Align::Start)
-                .css_classes(["title-2"])
-                .build(),
-        );
-        // Seat count and wording come from `teams_plan`, which is checked against
-        // the React shell's `teamsPlan.ts`. Quoting a price the other shell does
-        // not quote is how two surfaces end up making two different claims.
-        title_row.append(
-            &gtk::Label::builder()
-                .label("Free: 1 person, 1 device")
-                .valign(gtk::Align::Center)
-                .css_classes(["toolport-badge", "success", "caption"])
-                .build(),
-        );
+        let heading = gtk::Label::builder().label("Sync").halign(gtk::Align::Start).css_classes(["title-2"]).build();
+        title_row.append(&heading);
+        let plan_badge = gtk::Label::builder().label("Free: 1 person, 1 device").valign(gtk::Align::Center).css_classes(["toolport-badge", "success", "caption"]).build();
+        title_row.append(&plan_badge);
         page.append(&title_row);
-        page.append(
-            &gtk::Label::builder()
-                .label("Set up once. Your servers follow you to every machine. Secret values and approvals stay on this machine.")
-                .halign(gtk::Align::Fill)
-                .xalign(0.0)
-                .wrap(true)
-                .css_classes(["toolport-muted"])
-                .build(),
-        );
+        let intro = gtk::Label::builder().label("Set up once. Your servers follow you to every machine. Secret values and approvals stay on this machine.").halign(gtk::Align::Fill).xalign(0.0).wrap(true).css_classes(["toolport-muted"]).build();
+        page.append(&intro);
         let feedback = gtk::Label::builder()
             .halign(gtk::Align::Fill)
             .xalign(0.0)
@@ -96,6 +76,7 @@ impl TeamsPage {
             app: app.clone(),
             server_page,
             content,
+            header_title, heading, plan_badge, intro,
             feedback,
             busy: Rc::new(Cell::new(false)),
             pending: Rc::new(RefCell::new(None)),
@@ -219,6 +200,11 @@ impl TeamsPage {
     }
 
     fn render(&self, registry: crate::registry::Registry) {
+        let personal = registry.team.is_none() || crate::personal_sync::is_personal(&registry);
+        self.header_title.set_label(if personal { "Sync" } else { "Teams" });
+        self.heading.set_label(if personal { "Sync" } else { "Teams" });
+        self.plan_badge.set_visible(registry.team.is_none());
+        self.intro.set_label(if personal { "Set up once. Your servers follow you to every machine. Secret values and approvals stay on this machine." } else { "One shared server set, governed by your team. Credentials stay on each machine." });
         let notice = self.sync_notice.borrow_mut().take();
         let render_state = (
             serde_json::to_string(&registry).unwrap_or_default(),
@@ -272,112 +258,6 @@ impl TeamsPage {
                 self.schedule_join_poll();
             }
         }
-    }
-
-    /// What Teams actually buys you. Only rendered while disconnected: someone
-    /// who has already joined does not need the pitch, they need their team.
-    fn render_value_props(&self) {
-        let cards = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .min_children_per_line(1)
-            .max_children_per_line(2)
-            .column_spacing(10)
-            .row_spacing(10)
-            .homogeneous(true)
-            .build();
-        for (title, detail) in [
-            (
-                "One shared server set",
-                "Everyone connects to the same servers. No copying config between machines.",
-            ),
-            (
-                "Rules travel with it",
-                "Team instructions land in each member's agent files, alongside their own.",
-            ),
-            (
-                "Nothing runs unreviewed",
-                "Local commands and private endpoints wait for each member to approve them.",
-            ),
-            (
-                "Published, not copy-pasted",
-                "Compare your local servers against the team's and publish only the differences you choose.",
-            ),
-        ] {
-            let card = gtk::Box::new(gtk::Orientation::Vertical, 5);
-            card.add_css_class("toolport-value-card");
-            card.append(
-                &gtk::Label::builder()
-                    .label(title)
-                    .halign(gtk::Align::Start)
-                    .xalign(0.0)
-                    .wrap(true)
-                    .max_width_chars(22)
-                    .css_classes(["heading"])
-                    .build(),
-            );
-            card.append(
-                &gtk::Label::builder()
-                    .label(detail)
-                    .halign(gtk::Align::Start)
-                    .xalign(0.0)
-                    .wrap(true)
-                    // Without a cap the natural width of a full sentence is wide
-                    // enough that three cards cannot share a line, and the
-                    // FlowBox drops them to one per row.
-                    .max_width_chars(30)
-                    .css_classes(["caption", "toolport-muted"])
-                    .build(),
-            );
-            cards.append(&card);
-        }
-        self.content.append(&cards);
-    }
-
-    /// The three-step version, because "Sync service URL" and "Manual code" mean
-    /// nothing to someone who has not been told how a team gets made.
-    fn render_how_it_works(&self) {
-        let group = gtk::Box::new(gtk::Orientation::Vertical, 9);
-        group.add_css_class("toolport-settings-group");
-        group.add_css_class("toolport-padded-group");
-        group.append(
-            &gtk::Label::builder()
-                .label("How it works")
-                .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build(),
-        );
-        for (number, text) in [
-            (
-                "1",
-                "One person creates the team and adds the servers everyone should have.",
-            ),
-            ("2", "You join with the invite code they send you."),
-            (
-                "3",
-                "Your agents pick up the team's servers and rules. Anything that runs on your own machine still waits for you to approve it.",
-            ),
-        ] {
-            let step = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-            step.append(
-                &gtk::Label::builder()
-                    .label(number)
-                    .valign(gtk::Align::Start)
-                    .css_classes(["toolport-badge", "caption"])
-                    .build(),
-            );
-            step.append(
-                &gtk::Label::builder()
-                    .label(text)
-                    .halign(gtk::Align::Fill)
-                    .xalign(0.0)
-                    .wrap(true)
-                    .hexpand(true)
-                    .css_classes(["toolport-muted"])
-                    .build(),
-            );
-            group.append(&step);
-        }
-        self.content.append(&group);
     }
 
     fn render_join(&self) {
@@ -718,10 +598,6 @@ impl TeamsPage {
                 Err(_) => page.show_error("the team connection stopped unexpectedly"),
             }
         });
-    }
-
-    fn poll_join(&self, button: gtk::Button) {
-        self.run_join_poll(Some(button));
     }
 
     fn schedule_join_poll(&self) {

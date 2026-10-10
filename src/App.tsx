@@ -1,4 +1,5 @@
 import { secretReferenceReview } from "@/lib/secretRefs";
+import { isPersonalSync } from "@/lib/personalSync";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -792,7 +793,9 @@ function App() {
                     : view === "catalog"
                       ? "Browse catalog"
                       : view === "teams"
-                        ? "Teams"
+                        ? !registry?.team || isPersonalSync(registry)
+                          ? "Sync"
+                          : "Teams"
                         : view === "settings"
                           ? "Settings"
                           : view === "clients"
@@ -805,7 +808,9 @@ function App() {
                     : view === "catalog"
                       ? "Add MCP servers from the registry"
                       : view === "teams"
-                        ? "Share one MCP server set across your team"
+                        ? !registry?.team || isPersonalSync(registry)
+                          ? "Your setup, on every machine"
+                          : "Share one MCP server set across your team"
                         : view === "settings"
                           ? "Global discovery and security policy"
                           : view === "clients"
@@ -1121,7 +1126,7 @@ function App() {
             ? secretReferenceReview(confirmEnableTeam).join("\n") +
               "\n" +
               (confirmEnableTeam.transport === "stdio" || confirmEnableTeam.command
-                ? `This runs a local command on your machine: ${[confirmEnableTeam.command, ...(confirmEnableTeam.args ?? [])].join(" ")}. Only enable it if you recognize and trust this command.`
+                ? `This runs a local command on your machine: ${confirmEnableTeam.command} ${JSON.stringify(confirmEnableTeam.args ?? [])}, working directory: ${confirmEnableTeam.cwd ?? "client default"}. Only enable it if you recognize and trust this command.`
                 : `This connects Toolport to ${confirmEnableTeam.url ?? ""}, using its saved authentication. Verify the destination before enabling it.`)
             : undefined
         }

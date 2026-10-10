@@ -7243,13 +7243,14 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
     }
 
     if server.requires_review {
-        let badge = gtk::Label::new(Some("Review required"));
+        let personal = matches!(server.origin_label.as_str(), "Synced" | "This machine only");
+        let badge = gtk::Label::new(Some(if personal { "Review in Sync" } else { "Review in Teams" }));
         badge.add_css_class("toolport-badge");
         badge.set_valign(gtk::Align::Center);
         badge.set_halign(gtk::Align::Start);
         badge.add_css_class("review");
         badge.set_tooltip_text(Some(
-            "This team server must be reviewed before its command or private address can run",
+            "Review the exact command and credential references before enabling this server",
         ));
         card.append(&badge);
         let review = gtk::Button::with_label("Review references");
