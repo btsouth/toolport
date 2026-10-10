@@ -9243,7 +9243,15 @@ fn open_server_editor_prefilled(
                     feedback_for_fill.set_label(&snippet_fill_feedback(
                         &first.name,
                         servers.len(),
-                        first.env.len(),
+                        // Count what the import will vault, not every variable:
+                        // plain settings are saved with the server instead.
+                        first
+                            .env
+                            .iter()
+                            .filter(|env| {
+                                crate::import_credentials::secret_env(&env.key, env.value.as_deref())
+                            })
+                            .count(),
                     ));
                     feedback_for_fill.remove_css_class("error");
                     feedback_for_fill.add_css_class("success");

@@ -587,6 +587,56 @@ fn now() -> i64 {
         .unwrap_or_default()
         .as_millis() as i64
 }
+/// A plain value that probably belongs to this machine or is a credential
+/// someone did not mark secret. These default to staying local.
+fn looks_machine_local(key: &str, value: &str) -> bool {
+    let v = value.trim();
+    let path = v.starts_with('/')
+        || v.starts_with('~')
+        || v.starts_with("./")
+        || v.starts_with("..")
+        || v.starts_with('\\')
+        || v.get(1..3).is_some_and(|s| s == ":\\" || s == ":/");
+    let token_like = v.len() >= 20
+        && !v.contains(char::is_whitespace)
+        && v.chars().any(|c| c.is_ascii_digit())
+        && v.chars().any(|c| c.is_ascii_alphabetic())
+        && !v.contains("://");
+    path || token_like || credential_url(v) || risky_sync_env(key)
+}
+/// New plain values on a personal account sync by default, so a setting typed
+/// once reaches every machine. Values that existed before stay as they were:
+/// turning sync on must never upload something that was local until then.
+fn default_new_values_portable(before: &Registry, reg: &mut Registry) {
+    for server in reg.servers.iter_mut().filter(|s| eligible(s)) {
+        let old = before.servers.iter().find(|s| s.id == server.id);
+        let had_env = |key: &str| old.is_some_and(|o| o.env.iter().any(|e| e.key == key));
+        let had_input = |key: &str| {
+            old.is_some_and(|o| o.launch.iter().flat_map(|l| &l.inputs).any(|i| i.key == key))
+        };
+        for e in server.env.iter_mut().filter(|e| !e.secret && !had_env(&e.key)) {
+            if e.unknown_fields.contains_key("portable") || e.unknown_fields.contains_key("source") {
+                continue;
+            }
+            let value = e.value.as_deref().unwrap_or("");
+            e.unknown_fields
+                .insert("portable".into(), json!(!looks_machine_local(&e.key, value)));
+        }
+        for i in server
+            .launch
+            .iter_mut()
+            .flat_map(|l| &mut l.inputs)
+            .filter(|i| !i.secret && !had_input(&i.key))
+        {
+            if i.unknown_fields.contains_key("portable") || i.unknown_fields.contains_key("source") {
+                continue;
+            }
+            let value = i.value.as_deref().unwrap_or("");
+            i.unknown_fields
+                .insert("portable".into(), json!(!looks_machine_local(&i.key, value)));
+        }
+    }
+}
 pub fn keep_local(s: &ServerEntry) -> bool {
     s.unknown_fields.get("syncLocalOnly") == Some(&json!(true))
 }
@@ -954,6 +1004,7 @@ pub(crate) fn record(before: &Registry, reg: &mut Registry) -> Result<(), String
     if APPLYING.with(|v| v.get()) || !is_personal(before) || !is_personal(reg) {
         return Ok(());
     }
+    default_new_values_portable(before, reg);
     let mut st = state(reg)?;
     for server in &mut reg.servers {
         if server.enabled
@@ -3657,6 +3708,40 @@ mod tests {
         assert!(lines.iter().any(|s| s == "Last synced just now"));
     }
     #[test]
+    fn new_plain_values_sync_unless_they_look_machine_local() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-plain-defaults");
+        let mut r = machine();
+        let mut row = command("plain");
+        row["env"] = json!([{"key":"OLD_MODE","secret":false,"value":"slow"}]);
+        apply(&mut r, &config(vec![row]), 0).unwrap();
+        let before = r.clone();
+        for (key, value) in [
+            ("NOTES_MODE", "fast"),
+            ("NOTES_DIR", "/home/me/notes"),
+            ("WIN_DIR", "C:\\Users\\me"),
+            ("API_THING", "sk1234567890abcdefghij"),
+        ] {
+            r.servers[0].env.push(
+                serde_json::from_value(json!({"key":key,"secret":false,"value":value})).unwrap(),
+            );
+        }
+        record(&before, &mut r).unwrap();
+        let flag = |key: &str| {
+            r.servers[0].env.iter().find(|e| e.key == key).unwrap().unknown_fields.get("portable").cloned()
+        };
+        assert_eq!(flag("NOTES_MODE"), Some(json!(true)));
+        assert_eq!(flag("NOTES_DIR"), Some(json!(false)));
+        assert_eq!(flag("WIN_DIR"), Some(json!(false)));
+        assert_eq!(flag("API_THING"), Some(json!(false)));
+        // A value that was already here when sync started is never uploaded by default.
+        assert_eq!(flag("OLD_MODE"), None);
+        let exported = export(&r.servers[0]).to_string();
+        assert!(exported.contains("fast"));
+        assert!(!exported.contains("/home/me/notes"));
+        assert!(!exported.contains("sk1234567890"));
+        assert!(!exported.contains("slow"));
+    }
+    #[test]
     fn reference_saved_in_credentials_is_published() {
         let _data = crate::registry::DataDirTestEnv::new("sync-credentials-ref");
         let mut r = machine();
@@ -4268,7 +4353,7 @@ mod tests {
         let before = a.clone();
         let mut server = local(http("docs"));
         server.enabled = true;
-        server.env=serde_json::from_value(json!([{"key":"REGION","secret":false,"portable":true,"value":"west"},{"key":"LOCAL","secret":false,"value":"only-A"},{"key":"TOKEN","secret":true,"portable":true,"value":"synthetic-secret"}])).unwrap();
+        server.env=serde_json::from_value(json!([{"key":"REGION","secret":false,"portable":true,"value":"west"},{"key":"LOCAL","secret":false,"portable":false,"value":"only-A"},{"key":"TOKEN","secret":true,"portable":true,"value":"synthetic-secret"}])).unwrap();
         a.servers.push(server);
         record(&before, &mut a).unwrap();
         stale.store(true, Ordering::Release);
