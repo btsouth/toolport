@@ -141,6 +141,17 @@ describe("RegistryServerRow status accessibility", () => {
     },
   );
 
+  it("shows a closed local connection instead of an unreachable endpoint", () => {
+    renderRow(
+      true,
+      health({
+        failure: { kind: "unavailable" },
+        error: "Broken pipe (os error 32)",
+      }),
+    );
+    expect(screen.getByText("Connection closed")).toBeVisible();
+  });
+
   it("announces when a launcher package is being installed", () => {
     vi.useFakeTimers();
     const view = renderRow(true, undefined, {

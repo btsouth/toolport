@@ -37,6 +37,9 @@ impl ProbeResult {
         {
             return "Server stopped";
         }
+        if self.error.as_deref().is_some_and(|raw| raw.contains("Broken pipe")) {
+            return "Connection closed";
+        }
         match self.failure.as_ref() {
             Some(K::Auth {
                 target: AuthTarget::Scope,
