@@ -362,38 +362,6 @@ fn build_window(
     }
     split.set_sidebar(Some(&adw::NavigationPage::new(&sidebar, "Navigation")));
     let content_with_notice = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    if crate::registry::load().is_ok_and(|reg| reg.access_upgrade_notice_pending()) {
-        let notice = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        notice.add_css_class("toolport-setting-row");
-        notice.append(&gtk::Label::builder().label(
-            "Stop old Toolport gateways, then restart apps to use client access controls."
-        ).tooltip_text(
-            "Old Toolport gateways may still be running from before the upgrade. Stop old gateways, then restart any apps still using them so they use the new client access controls."
-        ).wrap(true).xalign(0.0).build());
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let stop = gtk::Button::with_label("Stop old gateways");
-        let settings = settings_page.clone();
-        let stack_for_stop = stack.clone();
-        stop.connect_clicked(move |_| {
-            stack_for_stop.set_visible_child_name("settings");
-            settings.stop_stale.emit_clicked();
-        });
-        actions.append(&stop);
-        let dismiss = gtk::Button::with_label("Dismiss");
-        let notice_for_dismiss = notice.clone();
-        dismiss.connect_clicked(move |_| {
-            match crate::registry::update(|reg| {
-                reg.dismiss_access_upgrade_notice();
-                Ok(())
-            }) {
-                Ok(_) => notice_for_dismiss.set_visible(false),
-                Err(error) => eprintln!("toolport: could not dismiss upgrade notice: {error}"),
-            }
-        });
-        actions.append(&dismiss);
-        notice.append(&actions);
-        content_with_notice.append(&notice);
-    }
     let removed = crate::registry::load()
         .map(|reg| reg.removed_features_notice())
         .unwrap_or_default();
@@ -435,6 +403,38 @@ fn build_window(
             }) {
                 Ok(_) => notice_for_dismiss.set_visible(false),
                 Err(error) => eprintln!("toolport: could not dismiss the notice: {error}"),
+            }
+        });
+        actions.append(&dismiss);
+        notice.append(&actions);
+        content_with_notice.append(&notice);
+    }
+    if crate::registry::load().is_ok_and(|reg| reg.access_upgrade_notice_pending()) {
+        let notice = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        notice.add_css_class("toolport-setting-row");
+        notice.append(&gtk::Label::builder().label(
+            "Stop old Toolport gateways, then restart apps to use client access controls."
+        ).tooltip_text(
+            "Old Toolport gateways may still be running from before the upgrade. Stop old gateways, then restart any apps still using them so they use the new client access controls."
+        ).wrap(true).xalign(0.0).build());
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let stop = gtk::Button::with_label("Stop old gateways");
+        let settings = settings_page.clone();
+        let stack_for_stop = stack.clone();
+        stop.connect_clicked(move |_| {
+            stack_for_stop.set_visible_child_name("settings");
+            settings.stop_stale.emit_clicked();
+        });
+        actions.append(&stop);
+        let dismiss = gtk::Button::with_label("Dismiss");
+        let notice_for_dismiss = notice.clone();
+        dismiss.connect_clicked(move |_| {
+            match crate::registry::update(|reg| {
+                reg.dismiss_access_upgrade_notice();
+                Ok(())
+            }) {
+                Ok(_) => notice_for_dismiss.set_visible(false),
+                Err(error) => eprintln!("toolport: could not dismiss upgrade notice: {error}"),
             }
         });
         actions.append(&dismiss);
