@@ -67,8 +67,11 @@ use conduit_lib::topology::LaunchKey;
 #[global_allocator]
 static CODE_MODE_ALLOCATOR: worker::WorkerAllocator = worker::WorkerAllocator;
 
+#[path = "../gateway/gateway_memory.rs"]
 mod gateway_memory;
+#[path = "../gateway/search_cache.rs"]
 mod search_cache;
+#[path = "../gateway/search_static.rs"]
 mod search_static;
 
 thread_local! {
@@ -21176,7 +21179,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     mod search_scale {
-        include!("search_eval_scale.rs");
+        include!("../gateway/search_eval_scale.rs");
     }
 
     #[test]
@@ -42487,7 +42490,7 @@ mod tests {
         }
     }
 
-    include!("token_budget_tests.rs");
+    include!("../gateway/token_budget_tests.rs");
 
     #[test]
     fn discovery_surface_token_measurement() {
