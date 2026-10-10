@@ -28,24 +28,32 @@ pub fn content_digest(value: &impl Serialize) -> [u8; 32] {
 #[derive(Debug)]
 pub struct ToolDefinition {
     value: Value,
+    // Downstream definition before client schema compatibility changes.
+    source: Option<Value>,
     pub(crate) arguments: Option<Arc<crate::schema_compat::ArgumentMap>>,
     pub digest: [u8; 32],
 }
 impl ToolDefinition {
     pub(crate) fn with_arguments(
         value: Value,
+        source: Value,
         arguments: Option<Arc<crate::schema_compat::ArgumentMap>>,
     ) -> Self {
         Self {
             digest: content_digest(&value),
+            source: (source != value).then_some(source),
             value,
             arguments,
         }
+    }
+    pub(crate) fn source(&self) -> &Value {
+        self.source.as_ref().unwrap_or(&self.value)
     }
     pub fn new(value: Value) -> Self {
         Self {
             digest: content_digest(&value),
             value,
+            source: None,
             arguments: None,
         }
     }
@@ -160,6 +168,9 @@ impl<'a> IntoIterator for &'a SharedTools {
 /// Read paths accept both fixture values and shared production definitions.
 pub trait ToolCatalog {
     fn values(&self) -> Box<dyn Iterator<Item = &Value> + '_>;
+    fn source_values(&self) -> Box<dyn Iterator<Item = &Value> + '_> {
+        self.values()
+    }
     fn len(&self) -> usize;
     fn address(&self) -> usize;
     fn get(&self, index: usize) -> Option<&Value>;
@@ -180,6 +191,9 @@ impl dyn ToolCatalog + '_ {
     }
 }
 impl ToolCatalog for SharedTools {
+    fn source_values(&self) -> Box<dyn Iterator<Item = &Value> + '_> {
+        Box::new(self.0.iter().map(|tool| tool.source()))
+    }
     fn values(&self) -> Box<dyn Iterator<Item = &Value> + '_> {
         Box::new(self.iter())
     }

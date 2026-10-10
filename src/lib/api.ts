@@ -58,6 +58,11 @@ export interface SecurityEvent {
   server?: string;
   tool?: string;
   change: string;
+  changed_fields?: string[];
+  parameters?: { added: string[]; removed: string[]; changed: string[] };
+  /** Current quarantine status; absent/null means unavailable. */
+  blocked?: boolean | null;
+  blocked_profiles?: string[];
   /** For tool_poison_flag: which heuristic signatures matched. */
   signatures?: string[];
   /** For tool_poison_flag: a short de-obfuscated excerpt of the matched text, so the

@@ -693,10 +693,11 @@ describe("ActivityView security drift dismissals", () => {
       tool: "srv__read",
       change: "changed",
       severity: "warn",
+      blocked: false,
     };
   }
 
-  it("maps warn drift to the loud lane and re-surfaces a later rewrite after dismissal", async () => {
+  it("shows server changes and re-surfaces a later rewrite after acceptance", async () => {
     localStorage.clear();
     const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
     getSecurityEvents.mockResolvedValue([warnEvent(1_700_000_000_000)]);
@@ -704,15 +705,16 @@ describe("ActivityView security drift dismissals", () => {
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
 
-    // A warn definition-content drift is actionable: it rides the loud lane, not the
-    // quiet "New & changed tools" history.
-    expect(screen.getByText("Tool security notices")).toBeInTheDocument();
-    expect(screen.getByText("srv__read")).toBeInTheDocument();
+    // A description rewrite stays visible as a server update.
+    expect(screen.getByText("Tool changes")).toBeInTheDocument();
+    expect(screen.getByText("Read")).toBeInTheDocument();
 
-    // Review (dismiss) this rewrite.
-    await user.click(screen.getByRole("button", { name: "Dismiss this notice" }));
+    // Accept just this tool.
+    await user.click(screen.getByRole("button", { name: /srv: 1 tool changed/ }));
+    await user.click(screen.getByText("Read"));
+    await user.click(screen.getByRole("button", { name: "Accept this tool" }));
     await act(async () => {});
-    expect(screen.queryByText("srv__read")).not.toBeInTheDocument();
+    expect(screen.queryByText("Read")).not.toBeInTheDocument();
 
     // A later, different rewrite of the SAME tool must reappear: a warn dismissal is
     // per instance, not per tool identity.
@@ -720,7 +722,7 @@ describe("ActivityView security drift dismissals", () => {
     await act(async () => {
       vi.advanceTimersByTime(3000);
     });
-    expect(screen.getByText("srv__read")).toBeInTheDocument();
+    expect(screen.getByText("Read")).toBeInTheDocument();
   });
 });
 

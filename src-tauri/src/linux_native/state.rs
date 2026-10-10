@@ -300,7 +300,7 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
     snapshot.server_stats = server_stats;
     snapshot.telemetry_notices =
         crate::telemetry::activity_notices(&crate::telemetry::activity_health());
-    snapshot.security_events = crate::integrity::read_recent(25)
+    snapshot.security_events = crate::integrity::review_events(2000)
         .map_err(|error| format!("could not read security events: {error}"))?;
     snapshot.search_traces = crate::searchtrace::read_recent(25)
         .map_err(|error| format!("could not read discovery traces: {error}"))?;
@@ -344,7 +344,17 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
             crate::integrity::tool_identities(&registry.servers, &registry.profiles)
                 .map_err(|error| format!("could not read the tool identity stores: {error}"))
         }) {
-        Ok(identities) => snapshot.tool_identities = identities,
+        Ok(identities) => {
+            for event in &mut snapshot.security_events {
+                if let Some(identity) = identities
+                    .iter()
+                    .find(|identity| event["server"] == identity.server_id)
+                {
+                    event["server_name"] = serde_json::json!(identity.server_name);
+                }
+            }
+            snapshot.tool_identities = identities;
+        }
         Err(error) => snapshot.tool_identities_error = Some(error),
     }
     Ok(snapshot)

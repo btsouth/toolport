@@ -1754,7 +1754,11 @@ impl Router {
                 .iter()
                 .map(|tool| match self.policy_definition(tool) {
                     std::borrow::Cow::Borrowed(_) => Arc::clone(tool),
-                    std::borrow::Cow::Owned(value) => Arc::new(ToolDefinition::new(value)),
+                    std::borrow::Cow::Owned(value) => Arc::new(ToolDefinition::with_arguments(
+                        value,
+                        self.policy_definition(tool.source()).into_owned(),
+                        tool.arguments.clone(),
+                    )),
                 })
                 .collect(),
         )
@@ -2064,7 +2068,9 @@ impl Router {
                 .get(&key)
                 .and_then(Weak::upgrade)
                 .unwrap_or_else(|| {
-                    let mut t = tools.materialize(idx);
+                    let mut source = tools.materialize(idx);
+                    source["name"] = json!(exposed);
+                    let mut t = source.clone();
                     if let Some(desc) = ov_desc {
                         t["description"] = json!(desc);
                     }
@@ -2077,7 +2083,7 @@ impl Router {
                             compiled = Some(Arc::new(arguments));
                         }
                     }
-                    let definition = Arc::new(ToolDefinition::with_arguments(t, compiled));
+                    let definition = Arc::new(ToolDefinition::with_arguments(t, source, compiled));
                     definitions.insert(key, Arc::downgrade(&definition));
                     definition
                 });

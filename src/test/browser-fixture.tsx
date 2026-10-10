@@ -1,3 +1,4 @@
+import { securityFixture } from "./security-fixture";
 // Separate development entry. Never imported by the shipping application.
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { useState } from "react";
@@ -29,6 +30,14 @@ const servers: ServerEntry[] = ["GitHub", "Linear", "Stripe"].map((name, i) => (
   url: null,
   source: "manual",
 }));
+if (new URLSearchParams(location.search).has("tool-changes")) {
+  servers.push(
+    ...[
+      ["cloudflare_full_api", "Cloudflare (Full API)"],
+      ["revenuecat", "RevenueCat"],
+    ].map(([id, name]) => ({ ...servers[0], id, name, enabled: false })),
+  );
+}
 const authGuidance = new URLSearchParams(location.search).has("auth-guidance");
 if (authGuidance) {
   servers[0] = {
@@ -156,6 +165,7 @@ if (memberReviewFixture) {
   } as NonNullable<Registry["team"]>;
 }
 
+const driftFixture = new URLSearchParams(location.search).has("tool-changes");
 const approvalFixture = new URLSearchParams(location.search).has("approvals");
 const sessionFixture = new URLSearchParams(location.search).has("sessions");
 const callerFixture = new URLSearchParams(location.search).has("caller-names");
@@ -769,10 +779,11 @@ mockIPC(
       case "decide_approval":
         pendingApproval = pendingApproval.filter((approval) => approval.id !== args.id);
         return null;
+      case "get_security_events":
+        return driftFixture ? securityFixture() : [];
       case "clients_needing_restart":
       case "list_allowed_tools":
       case "list_quarantined":
-      case "get_security_events":
         return [];
       case "get_search_traces":
         return auditRows

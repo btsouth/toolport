@@ -1080,7 +1080,7 @@ async fn audit_stats() -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn get_security_events(limit: usize) -> Result<Vec<serde_json::Value>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        integrity::read_recent(limit).map_err(|e| format!("Couldn't read security events: {e}"))
+        integrity::review_events(limit).map_err(|e| format!("Couldn't read security events: {e}"))
     })
     .await
     .map_err(|e| format!("security events task join failed: {e}"))?

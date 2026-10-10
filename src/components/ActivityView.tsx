@@ -1,3 +1,4 @@
+import { ToolChanges } from "./ToolChanges";
 import { activityClientName, clientIdentityTooltip } from "@/lib/clientIdentity";
 import { useWindowVisible } from "@/lib/windowVisible";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -69,32 +70,36 @@ import {
 
 /** A badge describing one security event by kind. */
 function eventBadge(e: SecurityEvent): { label: string; cls: string } {
+  const cls =
+    e.blocked || e.type === "result_injection_blocked"
+      ? "bg-destructive/15 text-destructive"
+      : "bg-muted text-muted-foreground";
   if (e.type === "result_injection_blocked") {
     return {
       label: "injection blocked",
-      cls: "bg-destructive/15 text-destructive",
+      cls,
     };
   }
   if (e.type === "result_injection") {
     return {
       label: "injected result",
-      cls: "bg-destructive/15 text-destructive",
+      cls,
     };
   }
   if (e.type === "tool_poison_flag") {
     return {
       label: "suspicious content",
-      cls: "bg-destructive/15 text-destructive",
+      cls,
     };
   }
   if (e.type === "pins_load_failed") {
     return {
       label: "integrity baseline lost",
-      cls: "bg-destructive/15 text-destructive",
+      cls,
     };
   }
   if (e.change === "changed") {
-    return { label: "changed", cls: "bg-warning/15 text-warning" };
+    return { label: "changed", cls: "bg-muted text-muted-foreground" };
   }
   return { label: "new tool", cls: "bg-owned/15 text-owned" };
 }
@@ -299,7 +304,7 @@ function SecurityLoadNotice({
       role="alert"
       className="mb-4 flex items-center gap-3 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs"
     >
-      <AlertTriangle className="size-4 shrink-0 text-warning" />
+      <AlertTriangle className="size-4 shrink-0 text-muted-foreground" />
       <span className="text-muted-foreground">
         <span className="font-medium text-foreground">
           {stale
@@ -360,20 +365,27 @@ function SecurityNotices({
   const [open, setOpen] = useState(true);
   // One row per finding, newest first, with a recurrence count. See collapseByIdentity.
   const collapsed = collapseByIdentity(events);
+  const blocked = events.some(
+    (event) => event.blocked || event.type === "result_injection_blocked",
+  );
   return (
-    <div className="mb-4 rounded-lg border border-warning/40 bg-warning/5 p-4">
+    <div
+      className={`mb-4 rounded-lg border p-4 ${blocked ? "border-destructive/40 bg-destructive/5" : "border-border bg-muted/20"}`}
+    >
       <button
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
         className="flex w-full items-center gap-2 text-left"
       >
-        <ShieldAlert className="size-4 shrink-0 text-warning" />
-        <h3 className="text-sm font-medium text-warning">Tool security notices</h3>
-        <span className="rounded-full bg-warning/15 px-1.5 py-0.5 text-xs font-medium text-warning">
+        <ShieldAlert className="size-4 shrink-0 text-muted-foreground" />
+        <h3 className="text-sm font-medium text-muted-foreground">
+          Tool security notices
+        </h3>
+        <span className="rounded-full bg-muted px-1.5 py-0.5 text-xs font-medium text-muted-foreground">
           {collapsed.length}
         </span>
         <ChevronRight
-          className={`ml-auto size-4 text-warning/70 transition-transform ${
+          className={`ml-auto size-4 text-muted-foreground/70 transition-transform ${
             open ? "rotate-90" : ""
           }`}
         />
@@ -406,7 +418,7 @@ function SecurityNotices({
                     )}
                     {count > 1 && (
                       <span
-                        className="rounded-full bg-warning/15 px-1.5 py-0.5 font-medium text-warning"
+                        className="rounded-full bg-muted px-1.5 py-0.5 font-medium text-muted-foreground"
                         title={`Recurred in ${count} separate time windows`}
                       >
                         ×{count}
@@ -1857,7 +1869,7 @@ export function ActivityView({
           status === "ready" || status === "stale" ? "stale" : "error",
         );
       });
-    getSecurityEvents(50)
+    getSecurityEvents(2000)
       .then((s) => {
         if (!alive) return;
         setSecurity(s);
@@ -1912,11 +1924,12 @@ export function ActivityView({
     e.type !== "tool_poison_flag" &&
     e.type !== "result_injection" &&
     e.type !== "result_injection_blocked";
+  const toolChanges = liveSecurity.filter((e) => e.type === "tool_drift");
   const highSecurity = liveSecurity.filter(
-    (e) => eventSeverity(e) === "high" && !isNewTool(e),
+    (e) => e.type !== "tool_drift" && eventSeverity(e) === "high" && !isNewTool(e),
   );
   const infoSecurity = liveSecurity.filter(
-    (e) => eventSeverity(e) !== "high" || isNewTool(e),
+    (e) => e.type !== "tool_drift" && (eventSeverity(e) !== "high" || isNewTool(e)),
   );
   const dismissSecurity = (e: SecurityEvent) => {
     setDismissed((prev) => addDismissed(prev, [dismissalKey(e)]));
@@ -1934,9 +1947,16 @@ export function ActivityView({
       {securityLoadStatus !== "ready" ? (
         <SecurityLoadNotice status={securityLoadStatus} onRetry={retryLoads} />
       ) : null}
+      {toolChanges.length > 0 ? (
+        <ToolChanges
+          events={toolChanges}
+          registry={registry}
+          onAccept={dismissAllSecurity}
+        />
+      ) : null}
       {highSecurity.length > 0 ? (
         <SecurityNotices events={highSecurity} onDismiss={dismissSecurity} />
-      ) : securityLoadStatus === "ready" ? (
+      ) : securityLoadStatus === "ready" && toolChanges.length === 0 ? (
         <SecurityResting />
       ) : null}
       {infoSecurity.length > 0 ? (

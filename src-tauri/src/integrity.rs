@@ -68,6 +68,11 @@ type Pins = BTreeMap<String, Pin>;
 struct Pin {
     /// Version-prefixed fingerprint of the whole definition (see `fingerprint`).
     fp: String,
+    /// True once the baseline is tied to the raw downstream definition.
+    #[serde(default)]
+    raw: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parameters: Option<BTreeMap<String, String>>,
     /// `readOnlyHint` at pin time, if the tool advertised one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ro: Option<bool>,
@@ -115,6 +120,8 @@ impl From<PinRepr> for Pin {
             PinRepr::Full(p) => p,
             PinRepr::Legacy(fp) => Pin {
                 fp,
+                raw: false,
+                parameters: None,
                 ro: None,
                 dh: None,
                 parts: None,
@@ -139,6 +146,8 @@ fn read_hint(tool: &Value, key: &str) -> Option<bool> {
 fn pin_of(tool: &Value) -> Pin {
     Pin {
         fp: fingerprint(tool),
+        raw: true,
+        parameters: Some(input_parameters(tool)),
         ro: read_hint(tool, "readOnlyHint"),
         dh: read_hint(tool, "destructiveHint"),
         parts: Some(definition_parts(tool)),
@@ -146,6 +155,103 @@ fn pin_of(tool: &Value) -> Pin {
         first_seen: 0,
         last_changed: 0,
     }
+}
+
+fn input_parameters(tool: &Value) -> BTreeMap<String, String> {
+    fn collect(schema: &Value, prefix: &str, out: &mut BTreeMap<String, String>) {
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (name, value) in properties {
+                let path = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                let required = schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .is_some_and(|keys| keys.iter().any(|key| key == name));
+                out.insert(
+                    path.clone(),
+                    definition_field_fingerprint(
+                        &json!({"parameter": [value, required]}),
+                        "parameter",
+                    ),
+                );
+                collect(value, &path, out);
+            }
+        }
+        if let Some(items) = schema.get("items") {
+            collect(items, &format!("{prefix}[]"), out);
+        }
+    }
+    let mut parameters = BTreeMap::new();
+    if let Some(schema) = tool.get("inputSchema") {
+        collect(schema, "", &mut parameters);
+    }
+    parameters
+}
+
+/// A legacy normalized hash cannot prove which raw definition produced it: normalization
+/// is lossy. Rebaseline only against a cached raw definition whose projection matches the
+/// saved trust root. Compare that verified raw definition with today's raw definition.
+fn migrate_source_pins(
+    profile: Option<&str>,
+    mut pins: Pins,
+    current: &(impl ToolCatalog + ?Sized),
+) -> Pins {
+    if !pins.values().any(|pin| !pin.raw) {
+        return pins;
+    }
+    let cache = profile_file(profile, "tool-cache-v2-", "tool-cache.json")
+        .map(|path| path.with_extension("servers.json"))
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    for tool in current.source_values() {
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(old) = pins.get_mut(name).filter(|pin| !pin.raw) else {
+            continue;
+        };
+        if old.fp == fingerprint(tool) {
+            old.raw = true;
+            old.parameters = Some(input_parameters(tool));
+            continue;
+        }
+        let Some((server, original)) = name.split_once("__") else {
+            continue;
+        };
+        let Some(cached) = cache
+            .as_ref()
+            .and_then(|cache| cache["servers"][server]["tools"].as_array())
+            .and_then(|tools| tools.iter().find(|tool| tool["name"] == original))
+        else {
+            continue;
+        };
+        let mut source = cached.clone();
+        source["name"] = json!(name);
+        let mut projected = source.clone();
+        if let Some(schema) = projected.get_mut("inputSchema") {
+            crate::router::normalize_tool_schema(schema);
+            crate::router::inline_refs(schema);
+        }
+        let mut refs_only = source.clone();
+        if let Some(schema) = refs_only.get_mut("inputSchema") {
+            crate::router::inline_refs(schema);
+        }
+        if old.fp != fingerprint(&source)
+            && old.fp != fingerprint(&projected)
+            && old.fp != fingerprint(&refs_only)
+        {
+            continue;
+        }
+        *old = Pin {
+            first_seen: old.first_seen,
+            last_changed: old.last_changed,
+            ..pin_of(&source)
+        };
+    }
+    pins
 }
 
 fn definition_parts(tool: &Value) -> DefinitionParts {
@@ -647,11 +753,13 @@ fn check_inner_with(
         }
     };
     // Servers we've already established a baseline for.
+    let persisted_pins = pins.clone();
+    let pins = migrate_source_pins(profile, pins, current);
     let established: BTreeSet<&str> = pins.keys().map(|k| server_of(k)).collect();
 
     let mut now: Pins = BTreeMap::new();
 
-    for t in current.values() {
+    for t in current.source_values() {
         // `current` is the router's aggregated DOWNSTREAM catalog, so every entry is a
         // real routed tool. Do NOT gate on a `server__` prefix: a tool renamed via a
         // tool override has an arbitrary exposed name with no `__`, and gating on `__`
@@ -780,7 +888,7 @@ fn check_inner_with(
     for e in &events {
         record_event(e);
     }
-    if updated != pins {
+    if updated != persisted_pins {
         save(profile, &updated)?;
     }
     Ok(events)
@@ -815,7 +923,7 @@ pub fn accept_staged_pins(
         };
         let stamp = epoch_millis();
         let mut updated = pins.clone();
-        for tool in current.values() {
+        for tool in current.source_values() {
             let Some(name) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
@@ -2095,7 +2203,7 @@ fn apply_quarantine_inner_with(
                 added = true;
             }
         }
-        for tool in current.values() {
+        for tool in current.source_values() {
             let Some(name) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
@@ -3403,6 +3511,13 @@ fn changed_event(server: &str, tool: &str, severity: &str, old: &Pin, new: &Pin)
     e["new_ro"] = json!(new.ro);
     e["prev_dh"] = json!(old.dh);
     e["new_dh"] = json!(new.dh);
+    if let (Some(before), Some(after)) = (&old.parameters, &new.parameters) {
+        e["parameters"] = json!({
+            "added": after.keys().filter(|key| !before.contains_key(*key)).collect::<Vec<_>>(),
+            "removed": before.keys().filter(|key| !after.contains_key(*key)).collect::<Vec<_>>(),
+            "changed": after.iter().filter(|(key, value)| before.get(*key).is_some_and(|old| old != *value)).map(|(key, _)| key).collect::<Vec<_>>(),
+        });
+    }
     let changed_fields = changed_definition_fields(old, new);
     if !changed_fields.is_empty() {
         e["changed_fields"] = json!(changed_fields);
@@ -3590,6 +3705,108 @@ pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
         .collect())
 }
 
+/// Attach current blocking state to retained findings. A damaged quarantine store is
+/// unknown, never a false "not blocked". Result blocks describe a past intercepted result.
+pub fn review_events(limit: usize) -> std::io::Result<Vec<Value>> {
+    let mut events = read_recent(limit.min(KEEP_LINES))?;
+    let quarantines = all_quarantined();
+    for event in &mut events {
+        match &quarantines {
+            Ok(records) => {
+                let profiles: Vec<&str> = records
+                    .iter()
+                    .filter(|record| {
+                        record["tool"].as_str().is_some() && record["tool"] == event["tool"]
+                    })
+                    .filter_map(|record| record["profile"].as_str())
+                    .collect();
+                event["blocked"] = json!(
+                    !profiles.is_empty()
+                        || (event["type"] == "pins_load_failed"
+                            && records.iter().any(|record| record["change"] == "tamper"))
+                );
+                event["blocked_profiles"] = json!(profiles);
+            }
+            Err(_) => {
+                event["blocked"] = Value::Null;
+            }
+        }
+    }
+    Ok(events)
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ToolChangeGroup {
+    pub server: String,
+    pub ts: u64,
+    pub tools: Vec<Value>,
+}
+
+/// One server refresh is one event, even when it changed hundreds of definitions.
+/// Keep updates more than a minute apart separate, and keep the newest row per tool.
+pub fn group_tool_changes(events: &[Value]) -> Vec<ToolChangeGroup> {
+    let mut ordered: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "tool_drift")
+        .collect();
+    ordered.sort_by_key(|event| std::cmp::Reverse(event["ts"].as_u64().unwrap_or(0)));
+    let mut groups: Vec<ToolChangeGroup> = Vec::new();
+    for event in ordered {
+        let server = event["server"].as_str().unwrap_or("Unknown server");
+        let ts = event["ts"].as_u64().unwrap_or(0);
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.server == server && group.ts.saturating_sub(ts) <= 60_000)
+        {
+            if !group.tools.iter().any(|tool| tool["tool"] == event["tool"]) {
+                group.tools.push(event.clone());
+            }
+        } else {
+            groups.push(ToolChangeGroup {
+                server: server.to_string(),
+                ts,
+                tools: vec![event.clone()],
+            });
+        }
+    }
+    groups
+}
+
+pub fn tool_change_summary(events: &[Value]) -> String {
+    let inputs = events
+        .iter()
+        .filter(|event| {
+            event["changed_fields"]
+                .as_array()
+                .is_some_and(|fields| fields.iter().any(|field| field == "input_schema"))
+        })
+        .count();
+    if inputs == events.len() {
+        format!(
+            "{} {} changed their inputs",
+            inputs,
+            if inputs == 1 { "tool" } else { "tools" }
+        )
+    } else if events.iter().all(|event| event["change"] == "added") {
+        format!("{} new tools", events.len())
+    } else if events
+        .iter()
+        .all(|event| event["changed_fields"] == json!(["description"]))
+    {
+        format!(
+            "{} {} changed their descriptions",
+            events.len(),
+            if events.len() == 1 { "tool" } else { "tools" }
+        )
+    } else {
+        format!(
+            "{} {} changed",
+            events.len(),
+            if events.len() == 1 { "tool" } else { "tools" }
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3741,6 +3958,119 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn raw_source_survives_schema_normalization_and_overrides() {
+        let _data = TestDataDir::new("raw-source");
+        let raw = json!({"name":"srv__update", "description":"Original", "inputSchema":{"type":"object", "properties":{"limit":{"type":"integer", "maximum":"100"}}}});
+        let mut client = raw.clone();
+        crate::router::normalize_tool_schema(&mut client["inputSchema"]);
+        client["description"] = json!("My local description");
+        let catalog = crate::tool_definitions::SharedTools(vec![std::sync::Arc::new(
+            crate::tool_definitions::ToolDefinition::with_arguments(client, raw.clone(), None),
+        )]);
+        assert!(check(None, &catalog).unwrap().is_empty());
+        assert_eq!(
+            baselines(None)["srv__update"].fingerprint,
+            fingerprint(&raw)
+        );
+        assert!(check(None, &vec![raw.clone()]).unwrap().is_empty());
+        let mut edited = raw;
+        edited["inputSchema"]["properties"]["limit"]["maximum"] = json!("200");
+        assert_eq!(check(None, &vec![edited]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn source_migration_verifies_cache_and_keeps_real_changes_visible() {
+        let _data = TestDataDir::new("raw-migration");
+        let raw = json!({"name":"srv__update", "description":"Original", "inputSchema":{"type":"object", "properties":{"limit":{"type":"integer", "maximum":"100"}}}});
+        let mut projected = raw.clone();
+        crate::router::normalize_tool_schema(&mut projected["inputSchema"]);
+        let mut legacy = pin_of(&projected);
+        legacy.raw = false;
+        legacy.first_seen = 100;
+        legacy.last_changed = 200;
+        save_pins(
+            None,
+            &BTreeMap::from([("srv__update".to_string(), legacy.clone())]),
+        )
+        .unwrap();
+        let mut cached = raw.clone();
+        cached["name"] = json!("update");
+        let cache = profile_file(None, "tool-cache-v2-", "tool-cache.json")
+            .unwrap()
+            .with_extension("servers.json");
+        std::fs::write(
+            &cache,
+            json!({"version":3, "servers":{"srv":{"tools":[cached]}}}).to_string(),
+        )
+        .unwrap();
+        assert!(check(None, &vec![raw.clone()]).unwrap().is_empty());
+        let migrated = read_pins_at(&pins_path(None).unwrap()).unwrap();
+        assert!(migrated["srv__update"].raw);
+        assert_eq!(migrated["srv__update"].last_changed, 200);
+        save_pins(None, &BTreeMap::from([("srv__update".to_string(), legacy)])).unwrap();
+        let mut changed = raw;
+        changed["description"] = json!("Upstream changed");
+        assert_eq!(
+            check(None, &vec![changed]).unwrap()[0]["changed_fields"],
+            json!(["description"])
+        );
+    }
+
+    #[test]
+    fn migration_does_not_hide_changes_erased_by_old_normalization() {
+        let _data = TestDataDir::new("raw-lossy-migration");
+        let raw = json!({"name":"srv__update", "inputSchema":{"properties":{"limit":{"maximum":"invalid-old"}}}});
+        let mut projected = raw.clone();
+        crate::router::normalize_tool_schema(&mut projected["inputSchema"]);
+        let mut old = pin_of(&projected);
+        old.raw = false;
+        save_pins(None, &BTreeMap::from([("srv__update".to_string(), old)])).unwrap();
+        let mut cached = raw.clone();
+        cached["name"] = json!("update");
+        let cache = profile_file(None, "tool-cache-v2-", "tool-cache.json")
+            .unwrap()
+            .with_extension("servers.json");
+        std::fs::write(
+            &cache,
+            json!({"servers":{"srv":{"tools":[cached]}}}).to_string(),
+        )
+        .unwrap();
+        let mut changed = raw;
+        changed["inputSchema"]["properties"]["limit"]["maximum"] = json!("invalid-new");
+        assert_eq!(check(None, &vec![changed]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parameter_summary_reports_added_removed_changed_and_required() {
+        let before = pin_of(
+            &json!({"inputSchema":{"properties":{"a":{"type":"string"},"b":{"type":"number"}},"required":["a"]}}),
+        );
+        let after = pin_of(
+            &json!({"inputSchema":{"properties":{"a":{"type":"string"},"c":{"type":"number"}}}}),
+        );
+        let event = changed_event("srv", "srv__tool", "warn", &before, &after);
+        assert_eq!(
+            event["parameters"],
+            json!({"added":["c"], "removed":["b"], "changed":["a"]})
+        );
+    }
+
+    #[test]
+    fn server_update_grouping_keeps_the_whole_burst_and_separate_updates() {
+        let mut events: Vec<_> = (0..357).map(|i| json!({"type":"tool_drift","server":"cloudflare","tool":format!("tool{i}"),"ts":100_000+i,"changed_fields":["input_schema"]})).collect();
+        events.push(events[0].clone());
+        events.push(json!({"type":"tool_drift","server":"other","tool":"read","ts":100_000}));
+        events.push(json!({"type":"tool_drift","server":"cloudflare","tool":"tool0","ts":1}));
+        let groups = group_tool_changes(&events);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].tools.len(), 357);
+        assert_eq!(
+            tool_change_summary(&groups[0].tools),
+            "357 tools changed their inputs"
+        );
     }
 
     fn tool(name: &str, desc: &str) -> Value {
@@ -6664,6 +6994,8 @@ mod tests {
             "inputSchema": {"type":"object"}, "annotations": { "readOnlyHint": false } })];
         let old = Pin {
             fp: "v1:old".into(),
+            raw: false,
+            parameters: None,
             ro: Some(true),
             dh: None,
             parts: None,
@@ -7144,6 +7476,8 @@ mod tests {
     fn legacy_pin(fp: &str) -> Pin {
         Pin {
             fp: fp.to_string(),
+            raw: false,
+            parameters: None,
             ro: None,
             dh: None,
             parts: None,
