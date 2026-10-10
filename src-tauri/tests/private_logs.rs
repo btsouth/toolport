@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 /// test-only binary that writes a transcript into a temp dir. Matched on the
 /// full relative path, not the basename, so a future `foo/registry.rs` is not
 /// silently exempt too.
-const EXEMPT: [&str; 2] = ["src/registry.rs", "src/bin/mock-mcp-server.rs"];
+const EXEMPT: [&str; 2] = ["src/registry.rs", "src/test_support/mock-mcp-server.rs"];
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));

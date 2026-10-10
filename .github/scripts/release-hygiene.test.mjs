@@ -1,7 +1,14 @@
 import { Buffer } from "node:buffer";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import {
+  readFileSync,
+  readdirSync,
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  rmSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +28,17 @@ const release = {
   assets: [{ name: "Toolport_2.0.0_x64-setup.exe", browser_download_url: url, digest }],
 };
 const installer = releaseInstaller(release, tag, "btsouth/toolport");
+test("Tauri's directory scan sees only shipping entry points", () => {
+  assert.deepEqual(readdirSync("src-tauri/src/bin"), ["toolport-gateway.rs"]);
+  const cargo = readFileSync("src-tauri/Cargo.toml", "utf8");
+  assert.match(cargo, /autobins = false/);
+  const mock = cargo
+    .split("[[bin]]")
+    .find((target) => target.includes('name = "mock-mcp-server"'));
+  assert.match(mock, /path = "src\/test_support\/mock-mcp-server.rs"/);
+  assert.match(mock, /required-features = \["test-support"\]/);
+  assert.doesNotMatch(cargo.match(/^default = .*$/m)[0], /test-support/);
+});
 const templates = [
   "Toolport.Toolport.yaml",
   "Toolport.Toolport.installer.yaml",

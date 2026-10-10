@@ -14,10 +14,10 @@ required-features = ["desktop"]
 
 [[bin]]
 name = "toolport-gtk"
-path = "src/bin/toolport-gtk.rs"
+path = "src/linux_native/main.rs"
 required-features = ["gtk-desktop"]
 
-# Explicit targets prevent test helpers from being discovered by release bundlers.
+# Keep src/bin limited to shipping entry points: Tauri also scans that directory.
 [[bin]]
 name = "toolport-gateway"
 path = "src/bin/toolport-gateway.rs"
@@ -25,7 +25,7 @@ required-features = ["search-static"]
 
 [[bin]]
 name = "mock-mcp-server"
-path = "src/bin/mock-mcp-server.rs"
+path = "src/test_support/mock-mcp-server.rs"
 required-features = ["test-support"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

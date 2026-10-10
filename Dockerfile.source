@@ -12,18 +12,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/build.rs ./src-tauri/
 WORKDIR /src/src-tauri
-RUN mkdir -p src/bin && \
+RUN mkdir -p src/bin src/test_support && \
     printf '%s\n' \
       '#[cfg(test)] mod tests {}' \
       'pub fn _docker_dep_stub() {}' > src/lib.rs && \
     printf 'fn main() {}\n' > src/main.rs && \
     printf 'fn main() {}\n' > src/bin/toolport-gateway.rs && \
-    printf 'fn main() {}\n' > src/bin/mock-mcp-server.rs && \
+    printf 'fn main() {}\n' > src/test_support/mock-mcp-server.rs && \
     cargo build --release --bin toolport-gateway --no-default-features --features search-static
 
 COPY src-tauri/assets/search ./assets/search
 COPY src-tauri/src ./src
-RUN touch src/lib.rs src/main.rs src/bin/toolport-gateway.rs src/bin/mock-mcp-server.rs && \
+RUN touch src/lib.rs src/main.rs src/bin/toolport-gateway.rs src/test_support/mock-mcp-server.rs && \
     cargo build --release --bin toolport-gateway --no-default-features --features search-static
 
 FROM debian:bookworm-slim
