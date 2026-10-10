@@ -565,6 +565,11 @@ fn restore_local(entry: &mut ServerEntry, old: &ServerEntry) {
                 .and_then(|i| i.value.clone());
         }
     }
+    if old_wire["launch"]["bindings"] == json!(entry.launch.as_ref().map(|l| &l.bindings)) {
+        if let (Some(installed), Some(previous)) = (&mut entry.launch, &old.launch) {
+            installed.bindings = previous.bindings.clone();
+        }
+    }
     for input in entry.launch.iter_mut().flat_map(|l| &mut l.inputs) {
         if !portable(&json!(input)) && !input.secret && reference(&json!(input)).is_none() {
             input.value = old
@@ -639,7 +644,9 @@ pub fn apply(
                     id.clone(),
                     Mutation {
                         local_id: local.id.clone(),
-                        before: remote.get(&id).cloned(),
+                        // With no common baseline, different existing local and
+                        // remote definitions require an explicit conflict choice.
+                        before: None,
                         after: Some(after),
                         at: now(),
                     },
@@ -735,7 +742,8 @@ pub fn apply(
                 crate::local_auth::revoke_personal_route(reg, &team_id, &old.id);
             }
         }
-        let changed = execution_changed(st.baseline.get(id), value);
+        let installed = old.as_ref().map(export);
+        let changed = execution_changed(installed.as_ref(), value);
         let refs_changed = has_references(value)
             && old
                 .as_ref()
@@ -1160,6 +1168,58 @@ mod tests {
         assert_eq!(apply(&mut b, &changed, 2).unwrap().review, 1);
         assert!(!b.servers[0].enabled);
         assert!(check_review(&b, &b.servers[0], Some(&reviewed)).is_err());
+    }
+    #[test]
+    fn choosing_a_conflicting_remote_command_still_requires_local_review() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-conflict-command");
+        let mut r = machine();
+        let first = config(vec![command("tool")]);
+        apply(&mut r, &first, 1).unwrap();
+        let reviewed = r.servers[0].clone();
+        let profile = r.active_profile_id();
+        crate::registry_controller::apply_server_enabled(
+            &mut r,
+            &profile,
+            &reviewed.id,
+            true,
+            true,
+        )
+        .unwrap();
+        let before = r.clone();
+        r.servers[0].args = vec!["-y".into(), "local-edit".into()];
+        record(&before, &mut r).unwrap();
+        let mut remote = first.clone();
+        remote["servers"][0]["args"] = json!(["-y", "remote-edit"]);
+        apply(&mut r, &remote, 2).unwrap(); // Advances fetched baseline while pending stays local.
+        let (_, conflicts) = merge(&remote, &state(&r).unwrap().pending).unwrap();
+        let mut st = state(&r).unwrap();
+        st.conflicts = conflicts;
+        save(&mut r, &st).unwrap();
+        crate::registry::save(&r).unwrap();
+        let mut r = resolve_conflict("tool", &remote["servers"][0], false).unwrap();
+        assert_eq!(apply(&mut r, &remote, 2).unwrap().review, 1);
+        assert!(!r.servers[0].enabled);
+        assert_eq!(r.servers[0].args, ["-y", "remote-edit"]);
+    }
+    #[test]
+    fn first_sign_in_conflicts_when_a_same_named_definition_differs() {
+        let _data = crate::registry::DataDirTestEnv::new("solo-initial-conflict");
+        let mut r = machine();
+        let mut mine = local(http("local"));
+        mine.name = "docs".into();
+        mine.url = Some("https://local.example/mcp".into());
+        mine.enabled = true;
+        r.servers.push(mine);
+        let cloud = config(vec![http("docs")]);
+        apply(&mut r, &cloud, 1).unwrap();
+        let (merged, conflicts) = merge(&cloud, &state(&r).unwrap().pending).unwrap();
+        assert_eq!(merged, cloud);
+        assert!(conflicts.contains_key("docs"));
+        assert_eq!(r.servers.len(), 1);
+        assert_eq!(
+            r.servers[0].url.as_deref(),
+            Some("https://local.example/mcp")
+        );
     }
     #[test]
     fn reference_sources_export_only_the_reference_and_use_secret_wire_defaults() {
