@@ -1149,20 +1149,6 @@ fn sync_recorded(wait_secs: u64) -> Result<SyncResult, String> {
     let _sync = SYNC_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let conn = crate::registry::load()?.team;
-    let result = sync_inner(wait_secs);
-    if let Some(conn) = conn {
-        // The status receipt is private local metadata. Keep the network failure
-        // visible even if its receipt cannot be saved.
-        crate::team_sync_status::record(
-            &conn,
-            result.as_ref().map(|_| ()).map_err(|e| e.as_str()),
-        )?;
-    }
-    result
-}
-
-fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
     // One-time migration for clients connected before operational receipts existed.
     crate::registry::update(|reg| {
         if let Some(team) = &mut reg.team {
@@ -1174,6 +1160,25 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         }
         Ok(())
     })?;
+    let conn = crate::registry::load()?.team;
+    let result = sync_inner(wait_secs);
+    if let Some(conn) = conn {
+        // The status receipt is private local metadata. Keep the network failure
+        // visible even if its receipt cannot be saved.
+        if let Err(status_error) = crate::team_sync_status::record(
+            &conn,
+            result.as_ref().map(|_| ()).map_err(|e| e.as_str()),
+        ) {
+            return Err(match result {
+                Err(sync_error) => format!("{sync_error}. Sync status could not be saved: {status_error}"),
+                Ok(_) => format!("Sync completed, but its status could not be saved: {status_error}"),
+            });
+        }
+    }
+    result
+}
+
+fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
     // Snapshot only what the network calls need; do NOT hold this copy to save later.
     let conn = {
         let reg = crate::registry::load()?;

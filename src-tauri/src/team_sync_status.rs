@@ -137,12 +137,24 @@ mod tests {
     }
     #[test]
     fn old_success_is_history_not_a_live_connection() {
-        let status = SyncStatus {
-            state: "not_checked".into(),
-            last_success_ms: Some(1791504000000),
-            checked_at_ms: 0,
-        };
-        let line = summary(&status);
-        assert!(line.contains("not been checked recently"));
+        let _data = registry::DataDirTestEnv::new("team-sync-status-age");
+        let mut reg = registry::Registry::default();
+        let conn: TeamConnection = serde_json::from_value(serde_json::json!({
+            "serverUrl":"https://example.invalid", "teamId":"one", "role":"member"
+        }))
+        .unwrap();
+        reg.team = Some(conn.clone());
+        registry::save(&reg).unwrap();
+        record(&conn, Ok(())).unwrap();
+        let success = current().last_success_ms;
+        let mut stored: Stored =
+            serde_json::from_str(&std::fs::read_to_string(path().unwrap()).unwrap()).unwrap();
+        stored.status.checked_at_ms = 0;
+        registry::atomic_write(&path().unwrap(), &serde_json::to_string(&stored).unwrap()).unwrap();
+        assert_eq!(current().state, "not_checked");
+        assert_eq!(current().last_success_ms, success);
+        record(&conn, Err("server returned 500")).unwrap();
+        assert_eq!(current().state, "error");
+        assert_eq!(current().last_success_ms, success);
     }
 }
