@@ -428,10 +428,19 @@ pub(crate) fn fetch_config_for_update(
 ) -> Result<(i64, Value), String> {
     fetch_config_mode(server_url, team_id, token, false)
 }
-pub(crate) fn fetch_personal_config(server_url: &str, team_id: &str, token: &str) -> Result<(i64, Value), String> {
+pub(crate) fn fetch_personal_config(
+    server_url: &str,
+    team_id: &str,
+    token: &str,
+) -> Result<(i64, Value), String> {
     fetch_config_mode(server_url, team_id, token, true)
 }
-fn fetch_config_mode(server_url: &str, team_id: &str, token: &str, personal: bool) -> Result<(i64, Value), String> {
+fn fetch_config_mode(
+    server_url: &str,
+    team_id: &str,
+    token: &str,
+    personal: bool,
+) -> Result<(i64, Value), String> {
     require_secure_team_url(server_url)?;
     let url = format!("{}/teams/{}/config?manage=1", base(server_url), team_id);
     let mut request = agent(server_url).get(&url).set_header("authorization", &format!("Bearer {token}"));
@@ -832,10 +841,23 @@ pub fn push_config(
 ) -> Result<PushOutcome, String> {
     push_config_mode(server_url, team_id, token, config, base_version, false)
 }
-pub(crate) fn push_personal_config(server_url: &str, team_id: &str, token: &str, config: &Value, base_version: i64) -> Result<PushOutcome, String> {
+pub(crate) fn push_personal_config(
+    server_url: &str,
+    team_id: &str,
+    token: &str,
+    config: &Value,
+    base_version: i64,
+) -> Result<PushOutcome, String> {
     push_config_mode(server_url, team_id, token, config, base_version, true)
 }
-fn push_config_mode(server_url: &str, team_id: &str, token: &str, config: &Value, base_version: i64, personal: bool) -> Result<PushOutcome, String> {
+fn push_config_mode(
+    server_url: &str,
+    team_id: &str,
+    token: &str,
+    config: &Value,
+    base_version: i64,
+    personal: bool,
+) -> Result<PushOutcome, String> {
     require_secure_team_url(server_url)?;
     let url = format!("{}/teams/{}/config", base(server_url), team_id);
     let body = push_body(config, base_version);
@@ -1170,8 +1192,13 @@ fn finish_connect(
             .unknown_fields
             .get("accountStatus")
             .is_some_and(|s| s["personalSync"] == true);
-    let delivery_blocked = conn.unknown_fields.get("accountStatus").is_some_and(|s|s["canReceiveConfig"]==false);
-    let pulled = if delivery_blocked { None } else if personal {
+    let delivery_blocked = conn
+        .unknown_fields
+        .get("accountStatus")
+        .is_some_and(|s| s["canReceiveConfig"] == false);
+    let pulled = if delivery_blocked {
+        None
+    } else if personal {
         let (version, config) =
             fetch_personal_config(server_url, &joined.team_id, &joined.member_token)?;
         Some((version, config, None))
@@ -1352,8 +1379,16 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
             Ok(())
         })
     })?;
-    if !fresh.team.as_ref().is_some_and(|t| t.team_id == conn.team_id && t.server_url == conn.server_url && t.reporting_device_id == conn.reporting_device_id) {
-        return Ok(SyncResult::Ok { role, role_changed, applied: None });
+    if !fresh.team.as_ref().is_some_and(|t| {
+        t.team_id == conn.team_id
+            && t.server_url == conn.server_url
+            && t.reporting_device_id == conn.reporting_device_id
+    }) {
+        return Ok(SyncResult::Ok {
+            role,
+            role_changed,
+            applied: None,
+        });
     }
     if let Some(status) = &status {
         if status["canReceiveConfig"] == false {

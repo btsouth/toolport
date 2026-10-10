@@ -199,11 +199,7 @@ async fn import_servers(
             .collect(),
     };
     tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::import_client_servers_inputs(
-            selected,
-            &secret_choices.unwrap_or_default(),
-            &credential_inputs.unwrap_or_default(),
-        )
+        crate::registry_controller::import_client_servers_inputs(selected, &secret_choices.unwrap_or_default(), &credential_inputs.unwrap_or_default())
     })
     .await
     .map_err(|_| "Import stopped".to_string())??;
@@ -223,12 +219,7 @@ async fn add_snippet_servers(
     >,
 ) -> Result<serde_json::Value, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::add_snippet_servers_inputs(
-            &text,
-            &selected,
-            &secret_choices.unwrap_or_default(),
-            &credential_inputs.unwrap_or_default(),
-        )
+        crate::registry_controller::add_snippet_servers_inputs(&text,&selected,&secret_choices.unwrap_or_default(),&credential_inputs.unwrap_or_default())
     })
     .await
     .map_err(|_| "Paste import stopped".to_string())??;
@@ -2158,14 +2149,8 @@ fn team_disconnect(state: State<RegistryState>) -> Result<Registry, String> {
 }
 
 #[tauri::command]
-async fn team_use_managed(
-    app: tauri::AppHandle,
-    state: State<'_, RegistryState>,
-    server_id: String,
-) -> Result<Registry, String> {
-    tauri::async_runtime::spawn_blocking(move || teams::use_managed_server(&server_id))
-        .await
-        .map_err(|e| e.to_string())??;
+async fn team_use_managed(app: tauri::AppHandle, state: State<'_, RegistryState>, server_id: String) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || teams::use_managed_server(&server_id)).await.map_err(|e| e.to_string())??;
     let fresh = reload_into_state(state.inner())?;
     let _ = app.emit("team-sync-registry", &fresh);
     Ok(fresh)
@@ -2196,17 +2181,11 @@ fn team_open_confirmation(url: String) -> Result<(), String> {
 /// only, secret values never sent). Remote instructions and policy fields are preserved, and
 /// an optimistic-concurrency conflict is returned rather than overwriting another admin.
 #[tauri::command]
-async fn team_push_preview(
-    state: State<'_, RegistryState>,
-    selected_ids: Option<Vec<String>>,
-) -> Result<teams::PushPreview, String> {
+async fn team_push_preview(state: State<'_, RegistryState>, selected_ids: Option<Vec<String>>) -> Result<teams::PushPreview, String> {
     refresh_from_disk(state.inner())?;
-    tauri::async_runtime::spawn_blocking(move || match selected_ids {
-        Some(ids) => teams::preview_push_selected(&ids),
-        None => teams::preview_push_current(),
-    })
-    .await
-    .map_err(|e| format!("push preview task join failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || match selected_ids { Some(ids) => teams::preview_push_selected(&ids), None => teams::preview_push_current() })
+        .await
+        .map_err(|e| format!("push preview task join failed: {e}"))?
 }
 
 #[tauri::command]
@@ -3652,11 +3631,7 @@ struct TeamPairEvent {
 
 impl TeamPairEvent {
     fn new(state: &'static str) -> Self {
-        Self {
-            state,
-            check: None,
-            message: None,
-        }
+        Self { state, check: None, message: None }
     }
 }
 
@@ -3671,21 +3646,12 @@ fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
         if let Some(current) = pairing.as_ref() {
             // A repeated link brings the waiting prompt back instead of pairing twice.
             if let Some(check) = &current.check {
-                let _ = app.emit(
-                    "team-pair",
-                    TeamPairEvent {
-                        check: Some(check.clone()),
-                        ..TeamPairEvent::new("pending")
-                    },
-                );
+                let _ = app.emit("team-pair", TeamPairEvent { check: Some(check.clone()), ..TeamPairEvent::new("pending") });
             }
             return;
         }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        *pairing = Some(TeamPairing {
-            cancel: std::sync::Arc::clone(&cancel),
-            check: None,
-        });
+        *pairing = Some(TeamPairing { cancel: std::sync::Arc::clone(&cancel), check: None });
         cancel
     };
     let pending = TeamPairGuard(std::sync::Arc::clone(&cancel));
@@ -3765,8 +3731,11 @@ fn tray_host_present() -> bool {
     let class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
     // Windows owns this class for Explorer's notification area.
     unsafe {
-        !windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(class.as_ptr(), std::ptr::null())
-            .is_null()
+        !windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(
+            class.as_ptr(),
+            std::ptr::null(),
+        )
+        .is_null()
     }
 }
 

@@ -38,7 +38,10 @@ impl TeamsPage {
         let header = adw::HeaderBar::new();
         header.add_css_class("toolport-header");
         header.set_show_back_button(true);
-        let header_title = gtk::Label::builder().label("Sync").css_classes(["title"]).build();
+        let header_title = gtk::Label::builder()
+            .label("Sync")
+            .css_classes(["title"])
+            .build();
         header.set_title_widget(Some(&header_title));
         root.append(&header);
         let scroller = gtk::ScrolledWindow::builder()
@@ -52,9 +55,17 @@ impl TeamsPage {
         page.set_margin_start(20);
         page.set_margin_end(20);
         let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        let heading = gtk::Label::builder().label("Sync").halign(gtk::Align::Start).css_classes(["title-2"]).build();
+        let heading = gtk::Label::builder()
+            .label("Sync")
+            .halign(gtk::Align::Start)
+            .css_classes(["title-2"])
+            .build();
         title_row.append(&heading);
-        let plan_badge = gtk::Label::builder().label("Free: 1 person, 1 device").valign(gtk::Align::Center).css_classes(["toolport-badge", "success", "caption"]).build();
+        let plan_badge = gtk::Label::builder()
+            .label("Free: 1 person, 1 device")
+            .valign(gtk::Align::Center)
+            .css_classes(["toolport-badge", "success", "caption"])
+            .build();
         title_row.append(&plan_badge);
         page.append(&title_row);
         let intro = gtk::Label::builder().label("Set up once. Your servers follow you to every machine. Secret values and approvals stay on this machine.").halign(gtk::Align::Fill).xalign(0.0).wrap(true).css_classes(["toolport-muted"]).build();
@@ -76,7 +87,10 @@ impl TeamsPage {
             app: app.clone(),
             server_page,
             content,
-            header_title, heading, plan_badge, intro,
+            header_title,
+            heading,
+            plan_badge,
+            intro,
             feedback,
             busy: Rc::new(Cell::new(false)),
             pending: Rc::new(RefCell::new(None)),
@@ -201,8 +215,10 @@ impl TeamsPage {
 
     fn render(&self, registry: crate::registry::Registry) {
         let personal = registry.team.is_none() || crate::personal_sync::is_personal(&registry);
-        self.header_title.set_label(if personal { "Sync" } else { "Teams" });
-        self.heading.set_label(if personal { "Sync" } else { "Teams" });
+        self.header_title
+            .set_label(if personal { "Sync" } else { "Teams" });
+        self.heading
+            .set_label(if personal { "Sync" } else { "Teams" });
         self.plan_badge.set_visible(registry.team.is_none());
         self.intro.set_label(if personal { "Set up once. Your servers follow you to every machine. Secret values and approvals stay on this machine." } else { "One shared server set, governed by your team. Credentials stay on each machine." });
         let notice = self.sync_notice.borrow_mut().take();
@@ -1702,23 +1718,10 @@ mod tests {
 
     #[test]
     fn the_confirm_action_matches_what_the_share_will_do() {
-        let switch = selection(
-            "Linear",
-            "Already shared",
-            HandoffOutcome::Switched,
-            "switches",
-        );
+        let switch = selection("Linear", "Already shared", HandoffOutcome::Switched, "switches");
         let kept = selection("Linear", "Already shared", HandoffOutcome::Kept, "keeps");
-        let blocked = selection(
-            "Vercel",
-            "Already shared",
-            HandoffOutcome::Attention,
-            "needs setup",
-        );
-        assert_eq!(
-            share_action(&selection_preview(vec![switch.clone(), blocked.clone()])),
-            Some("Use Team copies")
-        );
+        let blocked = selection("Vercel", "Already shared", HandoffOutcome::Attention, "needs setup");
+        assert_eq!(share_action(&selection_preview(vec![switch.clone(), blocked.clone()])), Some("Use Team copies"));
         assert_eq!(share_action(&selection_preview(vec![kept, blocked])), None);
         let mut update = selection_preview(vec![switch]);
         update.changed = vec!["Linear".into()];
@@ -1768,11 +1771,7 @@ mod tests {
         }
         dialog.close();
 
-        let picker = share_choice_label(
-            "Linear",
-            None,
-            Some("Shared. The Team copy is in use in this profile."),
-        );
+        let picker = share_choice_label("Linear", None, Some("Shared. The Team copy is in use in this profile."));
         let mut text = String::new();
         collect(picker.upcast_ref(), &mut text);
         assert_eq!(text, "Linear\nShared. The Team copy is in use in this profile.\n");
