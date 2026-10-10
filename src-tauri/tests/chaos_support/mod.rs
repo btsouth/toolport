@@ -482,6 +482,15 @@ impl Client {
 
     /// Wait for the response to `id`, buffering any other in-flight responses.
     pub fn wait_for_id(&mut self, id: i64, timeout: Duration) -> Value {
+        self.wait_for_id_with_diagnostics(id, timeout, String::new)
+    }
+
+    pub fn wait_for_id_with_diagnostics(
+        &mut self,
+        id: i64,
+        timeout: Duration,
+        context: impl FnOnce() -> String,
+    ) -> Value {
         if let Some(message) = self.pending.remove(&id) {
             return message;
         }
@@ -490,7 +499,11 @@ impl Client {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let line = match self.lines.recv_timeout(remaining) {
                 Ok(line) => line,
-                Err(error) => panic!("no answer to id {id} ({error})\n{}", self.diagnostics()),
+                Err(error) => panic!(
+                    "no answer to id {id} ({error}); adapter pid={}, exit={:?}, pending={:?}, notifications={:?}\n{}\n{}",
+                    self.child.id(), self.child.try_wait(), self.pending.keys(), self.notes,
+                    self.diagnostics(), context()
+                ),
             };
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
                 // The adapter filters downstream noise; a non-JSON line here is

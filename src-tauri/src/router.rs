@@ -8981,10 +8981,17 @@ for line in sys.stdin:
                 if has_session { 3 } else { 1 },
                 "only invalid sessions initialize again"
             );
+            drop(router);
             stop.store(true, Ordering::Release);
             wire.join().unwrap();
         }
         drop(data);
+        // Calls queue audit records. Drain the writer and close its file handles
+        // before deleting the fixture, including records already in flight.
+        assert!(crate::telemetry::retire_dir_for_test(
+            &scratch,
+            Duration::from_secs(5)
+        ));
         std::fs::remove_dir_all(scratch).unwrap();
     }
 
