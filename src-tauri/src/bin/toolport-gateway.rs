@@ -18774,6 +18774,25 @@ fn activity_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Dropping the sender wakes the worker immediately on normal return. Process
+/// exits (including the private gateway pipe and shared idle watchdog) keep their
+/// existing behavior; no join waits on a sleeping maintenance thread.
+fn spawn_cache_maintenance(
+    interval: Duration,
+    mut tick: impl FnMut() + Send + 'static,
+) -> std::sync::mpsc::Sender<()> {
+    let (stop, stopped) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while matches!(
+            stopped.recv_timeout(interval),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            tick();
+        }
+    });
+    stop
+}
+
 /// Exit the daemon once nothing has been in flight for `grace`. An open connection
 /// is what a legacy adapter's listen stream, its subscriptions, and a call in
 /// progress all reduce to, and a modern adapter checks in well inside the grace,
@@ -18789,16 +18808,8 @@ fn spawn_daemon_idle_watchdog(
     grace: Duration,
 ) {
     let poll = Duration::from_millis(200).min(grace);
-    let mut cache_tick = Instant::now();
-    let mut was_idle = false;
     std::thread::spawn(move || loop {
         std::thread::sleep(poll);
-        if cache_tick.elapsed() >= Duration::from_secs(30) {
-            let idle = host.idle_for() >= Duration::from_secs(30);
-            conduit_lib::shaping::maintain_cache(idle && !was_idle);
-            was_idle = idle;
-            cache_tick = Instant::now();
-        }
         if inflight.load(Ordering::Relaxed) > 0 {
             continue;
         }
@@ -20845,6 +20856,31 @@ fn main() {
         env_profile: env_profile.clone(),
     };
 
+    let cache_host = Arc::clone(&state.host);
+    let mut was_idle = false;
+    let cache_interval = Duration::from_secs(30);
+    #[cfg(feature = "test-support")]
+    let probe =
+        std::env::var_os("TOOLPORT_TEST_CACHE_MAINTENANCE_PROBE").map(std::path::PathBuf::from);
+    #[cfg(feature = "test-support")]
+    let cache_interval = if probe.is_some() {
+        conduit_lib::shaping::seed_cache_maintenance_probe();
+        Duration::from_millis(10)
+    } else {
+        cache_interval
+    };
+    let _cache_maintenance = spawn_cache_maintenance(cache_interval, move || {
+        let idle = cache_host.idle_for() >= Duration::from_secs(30);
+        conduit_lib::shaping::maintain_cache(idle && !was_idle);
+        was_idle = idle;
+        #[cfg(feature = "test-support")]
+        if let Some(path) = &probe {
+            if conduit_lib::shaping::cache_maintenance_probe_complete() {
+                let _ = std::fs::write(path, "expired and trim consumed");
+            }
+        }
+    });
+
     // Native HTTP/OpenAPI transport: a first-class path for HTTP tool clients
     // (Open WebUI and any OpenAPI consumer) with no external bridge. Standalone,
     // so it replaces the stdio loop; the background build + registry watcher
@@ -21029,6 +21065,25 @@ mod tests {
     }
 
     use conduit_lib::approval::decide_via_broker;
+
+    #[test]
+    fn cache_maintenance_stops_when_runtime_returns() {
+        let (observed, ticks) = std::sync::mpsc::channel();
+        let stop = spawn_cache_maintenance(Duration::from_millis(1), move || {
+            let _ = observed.send(());
+        });
+        ticks
+            .recv_timeout(Duration::from_secs(5))
+            .expect("maintenance tick");
+        drop(stop);
+        // Drain any tick already in progress and wait for the worker's sender
+        // to disconnect. This proves shutdown rather than guessing with a sleep.
+        while ticks.recv_timeout(Duration::from_secs(5)).is_ok() {}
+        assert!(matches!(
+            ticks.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
 
     #[test]
     fn installer_preflight_requires_exact_standalone_arguments() {

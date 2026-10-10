@@ -31,9 +31,8 @@ const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_CACHE_ENTRIES: usize = 64;
 
 /// Cap on estimated retained bytes, including parsed JSON allocations. Evict
-/// oldest until a new body fits, or the
-/// cache is empty (then one over-cap body is kept rather than dropping the result
-/// the caller just produced).
+/// oldest until a new body fits. A single over-cap entry is not retained; its
+/// cursor uses the same unknown-or-expired response as an evicted entry.
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn resolve_budget(value: Option<&str>) -> (usize, Option<String>) {
@@ -93,7 +92,7 @@ fn sweep(store: &mut SessionStore<Cached>) {
     }
 }
 
-/// Called by the daemon's existing maintenance tick. Reads never extend the
+/// Called by every gateway runtime's background maintenance tick. Reads never extend the
 /// insertion-based TTL. Trim outside the cache lock and off the request path.
 pub fn maintain_cache(idle_transition: bool) {
     {
@@ -154,8 +153,7 @@ fn retained_size(body: &String, structured: Option<&Value>) -> usize {
 }
 
 /// Bound memory: evict oldest until the entry count and total bytes leave room for
-/// a `new_entry_size`-byte result (or the stash empties, keeping one over-cap
-/// result). Each entry's `size` is precomputed, so this sum is O(n) adds, not O(n)
+/// a `new_entry_size`-byte result. Each entry's `size` is precomputed, so this sum is O(n) adds, not O(n)
 /// JSON re-serializations, on every iteration.
 fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) {
     while !store.is_empty()
@@ -167,6 +165,49 @@ fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) {
         }
         TRIM_PENDING.store(true, Ordering::Relaxed);
     }
+}
+
+fn retain_in(store: &mut SessionStore<Cached>, cursor: &str, entry: Cached) -> bool {
+    if entry.size > MAX_CACHE_BYTES {
+        return false;
+    }
+    sweep(store);
+    evict_to_fit(store, entry.size);
+    store.insert(cursor, entry);
+    true
+}
+
+fn retain(cursor: &str, entry: Cached) {
+    let size = entry.size;
+    let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
+    retain_in(&mut store, cursor, entry);
+    if size >= 1024 * 1024 {
+        TRIM_PENDING.store(true, Ordering::Relaxed);
+    }
+}
+
+// Process conformance tests seed an already expired entry, then observe a tick
+// without fetching or inserting again. These hooks are absent from shipped builds.
+#[cfg(feature = "test-support")]
+pub fn seed_cache_maintenance_probe() {
+    let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
+    *store = SessionStore::new(Duration::ZERO, MAX_CACHE_ENTRIES);
+    store.insert(
+        "maintenance-probe",
+        Cached {
+            server: None,
+            body: "x".repeat(1024 * 1024),
+            structured: None,
+            size: 1024 * 1024,
+            owner: None,
+        },
+    );
+}
+
+#[cfg(feature = "test-support")]
+pub fn cache_maintenance_probe_complete() -> bool {
+    cache().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        && !TRIM_PENDING.load(Ordering::Relaxed)
 }
 
 /// Concatenate the model-facing text of an MCP tool result's content blocks, then
@@ -425,26 +466,21 @@ pub fn shape_result_preserving_prefix(
         return false;
     }
 
-    // Only now stash the full body: the cursor in the marker above is live from
-    // here on.
-    {
-        let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
-        sweep(&mut store);
-        evict_to_fit(&mut store, new_entry_size);
-        store.insert(
-            &cursor,
-            Cached {
-                server: result
-                    .pointer("/_meta/app.toolport~1provenance/server")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                body,
-                structured,
-                size: new_entry_size,
-                owner: owner.map(str::to_string),
-            },
-        );
-    }
+    // Admission affects retention only; the first reply and its marker stay the
+    // same even when the full result exceeds the cache's memory ceiling.
+    retain(
+        &cursor,
+        Cached {
+            server: result
+                .pointer("/_meta/app.toolport~1provenance/server")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            body,
+            structured,
+            size: new_entry_size,
+            owner: owner.map(str::to_string),
+        },
+    );
 
     *result = shaped;
     if size >= 1024 * 1024 {
@@ -460,10 +496,7 @@ pub fn shape_result_preserving_prefix(
 pub fn stash_payload(body: String, structured: Option<Value>, owner: Option<&str>) -> String {
     let cursor = next_cursor();
     let size = retained_size(&body, structured.as_ref());
-    let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
-    sweep(&mut store);
-    evict_to_fit(&mut store, size);
-    store.insert(
+    retain(
         &cursor,
         Cached {
             server: None,
@@ -473,9 +506,7 @@ pub fn stash_payload(body: String, structured: Option<Value>, owner: Option<&str
             owner: owner.map(str::to_string),
         },
     );
-    if size >= 1024 * 1024 {
-        TRIM_PENDING.store(true, Ordering::Relaxed);
-    }
+
     cursor
 }
 
@@ -1151,33 +1182,35 @@ mod tests {
     }
 
     #[test]
-    fn cache_keeps_one_over_cap_body_rather_than_dropping_it() {
-        // Documented behaviour (see MAX_CACHE_BYTES): evict until it fits OR the
-        // cache is empty, so a single body larger than the cap is still retained
-        // rather than dropping the result the caller just produced.
-        let mut store: SessionStore<Cached> =
-            SessionStore::new(Duration::from_secs(900), MAX_CACHE_ENTRIES);
-        store.insert("stale", cached_entry(1024));
+    fn cache_rejects_over_cap_entries_without_evicting_live_results() {
+        let mut store = SessionStore::new(CACHE_TTL, MAX_CACHE_ENTRIES);
+        store.insert("live", cached_entry(1024));
+        assert!(!retain_in(
+            &mut store,
+            "oversize",
+            cached_entry(MAX_CACHE_BYTES + 1)
+        ));
+        assert!(store.get("oversize").is_none());
+        assert!(store.get("live").is_some());
+        assert!(retain_in(
+            &mut store,
+            "at-cap",
+            cached_entry(MAX_CACHE_BYTES)
+        ));
+        assert!(store.get("live").is_none());
+        assert_eq!(store.weight(|c| c.size), MAX_CACHE_BYTES);
+    }
 
-        evict_to_fit(&mut store, MAX_CACHE_BYTES + 1);
-        assert!(
-            store.is_empty(),
-            "everything older must be evicted to make room"
-        );
-
-        // Eviction stops at an empty cache, so the caller's own over-cap result is
-        // still inserted rather than discarded. It is over the cap by construction;
-        // the next oversized call is what evicts it.
-        store.insert("incoming", cached_entry(MAX_CACHE_BYTES + 1));
-        assert!(
-            store.get("incoming").is_some(),
-            "an over-cap body is kept, not dropped, when it is the only entry"
-        );
-        evict_to_fit(&mut store, 1);
-        assert!(
-            store.is_empty(),
-            "the retained over-cap entry must be evicted by the next arrival"
-        );
+    #[test]
+    fn over_cap_payload_cursor_uses_the_existing_rerun_error() {
+        // Reserved capacity exercises real admission without a huge text reply.
+        let cursor = stash_payload(String::with_capacity(MAX_CACHE_BYTES), None, None);
+        let reply = fetch_result(&cursor, 0, 1, None, None);
+        assert_eq!(reply["isError"], true);
+        assert!(reply["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown or expired"));
     }
 
     #[test]
