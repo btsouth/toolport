@@ -359,6 +359,9 @@ pub(crate) fn stop_for_purge(data_dir: &Path) -> Vec<crate::purge::Leftover> {
             if !process_exists(descriptor.pid) {
                 return Ok(());
             }
+            if !crate::gateway_publish::purge_process_owned(descriptor.pid) {
+                return Err("Could not verify this daemon belongs to your user and session".into());
+            }
             let identity = probe_identity(&descriptor)?;
             if identity.pid != descriptor.pid
                 || identity.compat != descriptor.compat

@@ -217,8 +217,26 @@ fn run_with(
         )
     })?;
     report.clients = disconnect()?;
-    if report.clients.iter().any(|client| client.error.is_some()) {
-        report.leftovers.push(Leftover { path: dir.display().to_string(), error: "Client restoration failed. All Toolport data and credentials were retained for recovery.".into() });
+    if report
+        .clients
+        .iter()
+        .any(|client| client.error.is_some() || !client.warnings.is_empty())
+    {
+        for client in &report.clients {
+            if let Some(error) = &client.error {
+                report.leftovers.push(Leftover {
+                    path: client.path.clone(),
+                    error: error.clone(),
+                });
+            }
+            if !client.warnings.is_empty() {
+                report.leftovers.push(Leftover {
+                    path: client.path.clone(),
+                    error: client.warnings.join("; "),
+                });
+            }
+        }
+        report.leftovers.push(Leftover { path: dir.display().to_string(), error: "Client restoration failed or retained an edited connection. All Toolport data and credentials were retained for recovery.".into() });
         return Ok(report);
     }
     report.leftovers.extend(stop(&dir));
@@ -538,5 +556,26 @@ mod tests {
         assert!(verify_data_ownership(&env.dir).is_err());
         crate::registry::save(&crate::registry::Registry::default()).unwrap();
         assert!(verify_data_ownership(&env.dir).is_ok());
+    }
+    #[test]
+    fn retained_edited_gateway_blocks_purge_even_without_a_disconnect_error() {
+        let _env = crate::registry::DataDirTestEnv::new("purge_retained_gateway");
+        let report = run_with(
+            || {
+                Ok(vec![crate::clients::DisconnectResult {
+                    client_id: "fixture".into(),
+                    path: "/fixture/edited-client.json".into(),
+                    dry_run: false,
+                    error: None,
+                    warnings: vec!["kept your edited toolport entry".into()],
+                }])
+            },
+            |_| panic!("connection remains"),
+            || panic!("connection remains"),
+            |_| panic!("connection remains"),
+        )
+        .unwrap();
+        assert!(report.removed.is_empty());
+        assert_eq!(report.leftovers[0].path, "/fixture/edited-client.json");
     }
 }

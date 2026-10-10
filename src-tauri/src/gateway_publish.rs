@@ -1357,6 +1357,10 @@ pub fn reap_stale(extra_keep: &[PathBuf]) -> ReapReport {
     report
 }
 
+pub(crate) fn purge_process_owned(pid: u32) -> bool {
+    installer_same_user_session(pid) == Some(true)
+}
+
 /// Read-only blockers for explicit removal, scoped like the existing reaper.
 pub(crate) fn purge_blockers(data_dir: &Path) -> Vec<crate::purge::Leftover> {
     let processes = list_gateway_processes();

@@ -67,7 +67,8 @@ failure, and 2 means confirmation was required. Review the report before
 removing the app.
 
 Removal first restores and disconnects clients through the same path as step 1.
-A failed restoration retains recovery data. Active gateway sessions block
+A failed restoration or retained edited Toolport entry keeps recovery data.
+Resolve the reported client paths before retrying. Active gateway sessions block
 removal: close the listed sessions and retry. Toolport requests a graceful stop
 only from authenticated daemons for this data directory.
 
