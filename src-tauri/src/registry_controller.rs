@@ -168,6 +168,8 @@ pub struct ServerFields {
     pub args: Vec<String>,
     pub url: Option<String>,
     pub cwd: Option<String>,
+    /// "Use my shell environment" for a local server. `None` keeps the saved choice.
+    pub inherit_env: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -340,6 +342,7 @@ impl ServerFields {
                 self.command = None;
                 self.args.clear();
                 self.cwd = None;
+                self.inherit_env = self.inherit_env.map(|_| false);
             }
             _ => return Err("choose stdio, HTTP, or SSE transport".into()),
         }
@@ -362,7 +365,7 @@ fn entry_from_fields(fields: ServerFields) -> Result<ServerEntry, String> {
     let fields = fields.normalized()?;
     Ok(ServerEntry {
         enabled: false,
-        inherit_env: false,
+        inherit_env: fields.inherit_env.unwrap_or(false),
         id: String::new(),
         name: fields.name,
         transport: fields.transport,
@@ -659,6 +662,9 @@ pub fn apply_update_server_fields(
     server.args = fields.args;
     server.url = fields.url;
     server.cwd = fields.cwd;
+    if let Some(inherit_env) = fields.inherit_env {
+        server.inherit_env = inherit_env;
+    }
     Ok(())
 }
 
@@ -869,6 +875,7 @@ pub fn add_snippet_servers_inputs(
             args: server.args,
             url: server.url,
             cwd: None,
+            inherit_env: None,
         })?;
         let definition = serde_json::json!({"env": server.env.into_iter().map(|e| (e.key,e.value.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null))).collect::<serde_json::Map<_,_>>()});
         let choice = choices.get(&entry.name);
@@ -952,7 +959,7 @@ pub fn server_entry_for_probe(
             let fields = fields.normalized()?;
             Ok(ServerEntry {
                 enabled: false,
-                inherit_env: false,
+                inherit_env: fields.inherit_env.unwrap_or(false),
                 id: "native-connection-test".into(),
                 name: fields.name,
                 transport: fields.transport,
@@ -4181,6 +4188,7 @@ mod tests {
             args: vec!["-y".into(), "example-server".into()],
             url: (transport != "stdio").then(|| "https://example.com/mcp".into()),
             cwd: (transport == "stdio").then(|| " /tmp/project ".into()),
+            inherit_env: None,
         }
     }
 
@@ -4424,6 +4432,23 @@ mod tests {
     }
 
     #[test]
+    fn native_field_edit_sets_or_keeps_the_shell_environment_choice() {
+        let mut registry = Registry::default();
+        let mut existing = server("one");
+        existing.inherit_env = true;
+        registry.servers.push(existing);
+        apply_update_server_fields(&mut registry, "one", fields("One", "stdio")).unwrap();
+        assert!(registry.servers[0].inherit_env, "None keeps the saved choice");
+        let mut off = fields("One", "stdio");
+        off.inherit_env = Some(false);
+        apply_update_server_fields(&mut registry, "one", off).unwrap();
+        assert!(!registry.servers[0].inherit_env);
+        let mut on = fields("One", "stdio");
+        on.inherit_env = Some(true);
+        assert!(entry_from_fields(on).unwrap().inherit_env);
+    }
+
+    #[test]
     fn native_field_edit_keeps_or_clears_generated_binding_explicitly() {
         let mut registry = Registry::default();
         let mut existing = server("one");
@@ -4457,6 +4482,7 @@ mod tests {
             args: vec!["-y".into(), "pkg".into(), "<launch-input>".into()],
             url: None,
             cwd: None,
+            inherit_env: None,
         };
         apply_update_server_fields(&mut registry, "one", same.clone()).unwrap();
         assert_eq!(
@@ -4498,6 +4524,7 @@ mod tests {
                     args: Vec::new(),
                     url: Some("file:///tmp/not-an-mcp-server".into()),
                     cwd: None,
+                    inherit_env: None,
                 },
             )
         });

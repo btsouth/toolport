@@ -537,6 +537,7 @@ pub(super) struct ServerView {
     pub(super) launch: Option<crate::registry::LaunchConfig>,
     pub(super) url: Option<String>,
     pub(super) cwd: Option<String>,
+    pub(super) inherit_env: bool,
     pub(super) secret_keys: Vec<String>,
     pub(super) secret_references: std::collections::BTreeMap<String, String>,
     pub(super) client_credentials: Option<ClientCredentialsView>,
@@ -612,6 +613,7 @@ impl RegistrySnapshot {
                     launch: server.launch.clone(),
                     url: server.url.clone(),
                     cwd: server.cwd.clone(),
+                    inherit_env: server.inherit_env,
                     secret_references: server
                         .env
                         .iter()
@@ -1003,6 +1005,7 @@ mod tests {
                     launch: None,
                     url: None,
                     cwd: None,
+                    inherit_env: false,
                     secret_keys: vec!["TOKEN".into()],
                     secret_references: Default::default(),
                     client_credentials: None,
@@ -1022,6 +1025,7 @@ mod tests {
                     launch: None,
                     url: None,
                     cwd: None,
+                    inherit_env: false,
                     secret_keys: Vec::new(),
                     secret_references: Default::default(),
                     client_credentials: None,

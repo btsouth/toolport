@@ -8797,6 +8797,35 @@ fn open_server_editor_prefilled(
         .css_classes(["toolport-input"])
         .build();
     let cwd_row = editor_field("Working directory", &cwd);
+    let inherit_env = gtk::Switch::builder()
+        .active(server.as_ref().is_some_and(|server| server.inherit_env))
+        .valign(gtk::Align::Center)
+        .build();
+    let inherit_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    inherit_row.set_margin_top(6);
+    let inherit_copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    inherit_copy.set_hexpand(true);
+    let inherit_label = gtk::Label::builder()
+        .label("Use my shell environment")
+        .halign(gtk::Align::Start)
+        .css_classes(["toolport-field-label"])
+        .build();
+    inherit_copy.append(&inherit_label);
+    inherit_copy.append(
+        &gtk::Label::builder()
+            .label("Gives this server every variable from your shell, such as AWS, GitHub or kube settings. When off it gets only PATH, HOME and other basics, plus the variables you set.")
+            .halign(gtk::Align::Start)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["toolport-muted", "caption"])
+            .build(),
+    );
+    inherit_env.update_relation(&[gtk::accessible::Relation::LabelledBy(&[
+        inherit_label.upcast_ref()
+    ])]);
+    inherit_row.append(&inherit_copy);
+    inherit_row.append(&inherit_env);
+    cwd_row.append(&inherit_row);
     connection.append(&cwd_row);
 
     let url = gtk::Entry::builder()
@@ -8979,6 +9008,7 @@ fn open_server_editor_prefilled(
     let args_for_test = args.clone();
     let url_for_test = url.clone();
     let cwd_for_test = cwd.clone();
+    let inherit_env_for_test = inherit_env.clone();
     let launch_for_test = launch_entries.clone();
     let launch_definition_for_test = original_launch.clone();
     let original_command_for_test = original_command.clone();
@@ -8996,6 +9026,7 @@ fn open_server_editor_prefilled(
             &args_for_test,
             &url_for_test,
             &cwd_for_test,
+            &inherit_env_for_test,
         );
         let binding_changed =
             fields.command != original_command_for_test || fields.args != original_args_for_test;
@@ -9093,7 +9124,8 @@ fn open_server_editor_prefilled(
         save.set_sensitive(false);
         feedback.set_visible(false);
         let server_id = server_id.clone();
-        let fields = collect_server_fields(&name, &transport, &command, &args, &url, &cwd);
+        let fields =
+            collect_server_fields(&name, &transport, &command, &args, &url, &cwd, &inherit_env);
         let binding_changed =
             fields.command != original_command_for_save || fields.args != original_args_for_save;
         let launch_values = launch_for_save
@@ -9327,6 +9359,7 @@ fn collect_server_fields(
     args: &gtk::TextView,
     url: &gtk::Entry,
     cwd: &gtk::Entry,
+    inherit_env: &gtk::Switch,
 ) -> crate::registry_controller::ServerFields {
     crate::registry_controller::ServerFields {
         name: name.text().to_string(),
@@ -9351,6 +9384,7 @@ fn collect_server_fields(
             .collect(),
         url: Some(url.text().to_string()),
         cwd: Some(cwd.text().to_string()),
+        inherit_env: Some(inherit_env.is_active()),
     }
 }
 
@@ -10939,6 +10973,7 @@ mod tests {
             launch: None,
             url: None,
             cwd: None,
+            inherit_env: false,
             secret_keys: Vec::new(),
             secret_references: Default::default(),
             client_credentials: None,
