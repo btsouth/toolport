@@ -1,9 +1,8 @@
 //! Result-shaping: keep oversized tool results from blowing the model's context
-//! WITHOUT losing data. When a downstream tool returns a result larger than the
-//! byte budget, the full body is cached in-process and the model gets a truncated
-//! head plus a Toolport-stamped marker carrying a cursor. `toolport_fetch_result`
-//! pages through the cached full result. Lossless: nothing is dropped, only
-//! deferred, and the full data stays retrievable.
+//! within a byte budget. Retained bodies can be paged with `toolport_fetch_result`
+//! until expiry or eviction. Very large entries retain only text when that fits;
+//! structured projections are then unavailable. If even text exceeds the cache
+//! cap, the truncated reply asks for a narrower call and offers no cursor.
 //!
 //! This is the "other half" of the token story: lazy discovery trims tool
 //! DEFINITION bloat; this trims tool RESULT bloat (a 10k-row response that would
@@ -12,7 +11,7 @@
 
 use crate::session_store::SessionStore;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -26,13 +25,13 @@ pub const DEFAULT_BUDGET_BYTES: usize = 48 * 1024;
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// Cap on the number of cached shaped results. A burst of large tool calls would
-/// otherwise grow process memory without bound between lazy TTL sweeps. Oldest
+/// otherwise grow process memory without bound between TTL sweeps. Oldest
 /// entries (by insertion time) are evicted first.
 const MAX_CACHE_ENTRIES: usize = 64;
 
-/// Cap on total cached body bytes. Evict oldest until a new body fits, or the
-/// cache is empty (then one over-cap body is kept rather than dropping the result
-/// the caller just produced).
+/// Cap on estimated retained bytes, including parsed JSON allocations. Evict
+/// oldest until a new body fits. Over-cap entries fall back to text alone; if
+/// that still exceeds the cap, no cursor is offered.
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn resolve_budget(value: Option<&str>) -> (usize, Option<String>) {
@@ -62,9 +61,8 @@ struct Cached {
     server: Option<String>,
     body: String,
     structured: Option<Value>,
-    /// The entry's total serialized size (`body` + structured JSON), computed once at
-    /// insert. The eviction loop sums this across entries on every oversized call, so
-    /// caching it avoids re-serializing every structured payload on each iteration.
+    projections_unavailable: bool,
+    /// Estimated retained allocations, computed once at insertion.
     size: usize,
     /// The client the result belongs to (a registered HTTP client's label), or None
     /// for the single-tenant stdio process. Only this client may fetch it back.
@@ -85,14 +83,78 @@ fn next_cursor() -> String {
     format!("r{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
+static TRIM_PENDING: AtomicBool = AtomicBool::new(false);
+
 fn sweep(store: &mut SessionStore<Cached>) {
-    store.reap_expired();
+    let before = store.weight(|c| c.size);
+    if store.reap_expired() > 0 && before >= 1024 * 1024 {
+        TRIM_PENDING.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Called by every gateway runtime's background maintenance tick. Reads never
+/// extend the insertion-based TTL. Trim outside the cache lock and off the request path.
+pub fn maintain_cache(idle_transition: bool) {
+    {
+        let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
+        sweep(&mut store);
+    }
+    if TRIM_PENDING.swap(false, Ordering::Relaxed) || idle_transition {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        // SAFETY: glibc's allocator synchronizes trimming with other allocations.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+}
+
+// glibc chunks need alignment and a header; other allocators are conservatively
+// charged the same overhead. Capacity matters even when the buffer is short.
+fn allocation_size(capacity: usize) -> usize {
+    if capacity == 0 {
+        0
+    } else {
+        capacity.saturating_add(15) / 16 * 16 + 16
+    }
+}
+
+fn value_heap_size(value: &Value) -> usize {
+    match value {
+        Value::String(s) => allocation_size(s.capacity()),
+        Value::Array(a) => {
+            allocation_size(a.capacity() * std::mem::size_of::<Value>())
+                + a.iter().map(value_heap_size).sum::<usize>()
+        }
+        Value::Object(o) => {
+            // std's B-tree nodes reserve eleven slots, even for a tiny object.
+            // Non-root nodes have at least five keys. Charge the upper node count
+            // and internal-node edges, not just the occupied key/value slots.
+            let nodes = if o.len() < 11 {
+                usize::from(!o.is_empty())
+            } else {
+                (o.len() - 1) / 5 + 1
+            };
+            let node_bytes = 11 * (std::mem::size_of::<String>() + std::mem::size_of::<Value>())
+                + 16
+                + 12 * std::mem::size_of::<usize>();
+            nodes * allocation_size(node_bytes)
+                + o.iter()
+                    .map(|(key, value)| allocation_size(key.capacity()) + value_heap_size(value))
+                    .sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
+fn retained_size(body: &String, structured: Option<&Value>) -> usize {
+    std::mem::size_of::<Cached>()
+        + allocation_size(body.capacity())
+        + structured.map(value_heap_size).unwrap_or(0)
 }
 
 /// Bound memory: evict oldest until the entry count and total bytes leave room for
-/// a `new_entry_size`-byte result (or the stash empties, keeping one over-cap
-/// result). Each entry's `size` is precomputed, so this sum is O(n) adds, not O(n)
-/// JSON re-serializations, on every iteration.
+/// a `new_entry_size`-byte result. Each entry's `size` is precomputed, so this sum
+/// is O(n) adds, not O(n) JSON re-serializations, on every iteration.
 fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) {
     while !store.is_empty()
         && (store.len() >= MAX_CACHE_ENTRIES
@@ -101,7 +163,58 @@ fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) {
         if !store.remove_oldest() {
             break;
         }
+        TRIM_PENDING.store(true, Ordering::Relaxed);
     }
+}
+
+fn retain_in(store: &mut SessionStore<Cached>, cursor: &str, mut entry: Cached) -> bool {
+    if entry.size > MAX_CACHE_BYTES && entry.structured.is_some() {
+        entry.structured = None;
+        entry.projections_unavailable = true;
+        entry.size = retained_size(&entry.body, None);
+    }
+    if entry.size > MAX_CACHE_BYTES {
+        return false;
+    }
+    sweep(store);
+    evict_to_fit(store, entry.size);
+    store.insert(cursor, entry);
+    true
+}
+
+fn retain(cursor: &str, entry: Cached) -> bool {
+    let size = entry.size;
+    let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
+    let retained = retain_in(&mut store, cursor, entry);
+    if size >= 1024 * 1024 {
+        TRIM_PENDING.store(true, Ordering::Relaxed);
+    }
+    retained
+}
+
+// Process conformance tests seed an already expired entry, then observe a tick
+// without fetching or inserting again. These hooks are absent from shipped builds.
+#[cfg(feature = "test-support")]
+pub fn seed_cache_maintenance_probe() {
+    let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
+    *store = SessionStore::new(Duration::ZERO, MAX_CACHE_ENTRIES);
+    store.insert(
+        "maintenance-probe",
+        Cached {
+            server: None,
+            body: "x".repeat(1024 * 1024),
+            structured: None,
+            projections_unavailable: false,
+            size: 1024 * 1024,
+            owner: None,
+        },
+    );
+}
+
+#[cfg(feature = "test-support")]
+pub fn cache_maintenance_probe_complete() -> bool {
+    cache().lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        && !TRIM_PENDING.load(Ordering::Relaxed)
 }
 
 /// Concatenate the model-facing text of an MCP tool result's content blocks, then
@@ -203,10 +316,10 @@ fn is_text_representable(result: &Value) -> bool {
     }
 }
 
-/// If `result` serializes to more than `budget` bytes, cache its full body, replace
-/// it with a truncated head + a stamped cursor marker, and return `true` (shaped).
-/// A `budget` of 0 disables shaping. Lossless: the full body stays fetchable via
-/// [`fetch_result`].
+/// If `result` serializes to more than `budget` bytes, attempt to retain its body,
+/// replace it with a truncated head and retention notice, and return `true` (shaped).
+/// A `budget` of 0 disables shaping. The full body stays fetchable via
+/// [`fetch_result`] while retained within the memory cap and insertion TTL.
 pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> bool {
     shape_result_preserving_prefix(result, budget, owner, 0)
 }
@@ -244,10 +357,8 @@ pub fn shape_result_preserving_prefix(
         return false;
     }
 
-    // Only shape what we can represent losslessly as a text head. If the result has
-    // non-text blocks, or its size is dominated by non-body envelope (the text
-    // projection captures under half the bytes), shaping would drop data and its
-    // "nothing was lost" claim would be false. Pass those through untouched.
+    // Only shape text-representable results. Pass through non-text blocks and
+    // results dominated by envelope fields that the text body cannot capture.
     let (body, source_bytes) = extract_body(result);
     if !is_text_representable(result) || source_bytes < size / 2 {
         return false;
@@ -295,7 +406,23 @@ pub fn shape_result_preserving_prefix(
         .unwrap_or(false);
 
     let cursor = next_cursor();
-    let new_entry_size = body.len() + structured.as_ref().map(value_size).unwrap_or(0);
+    let new_entry_size = retained_size(&body, structured.as_ref());
+
+    let body_bytes = body.len();
+    let retained = retain(
+        &cursor,
+        Cached {
+            server: result
+                .pointer("/_meta/app.toolport~1provenance/server")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            body,
+            structured,
+            projections_unavailable: false,
+            size: new_entry_size,
+            owner: owner.map(str::to_string),
+        },
+    );
 
     // Build the shaped result for a given head, then measure it. The marker's own
     // length varies with the head length it reports, and the preserved envelope is
@@ -303,7 +430,8 @@ pub fn shape_result_preserving_prefix(
     // to measure the finished value rather than predict it.
     let build = |head: &str| -> Value {
         let head_chars = head.chars().count();
-        let marker = format!(
+        let marker = if retained {
+            format!(
             "\n\n[Toolport shaped this result: ~{} KB exceeds {} KB budget. Showing first {} of {} \
              characters. Continue with toolport_fetch_result {{\"cursor\":\"{}\",\"offset\":{}}}. \
              If the cursor expired, re-run the original tool call.]",
@@ -313,9 +441,12 @@ pub fn shape_result_preserving_prefix(
             total,
             cursor,
             head_chars
-        );
+        )
+        } else {
+            not_retained_notice(body_bytes)
+        };
         // Shaping deliberately rewrites `content` and stashes `structuredContent`
-        // in the cache (both retrievable via the cursor). Every other top-level
+        // in the cache when admitted. Every other top-level
         // field belongs to the downstream server, not to us: `_meta`, and whatever
         // a future revision or extension adds. Carry them across so shaping stays a
         // truncation of the body rather than a rewrite of the envelope (SOU-444).
@@ -347,65 +478,60 @@ pub fn shape_result_preserving_prefix(
         head_byte_limit = head_byte_limit
             .saturating_sub(overage.max(1))
             .max(min_head_bytes);
-        head = head_within_bytes(&body, head_byte_limit).to_string();
+        head = head_within_bytes(&head, head_byte_limit).to_string();
         shaped = build(&head);
     }
 
     // An empty head that still overflows means the marker and envelope alone
     // exceed the budget, so no truncation can honour the contract. Returning
     // `true` there would be the same false claim the head floor used to make.
-    // Bail BEFORE caching, so a result we decline to shape leaves no orphaned
-    // cursor entry behind.
+    // Remove any admitted entry when we decline to shape.
     if serde_json::to_string(&shaped).map(|s| s.len()).unwrap_or(0) > budget {
+        cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&cursor);
         return false;
     }
 
-    // Only now stash the full body: the cursor in the marker above is live from
-    // here on.
-    {
-        let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
-        sweep(&mut store);
-        evict_to_fit(&mut store, new_entry_size);
-        store.insert(
-            &cursor,
-            Cached {
-                server: result
-                    .pointer("/_meta/app.toolport~1provenance/server")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                body,
-                structured,
-                size: new_entry_size,
-                owner: owner.map(str::to_string),
-            },
-        );
-    }
-
     *result = shaped;
+    if size >= 1024 * 1024 {
+        TRIM_PENDING.store(true, Ordering::Relaxed);
+    }
     true
 }
 
-/// Stash a Toolport-authored payload and return a cursor readable through
+fn not_retained_notice(body_bytes: usize) -> String {
+    format!(
+        "\n\n[Toolport: full result ({:.1} MB) was too large to keep for paging. Re-run the tool with narrower arguments.]",
+        body_bytes as f64 / 1_000_000.0
+    )
+}
+
+/// Stash a Toolport-authored payload and return an admitted cursor readable through
 /// `toolport_fetch_result`, with the same owner scoping, TTL, and bounds as shaped
 /// results. This lets a small marker in a tool result point at bulkier material
-/// without inflating the result it rides on.
-pub fn stash_payload(body: String, structured: Option<Value>, owner: Option<&str>) -> String {
+/// without inflating the result it rides on. `None` means the caller must report
+/// that paging is unavailable instead of advertising a fetch marker.
+pub fn stash_payload(
+    body: String,
+    structured: Option<Value>,
+    owner: Option<&str>,
+) -> Option<String> {
     let cursor = next_cursor();
-    let size = body.len() + structured.as_ref().map(value_size).unwrap_or(0);
-    let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
-    sweep(&mut store);
-    evict_to_fit(&mut store, size);
-    store.insert(
+    let size = retained_size(&body, structured.as_ref());
+    let retained = retain(
         &cursor,
         Cached {
             server: None,
             body,
             structured,
+            projections_unavailable: false,
             size,
             owner: owner.map(str::to_string),
         },
     );
-    cursor
+    retained.then_some(cursor)
 }
 
 /// Return the next slice of a cached shaped result, by cursor + character offset.
@@ -442,7 +568,11 @@ pub fn fetch_result(
             Some(value) => value,
             None => {
                 return text_result(
-                    "[Toolport: this cached result has no structuredContent.]".to_string(),
+                    if c.projections_unavailable {
+                        "[Toolport: projections aren't available for this very large result. Page the text or narrow the call.]"
+                    } else {
+                        "[Toolport: this cached result has no structuredContent.]"
+                    }.to_string(),
                     true,
                 );
             }
@@ -558,7 +688,7 @@ mod tests {
             value_size(&result) <= 2048,
             "notice must fit within the original budget"
         );
-        let cursor = stash_payload("Toolport-owned data".into(), None, None);
+        let cursor = stash_payload("Toolport-owned data".into(), None, None).unwrap();
         let fetched = fetch_result(&cursor, 0, 100, None, None);
         assert!(fetched.get("_meta").is_none());
     }
@@ -1034,6 +1164,7 @@ mod tests {
             server: None,
             body: String::new(),
             structured: None,
+            projections_unavailable: false,
             size,
             owner: None,
         }
@@ -1080,37 +1211,117 @@ mod tests {
     }
 
     #[test]
-    fn cache_keeps_one_over_cap_body_rather_than_dropping_it() {
-        // Documented behaviour (see MAX_CACHE_BYTES): evict until it fits OR the
-        // cache is empty, so a single body larger than the cap is still retained
-        // rather than dropping the result the caller just produced.
-        let mut store: SessionStore<Cached> =
-            SessionStore::new(Duration::from_secs(900), MAX_CACHE_ENTRIES);
-        store.insert("stale", cached_entry(1024));
+    fn cache_rejects_over_cap_entries_without_evicting_live_results() {
+        let mut store = SessionStore::new(CACHE_TTL, MAX_CACHE_ENTRIES);
+        store.insert("live", cached_entry(1024));
+        assert!(!retain_in(
+            &mut store,
+            "oversize",
+            cached_entry(MAX_CACHE_BYTES + 1)
+        ));
+        assert!(store.get("oversize").is_none());
+        assert!(store.get("live").is_some());
+        assert!(retain_in(
+            &mut store,
+            "at-cap",
+            cached_entry(MAX_CACHE_BYTES)
+        ));
+        assert!(store.get("live").is_none());
+        assert_eq!(store.weight(|c| c.size), MAX_CACHE_BYTES);
+    }
 
-        evict_to_fit(&mut store, MAX_CACHE_BYTES + 1);
-        assert!(
-            store.is_empty(),
-            "everything older must be evicted to make room"
-        );
+    #[test]
+    fn over_cap_payload_reports_no_cursor() {
+        assert!(stash_payload(String::with_capacity(MAX_CACHE_BYTES), None, None).is_none());
+    }
 
-        // Eviction stops at an empty cache, so the caller's own over-cap result is
-        // still inserted rather than discarded. It is over the cap by construction;
-        // the next oversized call is what evicts it.
-        store.insert("incoming", cached_entry(MAX_CACHE_BYTES + 1));
-        assert!(
-            store.get("incoming").is_some(),
-            "an over-cap body is kept, not dropped, when it is the only entry"
+    #[test]
+    fn over_cap_stash_retains_text_without_structured_projections() {
+        let structured = Value::String(String::with_capacity(MAX_CACHE_BYTES));
+        let cursor = stash_payload("retained text".into(), Some(structured), None).unwrap();
+        assert_eq!(
+            fetch_result(&cursor, 0, 100, None, None),
+            text_result(
+                "retained text\n\n[Toolport: end of result (13 characters).]".into(),
+                false
+            )
         );
-        evict_to_fit(&mut store, 1);
-        assert!(
-            store.is_empty(),
-            "the retained over-cap entry must be evicted by the next arrival"
+        assert_eq!(fetch_result(&cursor, 0, 100, None, Some("")), text_result("[Toolport: projections aren't available for this very large result. Page the text or narrow the call.]".into(), true));
+    }
+
+    #[test]
+    fn over_cap_shaping_reports_unavailable_paging_without_a_cursor() {
+        let mut result = json!({
+            "content": [{"type": "text", "text": "x".repeat(MAX_CACHE_BYTES)}],
+            "isError": false,
+            "_meta": {"fixture": true},
+        });
+        assert!(shape_result(&mut result, 2048, None));
+        assert!(value_size(&result) <= 2048);
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["_meta"]["fixture"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("xxx"));
+        assert!(text.ends_with("[Toolport: full result (67.1 MB) was too large to keep for paging. Re-run the tool with narrower arguments.]"));
+        assert!(!text.contains("cursor"));
+        assert!(!text.contains("toolport_fetch_result"));
+        assert!(not_retained_notice(MAX_CACHE_BYTES).len() < 128);
+    }
+
+    #[test]
+    fn over_cap_tree_retains_text_pages_but_refuses_projections() {
+        let structured =
+            json!({"rows": (0..100_000).map(|i| json!({"id": i, "ok": true})).collect::<Vec<_>>()});
+        let text = structured.to_string();
+        assert!(retained_size(&text, Some(&structured)) > MAX_CACHE_BYTES);
+        assert!(retained_size(&text, None) < MAX_CACHE_BYTES);
+        let mut result = json!({"structuredContent": structured});
+        assert!(shape_result(&mut result, 2048, Some("alice")));
+        let cursor = cursor_of(&result);
+        let page = fetch_result(&cursor, text.len() - 100, 100, Some("alice"), None);
+        assert_eq!(
+            page,
+            text_result(
+                format!(
+                    "{}\n\n[Toolport: end of result ({} characters).]",
+                    &text[text.len() - 100..],
+                    text.len()
+                ),
+                false
+            )
+        );
+        let projection = fetch_result(&cursor, 0, 100, Some("alice"), Some("rows.0"));
+        assert_eq!(projection, text_result("[Toolport: projections aren't available for this very large result. Page the text or narrow the call.]".into(), true));
+        assert_eq!(
+            fetch_result(&cursor, 0, 100, Some("bob"), Some("rows.0"))["isError"],
+            true
+        );
+        let store = cache().lock().unwrap_or_else(|e| e.into_inner());
+        let entry = store.get(&cursor).unwrap();
+        assert!(entry.structured.is_none());
+        assert!(entry.size <= MAX_CACHE_BYTES);
+    }
+
+    #[test]
+    fn normal_first_reply_and_pages_preserve_wire_bytes() {
+        let mut result = big_text_result(10_000);
+        assert!(shape_result(&mut result, 2048, None));
+        let cursor = cursor_of(&result);
+        let expected = text_result(format!("{}\n\n[Toolport shaped this result: ~9 KB exceeds 2 KB budget. Showing first 1536 of 10000 characters. Continue with toolport_fetch_result {{\"cursor\":\"{}\",\"offset\":1536}}. If the cursor expired, re-run the original tool call.]", "x".repeat(1536), cursor), false);
+        assert_eq!(
+            serde_json::to_vec(&result).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        let page = fetch_result(&cursor, 1536, 100, None, None);
+        let expected = text_result(format!("{}\n\n[Toolport: characters 1536..1636 of 10000. 8364 remain, call toolport_fetch_result with offset=1636 for the next slice.]", "x".repeat(100)), false);
+        assert_eq!(
+            serde_json::to_vec(&page).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
         );
     }
 
     #[test]
-    fn cached_size_records_body_plus_structured_bytes() {
+    fn cached_size_records_retained_allocations() {
         // The eviction loop trusts `Cached.size` instead of re-serializing, so a
         // size recorded as 0 (or body-only) would silently disable the byte cap.
         let structured = json!({ "rows": ["y".repeat(3_000)] });
@@ -1128,10 +1339,63 @@ mod tests {
             .expect("the shaped result is cached under its cursor");
         assert_eq!(
             entry.size,
-            entry.body.len() + entry.structured.as_ref().map(value_size).unwrap_or(0),
+            retained_size(&entry.body, entry.structured.as_ref()),
             "recorded size must cover the body and the stashed structuredContent"
         );
         assert!(entry.size >= 8_000, "recorded size was {}", entry.size);
+    }
+
+    #[test]
+    fn tiny_objects_charge_the_reserved_btree_node() {
+        let value = json!({"a": 1});
+        assert!(
+            value_heap_size(&value)
+                >= 11 * (std::mem::size_of::<String>() + std::mem::size_of::<Value>())
+        );
+        let empty = json!({});
+        assert_eq!(value_heap_size(&empty), 0);
+    }
+
+    #[test]
+    fn small_json_members_charge_tree_allocations() {
+        let structured =
+            json!({"rows": (0..1000).map(|_| json!({"a": 1, "b": 2})).collect::<Vec<_>>()});
+        let size = retained_size(&String::new(), Some(&structured));
+        assert!(size > value_size(&structured) * 5);
+        let mut store = SessionStore::new(CACHE_TTL, MAX_CACHE_ENTRIES);
+        store.insert("first", cached_entry(MAX_CACHE_BYTES - size + 1));
+        evict_to_fit(&mut store, size);
+        assert!(store.is_empty(), "parsed allocations must trigger eviction");
+    }
+
+    #[test]
+    fn retained_capacity_triggers_the_byte_cap() {
+        let mut body = String::with_capacity(4096);
+        body.push_str("short text");
+        let size = retained_size(&body, None);
+        assert!(
+            size >= 4096,
+            "retained capacity, not text length, must be charged"
+        );
+        let mut store = SessionStore::new(CACHE_TTL, MAX_CACHE_ENTRIES);
+        store.insert("oldest", cached_entry(MAX_CACHE_BYTES - 4096));
+        evict_to_fit(&mut store, size);
+        assert!(
+            store.is_empty(),
+            "the retained buffer must trigger eviction"
+        );
+    }
+
+    #[test]
+    fn sweep_releases_expired_results_without_a_fetch() {
+        let mut store = SessionStore::new(Duration::ZERO, MAX_CACHE_ENTRIES);
+        store.insert("expired", cached_entry(1024 * 1024));
+        sweep(&mut store);
+        assert!(store.is_empty());
+        let mut live = SessionStore::new(CACHE_TTL, MAX_CACHE_ENTRIES);
+        live.insert("live", cached_entry(1));
+        sweep(&mut live);
+        assert!(live.get("live").is_some());
     }
 
     #[test]
