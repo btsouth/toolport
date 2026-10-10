@@ -774,6 +774,32 @@ describe("ActivityView security drift dismissals", () => {
     expect(screen.getByText(/1 tool is blocked/)).toBeInTheDocument();
   });
 
+  it("keeps older fingerprint-less records in one expandable history summary", async () => {
+    localStorage.clear();
+    getSecurityEvents.mockResolvedValue([
+      {
+        ...warnEvent(1_700_000_000_000),
+        tool: "cloudflare__update",
+        server: "cloudflare",
+      },
+      ...Array.from({ length: 1500 }, (_, i) => ({
+        ...warnEvent(1_600_000_000_000),
+        tool: `old__read${i}`,
+        server: "old",
+        historical: true,
+      })),
+    ]);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(screen.getByText(/1500 older tool-change records/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /cloudflare: 1 tool changed/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/1500 older tool-change records/).closest("details"),
+    ).not.toHaveAttribute("open");
+  });
+
   it("accepts a server update larger than the old dismissal limit", async () => {
     localStorage.clear();
     const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });

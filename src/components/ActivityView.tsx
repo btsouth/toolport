@@ -1924,7 +1924,12 @@ export function ActivityView({
     e.type !== "tool_poison_flag" &&
     e.type !== "result_injection" &&
     e.type !== "result_injection_blocked";
-  const toolChanges = liveSecurity.filter((e) => e.type === "tool_drift");
+  const toolChanges = liveSecurity.filter(
+    (e) => e.type === "tool_drift" && !e.historical,
+  );
+  const olderToolChanges = liveSecurity.filter(
+    (e) => e.type === "tool_drift" && e.historical,
+  );
   const highSecurity = liveSecurity.filter(
     (e) => e.type !== "tool_drift" && eventSeverity(e) === "high" && !isNewTool(e),
   );
@@ -1953,6 +1958,19 @@ export function ActivityView({
           registry={registry}
           onAccept={dismissAllSecurity}
         />
+      ) : null}
+      {olderToolChanges.length > 0 ? (
+        <details className="mb-4 rounded-lg border border-border p-4">
+          <summary className="cursor-pointer text-sm">
+            {olderToolChanges.length} older tool-change records. Open history to review
+            them.
+          </summary>
+          <ToolChanges
+            events={olderToolChanges}
+            registry={registry}
+            onAccept={dismissAllSecurity}
+          />
+        </details>
       ) : null}
       {highSecurity.length > 0 ? (
         <SecurityNotices events={highSecurity} onDismiss={dismissSecurity} />

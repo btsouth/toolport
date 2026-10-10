@@ -3598,6 +3598,9 @@ impl ActivityPage {
             ));
             return;
         }
+        let (older, live): (Vec<_>, Vec<_>) = live
+            .into_iter()
+            .partition(|event| event["historical"] == true);
         self.set_security_status(&live);
         let groups = crate::integrity::group_tool_changes(&live);
         self.security_expander
@@ -3609,6 +3612,20 @@ impl ActivityPage {
         for group in groups {
             self.security_list
                 .append(&tool_change_group_card(&group, self.clone()));
+        }
+        if !older.is_empty() {
+            let history = gtk::Expander::builder()
+                .label(format!(
+                    "{} older tool-change records. Open history to review them.",
+                    older.len()
+                ))
+                .build();
+            let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            for group in crate::integrity::group_tool_changes(&older) {
+                rows.append(&tool_change_group_card(&group, self.clone()));
+            }
+            history.set_child(Some(&rows));
+            self.security_list.append(&history);
         }
         for (event, count) in crate::integrity::collapse_security_by_identity(
             &live

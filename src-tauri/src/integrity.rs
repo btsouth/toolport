@@ -3966,7 +3966,23 @@ fn review_events_uncached(limit: usize) -> std::io::Result<Vec<Value>> {
         }
     }
     attach_drift_poison_signatures(&mut events);
+    // Preview.6 showed 50 recent records in React. Reading the full retention
+    // window for complete refreshes must not turn older, fingerprint-less history
+    // into a new wall of findings. Keep every blocked or unverifiable block visible.
+    mark_older_drift_history(&mut events);
     Ok(events)
+}
+
+fn mark_older_drift_history(events: &mut [Value]) {
+    for event in events.iter_mut().skip(50) {
+        if event["type"] == "tool_drift"
+            && event["new_fp"].as_str().is_none()
+            && event["blocked"] == false
+            && event.get("signatures").is_none()
+        {
+            event["historical"] = json!(true);
+        }
+    }
 }
 
 /// Preserve poison findings on the drift row even when a shell hides or dismisses
@@ -4531,7 +4547,10 @@ mod tests {
             reg.profiles.push(crate::registry::Profile {
                 id: id.into(),
                 name: id.into(),
-                ..Default::default()
+                enabled_server_ids: vec![],
+                tool_scope: Default::default(),
+                instructions: None,
+                unknown_fields: Default::default(),
             });
         }
         crate::registry::save(&reg).unwrap();
@@ -4568,6 +4587,29 @@ mod tests {
             .unwrap()
             .contains("srv__update"));
         assert!(quarantined(Some("work")).unwrap().contains("srv__update"));
+    }
+
+    #[test]
+    fn older_history_is_compact_without_hiding_current_or_blocked_findings() {
+        let old = json!({"type":"tool_drift", "blocked":false});
+        let mut events = vec![old.clone(); 55];
+        events.push(json!({"type":"tool_drift", "new_fp":"v2:current", "blocked":false}));
+        events.push(json!({"type":"tool_drift", "blocked":true}));
+        events.push(json!({"type":"tool_drift", "blocked":null}));
+        events.push(json!({"type":"tool_poison_flag", "blocked":false}));
+        events.push(
+            json!({"type":"tool_drift", "blocked":false, "signatures":["instruction_override"]}),
+        );
+        mark_older_drift_history(&mut events);
+        assert!(events[..50]
+            .iter()
+            .all(|event| event.get("historical").is_none()));
+        assert!(events[50..55]
+            .iter()
+            .all(|event| event["historical"] == true));
+        assert!(events[55..]
+            .iter()
+            .all(|event| event.get("historical").is_none()));
     }
 
     #[test]

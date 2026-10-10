@@ -62,6 +62,8 @@ export interface SecurityEvent {
   change: string;
   changed_fields?: string[];
   new_fp?: string;
+  /** Older unblocked records without a captured fingerprint, shown in history. */
+  historical?: boolean;
   parameters?: { added: string[]; removed: string[]; changed: string[] };
   /** Current quarantine status; absent/null means unavailable. */
   blocked?: boolean | null;
