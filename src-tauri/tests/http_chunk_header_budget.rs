@@ -131,7 +131,7 @@ fn http_chunk_headers_stay_within_allocation_budget_and_next_call_works() {
             let sent = worker.join().unwrap();
             eprintln!("{kind} metadata={metadata}: largest allocation={largest}, sent={sent}, error={error}");
             if !rejected
-                || largest > 16 * 1024 * 1024
+                || largest > 1024 * 1024
                 || !error.to_string().contains(if metadata == "fields" {
                     "too many header fields"
                 } else if metadata == "header" {
