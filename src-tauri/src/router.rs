@@ -1520,7 +1520,9 @@ fn client_safe_error(error: &str) -> String {
             .collect();
         (!code.is_empty()).then_some(code)
     };
-    let summary = if let Some(code) = code_after("http ") {
+    let summary = if lower.contains("blocked: private or local address") {
+        "blocked: private or local address".to_string()
+    } else if let Some(code) = code_after("http ") {
         format!("the server answered HTTP {code}")
     } else if lower.contains("exited") {
         match code_after("status ") {
@@ -9903,6 +9905,10 @@ for line in sys.stdin:
             (
                 "write failed: Broken pipe (os error 32)",
                 "the server closed the connection",
+            ),
+            (
+                "io: blocked: private or local address (127.0.0.1)",
+                "blocked: private or local address",
             ),
             ("mock said: hunter2", "the connection failed"),
         ] {

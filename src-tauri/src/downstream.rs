@@ -1640,6 +1640,11 @@ fn record_shared_rate_limit(
 /// Post-send I/O errors (e.g. a read timeout after the server got the request)
 /// are deliberately excluded, since the call may already have run.
 fn is_retryable_transport(error: &ureq::Error) -> bool {
+    let cause = crate::http_client::connect_error(error).unwrap_or(error);
+    // A resolver policy denial is permanent, even though no request was sent.
+    if matches!(cause, ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied) {
+        return false;
+    }
     if crate::http_client::connect_error(error).is_some() {
         return true;
     }
@@ -1684,6 +1689,9 @@ fn http_read_error(error: std::io::Error) -> TransportError {
 fn http_transport_io_error(error: ureq::Error) -> TransportError {
     if http_metadata_rejected(&error) {
         return http_metadata_error(&error, false);
+    }
+    if matches!(&error, ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied) {
+        return TransportError::Fatal(error.to_string());
     }
     match error {
         ureq::Error::Timeout(_) => http_read_error(std::io::Error::new(
@@ -5809,13 +5817,13 @@ fn screen_resolved_addrs(
         if crate::oauth::ip_is_link_local(&ip) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("SSRF guard: refusing link-local / cloud-metadata address {ip}"),
+                format!("blocked: private or local address (link-local / cloud-metadata {ip})"),
             ));
         }
         if block_private && crate::oauth::ip_is_private(&ip) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("SSRF guard: refusing private / loopback address {ip}"),
+                format!("blocked: private or local address ({ip})"),
             ));
         }
     }
@@ -9707,6 +9715,33 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn resolver_policy_denials_are_fatal_without_transport_retry() {
+        for (url, block_private) in [
+            ("http://127.0.0.1:9/", true),
+            ("http://[::1]:9/", true),
+            ("http://169.254.169.254/", false),
+        ] {
+            let error =
+                super::guarded_agent_with_timeout(block_private, std::time::Duration::from_secs(1))
+                    .get(url)
+                    .call()
+                    .unwrap_err();
+            assert!(!super::is_retryable_transport(&error));
+            let error = super::http_transport_io_error(error);
+            assert!(matches!(error, TransportError::Fatal(_)), "{error}");
+            assert!(!error.is_health_failure());
+            assert!(error
+                .to_string()
+                .contains("blocked: private or local address"));
+        }
+        let error = crate::http_client::mark_connect_failure(ureq::Error::Io(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        ));
+        assert!(!super::is_retryable_transport(&error));
+        assert!(super::is_retryable_transport(&ureq::Error::HostNotFound));
+    }
 
     #[test]
     fn classified_connect_preserves_auth_and_timeout_categories() {
