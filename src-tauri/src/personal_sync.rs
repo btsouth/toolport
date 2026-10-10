@@ -680,6 +680,7 @@ pub fn apply(
             reg.servers.retain(|s| s.id != id);
             for p in &mut reg.profiles {
                 p.enabled_server_ids.retain(|s| s != &id);
+                p.tool_scope.remove(&id);
             }
         }
     }
