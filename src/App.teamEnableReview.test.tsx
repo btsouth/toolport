@@ -163,7 +163,7 @@ describe("team enable review dialog", () => {
     await dialog.findByText("Show full definition");
     expect(
       dialog
-        .getAllByText(/^Arguments:\s+1\. -y\s+2\. new-tool$/)
+        .getAllByText(/^Arguments changed:\s+2\. new-tool \(was old-tool\)$/)
         .find((node) => !node.closest("details")),
     ).toHaveClass("bg-amber-500/10");
     expect(dialog.getByText("Show full definition")).toBeInTheDocument();
