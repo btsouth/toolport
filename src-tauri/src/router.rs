@@ -1536,6 +1536,7 @@ fn client_safe_error(error: &str) -> String {
     } else if lower.contains("name resolution")
         || lower.contains("dns")
         || lower.contains("resolve")
+        || lower.contains("host not found")
     {
         "the server's address could not be resolved".to_string()
     } else if lower.contains("connection refused") {
@@ -9881,6 +9882,10 @@ for line in sys.stdin:
             ),
             (
                 "Temporary failure in name resolution",
+                "the server's address could not be resolved",
+            ),
+            (
+                "host not found",
                 "the server's address could not be resolved",
             ),
             (
