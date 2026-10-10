@@ -1411,11 +1411,11 @@ mod tests {
             let mut recreated = b.clone();
             let mut replacement = local(http("docs"));
             replacement.url = Some("https://changed.example/mcp".into());
+            let replacement_destination =
+                crate::local_auth::personal_credential_destination(&replacement);
             replacement.unknown_fields.insert(
                 "personalSyncCredentialDestination".into(),
-                json!(crate::local_auth::personal_credential_destination(
-                    &replacement
-                )),
+                json!(replacement_destination),
             );
             recreated.servers = vec![replacement];
             assert_eq!(
