@@ -6985,8 +6985,11 @@ fn cleanup_legacy_gateway_copies(current: &Path, dir: &Path, references: Option<
             crate::gateway_publish::paths_equal(r, &path)
                 || (!r.is_absolute() && r.file_name() == path.file_name())
         });
-        let result = if referenced {
-            // Keep cached/customized paths usable without leaving 1.x code behind.
+        let plain = matches!(name.to_str(), Some("toolport-gateway" | "conduit-gateway"));
+        let keep = referenced || plain;
+        let result = if keep {
+            // Scripts, service units and unsupported clients may use the plain path.
+            // Keep it and known references usable without leaving 1.x code behind.
             refresh_legacy_gateway(current, &path)
         } else {
             std::fs::remove_file(&path)
@@ -6994,8 +6997,8 @@ fn cleanup_legacy_gateway_copies(current: &Path, dir: &Path, references: Option<
         match result {
             Ok(()) => eprintln!(
                 "toolport: {} legacy gateway {}",
-                if referenced {
-                    "refreshed referenced"
+                if keep {
+                    "refreshed compatibility"
                 } else {
                     "removed unused"
                 },
@@ -8091,7 +8094,12 @@ mod tests {
         cleanup_legacy_gateway_copies(&current, &dir, None);
         assert!(unused.exists());
         cleanup_legacy_gateway_copies(&current, &dir, Some(std::slice::from_ref(&referenced)));
-        assert!(!unused.exists());
+        let plain_shim = std::fs::read_to_string(&unused).unwrap();
+        assert!(plain_shim.starts_with("#!/bin/sh\n# Toolport gateway compatibility shim\n"));
+        let unused_version = dir.join("toolport-gateway-1.16.0");
+        std::fs::write(&unused_version, old).unwrap();
+        cleanup_legacy_gateway_copies(&current, &dir, Some(&[]));
+        assert!(!unused_version.exists());
         #[cfg(unix)]
         {
             let shim = std::fs::read_to_string(&referenced).unwrap();
@@ -8101,6 +8109,13 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::write(&current, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
             std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(std::fs::metadata(&unused).unwrap().permissions().mode() & 0o777, 0o755);
+            let plain_output = std::process::Command::new(&unused)
+                .args(["unsupported caller", "$literal"])
+                .output()
+                .unwrap();
+            assert!(plain_output.status.success());
+            assert_eq!(plain_output.stdout, b"unsupported caller\n$literal\n");
             let output = std::process::Command::new(&referenced)
                 .args(["one argument", "$literal"])
                 .output()
