@@ -183,7 +183,7 @@ fn blocked_tool_message(name: &str, reason: &str) -> String {
         "outside this client's tool scope" => ("turned off for this client", "Clients"),
         "disabled" => ("turned off", "Servers"),
         "on a server that is turned off" => ("on a server that is turned off", "Clients"),
-        "blocked by the destructive-tool policy" => ("blocked by Strict safety", "Safety"),
+        "blocked by the destructive-tool policy" => ("destructive and blocked by Strict safety", "Safety"),
         "quarantined after a high-risk change; re-approve to restore" => (
             "quarantined after a tool change",
             "Activity to review and approve it",
@@ -6812,7 +6812,7 @@ for line in sys.stdin:
             assert!(denied
                 .route_call(exposed, json!({}))
                 .unwrap_err()
-                .contains("scope"));
+                .contains("turned off for this client"));
             let allowed = router.with_tool_allow(HashMap::from([(
                 "s".into(),
                 HashSet::from(["echo".into()]),

@@ -4694,7 +4694,7 @@ fn execute_call(
                 if message.contains("Strict safety")
                     && reg.safety_level_team_floor() == registry::SafetyLevel::Strict
                 {
-                    message = format!("Blocked by Toolport: {name} is blocked by your team's Strict safety policy. Ask your team admin to change it.");
+                    message = format!("Blocked by Toolport: {name} is destructive and blocked by your team's Strict safety policy. Ask your team admin to change it.");
                 }
                 return json!({"content": [{"type": "text", "text": message}], "isError": true});
             }
@@ -26268,7 +26268,7 @@ mod tests {
         assert!(call_result["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("not available to this client"));
+            .contains("turned off for this client"));
     }
 
     /// Typed stubs only list tools on servers the client is scoped to; out-of-scope
@@ -29333,7 +29333,7 @@ mod tests {
             .and_then(|t| t.as_str())
             .unwrap_or("");
         assert!(
-            text.contains("'resend' is not available to this client"),
+            text.contains("resend__send is turned off for this client"),
             "got {text}"
         );
         // An in-scope call passes the scope guard (it then fails at routing since
@@ -31213,7 +31213,7 @@ mod tests {
         let text = denied["content"][0]["text"].as_str().unwrap_or("");
         assert_eq!(denied["isError"], true);
         assert!(
-            text.contains("not available to this client"),
+            text.contains("turned off for this client"),
             "team twin must be a scope denial, got {denied}"
         );
         let allowed_call = execute_call(
