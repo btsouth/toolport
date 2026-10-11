@@ -123,7 +123,7 @@ describe("SettingsView tool loading", () => {
 
     renderSettings();
 
-    await user.click(screen.getByText("Advanced"));
+    await user.click(screen.getByText("Access"));
     // Open the access set.
     await user.click(
       screen.getByRole("button", {
@@ -515,7 +515,7 @@ describe("SettingsView setting merges", () => {
   });
 });
 
-it("keeps access sets and folder routing under Advanced and changes the default explicitly", async () => {
+it("keeps access sets and folder routing under Access and changes the default explicitly", async () => {
   const user = userEvent.setup();
   const onChange = vi.fn();
   const pinned = { ...registry, version: 3, defaultAccessProfileId: "default" };
@@ -528,11 +528,11 @@ it("keeps access sets and folder routing under Advanced and changes the default 
       <SettingsView registry={pinned} onRegistryChange={onChange} />
     </ThemeProvider>,
   );
-  const advanced = screen.getByText("Advanced").closest("details")!;
-  expect(advanced).not.toHaveAttribute("open");
-  expect(within(advanced).getByText("Access sets")).toBeInTheDocument();
-  expect(within(advanced).getByText(/folder routing/i)).toBeInTheDocument();
-  await user.click(screen.getByText("Advanced"));
+  const access = screen.getByText("Access").closest("details")!;
+  expect(access).not.toHaveAttribute("open");
+  expect(within(access).getByText("Access sets")).toBeInTheDocument();
+  expect(within(access).getByText(/folder routing/i)).toBeInTheDocument();
+  await user.click(screen.getByText("Access"));
   await user.click(screen.getByRole("combobox", { name: "Default access" }));
   await user.click(await screen.findByRole("option", { name: "All enabled servers" }));
   await waitFor(() => expect(setDefaultAccess).toHaveBeenCalledWith(null));
@@ -552,7 +552,7 @@ it("shows the expand affordance for an empty access set", async () => {
       <SettingsView registry={empty} onRegistryChange={vi.fn()} />
     </ThemeProvider>,
   );
-  await userEvent.click(screen.getByText("Advanced"));
+  await userEvent.click(screen.getByText("Access"));
   const toggle = screen.getByRole("button", { name: /Empty set/ });
   expect(toggle.querySelector("svg")).not.toHaveClass("invisible");
   await userEvent.click(toggle);

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, useRef } from "react";
+import { useCallback, useEffect, useMemo, useState, useRef, type ReactNode } from "react";
 import {
   Activity,
   Braces,
@@ -901,77 +901,13 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   );
 
   return (
-    <div className="mx-auto flex max-w-2xl flex-col gap-6">
+    <div className="mx-auto flex max-w-2xl flex-col gap-8">
+      {/* Sections run from what most people change to what almost nobody does.
+          Access and Advanced start folded so the page opens on the essentials. */}
       <section className="flex flex-col gap-2">
-        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Client connections
-        </h2>
-        <p className="text-sm text-muted-foreground">
-          Restore client configurations before removing Toolport.
-        </p>
-        <Button
-          variant="outline"
-          className="self-start"
-          disabled={removeBusy}
-          onClick={() => setRemoveOpen(true)}
-        >
-          Remove Toolport from all clients
-        </Button>
-        {removeResults && (
-          <ul className="text-sm" aria-live="polite">
-            {removeResults.length === 0 ? (
-              <li>No client connections to remove.</li>
-            ) : (
-              removeResults.map((result) => (
-                <li
-                  key={`${result.clientId}:${result.path}`}
-                  className={result.error ? "text-destructive" : "text-muted-foreground"}
-                >
-                  {result.clientId}: {result.error ?? "Client configuration restored"}
-                  {result.warnings?.length ? `; ${result.warnings.join("; ")}` : ""}
-                </li>
-              ))
-            )}
-          </ul>
-        )}
-        <Dialog
-          open={removeOpen}
-          onOpenChange={(open) => {
-            if (!removeBusy) setRemoveOpen(open);
-          }}
-        >
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Remove Toolport from all clients?</DialogTitle>
-              <DialogDescription>
-                Unchanged configs return to their original bytes. If you edited a config,
-                Toolport preserves your edits and restores entries it moved. Each client
-                result is reported here.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button
-                variant="outline"
-                disabled={removeBusy}
-                onClick={() => setRemoveOpen(false)}
-              >
-                Cancel
-              </Button>
-              <Button
-                variant="destructive"
-                disabled={removeBusy}
-                onClick={() => void removeAll()}
-              >
-                {removeBusy ? "Removing…" : "Remove from all clients"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-      </section>
-      <section className="flex flex-col gap-2">
-        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          General
-        </h2>
+        <SectionHeading title="General">
+          Startup, appearance and how agents find tools.
+        </SectionHeading>
         {toggle(
           Power,
           autostart.status === "ready" && autostart.enabled,
@@ -1026,12 +962,6 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             ))}
           </div>
         </div>
-      </section>
-
-      <section className="flex flex-col gap-2">
-        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Discovery
-        </h2>
         {toggle(
           Layers,
           lazyDiscovery,
@@ -1041,23 +971,11 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           apply("lazy-discovery", setLazyDiscovery),
           "lazy-discovery",
         )}
-        {/* Tools always included is a refinement of lazy discovery (the tools it must never
-            hide), not a peer feature, so nest it under the Lazy discovery toggle with an
-            indent + left rail. It has no meaning when lazy discovery is off, so it collapses
-            away entirely then. */}
-        {lazyDiscovery ? (
-          <div className="ml-4 border-l-2 border-border/50 pl-3">
-            <PinnedPrerequisites
-              registry={registry}
-              onRegistryChange={onRegistryChange}
-            />
-          </div>
-        ) : null}
       </section>
       <section className="flex flex-col gap-2">
-        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Security
-        </h2>
+        <SectionHeading title="Safety">
+          How Toolport handles risky tool calls.
+        </SectionHeading>
         <label className="flex items-center gap-3 text-sm">
           Safety
           <select
@@ -1168,8 +1086,51 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             </ul>
           </div>
         )}
-        <details>
-          <summary>Advanced</summary>
+          {allowedTools.length === 0 && allowedError && (
+            <div className="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+              <UserCheck className="size-4 shrink-0 text-info" />
+              <span>Couldn&apos;t read the allowed-tools list. Retrying every 10s.</span>
+            </div>
+          )}
+          {allowedTools.length > 0 && (
+            <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/20 px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <UserCheck className="size-4 shrink-0 text-info" />
+                <span className="text-sm font-medium">Allowed tools</span>
+                <span className="text-xs text-muted-foreground">
+                  {allowedError ? "list may be stale" : "skip human approval"}
+                </span>
+              </div>
+              <ul className="flex flex-col gap-1.5">
+                {allowedTools.map((t) => (
+                  <li key={t.key} className="flex items-center gap-2 text-xs">
+                    <span className="min-w-0 truncate font-mono">
+                      {t.server}/{t.tool}
+                    </span>
+                    <span className="shrink-0 text-muted-foreground">
+                      {t.persistent ? "always" : "this session"}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void revokeAllowed(t.key)}
+                      className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
+                    >
+                      Revoke
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+      </section>
+      <details className="flex flex-col gap-2">
+        <summary className="cursor-pointer list-outside">
+          <span className="text-base font-semibold">Access</span>
+          <span className="block text-sm text-muted-foreground">
+            Limit which servers and tools each client can use, by client or project folder.
+          </span>
+        </summary>
+        <div className="mt-3 flex flex-col gap-2">
           {profiles.length > 0 && (
             <section className="flex flex-col gap-2">
               <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
@@ -1337,6 +1298,16 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               <FolderRouting registry={registry} onRegistryChange={onRegistryChange} />
             </section>
           )}
+        </div>
+      </details>
+      <details className="flex flex-col gap-2">
+        <summary className="cursor-pointer list-outside">
+          <span className="text-base font-semibold">Advanced</span>
+          <span className="block text-sm text-muted-foreground">
+            Code mode, personal data, inspection, pinned tools, the local HTTP endpoint and old gateways.
+          </span>
+        </summary>
+        <div className="mt-3 flex flex-col gap-2">
           {toggle(
             Braces,
             codeMode,
@@ -1369,48 +1340,18 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             applyLiveInspect,
             "live-inspect",
           )}
-          {allowedTools.length === 0 && allowedError && (
-            <div className="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-              <UserCheck className="size-4 shrink-0 text-info" />
-              <span>Couldn&apos;t read the allowed-tools list. Retrying every 10s.</span>
-            </div>
-          )}
-          {allowedTools.length > 0 && (
-            <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/20 px-3 py-2.5">
-              <div className="flex items-center gap-2">
-                <UserCheck className="size-4 shrink-0 text-info" />
-                <span className="text-sm font-medium">Allowed tools</span>
-                <span className="text-xs text-muted-foreground">
-                  {allowedError ? "list may be stale" : "skip human approval"}
-                </span>
-              </div>
-              <ul className="flex flex-col gap-1.5">
-                {allowedTools.map((t) => (
-                  <li key={t.key} className="flex items-center gap-2 text-xs">
-                    <span className="min-w-0 truncate font-mono">
-                      {t.server}/{t.tool}
-                    </span>
-                    <span className="shrink-0 text-muted-foreground">
-                      {t.persistent ? "always" : "this session"}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => void revokeAllowed(t.key)}
-                      className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
-                    >
-                      Revoke
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </details>
-      </section>
-      <section className="flex flex-col gap-2">
-        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Integrations
-        </h2>
+        {/* Tools always included is a refinement of lazy discovery (the tools it must never
+            hide), not a peer feature, so nest it under the Lazy discovery toggle with an
+            indent + left rail. It has no meaning when lazy discovery is off, so it collapses
+            away entirely then. */}
+        {lazyDiscovery ? (
+          <div className="ml-4 border-l-2 border-border/50 pl-3">
+            <PinnedPrerequisites
+              registry={registry}
+              onRegistryChange={onRegistryChange}
+            />
+          </div>
+        ) : null}
         <div className="flex flex-col gap-2 rounded-md border px-3 py-2.5">
           <label className="flex items-center gap-2.5 text-sm">
             <Globe
@@ -1741,7 +1682,80 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             </div>
           )}
         </div>
+        </div>
+      </details>
+      <section className="flex flex-col gap-2">
+        <SectionHeading title="Help and data">
+          Restore client configurations before removing Toolport.
+        </SectionHeading>
+        <Button
+          variant="outline"
+          className="self-start text-destructive"
+          disabled={removeBusy}
+          onClick={() => setRemoveOpen(true)}
+        >
+          Remove Toolport from all clients
+        </Button>
+        {removeResults && (
+          <ul className="text-sm" aria-live="polite">
+            {removeResults.length === 0 ? (
+              <li>No client connections to remove.</li>
+            ) : (
+              removeResults.map((result) => (
+                <li
+                  key={`${result.clientId}:${result.path}`}
+                  className={result.error ? "text-destructive" : "text-muted-foreground"}
+                >
+                  {result.clientId}: {result.error ?? "Client configuration restored"}
+                  {result.warnings?.length ? `; ${result.warnings.join("; ")}` : ""}
+                </li>
+              ))
+            )}
+          </ul>
+        )}
+        <Dialog
+          open={removeOpen}
+          onOpenChange={(open) => {
+            if (!removeBusy) setRemoveOpen(open);
+          }}
+        >
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Remove Toolport from all clients?</DialogTitle>
+              <DialogDescription>
+                Unchanged configs return to their original bytes. If you edited a config,
+                Toolport preserves your edits and restores entries it moved. Each client
+                result is reported here.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                disabled={removeBusy}
+                onClick={() => setRemoveOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={removeBusy}
+                onClick={() => void removeAll()}
+              >
+                {removeBusy ? "Removing…" : "Remove from all clients"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </section>
+    </div>
+  );
+}
+
+function SectionHeading({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <h2 className="text-base font-semibold">{title}</h2>
+      <p className="text-sm text-muted-foreground">{children}</p>
     </div>
   );
 }
