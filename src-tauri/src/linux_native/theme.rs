@@ -409,6 +409,12 @@ dropdown popover row:selected {{
   background-color: alpha(white, 0.88);
 }}
 
+/* Single-color client marks are drawn in black. Dark themes turn them white;
+   the hue rotation keeps an accent such as Amazon Q's orange close to its own. */
+.toolport-mono-logo {{
+  filter: {mono_logo_filter};
+}}
+
 .toolport-nav-item {{
   min-height: 34px;
   padding: 0 12px;
@@ -1066,6 +1072,10 @@ window:backdrop .toolport-summary-item {{
             selection = self.selection,
             red = self.red,
             green = self.green,
+            mono_logo_filter = match self.mode {
+                ThemeMode::Dark => "invert(1) hue-rotate(180deg)",
+                ThemeMode::Light => "none",
+            },
         )
     }
 }
