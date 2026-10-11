@@ -233,7 +233,8 @@ impl TeamsPage {
         self.heading
             .set_label(if personal { "Sync" } else { "Teams" });
         self.plan_badge.set_visible(false);
-        self.intro.set_visible(true);
+        // The personal page states its status itself; the intro is for joining and teams.
+        self.intro.set_visible(!(personal && registry.team.is_some()));
         self.intro.set_label(if personal { "Set up once. Your servers follow you to every machine. Secret values and approvals stay on this machine." } else { "One shared server set, governed by your team. Credentials stay on each machine." });
         let notice = self.sync_notice.borrow_mut().take();
         let mut display = serde_json::to_value(&registry).unwrap_or_default();
@@ -534,8 +535,6 @@ impl TeamsPage {
         team: crate::registry::TeamConnection,
     ) {
         let sync = crate::personal_sync::state(&registry).unwrap_or_default();
-        self.intro.set_visible(false);
-
         // One status line and one primary action, like the rest of the app.
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let line = gtk::Label::builder()
@@ -658,6 +657,9 @@ impl TeamsPage {
         let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let label = section_label("Servers");
         label.set_hexpand(true);
+        label.set_margin_top(0);
+        label.set_valign(gtk::Align::Center);
+        heading.set_margin_top(14);
         heading.append(&label);
         heading.append(
             &gtk::Label::builder()
@@ -1311,6 +1313,7 @@ fn section_label(text: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(text)
         .halign(gtk::Align::Start)
+        .margin_top(14)
         .css_classes(["toolport-section-label"])
         .build()
 }
@@ -1416,6 +1419,7 @@ fn sync_server_row(server: &crate::registry::ServerEntry, tag: Option<&str>, pag
     row.append(&name);
     let choice = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     choice.add_css_class("linked");
+    choice.add_css_class("toolport-sync-choice");
     choice.set_valign(gtk::Align::Center);
     let every = gtk::ToggleButton::with_label("Every machine");
     let here = gtk::ToggleButton::with_label("This machine");

@@ -1098,6 +1098,31 @@ button.toolport-catalog-action {{
   border-bottom: none;
 }}
 
+.toolport-sync-choice {{
+  padding: 2px;
+  border-radius: 8px;
+  background-color: alpha(@toolport_fg, 0.05);
+  border: 1px solid alpha(@toolport_fg, 0.10);
+}}
+
+.toolport-sync-choice > button {{
+  min-height: 24px;
+  padding: 2px 10px;
+  border-radius: 6px;
+  border: none;
+  background: none;
+  box-shadow: none;
+  font-size: 12px;
+  font-weight: 500;
+  color: @toolport_muted;
+}}
+
+.toolport-sync-choice > button:checked {{
+  background-color: alpha(@toolport_fg, 0.14);
+  color: @toolport_fg;
+  font-weight: 650;
+}}
+
 .toolport-sync-tag {{
   color: @warning_color;
 }}
