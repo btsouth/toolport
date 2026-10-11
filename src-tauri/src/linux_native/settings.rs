@@ -96,14 +96,14 @@ impl SettingsPage {
         page.set_margin_end(20);
         page.append(
             &gtk::Label::builder()
-                .label("Safety and desktop behavior")
+                .label("Settings")
                 .halign(gtk::Align::Start)
                 .css_classes(["title-2"])
                 .build(),
         );
         page.append(
             &gtk::Label::builder()
-                .label("These settings apply to Toolport and its gateway. Protections required by a connected team stay locked on.")
+                .label("Most setups only need General. Everything else starts with safe defaults, and protections required by a connected team stay locked on.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
@@ -170,12 +170,7 @@ impl SettingsPage {
             .visible(false)
             .css_classes(["toolport-feedback"])
             .build();
-        page.append(&posture);
 
-        page.append(&settings_heading(
-            "Gateway capabilities",
-            "Control how every connected AI client discovers and uses Toolport.",
-        ));
         let capabilities = gtk::Box::new(gtk::Orientation::Vertical, 0);
         capabilities.add_css_class("toolport-settings-group");
         let (lazy_row, lazy_discovery) = setting_switch_row(
@@ -188,7 +183,6 @@ impl SettingsPage {
             "Let agents combine several tool calls in one script to reduce back-and-forth. Each call follows your access and approval settings. Scripts run in a restricted environment, but this does not replace those settings.",
         );
         code_row.set_tooltip_text(Some("A gateway started with TOOLPORT_CODE_MODE=1 can keep scripts available even when this setting is off."));
-        page.append(&capabilities);
 
         let pinned_section = gtk::Box::new(gtk::Orientation::Vertical, 8);
         pinned_section.append(
@@ -218,12 +212,7 @@ impl SettingsPage {
                 .build(),
         );
         pinned_section.append(&pinned_list);
-        page.append(&pinned_section);
 
-        page.append(&settings_heading(
-            "Tool-call safety",
-            "Choose how Toolport handles risky tools before they reach an AI client.",
-        ));
         let safety = gtk::Box::new(gtk::Orientation::Vertical, 0);
         safety.add_css_class("toolport-settings-group");
         let safety_level = gtk::DropDown::from_strings(&["Off", "Ask", "Strict"]);
@@ -246,11 +235,6 @@ impl SettingsPage {
         safety_kept.append(&safety_kept_reset);
         safety_kept.set_visible(false);
         safety.append(&safety_kept);
-        page.append(&safety);
-        page.append(&settings_heading(
-            "Advanced",
-            "Client access, folder routing, personal data and inspection.",
-        ));
         let protection = gtk::Box::new(gtk::Orientation::Vertical, 0);
         protection.add_css_class("toolport-settings-group");
         protection.append(&code_row);
@@ -264,10 +248,10 @@ impl SettingsPage {
             "Capture the last 50 tool calls locally for Activity. Turning this off clears the buffer.",
         );
         protection.append(&inspect_row);
-        protection.append(&settings_heading(
+        let approvals_heading = settings_heading(
             "Remembered approvals",
-            "Fingerprint-bound exceptions that can skip the human approval prompt.",
-        ));
+            "Tool calls you chose to always allow. They stop applying if the tool's definition changes.",
+        );
         let allowed_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         allowed_list.add_css_class("toolport-settings-group");
         allowed_list.append(
@@ -277,19 +261,16 @@ impl SettingsPage {
                 .css_classes(["toolport-muted"])
                 .build(),
         );
-        protection.append(&allowed_list);
 
-        page.append(&protection);
         let access_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        page.append(&access_list);
         let folder_button = gtk::Button::with_label("Add folder mapping");
         folder_button.add_css_class("toolport-secondary-action");
         folder_button.set_valign(gtk::Align::Center);
-        page.append(&settings_heading_with_action(
+        let folder_heading = settings_heading_with_action(
             "Project folder routing",
             "Automatically use the matching access set when an MCP client reports a project root. The longest matching folder wins.",
             &folder_button,
-        ));
+        );
         let folder_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         folder_list.add_css_class("toolport-settings-group");
         folder_list.append(
@@ -299,19 +280,13 @@ impl SettingsPage {
                 .css_classes(["toolport-muted"])
                 .build(),
         );
-        page.append(&folder_list);
 
-        page.append(&settings_heading(
-            "Desktop",
-            "Linux-native lifecycle preferences.",
-        ));
         let desktop = gtk::Box::new(gtk::Orientation::Vertical, 0);
         desktop.add_css_class("toolport-settings-group");
         let (launch_row, launch_at_login) = setting_switch_row(
             "Launch at login",
             "Start Toolport hidden so approvals and notifications remain available.",
         );
-        desktop.append(&launch_row);
         let stale_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         stale_row.add_css_class("toolport-setting-row");
         let stale_copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -379,13 +354,7 @@ impl SettingsPage {
                 .build(),
         );
         updates.append(&updates_copy);
-        desktop.append(&updates);
-        page.append(&desktop);
 
-        page.append(&settings_heading(
-            "Diagnostics",
-            "Copy a secret-safe support report or inspect Toolport's local files.",
-        ));
         let diagnostics = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         diagnostics.add_css_class("toolport-setting-row");
         let diagnostics_copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -416,12 +385,11 @@ impl SettingsPage {
         open_data.add_css_class("toolport-secondary-action");
         diagnostics_actions.insert(&open_data, -1);
         diagnostics.append(&diagnostics_actions);
-        page.append(&diagnostics);
 
-        page.append(&settings_heading(
+        let endpoint_heading = settings_heading(
             "Shared HTTP endpoint",
             "A supervised, authenticated local endpoint for clients that cannot launch an MCP process.",
-        ));
+        );
         let endpoint = gtk::Box::new(gtk::Orientation::Vertical, 8);
         endpoint.add_css_class("toolport-setting-row");
         let endpoint_copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -475,18 +443,17 @@ impl SettingsPage {
             .css_classes(["toolport-muted", "caption", "monospace"])
             .build();
         endpoint.append(&endpoint_token_value);
-        page.append(&endpoint);
         // The scoped-client list had no heading of its own, so its empty state
         // floated under the gateway row with nothing naming it.
         let add_http_client = gtk::Button::with_label("Add scoped HTTP client");
         add_http_client.add_css_class("toolport-secondary-action");
         add_http_client.set_valign(gtk::Align::Center);
         add_http_client.set_sensitive(false);
-        page.append(&settings_heading_with_action(
+        let http_client_heading = settings_heading_with_action(
             "Scoped HTTP clients",
             "Each gets its own bearer token and server scope, so one endpoint can serve several clients.",
             &add_http_client,
-        ));
+        );
         let http_client_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         http_client_list.add_css_class("toolport-settings-group");
         http_client_list.append(
@@ -499,12 +466,11 @@ impl SettingsPage {
                 .css_classes(["toolport-muted"])
                 .build(),
         );
-        page.append(&http_client_list);
 
-        page.append(&settings_heading(
+        let quarantine_heading = settings_heading(
             "Quarantined tools",
             "Strict blocks retained high-risk definition changes until you explicitly re-approve them.",
-        ));
+        );
         let quarantine_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         quarantine_list.add_css_class("toolport-settings-group");
         quarantine_list.append(
@@ -517,19 +483,47 @@ impl SettingsPage {
                 .css_classes(["toolport-muted"])
                 .build(),
         );
-        page.append(&quarantine_list);
 
-        page.append(&settings_heading(
-            "Client connections",
-            "Restore client configurations before removing Toolport.",
-        ));
         let remove_clients = gtk::Button::with_label("Remove Toolport from all clients");
         remove_clients.set_halign(gtk::Align::Start);
-        page.append(&remove_clients);
+        remove_clients.add_css_class("destructive-action");
         let removal_results = gtk::Label::new(None);
         removal_results.set_xalign(0.0);
         removal_results.set_wrap(true);
-        page.append(&removal_results);
+
+        // Sections run from what most people change to what almost nobody does.
+        // Access and Advanced start folded so the page opens on the essentials.
+        let general = settings_section(&page, "General", "Startup, updates and how agents find tools.");
+        capabilities.prepend(&launch_row);
+        capabilities.append(&updates);
+        general.append(&capabilities);
+
+        let safety_section = settings_section(&page, "Safety", "How Toolport handles risky tool calls.");
+        safety_section.append(&posture);
+        safety_section.append(&safety);
+        // Shown only when there is something in them (see render_allowed and
+        // render_quarantine), so an untouched setup has no empty boxes here.
+        safety_section.append(&listed_section(&approvals_heading, &allowed_list));
+        safety_section.append(&listed_section(&quarantine_heading, &quarantine_list));
+
+        let access = folded_section(&page, "Access", "Limit which servers and tools each client can use, by client or project folder.");
+        access.append(&access_list);
+        access.append(&folder_heading);
+        access.append(&folder_list);
+
+        let advanced = folded_section(&page, "Advanced", "Code mode, personal data, inspection, pinned tools, the local HTTP endpoint and old gateways.");
+        advanced.append(&protection);
+        advanced.append(&pinned_section);
+        advanced.append(&endpoint_heading);
+        advanced.append(&endpoint);
+        advanced.append(&http_client_heading);
+        advanced.append(&http_client_list);
+        advanced.append(&desktop);
+
+        let help = settings_section(&page, "Help and data", "Support reports, local files and removing Toolport.");
+        help.append(&diagnostics);
+        help.append(&remove_clients);
+        help.append(&removal_results);
         scroller.set_child(Some(&page));
         root.append(&scroller);
         let settings_page = Self {
@@ -1807,9 +1801,15 @@ impl SettingsPage {
                         .build(),
                 );
                 self.quarantine_list.append(&row);
+                if let Some(section) = self.quarantine_list.parent() {
+                    section.set_visible(true);
+                }
                 return;
             }
         };
+        if let Some(section) = self.quarantine_list.parent() {
+            section.set_visible(!entries.is_empty());
+        }
         if entries.is_empty() {
             self.quarantine_list
                 .append(&empty_state("No tools are quarantined."));
@@ -1828,6 +1828,9 @@ impl SettingsPage {
     fn render_allowed(&self, entries: Vec<AllowedTool>) {
         while let Some(child) = self.allowed_list.first_child() {
             self.allowed_list.remove(&child);
+        }
+        if let Some(section) = self.allowed_list.parent() {
+            section.set_visible(!entries.is_empty());
         }
         if entries.is_empty() {
             self.allowed_list
@@ -2394,6 +2397,61 @@ fn settings_heading_with_action(
     row.append(&heading);
     row.append(action);
     row
+}
+
+/// A top-level group of the page: a larger title, one line saying what is in it,
+/// and the box its rows go into.
+fn settings_section(page: &gtk::Box, title: &str, summary: &str) -> gtk::Box {
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    section.set_margin_top(12);
+    section.append(&section_title(title, summary));
+    page.append(&section);
+    section
+}
+
+/// Like [`settings_section`], but folded until the user opens it.
+fn folded_section(page: &gtk::Box, title: &str, summary: &str) -> gtk::Box {
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    body.set_margin_top(14);
+    let expander = gtk::Expander::builder()
+        .label_widget(&section_title(title, summary))
+        .child(&body)
+        .expanded(false)
+        .margin_top(12)
+        .build();
+    page.append(&expander);
+    body
+}
+
+fn section_title(title: &str, summary: &str) -> gtk::Box {
+    let heading = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    heading.append(
+        &gtk::Label::builder()
+            .label(title)
+            .halign(gtk::Align::Start)
+            .css_classes(["title-3"])
+            .build(),
+    );
+    heading.append(
+        &gtk::Label::builder()
+            .label(summary)
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .hexpand(true)
+            .css_classes(["toolport-muted"])
+            .build(),
+    );
+    heading
+}
+
+/// A heading and its list, hidden together until the list has entries.
+fn listed_section(heading: &gtk::Box, list: &gtk::Box) -> gtk::Box {
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    section.append(heading);
+    section.append(list);
+    section.set_visible(false);
+    section
 }
 
 fn settings_heading(title: &str, subtitle: &str) -> gtk::Box {
