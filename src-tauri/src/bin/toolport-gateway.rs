@@ -11718,6 +11718,15 @@ struct ToolScopeBase {
     /// The base router's own catalog, for requests that need no scoped view.
     /// Building it indexes every tool, so it must not happen per request.
     unscoped: Option<Arc<CatalogSnapshot>>,
+    /// Views carrying an adapter profile's own registry policy, keyed by the
+    /// client view they were copied from. Copying a router costs milliseconds.
+    adapter_views: Vec<AdapterPolicyView>,
+}
+
+struct AdapterPolicyView {
+    view: Arc<Router>,
+    policy: RegistryPolicy,
+    router: Arc<Router>,
 }
 
 struct ProfileToolView {
@@ -13005,6 +13014,7 @@ impl HostState {
             base: Arc::clone(&base),
             by_profile: HashMap::new(),
             unscoped: None,
+            adapter_views: Vec::new(),
         });
         debug_assert!(Arc::ptr_eq(&scoped.base, &base));
         if unscoped {
@@ -13030,6 +13040,100 @@ impl HostState {
             },
         );
         (router, catalog)
+    }
+
+    /// The client view with an adapter profile's registry policy applied. The view
+    /// is shared when its policy already matches; otherwise the policy copy is
+    /// cached beside the view so a call does not copy the router.
+    fn router_for_adapter_policy(
+        &self,
+        base: Arc<Router>,
+        reg: &Registry,
+        profile: &str,
+        client: Option<&str>,
+        policy: RegistryPolicy,
+    ) -> Arc<Router> {
+        let view = self
+            .router_for_client_view(Arc::clone(&base), reg, Some(profile), client)
+            .0;
+        if view.registry_policy() == policy {
+            return view;
+        }
+        let key = Arc::as_ptr(&base) as usize;
+        let cached = |views: &ToolScopeViews| {
+            let scoped = views.by_base.get(&key)?;
+            Arc::ptr_eq(&scoped.base, &base).then_some(())?;
+            scoped
+                .adapter_views
+                .iter()
+                .find(|entry| Arc::ptr_eq(&entry.view, &view) && entry.policy == policy)
+                .map(|entry| Arc::clone(&entry.router))
+        };
+        let views = self
+            .tool_scope_views
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(router) = cached(&views) {
+            return router;
+        }
+        drop(views);
+        let mut copy = (*view).clone();
+        copy.apply_registry_policy(policy.clone());
+        let router = Arc::new(copy);
+        // Declared before the lock guard so a replaced view drops after it is released.
+        let mut retired = Vec::new();
+        let mut views = self
+            .tool_scope_views
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Cache only beside a view the host still holds, so a superseded router is
+        // never pinned here.
+        if let Some(scoped) = views
+            .by_base
+            .get_mut(&key)
+            .filter(|scoped| Arc::ptr_eq(&scoped.base, &base))
+        {
+            let ToolScopeBase {
+                base,
+                by_profile,
+                adapter_views,
+                ..
+            } = scoped;
+            let held = |view: &Arc<Router>| {
+                Arc::ptr_eq(view, base)
+                    || by_profile
+                        .values()
+                        .any(|entry| Arc::ptr_eq(&entry.router, view))
+            };
+            if let Some(entry) = adapter_views
+                .iter()
+                .find(|entry| Arc::ptr_eq(&entry.view, &view) && entry.policy == policy)
+            {
+                // Another call cached the same view first; serve one copy.
+                let existing = Arc::clone(&entry.router);
+                drop(views);
+                return existing;
+            }
+            if held(&view) {
+                // A profile view replaced by a changed scope is never served again.
+                let (kept, gone): (Vec<_>, Vec<_>) = std::mem::take(adapter_views)
+                    .into_iter()
+                    .partition(|entry| held(&entry.view));
+                *adapter_views = kept;
+                retired.extend(gone);
+                if adapter_views.len() >= 8 {
+                    retired.push(adapter_views.remove(0));
+                }
+                adapter_views.push(AdapterPolicyView {
+                    view,
+                    policy,
+                    router: Arc::clone(&router),
+                });
+            }
+        }
+        drop(views);
+        drop(retired);
+        router
     }
 
     /// Record that this host just served something, for the daemon idle lease.
@@ -15441,20 +15545,10 @@ fn adapter_live_view(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let rooted = host.router_for_root(base, &current, root.as_deref(), Some(&scope));
-        let view = host
-            .router_for_client_view(rooted, &current, Some(profile), client.as_deref())
-            .0;
         // Post-HITL owner/fingerprint checks need the current adapter visibility,
         // not the host's union of profiles. Preserve the live quarantine state.
-        // Copying the router costs milliseconds per call, so share the view when
-        // its policy already matches.
         let policy = registry_policy(&current, Some(profile), false, false);
-        if view.registry_policy() == policy {
-            return view;
-        }
-        let mut view = (*view).clone();
-        view.apply_registry_policy(policy);
-        Arc::new(view)
+        host.router_for_adapter_policy(rooted, &current, profile, client.as_deref(), policy)
     });
     LiveRouterResolver { stale, resolve }
 }
@@ -23808,6 +23902,48 @@ mod tests {
         assert!(!Arc::ptr_eq(&fresh, &first));
         let views = state.tool_scope_views.lock().unwrap();
         assert!(views.by_base.values().all(|view| Arc::ptr_eq(&view.base, &rebuilt)));
+    }
+
+    #[test]
+    fn adapter_policy_views_are_shared_or_copied_once() {
+        let _env = DataDirTestEnv::new("adapter-policy-view-reuse");
+        let state = http_state(false);
+        let (reg, router, catalog) = tool_surface_fixture();
+        *state.registry.lock().unwrap() = reg.clone();
+        *state.router.lock().unwrap() = Arc::clone(&router);
+        *state.cached_tools.lock().unwrap() = catalog;
+        let profile = reg.resolve_profile_id("");
+        let client = Some("adapter:claude-code");
+        let resolve = |base: &Arc<Router>, policy: RegistryPolicy| {
+            state.router_for_adapter_policy(Arc::clone(base), &reg, &profile, client, policy)
+        };
+        // A matching policy needs no copy at all.
+        assert!(Arc::ptr_eq(&resolve(&router, router.registry_policy()), &router));
+        // A different one is copied once, then served from the cache.
+        let narrowed = RegistryPolicy {
+            servers: Some(HashSet::from(["alpha".to_string()])),
+            ..router.registry_policy()
+        };
+        let first = resolve(&router, narrowed.clone());
+        assert!(!Arc::ptr_eq(&first, &router));
+        assert_eq!(first.registry_policy(), narrowed);
+        assert!(router.authorize(DispatchTarget::Server("beta")).is_ok());
+        assert!(first.authorize(DispatchTarget::Server("beta")).is_err());
+        for _ in 0..3 {
+            assert!(Arc::ptr_eq(&resolve(&router, narrowed.clone()), &first));
+        }
+        // A rebuilt router gets its own copy, and the old one is not pinned.
+        let rebuilt = Arc::new((*router).clone());
+        *state.router.lock().unwrap() = Arc::clone(&rebuilt);
+        let fresh = resolve(&rebuilt, narrowed.clone());
+        assert!(!Arc::ptr_eq(&fresh, &first));
+        let views = state.tool_scope_views.lock().unwrap();
+        assert!(views.by_base.values().all(|view| Arc::ptr_eq(&view.base, &rebuilt)));
+        assert!(views
+            .by_base
+            .values()
+            .flat_map(|view| &view.adapter_views)
+            .all(|entry| !Arc::ptr_eq(&entry.router, &first)));
     }
 
     #[test]
