@@ -226,14 +226,14 @@ export function PersonalSyncView({
   const summary = failed
     ? "Last sync did not finish"
     : Object.keys(sync?.conflicts ?? {}).length
-    ? "Changes need your choice"
-    : arrivals.length
-      ? `${arrivals.length} ${arrivals.length === 1 ? "server is" : "servers are"} waiting for review on this machine`
-      : !lastSynced
-        ? "Waiting for first sync"
-        : Object.keys(sync?.pending ?? {}).length
-          ? "Changes waiting to sync"
-          : "Sync is up to date";
+      ? "Changes need your choice"
+      : arrivals.length
+        ? `${arrivals.length} ${arrivals.length === 1 ? "server is" : "servers are"} waiting for review on this machine`
+        : !lastSynced
+          ? "Waiting for first sync"
+          : Object.keys(sync?.pending ?? {}).length
+            ? "Changes waiting to sync"
+            : "Sync is up to date";
   const healthy = summary === "Sync is up to date";
   const statusLine = lastSynced ? `${summary} · ${lastSynced}` : summary;
   async function run(work: () => Promise<void>) {
