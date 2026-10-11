@@ -7511,7 +7511,12 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
         let profile_id = profile_id.to_string();
         let status_for_toggle = status.clone();
         let page_for_toggle = page.clone();
+        let server_for_toggle = server.clone();
+        let restoring = std::rc::Rc::new(std::cell::Cell::new(false));
         toggle.connect_state_set(move |toggle, enabled| {
+            if restoring.get() {
+                return gtk::glib::Propagation::Proceed;
+            }
             toggle.set_sensitive(false);
             status_for_toggle.set_label("Updating");
 
@@ -7519,6 +7524,10 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
             let server_name = server_name.clone();
             let profile_id = profile_id.clone();
             let page = page_for_toggle.clone();
+            let server = server_for_toggle.clone();
+            let toggle = toggle.clone();
+            let status = status_for_toggle.clone();
+            let restoring = restoring.clone();
             gtk::glib::spawn_future_local(async move {
                 let update = gtk::gio::spawn_blocking(move || {
                     crate::registry_controller::set_server_enabled(
@@ -7540,11 +7549,34 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
                         ));
                     }
                     Ok(Err(error)) => {
-                        page.restore_after_error(&format!(
-                            "Could not update {server_name}: {error}"
-                        ));
+                        // A refused change leaves the registry as it was, so the
+                        // page keeps this card and its switch must be put back here.
+                        restore_server_switch(&toggle, &status, &restoring, !enabled);
+                        let editor = enabled
+                            .then(|| missing_value_editor(&error, &server.secret_keys))
+                            .flatten();
+                        match editor {
+                            Some(editor) => {
+                                page.restore_after_error(&format!(
+                                    "Could not turn on {server_name}: {}",
+                                    missing_value_hint(&error, &editor)
+                                ));
+                                match editor {
+                                    MissingValueEditor::Credentials => {
+                                        open_credentials_editor(server, page.clone())
+                                    }
+                                    MissingValueEditor::EditServer => {
+                                        open_server_editor(Some(server), page.clone())
+                                    }
+                                }
+                            }
+                            None => page.restore_after_error(&format!(
+                                "Could not update {server_name}: {error}"
+                            )),
+                        }
                     }
                     Err(_) => {
+                        restore_server_switch(&toggle, &status, &restoring, !enabled);
                         page.restore_after_error(&format!(
                             "Could not update {server_name}: the operation stopped"
                         ));
@@ -8351,6 +8383,56 @@ fn action_menu_button(label: &str, icon: &str) -> gtk::Button {
     );
     button.set_child(Some(&row));
     button
+}
+
+fn restore_server_switch(
+    toggle: &gtk::Switch,
+    status: &gtk::Label,
+    restoring: &std::cell::Cell<bool>,
+    enabled: bool,
+) {
+    restoring.set(true);
+    toggle.set_active(enabled);
+    toggle.set_state(enabled);
+    restoring.set(false);
+    toggle.set_sensitive(true);
+    status.set_label(if enabled { "Enabled" } else { "Disabled" });
+}
+
+const SERVER_SETUP_SUFFIX: &str = " Open server setup to add it.";
+const CREDENTIALS_SUFFIX: &str = " > Credentials.";
+
+#[derive(Debug, PartialEq, Eq)]
+enum MissingValueEditor {
+    Credentials,
+    EditServer,
+}
+
+/// Enabling was refused because a value that does not sync is missing here.
+/// Secrets are added in Credentials and plain values in Edit server.
+fn missing_value_editor(error: &str, secret_keys: &[String]) -> Option<MissingValueEditor> {
+    if error.ends_with(CREDENTIALS_SUFFIX) {
+        return Some(MissingValueEditor::Credentials);
+    }
+    let needs = error.strip_suffix(SERVER_SETUP_SUFFIX)?;
+    let key = needs.rsplit(" needs ").next()?.trim_end_matches('.');
+    let key = key.strip_prefix("environment setting ").unwrap_or(key);
+    Some(if secret_keys.iter().any(|secret| secret == key) {
+        MissingValueEditor::Credentials
+    } else {
+        MissingValueEditor::EditServer
+    })
+}
+
+fn missing_value_hint(error: &str, editor: &MissingValueEditor) -> String {
+    let Some(needs) = error.strip_suffix(SERVER_SETUP_SUFFIX) else {
+        return error.to_string();
+    };
+    let place = match editor {
+        MissingValueEditor::Credentials => "Credentials",
+        MissingValueEditor::EditServer => "Edit server",
+    };
+    format!("{needs} Add it in {place}, then turn the server on.")
 }
 
 fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
@@ -11636,6 +11718,33 @@ mod tests {
         assert!(server_matches_query(&linear, " HTTP "));
         assert!(server_matches_query(&linear, ""));
         assert!(!server_matches_query(&linear, "local stdio"));
+    }
+
+    #[test]
+    fn a_missing_value_refusal_opens_the_editor_that_holds_it() {
+        let secrets = vec!["LINODE_API_TOKEN".to_string()];
+        let secret = "Linode needs LINODE_API_TOKEN. Open server setup to add it.";
+        let plain = "Linode needs environment setting REGION. Open server setup to add it.";
+        let input = "Linode needs API key. Add it in Servers > Linode > Credentials.";
+
+        assert_eq!(
+            missing_value_editor(secret, &secrets),
+            Some(MissingValueEditor::Credentials)
+        );
+        assert_eq!(
+            missing_value_hint(secret, &MissingValueEditor::Credentials),
+            "Linode needs LINODE_API_TOKEN. Add it in Credentials, then turn the server on."
+        );
+        assert_eq!(
+            missing_value_editor(plain, &secrets),
+            Some(MissingValueEditor::EditServer)
+        );
+        assert_eq!(
+            missing_value_editor(input, &secrets),
+            Some(MissingValueEditor::Credentials)
+        );
+        assert_eq!(missing_value_hint(input, &MissingValueEditor::Credentials), input);
+        assert_eq!(missing_value_editor("could not save the registry", &secrets), None);
     }
 }
 
