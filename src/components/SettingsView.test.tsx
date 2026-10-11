@@ -1,3 +1,4 @@
+import { type SettingsSubpage } from "@/lib/settingsPages";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -86,10 +87,10 @@ const registry: Registry = {
   codeMode: true,
 };
 
-function renderSettings() {
+function renderSettings(page: SettingsSubpage = "general") {
   render(
     <ThemeProvider>
-      <SettingsView registry={registry} onRegistryChange={vi.fn()} />
+      <SettingsView page={page} registry={registry} onRegistryChange={vi.fn()} />
     </ThemeProvider>,
   );
 }
@@ -121,28 +122,22 @@ describe("SettingsView tool loading", () => {
       .mockReturnValueOnce(githubRequest.promise)
       .mockReturnValueOnce(slackRequest.promise);
 
-    renderSettings();
-
-    await user.click(screen.getByText("Advanced"));
-    // Open the access set.
-    await user.click(
-      screen.getByRole("button", {
-        name: /default 2 servers/i,
-      }),
-    );
+    renderSettings("access");
 
     // Expand GitHub (request A starts).
     const githubToggle = screen.getByRole("button", {
       name: /github/i,
     });
     expect(githubToggle).toHaveAttribute("type", "button");
-    expect(githubToggle).toHaveAttribute("aria-expanded", "false");
+    expect(githubToggle).toHaveAttribute("aria-haspopup", "dialog");
     await user.click(githubToggle);
-    expect(githubToggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("dialog")).toHaveAccessibleName("Choose tools for GitHub");
 
     expect(screen.getByText("Loading tools…")).toBeInTheDocument();
 
-    // Expand Slack while GitHub is still pending (request B starts).
+    // Open Slack while GitHub is still pending (request B starts).
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(githubToggle).toHaveFocus());
     await user.click(
       screen.getByRole("button", {
         name: /slack/i,
@@ -229,7 +224,7 @@ describe("SettingsView launch at login", () => {
 describe("SettingsView restart check", () => {
   it("shows an error toast when the old-gateway check fails", async () => {
     mockedClientsNeedingRestart.mockRejectedValue(new Error("backend down"));
-    renderSettings();
+    renderSettings("connections");
 
     await waitFor(() => {
       expect(mockedToastError).toHaveBeenCalledWith(
@@ -243,7 +238,7 @@ describe("SettingsView restart check", () => {
       .mockRejectedValueOnce(new Error("backend down"))
       .mockResolvedValueOnce([{ client: "Codex", gateway: "old", clientPid: 1234 }]);
     const user = userEvent.setup();
-    renderSettings();
+    renderSettings("connections");
 
     const retry = await screen.findByRole("button", {
       name: "Retry checking for old gateway",
@@ -271,7 +266,7 @@ describe("SettingsView restart check", () => {
       needsRestart: [{ client: "Codex", gateway: "old", clientPid: 1234 }],
     });
     const user = userEvent.setup();
-    renderSettings();
+    renderSettings("connections");
 
     await screen.findByRole("button", { name: "Retry checking for old gateway" });
     await user.click(screen.getByRole("button", { name: "Run" }));
@@ -287,6 +282,37 @@ describe("SettingsView restart check", () => {
   });
 });
 
+it("shows protections kept from 1.x and drops them on request", async () => {
+  const user = userEvent.setup();
+  const onRegistryChange = vi.fn();
+  vi.mocked(setSafetyLevel).mockResolvedValueOnce({ ...registry, safetyLevel: "off" });
+  render(
+    <ThemeProvider>
+      <SettingsView
+        page="safety"
+        registry={{
+          ...registry,
+          safetyLevel: "off",
+          keptV1Safety: { blockOnInjection: true },
+        }}
+        onRegistryChange={onRegistryChange}
+      />
+    </ThemeProvider>,
+  );
+  expect(
+    screen.getByText(
+      /Kept from 1.x: Toolport also blocks results that look like prompt injection./,
+    ),
+  ).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Use standard Off" }));
+  expect(setSafetyLevel).toHaveBeenCalledWith("off");
+  await waitFor(() =>
+    expect(onRegistryChange).toHaveBeenCalledWith(
+      expect.objectContaining({ safetyLevel: "off", keptV1Safety: undefined }),
+    ),
+  );
+});
+
 it("selects and persists one safety level", async () => {
   const user = userEvent.setup();
   const onRegistryChange = vi.fn();
@@ -294,13 +320,14 @@ it("selects and persists one safety level", async () => {
   render(
     <ThemeProvider>
       <SettingsView
+        page="safety"
         registry={{ ...registry, safetyLevel: "ask" }}
         onRegistryChange={onRegistryChange}
       />
     </ThemeProvider>,
   );
-  expect(screen.getByRole("combobox", { name: "Safety" })).toHaveValue("ask");
-  await user.selectOptions(screen.getByRole("combobox", { name: "Safety" }), "strict");
+  expect(screen.getByRole("radio", { name: levelName("ask") })).toBeChecked();
+  await user.click(screen.getByRole("radio", { name: "Strict" }));
   expect(setSafetyLevel).toHaveBeenCalledWith("strict");
   await waitFor(() =>
     expect(onRegistryChange).toHaveBeenCalledWith({ ...registry, safetyLevel: "strict" }),
@@ -320,18 +347,19 @@ it.each([
   render(
     <ThemeProvider>
       <SettingsView
+        page="safety"
         registry={{ ...registry, safetyLevel: "off", teamMinSafetyLevel: floor }}
         onRegistryChange={vi.fn()}
       />
     </ThemeProvider>,
   );
-  const control = screen.getByRole("combobox", { name: "Safety" });
-  expect(control).toHaveValue(floor);
+  const control = screen.getByRole("radio", { name: levelName(floor) });
+  expect(control).toBeChecked();
   expect(
-    screen.getByRole("option", { name: below === "off" ? "Off" : "Ask" }),
+    screen.getByRole("radio", { name: below === "off" ? "Off" : "Ask" }),
   ).toBeDisabled();
-  await user.selectOptions(control, below);
-  expect(control).toHaveValue(floor);
+  await user.click(screen.getByRole("radio", { name: levelName(below) }));
+  expect(control).toBeChecked();
   expect(setSafetyLevel).not.toHaveBeenCalled();
   expect(
     screen.getByText(
@@ -344,6 +372,7 @@ it("uses legacy approval as an Ask floor without hiding the Strict choice", () =
   render(
     <ThemeProvider>
       <SettingsView
+        page="safety"
         registry={{
           ...registry,
           safetyLevel: "off",
@@ -354,15 +383,16 @@ it("uses legacy approval as an Ask floor without hiding the Strict choice", () =
       />
     </ThemeProvider>,
   );
-  expect(screen.getByRole("combobox", { name: "Safety" })).toHaveValue("ask");
-  expect(screen.getByRole("option", { name: "Off" })).toBeDisabled();
-  expect(screen.getByRole("option", { name: "Strict" })).not.toBeDisabled();
+  expect(screen.getByRole("radio", { name: levelName("ask") })).toBeChecked();
+  expect(screen.getByRole("radio", { name: "Off" })).toBeDisabled();
+  expect(screen.getByRole("radio", { name: "Strict" })).not.toBeDisabled();
 });
 
 it("independent team flags leave Off selected and all levels available", () => {
   render(
     <ThemeProvider>
       <SettingsView
+        page="safety"
         registry={{
           ...registry,
           safetyLevel: "off",
@@ -374,8 +404,8 @@ it("independent team flags leave Off selected and all levels available", () => {
       />
     </ThemeProvider>,
   );
-  expect(screen.getByRole("combobox", { name: "Safety" })).toHaveValue("off");
-  expect(screen.getByRole("option", { name: "Off" })).not.toBeDisabled();
+  expect(screen.getByRole("radio", { name: levelName("off") })).toBeChecked();
+  expect(screen.getByRole("radio", { name: "Off" })).not.toBeDisabled();
   expect(
     screen.getByText(/Team also enforces: quarantine on drift, block on injection/),
   ).toBeInTheDocument();
@@ -387,22 +417,24 @@ it("keeps a stronger member choice when the team lowers its floor", () => {
   const { rerender } = render(
     <ThemeProvider>
       <SettingsView
+        page="safety"
         registry={{ ...registry, safetyLevel: "strict", teamMinSafetyLevel: "ask" }}
         onRegistryChange={change}
       />
     </ThemeProvider>,
   );
-  expect(screen.getByRole("combobox", { name: "Safety" })).toHaveValue("strict");
+  expect(screen.getByRole("radio", { name: levelName("strict") })).toBeChecked();
   rerender(
     <ThemeProvider>
       <SettingsView
+        page="safety"
         registry={{ ...registry, safetyLevel: "strict", teamMinSafetyLevel: "off" }}
         onRegistryChange={change}
       />
     </ThemeProvider>,
   );
-  expect(screen.getByRole("combobox", { name: "Safety" })).toHaveValue("strict");
-  expect(screen.getByRole("option", { name: "Off" })).not.toBeDisabled();
+  expect(screen.getByRole("radio", { name: levelName("strict") })).toBeChecked();
+  expect(screen.getByRole("radio", { name: "Off" })).not.toBeDisabled();
 });
 
 it("keeps Code Mode off by default under Advanced and persists opt-in", async () => {
@@ -413,14 +445,11 @@ it("keeps Code Mode off by default under Advanced and persists opt-in", async ()
   vi.mocked(setCodeMode).mockResolvedValueOnce({ ...absent, codeMode: true });
   render(
     <ThemeProvider>
-      <SettingsView registry={absent} onRegistryChange={onRegistryChange} />
+      <SettingsView page="tools" registry={absent} onRegistryChange={onRegistryChange} />
     </ThemeProvider>,
   );
-  const advanced = screen.getByText("Advanced").closest("details");
-  expect(advanced).not.toHaveAttribute("open");
-  await user.click(screen.getByText("Advanced"));
-  expect(advanced).toHaveAttribute("open");
-  const control = within(advanced!).getByRole("switch", { name: /code mode/i });
+  expect(screen.queryByText("Advanced")).not.toBeInTheDocument();
+  const control = screen.getByRole("switch", { name: /code mode/i });
   expect(control).not.toBeChecked();
   await user.click(control);
   expect(setCodeMode).toHaveBeenCalledWith(true);
@@ -440,30 +469,40 @@ describe("SettingsView setting merges", () => {
     mockedSetPiiRedaction.mockReturnValueOnce(piiRequest.promise);
     mockedSetCodeMode.mockReturnValueOnce(codeModeRequest.promise);
 
-    render(
+    const { rerender } = render(
       <ThemeProvider>
-        <SettingsView registry={registry} onRegistryChange={onRegistryChange} />
+        <SettingsView
+          page="safety"
+          registry={registry}
+          onRegistryChange={onRegistryChange}
+        />
       </ThemeProvider>,
     );
-    await user.click(screen.getByText("Advanced"));
 
     const piiControl = screen.getByRole("switch", {
       name: /hide personal data from the model/i,
     });
-    const codeModeControl = screen.getByRole("switch", { name: /code mode/i });
-    const safetyControl = screen.getByRole("combobox", { name: "Safety" });
+    const safetyControl = screen.getByRole("radio", { name: "Off" });
 
     await user.click(piiControl);
     expect(mockedSetPiiRedaction).toHaveBeenCalledWith(true);
     expect(piiControl).toBeDisabled();
-    expect(codeModeControl).toBeEnabled();
+
     expect(safetyControl).toBeEnabled();
 
+    rerender(
+      <ThemeProvider>
+        <SettingsView
+          page="tools"
+          registry={registry}
+          onRegistryChange={onRegistryChange}
+        />
+      </ThemeProvider>,
+    );
+    const codeModeControl = screen.getByRole("switch", { name: /code mode/i });
     await user.click(codeModeControl);
     expect(mockedSetCodeMode).toHaveBeenCalledWith(false);
     expect(codeModeControl).toBeDisabled();
-    expect(piiControl).toBeDisabled();
-    expect(safetyControl).toBeEnabled();
 
     // Resolve the later request first, then return a stale Hide-personal-data snapshot
     // that still has Code Mode enabled. Each response must update only the setting it
@@ -474,18 +513,29 @@ describe("SettingsView setting merges", () => {
     expect(onRegistryChange).toHaveBeenCalledWith(codeModeOff);
 
     const piiOn = { ...registry, codeMode: true, piiRedaction: true };
+    rerender(
+      <ThemeProvider>
+        <SettingsView
+          page="safety"
+          registry={registry}
+          onRegistryChange={onRegistryChange}
+        />
+      </ThemeProvider>,
+    );
     piiRequest.resolve(piiOn);
-    await waitFor(() => expect(piiControl).toBeEnabled());
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: /hide personal data/i })).toBeEnabled(),
+    );
     expect(onRegistryChange).toHaveBeenLastCalledWith({
       ...registry,
       codeMode: false,
       piiRedaction: true,
     });
-    expect(safetyControl).toBeEnabled();
+    expect(screen.getByRole("radio", { name: "Off" })).toBeEnabled();
   });
 });
 
-it("keeps access sets and folder routing under Advanced and changes the default explicitly", async () => {
+it("keeps access sets and folder routing under Access and changes the default explicitly", async () => {
   const user = userEvent.setup();
   const onChange = vi.fn();
   const pinned = { ...registry, version: 3, defaultAccessProfileId: "default" };
@@ -495,14 +545,13 @@ it("keeps access sets and folder routing under Advanced and changes the default 
   });
   render(
     <ThemeProvider>
-      <SettingsView registry={pinned} onRegistryChange={onChange} />
+      <SettingsView page="access" registry={pinned} onRegistryChange={onChange} />
     </ThemeProvider>,
   );
-  const advanced = screen.getByText("Advanced").closest("details")!;
-  expect(advanced).not.toHaveAttribute("open");
-  expect(within(advanced).getByText("Access sets")).toBeInTheDocument();
-  expect(within(advanced).getByText(/folder routing/i)).toBeInTheDocument();
-  await user.click(screen.getByText("Advanced"));
+  const access = screen.getByRole("region", { name: "access" });
+  expect(within(access).getByText("Access sets")).toBeInTheDocument();
+  expect(within(access).getByText(/folder routing/i)).toBeInTheDocument();
+
   await user.click(screen.getByRole("combobox", { name: "Default access" }));
   await user.click(await screen.findByRole("option", { name: "All enabled servers" }));
   await waitFor(() => expect(setDefaultAccess).toHaveBeenCalledWith(null));
@@ -511,7 +560,7 @@ it("keeps access sets and folder routing under Advanced and changes the default 
   );
 });
 
-it("shows the expand affordance for an empty access set", async () => {
+it("shows server permissions immediately for an empty access set", () => {
   const empty = {
     ...registry,
     version: 3,
@@ -519,14 +568,10 @@ it("shows the expand affordance for an empty access set", async () => {
   };
   render(
     <ThemeProvider>
-      <SettingsView registry={empty} onRegistryChange={vi.fn()} />
+      <SettingsView page="access" registry={empty} onRegistryChange={vi.fn()} />
     </ThemeProvider>,
   );
-  await userEvent.click(screen.getByText("Advanced"));
-  const toggle = screen.getByRole("button", { name: /Empty set/ });
-  expect(toggle.querySelector("svg")).not.toHaveClass("invisible");
-  await userEvent.click(toggle);
-  expect(toggle).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByText("Empty set", { selector: "span" })).toBeVisible();
   expect(screen.getByRole("checkbox", { name: /GitHub/ })).not.toBeChecked();
 });
 
@@ -543,7 +588,7 @@ describe("Remove Toolport from all clients", () => {
       { clientId: "codex", path: "/fixture/config.toml", dryRun: false, error: null },
     ]);
     vi.mocked(getRegistry).mockRejectedValue(new Error("refresh failed"));
-    renderSettings();
+    renderSettings("help");
     await user.click(
       screen.getByRole("button", { name: "Remove Toolport from all clients" }),
     );
@@ -572,7 +617,7 @@ describe("Remove Toolport from all clients", () => {
       },
     ]);
     vi.mocked(getRegistry).mockResolvedValue(registry);
-    renderSettings();
+    renderSettings("help");
     await user.click(
       screen.getByRole("button", { name: "Remove Toolport from all clients" }),
     );
@@ -592,4 +637,67 @@ describe("Remove Toolport from all clients", () => {
     expect(screen.getByText("cursor: Client config conflict")).toBeInTheDocument();
     expect(disconnectAllClients).toHaveBeenCalledTimes(1);
   });
+});
+
+it.each([
+  [3, undefined, "ask"],
+  [3, "off", "off"],
+  [1, undefined, "off"],
+] as const)(
+  "matches backend defaults for registry v%s and safety %s",
+  (version, safetyLevel, expected) => {
+    render(
+      <ThemeProvider>
+        <SettingsView
+          page="safety"
+          registry={{ ...registry, version, safetyLevel }}
+          onRegistryChange={vi.fn()}
+        />
+      </ThemeProvider>,
+    );
+    expect(screen.getByRole("radio", { name: levelName(expected) })).toBeChecked();
+    expect(
+      screen.getByText(
+        new RegExp(`Safety is set to ${expected === "ask" ? "Ask" : "Off"}`),
+      ),
+    ).toBeInTheDocument();
+  },
+);
+
+it("shows a team's Ask minimum even when the member chose Off", () => {
+  render(
+    <ThemeProvider>
+      <SettingsView
+        page="safety"
+        registry={{
+          ...registry,
+          version: 3,
+          safetyLevel: "off",
+          teamMinSafetyLevel: "ask",
+        }}
+        onRegistryChange={vi.fn()}
+      />
+    </ThemeProvider>,
+  );
+  expect(screen.getByRole("radio", { name: levelName("ask") })).toBeChecked();
+  expect(
+    screen.getByText(/Destructive calls need your approval before they run/),
+  ).toBeInTheDocument();
+});
+
+function levelName(level: string) {
+  return level === "off" ? "Off" : level === "ask" ? "Ask" : "Strict";
+}
+it.each([
+  "general",
+  "tools",
+  "safety",
+  "access",
+  "connections",
+  "help",
+] as SettingsSubpage[])("shows only the %s settings page", (page) => {
+  renderSettings(page);
+  expect(screen.getAllByRole("region")).toHaveLength(1);
+  expect(screen.getByRole("region", { name: page })).toBeInTheDocument();
+  expect(document.querySelector("details")).toBeNull();
 });

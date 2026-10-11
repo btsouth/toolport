@@ -6,7 +6,11 @@ import { Button } from "@/components/ui/button";
 import { decideApproval, listPendingApprovals, type ApprovalScope } from "@/lib/api";
 import type { PendingApproval } from "@/lib/types";
 import { openExternal } from "@/lib/openUrl";
-import { trustedClientName, shortenClientLabel } from "@/lib/clientIdentity";
+import {
+  trustedClientName,
+  shortenClientLabel,
+  clientIdentityTooltip,
+} from "@/lib/clientIdentity";
 import { toastError } from "@/lib/toast";
 
 /** Fail-closed window (must match approval::DEFAULT_TIMEOUT_SECS on the gateway). A
@@ -47,7 +51,9 @@ const REASON: Record<Reason, { label: string; className: string; Icon: typeof Tr
  * safety net and refreshes immediately on the gateway's `approval-pending` /
  * `approval-resolved` events.
  */
-export function PendingApprovals() {
+export function PendingApprovals({
+  onCountChange,
+}: { onCountChange?: (count: number) => void } = {}) {
   const [pending, setPending] = useState<PendingApproval[]>([]);
   // Ids with a decision in flight: shown dimmed + disabled, removed authoritatively by the
   // resolved event / poll (NOT optimistically), so a poll landing before the backend
@@ -61,16 +67,18 @@ export function PendingApprovals() {
   const prevCount = useRef(0);
   // Monotonic request id: the interval poll, both event listeners, and a decision's error
   // path can all start a refresh, so an older response can land last and momentarily
-  // resurrect a resolved row (or hide a new one). Only the newest request may write,
-  // the same guard the sidebar badge and the quarantine card already carry.
+  // resurrect a resolved row (or hide a new one). Order applied responses rather than
+  // outstanding requests so a slow IPC call is not starved by every newer poll.
   const reqId = useRef(0);
+  const appliedId = useRef(0);
 
   const refresh = useCallback(async () => {
     const id = ++reqId.current;
     try {
       const list = await listPendingApprovals();
-      // A stale response must not write: the newer list is the authority.
-      if (id !== reqId.current) return;
+      // A response older than the last applied list must not write.
+      if (id <= appliedId.current) return;
+      appliedId.current = id;
       setPending(list);
       // Prune resolving ids the backend has confirmed gone (authoritative removal).
       setResolving((s) => {
@@ -96,6 +104,10 @@ export function PendingApprovals() {
     };
   }, [refresh]);
 
+  useEffect(() => {
+    onCountChange?.(pending.length);
+  }, [pending.length, onCountChange]);
+
   // Tick once a second while anything is pending, to drive the countdown.
   useEffect(() => {
     if (pending.length === 0) return;
@@ -115,7 +127,9 @@ export function PendingApprovals() {
     setResolving((s) => new Set(s).add(id));
     try {
       await decideApproval(id, approved, scope);
-      // Intentionally NOT removed here — the approval-resolved event + poll remove it.
+      // Read the authoritative queue after the acknowledgement as well as on
+      // events. A delayed or missed event must not leave the decision onscreen.
+      await refresh();
     } catch (e) {
       toastError(`Couldn't record your decision: ${e}`);
       setResolving((s) => {
@@ -156,7 +170,7 @@ export function PendingApprovals() {
         role="alertdialog"
         aria-modal="false"
         aria-label="Tool calls awaiting your approval"
-        className="animate-in fade-in slide-in-from-top-2 pointer-events-auto relative w-full max-w-lg overflow-hidden rounded-xl border border-warning/40 bg-popover/95 shadow-2xl ring-1 ring-warning/10 backdrop-blur outline-none focus-visible:ring-2 focus-visible:ring-warning"
+        className="animate-in fade-in slide-in-from-top-2 pointer-events-auto relative flex max-h-[calc(100dvh-2rem)] w-full max-w-lg flex-col overflow-hidden rounded-r-[10px] border-l-[3px] border-warning bg-popover shadow-2xl outline-none focus-visible:ring-2 focus-visible:ring-warning"
       >
         {/* Announce count changes to screen readers without re-announcing on every countdown
          * tick (the visible timer lives elsewhere; this text only changes when the count does). */}
@@ -164,7 +178,7 @@ export function PendingApprovals() {
           {pending.length} request{pending.length > 1 ? "s" : ""} awaiting your action.
           Press Escape to cancel.
         </div>
-        <header className="flex items-center gap-3 border-b border-border/60 px-4 py-3">
+        <header className="flex shrink-0 items-center gap-3 border-b border-border/60 px-4 py-3">
           <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-warning/15 text-warning">
             <ShieldAlert className="size-4" />
           </span>
@@ -177,12 +191,16 @@ export function PendingApprovals() {
           </div>
         </header>
 
-        <ul className="max-h-[70vh] divide-y divide-border/60 overflow-auto">
+        <ul className="min-h-0 divide-y divide-border/60 overflow-y-auto overscroll-contain">
           {pending.map((a) => {
             const reason = REASON[a.reason];
             const clientName = trustedClientName(a);
             const reportedLabel =
-              a.clientLabel && a.clientLabel !== clientName ? a.clientLabel : null;
+              a.clientLabel &&
+              a.clientLabel !== clientName &&
+              !clientName.endsWith(" (reported)")
+                ? a.clientLabel
+                : null;
             const urlElicitation = a.urlElicitation;
             const piiRelease = a.piiRelease;
             // Count down to the broker's authoritative deadline; fall back to
@@ -219,7 +237,10 @@ export function PendingApprovals() {
                         </>
                       )}
                     </div>
-                    <div className="mt-1 text-xs" title={a.client ?? undefined}>
+                    <div
+                      className="mt-1 text-xs"
+                      title={clientIdentityTooltip(a) ?? a.client ?? undefined}
+                    >
                       {clientName} wants to run this ·{" "}
                       {a.reason === "destructive"
                         ? "destructive tool"
@@ -261,7 +282,7 @@ export function PendingApprovals() {
                     <div className="mb-1 text-[0.7rem] font-medium uppercase tracking-wide text-muted-foreground">
                       Would send to {piiRelease.server}
                     </div>
-                    <ul className="divide-y divide-border/60 rounded-md border border-destructive/40 bg-destructive/5">
+                    <ul className="divide-y divide-border/60 toolport-alert border-destructive bg-destructive/8">
                       {piiRelease.values.map((v) => (
                         <li key={v.token} className="p-2.5 text-xs">
                           <div className="font-mono break-all text-foreground">

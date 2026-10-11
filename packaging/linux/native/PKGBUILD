@@ -33,12 +33,12 @@ sha256sums=('d521eb818d9d4da9cab43c792291a21108e1ab874aedecb01804655c004d2af0'
 build() {
   cd "toolport-$pkgver/src-tauri"
   cargo build --release --locked --no-default-features \
-    --features gtk-desktop --bin toolport-gtk --bin toolport-gateway
+    --features gtk-desktop,search-static --bin toolport-gtk --bin toolport-gateway
 }
 
 check() {
   cd "toolport-$pkgver/src-tauri"
-  cargo test --locked --no-default-features --features gtk-desktop,test-support \
+  cargo test --locked --no-default-features --features gtk-desktop,search-static,test-support \
     --lib linux_native::
 }
 

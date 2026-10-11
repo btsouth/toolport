@@ -8,6 +8,8 @@ written automatically when you connect:
 
 - `TOOLPORT_CLIENT_ID=<id>` - identifies this client for live profile resolution
   (written automatically when you Connect a client).
+- `TOOLPORT_ATTRIBUTION_ID=<id>` - display-only identity added by repairs and
+  plugin launches. It never selects access, profile, or discovery policy.
 - `TOOLPORT_PROFILE=<name>` - initial profile scope for a scoped install. Unset =
   follow Default access (resolved live via `TOOLPORT_CLIENT_ID`).
 - `TOOLPORT_DISCOVERY=lazy|full|grouped` - optional process default for a standalone
@@ -120,11 +122,11 @@ Before changing it, Toolport saves the 1.x file next to it as
 `exports/` in the data directory, never overwriting a file there: personal agent
 rules as `rules-<date>.md`, saved routines as `routines-<date>.json` (the original
 `routines.json` stays), and agent permission rules as `agent-permissions-<date>.json`.
-Client files are not edited. The upgrade sets one safety level (Strict if you blocked
-destructive tools, quarantined drift or blocked injection, otherwise Ask) and turns
-Code Mode off. Released 1.x builds do not check the schema version, so 2.0 keeps the
-1.x safety toggles in step with the level: a 1.x process still running during the
-upgrade enforces the same policy. To go back to 1.x, restore the `.bak` file.
+Client files are not edited. Safety, Code Mode, discovery and each server's
+environment keep their 1.x behavior; see [Upgrading from 1.x](upgrading-to-2.md).
+Released 1.x builds do not check the schema version, so 2.0 keeps the 1.x safety
+toggles in step with the level: a 1.x process still running during the upgrade
+enforces the same policy. To go back to 1.x, restore the `.bak` file.
 
 ### Downstream lifecycle
 

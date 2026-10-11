@@ -25,6 +25,8 @@
 //!   object per line. This is what lets a test assert exactly what bytes the
 //!   gateway sent downstream, which is the regression net for the envelope
 //!   transparency work (SOU-444).
+//! - `MOCK_MCP_WIRE_TRACE`: timestamped receive and response-flush events for
+//!   concurrent fixtures, separate from the request transcript.
 //! - `MOCK_MCP_FAIL_STARTS=<n>` with `MOCK_MCP_START_COUNTER=<path>` — the first
 //!   `n` starts exit before the handshake, like a server launched before the
 //!   network is up. The counter file records every start, so a test can also
@@ -123,6 +125,7 @@ struct Config {
     revision: Revision,
     strict: bool,
     transcript: Option<String>,
+    wire_trace: Option<String>,
     call_delay: Option<std::time::Duration>,
     start_delay: Option<std::time::Duration>,
     garbage_stdout: Option<std::time::Duration>,
@@ -138,6 +141,9 @@ impl Config {
             revision: Revision::from_env(),
             strict: std::env::var("MOCK_MCP_STRICT").as_deref() == Ok("1"),
             transcript: std::env::var("MOCK_MCP_TRANSCRIPT")
+                .ok()
+                .filter(|p| !p.is_empty()),
+            wire_trace: std::env::var("MOCK_MCP_WIRE_TRACE")
                 .ok()
                 .filter(|p| !p.is_empty()),
             call_delay: std::env::var("MOCK_MCP_CALL_DELAY_MS")
@@ -213,6 +219,28 @@ fn record(cfg: &Config, req: &Value) {
     }
 }
 
+// Optional concurrent-fixture diagnostics, separate from the request transcript.
+fn trace(cfg: &Config, event: &str, message: &Value) {
+    let Some(path) = cfg.wire_trace.as_deref() else {
+        return;
+    };
+    let entry = json!({
+        "pid": std::process::id(),
+        "timeUs": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_micros(),
+        "event": event,
+        "message": message,
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(format!("{entry}\n").as_bytes());
+    }
+}
+
 /// Decorate a result per the negotiated revision. Modern results carry a
 /// required `resultType` and a `serverInfo` `_meta` entry; list-shaped results
 /// additionally carry the `CacheableResult` fields. Legacy revisions are left
@@ -242,9 +270,19 @@ fn decorate(cfg: &Config, method: &str, mut result: Value) -> Value {
     result
 }
 
+/// Optional disposable catalog for gateway call-resolution regressions.
+fn fixture_tools() -> Option<Vec<Value>> {
+    let path = std::env::var_os("MOCK_MCP_TOOLS_FILE")?;
+    serde_json::from_slice(&std::fs::read(path).expect("read fixture tools"))
+        .expect("valid fixture tool catalog")
+}
+
 /// The advertised tool list. `greet` only appears once the server has "grown"
 /// (after a `grow` call), modeling a runtime tool-set change.
 fn tool_list(cfg: &Config, grown: bool) -> Value {
+    if let Some(tools) = fixture_tools() {
+        return json!({"tools": tools});
+    }
     let mut tools = vec![
         json!({ "name": "echo", "description": "Echo back the text argument.",
                 "inputSchema": { "type": "object", "properties": { "text": { "type": "string" } } } }),
@@ -265,6 +303,15 @@ fn tool_list(cfg: &Config, grown: bool) -> Value {
         json!({ "name": "legacy_elicitation", "description": "Issue a legacy server-to-client elicitation request.",
                 "inputSchema": { "type": "object", "properties": {} } }),
     ];
+    if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") {
+        tools.extend([
+            json!({"name":"structured", "description":"Return typed fixture data.",
+                "inputSchema":{"type":"object","properties":{}},
+                "outputSchema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"]}}),
+            json!({"name":"large", "description":"Return a bounded large fixture result.",
+                "inputSchema":{"type":"object","properties":{"bytes":{"type":"integer"}}}}),
+        ]);
+    }
     // A fixture marker lets rooted launches advertise different schemas for
     // the same tool name, as real project-scoped servers can.
     if let Ok(marker) = std::fs::read_to_string("toolport-mock-schema.txt") {
@@ -481,6 +528,12 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
             return None;
         }
         "tools/list" => tool_list(cfg, state.grown),
+        "resources/read" if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") => {
+            json!({"contents":[{"uri":req["params"]["uri"],"mimeType":"text/plain","text":"fixture resource"}]})
+        }
+        "prompts/get" if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") => {
+            json!({"messages":[{"role":"user","content":{"type":"text","text":"fixture prompt"}}]})
+        }
         "resources/list" => resource_list(state.grown),
         "resources/subscribe" => {
             if let Some(uri) = req["params"]["uri"].as_str() {
@@ -509,6 +562,19 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
                 .and_then(|p| p.get("arguments"))
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            // Keep echo's argument behavior in custom catalogs too.
+            if name != "echo"
+                && fixture_tools().is_some_and(|tools| tools.iter().any(|tool| tool["name"] == name))
+            {
+                return Some(success(
+                    id,
+                    decorate(
+                        cfg,
+                        method,
+                        json!({"content": [{"type": "text", "text": name}]}),
+                    ),
+                ));
+            }
             // `echo_meta` reflects the request's `_meta` back as structured
             // content so a test can assert end-to-end propagation through the
             // gateway without reading the transcript file.
@@ -603,6 +669,20 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
                 return None;
             }
             let text = match name {
+                "structured" if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") => {
+                    return Some(success(
+                        id,
+                        json!({"content":[{"type":"text","text":"{\"answer\":42}"}],"structuredContent":{"answer":42},"isError":false}),
+                    ));
+                }
+                "large" if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") => {
+                    let bytes = args
+                        .get("bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        .min(17 * 1024 * 1024);
+                    "x".repeat(bytes as usize)
+                }
                 "echo" => args
                     .get("text")
                     .and_then(|t| t.as_str())
@@ -873,6 +953,7 @@ fn serve_concurrent(cfg: Config, state: State) {
             continue;
         };
         record(&cfg, &req);
+        trace(&cfg, "received", &req);
         let (cfg, state, out) = (Arc::clone(&cfg), Arc::clone(&state), Arc::clone(&out));
         let barrier = barrier.clone();
         std::thread::spawn(move || {
@@ -904,17 +985,38 @@ fn serve_concurrent(cfg: Config, state: State) {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
             let mut pre = Vec::new();
-            let resp = handle(
-                &cfg,
-                &mut state.lock().unwrap_or_else(|e| e.into_inner()),
-                &req,
-                &mut pre,
-            );
+            let (resp, grew) = {
+                let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                let was_grown = state.grown;
+                let resp = handle(&cfg, &mut state, &req, &mut pre);
+                (resp, state.grown && !was_grown)
+            };
             let mut out = out.lock().unwrap_or_else(|e| e.into_inner());
+            let mut write_error = None;
             for message in pre.iter().chain(resp.as_ref()) {
-                let _ = writeln!(out, "{message}");
+                if let Err(error) = writeln!(out, "{message}") {
+                    write_error = Some(error.to_string());
+                }
             }
-            let _ = out.flush();
+            if grew {
+                for method in [
+                    "notifications/tools/list_changed",
+                    "notifications/resources/list_changed",
+                    "notifications/prompts/list_changed",
+                ] {
+                    let _ = writeln!(out, "{}", json!({"jsonrpc":"2.0","method":method}));
+                }
+            }
+            let flushed = out.flush();
+            drop(out);
+            if let Some(response) = resp.as_ref() {
+                trace(
+                    &cfg,
+                    "response-flush",
+                    &json!({"response": response, "writeError": write_error,
+                        "flushError": flushed.err().map(|e| e.to_string())}),
+                );
+            }
         });
     }
 }

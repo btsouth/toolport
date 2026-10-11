@@ -7,6 +7,8 @@ import { ClientLogo } from "@/components/ClientLogo";
 import { ServerLogo } from "@/components/ServerLogo";
 import type {
   AuditEntry,
+  ClientSession,
+  ClientActivity,
   PendingApproval,
   Registry,
   SavingsSummary,
@@ -27,6 +29,21 @@ const servers: ServerEntry[] = ["GitHub", "Linear", "Stripe"].map((name, i) => (
   url: null,
   source: "manual",
 }));
+const authGuidance = new URLSearchParams(location.search).has("auth-guidance");
+if (authGuidance) {
+  servers[0] = {
+    ...servers[0],
+    name: "Remote project tools",
+    transport: "http",
+    command: null,
+    url: "https://example.invalid/mcp",
+  };
+  servers[1] = {
+    ...servers[1],
+    name: "Service API tools",
+    env: [{ key: "API_KEY", value: "", secret: true }],
+  };
+}
 const longNames = new URLSearchParams(location.search).has("long-names");
 if (longNames) servers[0].name = "A".repeat(70);
 const registry: Registry = {
@@ -42,6 +59,33 @@ const registry: Registry = {
   accessUpgradeNoticeDismissed: false,
   clientScopes: { codex: "" },
 };
+const pagesTruth = new URLSearchParams(location.search).has("pages-truth");
+if (pagesTruth) {
+  registry.safetyLevel = "off";
+  registry.team = {
+    teamId: "fixture-team",
+    teamName: "Example team",
+    role: "member",
+    serverUrl: "https://teams.example.invalid",
+    lastVersion: 12,
+  };
+  servers[0] = {
+    ...servers[0],
+    name: "Team Linear",
+    transport: "http",
+    command: null,
+    url: "https://linear.example.invalid/mcp",
+    source: "team:fixture-team",
+  };
+  servers[1] = {
+    ...servers[1],
+    name: "Project tools",
+    transport: "http",
+    command: null,
+    url: "https://projects.example.invalid/mcp",
+  };
+  servers[2] = { ...servers[2], name: "Local tools", command: "/bin/false" };
+}
 const memberReviewFixture = new URLSearchParams(location.search).has("teams-review");
 if (memberReviewFixture) {
   registry.team = {
@@ -112,14 +156,62 @@ if (memberReviewFixture) {
   } as NonNullable<Registry["team"]>;
 }
 
+const personalFixture = new URLSearchParams(location.search).get("personal-sync");
+if (personalFixture && personalFixture !== "setup") {
+  registry.team = {
+    serverUrl: "https://teams.toolport.app",
+    teamId: "personal-fixture",
+    role: "admin",
+    lastVersion: 3,
+    accountStatus: {
+      personalSync: true,
+      plan: personalFixture === "trial" ? "pro" : "free",
+      trialActive: personalFixture === "trial",
+      trialEndsAt: Date.now() + 7 * 86400000,
+      freeSyncGraceEndsAt: personalFixture === "grace" ? Date.now() + 2 * 86400000 : null,
+      deviceId: "fixture",
+      canReceiveConfig: personalFixture !== "blocked",
+      reason:
+        personalFixture === "blocked"
+          ? "Choose this device in Your account to resume sync."
+          : null,
+    },
+    personalSyncState: {
+      lastSyncedAt: Date.now(),
+      error: personalFixture === "blocked" ? "Sync is paused on this device" : null,
+    },
+  };
+}
 const approvalFixture = new URLSearchParams(location.search).has("approvals");
+const sessionFixture = new URLSearchParams(location.search).has("sessions");
+const callerFixture = new URLSearchParams(location.search).has("caller-names");
+const sessionRows: ClientSession[] = sessionFixture
+  ? [
+      {
+        sessionId: "f3-fixture-session",
+        clientName: "Unknown app (via Cursor)",
+        clientLabel: "kt 1",
+        clientType: "unknown",
+        gatewayVersion: "2.0.0-preview.3",
+        phase: "checkpoint",
+        reason: "tools_list",
+        transport: "stdio",
+        toolsListCount: 3,
+        listChangedCount: 1,
+        firstCatalogSize: 4,
+        firstCatalogRevision: 1,
+        catalogRevision: 2,
+        contentChanged: true,
+      },
+    ]
+  : [];
 let pendingApproval: PendingApproval[] = approvalFixture
   ? [
       {
         id: "fixture-approval",
         client: "adapter:claude-code",
-        clientName: "Claude Code",
-        clientLabel: "Claude Code 2.1.0",
+        clientName: sessionFixture ? "Unknown app (via Cursor)" : "Claude Code",
+        clientLabel: sessionFixture ? "kt 1" : "Claude Code 2.1.0",
         server: "team-slack",
         tool: "delete_issue",
         reason: "destructive",
@@ -148,8 +240,10 @@ if (approvalFixture) {
       ok: true,
       durationMs: 850,
       client: "adapter:claude-code",
-      clientName: "Claude Code",
-      clientLabel: "Claude Code 2.1",
+      clientName: sessionFixture ? "Unknown app (via Cursor)" : "Claude Code",
+      clientLabel: sessionFixture ? "kt 1" : "Claude Code 2.1",
+      dispatchMs: sessionFixture ? 3 : undefined,
+      cold: sessionFixture ? false : undefined,
     },
     ...[
       "approved",
@@ -173,6 +267,108 @@ if (approvalFixture) {
     })),
   );
 }
+if (callerFixture) {
+  const identities = [
+    { client: "adapter:inbox", clientName: "inbox" },
+    { clientName: "Unknown client", clientLabel: "inbox" },
+    {},
+    { clientName: "[private]" },
+  ];
+  auditRows.splice(
+    0,
+    auditRows.length,
+    ...identities.map((identity, index) => ({
+      ts: Date.now() - 1000,
+      server: "GitHub",
+      tool: `list_issues_${index}`,
+      ok: true,
+      durationMs: 12,
+      ...identity,
+    })),
+  );
+  sessionRows.splice(
+    0,
+    sessionRows.length,
+    ...identities.map<ClientSession>((identity, index) => ({
+      sessionId: `caller-fixture-${index}`,
+      clientType: "unknown",
+      gatewayVersion: "2.0.0-preview.6",
+      phase: "close",
+      reason: "client_disconnect",
+      transport: "stdio",
+      toolsListCount: 1,
+      listChangedCount: 0,
+      firstCatalogSize: 4,
+      firstCatalogRevision: 1,
+      catalogRevision: 1,
+      contentChanged: false,
+      clientName: "Unrecorded client",
+      ...identity,
+    })),
+  );
+  pendingApproval = identities.slice(0, 3).map((identity, index) => ({
+    id: `caller-approval-${index}`,
+    server: "team-slack",
+    tool: `delete_issue_${index}`,
+    reason: "destructive",
+    arguments: { issue: 42 },
+    deadlineMs: Date.now() + 120000,
+    client: null,
+    ...identity,
+  }));
+}
+const dogfoodFixture = new URLSearchParams(location.search).has("dogfood");
+if (dogfoodFixture) {
+  sessionRows.splice(
+    0,
+    sessionRows.length,
+    ...Array.from({ length: 5 }, (_, i): ClientSession => ({
+      sessionId: `codex-${i}`,
+      client: "adapter:codex",
+      clientName: "Codex",
+      clientType: "codex",
+      gatewayVersion: "2.0.0-preview.6",
+      phase: "close",
+      reason: "client_disconnect",
+      transport: "stdio",
+      toolsListCount: 0,
+      listChangedCount: 0,
+      firstCatalogSize: 1711,
+      firstCatalogRevision: 1,
+      catalogRevision: 1,
+      contentChanged: false,
+    })),
+  );
+  auditRows.splice(
+    0,
+    auditRows.length,
+    ...["search", "describe", "status", "fetch"].map((tool, i) => ({
+      ts: Date.now() - (i + 1) * 60000,
+      kind: "internal",
+      server: "toolport",
+      tool,
+      ok: true,
+      client: "adapter:codex",
+      clientName: "Codex",
+      durationMs: 5,
+      cold: false,
+      dispatchMs: 2,
+    })),
+    {
+      ts: Date.now() - 300000,
+      server: "GitHub",
+      tool: "list_issues",
+      ok: true,
+      client: "adapter:codex",
+      clientName: "Codex",
+      durationMs: 12,
+      piiReplaced: 1,
+      cold: false,
+      dispatchMs: 3,
+    },
+  );
+}
+
 const savingsSummary: SavingsSummary = {
   tokensSaved: 35_000,
   tokenizedLoads: 12,
@@ -310,6 +506,21 @@ mockIPC(
         return setupCatalog;
       case "add_server":
         return fixtureAdd(args.entry as ServerEntry);
+      case "test_secret_reference":
+        return null;
+      case "set_secret_reference": {
+        const server = registry.servers.find((s) => s.id === args.serverId);
+        if (server) {
+          let entry = server.env.find((e) => e.key === args.key);
+          if (!entry) {
+            entry = { key: String(args.key), value: null, secret: true };
+            server.env.push(entry);
+          }
+          entry.source = { ref: String(args.reference) };
+          entry.value = null;
+        }
+        return structuredClone(registry);
+      }
       case "set_secret":
       case "set_launch_secret":
         return structuredClone(registry);
@@ -377,6 +588,12 @@ mockIPC(
       case "dismiss_access_upgrade_notice":
         registry.accessUpgradeNoticeDismissed = true;
         return registry;
+      case "dismiss_removed_features_notice":
+        if (registry.removedFeaturesNotice)
+          registry.removedFeaturesNotice.dismissed = true;
+        return registry;
+      case "open_exports_dir":
+        return null;
       case "set_default_access":
         registry.defaultAccessProfileId = args.profile as string | null;
         return registry;
@@ -409,6 +626,15 @@ mockIPC(
         if (server) server.enabled = args.enabled as boolean;
         return structuredClone(registry);
       }
+      case "personal_sync_local_only": {
+        const server = registry.servers.find((server) => server.id === args.serverId);
+        if (server) server.syncLocalOnly = args.localOnly as boolean;
+        return structuredClone(registry);
+      }
+      case "personal_sync_new_servers_local_only":
+        if (registry.team?.personalSyncState)
+          registry.team.personalSyncState.newServersLocalOnly = args.localOnly as boolean;
+        return structuredClone(registry);
       case "plugin:process|exit":
         return null;
       case "export_config":
@@ -435,6 +661,7 @@ mockIPC(
             gatewayInstalled: !setupFixture || setupConnected,
             entryState: !setupFixture || setupConnected ? "managed" : "absent",
             discovery: {
+              autoMode: "full",
               nativeToolSearch: true,
               toolsListChanged: null,
               evidence: "fixture",
@@ -442,10 +669,45 @@ mockIPC(
             error: null,
           },
         ];
+      case "team_sync_status":
+        return { state: "offline", lastSuccessMs: 1791504000000 };
+      case "team_sync":
+        throw new Error("Team server is unreachable");
       case "probe_servers":
-        return servers.map((s) => ({
+        if (pagesTruth)
+          return [
+            {
+              serverId: servers[0].id,
+              ok: false,
+              toolCount: 0,
+              error: "HTTP 401 (needs authentication)",
+              authRequired: true,
+              authTarget: "endpoint",
+              failure: { kind: "auth", target: "endpoint" },
+            },
+            {
+              serverId: servers[1].id,
+              ok: false,
+              toolCount: 0,
+              error: "Connection refused",
+              authRequired: false,
+              failure: { kind: "unavailable", after_send: false },
+            },
+            {
+              serverId: servers[2].id,
+              ok: false,
+              toolCount: 0,
+              error: "Server exited with status 1",
+              authRequired: false,
+              failure: { kind: "internal" },
+            },
+          ];
+        return servers.map((s, i) => ({
           serverId: s.id,
-          ok: true,
+          ok: !authGuidance || i === 2,
+          authRequired: authGuidance && i < 2,
+          authTarget:
+            authGuidance && i < 2 ? (i === 0 ? "endpoint" : "service_credential") : null,
           toolCount: 25,
           error: null,
         }));
@@ -462,10 +724,51 @@ mockIPC(
         return savingsSummary;
       case "plugin:app|version":
         return "1.18.0-fixture";
+      case "get_client_sessions": {
+        if (new URLSearchParams(location.search).has("raw-sessions")) return sessionRows;
+        const grouped = new Map<string, ClientActivity>();
+        for (const row of sessionRows) {
+          const key = `${row.clientName}:${row.clientLabel ?? ""}`;
+          const previous = grouped.get(key);
+          grouped.set(key, {
+            ...row,
+            lastActiveMs: Date.now() - 180000,
+            callsToday: (previous?.callsToday ?? 0) + 12,
+            sessionCount: (previous?.sessionCount ?? 0) + 1,
+          });
+        }
+        return [...grouped.values()];
+      }
       case "get_audit_log":
         return auditRows;
       case "audit_stats":
-        return { total: 200, errors: 0, errorRate: 0, servers: [] };
+        return {
+          total: dogfoodFixture ? 5225 : 200,
+          errors: 0,
+          errorRate: 0,
+          servers: [
+            {
+              server: "GitHub",
+              calls: dogfoodFixture ? 5225 : 200,
+              errors: 0,
+              errorRate: 0,
+              avgMs: 12,
+              p95Ms: 12,
+              lastTs: auditRows[auditRows.length - 1].ts,
+              tools: [
+                {
+                  tool: "list_issues",
+                  calls: dogfoodFixture ? 5225 : 200,
+                  errors: 0,
+                  errorRate: 0,
+                  avgMs: 12,
+                  p95Ms: 12,
+                  lastTs: auditRows[auditRows.length - 1].ts,
+                },
+              ],
+            },
+          ],
+        };
       case "list_server_tools":
         return [
           {
@@ -505,13 +808,31 @@ mockIPC(
       case "list_pending_approvals":
         return pendingApproval;
       case "decide_approval":
-        pendingApproval = [];
+        pendingApproval = pendingApproval.filter((approval) => approval.id !== args.id);
         return null;
       case "clients_needing_restart":
       case "list_allowed_tools":
       case "list_quarantined":
       case "get_security_events":
+        return [];
       case "get_search_traces":
+        return auditRows
+          .filter((row) => row.kind === "internal" && row.tool === "search")
+          .map((row) => ({
+            ts: row.ts,
+            client: row.clientName,
+            query: "GitHub issues",
+            top: "github_list_issues",
+            names: ["github_list_issues"],
+            returned: 1,
+            total: 75,
+            returnedTokens: 100,
+            flatTokens: 1000,
+            savedTokens: 900,
+            responseContentBytes: 400,
+            escalated: false,
+            mode: "lexical",
+          }));
       case "get_inspect_log":
       case "list_tool_identities":
         return [];
@@ -563,7 +884,7 @@ if (new URLSearchParams(location.search).has("logos")) {
       ))}
     </main>,
   );
-} else if (memberReviewFixture) {
+} else if (memberReviewFixture || personalFixture) {
   function ReviewFixture() {
     const [current, setCurrent] = useState(registry);
     return (

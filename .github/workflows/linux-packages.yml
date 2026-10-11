@@ -41,6 +41,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
       - name: Ubuntu upgrade, Debian and Fedora fresh installs
         run: scripts/test-linux-packages.sh .verify/native-packages/*.deb .verify/native-packages/*.rpm .verify/native-packages/old/*.deb
+        env:
+          TOOLPORT_PACKAGE_TEST_IMAGE_PREFIX: mirror.gcr.io/library/
       - name: Keep tested packages
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

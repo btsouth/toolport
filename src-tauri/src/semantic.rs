@@ -12,6 +12,7 @@
 //!   - Off by default. When off, or on any failure, the caller uses pure lexical
 //!     ranking, so this can never make search worse than today.
 //!   - Tool embeddings are cached on disk by content hash, so a catalog embeds once.
+use crate::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -134,16 +135,20 @@ fn embed_batch(cfg: &SemanticConfig, inputs: &[String]) -> Option<Vec<Vec<f32>>>
         crate::downstream::guarded_agent_with_timeout(false, std::time::Duration::from_secs(10));
     let mut req = agent
         .post(&cfg.endpoint)
-        .set("Content-Type", "application/json");
+        .set_header("Content-Type", "application/json");
     if let Some(key) = crate::brand::env_var("TOOLPORT_EMBED_KEY", "CONDUIT_EMBED_KEY") {
         if !key.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {key}"));
+            req = req.set_header("Authorization", &format!("Bearer {key}"));
         }
     }
     let resp: Value = req
         .send_json(json!({ "model": cfg.model, "input": inputs }))
+        .retain_status_body()
         .ok()?
-        .into_json()
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
         .ok()?;
     let data = resp.get("data")?.as_array()?;
     let mut out = Vec::with_capacity(data.len());

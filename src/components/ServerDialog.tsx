@@ -1,3 +1,5 @@
+import { secretReferenceReview } from "@/lib/secretRefs";
+import { SecretReferenceField } from "@/components/SecretReferenceField";
 import { useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
@@ -24,6 +26,7 @@ import {
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
 import { formatArgs, parseArgs } from "@/lib/args";
 import { isDownloadLauncher } from "@/lib/launcher";
+import { riskySyncEnv, syncsByDefault } from "@/lib/personalSync";
 import type {
   LaunchConfig,
   Registry,
@@ -42,6 +45,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -80,6 +84,19 @@ type TestResult = Extract<TestState, { status: "ok" | "fail" }>;
 
 const IDLE_TEST: TestState = { status: "idle", message: "" };
 
+/** What "Same on every machine" shows for a plain value. A saved or chosen
+ * answer wins. A name the server did not have yet gets sync's default; an old
+ * value nobody marked stays on this machine. */
+export function envRowSyncs(
+  row: { key: string; value: string; portable?: boolean },
+  saved: { key: string }[],
+): boolean {
+  if (riskySyncEnv(row.key)) return false;
+  if (row.portable !== undefined) return row.portable;
+  const key = row.key.trim();
+  return !saved.some((e) => e.key === key) && syncsByDefault(key, row.value);
+}
+
 export function ServerDialog({
   trigger,
   onSaved,
@@ -98,6 +115,7 @@ export function ServerDialog({
     args: formatArgs(initial?.args ?? []),
     url: initial?.url ?? "",
     cwd: initial?.cwd ?? "",
+    inheritEnv: initial?.inheritEnv ?? false,
     initializeTimeoutSeconds:
       initial?.initializeTimeoutMs == null
         ? ""
@@ -106,12 +124,20 @@ export function ServerDialog({
   // Env vars (API keys etc.). Values are vaulted in the OS keychain, never stored
   // in the registry, so existing secrets show as declared keys with empty values.
   const [envRows, setEnvRows] = useState<
-    { key: string; value: string; secret?: boolean }[]
+    {
+      key: string;
+      value: string;
+      secret?: boolean;
+      portable?: boolean;
+      source?: { ref: string };
+    }[]
   >(
     initial?.env.map((e) => ({
       key: e.key,
       value: e.secret ? "" : (e.value ?? ""),
       secret: e.secret,
+      source: e.source,
+      portable: e.portable,
     })) ?? [],
   );
   const [launch, setLaunch] = useState<LaunchConfig | null>(initial?.launch ?? null);
@@ -123,6 +149,7 @@ export function ServerDialog({
       ]) ?? [],
     ),
   );
+  const [localOnly, setLocalOnly] = useState(initial?.syncLocalOnly === true);
   const [bindingCleared, setBindingCleared] = useState(false);
   const [touched, setTouched] = useState<Set<string>>(() => new Set());
   const [pasteReview, setPasteReview] = useState<ParsedSnippetServer[] | null>(null);
@@ -166,6 +193,7 @@ export function ServerDialog({
     }
     if (next) {
       setPartialEdit(null);
+      setLocalOnly(initial?.syncLocalOnly === true);
       setForm({
         name: initial?.name ?? "",
         transport: (initial?.transport ?? "stdio") as Transport,
@@ -173,6 +201,7 @@ export function ServerDialog({
         args: formatArgs(initial?.args ?? []),
         url: initial?.url ?? "",
         cwd: initial?.cwd ?? "",
+        inheritEnv: initial?.inheritEnv ?? false,
         initializeTimeoutSeconds:
           initial?.initializeTimeoutMs == null
             ? ""
@@ -183,6 +212,8 @@ export function ServerDialog({
           key: e.key,
           value: e.secret ? "" : (e.value ?? ""),
           secret: e.secret,
+          source: e.source,
+          portable: e.portable,
         })) ?? [],
       );
       setLaunch(initial?.launch ?? null);
@@ -247,6 +278,7 @@ export function ServerDialog({
         args: formatArgs(s.args),
         url: s.url ?? "",
         cwd: "",
+        inheritEnv: false,
         initializeTimeoutSeconds: "",
       });
       setEnvRows(
@@ -276,8 +308,12 @@ export function ServerDialog({
   function buildEntry(withSecretValues: boolean): ServerEntry {
     const declared = envRows.filter((r) => r.key.trim());
     return {
+      // Saving replaces the whole entry, so an edit starts from the saved one
+      // and keeps what this dialog doesn't show, like switched-off tools.
+      ...(editing ? initial : undefined),
       id: currentEditId ?? "",
       enabled: initial?.enabled ?? false,
+      syncLocalOnly: localOnly,
       name: form.name.trim(),
       transport: form.transport,
       command: isStdio ? form.command.trim() || null : null,
@@ -288,22 +324,36 @@ export function ServerDialog({
               ...launch,
               inputs: launch.inputs.map((input) => ({
                 ...input,
-                value: input.secret
-                  ? withSecretValues
-                    ? launchValues[input.key] || null
-                    : null
-                  : launchValues[input.key] || null,
+                value: input.source
+                  ? null
+                  : input.secret
+                    ? withSecretValues
+                      ? launchValues[input.key] || null
+                      : null
+                    : launchValues[input.key] || null,
               })),
             }
           : null,
+      headerKeys: initial?.headerKeys,
+      secretSources: initial?.secretSources,
       env: declared.map((r) => ({
         key: r.key.trim(),
-        value: (withSecretValues || r.secret === false) && r.value ? r.value : null,
-        secret: r.secret !== false,
+        value:
+          !r.source && (withSecretValues || r.secret === false) && r.value
+            ? r.value
+            : null,
+        secret: r.source ? true : r.secret !== false,
+        ...(r.source ? { source: r.source } : {}),
+        // Left out unless saved or chosen, so sync's default for a new
+        // value applies (the box shows that default).
+        ...(!r.source && r.secret === false && r.portable !== undefined
+          ? { portable: r.portable && !riskySyncEnv(r.key) }
+          : {}),
       })),
       url: isStdio ? null : form.url.trim() || null,
       source: bindingCleared ? "manual" : (initial?.source ?? "manual"),
       cwd: isStdio ? form.cwd.trim() || null : null,
+      inheritEnv: isStdio && form.inheritEnv,
       requestTimeoutMs:
         isStdio || initialUsesLocalCommand ? null : initial?.requestTimeoutMs,
       initializeTimeoutMs: form.initializeTimeoutSeconds.trim()
@@ -399,7 +449,7 @@ export function ServerDialog({
       const failedKeys: string[] = [];
       if (id) {
         for (const r of declared) {
-          if (!r.value || r.secret === false) continue;
+          if (r.source || !r.value || r.secret === false) continue;
           const key = r.key.trim();
           try {
             result = await setSecret(id, key, r.value);
@@ -408,7 +458,7 @@ export function ServerDialog({
           }
         }
         for (const input of launch?.inputs ?? []) {
-          if (!input.secret || !launchValues[input.key]) continue;
+          if (input.source || !input.secret || !launchValues[input.key]) continue;
           try {
             result = await setLaunchSecret(id, input.key, launchValues[input.key]);
           } catch {
@@ -498,6 +548,12 @@ export function ServerDialog({
             setTouched((previous) => new Set([...previous, event.target.id]));
         }}
       >
+        {initial &&
+          secretReferenceReview(initial).map((line) => (
+            <p key={line} className="text-sm break-all">
+              {line}
+            </p>
+          ))}
         <DialogHeader>
           <DialogTitle>{editing ? "Edit server" : "Add MCP server"}</DialogTitle>
         </DialogHeader>
@@ -545,6 +601,16 @@ export function ServerDialog({
 
         <div className="flex flex-col gap-4 py-2">
           <div className="flex flex-col gap-2">
+            {!editing && (
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={localOnly}
+                  onChange={(e) => setLocalOnly(e.target.checked)}
+                />
+                This machine only
+              </label>
+            )}
             <Label htmlFor="srv-name">Name</Label>
             <Input
               id="srv-name"
@@ -614,23 +680,74 @@ export function ServerDialog({
                         {input.label}
                         {input.required ? " *" : ""}
                       </Label>
-                      <Input
-                        id={`launch-${input.key}`}
-                        type={input.secret ? "password" : "text"}
-                        value={launchValues[input.key] ?? ""}
-                        placeholder={
-                          input.secret && editing
-                            ? "Leave blank to keep vaulted value"
-                            : input.label
-                        }
-                        onChange={(event) => {
-                          setLaunchValues((values) => ({
-                            ...values,
-                            [input.key]: event.target.value,
-                          }));
-                          clearTest();
-                        }}
-                      />
+                      {input.secret && (
+                        <select
+                          aria-label={`Key source for ${input.label}`}
+                          className="self-start rounded border bg-background p-1 text-xs"
+                          value={input.source ? "reference" : "paste"}
+                          onChange={(e) => {
+                            setLaunch((l) =>
+                              l
+                                ? {
+                                    ...l,
+                                    inputs: l.inputs.map((i) =>
+                                      i.key === input.key
+                                        ? {
+                                            ...i,
+                                            source:
+                                              e.target.value === "reference"
+                                                ? { ref: "op://Engineering/Docs/key" }
+                                                : undefined,
+                                          }
+                                        : i,
+                                    ),
+                                  }
+                                : l,
+                            );
+                            clearTest();
+                          }}
+                        >
+                          <option value="paste">Paste a key</option>
+                          <option value="reference">From a password manager</option>
+                        </select>
+                      )}
+                      {input.source ? (
+                        <SecretReferenceField
+                          serverId={currentEditId ?? ""}
+                          value={input.source.ref}
+                          onChange={(ref) => {
+                            setLaunch((l) =>
+                              l
+                                ? {
+                                    ...l,
+                                    inputs: l.inputs.map((i) =>
+                                      i.key === input.key ? { ...i, source: { ref } } : i,
+                                    ),
+                                  }
+                                : l,
+                            );
+                            clearTest();
+                          }}
+                        />
+                      ) : (
+                        <Input
+                          id={`launch-${input.key}`}
+                          type={input.secret ? "password" : "text"}
+                          value={launchValues[input.key] ?? ""}
+                          placeholder={
+                            input.secret && editing
+                              ? "Leave blank to keep vaulted value"
+                              : input.label
+                          }
+                          onChange={(event) => {
+                            setLaunchValues((values) => ({
+                              ...values,
+                              [input.key]: event.target.value,
+                            }));
+                            clearTest();
+                          }}
+                        />
+                      )}
                     </div>
                   ))}
                   <p className="text-xs text-muted-foreground">
@@ -653,6 +770,21 @@ export function ServerDialog({
                   server). <code className="font-mono">~</code> and{" "}
                   <code className="font-mono">{"${VAR}"}</code> are expanded.
                 </p>
+              </div>
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex flex-col gap-1">
+                  <Label htmlFor="srv-inherit-env">Use my shell environment</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Gives this server every variable from your shell, such as AWS, GitHub
+                    or kube settings. When off it gets only PATH, HOME and other basics,
+                    plus the variables you set here.
+                  </p>
+                </div>
+                <Switch
+                  id="srv-inherit-env"
+                  checked={form.inheritEnv}
+                  onCheckedChange={(checked) => set("inheritEnv", checked)}
+                />
               </div>
             </>
           ) : (
@@ -709,21 +841,61 @@ export function ServerDialog({
               your OS keychain, never in the config.
             </p>
             {envRows.map((row, i) => (
-              <div key={i} className="flex items-center gap-2">
+              <div key={i} className="flex flex-wrap items-center gap-2">
                 <Input
                   placeholder="ENV_NAME"
                   className="font-mono"
                   value={row.key}
                   onChange={(e) => setEnvRow(i, "key", e.target.value)}
                 />
-                <Input
-                  type={row.secret === false ? "text" : "password"}
-                  placeholder={
-                    initial?.env.some((e) => e.key === row.key) ? "•••• (saved)" : "value"
-                  }
-                  value={row.value}
-                  onChange={(e) => setEnvRow(i, "value", e.target.value)}
-                />
+                {row.secret !== false && (
+                  <select
+                    aria-label={`Key source for ${row.key || "variable"}`}
+                    className="rounded border bg-background p-1 text-xs"
+                    value={row.source ? "reference" : "paste"}
+                    onChange={(e) =>
+                      setEnvRows((rows) =>
+                        rows.map((r, j) =>
+                          j === i
+                            ? {
+                                ...r,
+                                value: "",
+                                source:
+                                  e.target.value === "reference"
+                                    ? { ref: "op://Engineering/Docs/key" }
+                                    : undefined,
+                              }
+                            : r,
+                        ),
+                      )
+                    }
+                  >
+                    <option value="paste">Paste a key</option>
+                    <option value="reference">From a password manager</option>
+                  </select>
+                )}
+                {row.source ? (
+                  <SecretReferenceField
+                    serverId={currentEditId ?? ""}
+                    value={row.source.ref}
+                    onChange={(ref) =>
+                      setEnvRows((rows) =>
+                        rows.map((r, j) => (j === i ? { ...r, source: { ref } } : r)),
+                      )
+                    }
+                  />
+                ) : (
+                  <Input
+                    type={row.secret === false ? "text" : "password"}
+                    placeholder={
+                      initial?.env.some((e) => e.key === row.key)
+                        ? "•••• (saved)"
+                        : "value"
+                    }
+                    value={row.value}
+                    onChange={(e) => setEnvRow(i, "value", e.target.value)}
+                  />
+                )}
                 <label className="flex shrink-0 items-center gap-1 text-xs">
                   <input
                     type="checkbox"
@@ -732,13 +904,43 @@ export function ServerDialog({
                     onChange={(e) =>
                       setEnvRows((rows) =>
                         rows.map((r, j) =>
-                          j === i ? { ...r, secret: e.target.checked } : r,
+                          j === i
+                            ? {
+                                ...r,
+                                secret: e.target.checked,
+                                source: e.target.checked ? r.source : undefined,
+                              }
+                            : r,
                         ),
                       )
                     }
                   />
                   Keychain
                 </label>
+                {row.secret === false && (
+                  <label
+                    className="flex shrink-0 items-center gap-1 text-xs"
+                    title={
+                      riskySyncEnv(row.key)
+                        ? "This variable changes how programs run, so it always stays on this machine."
+                        : undefined
+                    }
+                  >
+                    <input
+                      type="checkbox"
+                      disabled={riskySyncEnv(row.key)}
+                      checked={envRowSyncs(row, editing ? (initial?.env ?? []) : [])}
+                      onChange={(e) =>
+                        setEnvRows((rows) =>
+                          rows.map((r, j) =>
+                            j === i ? { ...r, portable: e.target.checked } : r,
+                          ),
+                        )
+                      }
+                    />{" "}
+                    Same on every machine
+                  </label>
+                )}
                 <Button
                   size="icon"
                   variant="ghost"

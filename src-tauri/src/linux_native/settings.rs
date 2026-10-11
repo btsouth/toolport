@@ -11,9 +11,20 @@ pub(super) const NATIVE_AUTOSTART_NAME: &str = "Toolport";
 /// What the preview wrote. Only referenced by the migration.
 pub(super) const LEGACY_AUTOSTART_NAME: &str = "ToolportNativePreview";
 
+pub(super) const SETTINGS_PAGES: &[(&str, &str)] = &[
+    ("General", "emblem-system-symbolic"),
+    ("Tools", "applications-engineering-symbolic"),
+    ("Safety", "security-high-symbolic"),
+    ("Access", "changes-prevent-symbolic"),
+    ("Connections", "network-server-symbolic"),
+    ("Help and data", "help-browser-symbolic"),
+];
+
 #[derive(Clone)]
 pub(super) struct SettingsPage {
     pub(super) root: gtk::Box,
+    pages: Vec<gtk::Box>,
+    safety_cards: Vec<gtk::CheckButton>,
     pub(super) stop_stale: gtk::Button,
     bridge: super::http_bridge::BridgeController,
     broker: crate::approval_broker::ApprovalBroker,
@@ -22,6 +33,10 @@ pub(super) struct SettingsPage {
     safety_level: gtk::DropDown,
     safety_floor: Rc<Cell<crate::registry::SafetyLevel>>,
     safety_policy: gtk::Label,
+    safety_kept: gtk::Box,
+    safety_kept_note: gtk::Label,
+    safety_kept_reset: gtk::Button,
+    safety_current: Rc<Cell<crate::registry::SafetyLevel>>,
     lazy_discovery: gtk::Switch,
     pinned_section: gtk::Box,
     pinned_list: gtk::Box,
@@ -90,23 +105,6 @@ impl SettingsPage {
         page.set_margin_bottom(20);
         page.set_margin_start(20);
         page.set_margin_end(20);
-        page.append(
-            &gtk::Label::builder()
-                .label("Safety and desktop behavior")
-                .halign(gtk::Align::Start)
-                .css_classes(["title-2"])
-                .build(),
-        );
-        page.append(
-            &gtk::Label::builder()
-                .label("These settings are shared with the gateway and the current Toolport app. Team-enforced protections stay locked on.")
-                .halign(gtk::Align::Fill)
-                .xalign(0.0)
-                .wrap(true)
-            .hexpand(true)
-                .css_classes(["toolport-muted"])
-                .build(),
-        );
         let feedback = gtk::Label::builder()
             .halign(gtk::Align::Fill)
             .xalign(0.0)
@@ -166,36 +164,32 @@ impl SettingsPage {
             .visible(false)
             .css_classes(["toolport-feedback"])
             .build();
-        page.append(&posture);
 
-        page.append(&settings_heading(
-            "Gateway capabilities",
-            "Control how every connected AI client discovers and uses Toolport.",
-        ));
         let capabilities = gtk::Box::new(gtk::Orientation::Vertical, 0);
         capabilities.add_css_class("toolport-settings-group");
+        capabilities.add_css_class("toolport-switch-group");
         let (lazy_row, lazy_discovery) = setting_switch_row(
-            "Lazy discovery",
-            "Default for anonymous connections. Choose Auto or an override in Clients.",
+            "Find tools as needed",
+            "Agents search for tools as needed instead of loading the full list. This is the default for connections without saved client settings. Choose a different behavior in Clients.",
         );
         capabilities.append(&lazy_row);
         let (code_row, code_mode) = setting_switch_row(
             "Code mode",
-            "Off by default. Enable agents to combine scoped tool calls in one sandboxed server-side script. TOOLPORT_CODE_MODE=1 forces it on.",
+            "Let agents combine several tool calls in one script to reduce back-and-forth. Each call follows your access and approval settings. Scripts run in a restricted environment, but this does not replace those settings.",
         );
-        page.append(&capabilities);
+        code_row.set_tooltip_text(Some("A gateway started with TOOLPORT_CODE_MODE=1 can keep scripts available even when this setting is off."));
 
         let pinned_section = gtk::Box::new(gtk::Orientation::Vertical, 8);
         pinned_section.append(
             &gtk::Label::builder()
-                .label("Pinned prerequisites")
+                .label("Tools always included")
                 .halign(gtk::Align::Start)
                 .css_classes(["heading"])
                 .build(),
         );
         pinned_section.append(
             &gtk::Label::builder()
-                .label("Tools pinned in Server > Tools always surface in lazy discovery with their full schema.")
+                .label("Tools pinned in Servers > Tools are included in every tool search, even when they do not match the search.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
@@ -213,30 +207,81 @@ impl SettingsPage {
                 .build(),
         );
         pinned_section.append(&pinned_list);
-        page.append(&pinned_section);
 
-        page.append(&settings_heading(
-            "Tool-call safety",
-            "Choose how Toolport handles risky tools before they reach an AI client.",
-        ));
         let safety = gtk::Box::new(gtk::Orientation::Vertical, 0);
         safety.add_css_class("toolport-settings-group");
         let safety_level = gtk::DropDown::from_strings(&["Off", "Ask", "Strict"]);
         safety_level.set_tooltip_text(Some("Ask holds destructive calls. Strict also blocks destructive tools, risky drift and high-confidence injection, and asks before untrusted calls. Labeling and integrity recording stay on."));
+        safety_level.set_visible(false);
         safety.append(&safety_level);
+        let cards = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let mut safety_cards: Vec<gtk::CheckButton> = Vec::new();
+        for (index, (name, description)) in [
+            ("Off", "No extra checks before destructive calls."),
+            ("Ask", "Pause destructive calls for your approval."),
+            (
+                "Strict",
+                "Hide destructive tools and ask before untrusted calls.",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let card = gtk::CheckButton::new();
+            if let Some(first) = safety_cards.first() {
+                card.set_group(Some(first));
+            }
+            card.set_hexpand(true);
+            card.add_css_class("toolport-safety-card");
+            let copy = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            copy.append(
+                &gtk::Label::builder()
+                    .label(name)
+                    .xalign(0.0)
+                    .css_classes(["heading"])
+                    .build(),
+            );
+            copy.append(
+                &gtk::Label::builder()
+                    .label(description)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .max_width_chars(24)
+                    .css_classes(["toolport-muted"])
+                    .build(),
+            );
+            card.set_child(Some(&copy));
+            let control = safety_level.clone();
+            card.connect_toggled(move |card| {
+                if card.is_active() && card.is_sensitive() && control.is_sensitive() {
+                    // The model contains only levels at or above the team floor.
+                    let count = control.model().map(|model| model.n_items()).unwrap_or(3);
+                    control.set_selected((index as u32).saturating_sub(3 - count));
+                }
+            });
+            cards.append(&card);
+            safety_cards.push(card);
+        }
+        safety.append(&cards);
         let safety_policy = gtk::Label::new(None);
         safety_policy.set_xalign(0.0);
         safety_policy.set_wrap(true);
         safety_policy.add_css_class("dim-label");
         safety.append(&safety_policy);
-        page.append(&safety);
-        page.append(&settings_heading(
-            "Advanced",
-            "Client access, folder routing, personal data and inspection.",
-        ));
+        let safety_kept = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        safety_kept.set_margin_top(8);
+        let safety_kept_note = gtk::Label::new(None);
+        safety_kept_note.set_xalign(0.0);
+        safety_kept_note.set_wrap(true);
+        safety_kept.append(&safety_kept_note);
+        let safety_kept_reset = gtk::Button::builder().halign(gtk::Align::Start).build();
+        safety_kept.append(&safety_kept_reset);
+        safety_kept.set_visible(false);
+        safety.append(&safety_kept);
         let protection = gtk::Box::new(gtk::Orientation::Vertical, 0);
         protection.add_css_class("toolport-settings-group");
-        protection.append(&code_row);
+        protection.add_css_class("toolport-switch-group");
+        capabilities.append(&code_row);
         let (pii_row, pii_redaction) = setting_switch_row(
             "Pseudonymize PII",
             "Replace detected personal values before results reach the model.",
@@ -247,10 +292,10 @@ impl SettingsPage {
             "Capture the last 50 tool calls locally for Activity. Turning this off clears the buffer.",
         );
         protection.append(&inspect_row);
-        protection.append(&settings_heading(
+        let approvals_heading = settings_heading(
             "Remembered approvals",
-            "Fingerprint-bound exceptions that can skip the human approval prompt.",
-        ));
+            "Tool calls you chose to always allow. They stop applying if the tool's definition changes.",
+        );
         let allowed_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         allowed_list.add_css_class("toolport-settings-group");
         allowed_list.append(
@@ -260,19 +305,16 @@ impl SettingsPage {
                 .css_classes(["toolport-muted"])
                 .build(),
         );
-        protection.append(&allowed_list);
 
-        page.append(&protection);
         let access_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        page.append(&access_list);
         let folder_button = gtk::Button::with_label("Add folder mapping");
         folder_button.add_css_class("toolport-secondary-action");
         folder_button.set_valign(gtk::Align::Center);
-        page.append(&settings_heading_with_action(
+        let folder_heading = settings_heading_with_action(
             "Project folder routing",
             "Automatically use the matching access set when an MCP client reports a project root. The longest matching folder wins.",
             &folder_button,
-        ));
+        );
         let folder_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         folder_list.add_css_class("toolport-settings-group");
         folder_list.append(
@@ -282,19 +324,13 @@ impl SettingsPage {
                 .css_classes(["toolport-muted"])
                 .build(),
         );
-        page.append(&folder_list);
 
-        page.append(&settings_heading(
-            "Desktop",
-            "Linux-native lifecycle preferences.",
-        ));
         let desktop = gtk::Box::new(gtk::Orientation::Vertical, 0);
         desktop.add_css_class("toolport-settings-group");
         let (launch_row, launch_at_login) = setting_switch_row(
             "Launch at login",
             "Start Toolport hidden so approvals and notifications remain available.",
         );
-        desktop.append(&launch_row);
         let stale_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         stale_row.add_css_class("toolport-setting-row");
         let stale_copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -362,13 +398,7 @@ impl SettingsPage {
                 .build(),
         );
         updates.append(&updates_copy);
-        desktop.append(&updates);
-        page.append(&desktop);
 
-        page.append(&settings_heading(
-            "Diagnostics",
-            "Copy a secret-safe support report or inspect Toolport's local files.",
-        ));
         let diagnostics = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         diagnostics.add_css_class("toolport-setting-row");
         let diagnostics_copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -399,12 +429,11 @@ impl SettingsPage {
         open_data.add_css_class("toolport-secondary-action");
         diagnostics_actions.insert(&open_data, -1);
         diagnostics.append(&diagnostics_actions);
-        page.append(&diagnostics);
 
-        page.append(&settings_heading(
+        let endpoint_heading = settings_heading(
             "Shared HTTP endpoint",
             "A supervised, authenticated local endpoint for clients that cannot launch an MCP process.",
-        ));
+        );
         let endpoint = gtk::Box::new(gtk::Orientation::Vertical, 8);
         endpoint.add_css_class("toolport-setting-row");
         let endpoint_copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -458,18 +487,17 @@ impl SettingsPage {
             .css_classes(["toolport-muted", "caption", "monospace"])
             .build();
         endpoint.append(&endpoint_token_value);
-        page.append(&endpoint);
         // The scoped-client list had no heading of its own, so its empty state
         // floated under the gateway row with nothing naming it.
         let add_http_client = gtk::Button::with_label("Add scoped HTTP client");
         add_http_client.add_css_class("toolport-secondary-action");
         add_http_client.set_valign(gtk::Align::Center);
         add_http_client.set_sensitive(false);
-        page.append(&settings_heading_with_action(
+        let http_client_heading = settings_heading_with_action(
             "Scoped HTTP clients",
             "Each gets its own bearer token and server scope, so one endpoint can serve several clients.",
             &add_http_client,
-        ));
+        );
         let http_client_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         http_client_list.add_css_class("toolport-settings-group");
         http_client_list.append(
@@ -482,12 +510,11 @@ impl SettingsPage {
                 .css_classes(["toolport-muted"])
                 .build(),
         );
-        page.append(&http_client_list);
 
-        page.append(&settings_heading(
+        let quarantine_heading = settings_heading(
             "Quarantined tools",
             "Strict blocks retained high-risk definition changes until you explicitly re-approve them.",
-        ));
+        );
         let quarantine_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         quarantine_list.add_css_class("toolport-settings-group");
         quarantine_list.append(
@@ -500,24 +527,75 @@ impl SettingsPage {
                 .css_classes(["toolport-muted"])
                 .build(),
         );
-        page.append(&quarantine_list);
 
-        page.append(&settings_heading(
-            "Client connections",
-            "Restore client configurations before removing Toolport.",
-        ));
         let remove_clients = gtk::Button::with_label("Remove Toolport from all clients");
         remove_clients.set_halign(gtk::Align::Start);
-        page.append(&remove_clients);
+        remove_clients.add_css_class("destructive-action");
         let removal_results = gtk::Label::new(None);
         removal_results.set_xalign(0.0);
         removal_results.set_wrap(true);
-        page.append(&removal_results);
+
+        let general = settings_section(&page, "General", "Startup and updates.");
+        let startup = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        startup.add_css_class("toolport-settings-group");
+        startup.add_css_class("toolport-switch-group");
+        startup.append(&launch_row);
+        startup.append(&updates);
+        general.append(&startup);
+        let tools = settings_section(&page, "Tools", "How agents find and use your tools.");
+        tools.append(&capabilities);
+        tools.append(&pinned_section);
+        let safety_section =
+            settings_section(&page, "Safety", "How Toolport handles risky tool calls.");
+        safety_section.append(&posture);
+        safety_section.append(&safety);
+        safety_section.append(&protection);
+        let pending = gtk::Label::builder()
+            .label("Pending approvals appear in the approval queue.")
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["toolport-muted"])
+            .build();
+        safety_section.append(&pending);
+        safety_section.append(&listed_section(&approvals_heading, &allowed_list));
+        safety_section.append(&listed_section(&quarantine_heading, &quarantine_list));
+        let access = settings_section(
+            &page,
+            "Access",
+            "Limit which servers and tools each client can use, by client or project folder.",
+        );
+        access.append(&access_list);
+        access.append(&folder_heading);
+        access.append(&folder_list);
+        access.append(&http_client_heading);
+        access.append(&http_client_list);
+        let connections = settings_section(
+            &page,
+            "Connections",
+            "Your local HTTP endpoint and gateway processes.",
+        );
+        connections.append(&endpoint_heading);
+        connections.append(&endpoint);
+        connections.append(&desktop);
+        let help = settings_section(
+            &page,
+            "Help and data",
+            "Support reports, local files and removing Toolport.",
+        );
+        help.append(&diagnostics);
+        help.append(&remove_clients);
+        help.append(&removal_results);
+        let pages = vec![general, tools, safety_section, access, connections, help];
+        for (index, section) in pages.iter().enumerate() {
+            section.set_visible(index == 0);
+        }
         scroller.set_child(Some(&page));
         root.append(&scroller);
         let settings_page = Self {
             stop_stale: stop_stale.clone(),
             root,
+            pages,
+            safety_cards,
             bridge,
             broker,
             feedback,
@@ -525,6 +603,10 @@ impl SettingsPage {
             safety_level,
             safety_floor: Rc::new(Cell::new(crate::registry::SafetyLevel::Off)),
             safety_policy,
+            safety_kept,
+            safety_kept_note,
+            safety_kept_reset,
+            safety_current: Rc::new(Cell::new(crate::registry::SafetyLevel::Off)),
             lazy_discovery,
             pinned_section,
             pinned_list,
@@ -845,8 +927,14 @@ impl SettingsPage {
         creator.append(&add);
         self.access_list.append(&creator);
         for profile in &registry.profiles {
-            let expander = gtk::Expander::builder().label(&profile.name).build();
             let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+            content.append(
+                &gtk::Label::builder()
+                    .label(&profile.name)
+                    .xalign(0.0)
+                    .css_classes(["heading"])
+                    .build(),
+            );
             for server in registry
                 .servers
                 .iter()
@@ -898,8 +986,7 @@ impl SettingsPage {
                 page.mutate_access(move || crate::registry_controller::delete_profile(&pid));
             });
             content.append(&delete);
-            expander.set_child(Some(&content));
-            self.access_list.append(&expander);
+            self.access_list.append(&content);
         }
     }
 
@@ -1002,7 +1089,7 @@ impl SettingsPage {
             self.pinned_list.remove(&child);
         }
         if pins.is_empty() {
-            self.pinned_list.append(&empty_state("No prerequisites are pinned. Pin a load-bearing tool from Server > Tools when lazy discovery must always surface it."));
+            self.pinned_list.append(&empty_state("None yet. In Servers, open a server's Tools tab and pin tools your agent needs every time, such as sign-in or a required lookup."));
             return;
         }
         for pin in pins {
@@ -1413,6 +1500,26 @@ impl SettingsPage {
 
     fn connect_switches(&self) {
         let page = self.clone();
+        self.safety_kept_reset.connect_clicked(move |button| {
+            let level = page.safety_current.get();
+            page.begin_mutation();
+            button.set_sensitive(false);
+            let page = page.clone();
+            gtk::glib::spawn_future_local(async move {
+                let result = super::run_user_action(move || {
+                    crate::registry_controller::set_safety_level(level)
+                })
+                .await;
+                page.begin_mutation();
+                match result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => page.show_error(&error),
+                    Err(_) => page.show_error("the safety update stopped unexpectedly"),
+                }
+                page.refresh();
+            });
+        });
+        let page = self.clone();
         self.safety_level.connect_selected_notify(move |control| {
             if page.updating.get() {
                 return;
@@ -1424,9 +1531,12 @@ impl SettingsPage {
             };
             page.begin_mutation();
             control.set_sensitive(false);
+            for card in &page.safety_cards {
+                card.set_sensitive(false);
+            }
             let page = page.clone();
             gtk::glib::spawn_future_local(async move {
-                let result = gtk::gio::spawn_blocking(move || {
+                let result = super::run_user_action(move || {
                     crate::registry_controller::set_safety_level(level)
                 })
                 .await;
@@ -1437,6 +1547,9 @@ impl SettingsPage {
                     Err(_) => page.show_error("the safety update stopped unexpectedly"),
                 }
                 page.safety_level.set_sensitive(true);
+                for (index, card) in page.safety_cards.iter().enumerate() {
+                    card.set_sensitive(index >= page.safety_floor.get() as usize);
+                }
                 page.refresh();
             });
         });
@@ -1476,18 +1589,27 @@ impl SettingsPage {
                 let switch = switch.clone();
                 let page = page.clone();
                 gtk::glib::spawn_future_local(async move {
-                    let result = gtk::gio::spawn_blocking(move || {
+                    let result = super::run_user_action(move || {
                         crate::registry_controller::set_essential_setting(setting, enabled)
                     })
                     .await;
+                    // Checked before the completion bump below, which would
+                    // otherwise make every save look stale and leave the switch
+                    // unconfirmed until the next 15-second refresh.
+                    let latest = page.mutation_generation.get() == generation;
                     // Again on completion, so a read that started mid-write is
                     // discarded too.
                     page.begin_mutation();
                     match result {
                         Ok(Ok(settings)) => {
-                            if page.mutation_generation.get() == generation {
+                            if latest {
                                 page.render_settings(settings);
                             } else {
+                                // Another toggle is in flight; confirm only this
+                                // switch rather than rendering a stale snapshot.
+                                page.updating.set(true);
+                                set_switch(&switch, enabled);
+                                page.updating.set(false);
                                 switch.set_sensitive(true);
                             }
                             let outcome =
@@ -1526,7 +1648,7 @@ impl SettingsPage {
                 page.begin_mutation();
                 let page = page.clone();
                 gtk::glib::spawn_future_local(async move {
-                    let result = gtk::gio::spawn_blocking(move || {
+                    let result = super::run_user_action(move || {
                         if enabled {
                             crate::autostart::enable_linux(NATIVE_AUTOSTART_NAME)
                         } else {
@@ -1561,6 +1683,20 @@ impl SettingsPage {
                 });
                 gtk::glib::Propagation::Stop
             });
+    }
+
+    pub(super) fn select_page(&self, index: usize) {
+        for (current, page) in self.pages.iter().enumerate() {
+            page.set_visible(current == index);
+        }
+    }
+
+    pub(super) fn connect_page_selected(&self, index: usize, callback: impl Fn(bool) + 'static) {
+        self.pages[index].connect_visible_notify(move |page| callback(page.is_visible()));
+    }
+
+    pub(super) fn approval_broker(&self) -> crate::approval_broker::ApprovalBroker {
+        self.broker.clone()
     }
 
     pub(super) fn refresh(&self) {
@@ -1667,8 +1803,9 @@ impl SettingsPage {
         self.posture.set_label(&line);
         self.posture.remove_css_class("success");
         self.posture.remove_css_class("error");
-        self.posture
-            .add_css_class(if guarded { "success" } else { "error" });
+        if guarded {
+            self.posture.add_css_class("success");
+        }
         self.posture.set_visible(true);
         self.updating.set(true);
         set_switch(&self.lazy_discovery, settings.lazy_discovery);
@@ -1707,6 +1844,23 @@ impl SettingsPage {
                 || settings.block_on_injection_forced,
         );
         self.safety_level.set_sensitive(true);
+        for (index, card) in self.safety_cards.iter().enumerate() {
+            card.set_sensitive(index >= settings.team_min_safety_level as usize);
+            card.set_active(index == settings.safety_level as usize);
+        }
+        self.safety_current.set(settings.safety_level);
+        let kept = settings.kept_v1_safety.summary();
+        self.safety_kept.set_visible(kept.is_some());
+        if let Some(kept) = kept {
+            self.safety_kept_note.set_label(&format!(
+                "{kept} Choosing a level replaces these with that level's protections."
+            ));
+            self.safety_kept_reset.set_label(&format!(
+                "Use standard {}",
+                level_name(settings.safety_level)
+            ));
+            self.safety_kept_reset.set_sensitive(true);
+        }
         set_switch(&self.pii_redaction, settings.pii_redaction);
         set_team_managed(&self.pii_redaction, settings.pii_redaction_forced);
         self.updating.set(false);
@@ -1745,9 +1899,15 @@ impl SettingsPage {
                         .build(),
                 );
                 self.quarantine_list.append(&row);
+                if let Some(section) = self.quarantine_list.parent() {
+                    section.set_visible(true);
+                }
                 return;
             }
         };
+        if let Some(section) = self.quarantine_list.parent() {
+            section.set_visible(!entries.is_empty());
+        }
         if entries.is_empty() {
             self.quarantine_list
                 .append(&empty_state("No tools are quarantined."));
@@ -1766,6 +1926,9 @@ impl SettingsPage {
     fn render_allowed(&self, entries: Vec<AllowedTool>) {
         while let Some(child) = self.allowed_list.first_child() {
             self.allowed_list.remove(&child);
+        }
+        if let Some(section) = self.allowed_list.parent() {
+            section.set_visible(!entries.is_empty());
         }
         if entries.is_empty() {
             self.allowed_list
@@ -1809,34 +1972,20 @@ fn read_quarantined_tools() -> Result<Vec<QuarantinedTool>, String> {
         .collect())
 }
 
-/// The one-line security stance, mirroring the shipping card: a hard gate
-/// (human approval, destructive deny, or injection block) reads as guarded;
-/// softer measures alone read as partial; nothing reads as open.
+/// Describe the effective policy, including the team's enforced level.
 fn posture_summary(settings: &crate::registry_controller::EssentialSettings) -> (String, bool) {
-    let active: Vec<&str> = [
-        (settings.human_approval, "human approval on"),
-        (settings.deny_destructive, "destructive tools denied"),
-        (settings.confirm_destructive, "destructive calls ask first"),
-        (settings.quarantine_on_drift, "changed tools paused"),
-        (settings.block_on_injection, "injection-like output blocked"),
-    ]
-    .into_iter()
-    .filter_map(|(on, label)| on.then_some(label))
-    .collect();
-    let gated = settings.human_approval || settings.deny_destructive || settings.block_on_injection;
-    if active.is_empty() {
-        return (
-            "Approval gates are off. Tool calls run without a Toolport approval or blocking gate."
-                .to_string(),
-            false,
+    use crate::registry::SafetyLevel;
+    let (mut line, guarded) = match settings.safety_level {
+        SafetyLevel::Off => ("Safety is set to Off. Toolport does not ask before destructive calls. Server sign-in and client permissions may still ask for approval.".to_string(), false),
+        SafetyLevel::Ask => ("Safety is set to Ask. Destructive calls need your approval before they run.".to_string(), true),
+        SafetyLevel::Strict => ("Safety is set to Strict. Destructive tools are hidden and untrusted calls need your approval.".to_string(), true),
+    };
+    if settings.quarantine_on_drift_forced || settings.block_on_injection_forced {
+        line.push_str(
+            " Your team also requires protection against risky tool changes or injection.",
         );
     }
-    let label = if gated {
-        "Guardrails active"
-    } else {
-        "Some guardrails active"
-    };
-    (format!("{label}. Active: {}.", active.join(", ")), gated)
+    (line, guarded)
 }
 
 /// Which profile scopes a re-approve-all pass must clear, in first-seen order.
@@ -2348,6 +2497,47 @@ fn settings_heading_with_action(
     row
 }
 
+/// A top-level group of the page: a larger title, one line saying what is in it,
+/// and the box its rows go into.
+fn settings_section(page: &gtk::Box, title: &str, summary: &str) -> gtk::Box {
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    section.set_margin_top(12);
+    section.append(&section_title(title, summary));
+    page.append(&section);
+    section
+}
+
+fn section_title(title: &str, summary: &str) -> gtk::Box {
+    let heading = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    heading.append(
+        &gtk::Label::builder()
+            .label(title)
+            .halign(gtk::Align::Start)
+            .css_classes(["title-3"])
+            .build(),
+    );
+    heading.append(
+        &gtk::Label::builder()
+            .label(summary)
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .hexpand(true)
+            .css_classes(["toolport-muted"])
+            .build(),
+    );
+    heading
+}
+
+/// A heading and its list, hidden together until the list has entries.
+fn listed_section(heading: &gtk::Box, list: &gtk::Box) -> gtk::Box {
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    section.append(heading);
+    section.append(list);
+    section.set_visible(false);
+    section
+}
+
 fn settings_heading(title: &str, subtitle: &str) -> gtk::Box {
     let heading = gtk::Box::new(gtk::Orientation::Vertical, 3);
     // The page's own 14px spacing is the gap between rows within a section, so a
@@ -2358,7 +2548,7 @@ fn settings_heading(title: &str, subtitle: &str) -> gtk::Box {
         &gtk::Label::builder()
             .label(title)
             .halign(gtk::Align::Start)
-            .css_classes(["heading"])
+            .css_classes(["toolport-section-label"])
             .build(),
     );
     heading.append(
@@ -2448,8 +2638,34 @@ fn http_access_choice(
     }
 }
 
+fn level_name(level: crate::registry::SafetyLevel) -> &'static str {
+    match level {
+        crate::registry::SafetyLevel::Off => "Off",
+        crate::registry::SafetyLevel::Ask => "Ask",
+        crate::registry::SafetyLevel::Strict => "Strict",
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn settings_pages_match_the_sidebar_order() {
+        assert_eq!(
+            super::SETTINGS_PAGES
+                .iter()
+                .map(|(label, _)| *label)
+                .collect::<Vec<_>>(),
+            [
+                "General",
+                "Tools",
+                "Safety",
+                "Access",
+                "Connections",
+                "Help and data"
+            ]
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -2485,25 +2701,25 @@ mod tests {
     }
 
     #[test]
-    fn posture_reads_guarded_partial_or_open_by_gate_strength() {
+    fn posture_describes_the_effective_level_without_an_alarm_for_off() {
         let mut settings = crate::registry_controller::EssentialSettings::default();
+        settings.safety_level = crate::registry::SafetyLevel::Off;
         let (line, guarded) = posture_summary(&settings);
-        assert!(line.starts_with("Approval gates are off."));
+        assert!(line.starts_with("Safety is set to Off."));
+        assert!(line.contains("Server sign-in and client permissions"));
         assert!(!guarded);
+        // A leftover 1.x mirror is not an effective policy.
         settings.confirm_destructive = true;
-        let (line, guarded) = posture_summary(&settings);
-        assert_eq!(
-            line,
-            "Some guardrails active. Active: destructive calls ask first."
-        );
-        assert!(!guarded);
-        settings.human_approval = true;
-        let (line, guarded) = posture_summary(&settings);
-        assert_eq!(
-            line,
-            "Guardrails active. Active: human approval on, destructive calls ask first."
-        );
-        assert!(guarded);
+        assert_eq!(posture_summary(&settings).0, line);
+        settings.safety_level = crate::registry::SafetyLevel::Ask;
+        assert!(posture_summary(&settings)
+            .0
+            .contains("Destructive calls need your approval"));
+        assert!(posture_summary(&settings).1);
+        settings.quarantine_on_drift_forced = true;
+        assert!(posture_summary(&settings)
+            .0
+            .contains("Your team also requires"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Real vault/controller/transport/gateway checks with disposable data and strict
 //! fake providers. These establish Toolport's contract, not provider connectivity.
+use conduit_lib::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 use conduit_lib::{
     catalog, launch_inputs, registry, registry_controller as controller, secrets, server_runtime,
     sharing_controller,
@@ -499,15 +500,18 @@ fn gateway_lists_fixture_tools(fixture: &Fixture, ids: &[String]) {
     );
     let endpoint = format!("http://127.0.0.1:{port}/mcp");
     let post = |body: Value, session: Option<&str>| {
-        let mut request = ureq::post(&endpoint)
-            .set("Authorization", "Bearer fixture-gateway-token")
-            .set("Content-Type", "application/json")
-            .set("Accept", "application/json")
-            .timeout(Duration::from_secs(10));
+        let mut request = conduit_lib::http_client::agent()
+            .post(&endpoint)
+            .set_header("Authorization", "Bearer fixture-gateway-token")
+            .set_header("Content-Type", "application/json")
+            .set_header("Accept", "application/json")
+            .config()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build();
         if let Some(session) = session {
-            request = request.set("Mcp-Session-Id", session);
+            request = request.set_header("Mcp-Session-Id", session);
         }
-        request.send_json(body)
+        request.send_json(body).retain_status_body()
     };
     let deadline = Instant::now() + Duration::from_secs(30);
     let response = loop {
@@ -522,15 +526,27 @@ fn gateway_lists_fixture_tools(fixture: &Fixture, ids: &[String]) {
         assert!(Instant::now() < deadline, "gateway startup deadline");
         std::thread::sleep(Duration::from_millis(50));
     };
-    let session = response.header("Mcp-Session-Id").map(str::to_string);
-    let initialized: Value = response.into_json().unwrap();
+    let session = response
+        .headers()
+        .get("Mcp-Session-Id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let initialized: Value = response
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
+        .unwrap();
     assert!(initialized.get("error").is_none(), "{initialized}");
     let mut listed: Value = post(
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
         session.as_deref(),
     )
     .unwrap()
-    .into_json()
+    .into_body()
+    .with_config()
+    .limit(u64::MAX)
+    .read_json()
     .unwrap();
     let tool_names = |listed: &Value| -> Vec<String> {
         listed["result"]["tools"]
@@ -559,14 +575,18 @@ fn gateway_lists_fixture_tools(fixture: &Fixture, ids: &[String]) {
             .all(|id| tool_names(listed).contains(&format!("{}__ready", id.replace('-', "_"))))
     };
     if !complete(&listed) {
-        let listen = ureq::get(&endpoint)
-            .set("Authorization", "Bearer fixture-gateway-token")
-            .set("Accept", "text/event-stream")
-            .set("Mcp-Session-Id", session.as_deref().unwrap())
-            .timeout(deadline.saturating_duration_since(Instant::now()))
+        let listen = conduit_lib::http_client::agent()
+            .get(&endpoint)
+            .set_header("Authorization", "Bearer fixture-gateway-token")
+            .set_header("Accept", "text/event-stream")
+            .set_header("Mcp-Session-Id", session.as_deref().unwrap())
+            .config()
+            .timeout_global(Some(deadline.saturating_duration_since(Instant::now())))
+            .build()
             .call()
+            .retain_status_body()
             .unwrap();
-        let mut notifications = BufReader::new(listen.into_reader());
+        let mut notifications = BufReader::new(listen.into_body().into_reader());
         while !complete(&listed) {
             assert!(
                 Instant::now() < deadline,
@@ -587,7 +607,10 @@ fn gateway_lists_fixture_tools(fixture: &Fixture, ids: &[String]) {
                     session.as_deref(),
                 )
                 .unwrap()
-                .into_json()
+                .into_body()
+                .with_config()
+                .limit(u64::MAX)
+                .read_json()
                 .unwrap();
             }
         }
@@ -606,7 +629,10 @@ fn gateway_lists_fixture_tools(fixture: &Fixture, ids: &[String]) {
             session.as_deref(),
         )
         .unwrap()
-        .into_json()
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
         .unwrap();
         assert!(
             called.get("error").is_none() && called["result"]["isError"] != true,

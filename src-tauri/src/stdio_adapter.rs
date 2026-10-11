@@ -32,6 +32,7 @@
 //! requires. Notifications stay on the reader thread, which keeps a cancellation
 //! ahead of whatever is queued behind it (MCP cancellation is best-effort, so one
 //! that loses the race simply does not apply).
+use crate::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -51,6 +52,7 @@ pub const STDIO_ADAPTER_FLAG: &str = "--stdio-adapter";
 /// Internal daemon headers. The daemon accepts these only with its private
 /// rendezvous bearer; the public HTTP bridge never trusts them.
 pub const ADAPTER_CLIENT_ID_HEADER: &str = "Toolport-Adapter-Client-Id";
+pub const ADAPTER_ATTRIBUTION_HEADER: &str = "Toolport-Adapter-Attribution";
 pub const ADAPTER_PROFILE_HEADER: &str = "Toolport-Adapter-Profile";
 /// Path values are URL-safe base64 so Unicode and platform separators survive
 /// HTTP header transport. The daemon's cwd belongs to the first adapter only.
@@ -243,47 +245,20 @@ pub fn run_selected_stdio_adapter() {
 /// daemon alive when the client tears down the adapter's group, so the next
 /// adapter finds it through the rendezvous instead of paying a cold start.
 ///
-/// The adapter must not hand the daemon the environment the AI client launched it
-/// with (SEC-04): that environment can hold `AWS_*`, `GITHUB_TOKEN`,
-/// `OPENAI_API_KEY` and so on, and the daemon would then serve them to every
-/// client that attaches. The daemon is started from a cleared environment plus
-/// the same non-secret allowlist a downstream child gets, plus Toolport's own
-/// control variables, which it needs to run:
-///
-/// * `TOOLPORT_DATA_DIR` / `CONDUIT_DATA_DIR` and `TOOLPORT_REGISTRY` /
-///   `CONDUIT_REGISTRY` - the data directory and registry to serve, which must
-///   match the adapter's.
-/// * `TOOLPORT_SECRET_KEY` / `CONDUIT_SECRET_KEY` - the file-backend vault master
-///   key; without it the daemon cannot read the secrets it injects into children.
-/// * `TOOLPORT_SECRET_*` - per-secret environment fallbacks the daemon reads for
-///   a server whose secret is not in the vault.
-/// * `TOOLPORT_DISCOVERY`, `TOOLPORT_CODE_MODE`, `TOOLPORT_DEBUG` and their
-///   `CONDUIT_` legacy forms - the discovery, code-mode and trace flags the
-///   daemon bootstraps from.
-/// * `TOOLPORT_PROFILE`, `TOOLPORT_CLIENT_ID` and the legacy pair - the daemon's
-///   bootstrap profile and identity; adapters still pass their own per request.
-/// * `TOOLPORT_HTTP_TOKEN` and friends - only read in an HTTP mode, kept so a
-///   daemon started from an HTTP bridge keeps the same behavior.
-///
-/// The whole namespace is kept rather than a fixed list so a future control
-/// variable cannot silently stop working. None of it reaches the daemon's
-/// children: those go through [`crate::downstream::child_environment`], whose
-/// allowlist has no `TOOLPORT_`/`CONDUIT_` names. The AppImage bundle variables
-/// are kept too, because the daemon is a re-exec of our own bundled payload and
-/// needs the bundle's library paths.
+/// The daemon gets the adapter's whole environment, as in 1.x. Downstream
+/// children still start from [`crate::downstream::child_environment`]: a server
+/// sees only the non-secret allowlist unless it opted into `inheritEnv`, in
+/// which case it gets the user's login environment plus the names the client
+/// was started with (`crate::downstream::inherited_environment`). Clearing the
+/// daemon here would quietly drop those client variables for every opted-in
+/// server, which is what servers migrated from 1.x rely on.
 fn daemon_environment(
     parent: &std::collections::BTreeMap<String, String>,
 ) -> Vec<(String, String)> {
-    let mut env: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for (name, value) in parent {
-        if crate::downstream::is_control_env_name(name)
-            || crate::downstream::is_allowed_child_env_name(name)
-            || crate::hostenv::is_bundled_env_name(name)
-        {
-            env.insert(name.clone(), value.clone());
-        }
-    }
-    env.into_iter().collect()
+    parent
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
 }
 
 fn spawn_daemon() -> Result<(), String> {
@@ -307,7 +282,13 @@ fn spawn_daemon() -> Result<(), String> {
     }
     command
         .spawn()
-        .map(|_child| ())
+        .map(|mut child| {
+            // Reap exited daemons while this adapter stays connected. Dropping
+            // Child alone leaves a zombie after a crash or version handover.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        })
         .map_err(|error| format!("could not start the host daemon: {error}"))
 }
 
@@ -446,6 +427,7 @@ struct Session {
     stdout: Mutex<Box<dyn Write + Send>>,
     request_timeout: Duration,
     client_id: String,
+    attribution_id: Option<String>,
     env_profile: Option<String>,
     cwd: Option<String>,
     root_override: Option<String>,
@@ -522,6 +504,9 @@ impl Session {
             stdout: Mutex::new(Box::new(std::io::stdout())),
             request_timeout: REQUEST_TIMEOUT,
             client_id,
+            attribution_id: std::env::var(crate::brand::ATTRIBUTION_ID)
+                .ok()
+                .filter(|id| crate::clients::known_adapter_name(id).is_some()),
             env_profile,
             cwd,
             root_override,
@@ -534,23 +519,28 @@ impl Session {
         }
     }
 
-    fn with_identity(&self, request: ureq::Request) -> ureq::Request {
+    fn with_identity<B>(&self, request: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
         let request = request
-            .set(ADAPTER_CLIENT_ID_HEADER, &self.client_id)
-            .set("Toolport-Adapter-Instance", &self.instance);
+            .set_header(ADAPTER_CLIENT_ID_HEADER, &self.client_id)
+            .set_header("Toolport-Adapter-Pid", &std::process::id().to_string())
+            .set_header("Toolport-Adapter-Instance", &self.instance);
+        let request = match &self.attribution_id {
+            Some(id) => request.set_header(ADAPTER_ATTRIBUTION_HEADER, id),
+            None => request,
+        };
         let request = match &self.env_profile {
-            Some(profile) => request.set(ADAPTER_PROFILE_HEADER, profile),
+            Some(profile) => request.set_header(ADAPTER_PROFILE_HEADER, profile),
             None => request,
         };
         let request = match &self.cwd {
-            Some(cwd) => request.set(
+            Some(cwd) => request.set_header(
                 ADAPTER_CWD_HEADER,
                 &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cwd.as_bytes()),
             ),
             None => request,
         };
         let request = match &self.root_override {
-            Some(root) => request.set(
+            Some(root) => request.set_header(
                 ADAPTER_ROOT_OVERRIDE_HEADER,
                 &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(root.as_bytes()),
             ),
@@ -562,7 +552,7 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         match declared_root {
-            Some(root) => request.set(
+            Some(root) => request.set_header(
                 ADAPTER_DECLARED_ROOT_HEADER,
                 &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(root.as_bytes()),
             ),
@@ -731,35 +721,41 @@ impl Session {
         let descriptor = self.descriptor();
         let url = format!("http://{}/mcp", descriptor.endpoint);
         let request = match subscription {
-            Some(_) => ureq::AgentBuilder::new()
-                .timeout_read(SUBSCRIPTION_READ_TIMEOUT)
-                .build()
-                .post(&url),
-            None => ureq::post(&url).timeout(self.request_timeout),
+            Some(_) => crate::http_client::idle_agent(
+                SUBSCRIPTION_READ_TIMEOUT,
+                None,
+                Duration::from_secs(30),
+            )
+            .post(&url),
+            None => crate::http_client::agent()
+                .post(&url)
+                .config()
+                .timeout_global(Some(self.request_timeout))
+                .build(),
         };
         let mut request = self.with_identity(
             request
-                .set("Authorization", &format!("Bearer {}", descriptor.token))
-                .set("Content-Type", "application/json")
+                .set_header("Authorization", &format!("Bearer {}", descriptor.token))
+                .set_header("Content-Type", "application/json")
                 // Each POST owns a fresh agent, so this connection cannot be reused.
                 // Release the daemon's keepalive parser instead of leaving it waiting
                 // for a second request while the first call is still in flight.
-                .set("Connection", "close")
-                .set("Accept", "application/json, text/event-stream"),
+                .set_header("Connection", "close")
+                .set_header("Accept", "application/json, text/event-stream"),
         );
         for (name, value) in modern_headers(&message) {
-            request = request.set(&name, &value);
+            request = request.set_header(&name, &value);
         }
         let sent_session = self.session_id();
         if let Some(session) = &sent_session {
-            request = request.set("Mcp-Session-Id", session);
+            request = request.set_header("Mcp-Session-Id", session);
         }
-        let response = match request.send_string(body) {
+        let response = match request.send(body).retain_status_body() {
             Ok(response) => response,
             // The daemon answered, just not with 2xx. It is alive, so this is not a
             // reason to re-rendezvous; the body is the error the caller should see.
-            Err(ureq::Error::Status(code, response)) => {
-                let body = response.into_string().unwrap_or_default();
+            Err(crate::http_client::Error::Status(code, response)) => {
+                let body = response.into_body().read_to_string().unwrap_or_default();
                 // A modern protocol error comes with a 4xx status and a JSON-RPC
                 // body. That body is the answer, and the client needs it intact:
                 // an unsupported version lists the versions to retry with.
@@ -794,20 +790,26 @@ impl Session {
                 return Err(ExchangeError::Failed(error.to_string()));
             }
         };
-        if let Some(session) = response.header("Mcp-Session-Id") {
+        if let Some(session) = response
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|value| value.to_str().ok())
+        {
             if let Ok(mut guard) = self.session_id.lock() {
                 *guard = Some(session.to_string());
             }
         }
         let is_sse = response
-            .header("Content-Type")
+            .headers()
+            .get("Content-Type")
+            .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_ascii_lowercase()
             .contains("text/event-stream");
         let mut replied = false;
         let mut replay_error = None;
         relay_frames(
-            BufReader::new(response.into_reader()),
+            BufReader::new(response.into_body().into_reader()),
             is_sse,
             || {
                 subscription
@@ -1022,11 +1024,15 @@ impl Session {
         let descriptor = self.descriptor();
         let _ = self
             .with_identity(
-                ureq::delete(&format!("http://{}/adapter/lifetime", descriptor.endpoint))
-                    .set("Authorization", &format!("Bearer {}", descriptor.token))
-                    .timeout(Duration::from_secs(5)),
+                crate::http_client::agent()
+                    .delete(&format!("http://{}/adapter/lifetime", descriptor.endpoint))
+                    .set_header("Authorization", &format!("Bearer {}", descriptor.token))
+                    .config()
+                    .timeout_global(Some(Duration::from_secs(5)))
+                    .build(),
             )
-            .call();
+            .call()
+            .retain_status_body();
         let Some(session) = self.session_id() else {
             return;
         };
@@ -1034,12 +1040,16 @@ impl Session {
         let url = format!("http://{}/mcp", descriptor.endpoint);
         let _ = self
             .with_identity(
-                ureq::delete(&url)
-                    .set("Authorization", &format!("Bearer {}", descriptor.token))
-                    .set("Mcp-Session-Id", &session)
-                    .timeout(Duration::from_secs(5)),
+                crate::http_client::agent()
+                    .delete(&url)
+                    .set_header("Authorization", &format!("Bearer {}", descriptor.token))
+                    .set_header("Mcp-Session-Id", &session)
+                    .config()
+                    .timeout_global(Some(Duration::from_secs(5)))
+                    .build(),
             )
-            .call();
+            .call()
+            .retain_status_body();
     }
 }
 
@@ -1369,21 +1379,22 @@ impl Session {
         }
         let response = self
             .with_identity(
-                ureq::AgentBuilder::new()
-                    .timeout_connect(Duration::from_secs(2))
-                    .timeout_write(Duration::from_secs(2))
-                    .timeout_read(SUBSCRIPTION_READ_TIMEOUT)
-                    .build()
-                    .get(&format!("http://{}/adapter/lifetime", descriptor.endpoint))
-                    .set("Authorization", &format!("Bearer {}", descriptor.token)),
+                crate::http_client::idle_agent(
+                    SUBSCRIPTION_READ_TIMEOUT,
+                    Some(Duration::from_secs(2)),
+                    Duration::from_secs(2),
+                )
+                .get(&format!("http://{}/adapter/lifetime", descriptor.endpoint))
+                .set_header("Authorization", &format!("Bearer {}", descriptor.token)),
             )
             .call()
+            .retain_status_body()
             .map_err(|error| format!("could not open adapter lifetime: {error}"))?;
         *endpoint = Some(descriptor.endpoint.clone());
         let lifetime_endpoint = self.lifetime_endpoint.clone();
         let closed = self.closed.clone();
         std::thread::spawn(move || {
-            let mut reader = BufReader::new(response.into_reader());
+            let mut reader = BufReader::new(response.into_body().into_reader());
             while !closed.load(Ordering::SeqCst) {
                 if !matches!(read_bounded_line(&mut reader, MAX_FRAME_BYTES), Ok(Some(_))) {
                     break;
@@ -1419,18 +1430,21 @@ fn spawn_listen_stream(session: Arc<Session>) {
         let url = format!("http://{}/mcp", descriptor.endpoint);
         let response = session
             .with_identity(
-                ureq::AgentBuilder::new()
-                    .timeout_read(SUBSCRIPTION_READ_TIMEOUT)
-                    .build()
-                    .get(&url)
-                    .set("Authorization", &format!("Bearer {}", descriptor.token))
-                    .set("Accept", "text/event-stream")
-                    .set("Mcp-Session-Id", &session_id),
+                crate::http_client::idle_agent(
+                    SUBSCRIPTION_READ_TIMEOUT,
+                    None,
+                    Duration::from_secs(30),
+                )
+                .get(&url)
+                .set_header("Authorization", &format!("Bearer {}", descriptor.token))
+                .set_header("Accept", "text/event-stream")
+                .set_header("Mcp-Session-Id", &session_id),
             )
-            .call();
+            .call()
+            .retain_status_body();
         match response {
             Ok(response) => {
-                let mut reader = BufReader::new(response.into_reader());
+                let mut reader = BufReader::new(response.into_body().into_reader());
                 while let Ok(Some(ClientFrame::Line(line))) =
                     read_bounded_line(&mut reader, MAX_FRAME_BYTES)
                 {
@@ -1582,10 +1596,10 @@ mod tests {
         assert!(!adapter_requested(&[]));
     }
 
-    /// SEC-04: the daemon must not inherit the client's ambient credentials, but
-    /// it does need the whole Toolport control namespace and the locator vars.
+    /// The daemon keeps the client's environment so opted-in servers see it, as
+    /// in 1.x. Children that did not opt in are filtered by `child_environment`.
     #[test]
-    fn daemon_environment_keeps_control_vars_and_drops_ambient_secrets() {
+    fn daemon_environment_keeps_the_client_environment() {
         let parent: std::collections::BTreeMap<String, String> = [
             ("PATH", "/usr/bin"),
             ("HOME", "/home/u"),
@@ -1621,9 +1635,8 @@ mod tests {
             env.get("CONDUIT_BAR").map(String::as_str),
             Some("legacy-control")
         );
-        assert!(!env.contains_key("AWS_SECRET_ACCESS_KEY"));
-        assert!(!env.contains_key("GITHUB_TOKEN"));
-        assert!(!env.contains_key("OPENAI_API_KEY"));
+        assert_eq!(env.get("GITHUB_TOKEN").map(String::as_str), Some("ghp"));
+        assert_eq!(env.len(), parent.len());
     }
 
     #[test]

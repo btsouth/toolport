@@ -10,7 +10,7 @@ if [ -n "${TOOLPORT_RELEASE_TAG:-}" ] && [ "${TOOLPORT_RELEASE_TAG#v}" != "$TOOL
 fi
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}
 cargo build --manifest-path src-tauri/Cargo.toml --release --locked \
-  --no-default-features --features gtk-desktop --bin toolport-gtk --bin toolport-gateway
+  --no-default-features --features gtk-desktop,search-static --bin toolport-gtk --bin toolport-gateway
 outdir=.verify/native-packages
 mkdir -p "$outdir"
 # Match the plugin zip shipped by the native PKGBUILD.

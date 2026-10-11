@@ -16,6 +16,7 @@ it("shows the v3 upgrade notice, reuses cleanup, and hides after persisted dismi
     servers: [],
     profiles: [],
     activeProfileId: null,
+    accessUpgradeNoticePending: true,
     accessUpgradeNoticeDismissed: false,
   };
   const dismissed = { ...registry, accessUpgradeNoticeDismissed: true };
@@ -39,7 +40,7 @@ it("shows the v3 upgrade notice, reuses cleanup, and hides after persisted dismi
   expect(screen.queryByRole("status")).not.toBeInTheDocument();
 });
 
-it("shows an existing v3 registry without a dismissal marker and skips v2", () => {
+it("skips a fresh v3 registry and v2", () => {
   const registry: Registry = {
     version: 3,
     servers: [],
@@ -49,7 +50,7 @@ it("shows an existing v3 registry without a dismissal marker and skips v2", () =
   const { rerender } = render(
     <AccessUpgradeNotice registry={registry} onRegistryChange={vi.fn()} />,
   );
-  expect(screen.getByRole("status")).toBeInTheDocument();
+  expect(screen.queryByRole("status")).not.toBeInTheDocument();
   rerender(
     <AccessUpgradeNotice
       registry={{ ...registry, version: 2 }}

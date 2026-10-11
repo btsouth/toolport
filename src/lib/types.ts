@@ -30,8 +30,9 @@ export interface DetectedClient {
   id: string;
   name: string;
   usesConnectors: boolean;
-  /** Backend capability evidence; missing or unknown native search resolves to lazy. */
+  /** Backend capability evidence and measured Auto default. */
   discovery?: {
+    autoMode?: "full" | "lazy";
     nativeToolSearch: boolean | null;
     toolsListChanged: boolean | null;
     coldFullListWaitMs?: number;
@@ -76,6 +77,31 @@ export interface MigrateResult {
   outcome: WriteOutcome;
 }
 
+/** Retained transport observations. Reported labels are never app identity. */
+export interface ClientSession {
+  sessionId: string;
+  client?: string;
+  clientName: string;
+  clientLabel?: string;
+  clientType: string;
+  phase: "start" | "checkpoint" | "close";
+  reason: string;
+  gatewayVersion: string;
+  transport: string;
+  toolsListCount: number;
+  listChangedCount: number;
+  firstCatalogSize?: number;
+  firstCatalogRevision?: number;
+  catalogRevision: number;
+  contentChanged: boolean;
+}
+
+export interface ClientActivity extends Partial<ClientSession> {
+  lastActiveMs?: number;
+  callsToday?: number | null;
+  sessionCount?: number;
+}
+
 export interface AuditEntry {
   /** Approval outcomes are Activity events, never dispatched calls. */
   kind?: string;
@@ -89,6 +115,11 @@ export interface AuditEntry {
   ok: boolean;
   /** How long the call took, ms. Absent for records logged before timing. */
   durationMs?: number;
+  cold?: boolean;
+  dispatchMs?: number;
+  failureKind?: string;
+  runId?: string;
+  sessionId?: string;
   /** How long a gated call waited for a human approval decision, ms. Present on
    * `kind:"approval"` records instead of durationMs (which is downstream exec time). */
   heldMs?: number;
@@ -196,6 +227,21 @@ export interface ProbeResult {
   error: string | null;
   /** Failure looks like missing credentials (remote 401/403, or unvaulted secret). */
   authRequired: boolean;
+  authTarget?: "endpoint" | "service_credential" | "scope" | "oauth_refresh" | null;
+  failure?: {
+    kind:
+      | "auth"
+      | "timeout"
+      | "unavailable"
+      | "server_error"
+      | "quota"
+      | "cancelled"
+      | "internal"
+      | "invalid_input"
+      | "not_found"
+      | "conflict";
+    target?: string;
+  } | null;
 }
 
 /** A tool as advertised by a downstream MCP server (raw `tools/list` entry). */
@@ -337,6 +383,7 @@ export interface AuthInfo {
 
 /** One server a shared setup would add, shown for review before importing. */
 export interface ImportItem {
+  referenceReview?: string[];
   credentials?: { key: string; secret: boolean; present: boolean; required: boolean }[];
   unsupported?: string | null;
   envKeys?: string[];
@@ -383,13 +430,25 @@ export interface CatalogEntry {
 
 // --- Toolport registry (source of truth) ---
 
+export interface SecretReference {
+  ref: string;
+}
+export interface HeaderKey {
+  key: string;
+  env?: string;
+  source?: SecretReference;
+}
 export interface EnvVar {
+  source?: SecretReference;
+  portable?: boolean;
   key: string;
   value: string | null;
   secret: boolean;
 }
 
 export interface LaunchInput {
+  source?: SecretReference;
+  portable?: boolean;
   key: string;
   label: string;
   secret: boolean;
@@ -411,7 +470,20 @@ export interface LaunchConfig {
   revision?: number | null;
 }
 
+export interface KeptV1Safety {
+  holdUntrusted?: boolean;
+  denyDestructive?: boolean;
+  quarantineOnDrift?: boolean;
+  blockOnInjection?: boolean;
+}
+
 export interface ServerEntry {
+  syncExecutionReview?: Record<string, string>;
+  syncLocalOnly?: boolean;
+  teamOriginalId?: string;
+  personalSyncEntry?: boolean;
+  teamEnableReview?: boolean;
+  personalSyncArgsReview?: boolean;
   enabled?: boolean;
   id: string;
   name: string;
@@ -420,13 +492,20 @@ export interface ServerEntry {
   args: string[];
   launch?: LaunchConfig | null;
   env: EnvVar[];
+  headerKeys?: HeaderKey[];
+  secretSources?: { allowedPrefixes?: string[] };
   url: string | null;
   source: string | null;
+  /** A remote removal or disable kept this saved personal original off. */
+  teamRouteRemoved?: boolean;
   /** Original tool names switched off; hidden from clients by the gateway. */
   disabledTools?: string[];
   /** Working directory for a stdio server. Unset = inherit the gateway's cwd.
    * `~` and `${VAR}` are expanded. Lets a server run in a project dir (#239). */
   cwd?: string | null;
+  /** Pass the user's whole shell environment to this stdio server instead of
+   * the default allowlist. Servers migrated from 1.x start with it on. */
+  inheritEnv?: boolean;
   /** Headless outbound OAuth (SBS-524). Present = this server uses the
    * client-credentials flow instead of the interactive browser one. */
   clientCredentials?: ClientCredentials | null;
@@ -530,6 +609,7 @@ export interface Registry {
   defaultAccessProfileId?: string | null;
   defaultAccessContextId?: string | null;
   defaultAccessLegacyPolicy?: boolean;
+  accessUpgradeNoticePending?: boolean;
   accessUpgradeNoticeDismissed?: boolean;
   /** Folder -> profile auto-routing mappings. Absent/empty = no folder routing. */
   folderProfiles?: FolderProfile[];
@@ -544,6 +624,10 @@ export interface Registry {
   teamForcedDenyDestructive?: boolean;
   teamForcedQuarantineOnDrift?: boolean;
   teamForcedBlockOnInjection?: boolean;
+  /** Removed 1.x features this install used, recorded by the upgrade. */
+  removedFeaturesNotice?: { features?: string[]; dismissed?: boolean };
+  /** 1.x protections the upgrade kept on top of the level, until a level is picked. */
+  keptV1Safety?: KeptV1Safety;
   /** Retained legacy switch for registries without a safety level. */
   denyDestructive?: boolean;
   /** Per-call confirmation: intercept destructive tools with a preview + token. */
@@ -623,6 +707,9 @@ export interface HttpClient {
 
 /** A joined Toolport Teams server (the shared config-sync layer). */
 export interface TeamConnection {
+  accountStatus?: import("./personalSync").AccountStatus | null;
+  accountStatusError?: string | null;
+  personalSyncState?: import("./personalSync").PersonalSyncState;
   managedServerIds?: Record<string, string>;
   serverUrl: string;
   teamId: string;

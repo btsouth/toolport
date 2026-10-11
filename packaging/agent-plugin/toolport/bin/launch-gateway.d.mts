@@ -25,7 +25,11 @@ export function spawnFirst(
     ) => ChildProcess;
     stdio?: SpawnOptions["stdio"];
     windowsHide?: boolean;
+    env?: NodeJS.ProcessEnv;
+    host?: string;
   },
 ): Promise<number>;
 
 export function validateGatewayOverride(override?: string): string | null;
+
+export function pluginIdentity(env?: NodeJS.ProcessEnv, host?: string): string;

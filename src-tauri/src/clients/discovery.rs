@@ -4,9 +4,13 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveryCapabilities {
+    pub auto_mode: &'static str,
     pub native_tool_search: Option<bool>,
     pub tools_list_changed: Option<bool>,
     pub cold_full_list_wait_ms: u64,
+    /// Most tools this client accepts from one server. Above it the client drops
+    /// the server's whole list, so Full answers with the search tools instead.
+    pub max_tools: Option<usize>,
     pub evidence: &'static str,
 }
 
@@ -21,11 +25,7 @@ impl DiscoveryCapabilities {
     }
 
     pub fn auto_mode(self) -> &'static str {
-        if self.native_tool_search == Some(true) {
-            "full"
-        } else {
-            "lazy"
-        }
+        self.auto_mode
     }
 }
 
@@ -34,46 +34,71 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
     // in docs/client-discovery.md. API hosts are not file-based client adapters.
     match id {
         "claude-code" => DiscoveryCapabilities {
+            auto_mode: "lazy",
             native_tool_search: Some(true),
             tools_list_changed: Some(true),
             cold_full_list_wait_ms: 2_000,
+            max_tools: None,
             evidence: "https://code.claude.com/docs/en/mcp",
         },
         "codex" => DiscoveryCapabilities {
+            auto_mode: "full",
             native_tool_search: Some(true),
             tools_list_changed: Some(false),
             cold_full_list_wait_ms: 8_000,
+            // Codex 0.162.1 shows no tools from a server that lists 2,049 or more.
+            max_tools: Some(2_048),
             evidence: "https://developers.openai.com/codex/config-reference",
         },
         "cursor" => DiscoveryCapabilities {
+            auto_mode: "full",
             native_tool_search: Some(true),
-            tools_list_changed: None,
+            tools_list_changed: Some(false),
             cold_full_list_wait_ms: 5_000,
+            max_tools: None,
             evidence: "https://cursor.com/blog/dynamic-context-discovery",
         },
+        "opencode" | "gemini-cli" | "cline" | "zed" => DiscoveryCapabilities {
+            auto_mode: "lazy",
+            native_tool_search: None,
+            tools_list_changed: Some(true),
+            // Keep the conservative budget: handler registration alone does not
+            // establish how quickly every installed version refreshes its catalog.
+            cold_full_list_wait_ms: 5_000,
+            max_tools: None,
+            evidence: "docs/client-conformance.md (source and notification evidence)",
+        },
         "anthropic-api" => DiscoveryCapabilities {
+            auto_mode: "full",
             native_tool_search: Some(true),
             tools_list_changed: None,
             cold_full_list_wait_ms: 5_000,
+            max_tools: None,
             evidence:
                 "https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool",
         },
         "openai-api" => DiscoveryCapabilities {
+            auto_mode: "full",
             native_tool_search: Some(true),
             tools_list_changed: None,
             cold_full_list_wait_ms: 5_000,
+            max_tools: None,
             evidence: "https://developers.openai.com/api/docs/guides/tools-tool-search",
         },
         "lm-studio" | "jan" | "anythingllm" => DiscoveryCapabilities {
+            auto_mode: "lazy",
             native_tool_search: None,
             tools_list_changed: None,
             cold_full_list_wait_ms: 5_000,
+            max_tools: None,
             evidence: "docs/clients.md (local-model clients)",
         },
         _ => DiscoveryCapabilities {
+            auto_mode: "lazy",
             native_tool_search: None,
             tools_list_changed: None,
             cold_full_list_wait_ms: 5_000,
+            max_tools: None,
             evidence: "docs/clients.md (adapter notes; discovery support unverified)",
         },
     }
@@ -83,9 +108,20 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
 mod tests {
     use super::*;
     #[test]
+    fn verified_refresh_does_not_imply_native_search_or_a_shorter_startup_budget() {
+        for id in ["opencode", "gemini-cli", "cline", "zed"] {
+            let caps = capabilities(id);
+            assert_eq!(caps.tools_list_changed, Some(true), "{id}");
+            assert_eq!(caps.native_tool_search, None, "{id}");
+            assert_eq!(caps.auto_mode(), "lazy", "{id}");
+            assert_eq!(caps.cold_full_list_wait_ms, 5_000, "{id}");
+        }
+        assert_eq!(capabilities("codex").tools_list_changed, Some(false));
+        assert_eq!(capabilities("cursor").tools_list_changed, Some(false));
+    }
+    #[test]
     fn every_definition_carries_capability_evidence_and_preserves_overrides() {
         let mut registry = crate::registry::Registry::default();
-        registry.discovery_mode = Some("full".into());
         for definition in super::super::defs() {
             assert!(
                 !definition.discovery.evidence.is_empty(),
@@ -114,6 +150,33 @@ mod tests {
         }
         assert_eq!(
             super::super::discovery_capabilities("client:claude-code").auto_mode(),
+            "lazy"
+        );
+    }
+
+    #[test]
+    fn a_chosen_global_mode_beats_built_in_client_defaults() {
+        let mut registry = crate::registry::Registry::default();
+        assert_eq!(super::super::client_discovery_mode(&registry, "codex"), "full");
+        assert_eq!(
+            super::super::client_discovery_mode(&registry, "claude-code"),
+            "lazy"
+        );
+        registry.set_discovery_mode("lazy");
+        assert_eq!(super::super::client_discovery_mode(&registry, "codex"), "lazy");
+        registry.set_discovery_mode("grouped");
+        assert_eq!(
+            super::super::client_discovery_mode(&registry, "cursor"),
+            "grouped"
+        );
+        // A per-client choice still wins over the global one.
+        registry.set_client_discovery("cursor", Some("full"));
+        assert_eq!(super::super::client_discovery_mode(&registry, "cursor"), "full");
+        // 1.x "Find tools as needed" turned off meant full for everyone.
+        let mut v1 = crate::registry::Registry::default();
+        v1.lazy_discovery = false;
+        assert_eq!(
+            super::super::client_discovery_mode(&v1, "claude-code"),
             "full"
         );
     }
@@ -142,14 +205,36 @@ mod tests {
         registry.set_client_discovery("claude-code", None);
         assert_eq!(
             super::super::client_discovery_mode(&registry, "client:claude-code"),
-            "full"
+            "lazy"
         );
     }
 
     #[test]
-    fn auto_uses_native_search_with_per_client_cold_budgets() {
+    fn adapter_capabilities_do_not_rewrite_registry_choices_or_identity() {
+        let mut registry = crate::registry::Registry::default();
+        registry.set_client_discovery("claude-code", Some("full"));
+        let before = serde_json::to_value(&registry).unwrap();
+        for id in ["codex", "client:codex", "adapter:codex", "adapter:client:codex"] {
+            let caps = super::super::discovery_capabilities(id);
+            assert_eq!(caps.cold_full_list_wait_ms, 8_000, "{id}");
+            assert_eq!(caps.tools_list_changed, Some(false), "{id}");
+        }
+        assert_eq!(
+            super::super::client_discovery_mode(&registry, "claude-code"),
+            "full"
+        );
+        registry.set_client_discovery("claude-code", None);
+        assert_eq!(
+            super::super::client_discovery_mode(&registry, "claude-code"),
+            "lazy"
+        );
+        registry.set_client_discovery("claude-code", Some("full"));
+        assert_eq!(serde_json::to_value(registry).unwrap(), before);
+    }
+
+    #[test]
+    fn auto_uses_measured_defaults_with_per_client_cold_budgets() {
         for (id, budget) in [
-            ("claude-code", 2_000),
             ("codex", 8_000),
             ("cursor", 5_000),
             ("anthropic-api", 5_000),
@@ -158,14 +243,24 @@ mod tests {
             assert_eq!(capabilities(id).auto_mode(), "full", "{id}");
             assert_eq!(capabilities(id).cold_full_list_wait_ms, budget, "{id}");
         }
-        for id in ["lm-studio", "jan", "anythingllm", "unknown"] {
+        assert_eq!(capabilities("claude-code").cold_full_list_wait_ms, 2_000);
+        for id in [
+            "claude-code",
+            "opencode",
+            "lm-studio",
+            "jan",
+            "anythingllm",
+            "unknown",
+        ] {
             assert_eq!(capabilities(id).auto_mode(), "lazy", "{id}");
         }
         assert_eq!(
             DiscoveryCapabilities {
+                auto_mode: "lazy",
                 native_tool_search: None,
                 tools_list_changed: Some(true),
                 cold_full_list_wait_ms: 2_000,
+                max_tools: None,
                 evidence: "fixture"
             }
             .auto_mode(),

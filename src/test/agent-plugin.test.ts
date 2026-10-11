@@ -9,6 +9,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, posix, win32 } from "node:path";
 import {
   gatewayCandidates,
+  pluginIdentity,
   spawnFirst,
   validateGatewayOverride,
 } from "../../packaging/agent-plugin/toolport/bin/launch-gateway.mjs";
@@ -128,6 +129,54 @@ describe("agent plugin MCP config (mcp.json)", () => {
       const relative = launcherArg!.replace("${CLAUDE_PLUGIN_ROOT}/", "");
       expect(existsSync(join(pluginRoot, relative))).toBe(true);
     }
+  });
+});
+
+describe("plugin client identity", () => {
+  it("names supported hosts and preserves explicit identity", () => {
+    expect(pluginIdentity({}, "claude-code")).toBe("claude-code");
+    expect(pluginIdentity({}, "cursor")).toBe("cursor");
+    expect(pluginIdentity({ CLAUDE_PLUGIN_ROOT: "/fixture/inherited" }, "codex")).toBe(
+      "codex",
+    );
+    expect(pluginIdentity({ CURSOR_PLUGIN_ROOT: "/fixture/plugin" })).toBe("cursor");
+    expect(pluginIdentity({ CODEX_PLUGIN_ROOT: "/fixture/plugin" })).toBe("codex");
+    expect(pluginIdentity({ TOOLPORT_CLIENT_ID: "custom" }, "claude-code")).toBe(
+      "custom",
+    );
+    expect(pluginIdentity({ CONDUIT_CLIENT_ID: "legacy" })).toBe("legacy");
+    expect(pluginIdentity({})).toBe("toolport-plugin");
+  });
+  it("host attribution preserves scope identity and profile", async () => {
+    for (const env of [
+      { TOOLPORT_PROFILE: "narrow" },
+      { TOOLPORT_PROFILE: "narrow", CONDUIT_CLIENT_ID: "legacy" },
+    ]) {
+      await expect(
+        spawnFirst([process.execPath], {
+          env,
+          host: "claude-code",
+          stdio: "ignore",
+          args: [
+            "-e",
+            "process.exit(!process.env.TOOLPORT_CLIENT_ID && process.env.TOOLPORT_PROFILE === 'narrow' ? 0 : 1)",
+          ],
+        }),
+      ).resolves.toBe(0);
+    }
+  });
+  it("passes identity to the spawned gateway without recording environment values", async () => {
+    await expect(
+      spawnFirst([process.execPath], {
+        env: {},
+        host: "claude-code",
+        stdio: "ignore",
+        args: [
+          "-e",
+          "process.exit(process.env.TOOLPORT_ATTRIBUTION_ID === 'claude-code' ? 0 : 1)",
+        ],
+      }),
+    ).resolves.toBe(0);
   });
 });
 

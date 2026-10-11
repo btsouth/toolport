@@ -747,7 +747,10 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, host: BrokerHost) {
     let view = PendingView {
         id: req.id.clone(),
         client: req.client.clone(),
-        client_name: crate::clients::trusted_client_name(req.client.as_deref(), None),
+        client_name: crate::clients::trusted_client_name(
+            req.client.as_deref(),
+            req.client_name.as_deref(),
+        ),
         client_label: req.client_label.clone(),
         server: req.server.clone(),
         tool: req.tool.clone(),
@@ -1150,7 +1153,10 @@ mod tests {
         other.id = "other".into();
         let view = |req: ApprovalRequest| PendingView {
             id: req.id,
-            client_name: crate::clients::trusted_client_name(req.client.as_deref(), None),
+            client_name: crate::clients::trusted_client_name(
+                req.client.as_deref(),
+                req.client_name.as_deref(),
+            ),
             client: req.client,
             client_label: req.client_label,
             server: req.server,
@@ -1483,6 +1489,7 @@ mod tests {
             token: token.into(),
             id: "req-1".into(),
             client: None,
+            client_name: crate::session_observability::current().client_name,
             client_label: None,
             server: "db".into(),
             tool: "drop_table".into(),

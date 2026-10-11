@@ -633,10 +633,14 @@ fn configure_self_hosted(entry: &crate::catalog::CatalogEntry, hint: &str, page:
         launch: entry.launch.clone(),
         url: None,
         cwd: None,
+        inherit_env: false,
+        secret_references: Default::default(),
         secret_keys: entry.env_keys.clone(),
+        plain_env: Vec::new(),
         client_credentials: None,
         enabled: false,
         requires_review: false,
+        team_route_removed: false,
         probe_fingerprint: 0,
     };
     let editor =
@@ -857,7 +861,6 @@ mod tests {
             app: app.clone(),
             server_count: gtk::Label::new(None),
             enabled_count: gtk::Label::new(None),
-            profile_count: gtk::Label::new(None),
             section_title: gtk::Label::new(None),
             posture: gtk::Label::new(None),
             search: gtk::SearchEntry::new(),

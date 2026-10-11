@@ -25,6 +25,7 @@
   !else
     File /oname=$PLUGINSDIR\toolport-preflight.exe "${TOOLPORT_HOOK_DIR}\binaries\toolport-gateway-i686-pc-windows-msvc.exe"
   !endif
+  DetailPrint "Toolport connections may restart during installation; restart your MCP client if it disconnects."
   toolport_preflight_retry:
     nsExec::ExecToStack /TIMEOUT=60000 '"$PLUGINSDIR\toolport-preflight.exe" --installer-preflight "$INSTDIR"'
     Pop $0

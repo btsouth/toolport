@@ -31,7 +31,7 @@ export function TeamPairingDialog({ onConnected }: { onConnected: () => void }) 
       setCancelling(false);
       if (event.state === "connected") {
         setShown(null);
-        toast.success("Toolport connected to Teams.");
+        toast.success("Toolport is signed in to sync.");
         connected.current();
       } else if (event.state === "cancelled") {
         setShown(null);
@@ -70,7 +70,7 @@ export function TeamPairingDialog({ onConnected }: { onConnected: () => void }) 
             <DialogHeader>
               <DialogTitle>Connection not completed</DialogTitle>
               <DialogDescription>
-                {shown.message} Nothing was connected. Start again from the Teams website
+                {shown.message} Nothing was connected. Start again from the sync website
                 when you are ready.
               </DialogDescription>
             </DialogHeader>
@@ -84,7 +84,7 @@ export function TeamPairingDialog({ onConnected }: { onConnected: () => void }) 
               <DialogTitle>Approve this device in your browser</DialogTitle>
               <DialogDescription>
                 Device check: <span className="font-mono">{shown?.check}</span>. Approve
-                only if the browser shows this same check, the intended team and your
+                only if the browser shows this same check, the intended setup and your
                 account. This request expires in five minutes. You can hide this message;
                 Toolport finishes connecting when you approve.
               </DialogDescription>

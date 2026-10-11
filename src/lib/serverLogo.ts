@@ -36,6 +36,27 @@ const NAME_LOGO: [RegExp, string][] = [
   [/resend/i, "resend"],
   [/\bn8n\b/i, "n8n"],
   [/^git\b/i, "git"],
+  [/apify/i, "apify"],
+  [/browserbase/i, "browserbase"],
+  [/composio/i, "composio"],
+  [/context7/i, "context7"],
+  [/dataforseo/i, "dataforseo"],
+  [/deepwiki/i, "deepwiki"],
+  [/firecrawl/i, "firecrawl"],
+  [/langfuse/i, "langfuse"],
+  [/linode/i, "linode"],
+  [/microsoft/i, "microsoft"],
+  [/parallel search/i, "parallel"],
+  [/playwright/i, "playwright"],
+  [/tavily/i, "tavily"],
+  [/\bexa\b/i, "exa"],
+  // The reference servers have no brand. Match them only as the leading word,
+  // so a "Team memory" or "Showtime" server keeps its transport badge.
+  [/^fetch\b/i, "fetch"],
+  [/^filesystem\b/i, "filesystem"],
+  [/^memory\b/i, "memory"],
+  [/^sequential thinking\b/i, "sequentialthinking"],
+  [/^time\b/i, "time"],
 ];
 
 export function serverLogoKey(name: string): string | null {

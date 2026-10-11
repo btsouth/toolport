@@ -41,7 +41,7 @@ if (!args.has("--frontend")) {
       "src-tauri/Cargo.toml",
       "--no-default-features",
       "--features",
-      "test-support",
+      "test-support,search-static",
       "--lib",
       "--bins",
       "--tests",

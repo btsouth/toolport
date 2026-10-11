@@ -43,17 +43,18 @@ fn a_corrupt_registry_does_not_take_down_a_running_gateway() {
     let corrupt = "{ \"version\": 1, \"servers\": [ { \"id\": \"x\", TRUNCATED";
     std::fs::write(scratch.path().join("registry.json"), corrupt).expect("corrupt the registry");
 
-    // The unreadable bytes are preserved for inspection before anything heals.
+    // A matching temporary filename is not evidence that quarantine finished.
+    // Wait for the exact final copy, including every byte of the failed write.
+    let quarantined = format!(
+        "registry.json.unreadable-sha256-{}",
+        conduit_lib::registry::sha256_hex(corrupt)
+    );
     wait_for("the corrupt copy to be quarantined", Duration::from_secs(30), || {
-        !scratch.matching("registry.json.unreadable-").is_empty()
+        scratch.read(&quarantined) == corrupt
     });
-    let quarantined = scratch
-        .matching("registry.json.unreadable-")
-        .into_iter()
-        .map(|name| scratch.read(&name))
-        .find(|content| content.contains("TRUNCATED"));
-    assert!(
-        quarantined.is_some(),
+    assert_eq!(
+        scratch.read(&quarantined),
+        corrupt,
         "the corrupt bytes must survive in the quarantine copy"
     );
 
@@ -127,15 +128,18 @@ fn editing_one_server_preserves_the_other_pid_and_in_flight_call() {
     let a_pids = scratch.join("a.pids");
     let b_pids = scratch.join("b.pids");
     let transcript = scratch.join("b.requests");
+    let trace = scratch.join("b.wire.jsonl");
     let a_path = a_pids.to_string_lossy();
     let b_path = b_pids.to_string_lossy();
     let transcript_path = transcript.to_string_lossy();
+    let trace_path = trace.to_string_lossy();
     let mut a = mock_entry("a", &[("MOCK_MCP_PID_FILE", &a_path)]);
     let b = mock_entry(
         "b",
         &[
             ("MOCK_MCP_PID_FILE", &b_path),
             ("MOCK_MCP_TRANSCRIPT", &transcript_path),
+            ("MOCK_MCP_WIRE_TRACE", &trace_path),
             ("MOCK_MCP_CONCURRENT", "1"),
         ],
     );
@@ -175,7 +179,41 @@ fn editing_one_server_preserves_the_other_pid_and_in_flight_call() {
     let list_started = std::time::Instant::now();
     assert!(client.tool_names().contains(&"b__sleep".to_string()));
     assert!(list_started.elapsed() < Duration::from_secs(2));
-    let reply = worker.wait_for_id(call, Duration::from_secs(15));
+    let reply = worker.wait_for_id_with_diagnostics(call, Duration::from_secs(15), || {
+        let mut state = format!("observer:\n{}\n", client.diagnostics());
+        let mut pids: Vec<_> = live_daemon_pid(scratch.path())
+            .into_iter()
+            .map(|pid| pid.to_string())
+            .collect();
+        for name in [
+            "a.pids",
+            "b.pids",
+            "b.requests",
+            "b.wire.jsonl",
+            "registry.json",
+        ] {
+            let raw = scratch.read(name);
+            if name.ends_with(".pids") {
+                pids.extend(
+                    raw.lines()
+                        .filter(|line| line.parse::<u32>().is_ok())
+                        .map(str::to_string),
+                );
+            }
+            let lines: Vec<_> = raw.lines().collect();
+            state.push_str(&format!(
+                "{name}:\n{}\n",
+                lines[lines.len().saturating_sub(64)..].join("\n")
+            ));
+        }
+        if let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "pid,ppid,stat,etime,pcpu,comm", "-p", &pids.join(",")])
+            .output()
+        {
+            state.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+        state
+    });
     assert!(
         !reply["result"]["isError"].as_bool().unwrap_or(false),
         "B's call failed: {reply}"
@@ -251,7 +289,7 @@ fn a_cached_server_stays_lazy_then_stops_when_idle_and_restarts_on_use() {
 // Startup persists a spec before first-use discovery has populated its tools.
 // A matching spec alone cannot prove that a restart will stay lazy.
 fn has_cached_echo(cache: &serde_json::Value) -> bool {
-    cache["version"] == 2
+    cache["version"] == 4
         && cache["servers"]["lazy"]["spec"].is_string()
         && cache["servers"]["lazy"]["tools"]
             .as_array()
@@ -260,10 +298,10 @@ fn has_cached_echo(cache: &serde_json::Value) -> bool {
 
 #[test]
 fn an_empty_persisted_catalog_is_not_a_warm_cache() {
-    let mut cache = json!({"version":2,"servers":{"lazy":{"spec":"current","tools":[]}}});
+    let mut cache = json!({"version":4,"servers":{"lazy":{"spec":"current","tools":[]}}});
     assert!(!has_cached_echo(&cache));
     cache["servers"]["lazy"]["tools"] = json!([{"name":"echo"}]);
     assert!(has_cached_echo(&cache));
-    cache["version"] = json!(1);
+    cache["version"] = json!(3);
     assert!(!has_cached_echo(&cache));
 }

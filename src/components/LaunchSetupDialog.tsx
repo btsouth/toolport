@@ -1,7 +1,9 @@
+import { SecretReferenceField } from "@/components/SecretReferenceField";
+import { invoke } from "@tauri-apps/api/core";
 import { useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
-import { setLaunchInputValue, setLaunchSecret } from "@/lib/api";
+import { setLaunchInputValue, setLaunchSecret, setSecretReference } from "@/lib/api";
 import type { Registry, ServerEntry } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import {
@@ -28,9 +30,17 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
   const [busy, setBusy] = useState(false);
   const [values, setValues] = useState<Record<string, string>>({});
   const inputs = server.launch?.inputs ?? [];
+  const [references, setReferences] = useState<Record<string, string | undefined>>({});
+  const [portable, setPortable] = useState<Record<string, boolean>>({});
 
   function onOpenChange(next: boolean) {
     if (next) {
+      setReferences(
+        Object.fromEntries(
+          inputs.filter((i) => i.source).map((i) => [i.key, i.source!.ref]),
+        ),
+      );
+      setPortable(Object.fromEntries(inputs.map((i) => [i.key, i.portable === true])));
       setValues(
         Object.fromEntries(
           inputs.map((input) => [input.key, input.secret ? "" : (input.value ?? "")]),
@@ -46,10 +56,24 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
     try {
       for (const input of inputs) {
         const value = values[input.key] ?? "";
-        if (input.secret) {
+        if (references[input.key] !== undefined) {
+          result = await setSecretReference(server.id, input.key, references[input.key]!);
+        } else if (input.secret) {
           if (value) result = await setLaunchSecret(server.id, input.key, value);
         } else if (value !== (input.value ?? "")) {
           result = await setLaunchInputValue(server.id, input.key, value || null);
+        }
+        if (
+          !input.secret &&
+          references[input.key] === undefined &&
+          (portable[input.key] === true) !== (input.portable === true)
+        ) {
+          result = await invoke<Registry>("personal_sync_portable", {
+            serverId: server.id,
+            kind: "input",
+            key: input.key,
+            enabled: portable[input.key] === true,
+          });
         }
       }
       if (result) {
@@ -80,25 +104,64 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
                 {input.label}
                 {input.required ? " *" : ""}
               </Label>
-              <Input
-                id={`setup-${server.id}-${input.key}`}
-                type={input.secret ? "password" : "text"}
-                value={values[input.key] ?? ""}
-                placeholder={
-                  input.secret ? "Leave blank to keep any vaulted value" : input.label
-                }
-                onChange={(event) =>
-                  setValues((current) => ({
-                    ...current,
-                    [input.key]: event.target.value,
-                  }))
-                }
-              />
+              {input.secret && (
+                <select
+                  aria-label={`Key source for ${input.label}`}
+                  className="self-start rounded border bg-background p-1 text-xs"
+                  value={references[input.key] !== undefined ? "reference" : "paste"}
+                  onChange={(e) =>
+                    setReferences((r) => ({
+                      ...r,
+                      [input.key]:
+                        e.target.value === "reference"
+                          ? "op://Engineering/Docs/key"
+                          : undefined,
+                    }))
+                  }
+                >
+                  <option value="paste">Paste a key</option>
+                  <option value="reference">From a password manager</option>
+                </select>
+              )}
+              {references[input.key] !== undefined ? (
+                <SecretReferenceField
+                  serverId={server.id}
+                  value={references[input.key]!}
+                  onChange={(ref) => setReferences((r) => ({ ...r, [input.key]: ref }))}
+                />
+              ) : (
+                <Input
+                  id={`setup-${server.id}-${input.key}`}
+                  type={input.secret ? "password" : "text"}
+                  value={values[input.key] ?? ""}
+                  placeholder={
+                    input.secret ? "Leave blank to keep any vaulted value" : input.label
+                  }
+                  onChange={(event) =>
+                    setValues((current) => ({
+                      ...current,
+                      [input.key]: event.target.value,
+                    }))
+                  }
+                />
+              )}
+              {!input.secret && references[input.key] === undefined && (
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={portable[input.key] === true}
+                    onChange={(e) =>
+                      setPortable((p) => ({ ...p, [input.key]: e.target.checked }))
+                    }
+                  />{" "}
+                  Same on every machine
+                </label>
+              )}
             </div>
           ))}
           <p className="text-xs text-muted-foreground">
-            Secret values stay in Toolport's vault. This server can be enabled after its
-            required setup and credentials are present.
+            Pasted keys stay in Toolport's vault. Password manager references sync to your
+            other machines. Sign in to the provider on each machine.
           </p>
         </div>
         <DialogFooter>

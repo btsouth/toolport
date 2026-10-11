@@ -112,10 +112,10 @@ controls actively gate or block a call before it reaches an upstream server.
   untrusted-provenance servers (shared/registry sources) require an explicit human
   approval. This gate is fail-closed: a denied, timed-out, or unreachable decision
   blocks the call, which returns an error and never routes.
-- **Content provenance labeling.** Flagged tool results and resource reads are
-  wrapped with a provenance marker telling the model the block is external data,
-  not instructions. This labels and fences the content; by design it does not drop
-  or block it, so the model still receives it, clearly marked.
+- **Content screening.** Tool results and resource reads are scanned for
+  injection patterns. Findings are recorded in Activity, and results are returned
+  exactly as the server sent them, with provenance only in hidden `_meta`. In
+  Strict mode a high-confidence finding blocks the result and returns an error.
 
 Which of these are active depends on your settings and, for Teams, your org
 policy. Debug logging is off by default, gated behind `TOOLPORT_DEBUG` (legacy `CONDUIT_DEBUG`), and never

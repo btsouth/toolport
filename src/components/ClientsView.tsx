@@ -1,4 +1,8 @@
-import { useState } from "react";
+import { trustedClientName, clientIdentityTooltip } from "@/lib/clientIdentity";
+import { getClientSessions } from "@/lib/api";
+import type { ClientActivity } from "@/lib/types";
+import { fmtAgo } from "@/lib/utils";
+import { useEffect, useState } from "react";
 import { ChevronRight, Download, MonitorCog, Puzzle } from "lucide-react";
 import { ClientLogo } from "@/components/ClientLogo";
 import { Badge } from "@/components/ui/badge";
@@ -70,7 +74,7 @@ function ClientRow({
     <button
       type="button"
       onClick={onSelect}
-      className={`grid min-h-14 w-full grid-cols-[32px_minmax(0,1fr)_auto_16px] items-center gap-3 border-b border-border/60 px-3.5 py-2.5 text-left transition-colors last:border-b-0 hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring ${
+      className={`grid min-h-14 w-full grid-cols-[32px_minmax(0,1fr)_auto_16px] items-center gap-3 border-b border-border/60 px-1 py-3 text-left transition-colors last:border-b-0 hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring ${
         status === "missing" ? "opacity-60" : ""
       }`}
     >
@@ -115,6 +119,25 @@ export function ClientsView({
   onSelectClient: (id: string) => void;
 }) {
   const [showMissing, setShowMissing] = useState(false);
+  const [showRecent, setShowRecent] = useState(false);
+  const [sessions, setSessions] = useState<ClientActivity[]>([]);
+  const [sessionError, setSessionError] = useState(false);
+  useEffect(() => {
+    let current = true;
+    getClientSessions()
+      .then((rows) => {
+        if (current) {
+          setSessions(rows);
+          setSessionError(false);
+        }
+      })
+      .catch(() => {
+        if (current) setSessionError(true);
+      });
+    return () => {
+      current = false;
+    };
+  }, [clients]);
   const sorted = sortClients(clients);
   const present = sorted.filter((client) => statusOf(client) !== "missing");
   const missing = sorted.filter((client) => statusOf(client) === "missing");
@@ -131,7 +154,7 @@ export function ClientsView({
     );
   }
 
-  if (clients.length === 0) {
+  if (clients.length === 0 && sessions.length === 0 && !sessionError) {
     return (
       <EmptyState
         icon={<MonitorCog />}
@@ -143,6 +166,11 @@ export function ClientsView({
 
   return (
     <div className="flex flex-col gap-5">
+      {sessionError && (
+        <p role="status" className="text-xs text-muted-foreground">
+          Client session history could not be read.
+        </p>
+      )}
       {present.length === 0 && (
         <EmptyState
           icon={<MonitorCog />}
@@ -155,7 +183,7 @@ export function ClientsView({
       {connected.length > 0 && (
         <section>
           <SectionHeader count={connected.length}>Connected to Toolport</SectionHeader>
-          <div className="overflow-hidden rounded-xl border border-success/20 bg-success/5">
+          <div className="toolport-list">
             {connected.map((client) => (
               <ClientRow
                 key={client.id}
@@ -174,7 +202,7 @@ export function ClientsView({
           <p className="mb-2 text-xs text-muted-foreground">
             Select an installed client to connect it or review its configuration.
           </p>
-          <div className="overflow-hidden rounded-xl border border-border/60 bg-card/40">
+          <div className="toolport-list">
             {available.map((client) => (
               <ClientRow
                 key={client.id}
@@ -203,7 +231,7 @@ export function ClientsView({
             <span>{missing.length}</span>
           </button>
           {showMissing && (
-            <div className="mt-2 overflow-hidden rounded-xl border border-border/60 bg-card/30">
+            <div className="mt-2 toolport-list">
               {missing.map((client) => (
                 <ClientRow
                   key={client.id}
@@ -211,6 +239,59 @@ export function ClientsView({
                   importCount={0}
                   onSelect={() => onSelectClient(client.id)}
                 />
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+      {sessions.length > 0 && (
+        <section aria-label="Recent client activity">
+          <button
+            type="button"
+            onClick={() => setShowRecent((value) => !value)}
+            aria-expanded={showRecent}
+            className="flex w-full items-center gap-2 rounded-md px-1 py-1.5 text-left text-xs text-muted-foreground hover:text-foreground"
+          >
+            <ChevronRight
+              className={`size-3.5 ${showRecent ? "rotate-90" : ""}`}
+              aria-hidden="true"
+            />
+            Recent client activity <span>{sessions.length}</span>
+          </button>
+          {showRecent && (
+            <div className="mt-2 toolport-list">
+              {sessions.map((client) => (
+                <div
+                  key={trustedClientName(client)}
+                  className="border-b border-border/60 px-1 py-3 last:border-b-0"
+                >
+                  <p
+                    className="truncate text-sm font-medium"
+                    title={
+                      clientIdentityTooltip(client) ??
+                      [
+                        client.clientLabel && `Reports itself as: ${client.clientLabel}`,
+                        `${client.sessionCount ?? 1} recorded sessions`,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")
+                    }
+                  >
+                    {trustedClientName(client)}
+                  </p>
+                  <p
+                    className="text-xs text-muted-foreground"
+                    title="Calls today counts retained tool calls since local midnight. Older calls may no longer be retained."
+                  >
+                    {client.lastActiveMs
+                      ? `Last active ${fmtAgo(client.lastActiveMs)}`
+                      : "Last active time unavailable"}
+                    {client.callsToday != null &&
+                      ` · ${client.callsToday.toLocaleString()} ${client.callsToday === 1 ? "call" : "calls"} today`}
+                    {client.firstCatalogSize != null &&
+                      ` · Last saw ${client.firstCatalogSize.toLocaleString()} tools`}
+                  </p>
+                </div>
               ))}
             </div>
           )}

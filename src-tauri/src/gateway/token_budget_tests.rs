@@ -60,7 +60,7 @@ fn token_audit_measure(bpe: &tiktoken_rs::CoreBPE, text: &str) -> Value {
     })
 }
 
-fn token_audit_dispatch(catalog: &[Value], mode: DiscoveryMode, request: &Value) -> Value {
+fn token_audit_dispatch(catalog: &dyn ToolCatalog, mode: DiscoveryMode, request: &Value) -> Value {
     let host = dispatch_host(false);
     host.set_discovery_mode(mode);
     handle_request(
@@ -206,7 +206,7 @@ fn token_budget_audit() {
                 }
                 record(&format!("{prefix}.raw"), result.to_string());
                 integrity::neutralize_untrusted_result(&mut result);
-                integrity::label_untrusted_result_with_notice("public-fixture", &mut result, false);
+                integrity::label_untrusted_result("public-fixture", &mut result);
                 record(&format!("{prefix}.provenance"), result.to_string());
                 let shaped = shaping::shape_result(
                     &mut result,
@@ -256,7 +256,7 @@ fn token_budget_regression() {
     let bpe = tiktoken_rs::o200k_base().unwrap();
     let host = dispatch_host(false);
     let tools = floor_tool_defs(&host);
-    let floor = json!(tools).to_string() + DISCOVER_INSTRUCTIONS_PREAMBLE;
+    let floor = json!(tools).to_string() + &discovery_instructions(DiscoveryMode::Lazy, None);
     let tokens = bpe.encode_ordinary(&floor).len();
     // About 10% headroom above the measured payloads, not optimization targets.
     let check = |label: &str, measured: usize, limit: usize| {

@@ -1,4 +1,5 @@
 //! #759: exercise the shipped gateway/worker boundary, not an in-process Boa harness.
+use conduit_lib::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -112,9 +113,7 @@ impl Gateway {
         };
         if let (Some(port), Some(token)) = (http_port, http_token) {
             let deadline = Instant::now() + Duration::from_secs(20);
-            let agent = ureq::AgentBuilder::new()
-                .timeout(Duration::from_millis(500))
-                .build();
+            let agent = conduit_lib::http_client::agent();
             loop {
                 assert!(
                     gateway.child.try_wait().unwrap().is_none(),
@@ -125,10 +124,12 @@ impl Gateway {
                 // before this child has actually bound its HTTP listener.
                 let ready = agent
                     .get(&format!("http://127.0.0.1:{port}/"))
-                    .set("Authorization", &format!("Bearer {token}"))
+                    .config().timeout_global(Some(Duration::from_millis(500))).build()
+                    .set_header("Authorization", &format!("Bearer {token}"))
                     .call()
+                    .retain_status_body()
                     .ok()
-                    .and_then(|response| response.into_string().ok())
+                    .and_then(|response| response.into_body().read_to_string().ok())
                     .is_some_and(|body| body.starts_with("Toolport gateway (HTTP mode)."));
                 if ready {
                     return gateway;
@@ -175,7 +176,10 @@ impl Gateway {
             "tools/call",
             json!({ "name": "toolport_run_script", "arguments": arguments }),
         );
-        assert!(response["result"].is_object(), "code mode RPC failed: {response}");
+        assert!(
+            response["result"].is_object(),
+            "code mode RPC failed: {response}"
+        );
         response["result"].clone()
     }
 
@@ -199,21 +203,26 @@ impl Gateway {
     }
 
     fn http_call(&self, token: &str, name: &str, args: Value) -> Value {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(75))
-            .build();
+        let agent = conduit_lib::http_client::agent();
         let response = agent
             .post(&format!(
                 "http://127.0.0.1:{}/{name}",
                 self.http_port.unwrap()
             ))
-            .set("Authorization", &format!("Bearer {token}"))
-            .send_json(args);
+            .config().timeout_global(Some(Duration::from_secs(75))).build()
+            .set_header("Authorization", &format!("Bearer {token}"))
+            .send_json(args)
+            .retain_status_body();
         let response = match response {
-            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Ok(response) | Err(conduit_lib::http_client::Error::Status(_, response)) => response,
             Err(error) => panic!("HTTP gateway failed: {error}"),
         };
-        response.into_json().expect("JSON HTTP result")
+        response
+            .into_body()
+            .with_config()
+            .limit(u64::MAX)
+            .read_json()
+            .expect("JSON HTTP result")
     }
 
     fn audit(&self) -> Vec<Value> {
@@ -245,12 +254,10 @@ impl Drop for Gateway {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
         // The default stdio path is an adapter. Killing it does not kill its
         // detached host daemon, so stop that fixture daemon before removing the
-        // descriptor that identifies it.
+        // descriptor that identifies it. On Windows the daemon can retain an
+        // inherited pipe handle, so joining the reader first waits for idle exit.
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
@@ -280,8 +287,58 @@ impl Drop for Gateway {
                 }
             }
         }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+#[test]
+fn fixture_stops_its_daemon_before_joining_the_pipe_reader() {
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    let mut gateway = Gateway::start();
+    let dir = gateway.dir.clone();
+    let descriptor = std::fs::read_dir(&gateway.dir)
+        .unwrap()
+        .flatten()
+        .find_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            (name.starts_with("daemon-") && name.ends_with(".json"))
+                .then(|| conduit_lib::daemon::read_descriptor(&entry.path()))
+                .flatten()
+        })
+        .expect("stdio adapter published its fixture daemon");
+    let pid = descriptor.pid;
+    let reader = gateway.reader.take().unwrap();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let reader_stopped = Arc::clone(&stopped);
+    // Model a reader whose pipe stays open while the detached daemon lives.
+    // This also exercises the Windows teardown order on Unix, without relying
+    // on a race during OS pipe-handle inheritance to reproduce the delay.
+    gateway.reader = Some(std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while conduit_lib::gateway_publish::pid_is_running(descriptor.pid) {
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        reader_stopped.store(true, Ordering::Release);
+    }));
+    drop(gateway);
+    reader.join().unwrap();
+    assert!(
+        stopped.load(Ordering::Acquire),
+        "fixture must stop its daemon before waiting for pipe EOF"
+    );
+    assert!(!dir.exists(), "fixture data must be removed");
+    assert!(
+        !conduit_lib::gateway_publish::pid_is_running(pid),
+        "fixture daemon must exit before cleanup finishes"
+    );
 }
 
 #[test]
@@ -326,7 +383,7 @@ fn allocating_scripts_fail_without_killing_stdio_gateway() {
             .filter(|entry| {
                 entry["server"] == "toolport"
                     && entry["tool"] == "run_script"
-                    && entry["error"] == "code_mode_memory_budget"
+                    && entry["failureKind"] == "memory_limit"
             })
             .count()
             == 2
@@ -336,7 +393,7 @@ fn allocating_scripts_fail_without_killing_stdio_gateway() {
             .iter()
             .filter(|entry| entry["server"] == "toolport"
                 && entry["tool"] == "run_script"
-                && entry["error"] == "code_mode_memory_budget")
+                && entry["failureKind"] == "memory_limit")
             .count(),
         2
     );
@@ -383,9 +440,25 @@ fn script_error_text_cannot_impersonate_memory_exhaustion() {
     assert!(
         failures
             .iter()
-            .all(|entry| entry["error"] == "code_mode_failed"),
+            .all(|entry| entry["failureKind"] == "script_exception"),
         "script text changed the audit category: {failures:?}"
     );
+    for entry in &failures {
+        assert!(entry.get("error").is_none(), "{entry}");
+        let run_id = entry["runId"].as_str().expect("opaque run ID");
+        assert_eq!(run_id.len(), 32, "{entry}");
+        assert!(run_id.bytes().all(|byte| byte.is_ascii_hexdigit()), "{entry}");
+        let recorded = entry.to_string();
+        for private_text in [
+            "data.message",
+            "out of memory from a downstream service",
+            "memory allocation failed in the remote tool",
+            "invalid layout Layout",
+            "code mode script exceeded its memory budget",
+        ] {
+            assert!(!recorded.contains(private_text), "{entry}");
+        }
+    }
     gateway.assert_alive();
 }
 
@@ -426,19 +499,19 @@ fn mock_registry(reg: &mut Registry, dir: &Path) {
         std::env::var_os("TOOLPORT_TEST_MOCK")
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_mock-mcp-server").into()),
     );
+    let catalog = dir.join("tools.json");
+    std::fs::write(&catalog, json!([
+        {"name":"echo", "inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}, "annotations":{"destructiveHint":false}},
+        {"name":"delete_item", "inputSchema":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}}}, "annotations":{"destructiveHint":true}}
+    ]).to_string()).unwrap();
     reg.servers.push(serde_json::from_value(json!({
         "id": "s", "name": "Fixture", "transport": "stdio", "command": mock, "enabled": true,
-        "env": [{ "key": "MOCK_MCP_TRANSCRIPT", "value": dir.join("downstream.jsonl"), "secret": false }]
+        "env": [
+            { "key": "MOCK_MCP_TRANSCRIPT", "value": dir.join("downstream.jsonl"), "secret": false },
+            { "key": "MOCK_MCP_TOOLS_FILE", "value": catalog, "secret": false }
+        ]
     })).unwrap());
     reg.profiles[0].enabled_server_ids.push("s".into());
-    reg.tool_overrides.entry("s".into()).or_default().insert(
-        "add".into(),
-        registry::ToolOverride {
-            name: Some("s__delete_item".into()),
-            description: None,
-            unknown_fields: Default::default(),
-        },
-    );
 }
 
 #[test]
@@ -622,9 +695,10 @@ fn http_client_memory_failure_does_not_stop_other_clients_and_scope_stays_enforc
         }),
     );
     assert!(
-        scoped.to_string().contains("not available to this client"),
+        scoped.to_string().contains("Unknown tool:"),
         "{scoped}"
     );
+    assert!(scoped.to_string().contains("toolport_search_tools"), "{scoped}");
     let normal = gateway.http_call(
         "client-b",
         "toolport_run_script",

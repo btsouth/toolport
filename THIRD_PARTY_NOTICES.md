@@ -6,7 +6,7 @@ owners. Their use does not imply endorsement.
 
 ## Lobe Icons
 
-Selected client icons are adapted from
+Selected client and server icons are adapted from
 [`@lobehub/icons-static-svg`](https://github.com/lobehub/lobe-icons), licensed
 under the MIT License.
 
@@ -47,8 +47,47 @@ is released under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/).
 Individual marks may remain subject to their owners' trademark and usage rules.
 See the [Simple Icons disclaimer](https://github.com/simple-icons/simple-icons/blob/develop/DISCLAIMER.md).
 
+## Lucide
+
+The icons for the Fetch, Filesystem, Memory, Sequential Thinking and Time
+reference servers are adapted from [Lucide](https://lucide.dev), licensed under
+the ISC License.
+
+Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part of
+Feather (MIT). All other copyright (c) for Lucide are held by Lucide
+Contributors 2022.
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+## Vendor marks
+
+The Apify, Browserbase, Composio, Context7, DataForSEO, Parallel and Playwright
+marks are taken from each project's own website. They are used only to identify
+the corresponding server and remain the property of their owners.
+
+## Client vendor marks
+
+The Crush, Jan, Witsy and ZCode client icons are taken from each project's own
+website or repository. They are used only to identify the corresponding client
+and remain the property of their owners.
+
 ## RevenueCat
 
 The RevenueCat logomark is vendored from the official
 [RevenueCat press kit](https://www.revenuecat.com/press-kit). It is used only to
 identify the corresponding server. The mark remains the property of RevenueCat.
+
+## Model2Vec search vectors
+
+The gateway bundles an int8 conversion of
+[MinishLab potion-base-8M](https://huggingface.co/minishlab/potion-base-8M),
+revision `bf8b056651a2c21b8d2565580b8569da283cab23`, under the MIT License.
+Model2Vec was developed by Stephan Tulkens and Thomas van Dongen.
+Copyright (c) 2024 Thomas van Dongen. The full notice is in
+`src-tauri/assets/search/LICENSE` and embedded in the model data in the binary.
+Toolport changes only numeric storage; no Toolport queries or labels train it.
+
+The pure-Rust loader uses Hugging Face tokenizers 0.22.2 under Apache-2.0.
+Its full license is retained in `src-tauri/assets/search/tokenizers-LICENSE`.

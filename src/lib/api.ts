@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AuditEntry,
+  ClientActivity,
   AuditStats,
   AuthInfo,
   CatalogEntry,
@@ -63,6 +64,8 @@ export interface SecurityEvent {
    * flag is verifiable instead of an opaque label. Absent when no direct phrase matched
    * (e.g. an encoded payload) or on events written before evidence was captured. */
   evidence?: string;
+  /** For sync_change_refused: the full explanation shown to the user. */
+  detail?: string;
   /** "high" = loud/actionable (poison, destructive-tool change, safety-annotation
    * downgrade); "warn" = a read-only/definition-content change that the app shows on
    * the actionable tier and quarantine-on-drift blocks; "info" = cosmetic churn for
@@ -449,6 +452,11 @@ export function teamJoinPoll(
 }
 
 /** Pull the latest team config and re-merge it (no-op if unchanged). */
+/** Pair this machine again with its own sync account after its sign-in went missing. */
+export function reconnectSync(): Promise<void> {
+  return invoke<void>("reconnect_sync");
+}
+
 export function teamSync(): Promise<Registry> {
   return invoke<Registry>("team_sync");
 }
@@ -880,12 +888,14 @@ export function setServerEnabled(
   serverId: string,
   enabled: boolean,
   reviewed = false,
+  reviewedDefinition?: ServerEntry,
 ): Promise<Registry> {
   return invoke<Registry>("set_server_enabled", {
     profileId,
     serverId,
     enabled,
     reviewed,
+    ...(reviewedDefinition ? { reviewedDefinition } : {}),
   });
 }
 
@@ -911,6 +921,15 @@ export function setAccessServer(
 
 export function dismissAccessUpgradeNotice(): Promise<Registry> {
   return invoke<Registry>("dismiss_access_upgrade_notice");
+}
+
+export function dismissRemovedFeaturesNotice(): Promise<Registry> {
+  return invoke<Registry>("dismiss_removed_features_notice");
+}
+
+/** Open the folder where the 2.0 upgrade saved settings for removed features. */
+export function openExportsDir(): Promise<void> {
+  return invoke<void>("open_exports_dir");
 }
 
 /** Set (or clear with `null`) a profile's tool-granular scope for one server (SOU-189):
@@ -987,4 +1006,30 @@ export function addSnippetServers(
     secretChoices,
     credentialInputs,
   });
+}
+
+/** Recent privacy-safe session summaries, capped by the backend. */
+export function getClientSessions(): Promise<ClientActivity[]> {
+  const sinceMs = new Date().setHours(0, 0, 0, 0);
+  return invoke<ClientActivity[]>("get_client_sessions", { sinceMs });
+}
+export function setSecretReference(
+  serverId: string,
+  key: string,
+  reference: string,
+): Promise<Registry> {
+  return invoke<Registry>("set_secret_reference", { serverId, key, reference });
+}
+export function testSecretReference(serverId: string, reference: string): Promise<void> {
+  return invoke<void>("test_secret_reference", { serverId, reference });
+}
+
+export interface TeamSyncStatus {
+  state: "synced" | "offline" | "error" | "not_checked";
+  lastSuccessMs: number | null;
+  checkedAtMs?: number;
+}
+
+export function teamSyncStatus(): Promise<TeamSyncStatus> {
+  return invoke<TeamSyncStatus>("team_sync_status");
 }

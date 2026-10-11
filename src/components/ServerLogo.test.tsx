@@ -15,6 +15,16 @@ describe("serverLogoKey", () => {
     expect(serverLogoKey("Jira Production")).toBe("jira");
   });
 
+  it("gives the reference servers an icon only as the leading word", () => {
+    expect(serverLogoKey("Linode")).toBe("linode");
+    expect(serverLogoKey("Exa Search")).toBe("exa");
+    expect(serverLogoKey("Hexagon")).toBeNull();
+    expect(serverLogoKey("Time")).toBe("time");
+    expect(serverLogoKey("Sequential Thinking")).toBe("sequentialthinking");
+    expect(serverLogoKey("Showtime")).toBeNull();
+    expect(serverLogoKey("Team memory")).toBeNull();
+  });
+
   it("leaves unknown servers on the neutral transport fallback", () => {
     expect(serverLogoKey("My private MCP")).toBeNull();
   });

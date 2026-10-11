@@ -10,12 +10,17 @@ use crate::registry::{self, Registry};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ActivityView {
     pub(super) timestamp_ms: u64,
+    pub(super) internal: bool,
     pub(super) server: String,
     pub(super) tool: String,
     pub(super) client: Option<String>,
     pub(super) client_id: Option<String>,
     pub(super) client_label: Option<String>,
     pub(super) approval_decision: Option<String>,
+    pub(super) cold: Option<bool>,
+    pub(super) dispatch_ms: Option<u64>,
+    pub(super) failure_kind: Option<String>,
+    pub(super) run_id: Option<String>,
     pub(super) ok: bool,
     pub(super) held: bool,
     pub(super) duration_ms: Option<u64>,
@@ -41,6 +46,7 @@ pub(super) struct ActivitySnapshot {
     /// Exact MCP surface bytes are recorded separately; provider usage is unknown.
     pub(super) tokens_saved: i64,
     pub(super) savings_list_loads: u64,
+    pub(super) savings_tokenized_loads: u64,
     pub(super) savings_peak_catalog: u64,
     pub(super) savings_since_ts: u64,
     pub(super) savings_full_bytes: u64,
@@ -75,10 +81,12 @@ impl ActivitySnapshot {
         let mut call_count = 0usize;
         let mut calls = Vec::new();
 
+        let names = crate::clients::CallerNames::for_entries(&entries);
         for entry in entries {
+            let entry = crate::audit::activity_client_name(entry, &names);
             let call_ok = crate::audit::tool_call_ok(&entry);
             let is_approval = entry["kind"] == "approval";
-            if call_ok.is_none() && !is_approval {
+            if call_ok.is_none() && !is_approval && entry["kind"] != "internal" {
                 continue;
             }
             let duration_ms = entry
@@ -96,6 +104,7 @@ impl ActivitySnapshot {
             }
             if calls.len() < recent_limit {
                 calls.push(ActivityView {
+                    internal: entry["kind"] == "internal",
                     timestamp_ms: entry
                         .get("ts")
                         .and_then(serde_json::Value::as_u64)
@@ -106,10 +115,7 @@ impl ActivitySnapshot {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("Unknown tool")
                         .to_string(),
-                    client: Some(crate::clients::trusted_client_name(
-                        entry.get("client").and_then(serde_json::Value::as_str),
-                        entry.get("clientName").and_then(serde_json::Value::as_str),
-                    )),
+                    client: entry["clientName"].as_str().map(str::to_string),
                     client_id: entry
                         .get("client")
                         .and_then(serde_json::Value::as_str)
@@ -118,9 +124,13 @@ impl ActivitySnapshot {
                         .get("clientLabel")
                         .and_then(serde_json::Value::as_str)
                         .and_then(crate::approval::sanitize_client_label),
+                    cold: entry["cold"].as_bool(),
+                    dispatch_ms: entry["dispatchMs"].as_u64(),
+                    failure_kind: entry["failureKind"].as_str().map(str::to_string),
+                    run_id: entry["runId"].as_str().map(str::to_string),
                     approval_decision: is_approval
                         .then(|| entry["decision"].as_str().unwrap_or("unknown").to_string()),
-                    ok: call_ok.unwrap_or(true),
+                    ok: call_ok.unwrap_or_else(|| entry["ok"].as_bool().unwrap_or(true)),
                     held: entry
                         .get("held")
                         .and_then(serde_json::Value::as_bool)
@@ -150,6 +160,7 @@ impl ActivitySnapshot {
             average_duration_ms: (duration_count > 0).then(|| duration_total / duration_count),
             tokens_saved: 0,
             savings_list_loads: 0,
+            savings_tokenized_loads: 0,
             savings_peak_catalog: 0,
             savings_since_ts: 0,
             savings_full_bytes: 0,
@@ -308,6 +319,7 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(0);
     snapshot.savings_list_loads = savings_number("listLoads");
+    snapshot.savings_tokenized_loads = savings_number("tokenizedLoads");
     snapshot.savings_peak_catalog = savings_number("peakCatalog");
     snapshot.savings_since_ts = savings_number("sinceTs");
     snapshot.savings_full_bytes = savings_number("fullSurfaceBytes");
@@ -357,6 +369,8 @@ pub(super) struct ClientView {
     /// migration would import and then move out of the client. Plugin-detected
     /// servers are excluded because migration leaves them untouched.
     pub(super) movable_server_count: usize,
+    /// Servers the client lists besides Toolport's own entry, plugins included.
+    pub(super) other_server_count: usize,
     pub(super) gateway_state: ClientGatewayState,
     pub(super) shared_http: bool,
     pub(super) legacy_bearer_argv: bool,
@@ -380,6 +394,12 @@ impl ClientView {
                 .iter()
                 .filter(|server| !crate::clients::detected_is_gateway(server))
                 .count(),
+            other_server_count: client
+                .servers
+                .iter()
+                .filter(|server| !crate::clients::detected_is_gateway(server))
+                .count()
+                + client.plugin_servers.len(),
             gateway_state: match client.entry_state {
                 crate::clients::GatewayEntryState::Managed => ClientGatewayState::Connected,
                 crate::clients::GatewayEntryState::Customized => ClientGatewayState::Customized,
@@ -401,6 +421,8 @@ impl ClientView {
 pub(super) struct ClientSnapshot {
     pub(super) clients: Vec<ClientView>,
     pub(super) profiles: Vec<ProfileView>,
+    pub(super) sessions: Vec<serde_json::Value>,
+    pub(super) sessions_error: bool,
 }
 
 fn client_access_label(registry: &Registry, scope: Option<&str>) -> String {
@@ -437,6 +459,37 @@ fn client_access_options(registry: &Registry) -> Vec<ProfileView> {
     options
 }
 
+fn client_session_history() -> (Vec<serde_json::Value>, bool) {
+    let since = gtk::glib::DateTime::now_local()
+        .and_then(|now| {
+            gtk::glib::DateTime::new(
+                &now.timezone(),
+                now.year(),
+                now.month(),
+                now.day_of_month(),
+                0,
+                0,
+                0.0,
+            )
+        })
+        .ok()
+        .map(|day| day.to_unix().max(0) as u64 * 1000);
+    match crate::audit::recent_client_activity(64, since) {
+        Ok(sessions) => (sessions, false),
+        Err(_) => (Vec::new(), true),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn unreadable_session_history_is_optional_to_client_detection() {
+    let _data = crate::registry::DataDirTestEnv::new("f3-history-unreadable");
+    std::fs::create_dir(crate::audit::audit_path().unwrap()).unwrap();
+    let (rows, error) = client_session_history();
+    assert!(rows.is_empty());
+    assert!(error);
+}
+
 pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
     let path = registry::resolved_path().ok_or_else(|| "registry path unavailable".to_string())?;
     let registry = match std::fs::read_to_string(&path) {
@@ -471,9 +524,12 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
             .cmp(&left.app_present)
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     });
+    let (sessions, sessions_error) = client_session_history();
     Ok(ClientSnapshot {
         clients,
         profiles: client_access_options(&registry),
+        sessions,
+        sessions_error,
     })
 }
 
@@ -489,12 +545,25 @@ pub(super) struct ServerView {
     pub(super) launch: Option<crate::registry::LaunchConfig>,
     pub(super) url: Option<String>,
     pub(super) cwd: Option<String>,
+    pub(super) inherit_env: bool,
     pub(super) secret_keys: Vec<String>,
+    /// Nonsecret environment values, editable in Edit server.
+    pub(super) plain_env: Vec<PlainEnvView>,
+    pub(super) secret_references: std::collections::BTreeMap<String, String>,
     pub(super) client_credentials: Option<ClientCredentialsView>,
     pub(super) enabled: bool,
     pub(super) requires_review: bool,
+    pub(super) team_route_removed: bool,
     /// Changes whenever anything a probe reads from the registry entry does.
     pub(super) probe_fingerprint: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PlainEnvView {
+    pub(super) key: String,
+    pub(super) value: String,
+    /// The saved sync choice, if any. `None` means sync's default applies.
+    pub(super) portable: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -515,6 +584,7 @@ pub(super) struct RegistrySnapshot {
     /// which has to appear the moment pairing writes the registry, not only on
     /// the next launch.
     pub(super) paired: bool,
+    pub(super) personal_sync: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,7 +611,27 @@ impl RegistrySnapshot {
             .map(|server| {
                 let enabled = registry.server_enabled(&server.id);
                 ServerView {
-                    origin_label: if server.source.as_deref().unwrap_or("").starts_with("team:") {
+                    origin_label: if crate::personal_sync::is_personal(&registry) {
+                        if crate::personal_sync::keep_local(server) {
+                            "This machine only".into()
+                        } else if crate::personal_sync::state(&registry).is_ok_and(|st| {
+                            st.conflicts.contains_key(
+                                server
+                                    .unknown_fields
+                                    .get("teamOriginalId")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or(&server.id),
+                            )
+                        }) {
+                            "Sync conflict".into()
+                        } else if !enabled && server.needs_team_enable_review() {
+                            // Approved and on means reviewed, even though the
+                            // gate would apply again to turning it back on.
+                            "Needs review".into()
+                        } else {
+                            "Synced".into()
+                        }
+                    } else if server.source.as_deref().unwrap_or("").starts_with("team:") {
                         format!(
                             "Team · {}",
                             registry
@@ -562,11 +652,63 @@ impl RegistrySnapshot {
                     launch: server.launch.clone(),
                     url: server.url.clone(),
                     cwd: server.cwd.clone(),
+                    inherit_env: server.inherit_env,
+                    secret_references: server
+                        .env
+                        .iter()
+                        .filter_map(|e| {
+                            crate::secret_refs::reference_for(e)
+                                .map(|r| (e.key.clone(), r.to_string()))
+                        })
+                        .chain(
+                            server
+                                .launch
+                                .iter()
+                                .flat_map(|l| &l.inputs)
+                                .filter_map(|i| {
+                                    crate::secret_refs::source(&i.unknown_fields)
+                                        .ok()
+                                        .flatten()
+                                        .map(|r| (i.key.clone(), r.to_string()))
+                                }),
+                        )
+                        .chain(
+                            crate::secret_refs::headers(server)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter_map(|h| h.source.map(|r| (h.key, r.r#ref))),
+                        )
+                        .collect(),
                     secret_keys: server
                         .env
                         .iter()
                         .filter(|entry| entry.secret)
                         .map(|entry| entry.key.clone())
+                        .chain(
+                            crate::secret_refs::headers(server)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|h| {
+                                    if h.source.is_some() {
+                                        h.key
+                                    } else {
+                                        h.env.unwrap_or(h.key)
+                                    }
+                                }),
+                        )
+                        .collect(),
+                    plain_env: server
+                        .env
+                        .iter()
+                        .filter(|e| !e.secret && !e.unknown_fields.contains_key("source"))
+                        .map(|e| PlainEnvView {
+                            key: e.key.clone(),
+                            value: e.value.clone().unwrap_or_default(),
+                            portable: e
+                                .unknown_fields
+                                .get("portable")
+                                .and_then(serde_json::Value::as_bool),
+                        })
                         .collect(),
                     client_credentials: server.client_credentials.as_ref().map(|credentials| {
                         ClientCredentialsView {
@@ -579,6 +721,9 @@ impl RegistrySnapshot {
                     }),
                     enabled,
                     requires_review: !enabled && server.needs_team_enable_review(),
+                    team_route_removed: !enabled
+                        && server.unknown_fields.get("teamRouteRemoved")
+                            == Some(&serde_json::json!(true)),
                     probe_fingerprint: probe_fingerprint(server),
                 }
             })
@@ -599,6 +744,7 @@ impl RegistrySnapshot {
             profiles,
             servers,
             paired: registry.team.is_some(),
+            personal_sync: crate::personal_sync::is_personal(&registry),
         }
     }
 }
@@ -606,7 +752,8 @@ impl RegistrySnapshot {
 fn probe_fingerprint(server: &crate::registry::ServerEntry) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    serde_json::to_string(server)
+    serde_json::to_value(server)
+        .map(|v| v.to_string())
         .unwrap_or_default()
         .hash(&mut hasher);
     hasher.finish()
@@ -764,6 +911,20 @@ fn connect_reload(monitor: &gio::FileMonitor, controller: Weak<RegistryControlle
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn historical_caller_paths_do_not_reach_native_rows_or_tooltips() {
+        let snapshot = super::ActivitySnapshot::from_entries(
+            vec![
+                serde_json::json!({"client":"adapter:/home/private/customer.env", "clientLabel":"private/customer.env", "ok":true}),
+            ],
+            10,
+        );
+        let row = &snapshot.recent[0];
+        assert_eq!(row.client.as_deref(), Some("[private]"));
+        assert_eq!(row.client_label.as_deref(), Some("[private]"));
+        assert!(row.client_id.is_none());
+    }
+
     use super::*;
     use crate::registry::ServerEntry;
 
@@ -841,21 +1002,16 @@ mod tests {
         let mut registry = Registry::default();
         assert_eq!(client_access_label(&registry, None), "Default access");
         registry.default_access_profile_id = Some("default".into());
-        assert_eq!(
-            client_access_label(&registry, None),
-            "Default access (Default)"
-        );
+        // The migrated set is named "Default", which would only repeat itself.
+        assert_eq!(client_access_label(&registry, None), "Default access");
         let options = client_access_options(&registry);
         assert_eq!(options[0].id, "");
-        assert_eq!(options[0].name, "Default access (Default)");
+        assert_eq!(options[0].name, "Default access");
         assert_eq!(options[1].id, "@all-enabled");
         registry.default_access_profile_id = None;
         registry.default_access_context_id = Some("default".into());
         registry.default_access_legacy_policy = true;
-        assert_eq!(
-            client_access_label(&registry, Some("")),
-            "Default access (Default)"
-        );
+        assert_eq!(client_access_label(&registry, Some("")), "Default access");
         assert_eq!(
             client_access_label(&registry, Some(crate::registry::ALL_ENABLED_ACCESS)),
             "All enabled servers"
@@ -904,10 +1060,14 @@ mod tests {
                     launch: None,
                     url: None,
                     cwd: None,
+                    inherit_env: false,
                     secret_keys: vec!["TOKEN".into()],
+                    plain_env: Vec::new(),
+                    secret_references: Default::default(),
                     client_credentials: None,
                     enabled: false,
                     requires_review: false,
+                    team_route_removed: false,
                     probe_fingerprint: fingerprints[0],
                 },
                 ServerView {
@@ -921,14 +1081,33 @@ mod tests {
                     launch: None,
                     url: None,
                     cwd: None,
+                    inherit_env: false,
                     secret_keys: Vec::new(),
+                    plain_env: Vec::new(),
+                    secret_references: Default::default(),
                     client_credentials: None,
                     enabled: true,
                     requires_review: false,
+                    team_route_removed: false,
                     probe_fingerprint: fingerprints[1],
                 },
             ]
         );
+    }
+
+    #[test]
+    fn removed_team_route_explanation_tracks_the_personal_switch() {
+        let mut registry = Registry::default();
+        let mut personal = server("personal", "Saved original", "http");
+        personal
+            .unknown_fields
+            .insert("teamRouteRemoved".into(), serde_json::json!(true));
+        registry.servers.push(personal);
+        assert!(RegistrySnapshot::from_registry(registry.clone()).servers[0].team_route_removed);
+        registry
+            .set_global_server_enabled("personal", true)
+            .unwrap();
+        assert!(!RegistrySnapshot::from_registry(registry).servers[0].team_route_removed);
     }
 
     #[test]

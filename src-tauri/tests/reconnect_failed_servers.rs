@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -413,18 +413,53 @@ fn daemon_shares_the_recovered_server_with_a_later_client() {
 }
 
 /// Every request answered 401, like an OAuth server nobody signed into yet.
-fn unauthorized_server() -> (String, Arc<AtomicUsize>) {
+fn unauthorized_server() -> (String, Arc<Mutex<Vec<Instant>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
-    let hits = Arc::new(AtomicUsize::new(0));
+    let hits = Arc::new(Mutex::new(Vec::new()));
     let counted = Arc::clone(&hits);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
-            counted.fetch_add(1, Ordering::SeqCst);
             let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
             let mut buf = [0u8; 8192];
-            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let mut bytes = Vec::new();
+            let (header_end, length) = loop {
+                let Ok(n) = std::io::Read::read(&mut stream, &mut buf) else {
+                    break (0, 0);
+                };
+                if n == 0 {
+                    break (0, 0);
+                }
+                bytes.extend_from_slice(&buf[..n]);
+                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    break (end + 4, length);
+                }
+            };
+            while bytes.len() < header_end + length {
+                let Ok(n) = std::io::Read::read(&mut stream, &mut buf) else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            if let Ok(request) = serde_json::from_slice::<Value>(&bytes[header_end..]) {
+                if request["method"] == "initialize" {
+                    counted.lock().unwrap().push(Instant::now());
+                }
+            }
             let body = r#"{"error":"unauthorized"}"#;
             let _ = write!(
                 stream,
@@ -439,7 +474,7 @@ fn unauthorized_server() -> (String, Arc<AtomicUsize>) {
 }
 
 #[test]
-fn a_server_that_needs_sign_in_is_not_retried_in_a_loop() {
+fn endpoint_sign_in_retries_respect_backoff_and_preserve_healthy_peers() {
     let dir = scratch_dir();
     let (url, hits) = unauthorized_server();
     let locked = json!({
@@ -457,7 +492,7 @@ fn a_server_that_needs_sign_in_is_not_retried_in_a_loop() {
         &[mock_entry("good", &[]), locked],
         &["good", "locked"],
     );
-    let mut gateway = Gateway::start(&dir);
+    let mut gateway = Gateway::start_with_backoff(&dir, "2000");
     wait_for("the first build", Duration::from_secs(60), || {
         gateway.tool_names().contains(&"good__echo".to_string())
     });
@@ -468,21 +503,35 @@ fn a_server_that_needs_sign_in_is_not_retried_in_a_loop() {
         gateway.diagnostics()
     );
     assert!(!status.contains("Conduit"), "{status}");
-    let after_connect = hits.load(Ordering::SeqCst);
+    let after_connect = hits.lock().unwrap().len();
     assert!(after_connect > 0, "the first connect reached the server");
 
-    // Several backoff steps pass, and calls ask for the server, but nothing retries.
+    // Demand may retry after backoff, but cannot create a retry storm or block peers.
     for _ in 0..4 {
         let (is_error, text) = gateway.call("locked__anything");
         assert!(is_error);
-        assert!(text.contains("needs sign-in"), "{text}");
+        assert!(
+            text.contains("needs sign-in") || text.contains("connecting"),
+            "{text}"
+        );
+        assert_eq!(gateway.call("good__echo"), (false, "hi".to_string()));
         std::thread::sleep(Duration::from_secs(1));
     }
-    assert_eq!(
-        hits.load(Ordering::SeqCst),
-        after_connect,
-        "an auth-required server must wait for new credentials"
+    let attempts = hits.lock().unwrap();
+    assert!(
+        attempts.len() > after_connect,
+        "endpoint never retried after backoff"
     );
+    assert!(
+        attempts.len() <= after_connect + 3,
+        "endpoint auth retry storm"
+    );
+    for pair in attempts.windows(2) {
+        assert!(
+            pair[1].duration_since(pair[0]) >= Duration::from_millis(1600),
+            "endpoint auth retry ignored the minimum jittered backoff"
+        );
+    }
 }
 
 #[test]

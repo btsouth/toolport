@@ -54,7 +54,7 @@ describe("TeamPairingDialog", () => {
     emit({ state: "connected" });
     await waitFor(() => expect(screen.queryByText(APPROVE)).toBeNull());
     expect(onConnected).toHaveBeenCalledTimes(1);
-    expect(toast.success).toHaveBeenCalledWith("Toolport connected to Teams.");
+    expect(toast.success).toHaveBeenCalledWith("Toolport is signed in to sync.");
   });
 
   it.each([

@@ -43,17 +43,137 @@ function renderRow(enabled: boolean, result?: ProbeResult, rowServer = server) {
 }
 
 describe("RegistryServerRow status accessibility", () => {
+  it("explains why a removed shared server's personal original stays off", () => {
+    const view = renderRow(false, undefined, { ...server, teamRouteRemoved: true });
+    expect(
+      screen.getByText(
+        "Removed or disabled by the team. Your personal server stays off.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Toggle Example" })).not.toBeChecked();
+    view.unmount();
+    renderRow(true, health({ ok: true }), { ...server, teamRouteRemoved: true });
+    expect(screen.queryByText(/Your personal server stays off/)).not.toBeInTheDocument();
+  });
+  it("names the provider for a launch credential on the server card", () => {
+    renderRow(false, undefined, {
+      ...server,
+      launch: {
+        inputs: [
+          {
+            key: "KEY",
+            label: "Key",
+            secret: true,
+            required: true,
+            source: { ref: "op://v/i/key" },
+          },
+        ],
+        bindings: [],
+      },
+    });
+    expect(screen.getByText("Keys from 1Password")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["endpoint", "Needs sign-in"],
+    ["scope", "Permission required"],
+    ["service_credential", "Service key required"],
+  ] as const)("shows %s auth ownership", (authTarget, text) => {
+    renderRow(true, health({ authRequired: true, authTarget }));
+    expect(screen.getByText(text)).toBeInTheDocument();
+  });
+
+  it.each([
+    ["endpoint", "Sign in"],
+    ["service_credential", "Edit service key"],
+  ] as const)("offers a concrete %s action", (authTarget, label) => {
+    renderRow(true, health({ authRequired: true, authTarget }));
+    expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
+  });
+
   it.each([
     ["Server disabled", false, undefined],
     ["Checking connection", true, undefined],
     ["Ready, 2 tools", true, health({ ok: true, toolCount: 2 })],
-    ["Authentication required", true, health({ authRequired: true })],
-    ["Connection error", true, health({ error: "connection refused" })],
+    ["Needs sign-in", true, health({ authRequired: true })],
+    ["connection refused", true, health({ error: "connection refused" })],
   ] as const)("announces %s", (label, enabled, result) => {
     const view = renderRow(enabled, result);
 
     expect(screen.getByRole("status", { name: label })).toBeInTheDocument();
     view.unmount();
+  });
+
+  it.each(["timeout", "unavailable", "server_error"] as const)(
+    "shows a %s reason and recovery without expansion",
+    (kind) => {
+      const onReprobe = vi.fn();
+      render(
+        <TooltipProvider>
+          <RegistryServerRow
+            server={server}
+            registry={null}
+            enabled
+            health={health({ failure: { kind }, error: "full server output" })}
+            onToggle={vi.fn()}
+            onRemove={vi.fn()}
+            onRegistryChange={vi.fn()}
+            onReprobe={onReprobe}
+          />
+        </TooltipProvider>,
+      );
+      expect(
+        screen.getByText(
+          {
+            timeout: "Timed out",
+            unavailable: "Unreachable",
+            server_error: "Server failed",
+          }[kind],
+        ),
+      ).toBeVisible();
+      screen.getByRole("button", { name: "Retry" }).click();
+      expect(onReprobe).toHaveBeenCalledOnce();
+      act(() => screen.getByRole("button", { name: "View log" }).click());
+      expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(screen.getAllByText("full server output", { exact: true })).toHaveLength(2);
+    },
+  );
+
+  it("offers View log alongside Sign in for a failed team auth probe", () => {
+    renderRow(
+      true,
+      health({
+        authRequired: true,
+        authTarget: "endpoint",
+        failure: { kind: "auth", target: "endpoint" },
+        error: "HTTP 401: team Linear unauthorized",
+      }),
+      { ...server, source: "team:fixture" },
+    );
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    act(() => screen.getByRole("button", { name: "View log" }).click());
+    expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(
+      screen.getByText("HTTP 401: team Linear unauthorized", { exact: true }),
+    ).toBeVisible();
+  });
+
+  it("shows a closed local connection instead of an unreachable endpoint", () => {
+    renderRow(
+      true,
+      health({
+        failure: { kind: "unavailable" },
+        error: "Broken pipe (os error 32)",
+      }),
+    );
+    expect(screen.getByText("Connection closed")).toBeVisible();
   });
 
   it("announces when a launcher package is being installed", () => {

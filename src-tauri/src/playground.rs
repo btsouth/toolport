@@ -18,7 +18,9 @@ fn server(server_id: &str) -> Result<ServerEntry, String> {
 }
 
 pub fn list_tools(server_id: &str) -> Result<Vec<serde_json::Value>, String> {
-    let mut tools = crate::server_runtime::connect_server(&server(server_id)?)?.tools;
+    let mut tools = crate::server_runtime::connect_server(&server(server_id)?)?
+        .tools
+        .materialize_all();
     annotate_quarantine(server_id, &mut tools)?;
     Ok(tools)
 }
@@ -63,7 +65,19 @@ fn annotate_quarantine(server_id: &str, tools: &mut [serde_json::Value]) -> Resu
         });
         tool["toolportQuarantine"] = serde_json::json!(match (&quarantined, alias) {
             (Ok(names), Some(alias)) if !ambiguous_prefix && !ambiguous_alias =>
-                if names.contains(alias) {
+                if names.contains(alias)
+                    || tool
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|original| {
+                            crate::router::Router::legacy_tool_policy_name(
+                                &registry.tool_overrides,
+                                server_id,
+                                original,
+                            )
+                            .is_some_and(|legacy| names.contains(&legacy))
+                        })
+                {
                     "quarantined"
                 } else {
                     "clear"
@@ -84,9 +98,10 @@ pub struct Capabilities {
 pub fn capabilities(server_id: &str) -> Result<Capabilities, String> {
     let mut downstream = crate::server_runtime::connect_server(&server(server_id)?)?;
     downstream.load_resources_prompts();
-    annotate_quarantine(server_id, &mut downstream.tools)?;
+    let mut tools = downstream.tools.materialize_all();
+    annotate_quarantine(server_id, &mut tools)?;
     Ok(Capabilities {
-        tools: downstream.tools,
+        tools,
         resources: downstream.resources,
         prompts: downstream.prompts,
     })
@@ -160,4 +175,54 @@ pub fn get_prompt(
     downstream
         .get_prompt(name, arguments)
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reserved_alias_quarantine_annotation_uses_legacy_binding() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-playground-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = crate::registry::DataDirOverride::set(&dir);
+        let mut registry = crate::registry::Registry::default();
+        registry.tool_overrides.insert(
+            "s".into(),
+            std::collections::HashMap::from([(
+                "echo".into(),
+                crate::registry::ToolOverride {
+                    name: Some("toolport_custom_echo".into()),
+                    description: None,
+                    unknown_fields: Default::default(),
+                },
+            )]),
+        );
+        crate::registry::save_to(&dir.join("registry.json"), &registry).unwrap();
+        let profile = registry.default_access_id();
+        crate::integrity::apply_quarantine(
+            Some(&profile),
+            &[json!({"name":"toolport_custom_echo", "annotations":{"destructiveHint":true}})],
+            &[
+                json!({"type":"tool_drift", "tool":"toolport_custom_echo", "server":"s",
+                "change":"changed", "severity":"high"}),
+            ],
+        )
+        .unwrap();
+        let mut tools = vec![json!({"name":"echo"}), json!({"name":"add"})];
+        annotate_quarantine("s", &mut tools).unwrap();
+        assert_eq!(tools[0]["toolportQuarantine"], "quarantined");
+        assert_eq!(tools[1]["toolportQuarantine"], "clear");
+        drop(data);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

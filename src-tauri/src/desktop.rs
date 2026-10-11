@@ -146,10 +146,12 @@ async fn detect_clients(
 
 #[tauri::command]
 fn get_registry(state: State<RegistryState>) -> Registry {
-    state
+    let mut reg = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+        .clone();
+    crate::personal_sync::attach_status(&mut reg);
+    reg
 }
 
 /// Servers to add to the registry from a set of detected clients: both a
@@ -184,8 +186,12 @@ fn selected_servers_to_import(
 async fn import_servers(
     state: State<'_, RegistryState>,
     selected: Option<Vec<String>>,
-    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
-    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
+    secret_choices: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    >,
+    credential_inputs: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    >,
 ) -> Result<Registry, String> {
     let selected = match selected {
         Some(selected) => selected,
@@ -195,7 +201,11 @@ async fn import_servers(
             .collect(),
     };
     tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::import_client_servers_inputs(selected, &secret_choices.unwrap_or_default(), &credential_inputs.unwrap_or_default())
+        crate::registry_controller::import_client_servers_inputs(
+            selected,
+            &secret_choices.unwrap_or_default(),
+            &credential_inputs.unwrap_or_default(),
+        )
     })
     .await
     .map_err(|_| "Import stopped".to_string())??;
@@ -207,11 +217,20 @@ async fn add_snippet_servers(
     state: State<'_, RegistryState>,
     text: String,
     selected: Vec<String>,
-    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
-    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
+    secret_choices: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    >,
+    credential_inputs: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    >,
 ) -> Result<serde_json::Value, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::add_snippet_servers_inputs(&text,&selected,&secret_choices.unwrap_or_default(),&credential_inputs.unwrap_or_default())
+        crate::registry_controller::add_snippet_servers_inputs(
+            &text,
+            &selected,
+            &secret_choices.unwrap_or_default(),
+            &credential_inputs.unwrap_or_default(),
+        )
     })
     .await
     .map_err(|_| "Paste import stopped".to_string())??;
@@ -231,7 +250,8 @@ fn parse_server_snippet(text: String) -> Result<Vec<clients::ParsedSnippetServer
             MAX_SNIPPET_BYTES / 1024,
         ));
     }
-    clients::parse_snippet(&text).map_err(|_| "Could not read the pasted config. Check its syntax and retry.".into())
+    clients::parse_snippet(&text)
+        .map_err(|_| "Could not read the pasted config. Check its syntax and retry.".into())
 }
 
 #[tauri::command]
@@ -334,12 +354,18 @@ fn set_server_enabled(
     server_id: String,
     enabled: bool,
     reviewed: Option<bool>,
+    reviewed_definition: Option<ServerEntry>,
 ) -> Result<Registry, String> {
     let reviewed = reviewed.unwrap_or(false);
     let (reg, _) = write_registry(state.inner(), |reg| {
         // Checked inside the write closure so it sees the registry that will be
         // persisted: a team_sync_wait replace landing between a pre-lock check and
         // this write could swap the entry for one that needs review.
+        if enabled && reviewed {
+            if let Some(server) = reg.servers.iter().find(|s| s.id == server_id) {
+                crate::personal_sync::check_review(reg, server, reviewed_definition.as_ref())?;
+            }
+        }
         crate::registry_controller::apply_server_enabled(
             reg,
             &profile_id,
@@ -652,8 +678,12 @@ async fn migrate_client(
     force: Option<bool>,
     selected: Vec<String>,
     revision: String,
-    secret_choices: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,bool>>>,
-    credential_inputs: Option<std::collections::BTreeMap<String,std::collections::BTreeMap<String,String>>>,
+    secret_choices: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    >,
+    credential_inputs: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    >,
 ) -> Result<MigrateResult, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         crate::registry_controller::migrate_client_reviewed_inputs(
@@ -670,7 +700,20 @@ async fn migrate_client(
     .map_err(|e| e.to_string())??;
 
     let registry = reload_into_state(state.inner())?;
-    let backup_date = outcome.result.outcome.backup.as_ref().and_then(|path|std::fs::metadata(path).ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()).map(|duration|duration.as_secs());
+    let backup_date = outcome
+        .result
+        .outcome
+        .backup
+        .as_ref()
+        .and_then(|path| {
+            std::fs::metadata(path)
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+        })
+        .map(|duration| duration.as_secs());
     Ok(MigrateResult {
         registry,
         imported: outcome.imported,
@@ -680,6 +723,43 @@ async fn migrate_client(
         backup_date,
         outcome: outcome.result.outcome,
     })
+}
+
+#[tauri::command]
+async fn set_secret_reference(
+    app: AppHandle,
+    server_id: String,
+    key: String,
+    reference: String,
+) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        let (reg, ()) = write_registry(state.inner(), |reg| {
+            crate::registry_controller::apply_secret_reference(reg, &server_id, &key, &reference)
+        })?;
+        crate::registry_controller::approve_own_reference(&reg, &server_id)?;
+        Ok(reg)
+    })
+    .await
+    .map_err(|_| "Reference task stopped".to_string())?
+}
+#[tauri::command]
+async fn test_secret_reference(
+    server_id: String,
+    reference: String,
+) -> Result<(), crate::secret_refs::ResolveError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::registry_controller::test_secret_reference(&server_id, &reference)
+    })
+    .await
+    .map_err(|_| crate::secret_refs::ResolveError {
+        state: crate::secret_refs::ErrorState::Failed,
+        message: "Reference test stopped".into(),
+    })?
+}
+#[tauri::command]
+fn secret_reference_providers() -> Vec<crate::secret_refs::Provider> {
+    crate::secret_refs::PROVIDERS.to_vec()
 }
 
 /// Store a secret env value in the OS keychain and mark it on the server entry
@@ -968,6 +1048,17 @@ async fn get_audit_log(limit: usize) -> Result<Vec<serde_json::Value>, String> {
     })
     .await
     .map_err(|e| format!("activity log task join failed: {e}"))?
+}
+
+/// Bounded lifecycle summaries for the Clients page, with no request content.
+#[tauri::command]
+async fn get_client_sessions(since_ms: Option<u64>) -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        audit::recent_client_activity(64, since_ms)
+            .map_err(|e| format!("Couldn't read client sessions: {e}"))
+    })
+    .await
+    .map_err(|e| format!("client session task join failed: {e}"))?
 }
 
 /// Aggregate the full retained audit log into per-server call/error/latency stats for
@@ -1913,7 +2004,11 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
                     failures = 0;
                     3
                 }
-                Ok(true) => match teams::sync_wait(25) {
+                Ok(true) => match {
+                    let result = teams::sync_wait(25);
+                    let _ = handle.emit("team-sync-status", crate::team_sync_status::current());
+                    result
+                } {
                     Ok(result) => {
                         failures = 0;
                         if stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -1925,15 +2020,20 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
                                 let _ = handle.emit("team-sync-registry", &fresh);
                             }
                             Err(error) => {
-                                eprintln!("Toolport: Teams registry refresh failed: {error}")
+                                let _ = handle.emit("team-sync-error", &error);
                             }
                         }
                         teams::retry_delay_seconds(0)
                     }
                     Err(error) => {
                         failures = failures.saturating_add(1);
-                        eprintln!("Toolport: Teams sync pending: {error}");
-                        teams::retry_delay_seconds(failures)
+                        let _ = handle.emit("team-sync-error", &error);
+                        if let Ok(fresh) = registry::load() {
+                            let _ = handle.emit("team-sync-registry", &fresh);
+                        }
+                        registry::load()
+                            .map(|r| teams::sync_retry_seconds(&r, failures))
+                            .unwrap_or_else(|_| teams::retry_delay_seconds(failures))
                     }
                 },
                 Err(error) => {
@@ -1943,7 +2043,9 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
                 }
             };
             for _ in 0..delay {
-                if stop.load(std::sync::atomic::Ordering::Acquire) { break; }
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
@@ -2001,6 +2103,12 @@ async fn team_instructions_status() -> Option<teams::InstructionsStatusView> {
         .flatten()
 }
 
+#[tauri::command]
+async fn team_sync_status() -> crate::team_sync_status::SyncStatus {
+    tauri::async_runtime::spawn_blocking(crate::team_sync_status::current)
+        .await.unwrap_or_default()
+}
+
 // --- Agent hook sensor (SBS-822), retired -------------------------------------
 //
 // 2.0 removed the sensor. `hooks::cleanup_on_startup` (called on the launch thread
@@ -2009,8 +2117,63 @@ async fn team_instructions_status() -> Option<teams::InstructionsStatusView> {
 
 /// Leave the team: remove its merged servers, clear the connection and the token.
 #[tauri::command]
+fn personal_sync_local_only(
+    state: State<RegistryState>,
+    server_id: String,
+    local_only: bool,
+) -> Result<Registry, String> {
+    crate::personal_sync::set_local_only(&server_id, local_only)?;
+    reload_into_state(state.inner())
+}
+/// Pair this machine again with its own account after its sign-in went missing.
+#[tauri::command]
+fn reconnect_sync(app: AppHandle) -> Result<(), String> {
+    let reg = registry::load()?;
+    let team = reg.team.ok_or("This machine is not signed in to sync")?;
+    deliver_team_pair(&app, team.server_url, team.team_id);
+    Ok(())
+}
+#[tauri::command]
+fn personal_sync_portable(
+    state: State<RegistryState>,
+    server_id: String,
+    kind: String,
+    key: String,
+    enabled: bool,
+) -> Result<Registry, String> {
+    crate::personal_sync::set_portable(&server_id, &kind, &key, enabled)?;
+    reload_into_state(state.inner())
+}
+#[tauri::command]
+fn personal_sync_new_servers_local_only(
+    state: State<RegistryState>,
+    local_only: bool,
+) -> Result<Registry, String> {
+    crate::personal_sync::set_new_servers_local_only(local_only)?;
+    reload_into_state(state.inner())
+}
+#[tauri::command]
+fn personal_sync_finish_selection(state: State<RegistryState>) -> Result<Registry, String> {
+    crate::personal_sync::finish_local_selection()?;
+    reload_into_state(state.inner())
+}
+
+#[tauri::command]
+fn personal_sync_resolve_conflict(
+    state: State<RegistryState>,
+    id: String,
+    expected: String,
+    keep_mine: bool,
+) -> Result<Registry, String> {
+    crate::personal_sync::resolve_conflict(&id, &expected, keep_mine)?;
+    reload_into_state(state.inner())
+}
+
+#[tauri::command]
 async fn team_account_link() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(teams::account_link).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(teams::account_link)
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2023,8 +2186,14 @@ fn team_disconnect(state: State<RegistryState>) -> Result<Registry, String> {
 }
 
 #[tauri::command]
-async fn team_use_managed(app: tauri::AppHandle, state: State<'_, RegistryState>, server_id: String) -> Result<Registry, String> {
-    tauri::async_runtime::spawn_blocking(move || teams::use_managed_server(&server_id)).await.map_err(|e| e.to_string())??;
+async fn team_use_managed(
+    app: tauri::AppHandle,
+    state: State<'_, RegistryState>,
+    server_id: String,
+) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || teams::use_managed_server(&server_id))
+        .await
+        .map_err(|e| e.to_string())??;
     let fresh = reload_into_state(state.inner())?;
     let _ = app.emit("team-sync-registry", &fresh);
     Ok(fresh)
@@ -2055,11 +2224,17 @@ fn team_open_confirmation(url: String) -> Result<(), String> {
 /// only, secret values never sent). Remote instructions and policy fields are preserved, and
 /// an optimistic-concurrency conflict is returned rather than overwriting another admin.
 #[tauri::command]
-async fn team_push_preview(state: State<'_, RegistryState>, selected_ids: Option<Vec<String>>) -> Result<teams::PushPreview, String> {
+async fn team_push_preview(
+    state: State<'_, RegistryState>,
+    selected_ids: Option<Vec<String>>,
+) -> Result<teams::PushPreview, String> {
     refresh_from_disk(state.inner())?;
-    tauri::async_runtime::spawn_blocking(move || match selected_ids { Some(ids) => teams::preview_push_selected(&ids), None => teams::preview_push_current() })
-        .await
-        .map_err(|e| format!("push preview task join failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || match selected_ids {
+        Some(ids) => teams::preview_push_selected(&ids),
+        None => teams::preview_push_current(),
+    })
+    .await
+    .map_err(|e| format!("push preview task join failed: {e}"))?
 }
 
 #[tauri::command]
@@ -2266,6 +2441,20 @@ fn open_data_dir() -> Result<(), String> {
     crate::diagnostics_controller::open_data_dir()
 }
 
+#[tauri::command]
+fn open_exports_dir() -> Result<(), String> {
+    crate::diagnostics_controller::open_exports_dir()
+}
+
+#[tauri::command]
+fn dismiss_removed_features_notice(state: State<RegistryState>) -> Result<Registry, String> {
+    let (reg, _) = write_registry(state.inner(), |reg| {
+        reg.dismiss_removed_features_notice();
+        Ok(())
+    })?;
+    Ok(reg)
+}
+
 /// Serialize the user's servers into a shareable setup (server definitions only,
 /// never secret values). A teammate imports this and adds their own keys, so a
 /// curated server set can be shared without leaking any credentials. An optional
@@ -2455,6 +2644,7 @@ struct ImportItem {
     url: Option<String>,
     /// False if a server with this name already exists (the import would skip it).
     is_new: bool,
+    reference_review: Vec<String>,
     credentials: Vec<crate::registry_controller::CredentialReview>,
     unsupported: Option<String>,
 }
@@ -2472,6 +2662,7 @@ async fn preview_import_servers(
     Ok(candidates
         .into_iter()
         .map(|server| ImportItem {
+            reference_review: Vec::new(),
             key: Some(server.key),
             name: server.name,
             transport: server.transport,
@@ -2506,6 +2697,7 @@ fn preview_import(state: State<RegistryState>, json: String) -> Result<Vec<Impor
                 .iter()
                 .any(|e| e.name.eq_ignore_ascii_case(&s.name));
             ImportItem {
+                reference_review: crate::secret_refs::review_lines(&s),
                 key: None,
                 name: s.name,
                 transport: s.transport,
@@ -3488,13 +3680,22 @@ struct TeamPairEvent {
 
 impl TeamPairEvent {
     fn new(state: &'static str) -> Self {
-        Self { state, check: None, message: None }
+        Self {
+            state,
+            check: None,
+            message: None,
+        }
     }
 }
 
 fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
     show_main_window(app);
-    if registry::load().is_ok_and(|reg| teams::pair_target_is_current(&reg, &origin, &team)) {
+    // Already connected here, unless this machine lost its sign-in: then
+    // pairing again is exactly how it reconnects.
+    if registry::load().is_ok_and(|reg| {
+        teams::pair_target_is_current(&reg, &origin, &team)
+            && !crate::personal_sync::state(&reg).is_ok_and(|st| st.sign_in_required)
+    }) {
         let _ = app.emit("show-teams", ());
         return;
     }
@@ -3503,30 +3704,65 @@ fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
         if let Some(current) = pairing.as_ref() {
             // A repeated link brings the waiting prompt back instead of pairing twice.
             if let Some(check) = &current.check {
-                let _ = app.emit("team-pair", TeamPairEvent { check: Some(check.clone()), ..TeamPairEvent::new("pending") });
+                let _ = app.emit(
+                    "team-pair",
+                    TeamPairEvent {
+                        check: Some(check.clone()),
+                        ..TeamPairEvent::new("pending")
+                    },
+                );
             }
             return;
         }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        *pairing = Some(TeamPairing { cancel: std::sync::Arc::clone(&cancel), check: None });
+        *pairing = Some(TeamPairing {
+            cancel: std::sync::Arc::clone(&cancel),
+            check: None,
+        });
         cancel
     };
     let pending = TeamPairGuard(std::sync::Arc::clone(&cancel));
-    let handle=app.clone();
-    app.dialog().message(format!("Control plane: {origin}\nOnly continue if you trust this origin. Your browser will show the named team and account before approval. Connecting replaces this installation's current team connection."))
-        .title("Connect Toolport to Teams?").buttons(MessageDialogButtons::OkCancel).show(move |approved| {
-            if !approved { drop(pending); return; }
+    let handle = app.clone();
+    app.dialog()
+        .message(teams::pairing_confirm_copy(
+            &origin,
+            crate::registry::load().is_ok_and(|r| r.team.is_some()),
+        ))
+        .title("Sign in to sync?")
+        .buttons(MessageDialogButtons::OkCancel)
+        .show(move |approved| {
+            if !approved {
+                drop(pending);
+                return;
+            }
             std::thread::spawn(move || {
-                let result=teams::pair_device(&origin,&team,&cancel,|url,check| {
-                    if let Some(current) = team_pairing().as_mut().filter(|current| pending.owns(current)) { current.check = Some(check.to_string()); }
-                    let _ = handle.emit("team-pair", TeamPairEvent { check: Some(check.to_string()), ..TeamPairEvent::new("pending") });
-                    let _=crate::oauth::open_web_url(url);
+                let result = teams::pair_device(&origin, &team, &cancel, |url, check| {
+                    if let Some(current) = team_pairing()
+                        .as_mut()
+                        .filter(|current| pending.owns(current))
+                    {
+                        current.check = Some(check.to_string());
+                    }
+                    let _ = handle.emit(
+                        "team-pair",
+                        TeamPairEvent {
+                            check: Some(check.to_string()),
+                            ..TeamPairEvent::new("pending")
+                        },
+                    );
+                    let _ = crate::oauth::open_web_url(url);
                 });
                 drop(pending);
                 let event = match result {
-                    Ok(reg) => { let _=handle.emit("team-sync-registry",&reg); TeamPairEvent::new("connected") }
+                    Ok(reg) => {
+                        let _ = handle.emit("team-sync-registry", &reg);
+                        TeamPairEvent::new("connected")
+                    }
                     Err(e) if e == teams::PAIRING_CANCELLED => TeamPairEvent::new("cancelled"),
-                    Err(e) => TeamPairEvent { message: Some(e), ..TeamPairEvent::new("failed") },
+                    Err(e) => TeamPairEvent {
+                        message: Some(e),
+                        ..TeamPairEvent::new("failed")
+                    },
                 };
                 let _ = handle.emit("team-pair", event);
             });
@@ -3538,7 +3774,10 @@ fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
 #[tauri::command]
 fn team_pair_state() -> Option<TeamPairEvent> {
     team_pairing().as_ref().and_then(|current| {
-        current.check.clone().map(|check| TeamPairEvent { check: Some(check), ..TeamPairEvent::new("pending") })
+        current.check.clone().map(|check| TeamPairEvent {
+            check: Some(check),
+            ..TeamPairEvent::new("pending")
+        })
     })
 }
 
@@ -3546,7 +3785,9 @@ fn team_pair_state() -> Option<TeamPairEvent> {
 #[tauri::command]
 fn team_pair_cancel() {
     if let Some(current) = team_pairing().as_ref() {
-        current.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        current
+            .cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -3588,11 +3829,8 @@ fn tray_host_present() -> bool {
     let class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
     // Windows owns this class for Explorer's notification area.
     unsafe {
-        !windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(
-            class.as_ptr(),
-            std::ptr::null(),
-        )
-        .is_null()
+        !windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(class.as_ptr(), std::ptr::null())
+            .is_null()
     }
 }
 
@@ -3945,6 +4183,8 @@ pub fn run() {
             set_access_server,
             delete_profile,
             dismiss_access_upgrade_notice,
+            dismiss_removed_features_notice,
+            open_exports_dir,
             set_folder_profiles,
             set_profile_server_tools,
             install_gateway,
@@ -3953,6 +4193,9 @@ pub fn run() {
             migrate_client,
             preview_client_setup,
             set_secret,
+            set_secret_reference,
+            test_secret_reference,
+            secret_reference_providers,
             set_launch_secret,
             set_launch_input_value,
             delete_secret,
@@ -3961,6 +4204,7 @@ pub fn run() {
             has_client_secret,
             secret_status,
             get_audit_log,
+            get_client_sessions,
             audit_stats,
             get_security_events,
             savings_summary,
@@ -3998,12 +4242,19 @@ pub fn run() {
             set_lazy_discovery,
             set_code_mode,
             set_client_discovery,
+            personal_sync_local_only,
+            personal_sync_portable,
+            reconnect_sync,
+            personal_sync_resolve_conflict,
+            personal_sync_finish_selection,
+            personal_sync_new_servers_local_only,
             team_connect,
             team_join_poll,
             team_sync,
             team_sync_wait,
             main_window_visible,
             team_instructions_status,
+            team_sync_status,
             team_disconnect,
             team_push_preview,
             team_pair_state,

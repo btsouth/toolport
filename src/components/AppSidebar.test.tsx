@@ -76,6 +76,8 @@ function fakeUpdate(version = "1.1.0") {
  * ProfileBar renders, and a team connection so Team is a top-level row. */
 function pairedRegistry(): Registry {
   return {
+    version: 3,
+    servers: [],
     profiles: [{ id: "default", name: "Default" }],
     activeProfileId: "default",
     team: { teamId: "team-1" },
@@ -129,7 +131,7 @@ describe("AppSidebar accessibility", () => {
     );
   });
 
-  it("shows the four top-level views and hides Team until paired", async () => {
+  it("shows sign in before pairing and team navigation after pairing", async () => {
     const onSelectView = vi.fn();
     const { rerender } = render(
       <TooltipProvider>
@@ -149,7 +151,7 @@ describe("AppSidebar accessibility", () => {
       within(nav)
         .getAllByRole("button")
         .map((b) => b.textContent),
-    ).toEqual(["Servers", "Clients", "Activity", "Settings"]);
+    ).toEqual(["Servers", "Clients", "Activity", "Settings", "Sign in to sync"]);
     // Catalog, Playground, Agent rules, Agent activity and Team are not top-level.
     for (const name of [
       "Browse catalog",
@@ -653,9 +655,37 @@ it("shows negative net savings with the tokenizer method and excludes legacy est
       />
     </TooltipProvider>,
   );
-  const badge = await screen.findByRole("button", { name: "-12.3k tokens saved" });
+  const badge = await screen.findByRole("button", {
+    name: "-12.3k tokens saved",
+  });
   expect(badge).toHaveAttribute("title", expect.stringContaining("cl100k_base"));
   expect(badge).toHaveAttribute("title", expect.stringContaining("net of discovery"));
   expect(badge).toHaveAttribute("title", expect.stringContaining("once per session"));
   expect(badge).not.toHaveTextContent("1.0M");
+});
+
+it("shows indented settings pages with an active row and pending count", async () => {
+  const selectPage = vi.fn();
+  render(
+    <TooltipProvider>
+      <AppSidebar
+        registry={null}
+        onRegistryChange={vi.fn()}
+        view="settings"
+        onSelectView={vi.fn()}
+        onReplayOnboarding={vi.fn()}
+        onShortcuts={vi.fn()}
+        settingsPage="tools"
+        onSettingsPageChange={selectPage}
+        pendingCount={3}
+      />
+    </TooltipProvider>,
+  );
+  expect(screen.getByRole("button", { name: "Tools" })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  expect(screen.getByLabelText("3 pending approvals")).toHaveTextContent("3");
+  await userEvent.click(screen.getByRole("button", { name: "Safety" }));
+  expect(selectPage).toHaveBeenCalledWith("safety");
 });

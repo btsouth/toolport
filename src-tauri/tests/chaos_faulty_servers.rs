@@ -13,7 +13,7 @@ mod chaos_support;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -239,21 +239,80 @@ fn a_stderr_flood_does_not_wedge_the_server_or_the_gateway() {
     );
 }
 
-/// A server that answers every request 401, like an OAuth server nobody signed
-/// into yet.  The gateway must say so and wait for new credentials instead of
-/// retrying in a loop that hides the real cause.
-fn unauthorized_server() -> (String, Arc<AtomicUsize>) {
+/// An endpoint that initially rejects auth, then recovers without a registry
+/// edit. Retries must respect backoff and leave healthy peers available.
+fn unauthorized_server() -> (String, Arc<AtomicUsize>, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     let hits = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&hits);
+    let recovered = Arc::new(AtomicBool::new(false));
+    let ready = Arc::clone(&recovered);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             counted.fetch_add(1, Ordering::SeqCst);
             let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+            let mut request = Vec::new();
             let mut buf = [0u8; 8192];
-            let _ = stream.read(&mut buf);
+            let (header_end, length) = loop {
+                let Ok(n) = stream.read(&mut buf) else {
+                    break (0, 0);
+                };
+                if n == 0 {
+                    break (0, 0);
+                }
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    break (end + 4, length);
+                }
+            };
+            while request.len() < header_end + length {
+                let Ok(n) = stream.read(&mut buf) else { break };
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            if ready.load(Ordering::SeqCst) && request.starts_with(b"POST ") {
+                let rpc: serde_json::Value =
+                    serde_json::from_slice(&request[header_end..]).unwrap_or_default();
+                let Some(id) = rpc.get("id") else {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    continue;
+                };
+                let result = match rpc["method"].as_str().unwrap_or("") {
+                    "initialize" => {
+                        json!({"protocolVersion":"2025-03-26", "capabilities":{"tools":{}}, "serverInfo":{"name":"recovered", "version":"1"}})
+                    }
+                    "tools/list" => {
+                        json!({"tools":[{"name":"echo", "description":"Echo", "inputSchema":{"type":"object"}}]})
+                    }
+                    "tools/call" => {
+                        json!({"content":[{"type":"text", "text":rpc["params"]["arguments"]["text"].as_str().unwrap_or("")}]})
+                    }
+                    "prompts/list" => json!({"prompts":[]}),
+                    "resources/list" => json!({"resources":[]}),
+                    "resources/templates/list" => json!({"resourceTemplates":[]}),
+                    _ => json!({}),
+                };
+                let body = json!({"jsonrpc":"2.0", "id":id, "result":result}).to_string();
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                continue;
+            }
             let body = r#"{"error":"unauthorized"}"#;
             let _ = write!(
                 stream,
@@ -264,13 +323,13 @@ fn unauthorized_server() -> (String, Arc<AtomicUsize>) {
             );
         }
     });
-    (url, hits)
+    (url, hits, recovered)
 }
 
 #[test]
-fn an_auth_required_server_waits_for_sign_in_without_taking_the_gateway_down() {
+fn an_auth_required_endpoint_recovers_after_backoff_without_taking_the_gateway_down() {
     let scratch = Scratch::new("auth");
-    let (url, hits) = unauthorized_server();
+    let (url, hits, recovered) = unauthorized_server();
     write_registry(
         scratch.path(),
         &[mock_entry("good", &[]), http_entry("locked", &url)],
@@ -304,9 +363,18 @@ fn an_auth_required_server_waits_for_sign_in_without_taking_the_gateway_down() {
         assert!(text.contains("needs sign-in"), "{text}");
         std::thread::sleep(Duration::from_millis(500));
     }
-    assert_eq!(
-        hits.load(Ordering::SeqCst),
-        after_connect,
-        "an auth-required server must wait for new credentials"
+    assert!(
+        hits.load(Ordering::SeqCst) <= after_connect + 1,
+        "endpoint auth retries ignored exponential backoff"
     );
+    recovered.store(true, Ordering::SeqCst);
+    assert!(
+        client.wait_for_tool("locked__echo", CATALOG),
+        "{}",
+        client.diagnostics()
+    );
+    let reply = client.call("locked__echo", json!({"text":"recovered"}));
+    assert!(chaos_support::reply_ok(&reply, "recovered"), "{reply}");
+    let peer = client.call("good__echo", json!({"text":"still available"}));
+    assert!(chaos_support::reply_ok(&peer, "still available"), "{peer}");
 }

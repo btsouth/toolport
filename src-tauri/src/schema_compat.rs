@@ -805,6 +805,22 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_string_maximum_is_numeric_only_in_schema_positions() {
+        let mut schema = json!({
+            "type":"object",
+            "properties":{"per_page":{"type":"integer", "minimum":"1", "maximum":"100"}},
+            "$defs":{"limits":{"minItems":"0", "maxItems":"100", "maxProperties":"invalid"}},
+            "examples":[{"maximum":"100"}],
+        });
+        normalize(&mut schema);
+        assert_eq!(schema["properties"]["per_page"]["maximum"], 100);
+        assert_eq!(schema["properties"]["per_page"]["minimum"], 1);
+        assert_eq!(schema["$defs"]["limits"]["maxItems"], 100);
+        assert!(schema["$defs"]["limits"].get("maxProperties").is_none());
+        assert_eq!(schema["examples"][0]["maximum"], "100");
+    }
+
+    #[test]
     fn normalizes_public_preview2_schemas() {
         // Exact inputSchema objects from toolport-mcp-servers@0.2.0's shipped
         // data/{clerk,cloudflare,vercel}-curated.tools.json. No installed registry.

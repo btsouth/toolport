@@ -157,11 +157,17 @@ enum Format {
     YamlMcpServersList,
 }
 
+struct CombinedToolNameBudget {
+    total: usize,
+    separator: usize,
+}
+
 struct ClientDef {
     id: &'static str,
     name: &'static str,
     format: Format,
     discovery: DiscoveryCapabilities,
+    combined_tool_name_budget: Option<CombinedToolNameBudget>,
     uses_connectors: bool,
     /// Resolves the absolute config path for the current OS, if determinable.
     path: fn() -> Option<PathBuf>,
@@ -173,15 +179,40 @@ struct ClientDef {
 /// Resolve Auto without changing serialized per-client overrides. The global default
 /// remains for anonymous connections; identified clients use their capability table.
 pub fn client_discovery_mode(registry: &crate::registry::Registry, id: &str) -> &'static str {
-    let mode = registry.client_discovery_mode(id).or_else(|| {
-        id.strip_prefix("client:")
-            .and_then(|adapter| registry.client_discovery_mode(adapter))
-    });
+    let mode = registry
+        .client_discovery_mode(id)
+        .or_else(|| {
+            id.strip_prefix("client:")
+                .and_then(|adapter| registry.client_discovery_mode(adapter))
+        })
+        // A global mode the user chose beats the client's built-in default.
+        .or_else(|| registry.chosen_global_discovery_mode());
     discovery_capabilities(id).resolve_mode(mode)
 }
 
 pub fn discovery_capabilities(id: &str) -> DiscoveryCapabilities {
+    // Adapter routing wraps legacy client IDs too. Only the capability lookup
+    // uses this spelling; authorization and result ownership keep the wire ID.
+    let id = id.strip_prefix("adapter:").unwrap_or(id);
     discovery::capabilities(id.strip_prefix("client:").unwrap_or(id))
+}
+
+/// Client limits apply to the registered server key, profile separator overhead and alias.
+pub fn client_tool_name_limit(id: Option<&str>, registered_key: &str) -> usize {
+    let id = id.unwrap_or("");
+    let id = id.strip_prefix("adapter:").unwrap_or(id);
+    let id = id.strip_prefix("client:").unwrap_or(id);
+    defs()
+        .into_iter()
+        .find(|profile| profile.id == id)
+        .and_then(|profile| profile.combined_tool_name_budget)
+        .map(|combined| {
+            combined
+                .total
+                .saturating_sub(registered_key.len() + combined.separator)
+                .min(64)
+        })
+        .unwrap_or(64)
 }
 
 /// The name Toolport uses for its own entry when installed into a client config.
@@ -368,6 +399,7 @@ fn resolve_client_config_path(
         "kiro" => home.join(".kiro").join("settings").join("mcp.json"),
         "kimi-code" => home.join(".kimi-code").join("mcp.json"),
         "zcode" => home.join(".zcode").join("cli").join("config.json"),
+        "command-code" => home.join(".commandcode").join("mcp.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
         "jan" => data.join("Jan").join("data").join("mcp_config.json"),
         "zed" => match platform {
@@ -895,6 +927,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "kiro" => home.join(".kiro").join("settings").join("mcp.json"),
         "kimi-code" => home.join(".kimi-code").join("mcp.json"),
         "zcode" => home.join(".zcode").join("cli").join("config.json"),
+        "command-code" => home.join(".commandcode").join("mcp.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
         "jan" => data.join("Jan").join("data").join("mcp_config.json"),
         "zed" => config.join("zed").join("settings.json"),
@@ -1006,6 +1039,7 @@ fn resolve_rules_target(
         },
         "pi" => block(home.join(".pi").join("agent").join("AGENTS.md")),
         "omp" => block(home.join(".omp").join("agent").join("AGENTS.md")),
+        "command-code" => block(home.join(".commandcode").join("AGENTS.md")),
         "zed" => match platform {
             Platform::Windows => block(config.join("Zed").join("AGENTS.md")),
             Platform::MacOs | Platform::Linux => {
@@ -1475,25 +1509,176 @@ fn scan_roo_code_plugins() -> Vec<McpServer> {
         .unwrap_or_default()
 }
 
-/// Resolve display identity only from Toolport-owned names, never clientInfo.
+/// Resolve display identity from configured names, never clientInfo.
 /// Recorded friendly names remain authoritative for historical Activity rows.
+pub fn known_adapter_name(id: &str) -> Option<String> {
+    if id == "claude-code-secondary" {
+        return Some("Claude Code (secondary)".into());
+    }
+    defs()
+        .into_iter()
+        .find(|def| def.id == id)
+        .map(|def| def.name.to_string())
+}
+
+/// Resolve a whole Activity pass against one snapshot of caller names.
+pub struct CallerNames(HashMap<String, String>);
+
+impl CallerNames {
+    pub fn for_entries(entries: &[serde_json::Value]) -> Self {
+        Self::for_entries_with(entries, || crate::registry::load().ok())
+    }
+
+    fn for_entries_with(
+        entries: &[serde_json::Value],
+        load: impl FnOnce() -> Option<crate::registry::Registry>,
+    ) -> Self {
+        let mut names: HashMap<String, String> = defs()
+            .into_iter()
+            .map(|def| (format!("adapter:{}", def.id), def.name.to_string()))
+            .collect();
+        names.insert(
+            "adapter:claude-code-secondary".into(),
+            "Claude Code (secondary)".into(),
+        );
+        if entries.iter().any(|entry| {
+            entry["client"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("client:"))
+                && recorded_client_name(entry["client"].as_str(), entry["clientName"].as_str())
+                    .is_none()
+        }) {
+            if let Some(registry) = load() {
+                for client in registry.http_clients {
+                    names.insert(format!("client:{}", client.id), client.label);
+                }
+            }
+        }
+        Self(names)
+    }
+
+    pub fn trusted_name(&self, client: Option<&str>, recorded_name: Option<&str>) -> String {
+        trusted_client_name_with(client, recorded_name, |id| self.0.get(id).cloned())
+    }
+}
+
 pub fn trusted_client_name(client: Option<&str>, recorded_name: Option<&str>) -> String {
-    if let Some(name) = recorded_name.filter(|name| !name.is_empty()) {
-        return name.to_string();
+    trusted_client_name_with(client, recorded_name, |client| {
+        if let Some(id) = client.strip_prefix("adapter:") {
+            known_adapter_name(id)
+        } else {
+            let id = client.strip_prefix("client:")?;
+            crate::registry::load()
+                .ok()?
+                .http_clients
+                .into_iter()
+                .find(|client| client.id == id)
+                .map(|client| client.label)
+        }
+    })
+}
+
+/// Write-time fallback uses only identity already in the request context.
+/// Registered labels are resolved at session setup or when reading Activity.
+pub(crate) fn unresolved_client_name(client: Option<&str>) -> String {
+    trusted_client_name_with(client, None, |_| None)
+}
+
+fn recorded_client_name<'a>(
+    client: Option<&str>,
+    recorded_name: Option<&'a str>,
+) -> Option<&'a str> {
+    recorded_name.filter(|name| {
+        !name.is_empty()
+            && !matches!(
+                *name,
+                "An AI client" | "Unknown client" | "Unrecorded client"
+            )
+            && !name.starts_with("adapter-pid-")
+            && !client.is_some_and(|c| c.strip_prefix("adapter:") == Some(*name))
+            // A process guess loses to the client ID the caller was configured with.
+            && !(name.starts_with("Unknown app") && client.is_some_and(configured_adapter))
+    })
+}
+
+/// "inbox 1" or "Claude Code 2.1" adds nothing to the name it follows.
+pub fn label_only_adds_version(name: &str, label: &str) -> bool {
+    let (name, label) = (name.to_lowercase(), label.to_lowercase());
+    label == name
+        || label
+            .strip_prefix(&format!("{name} "))
+            .is_some_and(|version| !version.contains(' '))
+}
+
+fn configured_adapter(client: &str) -> bool {
+    client
+        .strip_prefix("adapter:")
+        .is_some_and(|id| !id.is_empty() && !id.starts_with("adapter-pid-"))
+}
+
+fn trusted_client_name_with(
+    client: Option<&str>,
+    recorded_name: Option<&str>,
+    lookup: impl FnOnce(&str) -> Option<String>,
+) -> String {
+    if let Some(name) = recorded_client_name(client, recorded_name) {
+        return crate::session_observability::display_label(name)
+            .unwrap_or_else(|| "Unknown client".into());
+    }
+    if let Some(name) = client.and_then(lookup) {
+        return crate::session_observability::display_label(&name)
+            .unwrap_or_else(|| "Unknown client".into());
     }
     if let Some(id) = client.and_then(|client| client.strip_prefix("adapter:")) {
-        if let Some(def) = defs().into_iter().find(|def| def.id == id) {
-            return def.name.to_string();
-        }
-    }
-    if let Some(id) = client.and_then(|client| client.strip_prefix("client:")) {
-        if let Ok(registry) = crate::registry::load() {
-            if let Some(client) = registry.http_clients.iter().find(|client| client.id == id) {
-                return client.label.clone();
+        if !id.starts_with("adapter-pid-") {
+            if let Some(name) = crate::session_observability::display_label(id) {
+                return name;
             }
         }
     }
-    "An AI client".to_string()
+    if client.is_some() {
+        "Unknown client"
+    } else {
+        "Unrecorded client"
+    }
+    .to_string()
+}
+
+pub const UNRECORDED_CLIENT_TOOLTIP: &str =
+    "Older Toolport versions did not record callers for these rows.";
+
+pub fn display_caller_name(name: Option<&str>, label: Option<&str>) -> String {
+    match name.filter(|n| {
+        !n.is_empty() && !matches!(*n, "An AI client" | "Unknown client" | "Unrecorded client")
+    }) {
+        Some(name) => name.to_string(),
+        None => label
+            .filter(|l| !l.is_empty())
+            .map(|l| format!("{l} (reported)"))
+            .unwrap_or_else(|| {
+                name.filter(|n| *n == "Unknown client")
+                    .unwrap_or("Unrecorded client")
+                    .to_string()
+            }),
+    }
+}
+
+/// Scope-selecting identity is independent from display-only attribution.
+pub fn resolve_launch_profile(
+    reg: &crate::registry::Registry,
+    client_id: Option<&str>,
+    env_profile: &Option<String>,
+) -> Option<String> {
+    let profile_ref = match client_id.and_then(|id| reg.client_scopes.get(id)) {
+        Some(p) if p.trim().is_empty() => return Some(reg.default_access_id()),
+        Some(p) => Some(p.as_str()),
+        None => env_profile.as_deref(),
+    };
+    Some(
+        profile_ref
+            .map(|profile| reg.resolve_profile_id(profile))
+            .unwrap_or_else(|| reg.default_access_id()),
+    )
 }
 
 fn defs() -> Vec<ClientDef> {
@@ -1501,6 +1686,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "claude-desktop",
             discovery: discovery::capabilities("claude-desktop"),
+            combined_tool_name_budget: None,
             name: "Claude Desktop",
             format: Format::JsonMcpServers,
             uses_connectors: true,
@@ -1510,6 +1696,10 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "cursor",
             discovery: discovery::capabilities("cursor"),
+            combined_tool_name_budget: Some(CombinedToolNameBudget {
+                total: 60,
+                separator: 0,
+            }),
             name: "Cursor",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1519,6 +1709,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "droid",
             discovery: discovery::capabilities("droid"),
+            combined_tool_name_budget: None,
             name: "Factory Droid",
             format: Format::JsonDroidMcpServers,
             uses_connectors: false,
@@ -1528,6 +1719,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "crush",
             discovery: discovery::capabilities("crush"),
+            combined_tool_name_budget: None,
             name: "Crush",
             format: Format::JsonMcp,
             uses_connectors: false,
@@ -1537,6 +1729,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "anythingllm",
             discovery: discovery::capabilities("anythingllm"),
+            combined_tool_name_budget: None,
             name: "AnythingLLM",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1546,6 +1739,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "vscode",
             discovery: discovery::capabilities("vscode"),
+            combined_tool_name_budget: None,
             name: "VS Code",
             format: Format::JsonServers,
             uses_connectors: false,
@@ -1555,6 +1749,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "amp",
             discovery: discovery::capabilities("amp"),
+            combined_tool_name_budget: None,
             name: "Amp",
             format: Format::JsonAmpMcpServers,
             uses_connectors: false,
@@ -1564,6 +1759,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "windsurf",
             discovery: discovery::capabilities("windsurf"),
+            combined_tool_name_budget: None,
             name: "Devin Desktop (Cascade)",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1573,6 +1769,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "devin-cli",
             discovery: discovery::capabilities("devin-cli"),
+            combined_tool_name_budget: None,
             name: "Devin Local / CLI",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1582,6 +1779,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "opencode",
             discovery: discovery::capabilities("opencode"),
+            combined_tool_name_budget: None,
             name: "OpenCode",
             format: Format::JsonOpenCodeMcp,
             uses_connectors: false,
@@ -1593,6 +1791,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "kilo-code",
             discovery: discovery::capabilities("kilo-code"),
+            combined_tool_name_budget: None,
             name: "Kilo Code",
             format: Format::JsonOpenCodeMcp,
             uses_connectors: false,
@@ -1606,6 +1805,7 @@ fn defs() -> Vec<ClientDef> {
             // [mcp_servers.<name>] - same TOML shape as Codex.
             id: "grok",
             discovery: discovery::capabilities("grok"),
+            combined_tool_name_budget: None,
             name: "Grok Build",
             format: Format::TomlMcpServers,
             uses_connectors: false,
@@ -1617,6 +1817,7 @@ fn defs() -> Vec<ClientDef> {
             // `CODEX_HOME` (default ~/.codex).
             id: "codex",
             discovery: discovery::capabilities("codex"),
+            combined_tool_name_budget: None,
             name: "Codex",
             format: Format::TomlMcpServers,
             uses_connectors: false,
@@ -1626,6 +1827,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "github-copilot-cli",
             discovery: discovery::capabilities("github-copilot-cli"),
+            combined_tool_name_budget: None,
             name: "GitHub Copilot CLI",
             format: Format::JsonCopilotMcpServers,
             uses_connectors: false,
@@ -1635,6 +1837,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "antigravity",
             discovery: discovery::capabilities("antigravity"),
+            combined_tool_name_budget: None,
             name: "Antigravity",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1644,6 +1847,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "claude-code",
             discovery: discovery::capabilities("claude-code"),
+            combined_tool_name_budget: None,
             name: "Claude Code",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1653,6 +1857,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "gemini-cli",
             discovery: discovery::capabilities("gemini-cli"),
+            combined_tool_name_budget: None,
             name: "Gemini CLI",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1662,6 +1867,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "qwen-code",
             discovery: discovery::capabilities("qwen-code"),
+            combined_tool_name_budget: None,
             name: "Qwen Code",
             format: Format::JsonQwenMcpServers,
             uses_connectors: false,
@@ -1671,6 +1877,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "junie",
             discovery: discovery::capabilities("junie"),
+            combined_tool_name_budget: None,
             name: "JetBrains Junie",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1682,6 +1889,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "cline",
             discovery: discovery::capabilities("cline"),
+            combined_tool_name_budget: None,
             name: "Cline",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1691,6 +1899,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "roo-code",
             discovery: discovery::capabilities("roo-code"),
+            combined_tool_name_budget: None,
             name: "Roo Code",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1700,6 +1909,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "warp",
             discovery: discovery::capabilities("warp"),
+            combined_tool_name_budget: None,
             name: "Warp",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1711,6 +1921,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "amazon-q",
             discovery: discovery::capabilities("amazon-q"),
+            combined_tool_name_budget: None,
             name: "Amazon Q",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1723,6 +1934,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "kiro",
             discovery: discovery::capabilities("kiro"),
+            combined_tool_name_budget: None,
             name: "Kiro",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1734,6 +1946,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "kimi-code",
             discovery: discovery::capabilities("kimi-code"),
+            combined_tool_name_budget: None,
             name: "Kimi Code",
             format: Format::JsonKimiMcpServers,
             uses_connectors: false,
@@ -1743,6 +1956,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "zcode",
             discovery: discovery::capabilities("zcode"),
+            combined_tool_name_budget: None,
             name: "ZCode",
             format: Format::JsonZCodeMcp,
             uses_connectors: false,
@@ -1750,8 +1964,23 @@ fn defs() -> Vec<ClientDef> {
             plugin_scan: None,
         },
         ClientDef {
+            id: "command-code",
+            discovery: discovery::capabilities("command-code"),
+            combined_tool_name_budget: None,
+            name: "Command Code",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            // Command Code's user-scope MCP config: `~/.commandcode/mcp.json` (`mcpServers`).
+            // It also merges a project `.mcp.json` and a per-project local file over it; we
+            // manage the user one so the gateway is available everywhere. Bare `command` and
+            // `url` entries read as stdio and http, and `type` is accepted for `transport`.
+            path: || client_config_path("command-code"),
+            plugin_scan: None,
+        },
+        ClientDef {
             id: "zed",
             discovery: discovery::capabilities("zed"),
+            combined_tool_name_budget: None,
             name: "Zed",
             format: Format::JsonContextServers,
             uses_connectors: false,
@@ -1764,6 +1993,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "lm-studio",
             discovery: discovery::capabilities("lm-studio"),
+            combined_tool_name_budget: None,
             name: "LM Studio",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1775,6 +2005,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "jan",
             discovery: discovery::capabilities("jan"),
+            combined_tool_name_budget: None,
             name: "Jan",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1788,6 +2019,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "boltai",
             discovery: discovery::capabilities("boltai"),
+            combined_tool_name_budget: None,
             name: "BoltAI",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1797,6 +2029,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "pi",
             discovery: discovery::capabilities("pi"),
+            combined_tool_name_budget: None,
             name: "Pi",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1809,6 +2042,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "omp",
             discovery: discovery::capabilities("omp"),
+            combined_tool_name_budget: None,
             name: "Oh My Pi",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1820,6 +2054,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "goose",
             discovery: discovery::capabilities("goose"),
+            combined_tool_name_budget: None,
             name: "Goose",
             format: Format::YamlExtensions,
             uses_connectors: false,
@@ -1829,6 +2064,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "hermes",
             discovery: discovery::capabilities("hermes"),
+            combined_tool_name_budget: None,
             name: "Hermes",
             format: Format::YamlMcpServers,
             uses_connectors: false,
@@ -1838,6 +2074,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "continue",
             discovery: discovery::capabilities("continue"),
+            combined_tool_name_budget: None,
             name: "Continue",
             format: Format::YamlMcpServersList,
             uses_connectors: false,
@@ -1847,6 +2084,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "witsy",
             discovery: discovery::capabilities("witsy"),
+            combined_tool_name_budget: None,
             name: "Witsy",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -5987,12 +6225,63 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
     })
 }
 
-/// A secondary Claude config has no distinct registry client id. Preserve its frozen
-/// profile and omit `TOOLPORT_CLIENT_ID`; otherwise every secondary resolves through
-/// the primary `claude-code` client scope and silently changes tool sets on repair.
-fn secondary_claude_gateway_entry(profile: Option<&str>) -> Result<ServerEntry, String> {
-    let mut entry = gateway_entry(profile, "claude-code")?;
-    entry.env.retain(|var| var.key != crate::brand::CLIENT_ID);
+/// Preserve the launch's scope identity when replacing a stale command.
+fn repair_gateway_entry(
+    format: Format,
+    path: &Path,
+    name: &str,
+    id: &str,
+) -> Result<ServerEntry, String> {
+    let text = read_config_file(path)?;
+    let value = mutation::value(format, Some(&text))?;
+    let container = moved::server_container(format, &value);
+    let prior = if matches!(format, Format::YamlMcpServersList) {
+        container
+            .as_array()
+            .and_then(|entries| entries.iter().find(|entry| entry["name"] == name))
+    } else {
+        container.get(name)
+    }
+    .ok_or("Missing owned gateway")?;
+    let env_key = match format {
+        Format::JsonOpenCodeMcp => "environment",
+        Format::YamlExtensions => "envs",
+        _ => "env",
+    };
+    let mut entry = gateway_entry(None, id)?;
+    entry.env.retain(|env| env.key != crate::brand::CLIENT_ID);
+    for (key, legacy) in [
+        (crate::brand::CLIENT_ID, crate::brand::CLIENT_ID_LEGACY),
+        (crate::brand::PROFILE, crate::brand::PROFILE_LEGACY),
+    ] {
+        for candidate in [key, legacy] {
+            if prior[env_key]
+                .get(candidate)
+                .is_some_and(|value| !value.is_string())
+            {
+                return Err("Invalid gateway scope environment".into());
+            }
+            if let Some(value) = prior[env_key]
+                .get(candidate)
+                .and_then(|value| value.as_str())
+            {
+                // Empty values mask inherited scope variables. Keep both aliases
+                // as written so inherited modern keys keep their precedence.
+                entry.env.push(crate::registry::EnvVar {
+                    key: candidate.into(),
+                    value: Some(value.into()),
+                    secret: false,
+                    unknown_fields: Default::default(),
+                });
+            }
+        }
+    }
+    entry.env.push(crate::registry::EnvVar {
+        key: crate::brand::ATTRIBUTION_ID.into(),
+        value: Some(id.into()),
+        secret: false,
+        unknown_fields: Default::default(),
+    });
     Ok(entry)
 }
 
@@ -6282,6 +6571,16 @@ fn edit_format(
     Ok(())
 }
 
+fn backfill_gateway_identity(
+    def: &ClientDef,
+    path: &Path,
+    entry_name: &str,
+    id: &str,
+) -> Result<(), String> {
+    backup_file(def.id, path)?;
+    moved::backfill_identity(def.format, path, entry_name, id)
+}
+
 /// Add Toolport's stdio gateway entry to a client's config (preserves existing servers).
 /// `profile` scopes the client to one profile via `TOOLPORT_PROFILE` (None = all).
 pub fn install_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOutcome, String> {
@@ -6542,13 +6841,14 @@ fn gateway_entry_needs_rewrite(
     {
         return true;
     }
-    // Migrate CONDUIT_CLIENT_ID / CONDUIT_PROFILE → TOOLPORT_* on launch when the
-    // entry name and path are already current (SOU-318 only renamed the key).
+    // Legacy-only entries need display identity once. Preserve their scope keys
+    // because normalizing aliases can override an inherited modern scope value.
     if let Some(text) = config_text {
         let has_legacy = text.contains(crate::brand::CLIENT_ID_LEGACY)
             || text.contains(crate::brand::PROFILE_LEGACY);
-        let has_new =
-            text.contains(crate::brand::CLIENT_ID) || text.contains(crate::brand::PROFILE);
+        let has_new = text.contains(crate::brand::CLIENT_ID)
+            || text.contains(crate::brand::PROFILE)
+            || text.contains(crate::brand::ATTRIBUTION_ID);
         if has_legacy && !has_new {
             return true;
         }
@@ -6699,7 +6999,10 @@ fn referenced_gateway_paths_in(clients: &[DetectedClient]) -> Option<Vec<PathBuf
                 continue;
             }
             let path = PathBuf::from(command);
-            if !out.iter().any(|p| p == &path) {
+            if !out
+                .iter()
+                .any(|p| crate::gateway_publish::paths_equal(p, &path))
+            {
                 out.push(path);
             }
         }
@@ -6724,10 +7027,172 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
     if !Path::new(&current).exists() {
         return outcome;
     }
+    // Preserve paths cached by clients before their on-disk configs are repointed.
+    #[cfg(target_os = "linux")]
+    let before = referenced_gateway_paths();
     let mut outcome = repoint_stale_gateways_in(&current, detect_clients(), managed);
     repoint_other_claude_configs(&current, &mut outcome);
     log_repoint_outcome(&current, &outcome);
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = crate::registry::conduit_dir().map(|d| d.join("bin")) {
+        let references = before
+            .zip(referenced_gateway_paths())
+            .map(|(mut before, after)| {
+                before.extend(after);
+                before.extend(
+                    crate::gateway_publish::list_gateway_processes()
+                        .into_iter()
+                        .filter_map(|p| p.path),
+                );
+                before
+            });
+        cleanup_legacy_gateway_copies(Path::new(&current), &dir, references.as_deref());
+    }
     outcome
+}
+
+/// 1.x Linux AppImages used stable_gateway_copy in this private bin directory.
+/// macOS uses bundled helpers; Windows publishing remains owned by its pruner. A matching name alone is not ownership: preserve
+/// symlinks, scripts and foreign executables, including user-written wrappers.
+#[cfg(any(target_os = "linux", test))]
+fn is_legacy_gateway_copy(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let stem = name.trim_end_matches(".exe");
+    if !matches!(stem, "toolport-gateway" | "conduit-gateway")
+        && !(stem.starts_with("toolport-gateway-1.") || stem.starts_with("conduit-gateway-1."))
+    {
+        return false;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() > 128 * 1024 * 1024 {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let native = bytes.starts_with(b"\x7fELF")
+        || bytes.starts_with(b"MZ")
+        || bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
+        || bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe]);
+    is_legacy_gateway_shim(path)
+        || native
+            && [
+                b"toolport-gateway".as_slice(),
+                b"TOOLPORT_CLIENT_ID",
+                b"tools/call",
+            ]
+            .iter()
+            .all(|marker| bytes.windows(marker.len()).any(|w| w == *marker))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_legacy_gateway_shim(path: &Path) -> bool {
+    use std::io::Read;
+    const HEADER: &[u8] = b"#!/bin/sh\n# Toolport gateway compatibility shim\n";
+    let mut header = [0u8; HEADER.len()];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok()
+        && header.as_slice() == HEADER
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn refresh_legacy_gateway(current: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let command = current
+            .to_str()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "gateway path is not UTF-8",
+                )
+            })?
+            .replace('\'', "'\"'\"'");
+        let text =
+            format!("#!/bin/sh\n# Toolport gateway compatibility shim\nexec '{command}' \"$@\"\n");
+        if std::fs::read(dest).is_ok_and(|bytes| bytes == text.as_bytes()) {
+            return Ok(());
+        }
+        let tmp = dest.with_extension(format!("{}.tmp", crate::approval::new_correlation_id()));
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, dest)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(tmp);
+        }
+        result
+    }
+    #[cfg(not(unix))]
+    {
+        replace_gateway_copy(current, dest)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cleanup_legacy_gateway_copies(current: &Path, dir: &Path, references: Option<&[PathBuf]>) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let Some(references) = references else {
+        eprintln!("toolport: skipping legacy gateway cleanup: client references are unknown");
+        return;
+    };
+    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        return;
+    }
+    // AppImage installs still use their stable copy. Never unlink the resolved gateway.
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if crate::gateway_publish::paths_equal(&path, current) || !is_legacy_gateway_copy(&path) {
+            continue;
+        }
+        let name = entry.file_name();
+        let referenced = references.iter().any(|r| {
+            crate::gateway_publish::paths_equal(r, &path)
+                || (!r.is_absolute() && r.file_name() == path.file_name())
+        });
+        let plain = matches!(name.to_str(), Some("toolport-gateway" | "conduit-gateway"));
+        let keep = referenced || plain || is_legacy_gateway_shim(&path);
+        let result = if keep {
+            // Scripts, service units and unsupported clients may use the plain path.
+            // Keep it and known references usable without leaving 1.x code behind.
+            refresh_legacy_gateway(current, &path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => eprintln!(
+                "toolport: {} legacy gateway {}",
+                if keep {
+                    "refreshed compatibility"
+                } else {
+                    "removed unused"
+                },
+                name.to_string_lossy()
+            ),
+            Err(error) => eprintln!(
+                "toolport: could not clean legacy gateway {}: {error}",
+                name.to_string_lossy()
+            ),
+        }
+    }
 }
 
 fn repoint_stale_gateways_in(
@@ -6774,13 +7239,14 @@ fn repoint_stale_gateways_in(
         let config_text = find_def(&client.id)
             .and_then(|def| resolved_definition_path(&def).ok())
             .and_then(|path| read_config_file(&path).ok());
-        if !gateway_entry_needs_rewrite(entry_name, stored, current, config_text.as_deref()) {
+        if !gateway_entry_needs_rewrite(entry_name, stored, current, config_text.as_deref())
+            && entry
+                .env_keys
+                .iter()
+                .any(|key| key == crate::brand::CLIENT_ID || key == crate::brand::ATTRIBUTION_ID)
+        {
             continue;
         }
-        let profile = config_text
-            .as_deref()
-            .and_then(profile_from_config_text)
-            .or_else(|| read_gateway_profile(&client.id));
         let rewrite = find_def(&client.id)
             .ok_or("Unknown client".to_string())
             .and_then(|def| {
@@ -6794,12 +7260,47 @@ fn repoint_stale_gateways_in(
                             "Client gateway changed during repoint; leaving it untouched".into(),
                         );
                     }
-                    let fresh_profile = read_config_file(&path)
-                        .ok()
-                        .as_deref()
-                        .and_then(profile_from_config_text)
-                        .or_else(|| profile.clone());
-                    install_gateway(&client.id, fresh_profile.as_deref())
+                    if !gateway_entry_needs_rewrite(
+                        entry_name,
+                        stored,
+                        current,
+                        config_text.as_deref(),
+                    ) {
+                        backfill_gateway_identity(&def, &path, entry_name, &client.id)?;
+                        let mut updated =
+                            repair_gateway_entry(def.format, &path, entry_name, &client.id)?;
+                        updated.command = Some(current.to_string());
+                        let detected = read_client(&def);
+                        let server = detected
+                            .servers
+                            .iter()
+                            .find(|s| detected_is_gateway(s))
+                            .ok_or("Gateway disappeared during identity repair")?;
+                        let mut managed = managed.get(&client.id).cloned().unwrap_or_else(|| ManagedEntry::from_gateway_entry(&updated));
+                        managed.command = current.to_string();
+                        managed.args = server.args.clone();
+                        for key in &server.env_keys {
+                            managed.env.entry(key.clone()).or_default();
+                        }
+                        managed
+                            .env
+                            .insert(crate::brand::ATTRIBUTION_ID.into(), client.id.clone());
+
+                        Ok(WriteOutcome {
+                            path: path.display().to_string(),
+                            backup: None,
+                            managed: Some(managed),
+                            restored: Vec::new(),
+                            used_move_record: false,
+                            revision: None,
+                            warnings: Vec::new(),
+                            recovery_path: None,
+                        })
+                    } else {
+                        let entry =
+                            repair_gateway_entry(def.format, &path, entry_name, &client.id)?;
+                        install_or_remove(&client.id, Some(&entry))
+                    }
                 })
             });
         match rewrite {
@@ -6854,15 +7355,10 @@ fn repoint_other_claude_configs(current: &str, outcome: &mut RepointOutcome) {
     for repair in claude_configs_needing_repair(&others, current) {
         let ClaudeRepair {
             path,
-            profile,
             stored,
+            ..
         } = repair;
-        let write = mutation::run("claude-code", &path, Format::JsonMcpServers, || {
-            secondary_claude_gateway_entry(profile.as_deref()).and_then(|entry| {
-                backup_secondary_claude_file(&path)?;
-                edit_json_gateway(&path, "mcpServers", Some(&entry), true)
-            })
-        });
+        let write = repair_secondary_claude_config(&path, current);
         match write {
             Ok(()) => {
                 let msg = format!(
@@ -6884,6 +7380,32 @@ fn repoint_other_claude_configs(current: &str, outcome: &mut RepointOutcome) {
             }
         }
     }
+}
+
+fn repair_secondary_claude_config(path: &Path, current: &str) -> Result<(), String> {
+    mutation::run("claude-code", path, Format::JsonMcpServers, || {
+        // Selection happened before the mutation lock. Respect a subsequent edit.
+        let fresh = claude_configs_needing_repair(&[path.to_path_buf()], current).pop()
+            .ok_or("Secondary gateway changed before repair; leaving it untouched")?;
+        let (entry_name, _) = claude_gateway_entry_in(&read_config_file(path)?)
+            .ok_or("Secondary gateway disappeared before repair")?;
+        backup_secondary_claude_file(path)?;
+        if !gateway_entry_needs_rewrite(&entry_name, &fresh.stored, current, None) {
+            return moved::backfill_identity(
+                Format::JsonMcpServers,
+                path,
+                &entry_name,
+                "claude-code-secondary",
+            );
+        }
+        let entry = repair_gateway_entry(
+            Format::JsonMcpServers,
+            path,
+            &entry_name,
+            "claude-code-secondary",
+        )?;
+        edit_json_gateway(path, "mcpServers", Some(&entry), true)
+    })
 }
 
 /// One secondary Claude config that needs its gateway entry repaired.
@@ -6912,7 +7434,23 @@ fn claude_configs_needing_repair(paths: &[PathBuf], current: &str) -> Vec<Claude
         let Some((entry_name, stored)) = claude_gateway_entry_in(&text) else {
             continue;
         };
-        if !gateway_entry_needs_rewrite(&entry_name, &stored, current, Some(&text)) {
+        if !command_is_gateway_binary(&stored) {
+            continue;
+        }
+        if !gateway_entry_needs_rewrite(&entry_name, &stored, current, Some(&text))
+            && serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| {
+                    v["mcpServers"][&entry_name]["env"][crate::brand::CLIENT_ID]
+                        .as_str()
+                        .or_else(|| {
+                            v["mcpServers"][&entry_name]["env"][crate::brand::ATTRIBUTION_ID]
+                                .as_str()
+                        })
+                        .map(str::to_string)
+                })
+                .is_some()
+        {
             continue;
         }
         out.push(ClaudeRepair {
@@ -7457,7 +7995,7 @@ mod tests {
         let repairs = claude_configs_needing_repair(
             &[
                 stale.clone(),
-                already_current,
+                already_current.clone(),
                 customized,
                 no_gateway,
                 unparseable,
@@ -7468,13 +8006,19 @@ mod tests {
 
         assert_eq!(
             repairs,
-            vec![ClaudeRepair {
-                path: stale,
-                // Preserved per file: dropping it would silently unscope this client.
-                profile: Some("work".to_string()),
-                stored: stale_command.to_string_lossy().into_owned(),
-            }],
-            "only the config pinned to a superseded gateway of ours should be repaired"
+            vec![
+                ClaudeRepair {
+                    path: stale,
+                    profile: Some("work".to_string()),
+                    stored: stale_command.to_string_lossy().into_owned(),
+                },
+                ClaudeRepair {
+                    path: already_current,
+                    profile: None,
+                    stored: current.clone()
+                }
+            ],
+            "owned gateways repair missing identity as well as stale commands"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7689,6 +8233,233 @@ mod tests {
             launch: None,
             unknown_fields: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn legacy_cleanup_leaves_published_and_bundled_gateways_alone() {
+        let data = crate::registry::DataDirTestEnv::new("legacy-cleanup-non-linux");
+        let dir = &data.dir;
+        let current = dir.join("toolport-gateway-2.0.0.exe");
+        let cached = dir.join("toolport-gateway-1.23.0.exe");
+        let plain = dir.join("toolport-gateway.exe");
+        let old = b"MZtoolport-gateway\0TOOLPORT_CLIENT_ID\0tools/call";
+        for path in [&cached, &plain] {
+            std::fs::write(path, old).unwrap();
+        }
+        cleanup_legacy_gateway_copies(&current, dir, Some(&[]));
+        for path in [&cached, &plain] {
+            assert_eq!(std::fs::read(path).unwrap(), old);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn f6_legacy_gateway_cleanup_preserves_foreign_files_and_references() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let _env_lock = env_test_lock();
+        let root = std::env::temp_dir().join(format!("toolport-f6-home-{}", std::process::id()));
+        let _home = EnvRestore::set("HOME", &root);
+        let dir = root.join(".config/Toolport/bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = b"\x7fELFtoolport-gateway\0TOOLPORT_CLIENT_ID\0tools/call\01.19.0";
+        let current = root.join("installed with 'quotes'/toolport-gateway");
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&current, b"current gateway").unwrap();
+        let unused = dir.join("toolport-gateway");
+        let referenced = dir.join("toolport-gateway-1.19.0");
+        let foreign = dir.join("conduit-gateway");
+        let wrapper = dir.join("toolport-gateway-1.17.0");
+        for path in [&unused, &referenced] {
+            std::fs::write(path, old).unwrap();
+        }
+        std::fs::write(&foreign, b"\x7fELFforeign executable").unwrap();
+        std::fs::write(&wrapper, b"#!/bin/sh\nexec user-command\n").unwrap();
+        cleanup_legacy_gateway_copies(&current, &dir, None);
+        assert!(unused.exists());
+        cleanup_legacy_gateway_copies(&current, &dir, Some(std::slice::from_ref(&referenced)));
+        let plain_shim = std::fs::read_to_string(&unused).unwrap();
+        assert!(plain_shim.starts_with("#!/bin/sh\n# Toolport gateway compatibility shim\n"));
+        let unused_version = dir.join("toolport-gateway-1.16.0");
+        std::fs::write(&unused_version, old).unwrap();
+        cleanup_legacy_gateway_copies(&current, &dir, Some(&[]));
+        assert!(!unused_version.exists());
+        #[cfg(unix)]
+        {
+            let shim = std::fs::read_to_string(&referenced).unwrap();
+            assert!(shim.starts_with("#!/bin/sh\n# Toolport gateway compatibility shim\nexec '"));
+            assert!(shim.contains("installed with '"));
+            assert!(shim.ends_with("' \"$@\"\n"));
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&current, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+            std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                std::fs::metadata(&unused).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            let plain_output = std::process::Command::new(&unused)
+                .args(["unsupported caller", "$literal"])
+                .output()
+                .unwrap();
+            assert!(plain_output.status.success());
+            assert_eq!(plain_output.stdout, b"unsupported caller\n$literal\n");
+            let output = std::process::Command::new(&referenced)
+                .args(["one argument", "$literal"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"one argument\n$literal\n");
+            let original = std::fs::read(&referenced).unwrap();
+            cleanup_legacy_gateway_copies(&current, &dir, Some(&[]));
+            assert_eq!(std::fs::read(&referenced).unwrap(), original);
+        }
+        #[cfg(not(unix))]
+        assert_eq!(std::fs::read(&referenced).unwrap(), b"current gateway");
+        assert_eq!(
+            std::fs::read(&foreign).unwrap(),
+            b"\x7fELFforeign executable"
+        );
+        assert_eq!(
+            std::fs::read(&wrapper).unwrap(),
+            b"#!/bin/sh\nexec user-command\n"
+        );
+        // The installed/stable destination and symlinks are never removed.
+        std::fs::write(&unused, old).unwrap();
+        cleanup_legacy_gateway_copies(&unused, &dir, Some(&[]));
+        assert!(unused.exists());
+        #[cfg(unix)]
+        {
+            let link = dir.join("toolport-gateway-1.18.0");
+            std::os::unix::fs::symlink(&unused, &link).unwrap();
+            cleanup_legacy_gateway_copies(&unused, &dir, Some(&[]));
+            assert!(std::fs::symlink_metadata(link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn legacy_gateway_shims_follow_install_moves_and_are_idempotent() {
+        use std::os::unix::fs::MetadataExt;
+        let root = crate::registry::DataDirTestEnv::new("legacy-shim-move");
+        let dir = root.dir.join("bin");
+        std::fs::create_dir(&dir).unwrap();
+        let first = root.dir.join("old install/toolport-gateway");
+        let second = root.dir.join("new 'install'/toolport-gateway");
+        for current in [&first, &second] {
+            std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+            std::fs::write(current, "#!/bin/sh\nprintf '%s\n' \"$@\"\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(current, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plain = dir.join("toolport-gateway");
+        let versioned = dir.join("toolport-gateway-1.23.0");
+        let old = b"\x7fELFtoolport-gateway\0TOOLPORT_CLIENT_ID\0tools/call";
+        for path in [&plain, &versioned] {
+            std::fs::write(path, old).unwrap();
+        }
+        cleanup_legacy_gateway_copies(&first, &dir, Some(std::slice::from_ref(&versioned)));
+        let before = std::fs::read(&plain).unwrap();
+        cleanup_legacy_gateway_copies(&second, &dir, None);
+        assert_eq!(std::fs::read(&plain).unwrap(), before);
+        cleanup_legacy_gateway_copies(&second, &dir, Some(&[]));
+        for path in [&plain, &versioned] {
+            let output = std::process::Command::new(path)
+                .arg("still works")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"still works\n");
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(text.contains("new '"));
+            assert_ne!(text.as_bytes(), before);
+            let inode = std::fs::metadata(path).unwrap().ino();
+            cleanup_legacy_gateway_copies(&second, &dir, Some(&[]));
+            assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
+        }
+    }
+
+    #[test]
+    fn activity_names_load_one_registry_snapshot_for_the_whole_pass() {
+        let entries = vec![serde_json::json!({"client":"client:real"}); 1000];
+        let mut loads = 0;
+        let names = CallerNames::for_entries_with(&entries, || {
+            loads += 1;
+            let mut registry = crate::registry::Registry::default();
+            registry.http_clients.push(crate::registry::HttpClient {
+                id: "real".into(),
+                label: "My assistant".into(),
+                token_sha256: "unused".into(),
+                profile: String::new(),
+                unknown_fields: Default::default(),
+            });
+            Some(registry)
+        });
+        for entry in entries {
+            assert_eq!(
+                names.trusted_name(entry["client"].as_str(), None),
+                "My assistant"
+            );
+            assert_eq!(
+                names.trusted_name(Some("adapter:claude-code"), None),
+                "Claude Code"
+            );
+            assert_eq!(names.trusted_name(Some("adapter:inbox"), None), "inbox");
+            assert_eq!(
+                names.trusted_name(Some("client:real"), Some("Recorded name")),
+                "Recorded name"
+            );
+        }
+        assert_eq!(loads, 1);
+        let _ = CallerNames::for_entries_with(
+            &[serde_json::json!({
+                "client":"client:real", "clientName":"Recorded name"
+            })],
+            || panic!("recorded friendly names must not load the registry"),
+        );
+        let _ =
+            CallerNames::for_entries_with(&[serde_json::json!({"client":"adapter:inbox"})], || {
+                panic!("adapter rows must not load the registry")
+            });
+    }
+
+    #[test]
+    fn f6_configured_names_are_display_only_and_private() {
+        assert_eq!(trusted_client_name(Some("adapter:inbox"), None), "inbox");
+        // Preview.6 recorded a process guess; the configured client ID wins.
+        assert_eq!(
+            trusted_client_name(Some("adapter:inbox"), Some("Unknown app (via python3.14)")),
+            "inbox"
+        );
+        assert_eq!(
+            trusted_client_name(None, Some("Unknown app (via python3.14)")),
+            "Unknown app (via python3.14)"
+        );
+        assert!(label_only_adds_version("inbox", "inbox 1"));
+        assert!(label_only_adds_version("Claude Code", "claude code 2.1"));
+        assert!(!label_only_adds_version("Codex", "codex-mcp-client 0.162.1"));
+        assert!(!label_only_adds_version("inbox", "inbox but not really"));
+        assert_eq!(
+            trusted_client_name(Some("adapter:/private/customer.env"), None),
+            "[private]"
+        );
+        assert_eq!(
+            trusted_client_name(Some("adapter:sk-live-abcdefghijk123456789"), None),
+            "[redacted]"
+        );
+        assert_eq!(
+            display_caller_name(Some("Unknown client"), Some("inbox 1")),
+            "inbox 1 (reported)"
+        );
+        assert_eq!(display_caller_name(None, None), "Unrecorded client");
+        let reg = crate::registry::Registry::default();
+        assert_eq!(
+            resolve_launch_profile(&reg, Some("inbox"), &None),
+            resolve_launch_profile(&reg, None, &None)
+        );
     }
 
     #[test]
@@ -9249,6 +10020,12 @@ bad = "not-a-table"
             current,
             Some(r#"{"env":{"TOOLPORT_CLIENT_ID":"claude-code"}}"#)
         ));
+        assert!(!gateway_entry_needs_rewrite(
+            GATEWAY_ENTRY_NAME,
+            current,
+            current,
+            Some(r#"{"env":{"CONDUIT_CLIENT_ID":"claude-code","TOOLPORT_ATTRIBUTION_ID":"claude-code"}}"#)
+        ));
 
         // Installing over a config whose only gateway entry is the legacy name renames
         // it in place: the entry is retained-out by identity and re-inserted under the
@@ -9472,21 +10249,285 @@ command = "npx"
     }
 
     #[test]
-    fn secondary_claude_repair_keeps_profile_without_primary_client_id() {
-        let entry = secondary_claude_gateway_entry(Some("work")).unwrap();
-        let env: std::collections::HashMap<_, _> = entry
-            .env
-            .iter()
-            .map(|e| (e.key.clone(), e.value.clone()))
-            .collect();
+    fn secondary_identity_repair_preserves_fields_and_rechecks_ownership() {
+        let data = crate::registry::DataDirTestEnv::new("f3-secondary-ownership");
+        let current = data.dir.join(if cfg!(windows) { "toolport-gateway.exe" } else { "toolport-gateway" });
+        std::fs::write(&current, "fixture").unwrap();
+        let current = current.to_str().unwrap();
+        let path = data.dir.join("secondary.json");
+        let raw = serde_json::json!({"mcpServers":{"toolport":{"command":current,"args":["--private"],"env":{"TOOLPORT_PROFILE":"work","KEEP":"fixture"},"unknown":42}}});
+        std::fs::write(&path, raw.to_string()).unwrap();
         assert_eq!(
-            env.get(crate::brand::PROFILE).unwrap().as_deref(),
-            Some("work")
+            claude_configs_needing_repair(&[path.clone()], current).len(),
+            1
         );
-        assert!(
-            !env.contains_key(crate::brand::CLIENT_ID),
-            "a secondary config must fall through to its own frozen profile"
+        repair_secondary_claude_config(&path, current).unwrap();
+        let mut after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after["mcpServers"]["toolport"]["env"][crate::brand::ATTRIBUTION_ID],
+            "claude-code-secondary"
         );
+        after["mcpServers"]["toolport"]["env"]
+            .as_object_mut()
+            .unwrap()
+            .remove(crate::brand::ATTRIBUTION_ID);
+        assert_eq!(after, raw);
+        std::fs::write(&path, raw.to_string()).unwrap();
+        assert_eq!(claude_configs_needing_repair(&[path.clone()], current).len(), 1);
+        let custom = r#"{"mcpServers":{"toolport":{"command":"manual-wrapper","env":{"KEEP":"fixture"}}}}"#;
+        std::fs::write(&path, custom).unwrap();
+        assert!(repair_secondary_claude_config(&path, current).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
+    }
+
+    #[test]
+    fn secondary_legacy_name_repair_preserves_scope_identity() {
+        let data = crate::registry::DataDirTestEnv::new("f3-secondary-legacy-scope");
+        let current = data.dir.join("toolport-gateway");
+        std::fs::write(&current, "fixture").unwrap();
+        let path = data.dir.join("secondary.json");
+        for command in [current.clone(), data.dir.join("conduit-gateway")] {
+            let raw = serde_json::json!({"mcpServers":{"conduit":{"command":command,"env":{"TOOLPORT_PROFILE":"narrow","CONDUIT_CLIENT_ID":"existing"}}}});
+            std::fs::write(&path, raw.to_string()).unwrap();
+            repair_secondary_claude_config(&path, current.to_str().unwrap()).unwrap();
+            let after: serde_json::Value =
+                serde_json::from_str(&read_config_file(&path).unwrap()).unwrap();
+            let env = &after["mcpServers"][GATEWAY_ENTRY_NAME]["env"];
+            assert_eq!(env[crate::brand::PROFILE], "narrow");
+            assert_eq!(env[crate::brand::CLIENT_ID_LEGACY], "existing");
+            assert!(env.get(crate::brand::CLIENT_ID).is_none());
+            assert_eq!(env[crate::brand::ATTRIBUTION_ID], "claude-code-secondary");
+        }
+    }
+
+    #[test]
+    fn stale_repair_preserves_scope_environment_over_inherited_values() {
+        let data = crate::registry::DataDirTestEnv::new("f3-inherited-scope");
+        let path = data.dir.join("client.json");
+        for env in [
+            serde_json::json!({"TOOLPORT_CLIENT_ID":"", "TOOLPORT_PROFILE":"narrow"}),
+            serde_json::json!({"CONDUIT_CLIENT_ID":"legacy", "TOOLPORT_PROFILE":"narrow"}),
+            serde_json::json!({"TOOLPORT_PROFILE":"", "CONDUIT_PROFILE":""}),
+        ] {
+            let raw = serde_json::json!({"mcpServers":{"toolport":{"command":"conduit-gateway", "env":env}}});
+            std::fs::write(&path, raw.to_string()).unwrap();
+            let repaired = repair_gateway_entry(
+                Format::JsonMcpServers,
+                &path,
+                GATEWAY_ENTRY_NAME,
+                "claude-code",
+            )
+            .unwrap();
+            let after: std::collections::HashMap<_, _> = repaired
+                .env
+                .iter()
+                .map(|item| (item.key.as_str(), item.value.as_deref().unwrap_or("")))
+                .collect();
+            // Explicit empty values mask inherited values. Legacy values must
+            // keep their precedence relative to inherited modern values.
+            let resolve = |lookup: &dyn Fn(&str) -> Option<String>| {
+                [
+                    crate::brand::CLIENT_ID,
+                    crate::brand::CLIENT_ID_LEGACY,
+                    crate::brand::PROFILE,
+                    crate::brand::PROFILE_LEGACY,
+                ]
+                .chunks(2)
+                .map(|keys| {
+                    keys.iter()
+                        .find_map(|key| lookup(key).filter(|value| !value.trim().is_empty()))
+                })
+                .collect::<Vec<_>>()
+            };
+            let inherited = |key: &str| match key {
+                crate::brand::CLIENT_ID => Some("wide-client".to_string()),
+                crate::brand::PROFILE => Some("wide-profile".to_string()),
+                _ => None,
+            };
+            let before = resolve(&|key| {
+                env.get(key)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| inherited(key))
+            });
+            let after = resolve(&|key| {
+                after
+                    .get(key)
+                    .map(|v| (*v).to_string())
+                    .or_else(|| inherited(key))
+            });
+            assert_eq!(before, after, "scope environment changed: {env}");
+        }
+    }
+
+    #[test]
+    fn every_adapter_identity_repair_preserves_effective_tools() {
+        let data = crate::registry::DataDirTestEnv::new("f3-all-adapter-scope");
+        let mut reg: crate::registry::Registry = serde_json::from_value(serde_json::json!({
+            "version":2,
+            "servers":[{"id":"public","name":"Public","command":"fixture","transport":"stdio"},
+                       {"id":"sensitive","name":"Sensitive","command":"fixture","transport":"stdio"}],
+            "profiles":[{"id":"narrow","name":"Narrow","enabledServerIds":["public"],"toolScope":{"public":["echo"]}},
+                        {"id":"wide","name":"Wide","enabledServerIds":["public","sensitive"]}]
+        })).unwrap();
+        for def in defs() {
+            reg.client_scopes.insert(def.id.into(), "wide".into());
+            for (scope_key, scope_id, profile, inherit_id) in [
+                (crate::brand::CLIENT_ID, None, Some("narrow"), false),
+                (crate::brand::CLIENT_ID, None, None, false),
+                (
+                    crate::brand::CLIENT_ID_LEGACY,
+                    Some("legacy"),
+                    Some("narrow"),
+                    false,
+                ),
+                (
+                    crate::brand::CLIENT_ID,
+                    Some("existing"),
+                    Some("narrow"),
+                    false,
+                ),
+                (crate::brand::CLIENT_ID, Some(""), Some("narrow"), true),
+                (
+                    crate::brand::CLIENT_ID_LEGACY,
+                    Some("legacy"),
+                    Some("narrow"),
+                    true,
+                ),
+            ] {
+                reg.client_scopes.insert("legacy".into(), "narrow".into());
+                reg.client_scopes.insert("existing".into(), "narrow".into());
+                let path = data.dir.join("adapter-config");
+                std::fs::remove_file(&path).ok();
+                let mut entry = sample_gateway(profile, def.id);
+                entry.env.retain(|env| env.key != crate::brand::CLIENT_ID);
+                if let Some(id) = scope_id {
+                    entry.env.push(EnvVar {
+                        key: scope_key.into(),
+                        value: Some(id.into()),
+                        secret: false,
+                        unknown_fields: Default::default(),
+                    });
+                }
+                edit_format(def.format, &path, Some(&entry), true).unwrap();
+                let read_env = || {
+                    let text = read_config_file(&path).unwrap();
+                    let value = mutation::value(def.format, Some(&text)).unwrap();
+                    let container = moved::server_container(def.format, &value);
+                    let entry = if matches!(def.format, Format::YamlMcpServersList) {
+                        &container[0]
+                    } else {
+                        &container[GATEWAY_ENTRY_NAME]
+                    };
+                    let key = match def.format {
+                        Format::YamlExtensions => "envs",
+                        Format::JsonOpenCodeMcp => "environment",
+                        _ => "env",
+                    };
+                    entry[key].as_object().cloned().unwrap_or_default()
+                };
+                let effective_launch = |env: &serde_json::Map<String, serde_json::Value>| {
+                    let id = [crate::brand::CLIENT_ID, crate::brand::CLIENT_ID_LEGACY]
+                        .into_iter()
+                        .find_map(|key| {
+                            env.get(key)
+                                .and_then(|v| v.as_str())
+                                .or_else(|| {
+                                    (inherit_id && key == crate::brand::CLIENT_ID).then_some(def.id)
+                                })
+                                .filter(|s| !s.trim().is_empty())
+                        });
+                    let profile = env
+                        .get(crate::brand::PROFILE)
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let profile = resolve_launch_profile(&reg, id, &profile).unwrap();
+                    let mut tools: Vec<_> = reg
+                        .enabled_servers_for(&profile)
+                        .iter()
+                        .flat_map(|server| {
+                            let allowlist = reg
+                                .access_profile(&profile)
+                                .and_then(|p| p.tool_scope.get(&server.id));
+                            ["echo", "add"]
+                                .into_iter()
+                                .filter(move |tool| {
+                                    allowlist.is_none_or(|list| list.iter().any(|t| t == tool))
+                                })
+                                .map(move |tool| format!("{}__{tool}", server.id))
+                        })
+                        .collect();
+                    tools.sort();
+                    (profile, tools)
+                };
+                let before = read_env();
+                backfill_gateway_identity(&def, &path, GATEWAY_ENTRY_NAME, def.id).unwrap();
+                let after = read_env();
+                assert_eq!(
+                    effective_launch(&before),
+                    effective_launch(&after),
+                    "{} scope changed",
+                    def.id
+                );
+                for key in [
+                    crate::brand::CLIENT_ID,
+                    crate::brand::CLIENT_ID_LEGACY,
+                    crate::brand::PROFILE,
+                    crate::brand::PROFILE_LEGACY,
+                ] {
+                    assert_eq!(before.get(key), after.get(key), "{} {key} changed", def.id);
+                }
+                let repaired =
+                    repair_gateway_entry(def.format, &path, GATEWAY_ENTRY_NAME, def.id).unwrap();
+                edit_format(def.format, &path, Some(&repaired), true).unwrap();
+                assert_eq!(
+                    effective_launch(&before),
+                    effective_launch(&read_env()),
+                    "{} command repair scope changed",
+                    def.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn identity_backfill_rejects_malformed_environment_without_mutation() {
+        let data = crate::registry::DataDirTestEnv::new("f3-invalid-env");
+        let path = data.dir.join("config.toml");
+        let text = "[mcp_servers.toolport]\ncommand = \"toolport-gateway\"\nenv = \"invalid\"\n";
+        std::fs::write(&path, text).unwrap();
+        assert!(moved::backfill_identity(Format::TomlMcpServers, &path, "toolport", "codex").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn identity_backfill_preserves_raw_entry_fields_across_formats() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-identity-backfill-{}",
+            crate::approval::new_correlation_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        for (format, text) in [
+            (Format::JsonMcpServers, r#"{"mcpServers":{"toolport":{"command":"toolport-gateway","args":["--private"],"env":{"TOOLPORT_PROFILE":"work","KEEP":"fixture"},"unknown":42},"custom":{"command":"wrapper"}}}"#),
+            (Format::TomlMcpServers, "[mcp_servers.toolport]\ncommand = \"toolport-gateway\"\nargs = [\"--private\"]\nunknown = 42\n[mcp_servers.toolport.env]\nTOOLPORT_PROFILE = \"work\"\nKEEP = \"fixture\"\n"),
+            (Format::JsonOpenCodeMcp, r#"{"mcp":{"toolport":{"type":"local","command":["toolport-gateway","--private"],"environment":{"TOOLPORT_PROFILE":"work","KEEP":"fixture"},"unknown":42}}}"#),
+            (Format::YamlMcpServers, "mcp_servers:\n  toolport:\n    command: toolport-gateway\n    args: [--private]\n    unknown: 42\n    env:\n      TOOLPORT_PROFILE: work\n      KEEP: fixture\n"),
+        ] {
+            let path = dir.join("client-config"); std::fs::write(&path, text).unwrap();
+            let before = mutation::value(format, Some(text)).unwrap();
+            moved::backfill_identity(format, &path, "toolport", "cursor").unwrap();
+            let output = std::fs::read_to_string(&path).unwrap();
+            let mut after = mutation::value(format, Some(&output)).unwrap();
+            let container = if matches!(format, Format::TomlMcpServers | Format::YamlMcpServers) { "mcp_servers" } else if matches!(format, Format::JsonOpenCodeMcp) { "mcp" } else { "mcpServers" };
+            let env = if matches!(format, Format::JsonOpenCodeMcp) { "environment" } else { "env" };
+            assert_eq!(after[container]["toolport"][env][crate::brand::ATTRIBUTION_ID], "cursor");
+            after[container]["toolport"][env].as_object_mut().unwrap().remove(crate::brand::ATTRIBUTION_ID);
+            assert_eq!(before, after, "only identity may change");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     // Informational (no assert): prints what the Cursor plugin scanner finds on
@@ -10650,6 +11691,7 @@ command = "npx"
             "witsy",
             "junie",
             "devin-cli",
+            "command-code",
         ] {
             let d = defs()
                 .into_iter()
@@ -10791,6 +11833,21 @@ command = "npx"
         assert!(matches!(definition.format, Format::JsonKimiMcpServers));
         assert!(!definition.uses_connectors);
         assert!((definition.path)().is_some());
+    }
+
+    #[test]
+    fn command_code_paths_are_under_its_home_dir() {
+        for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
+            let home = mock_home(platform);
+            assert_eq!(
+                resolve_client_config_path("command-code", &home, platform),
+                Some(home.join(".commandcode").join("mcp.json")),
+                "command-code MCP path on {platform:?}"
+            );
+            let rules = team_rules_target("command-code", &home, platform).expect("supported");
+            assert_eq!(rules.path, home.join(".commandcode").join("AGENTS.md"));
+            assert_eq!(rules.strategy, crate::instructions::Strategy::SentinelBlock);
+        }
     }
 
     #[test]

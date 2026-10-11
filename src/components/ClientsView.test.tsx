@@ -1,8 +1,11 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DetectedClient } from "@/lib/types";
 import { ClientsView } from "./ClientsView";
+import { getClientSessions } from "@/lib/api";
+vi.mock("@/lib/api", () => ({ getClientSessions: vi.fn() }));
+beforeEach(() => vi.mocked(getClientSessions).mockResolvedValue([]));
 
 function client(overrides: Partial<DetectedClient> = {}): DetectedClient {
   return {
@@ -22,6 +25,47 @@ function client(overrides: Partial<DetectedClient> = {}): DetectedClient {
 }
 
 describe("ClientsView", () => {
+  it("keeps observed identity ahead of the self-reported label without config actions", async () => {
+    vi.mocked(getClientSessions).mockResolvedValueOnce([
+      {
+        sessionId: "opaque",
+        clientName: "Unknown app (via Cursor)",
+        clientLabel: "kt 1",
+        clientType: "unknown",
+        gatewayVersion: "2",
+        phase: "close",
+        reason: "client_disconnect",
+        transport: "stdio",
+        toolsListCount: 3,
+        listChangedCount: 1,
+        firstCatalogSize: 4,
+        firstCatalogRevision: 1,
+        catalogRevision: 2,
+        contentChanged: true,
+      },
+    ]);
+    render(<ClientsView clients={[]} registry={null} onSelectClient={vi.fn()} />);
+    const toggle = await screen.findByRole("button", { name: /Recent client activity/ });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Unknown app (via Cursor)")).not.toBeInTheDocument();
+    await userEvent.click(toggle);
+    const heading = screen.getByText("Unknown app (via Cursor)");
+    expect(heading).toHaveAttribute(
+      "title",
+      expect.stringContaining("Reports itself as: kt 1"),
+    );
+    expect(screen.getByText(/Last active time unavailable/)).toHaveTextContent(
+      "Last saw 4 tools",
+    );
+    expect(screen.queryByText(/tool lists/)).not.toBeInTheDocument();
+  });
+  it("reports session history read failures", async () => {
+    vi.mocked(getClientSessions).mockRejectedValueOnce(new Error("failed"));
+    render(<ClientsView clients={[]} registry={null} onSelectClient={vi.fn()} />);
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Client session history could not be read.",
+    );
+  });
   it("groups connected clients before clients available to connect", () => {
     render(
       <ClientsView

@@ -1,4 +1,4 @@
-import { activityClientName } from "@/lib/clientIdentity";
+import { activityClientName, clientIdentityTooltip } from "@/lib/clientIdentity";
 import { useWindowVisible } from "@/lib/windowVisible";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -69,6 +69,12 @@ import {
 
 /** A badge describing one security event by kind. */
 function eventBadge(e: SecurityEvent): { label: string; cls: string } {
+  if (e.type === "sync_change_refused") {
+    return {
+      label: "synced change blocked",
+      cls: "bg-destructive/15 text-destructive",
+    };
+  }
   if (e.type === "result_injection_blocked") {
     return {
       label: "injection blocked",
@@ -263,8 +269,9 @@ function SecurityResting() {
     <div className="mb-4 flex items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-2.5 text-xs text-muted-foreground">
       <ShieldCheck className="size-4 shrink-0 text-owned" />
       <span>
-        <span className="font-medium text-foreground">Protection active.</span> Toolport
-        is watching tool definitions and results. Nothing needs your attention right now.
+        <span className="block font-semibold text-foreground">Protection active.</span>{" "}
+        Toolport is watching tool definitions and results. Nothing needs your attention
+        right now.
       </span>
     </div>
   );
@@ -297,11 +304,11 @@ function SecurityLoadNotice({
   return (
     <div
       role="alert"
-      className="mb-4 flex items-center gap-3 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs"
+      className="mb-4 flex items-center gap-3 toolport-alert border-warning bg-warning/8 px-4 py-2.5 text-xs"
     >
       <AlertTriangle className="size-4 shrink-0 text-warning" />
       <span className="text-muted-foreground">
-        <span className="font-medium text-foreground">
+        <span className="block font-semibold text-foreground">
           {stale
             ? "Security status may be out of date."
             : "Couldn't verify protection status."}
@@ -326,11 +333,13 @@ function AuditStaleNotice({ onRetry }: { onRetry: () => void }) {
   return (
     <div
       role="alert"
-      className="mb-4 flex items-center gap-3 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs"
+      className="mb-4 flex items-center gap-3 toolport-alert border-warning bg-warning/8 px-4 py-2.5 text-xs"
     >
       <AlertTriangle className="size-4 shrink-0 text-warning" />
       <span className="text-muted-foreground">
-        <span className="font-medium text-foreground">Activity may be out of date.</span>{" "}
+        <span className="block font-semibold text-foreground">
+          Activity may be out of date.
+        </span>{" "}
         Showing the last calls Toolport read successfully; the latest refresh failed.
       </span>
       <button
@@ -361,7 +370,7 @@ function SecurityNotices({
   // One row per finding, newest first, with a recurrence count. See collapseByIdentity.
   const collapsed = collapseByIdentity(events);
   return (
-    <div className="mb-4 rounded-lg border border-warning/40 bg-warning/5 p-4">
+    <div className="mb-4 toolport-alert border-warning bg-warning/8 p-4">
       <button
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
@@ -424,6 +433,11 @@ function SecurityNotices({
                       <X className="size-3.5" />
                     </button>
                   </div>
+                  {e.detail && (
+                    <p className="ml-1 max-w-2xl text-[11px] leading-relaxed break-words text-muted-foreground">
+                      {e.detail}
+                    </p>
+                  )}
                   {e.evidence && (
                     <p className="ml-1 max-w-2xl border-l-2 border-warning/40 pl-2 font-mono text-[11px] leading-relaxed break-words text-muted-foreground">
                       <span className="mr-1 select-none font-sans text-muted-foreground/70">
@@ -517,28 +531,18 @@ function QuietDriftHistory({
 
 /** Catalog exposure: exact serialized bytes with a provider-independent estimate. */
 function SavingsBanner({ savings }: { savings: SavingsSummary }) {
-  const hasCatalog = savings.listLoads > 0;
+  const hasCatalog = (savings.tokenizedLoads ?? 0) > 0;
   const measured = (savings.measuredLoads ?? 0) > 0;
   const discovered = (savings.discoveryCount ?? 0) > 0;
   const avoided = savings.avoidedSurfaceBytes ?? 0;
   const legacy = savings.legacyEstimatedTokensAvoided ?? 0;
   const oldV2 = savings.estimatedTokensAvoided ?? 0;
   const method =
-    "cl100k_base tokenizer; net of discovery responses and extra catalog exposure; counted once per session and scoped full/exposed catalog hash (sessionless HTTP: per listener/client). Historical estimates excluded. Client transformations and caching mean this is not model billing.";
+    "Tool descriptions are counted locally once per client session and catalog version, minus search results and any extra descriptions loaded. Older estimates are excluded; this is not a billing figure.";
   const since = savings.sinceTs > 0 ? fmtTs(savings.sinceTs, "monthDay") : null;
-  const details = [
-    (savings.tokenizedLoads ?? 0) > 0
-      ? `${savings.tokenizedLoads!.toLocaleString()} counted catalog exposure${savings.tokenizedLoads === 1 ? "" : "s"}`
-      : null,
-    hasCatalog && savings.peakCatalog > 4
-      ? `peak catalog ${savings.peakCatalog.toLocaleString()} tools`
-      : null,
-    since ? `since ${since}` : null,
-  ].filter(Boolean);
-
   const share = async () => {
     const text = hasCatalog
-      ? `Toolport recorded ${fmtTokens(savings.tokensSaved)} tokens saved, net of discovery responses. Counted with cl100k_base once per session and catalog hash, not model billing. toolport.app`
+      ? `Toolport counted ${fmtTokens(savings.tokensSaved)} catalog tokens avoided. Estimated locally; not a billing figure. toolport.app`
       : `Toolport recorded ${savings.discoveryCount ?? 0} discovery searches returning ${fmtBytes(savings.discoveryResponseBytes ?? 0)} of text at its MCP boundary. toolport.app`;
     try {
       await navigator.clipboard.writeText(text);
@@ -549,13 +553,11 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
   };
 
   return (
-    <div className="mb-6 rounded-lg border border-success/30 bg-success/[0.06] p-4">
+    <div className="mb-6 toolport-alert border-success bg-success/8 p-4">
       <div className="flex items-center gap-2">
         <Sparkles className="size-4 text-success" />
         <span className="text-sm font-medium text-muted-foreground">
-          {hasCatalog
-            ? "Tool definitions kept out of your agent's context"
-            : "Discovery payload returned"}
+          {hasCatalog ? "Catalog text avoided" : "Discovery payload returned"}
         </span>
       </div>
       <div className="mt-2 flex flex-wrap items-end gap-x-6 gap-y-1">
@@ -568,28 +570,11 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
           </span>
         </span>
       </div>
-      {(savings.latestCatalogTs ?? 0) > 0 && (
-        <div className="mt-2 text-sm text-muted-foreground">
-          Latest load: {fmtBytes(savings.latestFullSurfaceBytes ?? 0)} /{" "}
-          {(savings.latestFullToolCount ?? 0).toLocaleString()} tools full
-          {" → "}
-          {fmtBytes(savings.latestExposedSurfaceBytes ?? 0)} /{" "}
-          {(savings.latestExposedToolCount ?? 0).toLocaleString()} tools exposed
-        </div>
-      )}
-      {measured && (
-        <div
-          className="mt-2 text-sm text-muted-foreground"
-          title={`${avoided.toLocaleString()} exact UTF-8 bytes avoided`}
-        >
-          {fmtBytes(savings.fullSurfaceBytes ?? 0)} full ·{" "}
-          {fmtBytes(savings.exposedSurfaceBytes ?? 0)} exposed · {fmtBytes(avoided)}{" "}
-          avoided across measured loads
-          {` · ${fmtBytes(Math.round((savings.fullSurfaceBytes ?? 0) / (savings.measuredLoads ?? 1)))} full/load`}
-          {(savings.extraExposedSurfaceBytes ?? 0) > 0 &&
-            ` · ${fmtBytes(savings.extraExposedSurfaceBytes ?? 0)} extra exposure on small catalogs`}
-        </div>
-      )}
+      <p className="mt-2 text-xs text-muted-foreground">
+        {hasCatalog
+          ? "Tool descriptions your AI clients didn't have to load. Estimated locally; not a billing figure."
+          : "Text returned by tool searches, measured on this computer."}
+      </p>
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <button
           onClick={share}
@@ -598,22 +583,50 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
           <Share2 className="size-3.5" /> Share
         </button>
       </div>
-      <p className="mt-2.5 text-xs text-muted-foreground">
-        {details.length > 0 ? `${details.join(" · ")}. ` : ""}
-        {measured
-          ? `${(savings.measuredLoads ?? 0).toLocaleString()} measured load${savings.measuredLoads === 1 ? "" : "s"}. `
-          : ""}
-        {discovered
-          ? `${(savings.discoveryCount ?? 0).toLocaleString()} searches returned ${fmtBytes(savings.discoveryResponseBytes ?? 0)} of discovery text. `
-          : ""}
-        {legacy > 0
-          ? `Historical: ≈${fmtTokens(legacy)} from older estimated records, excluded. `
-          : ""}
-        {oldV2 > 0
-          ? `Historical bytes/4: ≈${fmtTokens(oldV2)} estimated tokens, excluded. `
-          : ""}
-        <span title={method}>Counting method</span>
-      </p>
+      <details className="mt-3 text-xs text-muted-foreground">
+        <summary className="cursor-pointer">How this is counted</summary>
+        <div className="mt-2 space-y-2">
+          <p>{method}</p>
+          <p>
+            {savings.tokenizedLoads ?? 0} catalog loads counted
+            {since ? ` since ${since}` : ""}; largest catalog:{" "}
+            {savings.peakCatalog.toLocaleString()} tools.
+          </p>
+          {measured && (
+            <p>
+              {fmtBytes(savings.fullSurfaceBytes ?? 0)} of tool descriptions available,{" "}
+              {fmtBytes(savings.exposedSurfaceBytes ?? 0)} loaded, {fmtBytes(avoided)}{" "}
+              avoided across {savings.measuredLoads} measured loads.
+            </p>
+          )}
+          {(savings.latestCatalogTs ?? 0) > 0 && (
+            <p>
+              Latest load: {savings.latestFullToolCount} tools available (
+              {fmtBytes(savings.latestFullSurfaceBytes ?? 0)}),{" "}
+              {savings.latestExposedToolCount} loaded (
+              {fmtBytes(savings.latestExposedSurfaceBytes ?? 0)}).
+            </p>
+          )}
+          {(savings.extraExposedSurfaceBytes ?? 0) > 0 && (
+            <p>
+              {fmtBytes(savings.extraExposedSurfaceBytes ?? 0)} of extra descriptions
+              loaded for small catalogs.
+            </p>
+          )}
+          {discovered && (
+            <p>
+              {savings.discoveryCount} searches returned{" "}
+              {fmtBytes(savings.discoveryResponseBytes ?? 0)} of text.
+            </p>
+          )}
+          {(legacy > 0 || oldV2 > 0) && (
+            <p>
+              Older estimated records ({fmtTokens(legacy)} and {fmtTokens(oldV2)} tokens)
+              are excluded.
+            </p>
+          )}
+        </div>
+      </details>
     </div>
   );
 }
@@ -734,10 +747,10 @@ function PiiBadge({ entry }: { entry: AuditEntry }) {
     return (
       <span
         className="flex shrink-0 items-center gap-1 rounded bg-warning/15 px-1.5 py-0.5 text-[10px] text-warning"
-        title={`${replaced} value${replaced === 1 ? "" : "s"} pseudonymized, but the pass did not fully apply — some values reached the model in the clear (the session map was full, or the result exceeded the scan cap).`}
+        title={`${replaced} value${replaced === 1 ? "" : "s"} masked, but the pass did not fully apply: some values reached the model in the clear (the session map was full, or the result exceeded the scan cap).`}
       >
         <ShieldAlert aria-hidden="true" className="size-3" />
-        {replaced} pseudonymized, incomplete
+        {replaced} {replaced === 1 ? "value" : "values"} masked, incomplete
       </span>
     );
   }
@@ -745,11 +758,24 @@ function PiiBadge({ entry }: { entry: AuditEntry }) {
   return (
     <span
       className="flex shrink-0 items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
-      title={`${replaced} value${replaced === 1 ? "" : "s"} in this result were replaced with pseudonyms before the model saw them. The values themselves are never logged.`}
+      title="Personal values in this result were replaced before reaching the model. The values themselves are never logged."
     >
       <ShieldCheck aria-hidden="true" className="size-3" />
-      {replaced} pseudonymized
+      {replaced} {replaced === 1 ? "value" : "values"} masked
     </span>
+  );
+}
+
+function internalActivityLabel(tool: string): string {
+  return (
+    (
+      {
+        search: "Searched tools",
+        describe: "Looked up a tool",
+        status: "Checked Toolport status",
+        fetch: "Retrieved a tool result",
+      } as Record<string, string>
+    )[tool] ?? "Used Toolport"
   );
 }
 
@@ -760,18 +786,28 @@ function CallRow({ e }: { e: AuditEntry }) {
       ? (APPROVAL_OUTCOME[e.decision ?? ""] ?? UNKNOWN_APPROVAL)
       : null;
   const RowIcon =
-    approvalOutcome?.Icon ?? (e.held ? ShieldAlert : e.ok ? CheckCircle2 : XCircle);
+    approvalOutcome?.Icon ??
+    (e.kind === "internal"
+      ? Clock
+      : e.held
+        ? ShieldAlert
+        : e.ok
+          ? CheckCircle2
+          : XCircle);
   const duration = approvalOutcome ? e.heldMs : e.durationMs;
   const meta = [
     activityClientName(e),
     fmtAgo(e.ts),
+    ...(e.failureKind ? [e.failureKind.replace(/_/g, " ")] : []),
     ...(duration == null
       ? []
       : [approvalOutcome ? `waited ${fmtMs(duration)}` : fmtMs(duration)]),
   ].join(" · ");
-  const hasDetail = !approvalOutcome && !e.ok && !!e.error;
+  const hasDetail = !approvalOutcome && !e.ok && (!!e.error || !!e.runId);
   return (
-    <div className="rounded-md border border-border/50 text-sm">
+    <div
+      className={`border-b border-border text-sm ${e.kind === "internal" ? "bg-muted/30" : ""}`}
+    >
       <div
         className={`flex items-center gap-3 rounded-md px-3 py-2 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none ${
           hasDetail ? "cursor-pointer hover:bg-muted/30" : ""
@@ -802,18 +838,33 @@ function CallRow({ e }: { e: AuditEntry }) {
           <span className="inline-block size-3.5 shrink-0" />
         )}
         <RowIcon
-          className={`size-4 shrink-0 ${approvalOutcome?.iconClass ?? (e.held ? "text-warning" : e.ok ? "text-success" : "text-destructive")}`}
+          className={`size-4 shrink-0 ${approvalOutcome?.iconClass ?? (e.kind === "internal" && e.ok ? "text-muted-foreground" : e.held ? "text-warning" : e.ok ? "text-success" : "text-destructive")}`}
         />
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 items-center gap-2">
-            <span className="min-w-0 truncate font-medium">{e.server}</span>
-            <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
-              {e.tool}
+            <span className="min-w-0 truncate font-medium">
+              {e.kind === "internal" ? internalActivityLabel(e.tool) : e.server}
             </span>
+            {e.kind !== "internal" && (
+              <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
+                {e.tool}
+              </span>
+            )}
           </div>
           <div
             className="mt-1 truncate text-xs text-muted-foreground"
-            title={e.client ? `${meta} · Client: ${e.client}` : meta}
+            title={[
+              meta,
+              clientIdentityTooltip(e),
+              e.client && `Client: ${e.client}`,
+              e.sessionId && `Session: ${e.sessionId}`,
+              e.runId && `Run: ${e.runId}`,
+              e.cold != null && (e.cold ? "cold catalog" : "warm catalog"),
+              e.dispatchMs != null && `dispatch ${fmtMs(e.dispatchMs)}`,
+              e.kind === "internal" && `Toolport: ${e.tool}`,
+            ]
+              .filter(Boolean)
+              .join(" · ")}
             dir="auto"
           >
             {meta}
@@ -828,11 +879,12 @@ function CallRow({ e }: { e: AuditEntry }) {
         )}
         <PiiBadge entry={e} />
       </div>
-      {open && e.error && (
+      {open && hasDetail && (
         <div className="border-t border-border/50 bg-destructive/5 px-3 py-2 pl-9">
           <p className="font-mono text-xs whitespace-pre-wrap break-words text-destructive">
-            {e.error}
+            {e.error ?? e.failureKind?.replace(/_/g, " ")}
           </p>
+          {e.runId && <p className="mt-1 font-mono text-xs">Run: {e.runId}</p>}
         </div>
       )}
     </div>
@@ -915,7 +967,7 @@ export function TelemetryNotice({ stats }: { stats: AuditStats | null }) {
   return (
     <div
       role="status"
-      className="mb-4 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs"
+      className="mb-4 toolport-alert border-warning bg-warning/8 px-4 py-2.5 text-xs"
     >
       {messages.map((message) => (
         <p key={message}>{message}</p>
@@ -939,8 +991,10 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
     <div className="mb-6 flex flex-col gap-3">
       <div className="grid grid-cols-3 gap-3">
         <div className="rounded-lg border p-3">
-          <div className="text-2xl font-semibold tabular-nums">{stats.total}</div>
-          <div className="text-xs text-muted-foreground">calls logged</div>
+          <div className="text-2xl font-semibold tabular-nums">
+            {stats.total.toLocaleString()}
+          </div>
+          <div className="text-xs text-muted-foreground">calls recorded</div>
         </div>
         <div
           className={`rounded-lg border p-3 ${stats.errors > 0 ? "border-destructive/40 bg-destructive/[0.04]" : ""}`}
@@ -956,7 +1010,7 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
           <div className="text-2xl font-semibold tabular-nums">
             {stats.servers.length}
           </div>
-          <div className="text-xs text-muted-foreground">active servers</div>
+          <div className="text-xs text-muted-foreground">servers used</div>
         </div>
       </div>
 
@@ -1023,7 +1077,7 @@ function fmtBody(v: unknown): string {
 function InspectRow({ e }: { e: InspectEntry }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="rounded-md border border-border/50 text-sm">
+    <div className="border-b border-border text-sm">
       <div
         className="flex cursor-pointer items-center gap-3 px-3 py-2 hover:bg-muted/30"
         onClick={() => setOpen((o) => !o)}
@@ -1097,7 +1151,7 @@ function DiscoveryRow({ t }: { t: SearchTrace }) {
       ? `${t.returned} of ${t.total}`
       : "no match";
   return (
-    <div className="rounded-md border border-border/50 text-sm">
+    <div className="border-b border-border text-sm">
       <div
         className="flex cursor-pointer items-center gap-3 px-3 py-2 hover:bg-muted/30"
         onClick={() => setOpen((o) => !o)}
@@ -1238,11 +1292,11 @@ function PanelErrorNotice({ label, onRetry }: { label: string; onRetry: () => vo
   return (
     <div
       role="alert"
-      className="mb-6 flex items-center gap-3 rounded-lg border border-warning/40 bg-warning/5 p-4 text-xs"
+      className="mb-6 flex items-center gap-3 toolport-alert border-warning bg-warning/8 p-4 text-xs"
     >
       <AlertTriangle className="size-4 shrink-0 text-warning" />
       <span className="text-muted-foreground">
-        <span className="font-medium text-foreground">
+        <span className="block font-semibold text-foreground">
           Couldn't load {label.toLowerCase()}.
         </span>{" "}
         This isn't necessarily empty — Toolport couldn't check.
@@ -1259,7 +1313,13 @@ function PanelErrorNotice({ label, onRetry }: { label: string; onRetry: () => vo
   );
 }
 
-function DiscoveryTraces({ refreshKey }: { refreshKey: number }) {
+function DiscoveryTraces({
+  refreshKey,
+  searches,
+}: {
+  refreshKey: number;
+  searches: number;
+}) {
   const [entries, setEntries] = useState<SearchTrace[]>([]);
   // Collapsed by default: this is glanceable telemetry, not an alert, and the list can run
   // to 100 rows. Leading with it open was a big part of the Activity tab feeling busy.
@@ -1304,13 +1364,14 @@ function DiscoveryTraces({ refreshKey }: { refreshKey: number }) {
           <Search className="size-4 shrink-0 text-owned" />
           <span className="font-medium text-foreground/80">Discovery</span>
         </div>
-        With lazy discovery on, this shows every tool search your agents run, what
-        matched, why it ranked, and the returned MCP payload size. Nothing searched yet.
+        {searches > 0
+          ? `${searches} searches in recent activity; detailed search records are not available.`
+          : "Nothing searched yet."}
       </div>
     );
 
   return (
-    <div className="mb-6 rounded-lg border border-owned/30 bg-owned/[0.04] p-4">
+    <div className="mb-6 toolport-alert border-owned bg-owned/8 p-4">
       <button
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
@@ -1353,7 +1414,7 @@ function ToolIdentityRow({ t }: { t: ToolIdentity }) {
   const fpShort = t.fingerprint.replace(/^v\d+:/, "").slice(0, 12) || "-";
   const fmtDate = (ms: number) => (ms > 0 ? fmtTs(ms, "date") : "-");
   return (
-    <div className="rounded-md border border-border/50 text-sm">
+    <div className="border-b border-border text-sm">
       <div
         className="flex cursor-pointer items-center gap-3 px-3 py-2 hover:bg-muted/30"
         onClick={() => setOpen((o) => !o)}
@@ -1439,7 +1500,7 @@ function IdentityServerGroup({
   const shown = forceOpen || open;
   const quarantined = items.filter((t) => t.quarantined).length;
   return (
-    <div className="rounded-md border border-border/50">
+    <div className="border-b border-border">
       <button
         onClick={() => setOpen((v) => !v)}
         aria-expanded={shown}
@@ -1651,7 +1712,7 @@ function LiveInspector({ refreshKey }: { refreshKey: number }) {
   }, [refreshKey, retryTick]);
 
   return (
-    <div className="mb-6 rounded-lg border border-info/30 bg-info/[0.04] p-4">
+    <div className="mb-6 toolport-alert border-info bg-info/8 p-4">
       <button
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
@@ -1909,10 +1970,17 @@ export function ActivityView({
             : "Catalog telemetry unavailable. Retry Activity to load measurements."}
         </p>
       )}
-      {savings && (savings.listLoads > 0 || (savings.discoveryCount ?? 0) > 0) ? (
+      {savings &&
+      ((savings.tokenizedLoads ?? 0) > 0 || (savings.discoveryCount ?? 0) > 0) ? (
         <SavingsBanner savings={savings} />
       ) : null}
-      <DiscoveryTraces refreshKey={liveKey} />
+      <DiscoveryTraces
+        refreshKey={liveKey}
+        searches={
+          (entries ?? []).filter((e) => e.kind === "internal" && e.tool === "search")
+            .length
+        }
+      />
       <ToolIdentities refreshKey={liveKey} />
       {registry?.liveInspect ? <LiveInspector refreshKey={liveKey} /> : null}
     </>
@@ -2033,7 +2101,7 @@ export function ActivityView({
           />
           Recent calls and approvals
           <span className="text-xs font-normal text-muted-foreground/70">
-            last {entries.length} {entries.length === 1 ? "event" : "events"}
+            latest {entries.length}
           </span>
         </button>
         <button
@@ -2061,6 +2129,17 @@ export function ActivityView({
           onConfirm={clearActivity}
         />
       </div>
+
+      <p className="mb-2 text-xs text-muted-foreground">
+        {stats
+          ? `${stats.total.toLocaleString()} ${stats.total === 1 ? "call" : "calls"} recorded on this computer. `
+          : ""}
+        {logOpen
+          ? visible.length === entries.length
+            ? `Showing the latest ${visible.length.toLocaleString()}.`
+            : `Showing ${visible.length.toLocaleString()} matching rows from the latest ${entries.length.toLocaleString()}.`
+          : `Latest ${entries.length.toLocaleString()} available.`}
+      </p>
 
       {logOpen && (
         <>
@@ -2093,7 +2172,7 @@ export function ActivityView({
               Errors only
             </button>
             <span className="ml-auto text-xs text-muted-foreground">
-              {visible.length} of {entries.length}
+              {serverFilter || errorsOnly ? "Filtered" : ""}
             </span>
           </div>
 

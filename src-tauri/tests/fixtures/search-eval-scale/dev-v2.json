@@ -1,0 +1,3862 @@
+[
+  {
+    "id": "dv2-001",
+    "query": "about to review gitlab MR !90, pull its description, discussion, commits and pipeline in one shot",
+    "kind": "ranked",
+    "expected": ["gitlab__get_merge_request_context"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-002",
+    "query": "search our internal docs for the onboarding checklist",
+    "kind": "ambiguous",
+    "expected": [
+      "notion__API-post-search",
+      "confluence__conf_get",
+      "google_workspace__search"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-003",
+    "query": "r2 buckets",
+    "kind": "ranked",
+    "expected": ["cloudflare__list_r2_buckets"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-004",
+    "query": "employee lost their company card ic_1Ab, freeze it",
+    "kind": "ranked",
+    "expected": ["stripe__update_issuing_card"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-005",
+    "query": "stripe update customer email cus_123",
+    "kind": "ranked",
+    "expected": ["stripe__update_customer"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-006",
+    "query": "record a video of the playwright browser session",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-007",
+    "query": "function logs for deployment dpl_Cd34, the api route is erroring at runtime",
+    "kind": "ranked",
+    "expected": ["vercel__list_runtime_logs"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-008",
+    "query": "sign cus_21 up for price_1Yz recurring",
+    "kind": "ranked",
+    "expected": ["stripe__create_subscription", "stripe__create_customer_subscription"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-009",
+    "query": "unpause the project, don't redeploy it",
+    "kind": "ranked",
+    "expected": ["vercel__unpause_project"],
+    "category": "negation",
+    "server": null
+  },
+  {
+    "id": "dv2-010",
+    "query": "turn on signed DNS for the zone",
+    "kind": "ranked",
+    "expected": ["cloudflare__patch_dnssec"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-011",
+    "query": "what's been happening recently, show activity",
+    "kind": "ambiguous",
+    "expected": [
+      "gitlab__list_my_events",
+      "gitlab__list_project_events",
+      "vercel__list_user_events"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-012",
+    "query": "throw away the draft invoice in_1T1, never sent",
+    "kind": "ranked",
+    "expected": ["stripe__delete_invoice"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-013",
+    "query": "who am I authenticated as",
+    "kind": "ambiguous",
+    "expected": [
+      "gitlab__get_current_user",
+      "linear__linear_get_user",
+      "vercel__get_auth_user",
+      "notion__API-get-self"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-014",
+    "query": "cloudflare analytics: requests per country for the last 24 hours",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-015",
+    "query": "disable email routing on the zone but don't delete the routing rules",
+    "kind": "ranked",
+    "expected": [
+      "cloudflare__disable_email_routing",
+      "cloudflare__delete_email_routing_dns"
+    ],
+    "category": "negation",
+    "server": null
+  },
+  {
+    "id": "dv2-016",
+    "query": "what commit and status is deployment dpl_Ef56",
+    "kind": "ranked",
+    "expected": ["vercel__get_deployment"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-017",
+    "query": "a bad migration just ran on D1, roll the database back to how it was 2 hours ago",
+    "kind": "ranked",
+    "expected": ["cloudflare__restore_d1_database_time_travel"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-018",
+    "query": "who is on call in pagerduty right now",
+    "kind": "no_match",
+    "expected": [],
+    "category": "absent_product",
+    "server": null
+  },
+  {
+    "id": "dv2-019",
+    "query": "check the supabase project for tables missing row level security and other security warnings",
+    "kind": "ranked",
+    "expected": ["supabase__get_advisors"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-020",
+    "query": "store the customer's EU VAT number DE123456789 on cus_31",
+    "kind": "ranked",
+    "expected": ["stripe__create_customer_tax_id", "stripe__create_tax_id"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-021",
+    "query": "users report auth emails failing, query supabase logs for auth errors in the last hour",
+    "kind": "ranked",
+    "expected": ["supabase__query_logs"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-022",
+    "query": "top pages by visits over the last 7 days",
+    "kind": "ranked",
+    "expected": ["vercel__aggregate_pageview"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-023",
+    "query": "list all users",
+    "kind": "ambiguous",
+    "expected": [
+      "cloudflare__list_access_users",
+      "slack__slack_get_users",
+      "notion__API-get-users"
+    ],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-024",
+    "query": "cancel the order",
+    "kind": "ambiguous",
+    "expected": [
+      "stripe__cancel_climate_order",
+      "stripe__cancel_payment_intent",
+      "stripe__expire_checkout_session"
+    ],
+    "category": "unnamed_object",
+    "server": null
+  },
+  {
+    "id": "dv2-025",
+    "query": "any lock contention or replication lag on the postgres db right now",
+    "kind": "ranked",
+    "expected": ["postgres__pg_monitor_database"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-026",
+    "query": "upload a file to the slack channel",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-027",
+    "query": "partial refund of $20 on payment intent pi_3Ab9Kz",
+    "kind": "ranked",
+    "expected": ["stripe__create_refund"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-028",
+    "query": "verify a user's identity with a photo ID and selfie",
+    "kind": "ranked",
+    "expected": ["stripe__create_identity_verification_session"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-029",
+    "query": "write up the meeting notes as a new page",
+    "kind": "ambiguous",
+    "expected": [
+      "google_workspace__createGoogleDoc",
+      "notion__API-post-page",
+      "confluence__conf_post"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-030",
+    "query": "delete the merged branch feature/sso on github",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-031",
+    "query": "we hit nexus in Washington, register to collect sales tax there",
+    "kind": "ranked",
+    "expected": ["stripe__create_tax_registration"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-032",
+    "query": "log today's three expenses as new rows at the bottom of the expenses sheet",
+    "kind": "ranked",
+    "expected": ["google_workspace__appendSpreadsheetRows"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-033",
+    "query": "the offsite got cancelled, remove it from the calendar and notify attendees",
+    "kind": "ranked",
+    "expected": ["google_workspace__deleteCalendarEvent"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-034",
+    "query": "generate the onboarding URL so connected account acct_1Q2 can finish KYC",
+    "kind": "ranked",
+    "expected": ["stripe__create_account_link"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-035",
+    "query": "vercel whoami",
+    "kind": "ranked",
+    "expected": ["vercel__get_auth_user"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-036",
+    "query": "gh pr merge 57 --squash",
+    "kind": "ranked",
+    "expected": ["github__merge_pull_request"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-037",
+    "query": "set retention so nothing in the audit bucket can be deleted for 7 years",
+    "kind": "ranked",
+    "expected": ["cloudflare__lock_r2_buckets_2"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-038",
+    "query": "finalize invoice in_1Rz",
+    "kind": "ranked",
+    "expected": ["stripe__finalize_invoice"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-039",
+    "query": "set up a cloudflare tunnel to my home server",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-040",
+    "query": "pull everything in the notion tasks database where status is In Progress",
+    "kind": "ranked",
+    "expected": ["notion__API-query-data-source"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-041",
+    "query": "claw back payout po_1Lk3 that already went to the wrong bank account",
+    "kind": "ranked",
+    "expected": ["stripe__reverse_payout"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-042",
+    "query": "archive prod_Lm2 without deleting it, it still has prices",
+    "kind": "ranked",
+    "expected": ["stripe__update_product"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-043",
+    "query": "who has access to the hiring plan doc in drive",
+    "kind": "ranked",
+    "expected": ["google_workspace__listPermissions"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-044",
+    "query": "register checkout.acme.com so Apple Pay shows up",
+    "kind": "ranked",
+    "expected": [
+      "stripe__create_apple_pay_domain",
+      "stripe__create_payment_method_domain"
+    ],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-045",
+    "query": "redirect /old-pricing to /pricing permanently",
+    "kind": "ambiguous",
+    "expected": [
+      "vercel__stage_redirect",
+      "cloudflare__create_pagerule",
+      "cloudflare__create_rulesets_rule"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-046",
+    "query": "user_2abcXYZ keeps spamming the forum, ban them from signing in",
+    "kind": "ranked",
+    "expected": ["clerk__ban_user"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-047",
+    "query": "delete that comment, it was posted by mistake",
+    "kind": "ambiguous",
+    "expected": [
+      "gitlab__delete_note",
+      "linear__linear_delete_comment",
+      "google_workspace__deleteComment"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-048",
+    "query": "create an S3 bucket in us-east-1",
+    "kind": "no_match",
+    "expected": [],
+    "category": "absent_product",
+    "server": null
+  },
+  {
+    "id": "dv2-049",
+    "query": "cloudflare dns recrods example.com",
+    "kind": "ranked",
+    "expected": ["cloudflare__list_dns_records"],
+    "category": "typo",
+    "server": null
+  },
+  {
+    "id": "dv2-050",
+    "query": "trigger the github actions deploy workflow",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-051",
+    "query": "our SaaS customer wants shop.customer.com to point at us with a cert, add it",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_custom_hostname"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-052",
+    "query": "cf zone settings all",
+    "kind": "ranked",
+    "expected": ["cloudflare__list_settings"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-053",
+    "query": "glob **/*.test.ts",
+    "kind": "ranked",
+    "expected": ["filesystem__search_files"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-054",
+    "query": "send invoice email to customer",
+    "kind": "ranked",
+    "expected": ["stripe__send_invoice"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-055",
+    "query": "notify https://hooks.acme.dev when a vercel deployment succeeds",
+    "kind": "ranked",
+    "expected": ["vercel__create_webhook"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-056",
+    "query": "edit my last comment to fix the typo",
+    "kind": "ambiguous",
+    "expected": ["gitlab__update_note", "linear__linear_update_comment"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-057",
+    "query": "tax calculation cart Austin TX",
+    "kind": "ranked",
+    "expected": ["stripe__create_tax_calculation"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-058",
+    "query": "zero trust okta idp",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_access_identity_provider"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-059",
+    "query": "leave a note on the pricing paragraph in the proposal doc asking legal to check it",
+    "kind": "ranked",
+    "expected": ["google_workspace__addComment"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-060",
+    "query": "read config/app.yaml",
+    "kind": "ambiguous",
+    "expected": [
+      "filesystem__read_text_file",
+      "filesystem__read_file",
+      "github__get_file_contents",
+      "gitlab__get_file_content"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-061",
+    "query": "share the dropbox folder with the agency",
+    "kind": "no_match",
+    "expected": [],
+    "category": "absent_product",
+    "server": null
+  },
+  {
+    "id": "dv2-062",
+    "query": "verify we own the domain",
+    "kind": "ambiguous",
+    "expected": [
+      "vercel__verify_project_domain",
+      "vercel__claim_domain_ownership",
+      "stripe__create_payment_method_domain_validate"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-063",
+    "query": "overwrite user_2ghi's metadata completely instead of merging",
+    "kind": "ranked",
+    "expected": ["clerk__call_replace_user_metadata"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-064",
+    "query": "change the IP on dns record 372e67954025e0ba6aaa6d586b9e0b59 in zone 023e105f4ecef8ad9ca31a8372d0c353 to 198.51.100.4",
+    "kind": "ranked",
+    "expected": ["cloudflare__patch_dns_record", "cloudflare__update_dns_record"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-065",
+    "query": "log 2 hours on PROJ-123 for today's debugging",
+    "kind": "ranked",
+    "expected": ["jira__jira_add_worklog"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-066",
+    "query": "list webhooks",
+    "kind": "ambiguous",
+    "expected": ["stripe__list_webhook_endpoints", "vercel__list_webhooks"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-067",
+    "query": "disable universal ssl",
+    "kind": "ranked",
+    "expected": ["cloudflare__patch_ssl_universal_settings"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-068",
+    "query": "update the issue title to 'Checkout fails on Safari'",
+    "kind": "ambiguous",
+    "expected": [
+      "github__update_issue",
+      "gitlab__update_issue",
+      "linear__linear_edit_issue"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-069",
+    "query": "refund that sale",
+    "kind": "ambiguous",
+    "expected": [
+      "stripe__create_refund",
+      "stripe__create_charge_refund",
+      "stripe__create_charge_refund_2",
+      "stripe__create_terminal_reader_refund_payment"
+    ],
+    "category": "unnamed_object",
+    "server": null
+  },
+  {
+    "id": "dv2-070",
+    "query": "spin up a linear project for the Q1 launch with its starter issues",
+    "kind": "ranked",
+    "expected": ["linear__linear_create_project_with_issues"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-071",
+    "query": "edge configs",
+    "kind": "ranked",
+    "expected": ["vercel__list_edge_configs"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-072",
+    "query": "gitlab grup members with acess levels for acme/platform",
+    "kind": "ranked",
+    "expected": ["gitlab__list_group_members"],
+    "category": "typo",
+    "server": null
+  },
+  {
+    "id": "dv2-073",
+    "query": "make a shareable buy link for the $49 starter plan I can paste in an email",
+    "kind": "ranked",
+    "expected": ["stripe__create_payment_link"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-074",
+    "query": "show the line items",
+    "kind": "ambiguous",
+    "expected": [
+      "stripe__list_invoice_lines",
+      "stripe__list_checkout_session_line_items",
+      "stripe__list_quote_line_items",
+      "stripe__list_payment_link_line_items",
+      "stripe__list_credit_note_lines",
+      "stripe__list_tax_calculation_line_items",
+      "stripe__list_tax_transaction_line_items"
+    ],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-075",
+    "query": "freeze the signed contract file so nobody can change it",
+    "kind": "ranked",
+    "expected": ["google_workspace__lockFile"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-076",
+    "query": "add a new-checkout toggle we can flip per environment",
+    "kind": "ranked",
+    "expected": ["vercel__create_flag"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-077",
+    "query": "playwright screenshot full page",
+    "kind": "ranked",
+    "expected": ["playwright__browser_take_screenshot"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-078",
+    "query": "create a clerk organization for the Initech customer",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-079",
+    "query": "only let people with an @acme.com email sign up",
+    "kind": "ranked",
+    "expected": ["clerk__create_allowlist_identifier"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-080",
+    "query": "what tables are in the database",
+    "kind": "ambiguous",
+    "expected": ["supabase__list_tables", "postgres__pg_manage_schema"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-081",
+    "query": "deploy the function",
+    "kind": "ambiguous",
+    "expected": ["supabase__deploy_edge_function", "vercel__create_deployment"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-082",
+    "query": "remove saved card pm_1Abc from the customer",
+    "kind": "ranked",
+    "expected": ["stripe__detach_payment_method"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-083",
+    "query": "schedule the report lambda for 9am Europe/Berlin time with a flexible window",
+    "kind": "ranked",
+    "expected": ["aws_lambda__create_advanced_schedule"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-084",
+    "query": "refund the platform fee fee_1Gh we took on that sale",
+    "kind": "ranked",
+    "expected": [
+      "stripe__create_application_fee_refund",
+      "stripe__create_application_fee_refund_2"
+    ],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-085",
+    "query": "access auth logs",
+    "kind": "ranked",
+    "expected": ["cloudflare__list_access_logs_access_requests"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-086",
+    "query": "block 45.33.12.0/24 from hitting our site on cloudflare",
+    "kind": "ranked",
+    "expected": [
+      "cloudflare__create_firewall_access_rules_rule",
+      "cloudflare__create_firewall_rule",
+      "cloudflare__create_rulesets_rule"
+    ],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-087",
+    "query": "show me all the transactions from yesterday in stripe",
+    "kind": "ambiguous",
+    "expected": [
+      "stripe__list_balance_transactions",
+      "stripe__get_balance_history",
+      "stripe__list_issuing_transactions",
+      "stripe__list_treasury_transactions",
+      "stripe__list_customer_balance_transactions",
+      "stripe__list_financial_connections_transactions"
+    ],
+    "category": "unnamed_object",
+    "server": null
+  },
+  {
+    "id": "dv2-088",
+    "query": "invoke the lambda function with this test payload",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-089",
+    "query": "slack post #deploys deploy finished",
+    "kind": "ranked",
+    "expected": ["slack__slack_post_message"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-090",
+    "query": "only allow office IPs to reach /admin on the zone",
+    "kind": "ranked",
+    "expected": [
+      "cloudflare__create_firewall_lockdown",
+      "cloudflare__create_firewall_rule",
+      "cloudflare__create_rulesets_rule"
+    ],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-091",
+    "query": "move the trello card to Done",
+    "kind": "no_match",
+    "expected": [],
+    "category": "absent_product",
+    "server": null
+  },
+  {
+    "id": "dv2-092",
+    "query": "shipping rate $5 flat",
+    "kind": "ranked",
+    "expected": ["stripe__create_shipping_rate"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-093",
+    "query": "fill in email and password on the login form",
+    "kind": "ranked",
+    "expected": ["playwright__browser_fill_form", "playwright__browser_type"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-094",
+    "query": "change the value of the STRIPE_KEY environment variable on the web project",
+    "kind": "ranked",
+    "expected": ["vercel__edit_project_env"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-095",
+    "query": "turn off payment link plink_1Ou8 so nobody else can buy through it",
+    "kind": "ranked",
+    "expected": ["stripe__update_payment_link"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-096",
+    "query": "is zone 023e105f4ecef8ad9ca31a8372d0c353 active yet and what nameservers did it get",
+    "kind": "ranked",
+    "expected": ["cloudflare__get_zone"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-097",
+    "query": "they churned, end sub_1MxQ7 right now instead of at period end",
+    "kind": "ranked",
+    "expected": ["stripe__cancel_subscription", "stripe__delete_customer_subscription"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-098",
+    "query": "search products where metadata sku is ABC-123",
+    "kind": "ranked",
+    "expected": ["stripe__search_products"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-099",
+    "query": "gh pr files #42 acme/web",
+    "kind": "ranked",
+    "expected": ["github__get_pull_request_files"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-100",
+    "query": "add funds to the stripe balance from our bank so payouts don't fail",
+    "kind": "ranked",
+    "expected": ["stripe__create_topup"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-101",
+    "query": "turn the new-checkout flag of in prodution",
+    "kind": "ranked",
+    "expected": ["vercel__update_flag"],
+    "category": "typo",
+    "server": null
+  },
+  {
+    "id": "dv2-102",
+    "query": "back up our cloudflare DNS as a BIND zone file",
+    "kind": "ranked",
+    "expected": ["cloudflare__export_dns_records"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-103",
+    "query": "run SELECT count(*) FROM users against our D1 database",
+    "kind": "ranked",
+    "expected": [
+      "cloudflare__create_d1_database_query",
+      "cloudflare__create_d1_database_raw"
+    ],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-104",
+    "query": "upload the file",
+    "kind": "ambiguous",
+    "expected": [
+      "google_workspace__uploadFile",
+      "stripe__create_file",
+      "cloudflare__update_r2_buckets_object",
+      "playwright__browser_file_upload",
+      "vercel__upload_file"
+    ],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-105",
+    "query": "merge two duplicate stripe customers cus_A1 and cus_B2 into one record",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-106",
+    "query": "show me the review comments on the PR",
+    "kind": "ambiguous",
+    "expected": ["github__get_pull_request_comments", "gitlab__get_notes"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-107",
+    "query": "zaraz publish",
+    "kind": "ranked",
+    "expected": ["cloudflare__publish_settings_zaraz"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-108",
+    "query": "move the notion page under the Archive page",
+    "kind": "ranked",
+    "expected": ["notion__API-move-page"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-109",
+    "query": "bump the authorized amount on pi_3Lb to include the tip",
+    "kind": "ranked",
+    "expected": ["stripe__create_payment_intent_increment_authorization"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-110",
+    "query": "email routing rules",
+    "kind": "ranked",
+    "expected": ["cloudflare__list_email_routing_rules"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-111",
+    "query": "staging is gone now, remove the old staging CNAME from our cloudflare zone",
+    "kind": "ranked",
+    "expected": ["cloudflare__delete_dns_record"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-112",
+    "query": "custom hostnames list",
+    "kind": "ranked",
+    "expected": ["cloudflare__list_custom_hostnames"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-113",
+    "query": "delte vercel projct old-landing",
+    "kind": "ranked",
+    "expected": ["vercel__delete_project"],
+    "category": "typo",
+    "server": null
+  },
+  {
+    "id": "dv2-114",
+    "query": "our database needs an allowlist, give the project fixed outbound IPs",
+    "kind": "ranked",
+    "expected": ["vercel__update_static_ip"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-115",
+    "query": "r2 list objects prefix avatars/",
+    "kind": "ranked",
+    "expected": ["cloudflare__list_r2_buckets_objects"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-116",
+    "query": "add 200 signups from the landing page to the clerk waitlist",
+    "kind": "ranked",
+    "expected": ["clerk__create_bulk_waitlist_entry"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-117",
+    "query": "how much is a .ai domain per year in general",
+    "kind": "ranked",
+    "expected": ["vercel__get_tld_price"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-118",
+    "query": "pause cloudflare on the zone so traffic goes straight to origin while we debug",
+    "kind": "ranked",
+    "expected": ["cloudflare__patch_zone"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-119",
+    "query": "add 'Team Seat' to our product catalog",
+    "kind": "ranked",
+    "expected": ["stripe__create_product"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-120",
+    "query": "ledger of fees, charges and settlements for september",
+    "kind": "ranked",
+    "expected": ["stripe__list_balance_transactions", "stripe__get_balance_history"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-121",
+    "query": "dir tree src",
+    "kind": "ranked",
+    "expected": ["filesystem__directory_tree"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-122",
+    "query": "how many credits does cus_8 have left",
+    "kind": "ranked",
+    "expected": ["stripe__get_billing_credit_balance_summary"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-123",
+    "query": "the old WAF keeps flagging /api/upload, add a URI override so it stops",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_firewall_waf_override"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-124",
+    "query": "list the environment variables",
+    "kind": "ambiguous",
+    "expected": ["vercel__filter_project_env", "vercel__list_shared_env_variables"],
+    "category": "unnamed_object",
+    "server": null
+  },
+  {
+    "id": "dv2-125",
+    "query": "click OK on the 'are you sure?' popup in the browser",
+    "kind": "ranked",
+    "expected": ["playwright__browser_handle_dialog"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-126",
+    "query": "meter event summaries mtr_1Ij",
+    "kind": "ranked",
+    "expected": ["stripe__list_billing_meter_event_summaries"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-127",
+    "query": "block fraudster@mail.ru by adding it to our radar blocklist",
+    "kind": "ranked",
+    "expected": ["stripe__create_radar_value_list_item"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-128",
+    "query": "install our own purchased SSL certificate on the zone",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_custom_certificate"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-129",
+    "query": "add the SSO add-on to sub_1St as another line",
+    "kind": "ranked",
+    "expected": [
+      "stripe__create_subscription_item",
+      "stripe__update_subscription",
+      "stripe__update_customer_subscription"
+    ],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-130",
+    "query": "cancel the payment intent pi_3Qz, not refund, it was never captured",
+    "kind": "ranked",
+    "expected": ["stripe__cancel_payment_intent"],
+    "category": "negation",
+    "server": null
+  },
+  {
+    "id": "dv2-131",
+    "query": "stripe connect accounts list",
+    "kind": "ranked",
+    "expected": ["stripe__list_connected_accounts"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-132",
+    "query": "bump alice from commenter to editor on that drive file",
+    "kind": "ranked",
+    "expected": ["google_workspace__updatePermission"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-133",
+    "query": "domain shows invalid configuration, re-check verification for the project domain",
+    "kind": "ranked",
+    "expected": ["vercel__verify_project_domain"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-134",
+    "query": "apply a supabase migration that adds an orders table",
+    "kind": "ranked",
+    "expected": ["supabase__apply_migration"],
+    "category": "api_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-135",
+    "query": "merge the supabase dev branch's migrations into production",
+    "kind": "ranked",
+    "expected": ["supabase__merge_branch"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-136",
+    "query": "who has approved gitlab MR !342 so far",
+    "kind": "ranked",
+    "expected": ["gitlab__get_merge_request_reviewers"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-137",
+    "query": "credit cus_14's account balance $50 as goodwill",
+    "kind": "ranked",
+    "expected": ["stripe__create_customer_balance_transaction"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-138",
+    "query": "turn on cloudflare email routing for the zone",
+    "kind": "ranked",
+    "expected": [
+      "cloudflare__enable_email_routing",
+      "cloudflare__create_email_routing_dns"
+    ],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-139",
+    "query": "invite jo@acme.com by email",
+    "kind": "ambiguous",
+    "expected": ["clerk__create_invitation", "vercel__invite_user_to_team"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-140",
+    "query": "stop people from editing the header rows of the shared sheet",
+    "kind": "ranked",
+    "expected": ["google_workspace__protectRange"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-141",
+    "query": "restart the crashing kubernetes pod in prod",
+    "kind": "no_match",
+    "expected": [],
+    "category": "absent_product",
+    "server": null
+  },
+  {
+    "id": "dv2-142",
+    "query": "browser console errors",
+    "kind": "ranked",
+    "expected": ["playwright__browser_console_messages"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-143",
+    "query": "schedule a slack message for 9am tomorrow",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-144",
+    "query": "25% off for the first 3 months discount for the beta cohort",
+    "kind": "ranked",
+    "expected": ["stripe__create_coupon"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-145",
+    "query": "terminal location create Denver",
+    "kind": "ranked",
+    "expected": ["stripe__create_terminal_location"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-146",
+    "query": "rename the spredsheet tab Sheet1 to Raw Data",
+    "kind": "ranked",
+    "expected": ["google_workspace__renameSheet"],
+    "category": "typo",
+    "server": null
+  },
+  {
+    "id": "dv2-147",
+    "query": "the vercel build for dpl_Ab12 failed at npm install, show me the build output",
+    "kind": "ranked",
+    "expected": ["vercel__list_deployment_events"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-148",
+    "query": "gslides duplicate slide 3",
+    "kind": "ranked",
+    "expected": ["google_workspace__duplicateSlide"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-149",
+    "query": "cancel the subscription item",
+    "kind": "ambiguous",
+    "expected": [
+      "stripe__delete_subscription_item",
+      "clerk__call_cancel_commerce_subscription_item"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-150",
+    "query": "cf user agent block rule BadCrawler",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_firewall_ua_rule"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-151",
+    "query": "remove example.com",
+    "kind": "ambiguous",
+    "expected": [
+      "vercel__delete_project_domain",
+      "vercel__delete_domain",
+      "cloudflare__delete_zone"
+    ],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-152",
+    "query": "add Acme Corp as a new buyer in stripe before I invoice them",
+    "kind": "ranked",
+    "expected": ["stripe__create_customer"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-153",
+    "query": "access groups cloudflare",
+    "kind": "ranked",
+    "expected": ["cloudflare__list_access_groups"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-154",
+    "query": "canary looks healthy, move the rollout to the next percentage",
+    "kind": "ranked",
+    "expected": ["vercel__approve_rolling_release_stage"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-155",
+    "query": "what hostnames and expiry date does this PEM certificate cover",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_ssl_analyze"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-156",
+    "query": "NYC sales tax 8.875% that we can apply to invoices",
+    "kind": "ranked",
+    "expected": ["stripe__create_tax_rate"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-157",
+    "query": "list teams",
+    "kind": "ambiguous",
+    "expected": ["vercel__list_teams", "linear__linear_get_teams"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-158",
+    "query": "add a Beta milestone due Nov 15 to the linear project",
+    "kind": "ranked",
+    "expected": ["linear__linear_create_project_milestone"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-159",
+    "query": "rebase the supabase dev branch on production, don't reset it",
+    "kind": "ranked",
+    "expected": ["supabase__rebase_branch"],
+    "category": "negation",
+    "server": null
+  },
+  {
+    "id": "dv2-160",
+    "query": "get the details of issue #431",
+    "kind": "ambiguous",
+    "expected": [
+      "github__get_issue",
+      "gitlab__get_issue_context",
+      "jira__jira_get_issue",
+      "linear__linear_get_issue"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-161",
+    "query": "upload our IoT root CA so devices authenticate with client certs",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_access_certificate"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-162",
+    "query": "add $25 of credit to the user's balance",
+    "kind": "ambiguous",
+    "expected": [
+      "clerk__call_adjust_user_billing_credit_balance",
+      "stripe__create_customer_balance_transaction",
+      "stripe__create_billing_credit_grant"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-163",
+    "query": "close the issue, it's fixed",
+    "kind": "ambiguous",
+    "expected": [
+      "github__update_issue",
+      "linear__linear_edit_issue",
+      "sentry__update_issue"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-164",
+    "query": "pg create index concurrently orders(customer_id)",
+    "kind": "ranked",
+    "expected": ["postgres__pg_manage_indexes"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-165",
+    "query": "vercel deployments marketing-site",
+    "kind": "ranked",
+    "expected": ["vercel__list_deployments"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-166",
+    "query": "find gitlab comments that mention 'flaky test'",
+    "kind": "ranked",
+    "expected": ["gitlab__search_notes"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-167",
+    "query": "look up the stripe customer with email jane@acme.io",
+    "kind": "ranked",
+    "expected": ["stripe__search_customers", "stripe__list_customers"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-168",
+    "query": "reset a clerk user's password",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-169",
+    "query": "stripe webhook endpoints",
+    "kind": "ranked",
+    "expected": ["stripe__list_webhook_endpoints"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-170",
+    "query": "make dana a viewer instead of a member on the team",
+    "kind": "ranked",
+    "expected": ["vercel__update_team_member"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-171",
+    "query": "someone wiped half the spec doc, roll the file back to yesterday's version",
+    "kind": "ranked",
+    "expected": ["google_workspace__restoreRevision"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-172",
+    "query": "forward support@example.com to my gmail via cloudflare",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_email_routing_rule"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-173",
+    "query": "replace the whole page content with this new draft",
+    "kind": "ambiguous",
+    "expected": ["google_workspace__updateGoogleDoc", "confluence__conf_put"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-174",
+    "query": "give the analytics user read-only access to the reporting schema",
+    "kind": "ranked",
+    "expected": ["postgres__pg_manage_users"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-175",
+    "query": "delete the clerk user account user_2abc entirely",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-176",
+    "query": "add a staging environment besides preview and production",
+    "kind": "ranked",
+    "expected": ["vercel__create_custom_environment"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-177",
+    "query": "vercel sandbox create",
+    "kind": "ranked",
+    "expected": ["vercel__create_sandbox"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-178",
+    "query": "delete that slack message I posted in #general",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-179",
+    "query": "add a custom domain",
+    "kind": "ambiguous",
+    "expected": [
+      "vercel__add_project_domain",
+      "cloudflare__create_custom_hostname",
+      "clerk__call_add_domain",
+      "cloudflare__create_r2_buckets_domains_custom"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-180",
+    "query": "what's the current minimum TLS version set on the zone",
+    "kind": "ranked",
+    "expected": ["cloudflare__get_setting", "cloudflare__list_settings"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-181",
+    "query": "reply in the slack thread that I'm on it",
+    "kind": "ranked",
+    "expected": ["slack__slack_reply_to_thread"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-182",
+    "query": "show cloudwatch logs for the lambda",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-183",
+    "query": "list all users in the jira project, not the issues",
+    "kind": "no_match",
+    "expected": [],
+    "category": "negation",
+    "server": null
+  },
+  {
+    "id": "dv2-184",
+    "query": "find the user named Priya",
+    "kind": "ambiguous",
+    "expected": ["github__search_users", "gitlab__search_users"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-185",
+    "query": "put report.pdf into our R2 bucket as reports/2026/q3.pdf",
+    "kind": "ranked",
+    "expected": ["cloudflare__update_r2_buckets_object"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-186",
+    "query": "vercel team invite sam@acme.com",
+    "kind": "ranked",
+    "expected": ["vercel__invite_user_to_team"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-187",
+    "query": "google shared drives",
+    "kind": "ranked",
+    "expected": ["google_workspace__listSharedDrives"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-188",
+    "query": "download the PDF for qt_1Mn to attach to the email",
+    "kind": "ranked",
+    "expected": ["stripe__get_quote_pdf"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-189",
+    "query": "merge gitlab MR !12 into main",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-190",
+    "query": "issuing cardholder create",
+    "kind": "ranked",
+    "expected": ["stripe__create_issuing_cardholder"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-191",
+    "query": "find the price with lookup key pro_monthly",
+    "kind": "ranked",
+    "expected": ["stripe__list_prices", "stripe__search_prices"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-192",
+    "query": "put the bug label on the issue",
+    "kind": "ambiguous",
+    "expected": [
+      "github__update_issue",
+      "gitlab__update_issue",
+      "linear__linear_edit_issue"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-193",
+    "query": "turn the scanned contract PDF in drive into something I can edit",
+    "kind": "ranked",
+    "expected": ["google_workspace__convertPdfToGoogleDoc"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-194",
+    "query": "undo transfer tr_1Mn4 to the connected account",
+    "kind": "ranked",
+    "expected": ["stripe__create_transfer_reversal"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-195",
+    "query": "open a PR from feature/sso into main",
+    "kind": "ambiguous",
+    "expected": ["github__create_pull_request", "gitlab__create_merge_request"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-196",
+    "query": "create a new vercel project from the acme/web repo",
+    "kind": "ranked",
+    "expected": ["vercel__create_project"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-197",
+    "query": "early fraud warnings",
+    "kind": "ranked",
+    "expected": ["stripe__list_radar_early_fraud_warnings"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-198",
+    "query": "search payment intents where metadata order_id is 5531",
+    "kind": "ranked",
+    "expected": ["stripe__search_payment_intents"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-199",
+    "query": "contractor's laptop was stolen, kill all their Access sessions across every app",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_access_organizations_revoke_user"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-200",
+    "query": "ship all our vercel logs to datadog",
+    "kind": "ranked",
+    "expected": [
+      "vercel__create_drain",
+      "vercel__create_configurable_log_drain",
+      "vercel__create_log_drain"
+    ],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-201",
+    "query": "comment on issue 42 that the fix is deployed",
+    "kind": "ambiguous",
+    "expected": [
+      "github__add_issue_comment",
+      "gitlab__create_note",
+      "linear__linear_create_comment",
+      "jira__jira_add_comment"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-202",
+    "query": "create a new branch in the gitlab repo acme/api",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-203",
+    "query": "new recurring price prod_Nx1 $29/mo",
+    "kind": "ranked",
+    "expected": ["stripe__create_price"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-204",
+    "query": "comment on the PR saying it needs a rebase",
+    "kind": "ambiguous",
+    "expected": [
+      "github__add_issue_comment",
+      "github__create_pull_request_review",
+      "gitlab__create_note"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-205",
+    "query": "confluence get page 123456",
+    "kind": "ranked",
+    "expected": ["confluence__conf_get"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-206",
+    "query": "migrate from S3 to R2 lazily as objects are requested",
+    "kind": "ranked",
+    "expected": ["cloudflare__update_r2_buckets_sippy"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-207",
+    "query": "past_due subscriptions so finance can chase them",
+    "kind": "ranked",
+    "expected": ["stripe__list_subscriptions", "stripe__search_subscriptions"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-208",
+    "query": "how many errors per hour did checkout throw yesterday in sentry",
+    "kind": "ranked",
+    "expected": ["sentry__search_events"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-209",
+    "query": "give a $15 credit against invoice in_1Q9 because of the outage",
+    "kind": "ranked",
+    "expected": ["stripe__create_credit_note"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-210",
+    "query": "register a brand new domain through cloudflare registrar",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-211",
+    "query": "run JQL: project = PAY AND status = 'In Review'",
+    "kind": "ranked",
+    "expected": ["jira__jira_ls_issues"],
+    "category": "api_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-212",
+    "query": "what cards does cus_12 have on file",
+    "kind": "ranked",
+    "expected": [
+      "stripe__list_customer_payment_methods",
+      "stripe__list_customer_cards",
+      "stripe__list_payment_methods",
+      "stripe__list_customer_sources"
+    ],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-213",
+    "query": "reorder the cloudflare firewall rules so the allow rule runs first",
+    "kind": "ranked",
+    "expected": ["cloudflare__patch_firewall_rules", "cloudflare__patch_firewall_rule"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-214",
+    "query": "run the cleanup lambda every day at 3am",
+    "kind": "ranked",
+    "expected": ["aws_lambda__create_cron_rule", "aws_lambda__create_advanced_schedule"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-215",
+    "query": "rename the file to final-v2",
+    "kind": "ambiguous",
+    "expected": ["filesystem__move_file", "google_workspace__renameItem"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-216",
+    "query": "let the express seller sign in to their own payouts dashboard",
+    "kind": "ranked",
+    "expected": ["stripe__create_account_login_link"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-217",
+    "query": "query the error logs",
+    "kind": "ambiguous",
+    "expected": ["supabase__query_logs", "sentry__search_events"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-218",
+    "query": "browser uploads to R2 fail with a CORS error, set a CORS policy allowing app.example.com",
+    "kind": "ranked",
+    "expected": ["cloudflare__update_r2_buckets_cors"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-219",
+    "query": "block traffic from North Korea in the vercel firewall",
+    "kind": "ranked",
+    "expected": ["vercel__update_firewall_config", "vercel__put_firewall_config"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-220",
+    "query": "switch cus_3 from monthly to annual automatically on January 1",
+    "kind": "ranked",
+    "expected": ["stripe__create_subscription_schedule"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-221",
+    "query": "list our SSL certificates",
+    "kind": "ambiguous",
+    "expected": [
+      "cloudflare__list_custom_certificates",
+      "cloudflare__list_ssl_certificate_packs",
+      "cloudflare__list_access_certificates"
+    ],
+    "category": "unnamed_object",
+    "server": null
+  },
+  {
+    "id": "dv2-222",
+    "query": "delete the webhook we created for testing",
+    "kind": "ambiguous",
+    "expected": ["stripe__delete_webhook_endpoint", "vercel__delete_webhook"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-223",
+    "query": "gitlab what did I just do",
+    "kind": "ranked",
+    "expected": ["gitlab__list_my_events"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-224",
+    "query": "revoke clerk API key ak_123, it leaked in a log",
+    "kind": "ranked",
+    "expected": ["clerk__call_api_key_6"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-225",
+    "query": "promotion code SUMMER25",
+    "kind": "ranked",
+    "expected": ["stripe__create_promotion_code"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-226",
+    "query": "charges > $1000 last week",
+    "kind": "ranked",
+    "expected": ["stripe__list_charges", "stripe__search_charges"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-227",
+    "query": "we're moving registrars, get the EPP code for example.com",
+    "kind": "ranked",
+    "expected": ["vercel__get_domain_auth_code"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-228",
+    "query": "turn on smart tiered cache",
+    "kind": "ranked",
+    "expected": [
+      "cloudflare__create_cache_tiered_cache_smart_topology_enable",
+      "cloudflare__patch_cache_tiered_cache_smart_topology_enable"
+    ],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-229",
+    "query": "show me the firewall rules",
+    "kind": "ambiguous",
+    "expected": ["cloudflare__list_firewall_rules", "vercel__get_firewall_config"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-230",
+    "query": "make the status column a dropdown with Todo, Doing, Done",
+    "kind": "ranked",
+    "expected": ["google_workspace__addDataValidation"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-231",
+    "query": "who is sitting on the most merge request reviews in the platform group on gitlab",
+    "kind": "ranked",
+    "expected": ["gitlab__analytics_review_bottlenecks"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-232",
+    "query": "let playwright e2e runs skip vercel authentication on previews",
+    "kind": "ranked",
+    "expected": ["vercel__update_project_protection_bypass"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-233",
+    "query": "stop pending payout po_1PcR, wrong bank",
+    "kind": "ranked",
+    "expected": ["stripe__cancel_payout"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-234",
+    "query": "how many signup_clicked custom events since analytics was enabled",
+    "kind": "ranked",
+    "expected": ["vercel__count_event"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-235",
+    "query": "r2 bulk delete objects",
+    "kind": "ranked",
+    "expected": ["cloudflare__delete_r2_buckets_objects"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-236",
+    "query": "create a branch called fix/login",
+    "kind": "ambiguous",
+    "expected": ["github__create_branch", "supabase__create_branch"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-237",
+    "query": "bring over the zone file from our old DNS provider into cloudflare",
+    "kind": "ranked",
+    "expected": ["cloudflare__import_dns_records"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-238",
+    "query": "when is payout po_1Nz8 going to land",
+    "kind": "ranked",
+    "expected": ["stripe__get_payout"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-239",
+    "query": "start a canary rollout of dpl_Ij90 to 10% of traffic",
+    "kind": "ranked",
+    "expected": ["vercel__start_rolling_release"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-240",
+    "query": "write off invoice in_1Nq2Lm as bad debt, the customer is never going to pay",
+    "kind": "ranked",
+    "expected": ["stripe__create_invoice_mark_uncollectible"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-241",
+    "query": "which queries are slowest on our postgres database",
+    "kind": "ranked",
+    "expected": ["postgres__pg_manage_query"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-242",
+    "query": "the page loads but the data never shows, list the network calls the page made",
+    "kind": "ranked",
+    "expected": ["playwright__browser_network_requests"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-243",
+    "query": "something broke in prod, pull the logs",
+    "kind": "ambiguous",
+    "expected": [
+      "vercel__list_runtime_logs",
+      "supabase__query_logs",
+      "sentry__search_events"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-244",
+    "query": "pause billing on sub_1Ok22 for two months while the client is on leave",
+    "kind": "ranked",
+    "expected": ["stripe__update_subscription", "stripe__update_customer_subscription"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-245",
+    "query": "accept the loss on du_1Cd, we have no evidence to fight it",
+    "kind": "ranked",
+    "expected": ["stripe__close_dispute", "stripe__close_charge_dispute"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-246",
+    "query": "a usage event got double counted yesterday, I need to correct it",
+    "kind": "ranked",
+    "expected": ["stripe__create_billing_meter_event_adjustment"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-247",
+    "query": "they hired more people, set si_1Uv to 12 seats",
+    "kind": "ranked",
+    "expected": [
+      "stripe__update_subscription_item",
+      "stripe__update_subscription",
+      "stripe__update_customer_subscription"
+    ],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-248",
+    "query": "update the coupon's metadata, don't create a new coupon",
+    "kind": "ranked",
+    "expected": ["stripe__update_coupon"],
+    "category": "negation",
+    "server": null
+  },
+  {
+    "id": "dv2-249",
+    "query": "auto delete objects in the tmp R2 bucket after 30 days",
+    "kind": "ranked",
+    "expected": ["cloudflare__update_r2_buckets_lifecycle"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-250",
+    "query": "find all stripe objects tagged with metadata campaign=fall",
+    "kind": "ambiguous",
+    "expected": [
+      "stripe__search_customers",
+      "stripe__search_charges",
+      "stripe__search_invoices",
+      "stripe__search_payment_intents",
+      "stripe__search_prices",
+      "stripe__search_products",
+      "stripe__search_subscriptions"
+    ],
+    "category": "unnamed_object",
+    "server": null
+  },
+  {
+    "id": "dv2-251",
+    "query": "tail /var/log/app.log 50 lines",
+    "kind": "ranked",
+    "expected": ["filesystem__read_text_file", "filesystem__read_file"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-252",
+    "query": "create a page rule forwarding old-blog.example.com/* to blog.example.com",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_pagerule"],
+    "category": "api_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-253",
+    "query": "who approved the PR",
+    "kind": "ambiguous",
+    "expected": [
+      "github__get_pull_request_reviews",
+      "gitlab__get_merge_request_reviewers"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-254",
+    "query": "add a row level security policy so users only see their own rows in postgres",
+    "kind": "ranked",
+    "expected": ["postgres__pg_manage_rls"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-255",
+    "query": "list the files in the docs folder",
+    "kind": "ambiguous",
+    "expected": [
+      "filesystem__list_directory",
+      "filesystem__list_directory_with_sizes",
+      "google_workspace__listFolder",
+      "gitlab__browse_repository",
+      "github__get_file_contents"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-256",
+    "query": "the client signed off, mark quote qt_1Op as accepted",
+    "kind": "ranked",
+    "expected": ["stripe__create_quote_accept"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-257",
+    "query": "create a new slack channel #launch-q4",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-258",
+    "query": "kill checkout session cs_test_a1B2 so the customer can't complete it",
+    "kind": "ranked",
+    "expected": ["stripe__expire_checkout_session"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-259",
+    "query": "fast forward the test clock a month to check the renewal invoice",
+    "kind": "ranked",
+    "expected": ["stripe__advance_test_helpers_test_clocks_test_clock"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-260",
+    "query": "remove the contractor from our vercel team",
+    "kind": "ranked",
+    "expected": ["vercel__delete_team_member"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-261",
+    "query": "supabase deploy edge function send-welcome-email",
+    "kind": "ranked",
+    "expected": ["supabase__deploy_edge_function"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-262",
+    "query": "remove 15 stale env vars from the project in one go",
+    "kind": "ranked",
+    "expected": ["vercel__batch_remove_project_env"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-263",
+    "query": "add a TXT record for google site verification on our vercel-managed domain",
+    "kind": "ranked",
+    "expected": ["vercel__create_record"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-264",
+    "query": "purge the cache",
+    "kind": "ambiguous",
+    "expected": [
+      "cloudflare__purge_cache",
+      "vercel__invalidate_by_tag",
+      "vercel__dangerously_delete_by_tag"
+    ],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-265",
+    "query": "customer double ordered so I need to give back the full amount of ch_3NxY2abc to their card",
+    "kind": "ranked",
+    "expected": [
+      "stripe__create_refund",
+      "stripe__create_charge_refund",
+      "stripe__create_charge_refund_2"
+    ],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-266",
+    "query": "all unpaid invoices for cus_5",
+    "kind": "ranked",
+    "expected": ["stripe__list_invoices", "stripe__search_invoices"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-267",
+    "query": "disable eventbridge rule nightly-sync",
+    "kind": "ranked",
+    "expected": ["aws_lambda__disable_rule"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-268",
+    "query": "append a paragraph with today's notes to the notion page",
+    "kind": "ranked",
+    "expected": ["notion__API-patch-block-children"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-269",
+    "query": "restore the supabase database to a point in time 3 hours ago",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-270",
+    "query": "custom hostname quota",
+    "kind": "ranked",
+    "expected": ["cloudflare__get_custom_hostnames_quota"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-271",
+    "query": "kill the running command in the sandbox session, don't stop the whole session",
+    "kind": "ranked",
+    "expected": ["vercel__kill_session_command"],
+    "category": "negation",
+    "server": null
+  },
+  {
+    "id": "dv2-272",
+    "query": "machine-to-machine token for the billing worker",
+    "kind": "ranked",
+    "expected": ["clerk__call_m2_m_token_2"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-273",
+    "query": "domain availability coolstartup.dev",
+    "kind": "ranked",
+    "expected": ["vercel__get_domain_availability"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-274",
+    "query": "create a folder called exports",
+    "kind": "ambiguous",
+    "expected": ["filesystem__create_directory", "google_workspace__createFolder"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-275",
+    "query": "send the customer a link where they can update their card and cancel themselves",
+    "kind": "ranked",
+    "expected": ["stripe__create_billing_portal_session"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-276",
+    "query": "issue a virtual corporate card to the new marketing hire",
+    "kind": "ranked",
+    "expected": ["stripe__create_issuing_card"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-277",
+    "query": "make a new API token for the CI pipeline",
+    "kind": "ambiguous",
+    "expected": ["vercel__create_auth_token", "clerk__call_api_key_2"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-278",
+    "query": "create a KV namespace in cloudflare",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-279",
+    "query": "retreive dispute du_1Xy",
+    "kind": "ranked",
+    "expected": ["stripe__get_dispute"],
+    "category": "typo",
+    "server": null
+  },
+  {
+    "id": "dv2-280",
+    "query": "new d1 db",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_d1_database"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-281",
+    "query": "vercel token create",
+    "kind": "ranked",
+    "expected": ["vercel__create_auth_token"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-282",
+    "query": "they agreed to a one-off $500 setup fee, add it so it lands on cus_42's next invoice",
+    "kind": "ranked",
+    "expected": ["stripe__create_invoice_item"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-283",
+    "query": "book a 30 min call tomorrow at 3pm with dana and add a meet link",
+    "kind": "ranked",
+    "expected": ["google_workspace__createCalendarEvent"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-284",
+    "query": "make the title line bold and 18pt in the google doc",
+    "kind": "ranked",
+    "expected": [
+      "google_workspace__applyTextStyle",
+      "google_workspace__formatGoogleDocText"
+    ],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-285",
+    "query": "support says checkout errored for pi_3Nd, show me its last payment error and status",
+    "kind": "ranked",
+    "expected": ["stripe__get_payment_intent"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-286",
+    "query": "create a github release v2.1.0 with notes",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-287",
+    "query": "delete issue 88, it's a duplicate",
+    "kind": "ambiguous",
+    "expected": ["gitlab__delete_issue", "linear__linear_delete_issue"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-288",
+    "query": "add a CNAME for docs pointing to cname.vercel-dns.com",
+    "kind": "ambiguous",
+    "expected": ["cloudflare__create_dns_record", "vercel__create_record"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-289",
+    "query": "vercel feautre flags for project",
+    "kind": "ranked",
+    "expected": ["vercel__list_flags", "vercel__list_flags_v2s"],
+    "category": "typo",
+    "server": null
+  },
+  {
+    "id": "dv2-290",
+    "query": "renew domain example.io",
+    "kind": "ranked",
+    "expected": ["vercel__renew_domain"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-291",
+    "query": "deactivate promo_1Pq so it stops working",
+    "kind": "ranked",
+    "expected": ["stripe__update_promotion_code"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-292",
+    "query": "list the DNS records for example.com",
+    "kind": "ambiguous",
+    "expected": ["cloudflare__list_dns_records", "vercel__list_records"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-293",
+    "query": "GDPR erasure request came in, permanently remove customer cus_test_99 from stripe",
+    "kind": "ranked",
+    "expected": ["stripe__delete_customer"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-294",
+    "query": "have sentry's AI figure out the root cause of PROJ-1A2 and suggest a fix",
+    "kind": "ranked",
+    "expected": ["sentry__analyze_issue_with_seer"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-295",
+    "query": "change the status property on the notion page to Done",
+    "kind": "ranked",
+    "expected": ["notion__API-patch-page"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-296",
+    "query": "issues assigned to me that are still open",
+    "kind": "ambiguous",
+    "expected": [
+      "github__search_issues",
+      "gitlab__get_user_issues",
+      "gitlab__search_issues",
+      "linear__linear_search_issues",
+      "jira__jira_ls_issues"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-297",
+    "query": "schedule this to run every night",
+    "kind": "ambiguous",
+    "expected": [
+      "aws_lambda__create_cron_rule",
+      "aws_lambda__create_rate_rule",
+      "aws_lambda__create_advanced_schedule"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-298",
+    "query": "force every visitor onto https on our cloudflare site",
+    "kind": "ranked",
+    "expected": ["cloudflare__patch_setting", "cloudflare__patch_settings"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-299",
+    "query": "report 1200 API calls of usage for cus_4 for usage-based billing",
+    "kind": "ranked",
+    "expected": ["stripe__create_billing_meter_event"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-300",
+    "query": "check whether bob@acme.com is allowed into the grafana Access app",
+    "kind": "ranked",
+    "expected": ["cloudflare__list_access_apps_user_policy_checks"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-301",
+    "query": "submit the tracking number as evidence on chargeback du_1Ab",
+    "kind": "ranked",
+    "expected": ["stripe__update_dispute"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-302",
+    "query": "stop mailinator.com addresses from accessing the app",
+    "kind": "ranked",
+    "expected": ["clerk__create_blocklist_identifier"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-303",
+    "query": "show me open chargebacks from this week",
+    "kind": "ranked",
+    "expected": ["stripe__list_disputes"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-304",
+    "query": "radar reviews open",
+    "kind": "ranked",
+    "expected": ["stripe__list_reviews"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-305",
+    "query": "list all my projects",
+    "kind": "ambiguous",
+    "expected": [
+      "vercel__list_projects",
+      "supabase__list_projects",
+      "gitlab__get_projects",
+      "linear__linear_list_projects",
+      "jira__jira_ls_projects",
+      "sentry__find_projects"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-306",
+    "query": "create a new cycle in linear for next sprint",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-307",
+    "query": "list every user in our clerk instance",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-308",
+    "query": "log in as user_2def to reproduce their bug",
+    "kind": "ranked",
+    "expected": ["clerk__create_actor_token"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-309",
+    "query": "move PROJ-77 to In Review in jira",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-310",
+    "query": "assign the alias beta.example.com to dpl_Op56",
+    "kind": "ranked",
+    "expected": ["vercel__assign_alia"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-311",
+    "query": "github code search useAuth(",
+    "kind": "ranked",
+    "expected": ["github__search_code"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-312",
+    "query": "transfer the vercel project to the acme-prod team",
+    "kind": "ranked",
+    "expected": ["vercel__create_project_transfer_request"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-313",
+    "query": "team-wide secret every vercel project can use, SENTRY_DSN",
+    "kind": "ranked",
+    "expected": ["vercel__create_shared_env_variable"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-314",
+    "query": "create a new database",
+    "kind": "ambiguous",
+    "expected": ["cloudflare__create_d1_database", "notion__API-create-a-data-source"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-315",
+    "query": "pull up ENG-78 and ENG-79 from linear",
+    "kind": "ranked",
+    "expected": [
+      "linear__linear_search_issues_by_identifier",
+      "linear__linear_get_issue"
+    ],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-316",
+    "query": "upgrade sub_1Wx from basic to pro",
+    "kind": "ranked",
+    "expected": ["stripe__update_subscription", "stripe__update_customer_subscription"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-317",
+    "query": "drop the discount that's applied to subscription sub_1Rr",
+    "kind": "ranked",
+    "expected": [
+      "stripe__delete_subscription_discount",
+      "stripe__delete_customer_subscription_discoun"
+    ],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-318",
+    "query": "create a custom price for this one customer",
+    "kind": "ambiguous",
+    "expected": ["stripe__create_price", "clerk__create_billing_price"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-319",
+    "query": "d1 databases list",
+    "kind": "ranked",
+    "expected": ["cloudflare__list_d1_databases"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-320",
+    "query": "which commits are in this PR",
+    "kind": "ambiguous",
+    "expected": ["github__list_commits", "gitlab__get_merge_request_commits"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-321",
+    "query": "push the standup on my calendar to Thursday 10am",
+    "kind": "ranked",
+    "expected": ["google_workspace__updateCalendarEvent"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-322",
+    "query": "commit these four files to the github repo in a single commit",
+    "kind": "ranked",
+    "expected": ["github__push_files"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-323",
+    "query": "vercel env rm LEGACY_API",
+    "kind": "ranked",
+    "expected": ["vercel__delete_project_env"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-324",
+    "query": "pay the marketplace seller acct_1Hh their 80% share",
+    "kind": "ranked",
+    "expected": ["stripe__create_transfer"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-325",
+    "query": "give cus_8 $100 of prepaid credits",
+    "kind": "ranked",
+    "expected": ["stripe__create_billing_credit_grant"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-326",
+    "query": "temporarily disable webhook endpoint we_1Gh while we migrate",
+    "kind": "ranked",
+    "expected": ["stripe__update_webhook_endpoint"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-327",
+    "query": "set maintenance_mode to true in the edge config",
+    "kind": "ranked",
+    "expected": ["vercel__update_edge_config_item"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-328",
+    "query": "what's the weather in Denver tomorrow",
+    "kind": "no_match",
+    "expected": [],
+    "category": "out_of_scope",
+    "server": null
+  },
+  {
+    "id": "dv2-329",
+    "query": "kick off a background scan for existing DNS records but don't add them yet",
+    "kind": "ranked",
+    "expected": ["cloudflare__trigger_dns_records_scan"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-330",
+    "query": "refund shopify order #1043",
+    "kind": "no_match",
+    "expected": [],
+    "category": "absent_product",
+    "server": null
+  },
+  {
+    "id": "dv2-331",
+    "query": "reply to zendesk ticket 8812",
+    "kind": "no_match",
+    "expected": [],
+    "category": "absent_product",
+    "server": null
+  },
+  {
+    "id": "dv2-332",
+    "query": "list the organizations I belong to",
+    "kind": "ambiguous",
+    "expected": ["supabase__list_organizations", "sentry__find_organizations"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-333",
+    "query": "roll zaraz back to last week's published config",
+    "kind": "ranked",
+    "expected": ["cloudflare__update_settings_zaraz_history"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-334",
+    "query": "registrar is asking for the DS record, get the DNSSEC details from cloudflare",
+    "kind": "ranked",
+    "expected": ["cloudflare__get_dnssec"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-335",
+    "query": "list disputes on our cards",
+    "kind": "ambiguous",
+    "expected": ["stripe__list_disputes", "stripe__list_issuing_disputes"],
+    "category": "unnamed_object",
+    "server": null
+  },
+  {
+    "id": "dv2-336",
+    "query": "vercel env add DATABASE_URL production",
+    "kind": "ranked",
+    "expected": ["vercel__create_project_env"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-337",
+    "query": "cloudflare add zone example.org",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_zone"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-338",
+    "query": "put internal.example.com behind company SSO with zero trust",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_access_app"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-339",
+    "query": "list supabase auth users",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-340",
+    "query": "domain autorenew off oldbrand.com",
+    "kind": "ranked",
+    "expected": ["vercel__update_domain_auto_renew"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-341",
+    "query": "create invoice cus_77",
+    "kind": "ranked",
+    "expected": ["stripe__create_invoice"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-342",
+    "query": "withdraw $2,000 to our bank account today",
+    "kind": "ranked",
+    "expected": ["stripe__create_payout"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-343",
+    "query": "vercel dns ls example.com",
+    "kind": "ranked",
+    "expected": ["vercel__list_records"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-344",
+    "query": "cloudflare list zones",
+    "kind": "ranked",
+    "expected": ["cloudflare__list_zones"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-345",
+    "query": "vercel team members",
+    "kind": "ranked",
+    "expected": ["vercel__list_team_members"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-346",
+    "query": "approve github PR #73 with a short LGTM review",
+    "kind": "ranked",
+    "expected": ["github__create_pull_request_review"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-347",
+    "query": "create a datadog monitor for p99 latency",
+    "kind": "no_match",
+    "expected": [],
+    "category": "absent_product",
+    "server": null
+  },
+  {
+    "id": "dv2-348",
+    "query": "fix the time I logged on PROJ-123, it should be 90 minutes",
+    "kind": "ranked",
+    "expected": ["jira__jira_update_worklog"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-349",
+    "query": "approve prv_1Ef from the manual review queue, it's legit",
+    "kind": "ranked",
+    "expected": ["stripe__approve_review"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-350",
+    "query": "what will cus_88's next bill look like if they upgrade to pro",
+    "kind": "ranked",
+    "expected": ["stripe__preview_invoices_create"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-351",
+    "query": "clear the compromised password flag on user_2pqr",
+    "kind": "ranked",
+    "expected": ["clerk__call_unset_user_password_compromised"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-352",
+    "query": "invoke the poller lambda every 5 minutes",
+    "kind": "ranked",
+    "expected": [
+      "aws_lambda__create_rate_rule",
+      "aws_lambda__create_cron_rule",
+      "aws_lambda__create_advanced_schedule"
+    ],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-353",
+    "query": "send anything to an unknown address at our domain to the ops inbox",
+    "kind": "ranked",
+    "expected": ["cloudflare__update_email_routing_rules_catch_all"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-354",
+    "query": "block this IP address 198.51.100.23",
+    "kind": "ambiguous",
+    "expected": [
+      "cloudflare__create_firewall_access_rules_rule",
+      "cloudflare__create_firewall_rule",
+      "cloudflare__create_rulesets_rule",
+      "vercel__update_firewall_config",
+      "vercel__put_firewall_config"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-355",
+    "query": "start a $120 payment for cus_9 that the frontend will confirm",
+    "kind": "ranked",
+    "expected": ["stripe__create_payment_intent"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-356",
+    "query": "send an email from my gmail account",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-357",
+    "query": "chnage clerk production domain to auth.acme.com",
+    "kind": "ranked",
+    "expected": ["clerk__change_production_instance_domain"],
+    "category": "typo",
+    "server": null
+  },
+  {
+    "id": "dv2-358",
+    "query": "delte r2 bucket old-backups",
+    "kind": "ranked",
+    "expected": ["cloudflare__delete_r2_bucket"],
+    "category": "typo",
+    "server": null
+  },
+  {
+    "id": "dv2-359",
+    "query": "purchase coolstartup.dev through vercel",
+    "kind": "ranked",
+    "expected": ["vercel__buy_single_domain", "vercel__buy_domain"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-360",
+    "query": "void in_1PbXqR2eZvKYlo2C, it went out with the wrong amount and we'll reissue",
+    "kind": "ranked",
+    "expected": ["stripe__void_invoice"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-361",
+    "query": "stripe custmer cus_Q8aLm2",
+    "kind": "ranked",
+    "expected": ["stripe__get_customer"],
+    "category": "typo",
+    "server": null
+  },
+  {
+    "id": "dv2-362",
+    "query": "put a banner across our gitlab instance about maintenance on Saturday",
+    "kind": "ranked",
+    "expected": ["gitlab__create_broadcast_message"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-363",
+    "query": "cloudflare mcp portal create",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_access_ai-controls_mcp_portal"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-364",
+    "query": "pull the spending on our issued card ic_1Cd last month",
+    "kind": "ranked",
+    "expected": ["stripe__list_issuing_transactions"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-365",
+    "query": "pause the project to save money",
+    "kind": "ambiguous",
+    "expected": ["vercel__pause_project", "supabase__pause_project"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-366",
+    "query": "serve the R2 bucket from cdn.example.com",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_r2_buckets_domains_custom"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-367",
+    "query": "rotate my AWS IAM access keys",
+    "kind": "no_match",
+    "expected": [],
+    "category": "absent_product",
+    "server": null
+  },
+  {
+    "id": "dv2-368",
+    "query": "hook app.example.com up to the vercel project",
+    "kind": "ranked",
+    "expected": ["vercel__add_project_domain"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-369",
+    "query": "are the CI checks green on github PR #42",
+    "kind": "ranked",
+    "expected": ["github__get_pull_request_status"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-370",
+    "query": "create a storage bucket in supabase for avatars",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-371",
+    "query": "create a confluence page in the ENG space with the release notes",
+    "kind": "ranked",
+    "expected": ["confluence__conf_post"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-372",
+    "query": "stop the build that's running for dpl_Zx91, I pushed the wrong branch",
+    "kind": "ranked",
+    "expected": ["vercel__cancel_deployment"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-373",
+    "query": "set up SAML SSO with Okta for the Initech customer",
+    "kind": "ranked",
+    "expected": ["clerk__create_enterprise_connection"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-374",
+    "query": "stripe checkout session create",
+    "kind": "ranked",
+    "expected": ["stripe__create_checkout_session"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-375",
+    "query": "translate this paragraph into French",
+    "kind": "no_match",
+    "expected": [],
+    "category": "out_of_scope",
+    "server": null
+  },
+  {
+    "id": "dv2-376",
+    "query": "move the file to trash, don't permanently delete it",
+    "kind": "ranked",
+    "expected": ["google_workspace__deleteItem"],
+    "category": "negation",
+    "server": null
+  },
+  {
+    "id": "dv2-377",
+    "query": "set up a webhook to https://hooks.acme.dev/in",
+    "kind": "ambiguous",
+    "expected": ["stripe__create_webhook_endpoint", "vercel__create_webhook"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-378",
+    "query": "clerk bulk invitations",
+    "kind": "ranked",
+    "expected": ["clerk__create_bulk_invitation"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-379",
+    "query": "what did vercel bill us for last month, broken down",
+    "kind": "ranked",
+    "expected": ["vercel__list_billing_charges"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-380",
+    "query": "who's in the platform group",
+    "kind": "ambiguous",
+    "expected": ["gitlab__list_group_members", "vercel__list_access_group_members"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-381",
+    "query": "bring back the paused subscription sub_9Tq so they start getting billed again",
+    "kind": "ranked",
+    "expected": ["stripe__resume_subscription"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-382",
+    "query": "insert or update the user row by email in postgres, don't fail on duplicates",
+    "kind": "ranked",
+    "expected": ["postgres__pg_execute_mutation"],
+    "category": "negation",
+    "server": null
+  },
+  {
+    "id": "dv2-383",
+    "query": "we're getting hammered, turn on challenge mode for every visitor",
+    "kind": "ranked",
+    "expected": ["vercel__update_attack_challenge_mode"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-384",
+    "query": "we shipped the order, collect the held funds on pi_3Ka",
+    "kind": "ranked",
+    "expected": ["stripe__capture_payment_intent"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-385",
+    "query": "stripe webhook endpoint create invoice events",
+    "kind": "ranked",
+    "expected": ["stripe__create_webhook_endpoint"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-386",
+    "query": "turn this plain English into a vercel routing rule: send /docs/* to the docs app",
+    "kind": "ranked",
+    "expected": ["vercel__generate_route"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-387",
+    "query": "create a google form for the event signup",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-388",
+    "query": "what's taking up space in ./logs, largest files first",
+    "kind": "ranked",
+    "expected": ["filesystem__list_directory_with_sizes"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-389",
+    "query": "create a hubspot contact for jane@acme.io",
+    "kind": "no_match",
+    "expected": [],
+    "category": "absent_product",
+    "server": null
+  },
+  {
+    "id": "dv2-390",
+    "query": "what did @jdoe work on in gitlab this week, totals by day",
+    "kind": "ranked",
+    "expected": ["gitlab__analytics_user_summary", "gitlab__list_user_events"],
+    "category": "near_dup",
+    "server": null
+  },
+  {
+    "id": "dv2-391",
+    "query": "sandbox exec npm test",
+    "kind": "ranked",
+    "expected": ["vercel__run_session_command"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-392",
+    "query": "vercel rm deployment dpl_Gh78",
+    "kind": "ranked",
+    "expected": ["vercel__delete_deployment"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-393",
+    "query": "are the CI checks passing on my PR",
+    "kind": "ambiguous",
+    "expected": [
+      "github__get_pull_request_status",
+      "gitlab__get_merge_request_pipelines"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-394",
+    "query": "move these 12 linear issues to Done in one go",
+    "kind": "ranked",
+    "expected": ["linear__linear_bulk_update_issues"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-395",
+    "query": "gitlab milestones acme/web",
+    "kind": "ranked",
+    "expected": ["gitlab__list_milestones"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-396",
+    "query": "swap every 'Acme' for 'Globex' in the contract google doc",
+    "kind": "ranked",
+    "expected": ["google_workspace__findAndReplaceInDoc"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-397",
+    "query": "point api.example.com at 203.0.113.10 in cloudflare",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_dns_record"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-398",
+    "query": "assign the issue to me",
+    "kind": "ambiguous",
+    "expected": [
+      "github__update_issue",
+      "gitlab__update_issue",
+      "linear__linear_edit_issue",
+      "sentry__update_issue"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-399",
+    "query": "save the customer's card for later without charging it now",
+    "kind": "ranked",
+    "expected": ["stripe__create_setup_intent"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-400",
+    "query": "is there an active DDoS attack on our project right now",
+    "kind": "ranked",
+    "expected": ["vercel__list_active_attack_status"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-401",
+    "query": "whats on my calender next week",
+    "kind": "ranked",
+    "expected": ["google_workspace__getCalendarEvents"],
+    "category": "typo",
+    "server": null
+  },
+  {
+    "id": "dv2-402",
+    "query": "failed payouts",
+    "kind": "ranked",
+    "expected": ["stripe__list_payouts"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-403",
+    "query": "promote preview deployment dpl_8fKq2 to production on vercel",
+    "kind": "ranked",
+    "expected": ["vercel__request_promote"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-404",
+    "query": "vercel env ls",
+    "kind": "ranked",
+    "expected": ["vercel__filter_project_env"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-405",
+    "query": "read my unread gmail",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-406",
+    "query": "superbase gen types typescript",
+    "kind": "ranked",
+    "expected": ["supabase__generate_typescript_types"],
+    "category": "typo",
+    "server": null
+  },
+  {
+    "id": "dv2-407",
+    "query": "update the existing DNS record in place, don't add a new one, just the TTL",
+    "kind": "ranked",
+    "expected": ["cloudflare__patch_dns_record", "cloudflare__update_dns_record"],
+    "category": "negation",
+    "server": null
+  },
+  {
+    "id": "dv2-408",
+    "query": "rotate the secret",
+    "kind": "ambiguous",
+    "expected": [
+      "cloudflare__rotate_access_service_tokens",
+      "clerk__call_rotate_o_auth_application_secret",
+      "clerk__call_rotate_machine_secret_key",
+      "cloudflare__rotate_access_keys"
+    ],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-409",
+    "query": "create a ticket for the login redirect bug",
+    "kind": "ambiguous",
+    "expected": [
+      "github__create_issue",
+      "gitlab__create_issue",
+      "linear__linear_create_issue"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-410",
+    "query": "r2 create bucket user-uploads",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_r2_bucket"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-411",
+    "query": "give org admins the billing:manage permission",
+    "kind": "ranked",
+    "expected": ["clerk__call_assign_permission_to_organization_role"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-412",
+    "query": "PR #61 is behind main, bring its branch up to date on github",
+    "kind": "ranked",
+    "expected": ["github__update_pull_request_branch"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-413",
+    "query": "stripe credit notes list",
+    "kind": "ranked",
+    "expected": ["stripe__list_credit_notes"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-414",
+    "query": "refresh everything cached under the 'products' tag, revalidate in the background",
+    "kind": "ranked",
+    "expected": ["vercel__invalidate_by_tag"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-415",
+    "query": "vercel projects",
+    "kind": "ranked",
+    "expected": ["vercel__list_projects"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-416",
+    "query": "verify the two small test deposits on the customer's bank account for ACH",
+    "kind": "ranked",
+    "expected": [
+      "stripe__verify_customer_bank_account",
+      "stripe__verify_customer_source",
+      "stripe__create_payment_intent_verify_microdeposit",
+      "stripe__create_setup_intent_verify_microdeposit"
+    ],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-417",
+    "query": "edge config get item maintenance_mode",
+    "kind": "ranked",
+    "expected": ["vercel__get_edge_config_item"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-418",
+    "query": "take bob@acme.com off the sharing list for the budget sheet",
+    "kind": "ranked",
+    "expected": ["google_workspace__removePermission"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-419",
+    "query": "clerk api keys",
+    "kind": "ranked",
+    "expected": ["clerk__call_api_key"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-420",
+    "query": "how much money is sitting in our stripe account right now",
+    "kind": "ranked",
+    "expected": ["stripe__get_balance"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-421",
+    "query": "sentry resolve WEB-3F1",
+    "kind": "ranked",
+    "expected": ["sentry__update_issue"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-422",
+    "query": "sheets add tab Q4",
+    "kind": "ranked",
+    "expected": ["google_workspace__addSheet", "google_workspace__addSpreadsheetSheet"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-423",
+    "query": "temporarily take the demo project offline",
+    "kind": "ranked",
+    "expected": ["vercel__pause_project"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-424",
+    "query": "change the build command to pnpm build on the project",
+    "kind": "ranked",
+    "expected": ["vercel__update_project"],
+    "category": "natural",
+    "server": null
+  },
+  {
+    "id": "dv2-425",
+    "query": "which job failed in pipeline 88 of acme/api on gitlab",
+    "kind": "ranked",
+    "expected": ["gitlab__get_pipeline_jobs"],
+    "category": "id_in_text",
+    "server": null
+  },
+  {
+    "id": "dv2-426",
+    "query": "CI needs non-interactive credentials to reach an Access protected app",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_access_service_token"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-427",
+    "query": "point prod back at the previous deploy, the new one is throwing 500s",
+    "kind": "ranked",
+    "expected": ["vercel__request_rollback"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-428",
+    "query": "cert pack has been stuck pending validation for a day, restart validation",
+    "kind": "ranked",
+    "expected": ["cloudflare__patch_ssl_certificate_pack"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-429",
+    "query": "order an advanced cert pack covering *.example.com and example.com",
+    "kind": "ranked",
+    "expected": ["cloudflare__create_ssl_certificate_packs_order"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-430",
+    "query": "convert hero.png to webp",
+    "kind": "no_match",
+    "expected": [],
+    "category": "out_of_scope",
+    "server": null
+  },
+  {
+    "id": "dv2-431",
+    "query": "create a new gitlab project called payments-v2",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-432",
+    "query": "who's on the team",
+    "kind": "ambiguous",
+    "expected": [
+      "vercel__list_team_members",
+      "gitlab__list_group_members",
+      "slack__slack_get_users",
+      "notion__API-get-users"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-433",
+    "query": "update the salesforce opportunity stage to closed won",
+    "kind": "no_match",
+    "expected": [],
+    "category": "absent_product",
+    "server": null
+  },
+  {
+    "id": "dv2-434",
+    "query": "attach payment method pm_1Def cus_7",
+    "kind": "ranked",
+    "expected": ["stripe__attach_payment_method"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-435",
+    "query": "just deployed a new app.js but users still get the old one, clear it from the cloudflare edge",
+    "kind": "ranked",
+    "expected": ["cloudflare__purge_cache"],
+    "category": "context_noise",
+    "server": null
+  },
+  {
+    "id": "dv2-436",
+    "query": "deploy a cloudflare worker script for the edge redirect",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-437",
+    "query": "deploy new code to the billing lambda",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-438",
+    "query": "send an SMS to the customer via twilio",
+    "kind": "no_match",
+    "expected": [],
+    "category": "absent_product",
+    "server": null
+  },
+  {
+    "id": "dv2-439",
+    "query": "gitlab retry pipeline 4512",
+    "kind": "ranked",
+    "expected": ["gitlab__manage_pipeline"],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-440",
+    "query": "put an :eyes: on that slack message so they know I saw it",
+    "kind": "ranked",
+    "expected": ["slack__slack_add_reaction"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-441",
+    "query": "read the README from the repo",
+    "kind": "ambiguous",
+    "expected": ["github__get_file_contents", "gitlab__get_file_content"],
+    "category": "unnamed_product",
+    "server": null
+  },
+  {
+    "id": "dv2-442",
+    "query": "lsit all subscripton schedules",
+    "kind": "ranked",
+    "expected": ["stripe__list_subscription_schedules"],
+    "category": "typo",
+    "server": null
+  },
+  {
+    "id": "dv2-443",
+    "query": "charge the card on file for open invoice in_1S0 right now",
+    "kind": "ranked",
+    "expected": ["stripe__pay_invoice"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-444",
+    "query": "cloudfare page rules list",
+    "kind": "ranked",
+    "expected": ["cloudflare__list_pagerules"],
+    "category": "typo",
+    "server": null
+  },
+  {
+    "id": "dv2-445",
+    "query": "put together a price quote for the enterprise deal with Initech",
+    "kind": "ranked",
+    "expected": ["stripe__create_quote"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-446",
+    "query": "share the Q3 board deck with legal@acme.com, view only",
+    "kind": "ranked",
+    "expected": ["google_workspace__shareFile", "google_workspace__addPermission"],
+    "category": "business_vocab",
+    "server": null
+  },
+  {
+    "id": "dv2-447",
+    "query": "export the notion page as a PDF",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-448",
+    "query": "stripe customer delete card",
+    "kind": "ranked",
+    "expected": [
+      "stripe__delete_customer_card",
+      "stripe__delete_customer_source",
+      "stripe__detach_payment_method",
+      "stripe__delete_customer_bank_account"
+    ],
+    "category": "terse",
+    "server": null
+  },
+  {
+    "id": "dv2-449",
+    "query": "create a jira ticket for the login bug in project PAY",
+    "kind": "no_match",
+    "expected": [],
+    "category": "missing_operation",
+    "server": null
+  },
+  {
+    "id": "dv2-450",
+    "query": "run this SQL against the database: select * from orders limit 10",
+    "kind": "ambiguous",
+    "expected": [
+      "postgres__pg_execute_query",
+      "postgres__pg_execute_sql",
+      "supabase__execute_sql",
+      "cloudflare__create_d1_database_query",
+      "cloudflare__create_d1_database_raw"
+    ],
+    "category": "unnamed_product",
+    "server": null
+  }
+]
