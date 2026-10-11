@@ -67,6 +67,12 @@ The Apify, Browserbase, Composio, Context7, DataForSEO, Parallel and Playwright
 marks are taken from each project's own website. They are used only to identify
 the corresponding server and remain the property of their owners.
 
+## Client vendor marks
+
+The Crush, Jan, Witsy and ZCode client icons are taken from each project's own
+website or repository. They are used only to identify the corresponding client
+and remain the property of their owners.
+
 ## RevenueCat
 
 The RevenueCat logomark is vendored from the official
