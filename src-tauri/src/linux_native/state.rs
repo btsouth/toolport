@@ -994,21 +994,16 @@ mod tests {
         let mut registry = Registry::default();
         assert_eq!(client_access_label(&registry, None), "Default access");
         registry.default_access_profile_id = Some("default".into());
-        assert_eq!(
-            client_access_label(&registry, None),
-            "Default access (Default)"
-        );
+        // The migrated set is named "Default", which would only repeat itself.
+        assert_eq!(client_access_label(&registry, None), "Default access");
         let options = client_access_options(&registry);
         assert_eq!(options[0].id, "");
-        assert_eq!(options[0].name, "Default access (Default)");
+        assert_eq!(options[0].name, "Default access");
         assert_eq!(options[1].id, "@all-enabled");
         registry.default_access_profile_id = None;
         registry.default_access_context_id = Some("default".into());
         registry.default_access_legacy_policy = true;
-        assert_eq!(
-            client_access_label(&registry, Some("")),
-            "Default access (Default)"
-        );
+        assert_eq!(client_access_label(&registry, Some("")), "Default access");
         assert_eq!(
             client_access_label(&registry, Some(crate::registry::ALL_ENABLED_ACCESS)),
             "All enabled servers"

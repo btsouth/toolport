@@ -232,7 +232,7 @@ mod tests {
         reg.default_access_profile_id = Some("default".into());
         let text = super::registry_summary(&reg);
         assert!(
-            text.contains("default access: Default access (Default)"),
+            text.contains("default access: Default access\n"),
             "{text}"
         );
         assert!(!text.contains("active profile"));

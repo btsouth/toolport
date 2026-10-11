@@ -3,7 +3,7 @@ import { cn } from "@/lib/utils";
 
 // Vendored official marks from @lobehub/icons-static-svg (MIT), simple-icons
 // (CC0), devicon (MIT), and vendor-published marks for Factory Droid, BoltAI,
-// AnythingLLM, Continue, and Oh My Pi.
+// AnythingLLM, Continue, Oh My Pi, Crush, Jan, Witsy and ZCode.
 // External local assets load only for clients actually on screen and can be
 // cached by the webview. Keep the mixed-color Amazon mark inline because its
 // orange accent and inherited foreground cannot both be expressed by a mask.
@@ -23,6 +23,7 @@ const MONOCHROME = new Set([
   "anythingllm",
   "boltai",
   "cline",
+  "command-code",
   "continue",
   "cursor",
   "devin",
@@ -41,9 +42,9 @@ const MONOCHROME = new Set([
 
 /**
  * Client id -> logo file basename. Most ids match their filename; the two Claude clients
- * share the Anthropic mark family but use distinct files. Ids absent here render a monogram
- * (Crush, Jan, and Witsy publish only a raster mark or a trademarked wordmark, so there is
- * nothing clean to vendor yet).
+ * share the Anthropic mark family but use distinct files. Crush, Jan, Witsy and ZCode publish
+ * only raster marks, so theirs are 128 px PNGs wrapped in SVG. Ids absent here render a
+ * monogram.
  */
 const CLIENT_LOGO: Record<string, string> = {
   "claude-desktop": "claude",
@@ -78,6 +79,11 @@ const CLIENT_LOGO: Record<string, string> = {
   boltai: "boltai",
   anythingllm: "anythingllm",
   continue: "continue",
+  "command-code": "command-code",
+  crush: "crush",
+  jan: "jan",
+  witsy: "witsy",
+  zcode: "zcode",
 };
 
 /** Initials for the monogram fallback: two letters for multi-word names, else two chars. */

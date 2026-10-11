@@ -30,6 +30,7 @@ const MONO_CLIENT_LOGOS: &[&str] = &[
     "anythingllm",
     "boltai",
     "cline",
+    "command-code",
     "continue",
     "cursor",
     "devin-cli",
@@ -82,6 +83,11 @@ pub(super) fn client_logo(id: &str) -> gtk::Image {
         "boltai" => Some(include_bytes!("../../icons/client-logos/boltai.png")),
         "anythingllm" => Some(include_bytes!("../../icons/client-logos/anythingllm.png")),
         "continue" => Some(include_bytes!("../../icons/client-logos/continue.png")),
+        "command-code" => Some(include_bytes!("../../icons/client-logos/command-code.png")),
+        "crush" => Some(include_bytes!("../../icons/client-logos/crush.png")),
+        "jan" => Some(include_bytes!("../../icons/client-logos/jan.png")),
+        "witsy" => Some(include_bytes!("../../icons/client-logos/witsy.png")),
+        "zcode" => Some(include_bytes!("../../icons/client-logos/zcode.png")),
         _ => None,
     };
     bytes.map_or_else(
