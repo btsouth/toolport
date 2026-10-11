@@ -5,7 +5,6 @@ import {
   Activity,
   Braces,
   Check,
-  ChevronRight,
   Copy,
   Eye,
   EyeOff,
@@ -33,6 +32,7 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  DialogTrigger,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import {
@@ -364,10 +364,10 @@ const REGISTRY_FIELD_BY_SETTING = {
   "live-inspect": "liveInspect",
 } as const satisfies Record<RegistrySettingKey, keyof Registry>;
 
-/** Tool-granular scope for one profile (SOU-189): per enabled server, expand to pick exactly
+/** Tool-granular scope for one profile (SOU-189): per enabled server, open an editor to pick exactly
  * which tools the profile exposes. All-checked = the whole server (no narrowing); unchecking
  * writes an allow-list that tools/list, search, and the call guard all honor. Tools load
- * lazily on expand. stdio clients (the per-profile router); the HTTP bridge is a follow-up. */
+ * lazily when the editor opens. stdio clients (the per-profile router); the HTTP bridge is a follow-up. */
 function ProfileToolScope({
   profile,
   registry,
@@ -474,64 +474,79 @@ function ProfileToolScope({
         const open = expanded === serverId;
         return (
           <div key={serverId} className="rounded border border-border/50 bg-muted/10">
-            <button
-              type="button"
-              onClick={() => expand(serverId)}
-              aria-expanded={open}
-              className="flex w-full items-center gap-2 px-2 py-1.5 text-xs hover:bg-muted/30"
+            <Dialog
+              open={open}
+              onOpenChange={(value) => {
+                if (value) void expand(serverId);
+                else setExpanded(null);
+              }}
             >
-              <ChevronRight
-                className={`size-3.5 shrink-0 transition-transform ${open ? "rotate-90" : ""}`}
-              />
-              <span className="font-medium">{serverName.get(serverId)}</span>
-              <span
-                className={`ml-auto ${scoped ? "text-info" : "text-muted-foreground"}`}
-              >
-                {badge}
-              </span>
-            </button>
-            {open && (
-              <div className="border-t border-border/40 px-2 py-1.5">
-                {loadingByServer[serverId] ? (
-                  <p className="text-xs text-muted-foreground">Loading tools…</p>
-                ) : errorByServer[serverId] ? (
-                  <div
-                    role="status"
-                    aria-live="polite"
-                    className="flex flex-col gap-2 rounded-md border border-border p-3"
+              <DialogTrigger asChild>
+                <button
+                  type="button"
+                  aria-haspopup="dialog"
+                  aria-label={`Choose tools for ${serverName.get(serverId)}`}
+                  className="flex w-full items-center gap-2 px-2 py-1.5 text-xs hover:bg-muted/30"
+                >
+                  <span className="font-medium">
+                    Choose tools for {serverName.get(serverId)}
+                  </span>
+                  <span
+                    className={`ml-auto ${scoped ? "text-info" : "text-muted-foreground"}`}
                   >
-                    <p className="text-xs text-muted-foreground">Couldn't load tools</p>
-                    <Button
-                      variant="outline"
-                      size="xs"
-                      className="w-fit"
-                      onClick={() => loadTools(serverId)}
+                    {badge}
+                  </span>
+                </button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Choose tools for {serverName.get(serverId)}</DialogTitle>
+                  <DialogDescription>
+                    Select which tools this access set exposes.
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="max-h-[60vh] overflow-y-auto">
+                  {loadingByServer[serverId] ? (
+                    <p className="text-xs text-muted-foreground">Loading tools…</p>
+                  ) : errorByServer[serverId] ? (
+                    <div
+                      role="status"
+                      aria-live="polite"
+                      className="flex flex-col gap-2 rounded-md border border-border p-3"
                     >
-                      Retry
-                    </Button>
-                  </div>
-                ) : allTools && allTools.length > 0 ? (
-                  <div className="flex flex-col gap-1">
-                    {allTools.map((tool) => (
-                      <label key={tool} className="flex items-center gap-2 text-xs">
-                        <input
-                          type="checkbox"
-                          checked={scoped ? scoped.includes(tool) : true}
-                          disabled={busy}
-                          onChange={() => toggleTool(serverId, tool, allTools)}
-                          className="size-3.5"
-                        />
-                        <code className="font-mono text-foreground/90">{tool}</code>
-                      </label>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="text-xs text-muted-foreground">
-                    This server exposes no tools.
-                  </p>
-                )}
-              </div>
-            )}
+                      <p className="text-xs text-muted-foreground">Couldn't load tools</p>
+                      <Button
+                        variant="outline"
+                        size="xs"
+                        className="w-fit"
+                        onClick={() => loadTools(serverId)}
+                      >
+                        Retry
+                      </Button>
+                    </div>
+                  ) : allTools && allTools.length > 0 ? (
+                    <div className="flex flex-col gap-1">
+                      {allTools.map((tool) => (
+                        <label key={tool} className="flex items-center gap-2 text-xs">
+                          <input
+                            type="checkbox"
+                            checked={scoped ? scoped.includes(tool) : true}
+                            disabled={busy}
+                            onChange={() => toggleTool(serverId, tool, allTools)}
+                            className="size-3.5"
+                          />
+                          <code className="font-mono text-foreground/90">{tool}</code>
+                        </label>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      This server exposes no tools.
+                    </p>
+                  )}
+                </div>
+              </DialogContent>
+            </Dialog>
           </div>
         );
       })}

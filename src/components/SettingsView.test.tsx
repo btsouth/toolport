@@ -129,13 +129,15 @@ describe("SettingsView tool loading", () => {
       name: /github/i,
     });
     expect(githubToggle).toHaveAttribute("type", "button");
-    expect(githubToggle).toHaveAttribute("aria-expanded", "false");
+    expect(githubToggle).toHaveAttribute("aria-haspopup", "dialog");
     await user.click(githubToggle);
-    expect(githubToggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("dialog")).toHaveAccessibleName("Choose tools for GitHub");
 
     expect(screen.getByText("Loading tools…")).toBeInTheDocument();
 
-    // Expand Slack while GitHub is still pending (request B starts).
+    // Open Slack while GitHub is still pending (request B starts).
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(githubToggle).toHaveFocus());
     await user.click(
       screen.getByRole("button", {
         name: /slack/i,
