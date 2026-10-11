@@ -1928,6 +1928,33 @@ fn unwrap_call_tool(payload: &Value) -> (String, Value) {
     (inner, args)
 }
 
+/// A `toolport_call_tool` request without a tool name. Says which keys arrived, so a
+/// client that rewrote the request (for example by merging `arguments` over it) is
+/// visible instead of surfacing as "no route for tool ''".
+fn missing_call_tool_name(payload: &Value) -> Value {
+    let received = match payload {
+        Value::Object(map) if map.is_empty() => "an empty object".to_string(),
+        Value::Object(map) => format!(
+            "keys {}",
+            map.keys()
+                .map(|key| format!("`{key}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::String(_) => "a string instead of an object".to_string(),
+        _ => "no object".to_string(),
+    };
+    json!({
+        "content": [{
+            "type": "text",
+            "text": format!(
+                "toolport_call_tool needs the tool's exact name as a string in `name`, with the tool's own parameters inside `arguments`. This call had no tool name; it received {received}."
+            )
+        }],
+        "isError": true
+    })
+}
+
 /// The server prefix of a namespaced tool name ("stripe_2__create" -> "stripe_2").
 fn tool_prefix(t: &Value) -> String {
     t.get("name")
@@ -7919,7 +7946,11 @@ fn handle_request_with_cancel(
                             .unwrap_or_else(|| json!({})),
                     )
                 } else {
-                    unwrap_call_tool(&arguments)
+                    let unwrapped = unwrap_call_tool(&arguments);
+                    if unwrapped.0.is_empty() {
+                        return Some(success(id, missing_call_tool_name(&arguments)));
+                    }
+                    unwrapped
                 }
             } else {
                 (name, arguments)
@@ -27602,6 +27633,101 @@ mod tests {
         router.add(downstream);
         let catalog = router.aggregated_tools();
         (Arc::new(router), calls, catalog)
+    }
+
+    struct ArgsRoute {
+        seen: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl conduit_lib::downstream::Transport for ArgsRoute {
+        fn request(
+            &mut self,
+            method: &str,
+            params: Value,
+        ) -> Result<Value, conduit_lib::downstream::TransportError> {
+            match method {
+                "initialize" => Ok(json!({ "protocolVersion": "2025-06-18" })),
+                "tools/list" => Ok(json!({
+                    "tools": [{
+                        "name": "add_memory",
+                        "description": "Add a memory",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": { "name": { "type": "string" }, "episode_body": { "type": "string" } },
+                            "required": ["name", "episode_body"]
+                        }
+                    }]
+                })),
+                "tools/call" => {
+                    self.seen.lock().unwrap().push(params);
+                    Ok(json!({ "content": [{ "type": "text", "text": "ok" }], "isError": false }))
+                }
+                other => Err(conduit_lib::downstream::TransportError::Fatal(format!(
+                    "unexpected {other}"
+                ))),
+            }
+        }
+
+        fn notify(
+            &mut self,
+            _method: &str,
+            _params: Value,
+        ) -> Result<(), conduit_lib::downstream::TransportError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn call_tool_keeps_an_argument_named_name() {
+        let _data = DataDirTestEnv::new("call-tool-inner-name");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let downstream = DownstreamServer::connect(
+            "s".to_string(),
+            Box::new(ArgsRoute { seen: Arc::clone(&seen) }),
+        )
+        .unwrap();
+        let mut router = Router::new();
+        router.add(downstream);
+        let router = Arc::new(router);
+        let state = http_state(false);
+        let mut reg = Registry::default();
+        reg.servers.push(stub_server("s", "Server"));
+        *state.registry.lock().unwrap() = reg;
+        *state.cached_tools.lock().unwrap() = Arc::new(CatalogSnapshot::new(router.shared_tools()));
+        swap_router(&state, router);
+        let allowed = HashSet::from(["s".to_string()]);
+        for mode in [DiscoveryMode::Lazy, DiscoveryMode::Full] {
+            seen.lock().unwrap().clear();
+            let response = process_request_wire(
+                &state,
+                &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
+                    "name":"toolport_call_tool",
+                    "arguments":{"name":"s__add_memory", "arguments":{"name":"ep", "episode_body":"x"}}
+                }}),
+                &SearchGuard::default(), Some(&allowed), None, None, None, Some("adapter:claude-code"), None, mode,
+            )
+            .unwrap();
+            assert_eq!(response.envelope["result"]["isError"], false, "{mode:?}: {}", response.envelope);
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "{mode:?}");
+            assert_eq!(seen[0]["name"], "add_memory", "{mode:?}");
+            assert_eq!(seen[0]["arguments"], json!({"name":"ep", "episode_body":"x"}), "{mode:?}");
+        }
+        // A client that drops the wrapper's own `name` gets told what arrived.
+        seen.lock().unwrap().clear();
+        let response = process_request_wire(
+            &state,
+            &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
+                "name":"toolport_call_tool",
+                "arguments":{"arguments":{"name":"ep", "episode_body":"x"}}
+            }}),
+            &SearchGuard::default(), Some(&allowed), None, None, None, Some("adapter:claude-code"), None, DiscoveryMode::Lazy,
+        )
+        .unwrap();
+        assert_eq!(response.envelope["result"]["isError"], true);
+        let text = response.envelope["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no tool name; it received keys `arguments`"), "{text}");
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     struct CacheRoute;
