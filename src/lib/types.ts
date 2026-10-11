@@ -653,6 +653,8 @@ export interface Registry {
   /** Global discovery mode ("full" | "lazy" | "grouped"). Takes precedence over
    * `lazyDiscovery`; absent = fall back to the `lazyDiscovery` bool. */
   discoveryMode?: string | null;
+  /** Set when a 1.x upgrade kept 1.x's Lazy default for every client. */
+  legacyLazyDiscovery?: boolean;
   /** Replacement for the gateway's built-in server instructions, for profiles that set
    * none of their own. Absent = built-in text; empty = send none. */
   gatewayInstructions?: string;

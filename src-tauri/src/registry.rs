@@ -1314,6 +1314,11 @@ pub struct Registry {
     /// browse per-server instead of searching - instead of setting a per-client env var.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_mode: Option<String>,
+    /// Set by the 1.x upgrade when the user was still on 1.x's Lazy default. 1.x ran
+    /// every client in Lazy; without this, 2.0 would read that default as Auto and move
+    /// some clients to Full. New installs never set it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_lazy_discovery: bool,
     /// Server-side "code mode": advertise the `toolport_run_script` meta-tool so an
     /// agent can orchestrate many downstream tool calls in one sandboxed JS script (a single
     /// round-trip). Off by default: each in-script call still hits the same
@@ -1681,6 +1686,7 @@ impl Default for Registry {
             pinned_tools: HashMap::new(),
             quarantine_on_drift: false,
             lazy_discovery: true,
+            legacy_lazy_discovery: false,
             gateway_instructions: None,
             discovery_mode: None,
             code_mode: false,
@@ -2964,11 +2970,13 @@ impl Registry {
     }
 
     /// The global discovery mode only when the user picked one. 1.x wrote
-    /// `lazyDiscovery: true` by default, so only `false` there was a choice.
+    /// `lazyDiscovery: true` by default, so only `false` there was a choice, except
+    /// that an upgraded 1.x default keeps the Lazy it ran with.
     pub fn chosen_global_discovery_mode(&self) -> Option<&str> {
         self.discovery_mode
             .as_deref()
             .or((!self.lazy_discovery).then_some("full"))
+            .or(self.legacy_lazy_discovery.then_some("lazy"))
     }
 
     /// This client's discovery-mode override, if any (`None` = inherit the global mode).

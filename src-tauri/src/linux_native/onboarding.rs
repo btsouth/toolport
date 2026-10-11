@@ -958,6 +958,7 @@ mod tests {
                 scope_id: None,
                 scope_name: None,
                 discovery_mode: None,
+                inherited_discovery: None,
                 config_error: false,
             }],
             profiles: Vec::new(),

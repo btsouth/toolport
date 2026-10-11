@@ -377,6 +377,8 @@ pub(super) struct ClientView {
     pub(super) scope_id: Option<String>,
     pub(super) scope_name: Option<String>,
     pub(super) discovery_mode: Option<String>,
+    /// The global mode a client without its own choice inherits, if the user has one.
+    pub(super) inherited_discovery: Option<String>,
     pub(super) config_error: bool,
 }
 
@@ -413,6 +415,7 @@ impl ClientView {
             scope_id: None,
             scope_name: None,
             discovery_mode: None,
+            inherited_discovery: None,
             config_error: client.error.is_some(),
         }
     }
@@ -517,6 +520,9 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
             .cloned();
         client.scope_name = Some(client_access_label(&registry, client.scope_id.as_deref()));
         client.discovery_mode = registry.client_discovery.get(&client.id).cloned();
+        client.inherited_discovery = registry
+            .chosen_global_discovery_mode()
+            .map(str::to_string);
     }
     clients.sort_by(|left, right| {
         right

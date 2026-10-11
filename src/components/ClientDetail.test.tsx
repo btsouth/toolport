@@ -544,6 +544,28 @@ describe("ClientDetail Auto discovery", () => {
       ),
     ).toBeInTheDocument();
   });
+  it("shows the Lazy a 1.x upgrade kept instead of the client default", () => {
+    render(
+      <ClientDetail
+        client={client({
+          id: "codex",
+          discovery: {
+            autoMode: "full",
+            nativeToolSearch: true,
+            toolsListChanged: false,
+            evidence: "fixture",
+          },
+        })}
+        registry={{ ...emptyRegistry(), legacyLazyDiscovery: true }}
+        onRegistryChange={vi.fn()}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Auto (lazy)")).toBeInTheDocument();
+    expect(
+      screen.getByText("Search, then call tools. Client per-tool permission rules need Full mode."),
+    ).toBeInTheDocument();
+  });
   it.each(["grouped", " GROUPED "])(
     "keeps an explicit override instead of Auto (%s)",
     (mode) => {

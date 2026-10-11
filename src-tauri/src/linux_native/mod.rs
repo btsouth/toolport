@@ -2665,7 +2665,12 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
     );
     if client.gateway_state == state::ClientGatewayState::Connected {
         let mode = crate::clients::discovery_capabilities(&client.id)
-            .resolve_mode(client.discovery_mode.as_deref());
+            .resolve_mode(
+                client
+                    .discovery_mode
+                    .as_deref()
+                    .or(client.inherited_discovery.as_deref()),
+            );
         let discovery_hint = match mode {
             "full" => "Full tool list. Client per-tool permission rules need Full mode.",
             "grouped" => {
@@ -2771,12 +2776,12 @@ fn append_client_discovery_actions(
             .css_classes(["toolport-menu-heading"])
             .build(),
     );
+    let auto_hint = match client.inherited_discovery.as_deref() {
+        Some(mode) => format!("Use your global discovery choice ({mode})"),
+        None => "Use this client's measured backend default discovery mode".to_string(),
+    };
     for (label, mode, hint) in [
-        (
-            "Auto",
-            None,
-            "Use this client's measured backend default discovery mode",
-        ),
+        ("Auto", None, auto_hint.as_str()),
         (
             "Full catalog",
             Some("full"),
@@ -10424,7 +10429,7 @@ mod tests {
             id: id.into(), name: name.into(), app_present: true, config_exists: true,
             uses_connectors: false, server_count: 2, movable_server_count: 0, other_server_count: 2, gateway_state,
             shared_http: false, legacy_bearer_argv: false, scope_id: None, scope_name: None,
-            discovery_mode: Some("lazy".into()), config_error: false,
+            discovery_mode: Some("lazy".into()), inherited_discovery: None, config_error: false,
         }).collect();
         clients.render(state::ClientSnapshot { clients: fixture_clients, profiles: Vec::new(), sessions_error: false, sessions: vec![serde_json::json!({"clientName":"Codex","clientType":"codex","sessionCount":5,"callsToday":60,"lastActiveMs":now-180000,"firstCatalogSize":1711})] });
         let approvals = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -10582,6 +10587,7 @@ mod tests {
             scope_id: None,
             scope_name: None,
             discovery_mode: None,
+            inherited_discovery: None,
             config_error: false,
         };
         let mut heights = Vec::new();
@@ -10650,6 +10656,7 @@ mod tests {
             scope_id: Some("work".into()),
             scope_name: Some("Work".into()),
             discovery_mode: None,
+            inherited_discovery: None,
             config_error: false,
         };
         let mut registry = crate::registry::Registry::default();

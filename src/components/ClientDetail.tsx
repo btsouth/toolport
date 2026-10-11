@@ -119,8 +119,14 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     });
   }
 
-  // Absence is Auto; use the backend default rather than infer it from native search.
-  const autoMode = client.discovery?.autoMode ?? "lazy";
+  // Absence is Auto: the user's global choice if they made one (mirrors
+  // Registry::chosen_global_discovery_mode), else the backend client default.
+  const globalMode = registry?.discoveryMode?.trim().toLowerCase();
+  const chosenGlobal =
+    (globalMode && DISCOVERY_HINT[globalMode] ? globalMode : "") ||
+    (registry?.lazyDiscovery === false ? "full" : "") ||
+    (registry?.legacyLazyDiscovery ? "lazy" : "");
+  const autoMode = chosenGlobal || client.discovery?.autoMode || "lazy";
   const storedMode = registry?.clientDiscovery?.[client.id]?.trim().toLowerCase();
   const clientMode = storedMode && DISCOVERY_HINT[storedMode] ? storedMode : "";
   const effectiveMode = clientMode || autoMode;

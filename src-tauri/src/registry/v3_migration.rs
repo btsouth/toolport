@@ -111,7 +111,7 @@ pub(super) fn migrate_v2_to_v3(value: &mut Value, _: &MigrationContext) -> Resul
 }
 
 /// 1.x ran every client in Lazy unless the user picked another mode. 2.0 treats an
-/// unset mode as Auto, which moves some clients to Full, so keep what upgraders had.
+/// unset mode as Auto, which moves some clients to Full, so mark the old default.
 fn keep_v1_lazy_discovery(document: &mut serde_json::Map<String, Value>) {
     let lazy = document
         .get("lazyDiscovery")
@@ -122,7 +122,7 @@ fn keep_v1_lazy_discovery(document: &mut serde_json::Map<String, Value>) {
         .and_then(Value::as_str)
         .is_some_and(|mode| !mode.trim().is_empty());
     if lazy && !mode_set {
-        document.insert("discoveryMode".into(), Value::String("lazy".into()));
+        document.insert("legacyLazyDiscovery".into(), Value::Bool(true));
     }
 }
 
@@ -193,7 +193,7 @@ mod tests {
         for (lazy, mode, expected) in [
             (None, None, Some("lazy")),
             (Some(true), None, Some("lazy")),
-            (Some(false), None, None),
+            (Some(false), None, Some("full")),
             (Some(true), Some("grouped"), Some("grouped")),
             (Some(true), Some(""), Some("lazy")),
         ] {
@@ -206,16 +206,20 @@ mod tests {
             }
             migrate_v2_to_v3(&mut value, &context).unwrap();
             let reg: Registry = serde_json::from_value(value).unwrap();
-            assert_eq!(reg.discovery_mode.as_deref(), expected, "{lazy:?} {mode:?}");
+            assert_eq!(reg.chosen_global_discovery_mode(), expected, "{lazy:?} {mode:?}");
             // Codex and Cursor would resolve to Full under Auto.
             for client in ["codex", "cursor", "claude-code"] {
                 let resolved = crate::clients::client_discovery_mode(&reg, client);
-                let want = if lazy == Some(false) { "full" } else { expected.unwrap() };
-                assert_eq!(resolved, want, "{client} {lazy:?} {mode:?}");
+                assert_eq!(resolved, expected.unwrap(), "{client} {lazy:?} {mode:?}");
             }
         }
-        // A new install keeps Auto.
-        assert_eq!(Registry::default().discovery_mode, None);
+        // A new install keeps Auto, and the Settings switch still works after upgrade.
+        assert_eq!(Registry::default().chosen_global_discovery_mode(), None);
+        let mut value = fixture(false);
+        migrate_v2_to_v3(&mut value, &context).unwrap();
+        let mut reg: Registry = serde_json::from_value(value).unwrap();
+        reg.set_lazy_discovery(false);
+        assert_eq!(crate::clients::client_discovery_mode(&reg, "claude-code"), "full");
     }
 
     #[test]
