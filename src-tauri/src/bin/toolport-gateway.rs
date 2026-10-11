@@ -37170,12 +37170,11 @@ mod tests {
             drop(sender);
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || done_tx.send(worker.join()).unwrap());
-            done_rx
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap()
-                .unwrap();
+            done_rx.recv_timeout(SHUTDOWN_JOIN_BUDGET).unwrap().unwrap();
         }
     }
+
+    const SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(5);
 
     #[test]
     fn http_ingress_shutdown_joins_idle_responder() {
@@ -37186,7 +37185,10 @@ mod tests {
             drop(ingress);
             done_tx.send(()).unwrap();
         });
-        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // A regression here hangs forever. Loaded Windows runners have taken over a
+        // second to schedule the join, so allow more while staying under the 10s
+        // header deadline a stuck responder would otherwise wait out.
+        done_rx.recv_timeout(SHUTDOWN_JOIN_BUDGET).unwrap();
         drop(server);
     }
 
