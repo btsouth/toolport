@@ -34,8 +34,9 @@ using it. Use the folder that contains your actual registry.
 - **Access sets.** Your existing profiles, tool scopes and folder assignments
   remain. The migration preserves each client's existing access, including
   clients without an explicit set. Servers enabled in any old profile become
-  globally enabled. The upgrade notice explains this separation: turning a
-  server off globally now removes it from every access set.
+  globally enabled. Turning a server off globally now removes it from every
+  access set. The upgrade notice offers to stop old gateways; restart affected
+  clients so they use the new access controls.
 - **Saved approvals.** Existing Always allow entries remain. Approval remains
   bound to the tool definition, so a changed definition can need approval again.
 - **Safety.** If neither approval nor confirmation was enabled, Safety becomes
