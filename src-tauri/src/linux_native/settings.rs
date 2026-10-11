@@ -96,13 +96,6 @@ impl SettingsPage {
         page.set_margin_end(20);
         page.append(
             &gtk::Label::builder()
-                .label("Settings")
-                .halign(gtk::Align::Start)
-                .css_classes(["title-2"])
-                .build(),
-        );
-        page.append(
-            &gtk::Label::builder()
                 .label("Most setups only need General. Everything else starts with safe defaults, and protections required by a connected team stay locked on.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
