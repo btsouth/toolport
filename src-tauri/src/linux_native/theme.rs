@@ -655,10 +655,11 @@ dropdown popover row:selected {{
 }}
 
 .toolport-credential-row {{
-  padding: 13px;
-  border-radius: 11px;
-  border: 1px solid alpha(@toolport_fg, 0.10);
-  background-color: alpha(@toolport_bg_dark, 0.24);
+  padding: 13px 4px;
+  border-radius: 0;
+  border: none;
+  border-bottom: 1px solid alpha(@toolport_fg, 0.12);
+  background-color: transparent;
 }}
 
 .toolport-approvals {{
@@ -740,9 +741,10 @@ dropdown popover row:selected {{
 }}
 
 .toolport-summary-item {{
-  background-color: alpha(@toolport_surface, 0.32);
-  border: 1px solid alpha(@toolport_fg, 0.09);
-  border-radius: 11px;
+  background-color: transparent;
+  border: none;
+  border-bottom: 1px solid alpha(@toolport_fg, 0.12);
+  border-radius: 0;
   padding: 10px 13px;
 }}
 
@@ -751,8 +753,9 @@ dropdown popover row:selected {{
   padding: 8px 12px;
   color: @toolport_fg;
   background-color: alpha(@toolport_surface, 0.28);
-  border: 1px solid alpha(@toolport_success, 0.16);
-  border-radius: 10px;
+  border: none;
+  border-left: 3px solid @toolport_success;
+  border-radius: 0 10px 10px 0;
   box-shadow: none;
 }}
 
@@ -888,9 +891,10 @@ button.toolport-activity-filter {{
 /* Wider than `toolport-summary-item`, which is sized for a number over a
    one-word label rather than a heading over a wrapped sentence. */
 .toolport-value-card {{
-  background-color: alpha(@toolport_surface, 0.32);
-  border: 1px solid alpha(@toolport_fg, 0.09);
-  border-radius: 11px;
+  background-color: transparent;
+  border: none;
+  border-bottom: 1px solid alpha(@toolport_fg, 0.12);
+  border-radius: 0;
   padding: 15px 17px;
 }}
 

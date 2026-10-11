@@ -268,7 +268,7 @@ describe("TeamsView shared-server update", () => {
     await userEvent.click(screen.getByRole("button", { name: "Share selected servers" }));
     await userEvent.click(await screen.findByRole("button", { name: "Share selected" }));
     const warning = await screen.findByText(/stays on in this profile/);
-    expect(warning.className).toMatch(/text-warning/);
+    expect(warning).toHaveClass("toolport-alert", "border-warning");
   });
 
   it("disables the confirm when nothing would be uploaded or switched", async () => {
