@@ -1867,7 +1867,10 @@ impl Router {
                 .iter()
                 .map(|tool| match self.policy_definition(tool) {
                     std::borrow::Cow::Borrowed(_) => Arc::clone(tool),
-                    std::borrow::Cow::Owned(value) => Arc::new(ToolDefinition::new(value)),
+                    std::borrow::Cow::Owned(value) => Arc::new(
+                        ToolDefinition::new(value)
+                            .with_source_input_schema(tool.source_input_schema.clone()),
+                    ),
                 })
                 .collect(),
         )
@@ -2325,14 +2328,19 @@ impl Router {
                     }
                     t["name"] = json!(exposed);
                     let mut compiled = None;
+                    let mut source_input_schema = None;
                     if let Some(schema) = t.get_mut("inputSchema") {
+                        source_input_schema = Some(crate::integrity::schema_part_hash(schema));
                         let arguments = crate::schema_compat::normalize(schema);
                         inline_refs(schema);
                         if !arguments.is_empty() {
                             compiled = Some(Arc::new(arguments));
                         }
                     }
-                    let definition = Arc::new(ToolDefinition::with_arguments(t, compiled));
+                    let definition = Arc::new(
+                        ToolDefinition::with_arguments(t, compiled)
+                            .with_source_input_schema(source_input_schema),
+                    );
                     definitions.insert(key, Arc::downgrade(&definition));
                     definition
                 });
