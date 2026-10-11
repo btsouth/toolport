@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, useRef } from "react";
+import { useCallback, useEffect, useMemo, useState, useRef, type ReactNode } from "react";
 import {
   Activity,
   Braces,
@@ -901,77 +901,13 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   );
 
   return (
-    <div className="mx-auto flex max-w-2xl flex-col gap-6">
+    <div className="mx-auto flex max-w-2xl flex-col gap-8">
+      {/* Sections run from what most people change to what almost nobody does.
+          Access and Advanced start folded so the page opens on the essentials. */}
       <section className="flex flex-col gap-2">
-        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Client connections
-        </h2>
-        <p className="text-sm text-muted-foreground">
-          Restore client configurations before removing Toolport.
-        </p>
-        <Button
-          variant="outline"
-          className="self-start"
-          disabled={removeBusy}
-          onClick={() => setRemoveOpen(true)}
-        >
-          Remove Toolport from all clients
-        </Button>
-        {removeResults && (
-          <ul className="text-sm" aria-live="polite">
-            {removeResults.length === 0 ? (
-              <li>No client connections to remove.</li>
-            ) : (
-              removeResults.map((result) => (
-                <li
-                  key={`${result.clientId}:${result.path}`}
-                  className={result.error ? "text-destructive" : "text-muted-foreground"}
-                >
-                  {result.clientId}: {result.error ?? "Client configuration restored"}
-                  {result.warnings?.length ? `; ${result.warnings.join("; ")}` : ""}
-                </li>
-              ))
-            )}
-          </ul>
-        )}
-        <Dialog
-          open={removeOpen}
-          onOpenChange={(open) => {
-            if (!removeBusy) setRemoveOpen(open);
-          }}
-        >
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Remove Toolport from all clients?</DialogTitle>
-              <DialogDescription>
-                Unchanged configs return to their original bytes. If you edited a config,
-                Toolport preserves your edits and restores entries it moved. Each client
-                result is reported here.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button
-                variant="outline"
-                disabled={removeBusy}
-                onClick={() => setRemoveOpen(false)}
-              >
-                Cancel
-              </Button>
-              <Button
-                variant="destructive"
-                disabled={removeBusy}
-                onClick={() => void removeAll()}
-              >
-                {removeBusy ? "Removing…" : "Remove from all clients"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-      </section>
-      <section className="flex flex-col gap-2">
-        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          General
-        </h2>
+        <SectionHeading title="General">
+          Startup, appearance and how agents find tools.
+        </SectionHeading>
         {toggle(
           Power,
           autostart.status === "ready" && autostart.enabled,
@@ -1026,12 +962,6 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             ))}
           </div>
         </div>
-      </section>
-
-      <section className="flex flex-col gap-2">
-        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Discovery
-        </h2>
         {toggle(
           Layers,
           lazyDiscovery,
@@ -1041,23 +971,11 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           apply("lazy-discovery", setLazyDiscovery),
           "lazy-discovery",
         )}
-        {/* Tools always included is a refinement of lazy discovery (the tools it must never
-            hide), not a peer feature, so nest it under the Lazy discovery toggle with an
-            indent + left rail. It has no meaning when lazy discovery is off, so it collapses
-            away entirely then. */}
-        {lazyDiscovery ? (
-          <div className="ml-4 border-l-2 border-border/50 pl-3">
-            <PinnedPrerequisites
-              registry={registry}
-              onRegistryChange={onRegistryChange}
-            />
-          </div>
-        ) : null}
       </section>
       <section className="flex flex-col gap-2">
-        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Security
-        </h2>
+        <SectionHeading title="Safety">
+          How Toolport handles risky tool calls.
+        </SectionHeading>
         <label className="flex items-center gap-3 text-sm">
           Safety
           <select
@@ -1168,8 +1086,52 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             </ul>
           </div>
         )}
-        <details>
-          <summary>Advanced</summary>
+        {allowedTools.length === 0 && allowedError && (
+          <div className="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+            <UserCheck className="size-4 shrink-0 text-info" />
+            <span>Couldn&apos;t read the allowed-tools list. Retrying every 10s.</span>
+          </div>
+        )}
+        {allowedTools.length > 0 && (
+          <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/20 px-3 py-2.5">
+            <div className="flex items-center gap-2">
+              <UserCheck className="size-4 shrink-0 text-info" />
+              <span className="text-sm font-medium">Allowed tools</span>
+              <span className="text-xs text-muted-foreground">
+                {allowedError ? "list may be stale" : "skip human approval"}
+              </span>
+            </div>
+            <ul className="flex flex-col gap-1.5">
+              {allowedTools.map((t) => (
+                <li key={t.key} className="flex items-center gap-2 text-xs">
+                  <span className="min-w-0 truncate font-mono">
+                    {t.server}/{t.tool}
+                  </span>
+                  <span className="shrink-0 text-muted-foreground">
+                    {t.persistent ? "always" : "this session"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void revokeAllowed(t.key)}
+                    className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
+                  >
+                    Revoke
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </section>
+      <details className="flex flex-col gap-2">
+        <summary className="cursor-pointer list-outside">
+          <span className="text-base font-semibold">Access</span>
+          <span className="block text-sm text-muted-foreground">
+            Limit which servers and tools each client can use, by client or project
+            folder.
+          </span>
+        </summary>
+        <div className="mt-3 flex flex-col gap-2">
           {profiles.length > 0 && (
             <section className="flex flex-col gap-2">
               <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
@@ -1337,6 +1299,17 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               <FolderRouting registry={registry} onRegistryChange={onRegistryChange} />
             </section>
           )}
+        </div>
+      </details>
+      <details className="flex flex-col gap-2">
+        <summary className="cursor-pointer list-outside">
+          <span className="text-base font-semibold">Advanced</span>
+          <span className="block text-sm text-muted-foreground">
+            Code mode, personal data, inspection, pinned tools, the local HTTP endpoint
+            and old gateways.
+          </span>
+        </summary>
+        <div className="mt-3 flex flex-col gap-2">
           {toggle(
             Braces,
             codeMode,
@@ -1369,379 +1342,426 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             applyLiveInspect,
             "live-inspect",
           )}
-          {allowedTools.length === 0 && allowedError && (
-            <div className="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-              <UserCheck className="size-4 shrink-0 text-info" />
-              <span>Couldn&apos;t read the allowed-tools list. Retrying every 10s.</span>
+          {/* Tools always included is a refinement of lazy discovery (the tools it must never
+            hide), not a peer feature, so nest it under the Lazy discovery toggle with an
+            indent + left rail. It has no meaning when lazy discovery is off, so it collapses
+            away entirely then. */}
+          {lazyDiscovery ? (
+            <div className="ml-4 border-l-2 border-border/50 pl-3">
+              <PinnedPrerequisites
+                registry={registry}
+                onRegistryChange={onRegistryChange}
+              />
             </div>
-          )}
-          {allowedTools.length > 0 && (
-            <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/20 px-3 py-2.5">
-              <div className="flex items-center gap-2">
-                <UserCheck className="size-4 shrink-0 text-info" />
-                <span className="text-sm font-medium">Allowed tools</span>
+          ) : null}
+          <div className="flex flex-col gap-2 rounded-md border px-3 py-2.5">
+            <label className="flex items-center gap-2.5 text-sm">
+              <Globe
+                className={`size-4 shrink-0 ${bridge?.running ? "text-success" : "text-muted-foreground"}`}
+              />
+              <span className="flex min-w-0 flex-1 flex-col leading-tight">
+                <span className="font-medium">Open WebUI / HTTP endpoint</span>
                 <span className="text-xs text-muted-foreground">
-                  {allowedError ? "list may be stale" : "skip human approval"}
+                  Serve your tools over HTTP/OpenAPI for Open WebUI and any OpenAPI client
                 </span>
-              </div>
-              <ul className="flex flex-col gap-1.5">
-                {allowedTools.map((t) => (
-                  <li key={t.key} className="flex items-center gap-2 text-xs">
-                    <span className="min-w-0 truncate font-mono">
-                      {t.server}/{t.tool}
-                    </span>
-                    <span className="shrink-0 text-muted-foreground">
-                      {t.persistent ? "always" : "this session"}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => void revokeAllowed(t.key)}
-                      className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
-                    >
-                      Revoke
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </details>
-      </section>
-      <section className="flex flex-col gap-2">
-        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Integrations
-        </h2>
-        <div className="flex flex-col gap-2 rounded-md border px-3 py-2.5">
-          <label className="flex items-center gap-2.5 text-sm">
-            <Globe
-              className={`size-4 shrink-0 ${bridge?.running ? "text-success" : "text-muted-foreground"}`}
-            />
-            <span className="flex min-w-0 flex-1 flex-col leading-tight">
-              <span className="font-medium">Open WebUI / HTTP endpoint</span>
-              <span className="text-xs text-muted-foreground">
-                Serve your tools over HTTP/OpenAPI for Open WebUI and any OpenAPI client
               </span>
-            </span>
-            <Switch
-              checked={!!bridge?.running}
-              onCheckedChange={toggleBridge}
-              disabled={bridgeBusy}
-            />
-          </label>
-          {bridgeError && bridge === null && (
-            <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <span>
-                Couldn&apos;t read the HTTP endpoint status. The gateway may be starting
-                up.
-              </span>
-              <button
-                type="button"
-                onClick={loadBridge}
-                className="shrink-0 font-medium text-foreground underline underline-offset-2 hover:text-primary"
-              >
-                Retry
-              </button>
-            </p>
-          )}
-          {bridge?.running && bridge.url && (
-            <>
-              <div className="flex items-center gap-2 rounded border bg-muted/40 px-2 py-1.5">
-                <span className="shrink-0 text-[11px] font-medium text-muted-foreground">
-                  URL
+              <Switch
+                checked={!!bridge?.running}
+                onCheckedChange={toggleBridge}
+                disabled={bridgeBusy}
+              />
+            </label>
+            {bridgeError && bridge === null && (
+              <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <span>
+                  Couldn&apos;t read the HTTP endpoint status. The gateway may be starting
+                  up.
                 </span>
-                <code className="min-w-0 flex-1 truncate text-xs">{bridge.url}</code>
                 <button
                   type="button"
-                  onClick={() => copy(bridge.url!, "url")}
-                  title="Copy URL"
-                  className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  onClick={loadBridge}
+                  className="shrink-0 font-medium text-foreground underline underline-offset-2 hover:text-primary"
                 >
-                  {copied === "url" ? (
-                    <Check className="size-3.5 text-success" />
-                  ) : (
-                    <Copy className="size-3.5" />
-                  )}
+                  Retry
                 </button>
-              </div>
-              {bridge.token && (
+              </p>
+            )}
+            {bridge?.running && bridge.url && (
+              <>
                 <div className="flex items-center gap-2 rounded border bg-muted/40 px-2 py-1.5">
                   <span className="shrink-0 text-[11px] font-medium text-muted-foreground">
-                    Token
+                    URL
                   </span>
-                  <code className="min-w-0 flex-1 truncate text-xs">
-                    {showToken ? bridge.token : "•".repeat(24)}
-                  </code>
+                  <code className="min-w-0 flex-1 truncate text-xs">{bridge.url}</code>
                   <button
                     type="button"
-                    onClick={() => setShowToken((s) => !s)}
-                    title={showToken ? "Hide token" : "Reveal token"}
-                    aria-label={showToken ? "Hide token" : "Reveal token"}
+                    onClick={() => copy(bridge.url!, "url")}
+                    title="Copy URL"
                     className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                   >
-                    {showToken ? (
-                      <EyeOff className="size-3.5" />
-                    ) : (
-                      <Eye className="size-3.5" />
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => copy(bridge.token!, "token")}
-                    title="Copy token"
-                    className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-                  >
-                    {copied === "token" ? (
+                    {copied === "url" ? (
                       <Check className="size-3.5 text-success" />
                     ) : (
                       <Copy className="size-3.5" />
                     )}
                   </button>
                 </div>
-              )}
-              <p className="text-xs text-muted-foreground">
-                In Open WebUI: Settings &rarr; Tools &rarr; add the URL as an OpenAPI
-                server and paste the token as its API key (Bearer auth), then set Function
-                Calling to Native (per chat). The token stops other local apps from
-                calling your tools.
-              </p>
+                {bridge.token && (
+                  <div className="flex items-center gap-2 rounded border bg-muted/40 px-2 py-1.5">
+                    <span className="shrink-0 text-[11px] font-medium text-muted-foreground">
+                      Token
+                    </span>
+                    <code className="min-w-0 flex-1 truncate text-xs">
+                      {showToken ? bridge.token : "•".repeat(24)}
+                    </code>
+                    <button
+                      type="button"
+                      onClick={() => setShowToken((s) => !s)}
+                      title={showToken ? "Hide token" : "Reveal token"}
+                      aria-label={showToken ? "Hide token" : "Reveal token"}
+                      className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                    >
+                      {showToken ? (
+                        <EyeOff className="size-3.5" />
+                      ) : (
+                        <Eye className="size-3.5" />
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => copy(bridge.token!, "token")}
+                      title="Copy token"
+                      className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                    >
+                      {copied === "token" ? (
+                        <Check className="size-3.5 text-success" />
+                      ) : (
+                        <Copy className="size-3.5" />
+                      )}
+                    </button>
+                  </div>
+                )}
+                <p className="text-xs text-muted-foreground">
+                  In Open WebUI: Settings &rarr; Tools &rarr; add the URL as an OpenAPI
+                  server and paste the token as its API key (Bearer auth), then set
+                  Function Calling to Native (per chat). The token stops other local apps
+                  from calling your tools.
+                </p>
 
-              <div className="mt-1 flex flex-col gap-2 rounded border bg-muted/20 p-2.5">
-                <div className="flex items-baseline justify-between gap-2">
-                  <span className="text-[11px] font-medium text-muted-foreground">
-                    Scoped clients
-                  </span>
-                  <span className="text-[11px] text-muted-foreground/70">
-                    each gets its own token and server set
-                  </span>
-                </div>
+                <div className="mt-1 flex flex-col gap-2 rounded border bg-muted/20 p-2.5">
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className="text-[11px] font-medium text-muted-foreground">
+                      Scoped clients
+                    </span>
+                    <span className="text-[11px] text-muted-foreground/70">
+                      each gets its own token and server set
+                    </span>
+                  </div>
 
-                {httpClients.length > 0 && (
-                  <ul className="flex flex-col gap-1">
-                    {httpClients.map((c) => (
-                      <li key={c.id} className="flex items-center gap-2 text-xs">
-                        <span className="truncate font-medium">
-                          {c.label || "(unnamed)"}
+                  {httpClients.length > 0 && (
+                    <ul className="flex flex-col gap-1">
+                      {httpClients.map((c) => (
+                        <li key={c.id} className="flex items-center gap-2 text-xs">
+                          <span className="truncate font-medium">
+                            {c.label || "(unnamed)"}
+                          </span>
+                          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                            {c.profile === "@all-enabled"
+                              ? "All enabled servers"
+                              : profiles.find(
+                                  (p) => p.id === c.profile || p.name === c.profile,
+                                )?.name ||
+                                c.profile ||
+                                "Full connected set"}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => removeClient(c.id)}
+                            aria-label={`Revoke ${c.label}`}
+                            className="ml-auto shrink-0 rounded p-1 text-muted-foreground/60 hover:bg-destructive/10 hover:text-destructive"
+                          >
+                            <Trash2 className="size-3.5" />
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+
+                  {newToken && (
+                    <>
+                      <div className="flex items-center gap-2 rounded border border-success/30 bg-success/5 px-2 py-1.5">
+                        <span className="shrink-0 text-[11px] font-medium text-success">
+                          New token
                         </span>
-                        <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                          {c.profile === "@all-enabled"
-                            ? "All enabled servers"
-                            : profiles.find(
-                                (p) => p.id === c.profile || p.name === c.profile,
-                              )?.name ||
-                              c.profile ||
-                              "Full connected set"}
-                        </span>
+                        <code className="min-w-0 flex-1 truncate text-xs">
+                          {newToken}
+                        </code>
                         <button
                           type="button"
-                          onClick={() => removeClient(c.id)}
-                          aria-label={`Revoke ${c.label}`}
-                          className="ml-auto shrink-0 rounded p-1 text-muted-foreground/60 hover:bg-destructive/10 hover:text-destructive"
+                          onClick={() => copy(newToken, "newtoken")}
+                          title="Copy token"
+                          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                         >
-                          <Trash2 className="size-3.5" />
+                          {copied === "newtoken" ? (
+                            <Check className="size-3.5 text-success" />
+                          ) : (
+                            <Copy className="size-3.5" />
+                          )}
                         </button>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-
-                {newToken && (
-                  <>
-                    <div className="flex items-center gap-2 rounded border border-success/30 bg-success/5 px-2 py-1.5">
-                      <span className="shrink-0 text-[11px] font-medium text-success">
-                        New token
-                      </span>
-                      <code className="min-w-0 flex-1 truncate text-xs">{newToken}</code>
-                      <button
-                        type="button"
-                        onClick={() => copy(newToken, "newtoken")}
-                        title="Copy token"
-                        className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-                      >
-                        {copied === "newtoken" ? (
-                          <Check className="size-3.5 text-success" />
-                        ) : (
-                          <Copy className="size-3.5" />
-                        )}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setNewToken(null)}
-                        aria-label="Dismiss"
-                        className="shrink-0 rounded p-1 text-muted-foreground/60 hover:text-foreground"
-                      >
-                        <X className="size-3.5" />
-                      </button>
-                    </div>
-                    <p className="text-[11px] text-warning">
-                      Copy this token now, it won't be shown again.
-                    </p>
-                  </>
-                )}
-
-                <div className="flex items-center gap-2">
-                  <input
-                    value={newLabel}
-                    onChange={(e) => setNewLabel(e.target.value)}
-                    placeholder="Client name (e.g. Open WebUI)"
-                    className="h-8 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-xs focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none"
-                  />
-                  {profiles.length > 0 && (
-                    <Select
-                      value={newProfile || "__default__"}
-                      onValueChange={(v) => setNewProfile(v === "__default__" ? "" : v)}
-                    >
-                      <SelectTrigger
-                        size="sm"
-                        aria-label="Access"
-                        className="h-8 w-32 shrink-0 text-xs"
-                      >
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="__default__">Full connected set</SelectItem>
-                        <SelectItem value="@all-enabled">All enabled servers</SelectItem>
-                        {profiles.map((p) => (
-                          <SelectItem key={p.id} value={p.id}>
-                            {p.name}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                        <button
+                          type="button"
+                          onClick={() => setNewToken(null)}
+                          aria-label="Dismiss"
+                          className="shrink-0 rounded p-1 text-muted-foreground/60 hover:text-foreground"
+                        >
+                          <X className="size-3.5" />
+                        </button>
+                      </div>
+                      <p className="text-[11px] text-warning">
+                        Copy this token now, it won't be shown again.
+                      </p>
+                    </>
                   )}
-                  <button
-                    type="button"
-                    onClick={addClient}
-                    disabled={clientBusy || !newLabel.trim()}
-                    className="h-8 shrink-0 rounded-md border bg-background px-2.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
-                  >
-                    Add
-                  </button>
+
+                  <div className="flex items-center gap-2">
+                    <input
+                      value={newLabel}
+                      onChange={(e) => setNewLabel(e.target.value)}
+                      placeholder="Client name (e.g. Open WebUI)"
+                      className="h-8 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-xs focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none"
+                    />
+                    {profiles.length > 0 && (
+                      <Select
+                        value={newProfile || "__default__"}
+                        onValueChange={(v) => setNewProfile(v === "__default__" ? "" : v)}
+                      >
+                        <SelectTrigger
+                          size="sm"
+                          aria-label="Access"
+                          className="h-8 w-32 shrink-0 text-xs"
+                        >
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="__default__">Full connected set</SelectItem>
+                          <SelectItem value="@all-enabled">
+                            All enabled servers
+                          </SelectItem>
+                          {profiles.map((p) => (
+                            <SelectItem key={p.id} value={p.id}>
+                              {p.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    )}
+                    <button
+                      type="button"
+                      onClick={addClient}
+                      disabled={clientBusy || !newLabel.trim()}
+                      className="h-8 shrink-0 rounded-md border bg-background px-2.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
+                    >
+                      Add
+                    </button>
+                  </div>
                 </div>
-              </div>
-            </>
-          )}
-        </div>
-        <div className="flex flex-col gap-2 rounded-md border px-3 py-2.5">
-          <div className="flex items-center gap-2.5 text-sm">
-            <RefreshCw
-              className={`size-4 shrink-0 text-muted-foreground ${reapBusy ? "animate-spin" : ""}`}
-            />
-            <span className="flex min-w-0 flex-1 flex-col leading-tight">
-              <span className="font-medium">Stop old gateways</span>
-              <span className="text-xs text-muted-foreground">
-                End leftover gateway processes from earlier installs. Where the gateway
-                path stays the same across upgrades, a host that respawns MCP picks up the
-                new binary on its own. Where the filename carries its version, or the old
-                one sits at a path an upgrade never touches, an app that was already
-                running keeps launching it until you restart that app.
-              </span>
-            </span>
-            <button
-              type="button"
-              disabled={reapBusy}
-              onClick={async () => {
-                setReapBusy(true);
-                setReapResult(null);
-                try {
-                  const outcome = await stopStaleGateways();
-                  // Always from the outcome: it carries the merged advice, so
-                  // clicking Run before a client has respawned cannot blank the
-                  // panel below (SOU-435).
-                  setNeedsRestart(outcome.needsRestart);
-                  // This outcome IS a fresh answer to "which apps need a
-                  // restart", so a stale "couldn't check" panel must go with it.
-                  // Leaving it up would state the check failed directly above
-                  // the check's own result, which is the same contradiction the
-                  // panel exists to prevent (#730).
-                  setRestartCheckFailed(false);
-                  const parts: string[] = [];
-                  if (outcome.killed.length > 0) {
-                    parts.push(
-                      `Stopped ${outcome.killed.length}: ${outcome.killed.join("; ")}`,
-                    );
-                  }
-                  // Reporting "found nothing" while a process is still running would
-                  // be the same lie the panel exists to prevent.
-                  if (outcome.failed.length > 0) {
-                    parts.push(
-                      `Could not stop ${outcome.failed.length}: ${outcome.failed.join("; ")}`,
-                    );
-                  }
-                  setReapResult(
-                    parts.length > 0
-                      ? parts.join(". ")
-                      : outcome.needsRestart.length > 0
-                        ? // Saying "found nothing" while the panel below names an app
-                          // still launching an old gateway would be the same
-                          // self-contradiction this panel exists to prevent. Naming
-                          // only the moment ("none right now") was not enough either:
-                          // read directly above "5 apps are still launching an old
-                          // gateway" it still lands as a contradiction. State the
-                          // reason, because that is what makes both true at once — a
-                          // client spawns the gateway on its next tool call, not
-                          // continuously.
-                          "Nothing to stop: these apps spawn the old gateway on their " +
-                          "next tool call, so there is no process running between calls."
-                        : "No old gateway processes found.",
-                  );
-                } catch (e) {
-                  toastError(`Couldn't stop old gateways: ${e}`);
-                } finally {
-                  setReapBusy(false);
-                }
-              }}
-              className="h-8 shrink-0 rounded-md border bg-background px-2.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
-            >
-              {reapBusy ? "Working…" : "Run"}
-            </button>
+              </>
+            )}
           </div>
-          {reapResult && <p className="text-xs text-muted-foreground">{reapResult}</p>}
-          {restartCheckFailed && (
-            <p className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
-              Couldn&apos;t check for apps using an old gateway.
+          <div className="flex flex-col gap-2 rounded-md border px-3 py-2.5">
+            <div className="flex items-center gap-2.5 text-sm">
+              <RefreshCw
+                className={`size-4 shrink-0 text-muted-foreground ${reapBusy ? "animate-spin" : ""}`}
+              />
+              <span className="flex min-w-0 flex-1 flex-col leading-tight">
+                <span className="font-medium">Stop old gateways</span>
+                <span className="text-xs text-muted-foreground">
+                  End leftover gateway processes from earlier installs. Where the gateway
+                  path stays the same across upgrades, a host that respawns MCP picks up
+                  the new binary on its own. Where the filename carries its version, or
+                  the old one sits at a path an upgrade never touches, an app that was
+                  already running keeps launching it until you restart that app.
+                </span>
+              </span>
               <button
                 type="button"
-                aria-label="Retry checking for old gateway"
-                onClick={() => void loadNeedsRestart()}
-                className="shrink-0 font-medium text-foreground underline underline-offset-2 hover:text-primary"
+                disabled={reapBusy}
+                onClick={async () => {
+                  setReapBusy(true);
+                  setReapResult(null);
+                  try {
+                    const outcome = await stopStaleGateways();
+                    // Always from the outcome: it carries the merged advice, so
+                    // clicking Run before a client has respawned cannot blank the
+                    // panel below (SOU-435).
+                    setNeedsRestart(outcome.needsRestart);
+                    // This outcome IS a fresh answer to "which apps need a
+                    // restart", so a stale "couldn't check" panel must go with it.
+                    // Leaving it up would state the check failed directly above
+                    // the check's own result, which is the same contradiction the
+                    // panel exists to prevent (#730).
+                    setRestartCheckFailed(false);
+                    const parts: string[] = [];
+                    if (outcome.killed.length > 0) {
+                      parts.push(
+                        `Stopped ${outcome.killed.length}: ${outcome.killed.join("; ")}`,
+                      );
+                    }
+                    // Reporting "found nothing" while a process is still running would
+                    // be the same lie the panel exists to prevent.
+                    if (outcome.failed.length > 0) {
+                      parts.push(
+                        `Could not stop ${outcome.failed.length}: ${outcome.failed.join("; ")}`,
+                      );
+                    }
+                    setReapResult(
+                      parts.length > 0
+                        ? parts.join(". ")
+                        : outcome.needsRestart.length > 0
+                          ? // Saying "found nothing" while the panel below names an app
+                            // still launching an old gateway would be the same
+                            // self-contradiction this panel exists to prevent. Naming
+                            // only the moment ("none right now") was not enough either:
+                            // read directly above "5 apps are still launching an old
+                            // gateway" it still lands as a contradiction. State the
+                            // reason, because that is what makes both true at once — a
+                            // client spawns the gateway on its next tool call, not
+                            // continuously.
+                            "Nothing to stop: these apps spawn the old gateway on their " +
+                            "next tool call, so there is no process running between calls."
+                          : "No old gateway processes found.",
+                    );
+                  } catch (e) {
+                    toastError(`Couldn't stop old gateways: ${e}`);
+                  } finally {
+                    setReapBusy(false);
+                  }
+                }}
+                className="h-8 shrink-0 rounded-md border bg-background px-2.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
               >
-                Retry
+                {reapBusy ? "Working…" : "Run"}
               </button>
-            </p>
-          )}
-          {needsRestart.length > 0 && (
-            <div className="rounded-md border border-warning/40 bg-warning/5 p-3">
-              <p className="text-xs font-medium text-warning">
-                {needsRestart.length === 1
-                  ? "1 app is still launching an old gateway"
-                  : `${needsRestart.length} apps are still launching an old gateway`}
+            </div>
+            {reapResult && <p className="text-xs text-muted-foreground">{reapResult}</p>}
+            {restartCheckFailed && (
+              <p className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
+                Couldn&apos;t check for apps using an old gateway.
+                <button
+                  type="button"
+                  aria-label="Retry checking for old gateway"
+                  onClick={() => void loadNeedsRestart()}
+                  className="shrink-0 font-medium text-foreground underline underline-offset-2 hover:text-primary"
+                >
+                  Retry
+                </button>
               </p>
-              <ul className="mt-1.5 space-y-1">
-                {needsRestart.map((c) => (
-                  <li key={c.clientPid} className="text-xs text-muted-foreground">
-                    <span className="font-medium text-foreground">{c.client}</span>
-                    {/* The pid is the only thing separating two rows for the same app.
+            )}
+            {needsRestart.length > 0 && (
+              <div className="rounded-md border border-warning/40 bg-warning/5 p-3">
+                <p className="text-xs font-medium text-warning">
+                  {needsRestart.length === 1
+                    ? "1 app is still launching an old gateway"
+                    : `${needsRestart.length} apps are still launching an old gateway`}
+                </p>
+                <ul className="mt-1.5 space-y-1">
+                  {needsRestart.map((c) => (
+                    <li key={c.clientPid} className="text-xs text-muted-foreground">
+                      <span className="font-medium text-foreground">{c.client}</span>
+                      {/* The pid is the only thing separating two rows for the same app.
                         Without it, several copies of one editor render as identical
                         lines that read as a duplicate-row bug, and "restart each one"
                         cannot be followed when a dozen are running. */}
-                    <span className="ml-1 font-mono text-muted-foreground/70">
-                      (pid {c.clientPid})
-                    </span>{" "}
-                    keeps starting <code className="font-mono">{c.gateway}</code>
-                  </li>
-                ))}
-              </ul>
-              <p className="mt-2 text-xs text-muted-foreground">
-                These apps cached the old gateway path when they started, so stopping the
-                process only makes them launch it again — and they only launch it when
-                they next use a tool, which is why none may be running this moment.
-                Restart each one to pick up the current gateway. This list clears itself
-                as you do.
-              </p>
-            </div>
-          )}
+                      <span className="ml-1 font-mono text-muted-foreground/70">
+                        (pid {c.clientPid})
+                      </span>{" "}
+                      keeps starting <code className="font-mono">{c.gateway}</code>
+                    </li>
+                  ))}
+                </ul>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  These apps cached the old gateway path when they started, so stopping
+                  the process only makes them launch it again — and they only launch it
+                  when they next use a tool, which is why none may be running this moment.
+                  Restart each one to pick up the current gateway. This list clears itself
+                  as you do.
+                </p>
+              </div>
+            )}
+          </div>
         </div>
+      </details>
+      <section className="flex flex-col gap-2">
+        <SectionHeading title="Help and data">
+          Restore client configurations before removing Toolport.
+        </SectionHeading>
+        <Button
+          variant="outline"
+          className="self-start text-destructive"
+          disabled={removeBusy}
+          onClick={() => setRemoveOpen(true)}
+        >
+          Remove Toolport from all clients
+        </Button>
+        {removeResults && (
+          <ul className="text-sm" aria-live="polite">
+            {removeResults.length === 0 ? (
+              <li>No client connections to remove.</li>
+            ) : (
+              removeResults.map((result) => (
+                <li
+                  key={`${result.clientId}:${result.path}`}
+                  className={result.error ? "text-destructive" : "text-muted-foreground"}
+                >
+                  {result.clientId}: {result.error ?? "Client configuration restored"}
+                  {result.warnings?.length ? `; ${result.warnings.join("; ")}` : ""}
+                </li>
+              ))
+            )}
+          </ul>
+        )}
+        <Dialog
+          open={removeOpen}
+          onOpenChange={(open) => {
+            if (!removeBusy) setRemoveOpen(open);
+          }}
+        >
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Remove Toolport from all clients?</DialogTitle>
+              <DialogDescription>
+                Unchanged configs return to their original bytes. If you edited a config,
+                Toolport preserves your edits and restores entries it moved. Each client
+                result is reported here.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                disabled={removeBusy}
+                onClick={() => setRemoveOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={removeBusy}
+                onClick={() => void removeAll()}
+              >
+                {removeBusy ? "Removing…" : "Remove from all clients"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </section>
+    </div>
+  );
+}
+
+function SectionHeading({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <h2 className="text-base font-semibold">{title}</h2>
+      <p className="text-sm text-muted-foreground">{children}</p>
     </div>
   );
 }
