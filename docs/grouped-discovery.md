@@ -1,8 +1,9 @@
 # Grouped discovery mode
 
 Toolport has three tool-discovery modes. Identified clients use Auto unless you
-choose a per-client or global override in Clients. Auto selects Full or Lazy
-from the client's capabilities. `TOOLPORT_DISCOVERY` selects the process default
+choose a mode for the client in Clients or turn off Lazy discovery in Settings.
+Auto selects Full or Lazy from the client's capabilities. Installs upgraded from
+1.x on its Lazy default keep Lazy. `TOOLPORT_DISCOVERY` selects the process default
 for a standalone gateway; shared daemon sessions use their client policy. See
 [client discovery](client-discovery.md).
 
