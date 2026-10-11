@@ -428,6 +428,7 @@ fn build_window(
         let stack_for_stop = stack.clone();
         stop.connect_clicked(move |_| {
             stack_for_stop.set_visible_child_name("settings");
+            settings.select_page(4);
             settings.stop_stale.emit_clicked();
         });
         actions.append(&stop);
@@ -456,10 +457,12 @@ fn build_window(
     let review_quarantine = gtk::gio::SimpleAction::new("review-quarantine", None);
     let app_for_quarantine = app.clone();
     let window_for_quarantine = window.clone();
+    let settings_for_quarantine = settings_page.clone();
     review_quarantine.connect_activate(move |_, _| {
         if let Some(action) = app_for_quarantine.lookup_action("show-settings") {
             action.activate(None);
         }
+        settings_for_quarantine.select_page(2);
         window_for_quarantine.present();
     });
     app.add_action(&review_quarantine);
@@ -936,6 +939,10 @@ fn build_sidebar(
                     });
                 }
                 child.set_child(Some(&row));
+                let selected = child.clone();
+                settings_page.connect_page_selected(index, move |visible| {
+                    if visible { selected.add_css_class("selected"); } else { selected.remove_css_class("selected"); }
+                });
                 children.append(&child);
                 subbuttons.push(child);
             }
@@ -1627,6 +1634,7 @@ fn show_native_page(
     } else if target == "teams" {
         teams_page.refresh();
     } else if target == "settings" {
+        settings_page.select_page(0);
         settings_page.refresh();
     }
 }

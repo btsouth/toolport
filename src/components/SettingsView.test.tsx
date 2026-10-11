@@ -125,12 +125,6 @@ describe("SettingsView tool loading", () => {
     renderSettings("access");
 
     // Open the access set.
-    await user.click(
-      screen.getByRole("button", {
-        name: /default 2 servers/i,
-      }),
-    );
-
     // Expand GitHub (request A starts).
     const githubToggle = screen.getByRole("button", {
       name: /github/i,
@@ -565,7 +559,7 @@ it("keeps access sets and folder routing under Access and changes the default ex
   );
 });
 
-it("shows the expand affordance for an empty access set", async () => {
+it("shows server permissions immediately for an empty access set", () => {
   const empty = {
     ...registry,
     version: 3,
@@ -576,11 +570,7 @@ it("shows the expand affordance for an empty access set", async () => {
       <SettingsView page="access" registry={empty} onRegistryChange={vi.fn()} />
     </ThemeProvider>,
   );
-
-  const toggle = screen.getByRole("button", { name: /Empty set/ });
-  expect(toggle.querySelector("svg")).not.toHaveClass("invisible");
-  await userEvent.click(toggle);
-  expect(toggle).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByText("Empty set", { selector: "span" })).toBeVisible();
   expect(screen.getByRole("checkbox", { name: /GitHub/ })).not.toBeChecked();
 });
 

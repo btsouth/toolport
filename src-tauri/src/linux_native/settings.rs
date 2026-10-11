@@ -927,8 +927,14 @@ impl SettingsPage {
         creator.append(&add);
         self.access_list.append(&creator);
         for profile in &registry.profiles {
-            let expander = gtk::Expander::builder().label(&profile.name).build();
             let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+            content.append(
+                &gtk::Label::builder()
+                    .label(&profile.name)
+                    .xalign(0.0)
+                    .css_classes(["heading"])
+                    .build(),
+            );
             for server in registry
                 .servers
                 .iter()
@@ -980,8 +986,7 @@ impl SettingsPage {
                 page.mutate_access(move || crate::registry_controller::delete_profile(&pid));
             });
             content.append(&delete);
-            expander.set_child(Some(&content));
-            self.access_list.append(&expander);
+            self.access_list.append(&content);
         }
     }
 
@@ -1542,6 +1547,9 @@ impl SettingsPage {
                     Err(_) => page.show_error("the safety update stopped unexpectedly"),
                 }
                 page.safety_level.set_sensitive(true);
+                for (index, card) in page.safety_cards.iter().enumerate() {
+                    card.set_sensitive(index >= page.safety_floor.get() as usize);
+                }
                 page.refresh();
             });
         });
@@ -1681,6 +1689,10 @@ impl SettingsPage {
         for (current, page) in self.pages.iter().enumerate() {
             page.set_visible(current == index);
         }
+    }
+
+    pub(super) fn connect_page_selected(&self, index: usize, callback: impl Fn(bool) + 'static) {
+        self.pages[index].connect_visible_notify(move |page| callback(page.is_visible()));
     }
 
     pub(super) fn pending_count(&self) -> usize {
