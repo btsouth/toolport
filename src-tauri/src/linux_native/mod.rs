@@ -7451,6 +7451,7 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
         let page = page.clone();
         let id = server.id.clone();
         let profile = profile_id.to_string();
+        let view = server.clone();
         review.connect_clicked(move |_| {
             let Ok(reg) = crate::registry::load() else {
                 return;
@@ -7484,6 +7485,7 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
             dialog.set_default_response(Some("cancel"));
             let profile = profile.clone();
             let page = page.clone();
+            let view = view.clone();
             dialog.connect_response(None, move |_, response| {
                 if response != "enable" {
                     return;
@@ -7491,11 +7493,25 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
                 let profile = profile.clone();
                 let entry = entry.clone();
                 let page = page.clone();
+                let view = view.clone();
                 gtk::glib::spawn_future_local(async move {
                     let result = gtk::gio::spawn_blocking(move || crate::registry_controller::set_server_enabled_after_reference_review(&profile, &entry)).await;
                     match result {
                         Ok(Ok(reg)) => page.render(state::RegistryState::Ready(state::RegistrySnapshot::from_registry(reg))),
-                        Ok(Err(e)) => page.show_feedback(&e, true),
+                        // A key this machine still needs: open where it goes.
+                        Ok(Err(e)) => match missing_value_editor(&e, &view.secret_keys) {
+                            Some(editor) => {
+                                page.show_feedback(
+                                    &format!("Could not turn on {}: {}", view.name, missing_value_hint(&e, &editor)),
+                                    true,
+                                );
+                                match editor {
+                                    MissingValueEditor::Credentials => open_credentials_editor(view, page.clone()),
+                                    MissingValueEditor::EditServer => open_server_editor(Some(view), page.clone()),
+                                }
+                            }
+                            None => page.show_feedback(&e, true),
+                        },
                         Err(_) => page.show_feedback("The reference review stopped. Retry enabling the server.", true),
                     }
                 });
