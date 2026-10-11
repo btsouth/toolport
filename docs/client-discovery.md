@@ -8,6 +8,10 @@ fixture successes with 78.7% less mean input. These are fixture results for thos
 builds and models, not production-service acceptance. Other defaults retain the
 capability-based choice below. Unknown means unverified.
 
+Codex 0.162.1 shows no tools at all from a server that lists more than 2,048.
+When a Full list for Codex would pass that limit, Toolport answers with the Lazy
+search tools instead, so Codex keeps a working search.
+
 Auto is resolved at request time. Existing installs receive updated defaults
 without a migration or config rewrite; explicit Full, Lazy and Grouped choices
 remain unchanged.
