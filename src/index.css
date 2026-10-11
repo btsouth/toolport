@@ -214,6 +214,8 @@
   .toolport-alert p {
     color: var(--muted-foreground);
   }
+  .toolport-alert p.font-medium,
+  .toolport-alert p.font-semibold,
   .toolport-alert strong {
     color: var(--foreground);
     font-weight: 600;

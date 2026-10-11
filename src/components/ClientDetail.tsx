@@ -479,7 +479,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         >
           <TriangleAlert className="mt-0.5 size-4 shrink-0" />
           <div className="min-w-0">
-            <p className="font-medium">Couldn't read this client's configuration</p>
+            <p className="font-semibold">Couldn't read this client's configuration</p>
             <p className="mt-0.5 break-words text-xs">{client.error}</p>
           </div>
         </div>
@@ -492,7 +492,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         >
           <RefreshCw className="mt-0.5 size-4 shrink-0" />
           <div className="min-w-0 flex-1">
-            <p className="font-medium">{showRestartNotice.title}</p>
+            <p className="font-semibold">{showRestartNotice.title}</p>
             <p className="mt-0.5 break-words text-xs">{showRestartNotice.text}</p>
           </div>
           <button
