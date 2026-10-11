@@ -113,7 +113,7 @@ function DialogFooter({
     <div
       data-slot="dialog-footer"
       className={cn(
-        "flex shrink-0 flex-wrap items-center justify-end gap-2 border-t bg-muted/50 pt-3",
+        "flex shrink-0 flex-wrap items-center justify-end gap-2 border-t pt-3",
         className,
       )}
       {...props}
@@ -136,7 +136,7 @@ function DialogTitle({
     <DialogPrimitive.Title
       data-slot="dialog-title"
       className={cn(
-        "font-heading break-words text-base leading-none font-medium",
+        "font-heading break-words text-xl leading-snug font-semibold",
         className,
       )}
       {...props}
