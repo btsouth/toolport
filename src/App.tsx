@@ -1,3 +1,4 @@
+import { type SettingsSubpage } from "@/lib/settingsPages";
 import { visibleExecutionText } from "@/lib/visibleExecutionText";
 import { isPersonalSync } from "@/lib/personalSync";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
@@ -128,6 +129,8 @@ function App() {
   const [readyEnableReview, setReadyEnableReview] = useState<ServerEntry | null>(null);
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
   const [toolsServerId, setToolsServerId] = useState<string | null>(null);
+  const [settingsPage, setSettingsPage] = useState<SettingsSubpage>("general");
+  const [pendingCount, setPendingCount] = useState(0);
   const [view, setView] = useState<View>("servers");
   const [activityKey, setActivityKey] = useState(0);
   const [health, setHealth] = useState<Record<string, ProbeResult>>({});
@@ -455,6 +458,7 @@ function App() {
 
   // Top-level destinations leave any selected client detail behind.
   function selectView(v: View) {
+    if (v === "settings") setSettingsPage("general");
     setSelectedClientId(null);
     setView(v);
   }
@@ -766,6 +770,9 @@ function App() {
           onRegistryChange={applyRegistryChange}
           view={view}
           onSelectView={selectView}
+          settingsPage={settingsPage}
+          onSettingsPageChange={setSettingsPage}
+          pendingCount={pendingCount}
           onShortcuts={() => setShortcutsOpen(true)}
           onReplayOnboarding={() => {
             setOnboardingStep(0);
@@ -1015,6 +1022,8 @@ function App() {
                     />
                   ) : view === "settings" ? (
                     <SettingsView
+                      page={settingsPage}
+                      pendingCount={pendingCount}
                       registry={registry}
                       onRegistryChange={applyRegistryChange}
                     />
@@ -1116,11 +1125,16 @@ function App() {
         refreshKey={activityKey}
         onVisibleChange={setStarSurface}
       />
-      <PendingApprovals />
+      <PendingApprovals onCountChange={setPendingCount} />
       <TeamPairingDialog onConnected={openTeams} />
       {/* Quarantine has no global signal otherwise: the first sign used to be an agent
           call failing, with the only fix buried in Settings (SOU-293). */}
-      <QuarantineAlert onReview={() => selectView("settings")} />
+      <QuarantineAlert
+        onReview={() => {
+          selectView("settings");
+          setSettingsPage("safety");
+        }}
+      />
       <ConfirmDialog
         open={confirmDisableAll}
         onOpenChange={setConfirmDisableAll}

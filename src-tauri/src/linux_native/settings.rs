@@ -11,9 +11,20 @@ pub(super) const NATIVE_AUTOSTART_NAME: &str = "Toolport";
 /// What the preview wrote. Only referenced by the migration.
 pub(super) const LEGACY_AUTOSTART_NAME: &str = "ToolportNativePreview";
 
+pub(super) const SETTINGS_PAGES: &[(&str, &str)] = &[
+    ("General", "emblem-system-symbolic"),
+    ("Tools", "applications-engineering-symbolic"),
+    ("Safety", "security-high-symbolic"),
+    ("Access", "changes-prevent-symbolic"),
+    ("Connections", "network-server-symbolic"),
+    ("Help and data", "help-browser-symbolic"),
+];
+
 #[derive(Clone)]
 pub(super) struct SettingsPage {
     pub(super) root: gtk::Box,
+    pages: Vec<gtk::Box>,
+    safety_cards: Vec<gtk::CheckButton>,
     pub(super) stop_stale: gtk::Button,
     bridge: super::http_bridge::BridgeController,
     broker: crate::approval_broker::ApprovalBroker,
@@ -94,16 +105,6 @@ impl SettingsPage {
         page.set_margin_bottom(20);
         page.set_margin_start(20);
         page.set_margin_end(20);
-        page.append(
-            &gtk::Label::builder()
-                .label("Most setups only need General. Everything else starts with safe defaults, and protections required by a connected team stay locked on.")
-                .halign(gtk::Align::Fill)
-                .xalign(0.0)
-                .wrap(true)
-            .hexpand(true)
-                .css_classes(["toolport-muted"])
-                .build(),
-        );
         let feedback = gtk::Label::builder()
             .halign(gtk::Align::Fill)
             .xalign(0.0)
@@ -210,7 +211,35 @@ impl SettingsPage {
         safety.add_css_class("toolport-settings-group");
         let safety_level = gtk::DropDown::from_strings(&["Off", "Ask", "Strict"]);
         safety_level.set_tooltip_text(Some("Ask holds destructive calls. Strict also blocks destructive tools, risky drift and high-confidence injection, and asks before untrusted calls. Labeling and integrity recording stay on."));
+        safety_level.set_visible(false);
         safety.append(&safety_level);
+        let cards = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let mut safety_cards: Vec<gtk::CheckButton> = Vec::new();
+        for (index, (name, description)) in [
+            ("Off", "No extra checks before destructive calls."),
+            ("Ask", "Pause destructive calls for your approval."),
+            ("Strict", "Hide destructive tools and ask before untrusted calls."),
+        ].into_iter().enumerate() {
+            let card = gtk::CheckButton::new();
+            if let Some(first) = safety_cards.first() { card.set_group(Some(first)); }
+            card.set_hexpand(true);
+            card.add_css_class("toolport-safety-card");
+            let copy = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            copy.append(&gtk::Label::builder().label(name).xalign(0.0).css_classes(["heading"]).build());
+            copy.append(&gtk::Label::builder().label(description).xalign(0.0).wrap(true).max_width_chars(24).css_classes(["toolport-muted"]).build());
+            card.set_child(Some(&copy));
+            let control = safety_level.clone();
+            card.connect_toggled(move |card| {
+                if card.is_active() && card.is_sensitive() && control.is_sensitive() {
+                    // The model contains only levels at or above the team floor.
+                    let count = control.model().map(|model| model.n_items()).unwrap_or(3);
+                    control.set_selected((index as u32).saturating_sub(3 - count));
+                }
+            });
+            cards.append(&card);
+            safety_cards.push(card);
+        }
+        safety.append(&cards);
         let safety_policy = gtk::Label::new(None);
         safety_policy.set_xalign(0.0);
         safety_policy.set_wrap(true);
@@ -230,7 +259,7 @@ impl SettingsPage {
         safety.append(&safety_kept);
         let protection = gtk::Box::new(gtk::Orientation::Vertical, 0);
         protection.add_css_class("toolport-settings-group");
-        protection.append(&code_row);
+        capabilities.append(&code_row);
         let (pii_row, pii_redaction) = setting_switch_row(
             "Pseudonymize PII",
             "Replace detected personal values before results reach the model.",
@@ -484,44 +513,46 @@ impl SettingsPage {
         removal_results.set_xalign(0.0);
         removal_results.set_wrap(true);
 
-        // Sections run from what most people change to what almost nobody does.
-        // Access and Advanced start folded so the page opens on the essentials.
-        let general = settings_section(&page, "General", "Startup, updates and how agents find tools.");
-        capabilities.prepend(&launch_row);
-        capabilities.append(&updates);
-        general.append(&capabilities);
-
+        let general = settings_section(&page, "General", "Startup and updates.");
+        let startup = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        startup.add_css_class("toolport-settings-group");
+        startup.append(&launch_row);
+        startup.append(&updates);
+        general.append(&startup);
+        let tools = settings_section(&page, "Tools", "How agents find and use your tools.");
+        tools.append(&capabilities);
+        tools.append(&pinned_section);
         let safety_section = settings_section(&page, "Safety", "How Toolport handles risky tool calls.");
         safety_section.append(&posture);
         safety_section.append(&safety);
-        // Shown only when there is something in them (see render_allowed and
-        // render_quarantine), so an untouched setup has no empty boxes here.
+        safety_section.append(&protection);
+        let pending = gtk::Label::builder().label("Pending approvals appear in the approval queue.").xalign(0.0).wrap(true).css_classes(["toolport-muted"]).build();
+        safety_section.append(&pending);
         safety_section.append(&listed_section(&approvals_heading, &allowed_list));
         safety_section.append(&listed_section(&quarantine_heading, &quarantine_list));
-
-        let access = folded_section(&page, "Access", "Limit which servers and tools each client can use, by client or project folder.");
+        let access = settings_section(&page, "Access", "Limit which servers and tools each client can use, by client or project folder.");
         access.append(&access_list);
         access.append(&folder_heading);
         access.append(&folder_list);
-
-        let advanced = folded_section(&page, "Advanced", "Code mode, personal data, inspection, pinned tools, the local HTTP endpoint and old gateways.");
-        advanced.append(&protection);
-        advanced.append(&pinned_section);
-        advanced.append(&endpoint_heading);
-        advanced.append(&endpoint);
-        advanced.append(&http_client_heading);
-        advanced.append(&http_client_list);
-        advanced.append(&desktop);
-
+        access.append(&http_client_heading);
+        access.append(&http_client_list);
+        let connections = settings_section(&page, "Connections", "Your local HTTP endpoint and gateway processes.");
+        connections.append(&endpoint_heading);
+        connections.append(&endpoint);
+        connections.append(&desktop);
         let help = settings_section(&page, "Help and data", "Support reports, local files and removing Toolport.");
         help.append(&diagnostics);
         help.append(&remove_clients);
         help.append(&removal_results);
+        let pages = vec![general, tools, safety_section, access, connections, help];
+        for (index, section) in pages.iter().enumerate() { section.set_visible(index == 0); }
         scroller.set_child(Some(&page));
         root.append(&scroller);
         let settings_page = Self {
             stop_stale: stop_stale.clone(),
             root,
+            pages,
+            safety_cards,
             bridge,
             broker,
             feedback,
@@ -1452,6 +1483,7 @@ impl SettingsPage {
             };
             page.begin_mutation();
             control.set_sensitive(false);
+            for card in &page.safety_cards { card.set_sensitive(false); }
             let page = page.clone();
             gtk::glib::spawn_future_local(async move {
                 let result = super::run_user_action(move || {
@@ -1600,6 +1632,12 @@ impl SettingsPage {
             });
     }
 
+    pub(super) fn select_page(&self, index: usize) {
+        for (current, page) in self.pages.iter().enumerate() { page.set_visible(current == index); }
+    }
+
+    pub(super) fn pending_count(&self) -> usize { self.broker.list().len() }
+
     pub(super) fn refresh(&self) {
         self.refresh_with_feedback(true)
     }
@@ -1745,6 +1783,10 @@ impl SettingsPage {
                 || settings.block_on_injection_forced,
         );
         self.safety_level.set_sensitive(true);
+        for (index, card) in self.safety_cards.iter().enumerate() {
+            card.set_sensitive(index >= settings.team_min_safety_level as usize);
+            card.set_active(index == settings.safety_level as usize);
+        }
         self.safety_current.set(settings.safety_level);
         let kept = settings.kept_v1_safety.summary();
         self.safety_kept.set_visible(kept.is_some());
@@ -2400,20 +2442,6 @@ fn settings_section(page: &gtk::Box, title: &str, summary: &str) -> gtk::Box {
     section.append(&section_title(title, summary));
     page.append(&section);
     section
-}
-
-/// Like [`settings_section`], but folded until the user opens it.
-fn folded_section(page: &gtk::Box, title: &str, summary: &str) -> gtk::Box {
-    let body = gtk::Box::new(gtk::Orientation::Vertical, 14);
-    body.set_margin_top(14);
-    let expander = gtk::Expander::builder()
-        .label_widget(&section_title(title, summary))
-        .child(&body)
-        .expanded(false)
-        .margin_top(12)
-        .build();
-    page.append(&expander);
-    body
 }
 
 fn section_title(title: &str, summary: &str) -> gtk::Box {

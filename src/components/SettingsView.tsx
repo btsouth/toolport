@@ -1,3 +1,5 @@
+import { type SettingsSubpage, SETTINGS_PAGES } from "@/lib/settingsPages";
+import { toast } from "sonner";
 import { useCallback, useEffect, useMemo, useState, useRef, type ReactNode } from "react";
 import {
   Activity,
@@ -34,6 +36,8 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import {
+  gatherDiagnostics,
+  openDataDir,
   addHttpClient,
   disconnectAllClients,
   getRegistry,
@@ -342,6 +346,8 @@ function AccessSetCreator({
 }
 
 interface Props {
+  page?: SettingsSubpage;
+  pendingCount?: number;
   registry: Registry | null;
   onRegistryChange: (registry: Registry) => void;
 }
@@ -535,7 +541,12 @@ function ProfileToolScope({
 
 /** Anonymous discovery defaults and global security policy. Identified clients
  * choose discovery in Clients. */
-export function SettingsView({ registry, onRegistryChange }: Props) {
+export function SettingsView({
+  registry,
+  onRegistryChange,
+  page = "general",
+  pendingCount = 0,
+}: Props) {
   const { theme, setTheme } = useTheme();
   const [removeOpen, setRemoveOpen] = useState(false);
   const [removeBusy, setRemoveBusy] = useState(false);
@@ -902,414 +913,107 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
 
   return (
     <div className="mx-auto flex max-w-2xl flex-col gap-8">
-      {/* Sections run from what most people change to what almost nobody does.
-          Access and Advanced start folded so the page opens on the essentials. */}
-      <section className="flex flex-col gap-2">
-        <SectionHeading title="General">
-          Startup, appearance and how agents find tools.
-        </SectionHeading>
-        {toggle(
-          Power,
-          autostart.status === "ready" && autostart.enabled,
-          "text-info",
-          "Launch at login",
-          "Start Toolport in the tray when you sign in, so it can hold tool calls for approval even before you open it",
-          toggleAutostart,
-          "autostart",
-          {
-            switchDisabled: autostart.status !== "ready",
-            hint:
-              autostart.status === "loading"
-                ? "Checking the current OS setting…"
-                : autostart.status === "error"
-                  ? "Couldn't read the OS setting — launch-at-login state is unknown."
-                  : undefined,
-            hintTone: autostart.status === "error" ? "destructive" : "muted",
-            onRetry:
-              autostart.status === "error" ? () => void loadAutostart() : undefined,
-          },
-        )}
-        <div className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm">
-          <Sun className="size-4 shrink-0 text-info" />
-          <span className="flex min-w-0 flex-1 flex-col leading-tight">
-            <span className="font-medium">Appearance</span>
-            <span className="text-xs text-muted-foreground">
-              Light, dark, or follow your system setting.
+      <SectionHeading title={SETTINGS_PAGES.find((item) => item.id === page)!.label}>
+        {SETTINGS_PAGES.find((item) => item.id === page)!.description}
+      </SectionHeading>
+      {page === "general" && (
+        <section className="settings-page flex flex-col gap-4" aria-label="general">
+          {toggle(
+            Power,
+            autostart.status === "ready" && autostart.enabled,
+            "text-info",
+            "Launch at login",
+            "Start Toolport in the tray when you sign in, so it can hold tool calls for approval even before you open it",
+            toggleAutostart,
+            "autostart",
+            {
+              switchDisabled: autostart.status !== "ready",
+              hint:
+                autostart.status === "loading"
+                  ? "Checking the current OS setting…"
+                  : autostart.status === "error"
+                    ? "Couldn't read the OS setting — launch-at-login state is unknown."
+                    : undefined,
+              hintTone: autostart.status === "error" ? "destructive" : "muted",
+              onRetry:
+                autostart.status === "error" ? () => void loadAutostart() : undefined,
+            },
+          )}
+          <div className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm">
+            <Sun className="size-4 shrink-0 text-info" />
+            <span className="flex min-w-0 flex-1 flex-col leading-tight">
+              <span className="font-medium">Appearance</span>
+              <span className="text-xs text-muted-foreground">
+                Light, dark, or follow your system setting.
+              </span>
             </span>
-          </span>
-          <div className="flex shrink-0 gap-0.5 rounded-md border bg-background p-0.5">
-            {(
-              [
-                ["light", Sun, "Light"],
-                ["system", Monitor, "System"],
-                ["dark", Moon, "Dark"],
-              ] as [Theme, typeof Sun, string][]
-            ).map(([value, Icon, label]) => (
-              <button
-                key={value}
-                onClick={() => setTheme(value)}
-                aria-pressed={theme === value}
-                title={label}
-                className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors ${
-                  theme === value
-                    ? "bg-muted font-medium text-foreground"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <Icon className="size-3.5" />
-                {label}
-              </button>
-            ))}
+            <div className="flex shrink-0 gap-0.5 rounded-md border bg-background p-0.5">
+              {(
+                [
+                  ["light", Sun, "Light"],
+                  ["system", Monitor, "System"],
+                  ["dark", Moon, "Dark"],
+                ] as [Theme, typeof Sun, string][]
+              ).map(([value, Icon, label]) => (
+                <button
+                  key={value}
+                  onClick={() => setTheme(value)}
+                  aria-pressed={theme === value}
+                  title={label}
+                  className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors ${
+                    theme === value
+                      ? "bg-muted font-medium text-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <Icon className="size-3.5" />
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
-        {toggle(
-          Layers,
-          lazyDiscovery,
-          "text-info",
-          "Find tools as needed",
-          "Agents search for the tools they need instead of loading the full list. This is the default for connections without saved client settings. Choose a different behavior in Clients.",
-          apply("lazy-discovery", setLazyDiscovery),
-          "lazy-discovery",
-        )}
-      </section>
-      <section className="flex flex-col gap-2">
-        <SectionHeading title="Safety">
-          How Toolport handles risky tool calls.
-        </SectionHeading>
-        <label className="flex items-center gap-3 text-sm">
-          Safety
-          <select
-            aria-label="Safety"
-            disabled={safetyBusy}
-            value={effectiveLevel}
-            onChange={(event) =>
-              chooseSafety(event.target.value as "off" | "ask" | "strict")
-            }
-          >
-            <option value="off" disabled={teamFloor !== "off"}>
-              Off
-            </option>
-            <option value="ask" disabled={teamFloor === "strict"}>
-              Ask
-            </option>
-            <option value="strict">Strict</option>
-          </select>
-        </label>
-        <p className="text-xs text-muted-foreground">
-          Ask pauses destructive calls for your approval. Strict also hides destructive
-          tools, pauses risky tool changes, blocks high-confidence injection and asks
-          before untrusted calls. Tool labeling and change history stay on at every level.
-        </p>
-        <p
-          role="status"
-          className="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground"
-        >
-          {effectiveLevel === "off"
-            ? "Safety is set to Off. Toolport does not ask before destructive calls. Server sign-in and client permissions may still ask for approval."
-            : effectiveLevel === "ask"
-              ? "Safety is set to Ask. Destructive calls need your approval before they run."
-              : "Safety is set to Strict. Destructive tools are hidden and untrusted calls need your approval."}
-        </p>
-        {keptSummary && (
-          <div className="flex flex-col items-start gap-2 rounded-md border px-3 py-2 text-xs">
-            <p>
-              {keptSummary} Choosing a level replaces these with that level's protections.
-            </p>
+          <div className="flex items-center justify-between gap-3 rounded-md border p-3 text-sm">
+            <div>
+              <p className="font-medium">Updates</p>
+              <p className="text-xs text-muted-foreground">
+                Check for a newer version of Toolport.
+              </p>
+            </div>
             <Button
-              size="sm"
               variant="outline"
-              disabled={safetyBusy}
-              onClick={() => chooseSafety(effectiveLevel)}
+              onClick={() => window.dispatchEvent(new Event("toolport-check-updates"))}
             >
-              Use standard {levelLabel[effectiveLevel]}
+              Check for updates
             </Button>
           </div>
-        )}
-        {teamFloor !== "off" && (
-          <p className="text-xs">
-            Team minimum safety level: {teamFloor === "ask" ? "Ask" : "Strict"}. Choices
-            below this floor are unavailable.
-          </p>
-        )}
-        {(registry?.teamForcedQuarantineOnDrift ||
-          registry?.teamForcedBlockOnInjection) && (
-          <p className="text-xs">
-            Team also enforces:{" "}
-            {[
-              registry.teamForcedQuarantineOnDrift && "quarantine on drift",
-              registry.teamForcedBlockOnInjection && "block on injection",
-            ]
-              .filter(Boolean)
-              .join(", ")}
-            . These protections do not raise your safety level.
-          </p>
-        )}
-        {quarantined.length === 0 && quarantineError && (
-          <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
-            <ShieldX className="size-4 shrink-0 text-destructive" />
-            <span>Couldn&apos;t read quarantine status. Retrying every 15s.</span>
-          </div>
-        )}
-        {quarantined.length > 0 && (
-          <div className="flex flex-col gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
-            <div className="flex items-center gap-2">
-              <ShieldX className="size-4 shrink-0 text-destructive" />
-              <span className="text-sm font-medium">Quarantined tools</span>
-              <span className="text-xs text-muted-foreground">
-                {quarantineError
-                  ? "status may be stale"
-                  : "blocked in Strict until you re-approve"}
-              </span>
+        </section>
+      )}
+      {page === "tools" && (
+        <section className="settings-page flex flex-col gap-4" aria-label="tools">
+          <div className="settings-switches">
+            {" "}
+            {toggle(
+              Layers,
+              lazyDiscovery,
+              "text-info",
+              "Find tools as needed",
+              "Agents search for the tools they need instead of loading the full list. This is the default for connections without saved client settings. Choose a different behavior in Clients.",
+              apply("lazy-discovery", setLazyDiscovery),
+              "lazy-discovery",
+            )}
+          </div>{" "}
+          {/* Tools always included is a refinement of lazy discovery (the tools it must never
+            hide), not a peer feature, so nest it under the Lazy discovery toggle with an
+            indent + left rail. It has no meaning when lazy discovery is off, so it collapses
+            away entirely then. */}
+          {lazyDiscovery ? (
+            <div className="ml-4 border-l-2 border-border/50 pl-3">
+              <PinnedPrerequisites
+                registry={registry}
+                onRegistryChange={onRegistryChange}
+              />
             </div>
-            <ul className="flex flex-col gap-1.5">
-              {quarantined.map((q) => (
-                <li
-                  key={`${q.profile}:${q.tool}`}
-                  className="flex items-center gap-2 text-xs"
-                >
-                  <span className="min-w-0 truncate font-mono">{q.tool}</span>
-                  <span
-                    className="min-w-0 truncate text-muted-foreground"
-                    title={q.detail || q.reason}
-                  >
-                    {q.detail ? q.detail : q.reason}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => reapprove(q)}
-                    className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
-                  >
-                    Re-approve
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-        {allowedTools.length === 0 && allowedError && (
-          <div className="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-            <UserCheck className="size-4 shrink-0 text-info" />
-            <span>Couldn&apos;t read the allowed-tools list. Retrying every 10s.</span>
-          </div>
-        )}
-        {allowedTools.length > 0 && (
-          <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/20 px-3 py-2.5">
-            <div className="flex items-center gap-2">
-              <UserCheck className="size-4 shrink-0 text-info" />
-              <span className="text-sm font-medium">Allowed tools</span>
-              <span className="text-xs text-muted-foreground">
-                {allowedError ? "list may be stale" : "skip human approval"}
-              </span>
-            </div>
-            <ul className="flex flex-col gap-1.5">
-              {allowedTools.map((t) => (
-                <li key={t.key} className="flex items-center gap-2 text-xs">
-                  <span className="min-w-0 truncate font-mono">
-                    {t.server}/{t.tool}
-                  </span>
-                  <span className="shrink-0 text-muted-foreground">
-                    {t.persistent ? "always" : "this session"}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => void revokeAllowed(t.key)}
-                    className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
-                  >
-                    Revoke
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-      </section>
-      <details className="flex flex-col gap-2">
-        <summary className="cursor-pointer list-outside">
-          <span className="text-base font-semibold">Access</span>
-          <span className="block text-sm text-muted-foreground">
-            Limit which servers and tools each client can use, by client or project
-            folder.
-          </span>
-        </summary>
-        <div className="mt-3 flex flex-col gap-2">
-          {profiles.length > 0 && (
-            <section className="flex flex-col gap-2">
-              <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-                Access sets
-              </h2>
-              <p className="text-xs text-muted-foreground">
-                Access sets narrow enabled servers and, for stdio clients, tools. Servers
-                that are off stay hidden from every client.
-              </p>
-              <p className="text-sm">Default access</p>
-              <Select
-                value={registry?.defaultAccessProfileId || "@all-enabled"}
-                onValueChange={async (id) => {
-                  try {
-                    onRegistryChange(
-                      await setDefaultAccess(id === "@all-enabled" ? null : id),
-                    );
-                  } catch (e) {
-                    toastError(`${e}`);
-                  }
-                }}
-              >
-                <SelectTrigger aria-label="Default access">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="@all-enabled">All enabled servers</SelectItem>
-                  {profiles.map((p) => (
-                    <SelectItem key={p.id} value={p.id}>
-                      {p.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {registry?.defaultAccessLegacyPolicy &&
-                !registry.defaultAccessProfileId && (
-                  <div className="flex flex-col gap-2 text-xs text-muted-foreground">
-                    <p>
-                      The upgrade retained the default access set&apos;s tool restrictions
-                      and instructions.
-                    </p>
-                    <button
-                      className="w-fit rounded border px-2 py-1"
-                      onClick={async () => {
-                        try {
-                          onRegistryChange(await setDefaultAccess(null));
-                        } catch (e) {
-                          toastError(`${e}`);
-                        }
-                      }}
-                    >
-                      Use All enabled servers
-                    </button>
-                  </div>
-                )}
-              <AccessSetCreator onRegistryChange={onRegistryChange} />
-              <div className="flex flex-col divide-y rounded-lg border">
-                {profiles.map((p) => {
-                  const names = p.enabledServerIds
-                    .map((id) => serverName.get(id))
-                    .filter((n): n is string => !!n)
-                    .sort((a, b) => a.localeCompare(b));
-                  const active = p.id === registry?.defaultAccessProfileId;
-                  const isOpen = openProfiles.has(p.id);
-                  const toggle = () =>
-                    setOpenProfiles((prev) => {
-                      const next = new Set(prev);
-                      if (next.has(p.id)) next.delete(p.id);
-                      else next.add(p.id);
-                      return next;
-                    });
-                  return (
-                    <div key={p.id} className="flex flex-col gap-1 px-3 py-2.5">
-                      <button
-                        type="button"
-                        onClick={toggle}
-                        aria-expanded={isOpen}
-
-                        className="flex items-center gap-2 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-border disabled:cursor-default"
-                      >
-                        <ChevronRight
-                          className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${
-                            isOpen ? "rotate-90" : ""
-                          }`}
-                        />
-                        <span className="text-sm font-medium">{p.name}</span>
-                        {active && (
-                          <span className="rounded-full bg-info/15 px-1.5 py-0.5 text-[10px] font-medium text-info">
-                            default
-                          </span>
-                        )}
-                        <span className="ml-auto text-xs text-muted-foreground">
-                          {names.length} {names.length === 1 ? "server" : "servers"}
-                        </span>
-                      </button>
-                      {isOpen && registry && (
-                        <div className="flex flex-col gap-2 pl-5">
-                          {registry.servers
-                            .filter((server) => !isGatewayServer(server))
-                            .map((server) => (
-                              <label
-                                key={server.id}
-                                className="flex items-center gap-2 text-xs"
-                              >
-                                <input
-                                  type="checkbox"
-                                  checked={p.enabledServerIds.includes(server.id)}
-                                  onChange={async (e) => {
-                                    try {
-                                      onRegistryChange(
-                                        await setAccessServer(
-                                          p.id,
-                                          server.id,
-                                          e.target.checked,
-                                        ),
-                                      );
-                                    } catch (error) {
-                                      toastError(`${error}`);
-                                    }
-                                  }}
-                                />
-                                {server.name}
-                                {!server.enabled && " (off)"}
-                              </label>
-                            ))}
-                          <button
-                            disabled={
-                              profiles.length <= 1 ||
-                              p.id === registry.defaultAccessProfileId ||
-                              p.id === registry.defaultAccessContextId
-                            }
-                            onClick={async () => {
-                              try {
-                                onRegistryChange(await deleteProfile(p.id));
-                              } catch (e) {
-                                toastError(`${e}`);
-                              }
-                            }}
-                          >
-                            Delete access set
-                          </button>
-                        </div>
-                      )}
-                      {names.length === 0 ? (
-                        <p className="pl-5 text-xs text-muted-foreground italic">
-                          No servers in this access set.
-                        </p>
-                      ) : isOpen ? (
-                        registry && (
-                          <ProfileToolScope
-                            profile={p}
-                            registry={registry}
-                            onRegistryChange={onRegistryChange}
-                          />
-                        )
-                      ) : (
-                        <p className="truncate pl-5 text-xs text-muted-foreground">
-                          {names.join(", ")}
-                        </p>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-              <FolderRouting registry={registry} onRegistryChange={onRegistryChange} />
-            </section>
-          )}
-        </div>
-      </details>
-      <details className="flex flex-col gap-2">
-        <summary className="cursor-pointer list-outside">
-          <span className="text-base font-semibold">Advanced</span>
-          <span className="block text-sm text-muted-foreground">
-            Code mode, personal data, inspection, pinned tools, the local HTTP endpoint
-            and old gateways.
-          </span>
-        </summary>
-        <div className="mt-3 flex flex-col gap-2">
+          ) : null}
           {toggle(
             Braces,
             codeMode,
@@ -1323,37 +1027,494 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                 "A gateway started with TOOLPORT_CODE_MODE=1 can keep scripts available even when this setting is off.",
             },
           )}
-
-          {toggle(
-            EyeOff,
-            piiRedaction,
-            "text-info",
-            "Hide personal data from the model",
-            "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. A value only goes back to the server it came from, so a call that would send one server's data to another is refused. Real data stays on this machine and is forgotten when the conversation ends. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
-            apply("pii-redaction", setPiiRedaction),
-            "pii-redaction",
-          )}
-          {toggle(
-            Activity,
-            liveInspect,
-            "text-info",
-            "Live request/response inspection",
-            "Off by default. While on, Toolport captures each tool call's arguments and results to a small local, ephemeral buffer (the last 50 calls) so you can inspect them in Activity. This is separate from the audit log, never leaves your machine, and is cleared when you turn it off or restart the gateway.",
-            applyLiveInspect,
-            "live-inspect",
-          )}
-          {/* Tools always included is a refinement of lazy discovery (the tools it must never
-            hide), not a peer feature, so nest it under the Lazy discovery toggle with an
-            indent + left rail. It has no meaning when lazy discovery is off, so it collapses
-            away entirely then. */}
-          {lazyDiscovery ? (
-            <div className="ml-4 border-l-2 border-border/50 pl-3">
-              <PinnedPrerequisites
-                registry={registry}
-                onRegistryChange={onRegistryChange}
-              />
+        </section>
+      )}
+      {page === "safety" && (
+        <section className="settings-page flex flex-col gap-4" aria-label="safety">
+          <fieldset className="grid grid-cols-1 gap-3 sm:grid-cols-3" aria-label="Safety">
+            <legend className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              Safety level
+            </legend>
+            {safetyLevels.map((level) => (
+              <label
+                key={level}
+                className={`flex cursor-pointer flex-col gap-2 rounded-lg border p-4 ${effectiveLevel === level ? "border-primary bg-primary/5" : "bg-card"}`}
+              >
+                <span className="flex items-center justify-between font-medium">
+                  {levelLabel[level]}
+                  <input
+                    type="radio"
+                    name="safety"
+                    aria-label={levelLabel[level]}
+                    checked={effectiveLevel === level}
+                    disabled={
+                      safetyBusy ||
+                      safetyLevels.indexOf(level) < safetyLevels.indexOf(teamFloor)
+                    }
+                    onChange={() => void chooseSafety(level)}
+                    className="accent-primary"
+                  />
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  {level === "off"
+                    ? "No extra checks before destructive calls."
+                    : level === "ask"
+                      ? "Pause destructive calls for your approval."
+                      : "Hide destructive tools and ask before untrusted calls."}
+                </span>
+              </label>
+            ))}
+          </fieldset>
+          <p className="text-xs text-muted-foreground">
+            Ask pauses destructive calls for your approval. Strict also hides destructive
+            tools, pauses risky tool changes, blocks high-confidence injection and asks
+            before untrusted calls. Tool labeling and change history stay on at every
+            level.
+          </p>
+          <p
+            role="status"
+            className="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground"
+          >
+            {effectiveLevel === "off"
+              ? "Safety is set to Off. Toolport does not ask before destructive calls. Server sign-in and client permissions may still ask for approval."
+              : effectiveLevel === "ask"
+                ? "Safety is set to Ask. Destructive calls need your approval before they run."
+                : "Safety is set to Strict. Destructive tools are hidden and untrusted calls need your approval."}
+          </p>
+          {keptSummary && (
+            <div className="flex flex-col items-start gap-2 rounded-md border px-3 py-2 text-xs">
+              <p>
+                {keptSummary} Choosing a level replaces these with that level's
+                protections.
+              </p>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={safetyBusy}
+                onClick={() => chooseSafety(effectiveLevel)}
+              >
+                Use standard {levelLabel[effectiveLevel]}
+              </Button>
             </div>
-          ) : null}
+          )}
+          {teamFloor !== "off" && (
+            <p className="text-xs">
+              Team minimum safety level: {teamFloor === "ask" ? "Ask" : "Strict"}. Choices
+              below this floor are unavailable.
+            </p>
+          )}
+          {(registry?.teamForcedQuarantineOnDrift ||
+            registry?.teamForcedBlockOnInjection) && (
+            <p className="text-xs">
+              Team also enforces:{" "}
+              {[
+                registry.teamForcedQuarantineOnDrift && "quarantine on drift",
+                registry.teamForcedBlockOnInjection && "block on injection",
+              ]
+                .filter(Boolean)
+                .join(", ")}
+              . These protections do not raise your safety level.
+            </p>
+          )}
+          {quarantined.length === 0 && quarantineError && (
+            <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
+              <ShieldX className="size-4 shrink-0 text-destructive" />
+              <span>Couldn&apos;t read quarantine status. Retrying every 15s.</span>
+            </div>
+          )}
+          {quarantined.length > 0 && (
+            <div className="flex flex-col gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <ShieldX className="size-4 shrink-0 text-destructive" />
+                <span className="text-sm font-medium">Quarantined tools</span>
+                <span className="text-xs text-muted-foreground">
+                  {quarantineError
+                    ? "status may be stale"
+                    : "blocked in Strict until you re-approve"}
+                </span>
+              </div>
+              <ul className="flex flex-col gap-1.5">
+                {quarantined.map((q) => (
+                  <li
+                    key={`${q.profile}:${q.tool}`}
+                    className="flex items-center gap-2 text-xs"
+                  >
+                    <span className="min-w-0 truncate font-mono">{q.tool}</span>
+                    <span
+                      className="min-w-0 truncate text-muted-foreground"
+                      title={q.detail || q.reason}
+                    >
+                      {q.detail ? q.detail : q.reason}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => reapprove(q)}
+                      className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
+                    >
+                      Re-approve
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {allowedTools.length === 0 && allowedError && (
+            <div className="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+              <UserCheck className="size-4 shrink-0 text-info" />
+              <span>Couldn&apos;t read the allowed-tools list. Retrying every 10s.</span>
+            </div>
+          )}
+          {allowedTools.length > 0 && (
+            <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/20 px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <UserCheck className="size-4 shrink-0 text-info" />
+                <span className="text-sm font-medium">Allowed tools</span>
+                <span className="text-xs text-muted-foreground">
+                  {allowedError ? "list may be stale" : "skip human approval"}
+                </span>
+              </div>
+              <ul className="flex flex-col gap-1.5">
+                {allowedTools.map((t) => (
+                  <li key={t.key} className="flex items-center gap-2 text-xs">
+                    <span className="min-w-0 truncate font-mono">
+                      {t.server}/{t.tool}
+                    </span>
+                    <span className="shrink-0 text-muted-foreground">
+                      {t.persistent ? "always" : "this session"}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void revokeAllowed(t.key)}
+                      className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
+                    >
+                      Revoke
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <div className="settings-switches">
+            {" "}
+            {toggle(
+              EyeOff,
+              piiRedaction,
+              "text-info",
+              "Hide personal data from the model",
+              "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. A value only goes back to the server it came from, so a call that would send one server's data to another is refused. Real data stays on this machine and is forgotten when the conversation ends. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
+              apply("pii-redaction", setPiiRedaction),
+              "pii-redaction",
+            )}
+            {toggle(
+              Activity,
+              liveInspect,
+              "text-info",
+              "Live request/response inspection",
+              "Off by default. While on, Toolport captures each tool call's arguments and results to a small local, ephemeral buffer (the last 50 calls) so you can inspect them in Activity. This is separate from the audit log, never leaves your machine, and is cleared when you turn it off or restart the gateway.",
+              applyLiveInspect,
+              "live-inspect",
+            )}
+          </div>
+          <p className="text-sm" aria-live="polite">
+            Pending approvals: {pendingCount}. Waiting calls appear in the approval queue.
+          </p>
+        </section>
+      )}
+      {page === "access" && (
+        <section className="settings-page flex flex-col gap-4" aria-label="access">
+          <div className="mt-3 flex flex-col gap-2">
+            {profiles.length > 0 && (
+              <section className="flex flex-col gap-2">
+                <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+                  Access sets
+                </h2>
+                <p className="text-xs text-muted-foreground">
+                  Access sets narrow enabled servers and, for stdio clients, tools.
+                  Servers that are off stay hidden from every client.
+                </p>
+                <p className="text-sm">Default access</p>
+                <Select
+                  value={registry?.defaultAccessProfileId || "@all-enabled"}
+                  onValueChange={async (id) => {
+                    try {
+                      onRegistryChange(
+                        await setDefaultAccess(id === "@all-enabled" ? null : id),
+                      );
+                    } catch (e) {
+                      toastError(`${e}`);
+                    }
+                  }}
+                >
+                  <SelectTrigger aria-label="Default access">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="@all-enabled">All enabled servers</SelectItem>
+                    {profiles.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>
+                        {p.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {registry?.defaultAccessLegacyPolicy &&
+                  !registry.defaultAccessProfileId && (
+                    <div className="flex flex-col gap-2 text-xs text-muted-foreground">
+                      <p>
+                        The upgrade retained the default access set&apos;s tool
+                        restrictions and instructions.
+                      </p>
+                      <button
+                        className="w-fit rounded border px-2 py-1"
+                        onClick={async () => {
+                          try {
+                            onRegistryChange(await setDefaultAccess(null));
+                          } catch (e) {
+                            toastError(`${e}`);
+                          }
+                        }}
+                      >
+                        Use All enabled servers
+                      </button>
+                    </div>
+                  )}
+                <AccessSetCreator onRegistryChange={onRegistryChange} />
+                <div className="flex flex-col divide-y rounded-lg border">
+                  {profiles.map((p) => {
+                    const names = p.enabledServerIds
+                      .map((id) => serverName.get(id))
+                      .filter((n): n is string => !!n)
+                      .sort((a, b) => a.localeCompare(b));
+                    const active = p.id === registry?.defaultAccessProfileId;
+                    const isOpen = openProfiles.has(p.id);
+                    const toggle = () =>
+                      setOpenProfiles((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(p.id)) next.delete(p.id);
+                        else next.add(p.id);
+                        return next;
+                      });
+                    return (
+                      <div key={p.id} className="flex flex-col gap-1 px-3 py-2.5">
+                        <button
+                          type="button"
+                          onClick={toggle}
+                          aria-expanded={isOpen}
+
+                          className="flex items-center gap-2 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-border disabled:cursor-default"
+                        >
+                          <ChevronRight
+                            className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${
+                              isOpen ? "rotate-90" : ""
+                            }`}
+                          />
+                          <span className="text-sm font-medium">{p.name}</span>
+                          {active && (
+                            <span className="rounded-full bg-info/15 px-1.5 py-0.5 text-[10px] font-medium text-info">
+                              default
+                            </span>
+                          )}
+                          <span className="ml-auto text-xs text-muted-foreground">
+                            {names.length} {names.length === 1 ? "server" : "servers"}
+                          </span>
+                        </button>
+                        {isOpen && registry && (
+                          <div className="flex flex-col gap-2 pl-5">
+                            {registry.servers
+                              .filter((server) => !isGatewayServer(server))
+                              .map((server) => (
+                                <label
+                                  key={server.id}
+                                  className="flex items-center gap-2 text-xs"
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={p.enabledServerIds.includes(server.id)}
+                                    onChange={async (e) => {
+                                      try {
+                                        onRegistryChange(
+                                          await setAccessServer(
+                                            p.id,
+                                            server.id,
+                                            e.target.checked,
+                                          ),
+                                        );
+                                      } catch (error) {
+                                        toastError(`${error}`);
+                                      }
+                                    }}
+                                  />
+                                  {server.name}
+                                  {!server.enabled && " (off)"}
+                                </label>
+                              ))}
+                            <button
+                              disabled={
+                                profiles.length <= 1 ||
+                                p.id === registry.defaultAccessProfileId ||
+                                p.id === registry.defaultAccessContextId
+                              }
+                              onClick={async () => {
+                                try {
+                                  onRegistryChange(await deleteProfile(p.id));
+                                } catch (e) {
+                                  toastError(`${e}`);
+                                }
+                              }}
+                            >
+                              Delete access set
+                            </button>
+                          </div>
+                        )}
+                        {names.length === 0 ? (
+                          <p className="pl-5 text-xs text-muted-foreground italic">
+                            No servers in this access set.
+                          </p>
+                        ) : isOpen ? (
+                          registry && (
+                            <ProfileToolScope
+                              profile={p}
+                              registry={registry}
+                              onRegistryChange={onRegistryChange}
+                            />
+                          )
+                        ) : (
+                          <p className="truncate pl-5 text-xs text-muted-foreground">
+                            {names.join(", ")}
+                          </p>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                <FolderRouting registry={registry} onRegistryChange={onRegistryChange} />
+              </section>
+            )}
+          </div>
+
+          {bridge?.running ? (
+            <div className="mt-1 flex flex-col gap-2 rounded border bg-muted/20 p-2.5">
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-[11px] font-medium text-muted-foreground">
+                  Scoped clients
+                </span>
+                <span className="text-[11px] text-muted-foreground/70">
+                  each gets its own token and server set
+                </span>
+              </div>
+
+              {httpClients.length > 0 && (
+                <ul className="flex flex-col gap-1">
+                  {httpClients.map((c) => (
+                    <li key={c.id} className="flex items-center gap-2 text-xs">
+                      <span className="truncate font-medium">
+                        {c.label || "(unnamed)"}
+                      </span>
+                      <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                        {c.profile === "@all-enabled"
+                          ? "All enabled servers"
+                          : profiles.find(
+                              (p) => p.id === c.profile || p.name === c.profile,
+                            )?.name ||
+                            c.profile ||
+                            "Full connected set"}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => removeClient(c.id)}
+                        aria-label={`Revoke ${c.label}`}
+                        className="ml-auto shrink-0 rounded p-1 text-muted-foreground/60 hover:bg-destructive/10 hover:text-destructive"
+                      >
+                        <Trash2 className="size-3.5" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              {newToken && (
+                <>
+                  <div className="flex items-center gap-2 rounded border border-success/30 bg-success/5 px-2 py-1.5">
+                    <span className="shrink-0 text-[11px] font-medium text-success">
+                      New token
+                    </span>
+                    <code className="min-w-0 flex-1 truncate text-xs">{newToken}</code>
+                    <button
+                      type="button"
+                      onClick={() => copy(newToken, "newtoken")}
+                      title="Copy token"
+                      className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                    >
+                      {copied === "newtoken" ? (
+                        <Check className="size-3.5 text-success" />
+                      ) : (
+                        <Copy className="size-3.5" />
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setNewToken(null)}
+                      aria-label="Dismiss"
+                      className="shrink-0 rounded p-1 text-muted-foreground/60 hover:text-foreground"
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  </div>
+                  <p className="text-[11px] text-warning">
+                    Copy this token now, it won't be shown again.
+                  </p>
+                </>
+              )}
+
+              <div className="flex items-center gap-2">
+                <input
+                  value={newLabel}
+                  onChange={(e) => setNewLabel(e.target.value)}
+                  placeholder="Client name (e.g. Open WebUI)"
+                  className="h-8 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-xs focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none"
+                />
+                {profiles.length > 0 && (
+                  <Select
+                    value={newProfile || "__default__"}
+                    onValueChange={(v) => setNewProfile(v === "__default__" ? "" : v)}
+                  >
+                    <SelectTrigger
+                      size="sm"
+                      aria-label="Access"
+                      className="h-8 w-32 shrink-0 text-xs"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__default__">Full connected set</SelectItem>
+                      <SelectItem value="@all-enabled">All enabled servers</SelectItem>
+                      {profiles.map((p) => (
+                        <SelectItem key={p.id} value={p.id}>
+                          {p.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+                <button
+                  type="button"
+                  onClick={addClient}
+                  disabled={clientBusy || !newLabel.trim()}
+                  className="h-8 shrink-0 rounded-md border bg-background px-2.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
+                >
+                  Add
+                </button>
+              </div>
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              Start the HTTP endpoint in Connections to manage scoped clients.
+            </p>
+          )}
+        </section>
+      )}
+      {page === "connections" && (
+        <section className="settings-page flex flex-col gap-4" aria-label="connections">
           <div className="flex flex-col gap-2 rounded-md border px-3 py-2.5">
             <label className="flex items-center gap-2.5 text-sm">
               <Globe
@@ -1447,124 +1608,6 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   Function Calling to Native (per chat). The token stops other local apps
                   from calling your tools.
                 </p>
-
-                <div className="mt-1 flex flex-col gap-2 rounded border bg-muted/20 p-2.5">
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className="text-[11px] font-medium text-muted-foreground">
-                      Scoped clients
-                    </span>
-                    <span className="text-[11px] text-muted-foreground/70">
-                      each gets its own token and server set
-                    </span>
-                  </div>
-
-                  {httpClients.length > 0 && (
-                    <ul className="flex flex-col gap-1">
-                      {httpClients.map((c) => (
-                        <li key={c.id} className="flex items-center gap-2 text-xs">
-                          <span className="truncate font-medium">
-                            {c.label || "(unnamed)"}
-                          </span>
-                          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                            {c.profile === "@all-enabled"
-                              ? "All enabled servers"
-                              : profiles.find(
-                                  (p) => p.id === c.profile || p.name === c.profile,
-                                )?.name ||
-                                c.profile ||
-                                "Full connected set"}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => removeClient(c.id)}
-                            aria-label={`Revoke ${c.label}`}
-                            className="ml-auto shrink-0 rounded p-1 text-muted-foreground/60 hover:bg-destructive/10 hover:text-destructive"
-                          >
-                            <Trash2 className="size-3.5" />
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-
-                  {newToken && (
-                    <>
-                      <div className="flex items-center gap-2 rounded border border-success/30 bg-success/5 px-2 py-1.5">
-                        <span className="shrink-0 text-[11px] font-medium text-success">
-                          New token
-                        </span>
-                        <code className="min-w-0 flex-1 truncate text-xs">
-                          {newToken}
-                        </code>
-                        <button
-                          type="button"
-                          onClick={() => copy(newToken, "newtoken")}
-                          title="Copy token"
-                          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-                        >
-                          {copied === "newtoken" ? (
-                            <Check className="size-3.5 text-success" />
-                          ) : (
-                            <Copy className="size-3.5" />
-                          )}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setNewToken(null)}
-                          aria-label="Dismiss"
-                          className="shrink-0 rounded p-1 text-muted-foreground/60 hover:text-foreground"
-                        >
-                          <X className="size-3.5" />
-                        </button>
-                      </div>
-                      <p className="text-[11px] text-warning">
-                        Copy this token now, it won't be shown again.
-                      </p>
-                    </>
-                  )}
-
-                  <div className="flex items-center gap-2">
-                    <input
-                      value={newLabel}
-                      onChange={(e) => setNewLabel(e.target.value)}
-                      placeholder="Client name (e.g. Open WebUI)"
-                      className="h-8 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-xs focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none"
-                    />
-                    {profiles.length > 0 && (
-                      <Select
-                        value={newProfile || "__default__"}
-                        onValueChange={(v) => setNewProfile(v === "__default__" ? "" : v)}
-                      >
-                        <SelectTrigger
-                          size="sm"
-                          aria-label="Access"
-                          className="h-8 w-32 shrink-0 text-xs"
-                        >
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="__default__">Full connected set</SelectItem>
-                          <SelectItem value="@all-enabled">
-                            All enabled servers
-                          </SelectItem>
-                          {profiles.map((p) => (
-                            <SelectItem key={p.id} value={p.id}>
-                              {p.name}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    )}
-                    <button
-                      type="button"
-                      onClick={addClient}
-                      disabled={clientBusy || !newLabel.trim()}
-                      className="h-8 shrink-0 rounded-md border bg-background px-2.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
-                    >
-                      Add
-                    </button>
-                  </div>
-                </div>
               </>
             )}
           </div>
@@ -1688,71 +1731,95 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               </div>
             )}
           </div>
-        </div>
-      </details>
-      <section className="flex flex-col gap-2">
-        <SectionHeading title="Help and data">
-          Restore client configurations before removing Toolport.
-        </SectionHeading>
-        <Button
-          variant="outline"
-          className="self-start text-destructive"
-          disabled={removeBusy}
-          onClick={() => setRemoveOpen(true)}
-        >
-          Remove Toolport from all clients
-        </Button>
-        {removeResults && (
-          <ul className="text-sm" aria-live="polite">
-            {removeResults.length === 0 ? (
-              <li>No client connections to remove.</li>
-            ) : (
-              removeResults.map((result) => (
-                <li
-                  key={`${result.clientId}:${result.path}`}
-                  className={result.error ? "text-destructive" : "text-muted-foreground"}
+        </section>
+      )}
+      {page === "help" && (
+        <section className="settings-page flex flex-col gap-4" aria-label="help">
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant="outline"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(await gatherDiagnostics());
+                  toast.success("Diagnostics copied, paste them into your bug report");
+                } catch {
+                  toastError("Couldn't copy diagnostics");
+                }
+              }}
+            >
+              Copy diagnostics
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() =>
+                openDataDir().catch(() => toastError("Couldn't open data folder"))
+              }
+            >
+              Open data folder
+            </Button>
+          </div>
+          <Button
+            variant="outline"
+            className="self-start text-destructive"
+            disabled={removeBusy}
+            onClick={() => setRemoveOpen(true)}
+          >
+            Remove Toolport from all clients
+          </Button>
+          {removeResults && (
+            <ul className="text-sm" aria-live="polite">
+              {removeResults.length === 0 ? (
+                <li>No client connections to remove.</li>
+              ) : (
+                removeResults.map((result) => (
+                  <li
+                    key={`${result.clientId}:${result.path}`}
+                    className={
+                      result.error ? "text-destructive" : "text-muted-foreground"
+                    }
+                  >
+                    {result.clientId}: {result.error ?? "Client configuration restored"}
+                    {result.warnings?.length ? `; ${result.warnings.join("; ")}` : ""}
+                  </li>
+                ))
+              )}
+            </ul>
+          )}
+          <Dialog
+            open={removeOpen}
+            onOpenChange={(open) => {
+              if (!removeBusy) setRemoveOpen(open);
+            }}
+          >
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Remove Toolport from all clients?</DialogTitle>
+                <DialogDescription>
+                  Unchanged configs return to their original bytes. If you edited a
+                  config, Toolport preserves your edits and restores entries it moved.
+                  Each client result is reported here.
+                </DialogDescription>
+              </DialogHeader>
+              <DialogFooter>
+                <Button
+                  variant="outline"
+                  disabled={removeBusy}
+                  onClick={() => setRemoveOpen(false)}
                 >
-                  {result.clientId}: {result.error ?? "Client configuration restored"}
-                  {result.warnings?.length ? `; ${result.warnings.join("; ")}` : ""}
-                </li>
-              ))
-            )}
-          </ul>
-        )}
-        <Dialog
-          open={removeOpen}
-          onOpenChange={(open) => {
-            if (!removeBusy) setRemoveOpen(open);
-          }}
-        >
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Remove Toolport from all clients?</DialogTitle>
-              <DialogDescription>
-                Unchanged configs return to their original bytes. If you edited a config,
-                Toolport preserves your edits and restores entries it moved. Each client
-                result is reported here.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button
-                variant="outline"
-                disabled={removeBusy}
-                onClick={() => setRemoveOpen(false)}
-              >
-                Cancel
-              </Button>
-              <Button
-                variant="destructive"
-                disabled={removeBusy}
-                onClick={() => void removeAll()}
-              >
-                {removeBusy ? "Removing…" : "Remove from all clients"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-      </section>
+                  Cancel
+                </Button>
+                <Button
+                  variant="destructive"
+                  disabled={removeBusy}
+                  onClick={() => void removeAll()}
+                >
+                  {removeBusy ? "Removing…" : "Remove from all clients"}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+        </section>
+      )}
     </div>
   );
 }

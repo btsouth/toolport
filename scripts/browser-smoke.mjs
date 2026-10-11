@@ -105,13 +105,13 @@ try {
   await page.screenshot({ path: path.join(output, "client-access.png") });
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await page.getByText("Access", { exact: true }).click();
+  await page.getByRole("button", { name: "Access", exact: true }).click();
   await expect(
     page.getByRole("combobox", { name: "Default access", exact: true }),
   ).toBeVisible();
   await expect(page.getByText("Access sets", { exact: true })).toBeVisible();
   await page
-    .getByText("Access", { exact: true })
+    .getByRole("heading", { name: "Access", exact: true })
     .evaluate((element) => element.scrollIntoView({ block: "start" }));
   await page.screenshot({
     path: path.join(output, "settings-advanced.png"),
@@ -201,7 +201,8 @@ try {
   await page.getByRole("button", { name: "View log", exact: true }).first().click();
   await expect(page.getByRole("tab", { name: "Overview", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await expect(page.getByRole("combobox", { name: "Safety" })).toHaveValue("off");
+  await page.getByRole("button", { name: "Safety", exact: true }).click();
+  await expect(page.getByRole("radio", { name: "Off", exact: true })).toBeChecked();
   await expect(page.getByText(/Safety is set to Off/)).toBeVisible();
   await expect(page.getByText("Find tools as needed", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Team", exact: true }).click();
