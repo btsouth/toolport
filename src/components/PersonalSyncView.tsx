@@ -20,7 +20,13 @@ import { Input } from "./ui/input";
 import { Callout } from "./Callout";
 import { ServerLogo } from "./ServerLogo";
 
-function SectionLabel({ children, className = "" }: { children: string; className?: string }) {
+function SectionLabel({
+  children,
+  className = "",
+}: {
+  children: string;
+  className?: string;
+}) {
   return (
     <h3
       className={`mb-2 text-xs font-semibold tracking-[0.05em] text-muted-foreground uppercase ${className}`}
@@ -422,7 +428,9 @@ export function PersonalSyncView({
                                 })
                               }
                             >
-                              {keepMine ? "Keep this machine's version" : "Use synced version"}
+                              {keepMine
+                                ? "Keep this machine's version"
+                                : "Use synced version"}
                             </Button>
                           ))}
                         </div>
@@ -556,8 +564,8 @@ export function PersonalSyncView({
                   <p className="font-medium">Your account</p>
                   {sync?.signInRequired ? (
                     <p className="text-xs text-muted-foreground">
-                      Saved account plan: {planName(status?.plan)}. Sign in to confirm your
-                      account and resume sync.
+                      Saved account plan: {planName(status?.plan)}. Sign in to confirm
+                      your account and resume sync.
                     </p>
                   ) : status ? (
                     accountStatusText(status).map((line) => (
