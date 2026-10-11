@@ -15441,13 +15441,19 @@ fn adapter_live_view(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let rooted = host.router_for_root(base, &current, root.as_deref(), Some(&scope));
-        let mut view = (*host
+        let view = host
             .router_for_client_view(rooted, &current, Some(profile), client.as_deref())
-            .0)
-            .clone();
+            .0;
         // Post-HITL owner/fingerprint checks need the current adapter visibility,
         // not the host's union of profiles. Preserve the live quarantine state.
-        view.apply_registry_policy(registry_policy(&current, Some(profile), false, false));
+        // Copying the router costs milliseconds per call, so share the view when
+        // its policy already matches.
+        let policy = registry_policy(&current, Some(profile), false, false);
+        if view.registry_policy() == policy {
+            return view;
+        }
+        let mut view = (*view).clone();
+        view.apply_registry_policy(policy);
         Arc::new(view)
     });
     LiveRouterResolver { stale, resolve }
