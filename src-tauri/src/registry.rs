@@ -2222,7 +2222,9 @@ impl Registry {
                     .flatten()
             })
             .and_then(|id| self.profiles.iter().find(|p| p.id == id))
-            .map(|p| p.name.as_str());
+            .map(|p| p.name.as_str())
+            // A set that is itself named "Default" would read "Default access (Default)".
+            .filter(|name| !name.trim().eq_ignore_ascii_case("default"));
         name.map(|name| format!("Default access ({name})"))
             .unwrap_or_else(|| "Default access".into())
     }

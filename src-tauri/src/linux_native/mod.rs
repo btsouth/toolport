@@ -2540,13 +2540,7 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             } else {
                 " · stdio"
             });
-            detail.push_str(
-                &client
-                    .scope_name
-                    .as_deref()
-                    .map(|scope| format!(" · {scope}"))
-                    .unwrap_or_else(|| " · default access".to_string()),
-            );
+            // Access is not repeated here: the card's access button shows it.
         }
         detail
     } else {
@@ -2568,13 +2562,7 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             } else {
                 " · stdio"
             });
-            detail.push_str(
-                &client
-                    .scope_name
-                    .as_deref()
-                    .map(|scope| format!(" · {scope}"))
-                    .unwrap_or_else(|| " · default access".to_string()),
-            );
+            // Access is not repeated here: the card's access button shows it.
         }
         detail
     };
@@ -2807,8 +2795,14 @@ fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuBu
         .as_deref()
         .map(|scope| scope.to_string())
         .unwrap_or_else(|| "Default access".to_string());
+    // "Default access" and "All enabled servers" already say what they are.
+    let label = if label.starts_with("Default access") || label == "All enabled servers" {
+        label
+    } else {
+        format!("Access: {label}")
+    };
     let menu = gtk::MenuButton::builder()
-        .label(format!("Access: {label}"))
+        .label(label)
         .tooltip_text("Choose this client's access to enabled servers")
         .build();
     menu.add_css_class("toolport-secondary-action");
