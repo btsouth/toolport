@@ -123,8 +123,8 @@ Before changing it, Toolport saves the 1.x file next to it as
 rules as `rules-<date>.md`, saved routines as `routines-<date>.json` (the original
 `routines.json` stays), and agent permission rules as `agent-permissions-<date>.json`.
 The schema migration does not edit client files. Safety, Code Mode and server
-environment choices carry over. Discovery keeps explicit choices; the old Lazy
-default becomes Auto for identified clients. See [Upgrading from 1.x](migration.md).
+environment choices carry over. Discovery stays as it was: clients on the old
+Lazy default keep Lazy. See [Upgrading from 1.x](migration.md).
 Released 1.x builds do not check the schema version. 2.0 keeps legacy safety
 toggles as a compatibility mirror, but a rollback still needs the original
 v1 backup. Follow the guide before starting 1.24 again.

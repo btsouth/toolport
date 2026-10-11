@@ -50,10 +50,10 @@ using it. Use the folder that contains your actual registry.
   local servers keep full shell environment inheritance unless already set
   explicitly. New local servers use an environment allowlist by default.
 - **Discovery.** Explicit per-client and global choices remain, including the
-  old `lazyDiscovery: false` choice of Full. The old default
-  `lazyDiscovery: true` alone is treated as Auto for identified clients, which
-  can select Full or Lazy based on the client. New installs also use Auto.
-  Choose an explicit mode in Clients if you want to keep Lazy everywhere.
+  old `lazyDiscovery: false` choice of Full. If you were on the 1.x default,
+  every client keeps Lazy, and Clients shows it as "Auto (lazy)". New installs
+  use Auto, which picks Full or Lazy per client. You can pick a mode for any
+  client in Clients.
 
 ## What is available in 2.0
 
