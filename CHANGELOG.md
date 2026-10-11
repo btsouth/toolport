@@ -36,7 +36,8 @@ Your 1.x Safety and Code Mode settings are kept. Read the
 - The sidebar is Servers, Clients, Activity and Settings. Catalog browsing is in
   Servers; Playground is in each server's Tools tab. Number shortcuts follow the
   new sidebar. Restart clients still using an old gateway after upgrading.
-- Windows installs and updates ask you to close MCP clients first.
+- Windows installs and updates work while MCP clients are open. The installer
+  stops only Toolport's own gateway processes; restart your MCP clients afterward.
 - Linux `.deb` and `.rpm` packages use GTK. The deb needs Ubuntu 24.04+ or
   Debian 13+; older distros, including Ubuntu 22.04 and Debian 12, use the
   AppImage. AUR `toolport-bin` also becomes GTK. GTK has no in-app update check;
