@@ -2027,7 +2027,16 @@ impl Router {
                         if !visible(server) || !model_visible {
                             return None;
                         }
-                        let distance = alias_distance(exposed_name, name);
+                        // A bare tool name without its server prefix is the
+                        // closest match there is.
+                        let unprefixed = name
+                            .strip_suffix(exposed_name)
+                            .is_some_and(|prefix| prefix.ends_with("__"));
+                        let distance = if unprefixed {
+                            0
+                        } else {
+                            alias_distance(exposed_name, name)
+                        };
                         (distance <= 3).then_some((distance, name))
                     })
                     .collect();
@@ -6856,6 +6865,18 @@ for line in sys.stdin:
         assert_eq!(
             aliases,
             Router::server_tool_aliases("s", &reversed, HashMap::new())
+        );
+    }
+
+    #[test]
+    fn bare_tool_names_suggest_their_prefixed_route() {
+        let mut router = Router::new();
+        router.add(mock_server("alpha"));
+        router.add(mock_server("beta"));
+        assert_eq!(
+            router.no_route_message("echo"),
+            "Unknown tool: echo\nClose matches: alpha__echo, beta__echo\n\
+             Use toolport_search_tools to find tools."
         );
     }
 
