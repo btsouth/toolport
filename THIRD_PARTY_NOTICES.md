@@ -6,7 +6,7 @@ owners. Their use does not imply endorsement.
 
 ## Lobe Icons
 
-Selected client icons are adapted from
+Selected client and server icons are adapted from
 [`@lobehub/icons-static-svg`](https://github.com/lobehub/lobe-icons), licensed
 under the MIT License.
 
@@ -46,6 +46,26 @@ Selected client and server icon data is adapted from
 is released under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/).
 Individual marks may remain subject to their owners' trademark and usage rules.
 See the [Simple Icons disclaimer](https://github.com/simple-icons/simple-icons/blob/develop/DISCLAIMER.md).
+
+## Lucide
+
+The icons for the Fetch, Filesystem, Memory, Sequential Thinking and Time
+reference servers are adapted from [Lucide](https://lucide.dev), licensed under
+the ISC License.
+
+Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part of
+Feather (MIT). All other copyright (c) for Lucide are held by Lucide
+Contributors 2022.
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+## Vendor marks
+
+The Apify, Browserbase, Composio, Context7, DataForSEO, Parallel and Playwright
+marks are taken from each project's own website. They are used only to identify
+the corresponding server and remain the property of their owners.
 
 ## RevenueCat
 
