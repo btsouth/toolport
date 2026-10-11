@@ -1,16 +1,18 @@
 # Grouped discovery mode
 
-Toolport has three tool-discovery modes, selected per client by the
-`TOOLPORT_DISCOVERY` environment variable (falling back to the registry's
-`lazy_discovery` setting when unset):
+Toolport has three tool-discovery modes. Identified clients use Auto unless you
+choose a per-client or global override in Clients. Auto selects Full or Lazy
+from the client's capabilities. `TOOLPORT_DISCOVERY` selects the process default
+for a standalone gateway; shared daemon sessions use their client policy. See
+[client discovery](client-discovery.md).
 
-| Mode             | `tools/list` advertises                                                                                                                                                                                                  | Best for                                                                                 |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
-| `lazy` (default) | The core meta-tools (`toolport_status`, `toolport_search_tools`, `toolport_call_tool`, `toolport_fetch_result`), plus the Code Mode tool when it is enabled (off by default, so the default exposes the four core tools) | Capable models: minimal, constant context regardless of server count                     |
-| `grouped`        | The core meta-tools **plus** a per-server `help_<server>` browse tool                                                                                                                                                    | Weaker / local models: an _enumerable_ server choice instead of inventing a search query |
-| `full`           | `toolport_status`, `toolport_fetch_result`, and the scoped namespaced catalog (`server__tool`)                                                                                                                           | Debugging, or small setups where full schemas are affordable                             |
+| Mode      | `tools/list` advertises                                                                                                                                                                                                  | Best for                                                                                 |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| `lazy`    | The core meta-tools (`toolport_status`, `toolport_search_tools`, `toolport_call_tool`, `toolport_fetch_result`), plus the Code Mode tool when it is enabled (off by default, so the default exposes the four core tools) | Capable models: minimal, constant context regardless of server count                     |
+| `grouped` | The core meta-tools **plus** a per-server `help_<server>` browse tool                                                                                                                                                    | Weaker / local models: an _enumerable_ server choice instead of inventing a search query |
+| `full`    | `toolport_status`, `toolport_fetch_result`, and the scoped namespaced catalog (`server__tool`)                                                                                                                           | Debugging, or small setups where full schemas are affordable                             |
 
-These are the core definitions. Code Mode, confirmation, agent-control,
+These are the core definitions. Code Mode, confirmation,
 and negotiated MCP Apps settings can add or change definitions for a particular
 client. The exact measurement uses that client's resulting tool array.
 

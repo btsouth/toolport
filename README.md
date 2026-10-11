@@ -45,6 +45,7 @@ configuration and policies while each member keeps their own credentials.
 
 ## Documentation
 
+- [Upgrade from 1.24.x to 2.0](docs/migration.md)
 - [Supported clients and setup](docs/clients.md)
 - [Profiles, environment variables, and configuration](docs/configuration.md)
 - [Headless gateway and Docker](docs/headless.md)

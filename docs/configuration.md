@@ -116,17 +116,18 @@ account, and enable one in each profile. A client scoped to the work profile
 (`TOOLPORT_PROFILE`) then only ever sees the work account. Tool names are
 namespaced per server, so the two never collide even in the same profile.
 
-**Upgrading from 1.x.** The first 2.0 start upgrades `registry.json` to schema v2.
+**Upgrading from 1.x.** The first 2.0 start upgrades `registry.json` through schema v2 to v3.
 Before changing it, Toolport saves the 1.x file next to it as
 `registry.json.v1-<time>.bak`. User data from features 2.0 removed is copied to
 `exports/` in the data directory, never overwriting a file there: personal agent
 rules as `rules-<date>.md`, saved routines as `routines-<date>.json` (the original
 `routines.json` stays), and agent permission rules as `agent-permissions-<date>.json`.
-Client files are not edited. Safety, Code Mode, discovery and each server's
-environment keep their 1.x behavior; see [Upgrading from 1.x](upgrading-to-2.md).
-Released 1.x builds do not check the schema version, so 2.0 keeps the 1.x safety
-toggles in step with the level: a 1.x process still running during the upgrade
-enforces the same policy. To go back to 1.x, restore the `.bak` file.
+The schema migration does not edit client files. Safety, Code Mode and server
+environment choices carry over. Discovery keeps explicit choices; the old Lazy
+default becomes Auto for identified clients. See [Upgrading from 1.x](migration.md).
+Released 1.x builds do not check the schema version. 2.0 keeps legacy safety
+toggles as a compatibility mirror, but a rollback still needs the original
+v1 backup. Follow the guide before starting 1.24 again.
 
 ### Downstream lifecycle
 

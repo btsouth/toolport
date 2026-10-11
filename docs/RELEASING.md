@@ -66,7 +66,7 @@ release-body extraction steps read that exact section. The updater manifest
 currently includes version, date and platform artifacts but **no `notes` field**;
 the app displays `update.body` only when supplied. Before enabling the 1.x offer,
 ensure `latest.json` carries the short summary as `notes` and links to the
-[upgrade guide](upgrading-to-2.md). Writing the changelog alone does not populate
+[upgrade guide](migration.md). Writing the changelog alone does not populate
 an in-app prompt. Check the published manifest and prompt before promotion.
 
 ## Package channels

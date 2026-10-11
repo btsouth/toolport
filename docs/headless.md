@@ -273,7 +273,7 @@ server's MCP endpoint:
 calls. New 2.0 installs otherwise default to Ask: destructive calls fail closed
 without the desktop approval broker. Choose Off only when that is your intended
 policy; team minimum safety still applies. A 1.x registry keeps its old Safety
-and Code Mode settings; see the [upgrade guide](upgrading-to-2.md).
+and Code Mode settings; see the [upgrade guide](migration.md).
 
 Stdio servers inside the container need their runtimes (`node`/`npx`, `uv`,
 etc.) installed in the image or reached via another container on the same
