@@ -23,6 +23,30 @@ pub(super) fn toolport_mark() -> gtk::Image {
     )
 }
 
+/// Client marks whose art is black, so dark themes must lighten them.
+const MONO_CLIENT_LOGOS: &[&str] = &[
+    "amazon-q",
+    "amp",
+    "anythingllm",
+    "boltai",
+    "cline",
+    "continue",
+    "cursor",
+    "devin-cli",
+    "droid",
+    "github-copilot-cli",
+    "goose",
+    "grok",
+    "hermes",
+    "kilo-code",
+    "kimi-code",
+    "lm-studio",
+    "opencode",
+    "pi",
+    "roo-code",
+    "windsurf",
+];
+
 pub(super) fn client_logo(id: &str) -> gtk::Image {
     let bytes: Option<&'static [u8]> = match id {
         "claude-desktop" => Some(include_bytes!("../../icons/client-logos/claude.png")),
@@ -66,7 +90,15 @@ pub(super) fn client_logo(id: &str) -> gtk::Image {
             image.add_css_class("toolport-card-icon");
             centered_logo(image)
         },
-        |bytes| png_image(bytes, "toolport-client-logo"),
+        |bytes| {
+            // The art is 64 px so it stays sharp on scaled displays.
+            let image = png_image(bytes, "toolport-client-logo");
+            image.set_pixel_size(32);
+            if MONO_CLIENT_LOGOS.contains(&id) {
+                image.add_css_class("toolport-mono-logo");
+            }
+            image
+        },
     )
 }
 
