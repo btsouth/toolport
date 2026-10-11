@@ -26,6 +26,7 @@
   "humanApproval": false,
   "humanApprovalAllow": ["github/search_code"],
   "lazyDiscovery": true,
+  "discoveryMode": "lazy",
   "pinnedTools": {
     "github": ["get_me"]
   },

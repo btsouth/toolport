@@ -8,21 +8,9 @@ pub(super) fn migrate_v2_to_v3(value: &mut Value, _: &MigrationContext) -> Resul
         return Ok(());
     }
     let document = value.as_object_mut().ok_or("registry must be an object")?;
-    // 1.x ran every client in Lazy unless the user picked another mode. 2.0 treats an
-    // unset mode as Auto, which moves some clients to Full, so keep what upgraders had.
-    let lazy = document
-        .get("lazyDiscovery")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let mode_set = document
-        .get("discoveryMode")
-        .and_then(Value::as_str)
-        .is_some_and(|mode| !mode.trim().is_empty());
-    if lazy && !mode_set {
-        document.insert("discoveryMode".into(), Value::String("lazy".into()));
-    }
     // Malformed typed fields are left to the framework's deserialization/recovery path.
     let Some(profiles) = document.get("profiles").and_then(Value::as_array) else {
+        keep_v1_lazy_discovery(document);
         return Ok(());
     };
     // Match the loader's legacy normalization before pinning the default:
@@ -96,6 +84,7 @@ pub(super) fn migrate_v2_to_v3(value: &mut Value, _: &MigrationContext) -> Resul
         Value::String(active.clone()),
     );
     document.insert("defaultAccessLegacyPolicy".into(), Value::Bool(true));
+    keep_v1_lazy_discovery(document);
     document.insert("accessUpgradeNoticeDismissed".into(), Value::Bool(false));
     document.insert("accessUpgradeNoticePending".into(), Value::Bool(true));
     if active_set != union || active_missing {
@@ -119,6 +108,22 @@ pub(super) fn migrate_v2_to_v3(value: &mut Value, _: &MigrationContext) -> Resul
             .insert("enabled".into(), Value::Bool(enabled));
     }
     Ok(())
+}
+
+/// 1.x ran every client in Lazy unless the user picked another mode. 2.0 treats an
+/// unset mode as Auto, which moves some clients to Full, so keep what upgraders had.
+fn keep_v1_lazy_discovery(document: &mut serde_json::Map<String, Value>) {
+    let lazy = document
+        .get("lazyDiscovery")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mode_set = document
+        .get("discoveryMode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| !mode.trim().is_empty());
+    if lazy && !mode_set {
+        document.insert("discoveryMode".into(), Value::String("lazy".into()));
+    }
 }
 
 #[cfg(test)]
