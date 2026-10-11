@@ -2265,6 +2265,16 @@ fn verify_setup_gateway(
     profile: Option<&str>,
 ) -> Result<SetupVerification, String> {
     let intended = moved;
+    // Nothing moves, so there is nothing to verify. Spawning the setup gateway
+    // here waited on every existing server's catalog before confirming.
+    if intended.is_empty() {
+        clients::resolve_gateway_path_readonly()
+            .ok_or("Could not locate the Toolport gateway. Client config unchanged.")?;
+        return Ok(SetupVerification {
+            tools: Vec::new(),
+            servers: Vec::new(),
+        });
+    }
     let mut servers = Vec::new();
     let mut tool_counts = std::collections::BTreeMap::new();
     for name in intended {
@@ -4188,6 +4198,22 @@ mod tests {
                 unknown_fields: Default::default(),
             });
         assert!(verify_setup_gateway(&reg, &["broken".into()], "claude-code", None).is_err());
+    }
+
+    #[test]
+    fn connecting_without_imports_does_not_wait_on_existing_servers() {
+        let _fixture = MoveFixture::new(&Registry::default());
+        let mut reg = Registry::default();
+        let mut entry = server("slow");
+        entry.command = Some("/does-not-exist-toolport-setup".into());
+        reg.add_server(entry);
+        match verify_setup_gateway(&reg, &[], "claude-code", None) {
+            Ok(verification) => {
+                assert!(verification.tools.is_empty());
+                assert!(verification.servers.is_empty());
+            }
+            Err(error) => assert!(error.contains("locate the Toolport gateway"), "{error}"),
+        }
     }
 
     #[test]
