@@ -2026,7 +2026,7 @@ mod tests {
     }
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
-    fn personal_sync_conflicts_and_disabled_rows_are_readable() {
+    fn personal_sync_lists_what_syncs_and_waits_on_conflicts() {
         adw::init().unwrap();
         let _data = crate::registry::DataDirTestEnv::new("gtk-personal-conflicts");
         let app = adw::Application::builder().flags(gtk::gio::ApplicationFlags::NON_UNIQUE).build();
@@ -2041,8 +2041,11 @@ mod tests {
         page.render(reg);
         assert!(!page.feedback.has_css_class("success"));
         let mut text = String::new(); collect(page.root.upcast_ref(), &mut text);
-        assert!(text.contains("Toolport docs changed on both machines")); assert!(text.contains("This machine")); assert!(text.contains("Other machine")); assert!(text.contains("URL:"));
-        assert!(!text.contains("Sync is up to date")); assert!(!text.contains("Review and enable")); assert!(text.contains("Turned off")); assert!(!page.plan_badge.is_visible());
+        // The conflict waits in Needs you; its versions open in Compare.
+        assert!(text.contains("Toolport docs changed on two machines")); assert!(text.contains("Compare"));
+        assert!(text.contains("Every machine")); assert!(text.contains("This machine")); assert!(text.contains("changed on two machines"));
+        // Sync no longer turns servers on or off.
+        assert!(!text.contains("Review and enable")); assert!(!text.contains("Turned off")); assert!(!page.plan_badge.is_visible());
         // Turned off elsewhere, nothing to confirm: no review text.
         assert!(!text.contains("New server")); assert!(!text.contains("Nothing in this definition changed"));
     }
