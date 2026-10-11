@@ -1072,6 +1072,43 @@ button.toolport-catalog-action {{
   text-transform: uppercase;
   color: @toolport_muted;
 }}
+
+/* Sync page: one amber block for everything that needs a decision. */
+.toolport-attention {{
+  border-left: 3px solid @warning_color;
+  border-radius: 0 10px 10px 0;
+  background-color: alpha(@warning_color, 0.07);
+}}
+
+.toolport-attention-item {{
+  padding: 10px 14px;
+  border-bottom: 1px solid alpha(@warning_color, 0.14);
+}}
+
+.toolport-attention-item:last-child {{
+  border-bottom: none;
+}}
+
+.toolport-sync-row {{
+  padding: 9px 2px;
+  border-bottom: 1px solid alpha(@toolport_fg, 0.075);
+}}
+
+.toolport-sync-row:last-child {{
+  border-bottom: none;
+}}
+
+.toolport-sync-tag {{
+  color: @warning_color;
+}}
+
+.toolport-sync-status {{
+  color: @toolport_muted;
+}}
+
+.toolport-sync-status.healthy {{
+  color: @toolport_success;
+}}
 .toolport-muted {{ font-size: 13px; }}
 .toolport-native button {{ border-radius: 8px; font-weight: 600; }}
 .toolport-feedback.warning {{
