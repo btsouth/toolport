@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { abstained, finalText, includes, score, warmCatalogComplete } from "./live-client-bench.mjs";
+import {
+  abstained,
+  finalText,
+  includes,
+  score,
+  warmCatalogComplete,
+} from "./live-client-bench.mjs";
 import { specifications, tasksFrom } from "./live-client-bench-tasks.mjs";
 
 const catalog = [
@@ -184,10 +190,13 @@ test("public development file-read alternatives retain requested arguments", () 
   ]);
 });
 
-
 test("prewarming requires the complete downstream catalog regardless of helper count", () => {
-  const downstream = Array.from({ length: 1707 }, (_, i) => ({ name: `fixture__tool${i}` }));
-  const helpers = ["status", "fetch_result", "search_tools", "call_tool"].map(name => ({name: `toolport_${name}`}));
+  const downstream = Array.from({ length: 1707 }, (_, i) => ({
+    name: `fixture__tool${i}`,
+  }));
+  const helpers = ["status", "fetch_result", "search_tools", "call_tool"].map((name) => ({
+    name: `toolport_${name}`,
+  }));
   assert.equal(warmCatalogComplete([...helpers.slice(0, 2), ...downstream]), true);
   assert.equal(warmCatalogComplete([...helpers, ...downstream]), true);
   assert.equal(warmCatalogComplete([...helpers, ...downstream.slice(0, 1705)]), false);

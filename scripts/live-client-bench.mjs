@@ -301,7 +301,10 @@ async function coldBridge(cfg, output) {
 }
 
 export function warmCatalogComplete(tools) {
-  return Array.isArray(tools) && tools.filter((tool) => !tool.name.startsWith("toolport_")).length === 1707;
+  return (
+    Array.isArray(tools) &&
+    tools.filter((tool) => !tool.name.startsWith("toolport_")).length === 1707
+  );
 }
 
 async function prewarm(cfg) {
@@ -314,7 +317,9 @@ async function prewarm(cfg) {
     cwd: cfg.home,
     stdio: ["pipe", "pipe", "pipe"],
   });
-  child.stderr.on("data", (data) => appendFileSync(path.join(cfg.home, "prewarm-stderr.txt"), data));
+  child.stderr.on("data", (data) =>
+    appendFileSync(path.join(cfg.home, "prewarm-stderr.txt"), data),
+  );
   const lines = createInterface({ input: child.stdout });
   let requestId = 2,
     pending = false,
@@ -375,11 +380,7 @@ async function prewarm(cfg) {
         timer = setTimeout(() => reject(new Error("Warm catalog deadline")), 25000);
       }),
     ]);
-    assert.equal(
-      count,
-      1707,
-      "Warm fixture must expose all 1707 public tools",
-    );
+    assert.equal(count, 1707, "Warm fixture must expose all 1707 public tools");
   } finally {
     clearTimeout(timer);
     child.kill();
