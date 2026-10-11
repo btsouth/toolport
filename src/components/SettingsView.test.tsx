@@ -124,7 +124,6 @@ describe("SettingsView tool loading", () => {
 
     renderSettings("access");
 
-    // Open the access set.
     // Expand GitHub (request A starts).
     const githubToggle = screen.getByRole("button", {
       name: /github/i,

@@ -236,6 +236,7 @@ try {
   await page.getByRole("button", { name: "Safety", exact: true }).click();
   await expect(page.getByRole("radio", { name: "Off", exact: true })).toBeChecked();
   await expect(page.getByText(/Safety is set to Off/)).toBeVisible();
+  await page.getByRole("button", { name: "Tools", exact: true }).click();
   await expect(page.getByText("Find tools as needed", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Team", exact: true }).click();
   await expect(
