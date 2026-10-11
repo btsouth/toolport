@@ -269,8 +269,9 @@ function SecurityResting() {
     <div className="mb-4 flex items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-2.5 text-xs text-muted-foreground">
       <ShieldCheck className="size-4 shrink-0 text-owned" />
       <span>
-        <span className="font-medium text-foreground">Protection active.</span> Toolport
-        is watching tool definitions and results. Nothing needs your attention right now.
+        <span className="block font-semibold text-foreground">Protection active.</span>{" "}
+        Toolport is watching tool definitions and results. Nothing needs your attention
+        right now.
       </span>
     </div>
   );
@@ -303,11 +304,11 @@ function SecurityLoadNotice({
   return (
     <div
       role="alert"
-      className="mb-4 flex items-center gap-3 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs"
+      className="mb-4 flex items-center gap-3 toolport-alert border-warning bg-warning/8 px-4 py-2.5 text-xs"
     >
       <AlertTriangle className="size-4 shrink-0 text-warning" />
       <span className="text-muted-foreground">
-        <span className="font-medium text-foreground">
+        <span className="block font-semibold text-foreground">
           {stale
             ? "Security status may be out of date."
             : "Couldn't verify protection status."}
@@ -332,11 +333,13 @@ function AuditStaleNotice({ onRetry }: { onRetry: () => void }) {
   return (
     <div
       role="alert"
-      className="mb-4 flex items-center gap-3 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs"
+      className="mb-4 flex items-center gap-3 toolport-alert border-warning bg-warning/8 px-4 py-2.5 text-xs"
     >
       <AlertTriangle className="size-4 shrink-0 text-warning" />
       <span className="text-muted-foreground">
-        <span className="font-medium text-foreground">Activity may be out of date.</span>{" "}
+        <span className="block font-semibold text-foreground">
+          Activity may be out of date.
+        </span>{" "}
         Showing the last calls Toolport read successfully; the latest refresh failed.
       </span>
       <button
@@ -367,7 +370,7 @@ function SecurityNotices({
   // One row per finding, newest first, with a recurrence count. See collapseByIdentity.
   const collapsed = collapseByIdentity(events);
   return (
-    <div className="mb-4 rounded-lg border border-warning/40 bg-warning/5 p-4">
+    <div className="mb-4 toolport-alert border-warning bg-warning/8 p-4">
       <button
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
@@ -550,7 +553,7 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
   };
 
   return (
-    <div className="mb-6 rounded-lg border border-success/30 bg-success/[0.06] p-4">
+    <div className="mb-6 toolport-alert border-success bg-success/8 p-4">
       <div className="flex items-center gap-2">
         <Sparkles className="size-4 text-success" />
         <span className="text-sm font-medium text-muted-foreground">
@@ -803,7 +806,7 @@ function CallRow({ e }: { e: AuditEntry }) {
   const hasDetail = !approvalOutcome && !e.ok && (!!e.error || !!e.runId);
   return (
     <div
-      className={`rounded-md border border-border/50 text-sm ${e.kind === "internal" ? "bg-muted/30" : ""}`}
+      className={`border-b border-border text-sm ${e.kind === "internal" ? "bg-muted/30" : ""}`}
     >
       <div
         className={`flex items-center gap-3 rounded-md px-3 py-2 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none ${
@@ -964,7 +967,7 @@ export function TelemetryNotice({ stats }: { stats: AuditStats | null }) {
   return (
     <div
       role="status"
-      className="mb-4 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs"
+      className="mb-4 toolport-alert border-warning bg-warning/8 px-4 py-2.5 text-xs"
     >
       {messages.map((message) => (
         <p key={message}>{message}</p>
@@ -1074,7 +1077,7 @@ function fmtBody(v: unknown): string {
 function InspectRow({ e }: { e: InspectEntry }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="rounded-md border border-border/50 text-sm">
+    <div className="border-b border-border text-sm">
       <div
         className="flex cursor-pointer items-center gap-3 px-3 py-2 hover:bg-muted/30"
         onClick={() => setOpen((o) => !o)}
@@ -1148,7 +1151,7 @@ function DiscoveryRow({ t }: { t: SearchTrace }) {
       ? `${t.returned} of ${t.total}`
       : "no match";
   return (
-    <div className="rounded-md border border-border/50 text-sm">
+    <div className="border-b border-border text-sm">
       <div
         className="flex cursor-pointer items-center gap-3 px-3 py-2 hover:bg-muted/30"
         onClick={() => setOpen((o) => !o)}
@@ -1289,11 +1292,11 @@ function PanelErrorNotice({ label, onRetry }: { label: string; onRetry: () => vo
   return (
     <div
       role="alert"
-      className="mb-6 flex items-center gap-3 rounded-lg border border-warning/40 bg-warning/5 p-4 text-xs"
+      className="mb-6 flex items-center gap-3 toolport-alert border-warning bg-warning/8 p-4 text-xs"
     >
       <AlertTriangle className="size-4 shrink-0 text-warning" />
       <span className="text-muted-foreground">
-        <span className="font-medium text-foreground">
+        <span className="block font-semibold text-foreground">
           Couldn't load {label.toLowerCase()}.
         </span>{" "}
         This isn't necessarily empty — Toolport couldn't check.
@@ -1368,7 +1371,7 @@ function DiscoveryTraces({
     );
 
   return (
-    <div className="mb-6 rounded-lg border border-owned/30 bg-owned/[0.04] p-4">
+    <div className="mb-6 toolport-alert border-owned bg-owned/8 p-4">
       <button
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
@@ -1411,7 +1414,7 @@ function ToolIdentityRow({ t }: { t: ToolIdentity }) {
   const fpShort = t.fingerprint.replace(/^v\d+:/, "").slice(0, 12) || "-";
   const fmtDate = (ms: number) => (ms > 0 ? fmtTs(ms, "date") : "-");
   return (
-    <div className="rounded-md border border-border/50 text-sm">
+    <div className="border-b border-border text-sm">
       <div
         className="flex cursor-pointer items-center gap-3 px-3 py-2 hover:bg-muted/30"
         onClick={() => setOpen((o) => !o)}
@@ -1497,7 +1500,7 @@ function IdentityServerGroup({
   const shown = forceOpen || open;
   const quarantined = items.filter((t) => t.quarantined).length;
   return (
-    <div className="rounded-md border border-border/50">
+    <div className="border-b border-border">
       <button
         onClick={() => setOpen((v) => !v)}
         aria-expanded={shown}
@@ -1709,7 +1712,7 @@ function LiveInspector({ refreshKey }: { refreshKey: number }) {
   }, [refreshKey, retryTick]);
 
   return (
-    <div className="mb-6 rounded-lg border border-info/30 bg-info/[0.04] p-4">
+    <div className="mb-6 toolport-alert border-info bg-info/8 p-4">
       <button
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}

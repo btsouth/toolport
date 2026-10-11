@@ -9944,7 +9944,7 @@ fn section_heading(title: &str, subtitle: &str) -> gtk::Box {
         &gtk::Label::builder()
             .label(title)
             .halign(gtk::Align::Start)
-            .css_classes(["heading"])
+            .css_classes(["toolport-section-label"])
             .build(),
     );
     heading.append(

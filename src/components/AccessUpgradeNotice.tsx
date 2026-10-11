@@ -22,7 +22,7 @@ export function AccessUpgradeNotice({
   return (
     <div
       role="status"
-      className="access-upgrade-notice flex shrink-0 flex-wrap items-center gap-2 border-b bg-info/10 px-3 py-2 text-sm sm:gap-3 sm:px-6 sm:py-3"
+      className="access-upgrade-notice flex shrink-0 flex-wrap items-center gap-2 toolport-alert border-info bg-info/8 px-3 py-2 text-sm sm:gap-3 sm:px-6 sm:py-3"
     >
       {/* eslint-disable jsx-a11y/no-noninteractive-tabindex -- The labelled scroll region needs keyboard focus. */}
       <p
@@ -62,7 +62,7 @@ export function AccessUpgradeNotice({
             setBusy(false);
           }
         }}
-        className="rounded border px-2 py-1"
+        className="rounded-[8px] border px-2.5 py-1 text-[13px] font-semibold"
       >
         Stop old gateways
       </button>
@@ -80,7 +80,7 @@ export function AccessUpgradeNotice({
             setBusy(false);
           }
         }}
-        className="rounded border px-2 py-1"
+        className="rounded-[8px] border px-2.5 py-1 text-[13px] font-semibold"
       >
         Dismiss
       </button>

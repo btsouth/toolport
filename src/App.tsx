@@ -805,7 +805,7 @@ function App() {
                 </>
               )}
               <div className="min-w-0">
-                <h1 className="truncate text-lg font-semibold tracking-tight">
+                <h1 className="truncate text-[22px] font-[650] tracking-tight">
                   {view === "activity"
                     ? "Activity"
                     : view === "catalog"
@@ -1063,9 +1063,7 @@ function App() {
                           errorServers={errorAttention}
                         />
                       )}
-                      <div className="overflow-hidden rounded-xl border border-border/60 bg-card/40">
-                        {visible.map(serverRow)}
-                      </div>
+                      <div className="toolport-list">{visible.map(serverRow)}</div>
                     </div>
                   )}
                 </Suspense>
@@ -1322,8 +1320,8 @@ function ServerPosture({
   return (
     <div
       role="status"
-      className={`flex items-center gap-3 rounded-xl border px-4 py-3 ${
-        healthy ? "border-success/20 bg-success/5" : "border-border/70 bg-card/40"
+      className={`flex items-center gap-3 toolport-alert px-4 py-3 ${
+        healthy ? "border-success bg-success/8" : "border-info bg-info/8"
       }`}
     >
       <div
@@ -1378,7 +1376,7 @@ function ServerNextAction({
         : `${authCount} need sign-in; ${errorCount} couldn't start. The other servers stay available.`;
 
   return (
-    <div className="flex items-start gap-3 rounded-xl border border-warning/25 bg-card/45 px-4 py-3">
+    <div className="flex items-start gap-3 toolport-alert border-warning bg-warning/8 px-4 py-3">
       <div className="grid size-8 shrink-0 place-items-center rounded-lg bg-warning/10 text-warning">
         {authCount > 0 && errorCount === 0 ? (
           <KeyRound className="size-4" />
