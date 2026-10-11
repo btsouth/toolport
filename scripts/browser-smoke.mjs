@@ -117,6 +117,38 @@ try {
     path: path.join(output, "settings-advanced.png"),
     fullPage: true,
   });
+
+  // Settings navigation and visual evidence for every page in both themes.
+  for (const theme of ["dark", "light"]) {
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page
+      .getByRole("button", { name: theme === "dark" ? "Dark" : "Light", exact: true })
+      .click();
+    for (const [id, label] of [
+      ["general", "General"],
+      ["tools", "Tools"],
+      ["safety", "Safety"],
+      ["access", "Access"],
+      ["connections", "Connections"],
+      ["help", "Help and data"],
+    ]) {
+      await page.getByRole("button", { name: label, exact: true }).click();
+      await expect(page.getByRole("heading", { name: label, exact: true })).toBeVisible();
+      await expect(page.locator(".settings-page")).toHaveCount(1);
+      await expect(page.locator(".settings-page details")).toHaveCount(0);
+      await expect(
+        page.getByRole("button", { name: label, exact: true }),
+      ).toHaveAttribute("aria-current", "page");
+      await page.screenshot({
+        path: path.join(output, `settings-${id}-${theme}.png`),
+        fullPage: true,
+      });
+    }
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await expect(
+      page.getByRole("heading", { name: "General", exact: true }),
+    ).toBeVisible();
+  }
   await page.goto(`${baseURL}/fixtures/?long-names=1`);
   await page.setViewportSize({ width: 480, height: 360 });
   const longServer = "A".repeat(70);

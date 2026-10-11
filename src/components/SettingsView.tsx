@@ -991,7 +991,6 @@ export function SettingsView({
       {page === "tools" && (
         <section className="settings-page flex flex-col gap-4" aria-label="tools">
           <div className="settings-switches">
-            {" "}
             {toggle(
               Layers,
               lazyDiscovery,
@@ -1001,32 +1000,32 @@ export function SettingsView({
               apply("lazy-discovery", setLazyDiscovery),
               "lazy-discovery",
             )}
-          </div>{" "}
+            {toggle(
+              Braces,
+              codeMode,
+              "text-info",
+              "Code mode",
+              "Let agents combine several tool calls in one script to reduce back-and-forth. Each call follows your access and approval settings. Scripts run in a restricted environment, but this does not replace those settings.",
+              apply("code-mode", setCodeMode),
+              "code-mode",
+              {
+                tooltip:
+                  "A gateway started with TOOLPORT_CODE_MODE=1 can keep scripts available even when this setting is off.",
+              },
+            )}
+          </div>
           {/* Tools always included is a refinement of lazy discovery (the tools it must never
             hide), not a peer feature, so nest it under the Lazy discovery toggle with an
             indent + left rail. It has no meaning when lazy discovery is off, so it collapses
             away entirely then. */}
           {lazyDiscovery ? (
-            <div className="ml-4 border-l-2 border-border/50 pl-3">
+            <div className="rounded-md border p-3">
               <PinnedPrerequisites
                 registry={registry}
                 onRegistryChange={onRegistryChange}
               />
             </div>
           ) : null}
-          {toggle(
-            Braces,
-            codeMode,
-            "text-info",
-            "Code mode",
-            "Let agents combine several tool calls in one script to reduce back-and-forth. Each call follows your access and approval settings. Scripts run in a restricted environment, but this does not replace those settings.",
-            apply("code-mode", setCodeMode),
-            "code-mode",
-            {
-              tooltip:
-                "A gateway started with TOOLPORT_CODE_MODE=1 can keep scripts available even when this setting is off.",
-            },
-          )}
         </section>
       )}
       {page === "safety" && (
@@ -1195,7 +1194,6 @@ export function SettingsView({
             </div>
           )}
           <div className="settings-switches">
-            {" "}
             {toggle(
               EyeOff,
               piiRedaction,
