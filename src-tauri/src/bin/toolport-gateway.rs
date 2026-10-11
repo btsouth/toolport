@@ -4710,6 +4710,18 @@ fn execute_call(
     {
         return json!({"content": [{"type": "text", "text": STALE_LIVE_VIEW}], "isError": true});
     }
+    // A visible server the user turned off is a block, not an unknown tool.
+    if view.route_of(name).is_none()
+        && !candidates.is_empty()
+        && candidates
+            .iter()
+            .all(|id| visible(id) && !reg.server_enabled(id))
+    {
+        let text = format!(
+            "Blocked by Toolport: {name} is on a server that is turned off. Change it in Toolport > Servers."
+        );
+        return json!({"content": [{"type": "text", "text": text}], "isError": true});
+    }
     let candidates: Vec<_> = candidates
         .into_iter()
         .filter(|id| visible(id) && view.authorize(DispatchTarget::Server(id)).is_ok())
@@ -27875,6 +27887,46 @@ mod tests {
         ) -> Result<(), conduit_lib::downstream::TransportError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn call_tool_on_a_turned_off_server_says_it_is_blocked() {
+        let _data = DataDirTestEnv::new("call-tool-server-off");
+        let mut router = Router::new();
+        router.add(DownstreamServer::connect("on".into(), Box::new(CacheRoute)).unwrap());
+        let router = Arc::new(router);
+        let state = http_state(false);
+        let mut reg = Registry::default();
+        for (id, enabled) in [("on", true), ("off", false), ("hidden", false)] {
+            reg.servers.push(ServerEntry {
+                enabled,
+                ..stub_server(id, id)
+            });
+        }
+        *state.registry.lock().unwrap() = reg;
+        *state.cached_tools.lock().unwrap() = Arc::new(CatalogSnapshot::new(router.shared_tools()));
+        swap_router(&state, router);
+        let allowed = HashSet::from(["on".to_string(), "off".to_string()]);
+        let call = |name: &str| {
+            let response = process_request_wire(
+                &state,
+                &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
+                    "name":"toolport_call_tool", "arguments":{"name":name, "arguments":{}}
+                }}),
+                &SearchGuard::default(), Some(&allowed), None, None, None, Some("adapter:claude-code"), None, DiscoveryMode::Lazy,
+            )
+            .unwrap();
+            assert_eq!(response.envelope["result"]["isError"], true, "{}", response.envelope);
+            response.envelope["result"]["content"][0]["text"].as_str().unwrap().to_string()
+        };
+        assert_eq!(
+            call("off__read"),
+            "Blocked by Toolport: off__read is on a server that is turned off. Change it in Toolport > Servers."
+        );
+        // A server outside this client's access stays private.
+        let hidden = call("hidden__read");
+        assert!(!hidden.contains("turned off"), "{hidden}");
+        assert!(call("nope__read").starts_with("Unknown tool: nope__read"));
     }
 
     #[test]
