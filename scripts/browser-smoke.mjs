@@ -71,12 +71,11 @@ try {
   }
   await page.goto(`${baseURL}/fixtures/`);
   await expect(page.getByText("GitHub", { exact: true })).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "35.0k catalog tokens avoided" }),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "35.0k catalog tokens avoided" }),
-  ).toHaveAttribute("title", /cl100k_base.*net of discovery.*once per session/);
+  await expect(page.getByRole("button", { name: "35.0k tokens saved" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "35.0k tokens saved" })).toHaveAttribute(
+    "title",
+    /cl100k_base.*net of discovery.*once per session/,
+  );
   await page.screenshot({ path: path.join(output, "servers.png") });
   await page.getByRole("button", { name: "Show GitHub details", exact: true }).click();
   await page.getByRole("tab", { name: "Tools", exact: true }).click();
@@ -91,9 +90,7 @@ try {
   await page.getByRole("button", { name: "Activity", exact: true }).click();
   await expect(page.getByText("Protection active.", { exact: true })).toBeVisible();
   await expect(page.getByText("Catalog text avoided")).toBeVisible();
-  await expect(
-    page.getByRole("main").getByText("35.0k catalog tokens avoided"),
-  ).toBeVisible();
+  await expect(page.getByRole("main").getByText("35.0k tokens saved")).toBeVisible();
   await expect(page.getByText("How this is counted", { exact: true })).toBeVisible();
   await expect(page.getByText(/Older estimated records/)).not.toBeVisible();
   await page.screenshot({ path: path.join(output, "activity.png") });
@@ -108,18 +105,50 @@ try {
   await page.screenshot({ path: path.join(output, "client-access.png") });
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await page.getByText("Advanced", { exact: true }).click();
+  await page.getByRole("button", { name: "Access", exact: true }).click();
   await expect(
     page.getByRole("combobox", { name: "Default access", exact: true }),
   ).toBeVisible();
   await expect(page.getByText("Access sets", { exact: true })).toBeVisible();
   await page
-    .getByText("Advanced", { exact: true })
+    .getByRole("heading", { name: "Access", exact: true })
     .evaluate((element) => element.scrollIntoView({ block: "start" }));
   await page.screenshot({
     path: path.join(output, "settings-advanced.png"),
     fullPage: true,
   });
+
+  // Settings navigation and visual evidence for every page in both themes.
+  for (const theme of ["dark", "light"]) {
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page
+      .getByRole("button", { name: theme === "dark" ? "Dark" : "Light", exact: true })
+      .click();
+    for (const [id, label] of [
+      ["general", "General"],
+      ["tools", "Tools"],
+      ["safety", "Safety"],
+      ["access", "Access"],
+      ["connections", "Connections"],
+      ["help", "Help and data"],
+    ]) {
+      await page.getByRole("button", { name: label, exact: true }).click();
+      await expect(page.getByRole("heading", { name: label, exact: true })).toBeVisible();
+      await expect(page.locator(".settings-page")).toHaveCount(1);
+      await expect(page.locator(".settings-page details")).toHaveCount(0);
+      await expect(
+        page.getByRole("button", { name: label, exact: true }),
+      ).toHaveAttribute("aria-current", "page");
+      await page.screenshot({
+        path: path.join(output, `settings-${id}-${theme}.png`),
+        fullPage: true,
+      });
+    }
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await expect(
+      page.getByRole("heading", { name: "General", exact: true }),
+    ).toBeVisible();
+  }
   await page.goto(`${baseURL}/fixtures/?long-names=1`);
   await page.setViewportSize({ width: 480, height: 360 });
   const longServer = "A".repeat(70);
@@ -204,8 +233,10 @@ try {
   await page.getByRole("button", { name: "View log", exact: true }).first().click();
   await expect(page.getByRole("tab", { name: "Overview", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await expect(page.getByRole("combobox", { name: "Safety" })).toHaveValue("off");
+  await page.getByRole("button", { name: "Safety", exact: true }).click();
+  await expect(page.getByRole("radio", { name: "Off", exact: true })).toBeChecked();
   await expect(page.getByText(/Safety is set to Off/)).toBeVisible();
+  await page.getByRole("button", { name: "Tools", exact: true }).click();
   await expect(page.getByText("Find tools as needed", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Team", exact: true }).click();
   await expect(
@@ -245,6 +276,27 @@ try {
   );
   expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
   expect(errors).toEqual([]);
+  for (const scenario of ["setup", "trial", "grace", "blocked"]) {
+    await page.goto(`${baseURL}/fixtures/?personal-sync=${scenario}`);
+    await expect(page.getByRole("heading", { name: "Sync", exact: true })).toBeVisible();
+    if (scenario === "setup") {
+      await expect(
+        page.getByRole("button", { name: "Sign in to sync", exact: true }),
+      ).toBeVisible();
+      await page.getByText("Use a manual code", { exact: true }).click();
+      await expect(page.getByLabel("Manual code", { exact: true })).toBeVisible();
+    } else {
+      await expect(page.getByText(/Last synced/)).toBeVisible();
+      if (scenario === "trial")
+        await expect(page.getByText("7 trial days left", { exact: true })).toBeVisible();
+      if (scenario === "grace")
+        await expect(page.getByText(/Every device keeps syncing until/)).toBeVisible();
+      if (scenario === "blocked")
+        await expect(page.getByRole("alert")).toHaveText("Sync is paused on this device");
+    }
+    await page.screenshot({ path: path.join(output, `personal-sync-${scenario}.png`) });
+    expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
+  }
   await page.goto(`${baseURL}/fixtures/?approvals`);
   const approval = page.getByRole("alertdialog");
   await expect(
@@ -267,9 +319,7 @@ try {
   ]) {
     await expect(page.getByText(label, { exact: true })).toBeVisible();
   }
-  await expect(
-    page.getByText('Claude Code (reports "Claude Code 2.1") · 2m ago · waited 1m 30s'),
-  ).toBeVisible();
+  await expect(page.getByText("Claude Code · 2m ago · waited 1m 30s")).toBeVisible();
   await page.screenshot({ path: path.join(output, "approval-activity.png") });
   await page.setViewportSize({ width: 1240, height: 900 });
   for (const failure of ["", "launch", "credential", "optional", "vault", "verifying"]) {

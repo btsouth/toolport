@@ -156,6 +156,32 @@ if (memberReviewFixture) {
   } as NonNullable<Registry["team"]>;
 }
 
+const personalFixture = new URLSearchParams(location.search).get("personal-sync");
+if (personalFixture && personalFixture !== "setup") {
+  registry.team = {
+    serverUrl: "https://teams.toolport.app",
+    teamId: "personal-fixture",
+    role: "admin",
+    lastVersion: 3,
+    accountStatus: {
+      personalSync: true,
+      plan: personalFixture === "trial" ? "pro" : "free",
+      trialActive: personalFixture === "trial",
+      trialEndsAt: Date.now() + 7 * 86400000,
+      freeSyncGraceEndsAt: personalFixture === "grace" ? Date.now() + 2 * 86400000 : null,
+      deviceId: "fixture",
+      canReceiveConfig: personalFixture !== "blocked",
+      reason:
+        personalFixture === "blocked"
+          ? "Choose this device in Your account to resume sync."
+          : null,
+    },
+    personalSyncState: {
+      lastSyncedAt: Date.now(),
+      error: personalFixture === "blocked" ? "Sync is paused on this device" : null,
+    },
+  };
+}
 const approvalFixture = new URLSearchParams(location.search).has("approvals");
 const sessionFixture = new URLSearchParams(location.search).has("sessions");
 const callerFixture = new URLSearchParams(location.search).has("caller-names");
@@ -562,6 +588,12 @@ mockIPC(
       case "dismiss_access_upgrade_notice":
         registry.accessUpgradeNoticeDismissed = true;
         return registry;
+      case "dismiss_removed_features_notice":
+        if (registry.removedFeaturesNotice)
+          registry.removedFeaturesNotice.dismissed = true;
+        return registry;
+      case "open_exports_dir":
+        return null;
       case "set_default_access":
         registry.defaultAccessProfileId = args.profile as string | null;
         return registry;
@@ -594,6 +626,15 @@ mockIPC(
         if (server) server.enabled = args.enabled as boolean;
         return structuredClone(registry);
       }
+      case "personal_sync_local_only": {
+        const server = registry.servers.find((server) => server.id === args.serverId);
+        if (server) server.syncLocalOnly = args.localOnly as boolean;
+        return structuredClone(registry);
+      }
+      case "personal_sync_new_servers_local_only":
+        if (registry.team?.personalSyncState)
+          registry.team.personalSyncState.newServersLocalOnly = args.localOnly as boolean;
+        return structuredClone(registry);
       case "plugin:process|exit":
         return null;
       case "export_config":
@@ -843,7 +884,7 @@ if (new URLSearchParams(location.search).has("logos")) {
       ))}
     </main>,
   );
-} else if (memberReviewFixture) {
+} else if (memberReviewFixture || personalFixture) {
   function ReviewFixture() {
     const [current, setCurrent] = useState(registry);
     return (

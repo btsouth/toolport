@@ -340,18 +340,6 @@ pub fn shape_result_preserving_prefix(
         .pointer("/_meta/app.toolport~1provenance/server")
         .and_then(Value::as_str)
         .map(str::to_string);
-    // Callers add the notice after caching, so reserve its exact serialized cost.
-    let budget = if let Some(server) = &server {
-        let mut notice = serde_json::json!({"content":[]});
-        crate::integrity::label_untrusted_result(server, &mut notice);
-        let reserve = value_size(&notice["content"][0]) + 1;
-        budget.saturating_sub(reserve)
-    } else {
-        budget
-    };
-    if budget == 0 {
-        return false;
-    }
     let size = serde_json::to_string(result).map(|s| s.len()).unwrap_or(0);
     if size <= budget {
         return false;
@@ -460,7 +448,7 @@ pub fn shape_result_preserving_prefix(
             }
         }
         if let Some(server) = &server {
-            crate::integrity::label_untrusted_result_with_notice(server, &mut shaped, false);
+            crate::integrity::label_untrusted_result(server, &mut shaped);
         }
         shaped
     };
@@ -662,7 +650,7 @@ mod tests {
     #[test]
     fn fetched_pages_and_projections_keep_the_real_server() {
         let mut result = serde_json::json!({"content":[{"type":"text", "text":"x".repeat(10_000)}], "structuredContent":{"value":7}});
-        crate::integrity::label_untrusted_result_with_notice("github", &mut result, false);
+        crate::integrity::label_untrusted_result("github", &mut result);
         assert!(shape_result(&mut result, 2048, None));
         let text = result["content"][0]["text"].as_str().unwrap();
         let cursor = text
@@ -678,16 +666,10 @@ mod tests {
                 fetched["_meta"]["app.toolport/provenance"]["server"],
                 "github"
             );
-            assert!(fetched["content"][1]["text"]
-                .as_str()
-                .unwrap()
-                .contains("from github;"));
+            assert_eq!(fetched["content"].as_array().unwrap().len(), 1);
         }
         crate::integrity::label_untrusted_result("github", &mut result);
-        assert!(
-            value_size(&result) <= 2048,
-            "notice must fit within the original budget"
-        );
+        assert!(value_size(&result) <= 2048);
         let cursor = stash_payload("Toolport-owned data".into(), None, None).unwrap();
         let fetched = fetch_result(&cursor, 0, 100, None, None);
         assert!(fetched.get("_meta").is_none());
@@ -710,7 +692,7 @@ mod tests {
                 structured.to_string()
             };
             let mut result = json!({"content":[{"type":"text","text":text}], "structuredContent":structured,"isError":false,"extension":{"preserve":true}});
-            crate::integrity::label_untrusted_result_with_notice("github", &mut result, false);
+            crate::integrity::label_untrusted_result("github", &mut result);
             let original = serde_json::to_vec(&result).unwrap();
             let mut under = result.clone();
             assert!(!shape_result(

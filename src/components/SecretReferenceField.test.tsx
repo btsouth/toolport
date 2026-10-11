@@ -40,7 +40,7 @@ describe("SecretReferenceField", () => {
       expect(screen.getByRole("status")).toHaveTextContent("Install the official op CLI"),
     );
   });
-  it("selects the provider's reference format", async () => {
+  it("starts a new provider's reference from its prefix only", async () => {
     const change = vi.fn();
     render(
       <SecretReferenceField
@@ -53,6 +53,7 @@ describe("SecretReferenceField", () => {
       screen.getByLabelText("Password manager provider"),
       "keeper://",
     );
-    expect(change).toHaveBeenCalledWith("keeper://8f8I-OqPV58o2r91wVgZ_A/field/password");
+    // Only the prefix: an example reference could be saved by mistake.
+    expect(change).toHaveBeenCalledWith("keeper://");
   });
 });

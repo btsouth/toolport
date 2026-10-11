@@ -552,7 +552,10 @@ export function isPrivateHostUrl(url: string | null | undefined): boolean {
  * and refuses without an explicit reviewed flag, so a miss here costs a clear error
  * rather than an unreviewed enable. */
 export function needsTeamEnableReview(
-  server: Pick<ServerEntry, "source" | "transport" | "command" | "url"> &
+  server: Pick<
+    ServerEntry,
+    "source" | "transport" | "command" | "url" | "personalSyncEntry" | "teamEnableReview"
+  > &
     Partial<Pick<ServerEntry, "env" | "headerKeys" | "launch">>,
 ): boolean {
   if (
@@ -562,6 +565,7 @@ export function needsTeamEnableReview(
       server.launch?.inputs.some((i) => i.source))
   )
     return true;
+  if (server.personalSyncEntry) return server.teamEnableReview === true;
   if (!server.source?.startsWith("team:")) return false;
   if (server.transport === "stdio" || !!server.command) return true;
   // Anything that is not a plain https:// URL to a dotted public name is treated as
@@ -598,6 +602,7 @@ export type ReviewedFields = {
   headerKeys?: ServerEntry["headerKeys"];
   launch?: ServerEntry["launch"];
   cwd?: ServerEntry["cwd"];
+  inheritEnv?: ServerEntry["inheritEnv"];
 };
 
 /** Compared on confirm so a team push landing mid-dialog cannot swap the definition
@@ -611,6 +616,7 @@ export function sameReviewedDefinition(a: ReviewedFields, b: ReviewedFields): bo
     JSON.stringify(a.env ?? []) === JSON.stringify(b.env ?? []) &&
     JSON.stringify(a.headerKeys ?? []) === JSON.stringify(b.headerKeys ?? []) &&
     JSON.stringify(a.launch ?? null) === JSON.stringify(b.launch ?? null) &&
+    (a.inheritEnv ?? false) === (b.inheritEnv ?? false) &&
     (a.cwd ?? "") === (b.cwd ?? "")
   );
 }

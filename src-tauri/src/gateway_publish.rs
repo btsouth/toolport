@@ -305,8 +305,8 @@ fn live_host_daemons_in(data_dir: &Path) -> Vec<crate::daemon::DaemonDescriptor>
 //
 // Two modes:
 //   * stop_stale_gateways — every launch; keep current/resolved paths, kill obsolete
-//   * stop_spawned_gateways — in-app updater; defer open sessions and request
-//     authenticated idle shutdown before the installer replaces files
+//   * stop_spawned_gateways — in-app updater; stop owned Windows sessions as in
+//     1.x, otherwise defer; request authenticated idle shutdown first
 //
 // Parent agent apps (Cursor, Claude, …) are never touched. Clients that auto-respawn
 // MCP on a dead stdio pipe pick up the repointed binary on the next tool call.
@@ -1224,12 +1224,18 @@ fn installer_process_inventory() -> Vec<GatewayProcess> {
     }
 }
 
-/// Refuse manual installation while a client gateway is open. Only authenticated
-/// idle shutdown is requested; no process is force-killed, even on older installs.
+/// Prepare gateway images for replacement. Windows retains the 1.x installer
+/// policy: stop owned client gateways, never their parent apps. Other platforms
+/// defer open sessions. Idle daemons get an authenticated shutdown first.
 pub fn installer_preflight(install_dir: &Path) -> Result<(), Vec<String>> {
     if !install_dir.is_absolute() {
         return Err(vec!["Installer path must be absolute".into()]);
     }
+    // Published/versioned images do not lock the install directory. Leave those
+    // sessions running on Windows; normal launch migration handles old versions.
+    #[cfg(windows)]
+    let data_dir: Option<PathBuf> = None;
+    #[cfg(not(windows))]
     let data_dir = crate::registry::conduit_dir();
     let inventory = || {
         installer_process_inventory()
@@ -1253,8 +1259,22 @@ pub fn installer_preflight(install_dir: &Path) -> Result<(), Vec<String>> {
     // cold PowerShell/CIM startup must not consume every shutdown poll's budget.
     #[cfg(windows)]
     windows_assign_daemon_roles(&mut initial);
+    #[cfg(windows)]
+    {
+        // Preserve 1.x upgrade behavior without its global taskkill by basename.
+        // Refuse ambiguous ownership before stopping any known client session.
+        if initial.iter().any(|process| process.path.is_none()) {
+            return Err(installer_blockers(&initial));
+        }
+        for process in &initial {
+            if process.is_host_daemon != Some(true) {
+                windows_stop_installer_gateway(process)?;
+            }
+        }
+    }
     // A stdio adapter, private host or old gateway is an open client connection.
     // Unknown command lines cannot be treated as idle.
+    #[cfg(not(windows))]
     if initial
         .iter()
         .any(|process| process.is_host_daemon != Some(true))
@@ -1281,13 +1301,83 @@ pub fn installer_preflight(install_dir: &Path) -> Result<(), Vec<String>> {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
+            #[cfg(windows)]
+            {
+                // Busy daemons cannot shut down while adapters are connected.
+                // Confirm every remaining image exited before NSIS touches files.
+                for process in &remaining {
+                    windows_stop_installer_gateway(process)?;
+                }
+                let remaining = inventory();
+                if remaining.is_empty() {
+                    return Ok(());
+                }
+                return Err(installer_blockers(&remaining));
+            }
+            #[cfg(not(windows))]
             return Err(installer_blockers(&remaining));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
-/// In-app updates use the same close/defer policy as manual installers.
+#[cfg(windows)]
+fn windows_stop_installer_gateway(process: &GatewayProcess) -> Result<(), Vec<String>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+        WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE,
+    };
+    // Pin the image before comparing it with the inventory. Never terminate a
+    // reused PID or fall back to an unscoped taskkill. Wait on this same handle.
+    unsafe {
+        let handle = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+            0,
+            process.pid,
+        );
+        if handle.is_null() {
+            return if !pid_is_running(process.pid) {
+                Ok(())
+            } else {
+                Err(installer_blockers(std::slice::from_ref(process)))
+            };
+        }
+        let mut buffer = [0u16; 32768];
+        let mut size = buffer.len() as u32;
+        let inspected = QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) != 0;
+        let path = PathBuf::from(String::from_utf16_lossy(&buffer[..size as usize]));
+        let mut created: FILETIME = std::mem::zeroed();
+        let mut exited_at: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        let timed =
+            GetProcessTimes(handle, &mut created, &mut exited_at, &mut kernel, &mut user) != 0;
+        let started = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+        let owned = inspected
+            && timed
+            && process.start_time == Some(started)
+            && process
+                .path
+                .as_ref()
+                .is_some_and(|expected| paths_equal(expected, &path))
+            && installer_same_user_session(process.pid) == Some(true);
+        let exited = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
+        let stopped = exited
+            || (owned
+                && TerminateProcess(handle, 1) != 0
+                && WaitForSingleObject(handle, 3000) == WAIT_OBJECT_0);
+        CloseHandle(handle);
+        if stopped {
+            Ok(())
+        } else {
+            Err(installer_blockers(std::slice::from_ref(process)))
+        }
+    }
+}
+
+/// In-app updates use the same platform-specific policy as manual installers.
 pub fn stop_spawned_gateways() -> ReapReport {
     let result = std::env::current_exe()
         .ok()

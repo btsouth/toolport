@@ -71,5 +71,6 @@ sudo pacman-key --delete A16BFA2E1014BD6BD718CC6E6621247E3FFA6AA7
   builds read the same `~/.config/Toolport` and only one process can hold the
   approval broker, so pacman swaps an existing `toolport-bin` install in place
   rather than installing beside it.
-- The `.deb` and the AppImage are unchanged for Ubuntu 22.04, Debian 12, and any
-  distribution without GTK 4.10 and libadwaita 1.4.
+- In 2.0 the `.deb` and `.rpm` also ship GTK. The `.deb` needs Ubuntu 24.04+
+  or Debian 13+. Ubuntu 22.04 and Debian 12 use the Tauri AppImage. See
+  [Linux installation](linux-packages.md#install) for other distributions.

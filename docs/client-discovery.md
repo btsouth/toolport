@@ -8,6 +8,10 @@ fixture successes with 78.7% less mean input. These are fixture results for thos
 builds and models, not production-service acceptance. Other defaults retain the
 capability-based choice below. Unknown means unverified.
 
+Codex 0.162.1 shows no tools at all from a server that lists more than 2,048.
+When a Full list for Codex would pass that limit, Toolport answers with the Lazy
+search tools instead, so Codex keeps a working search.
+
 Auto is resolved at request time. Existing installs receive updated defaults
 without a migration or config rewrite; explicit Full, Lazy and Grouped choices
 remain unchanged.
@@ -61,6 +65,7 @@ not new file-based adapters.
 | `kiro`               | Unknown                  | Unknown             | Lazy | 5 s              | [Client adapter notes](clients.md); search and notification behavior unverified                                                                                                                                                                                                          |
 | `kimi-code`          | Unknown                  | Unknown             | Lazy | 5 s              | [Client adapter notes](clients.md); search and notification behavior unverified                                                                                                                                                                                                          |
 | `zcode`              | Unknown                  | Unknown             | Lazy | 5 s              | [Client adapter notes](clients.md); search and notification behavior unverified                                                                                                                                                                                                          |
+| `command-code`       | Unknown                  | Unknown             | Lazy | 5 s              | [Client adapter notes](clients.md); search and notification behavior unverified                                                                                                                                                                                                          |
 | `zed`                | Unknown                  | Yes                 | Lazy | 5 s              | [Client conformance source evidence](client-conformance.md#verified-notification-evidence), checked 2026-10-09                                                                                                                                                                           |
 | `lm-studio`          | Unknown                  | Unknown             | Lazy | 5 s              | [Client adapter notes](clients.md); search and notification behavior unverified                                                                                                                                                                                                          |
 | `jan`                | Unknown                  | Unknown             | Lazy | 5 s              | [Client adapter notes](clients.md); search and notification behavior unverified                                                                                                                                                                                                          |

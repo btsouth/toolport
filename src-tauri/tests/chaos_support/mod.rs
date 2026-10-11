@@ -404,6 +404,17 @@ impl Client {
         Self::spawn(command, dir)
     }
 
+    /// An adapter launched with extra client environment. With no daemon running
+    /// it starts one itself, the path real clients take.
+    pub fn start_with_env(dir: &Path, tag: &str, env: &[(&str, &str)]) -> Self {
+        discovery_support::select_full(dir, tag);
+        let mut command = base_gateway_command(dir);
+        command.env("TOOLPORT_GATEWAY_TOPOLOGY", "daemon");
+        command.env("TOOLPORT_CLIENT_ID", tag);
+        command.envs(env.iter().copied());
+        Self::spawn(command, dir)
+    }
+
     fn spawn(mut command: Command, dir: &Path) -> Self {
         let mut child = command
             .stdin(Stdio::piped())

@@ -87,6 +87,7 @@ describe("LaunchSetupDialog", () => {
       "reference",
     );
     await user.selectOptions(screen.getByLabelText("Password manager provider"), "env:");
+    await user.type(screen.getByLabelText("Secret reference"), "API_TOKEN");
     await user.click(screen.getByRole("button", { name: "Save setup" }));
     expect(api.setSecretReference).toHaveBeenCalledWith(
       "team_twilio",

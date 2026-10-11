@@ -309,6 +309,38 @@ fn decision_entry(
     entry
 }
 
+/// Snapshot why approval was requested before the registry can change during a hold.
+pub fn record_approval_raised(
+    reg: &crate::registry::Registry,
+    server: &str,
+    tool: &str,
+    client: Option<&str>,
+    reason: &str,
+    args: &Value,
+) {
+    let mut entry = decision_entry(
+        server,
+        tool,
+        client,
+        reason,
+        "requested",
+        &args_hash(args),
+        None,
+    );
+    // The final decision records held status. This snapshot must not count it twice.
+    entry["held"] = json!(false);
+    entry["safetyLevel"] = json!(reg.safety_level_effective());
+    entry["safetySource"] = json!(
+        if reg.safety_level_team_floor() > reg.safety_level_selected() {
+            "team_floor"
+        } else {
+            "personal"
+        }
+    );
+    entry["gatewayVersion"] = json!(env!("CARGO_PKG_VERSION"));
+    write_line(&entry);
+}
+
 /// Record a gated HITL decision (the human approved/denied it, it timed out, or the
 /// broker was unreachable). Replaces the flat `record_held` on the approval path so the
 /// audit can distinguish the outcomes. Hashes the arguments; never stores them raw.
@@ -511,10 +543,11 @@ pub fn recent_client_activity(limit: usize, since_ms: Option<u64>) -> std::io::R
 }
 
 fn client_activity_from_entries(
-    entries: Vec<Value>,
+    mut entries: Vec<Value>,
     limit: usize,
     since_ms: Option<u64>,
 ) -> Vec<Value> {
+    fill_session_clients(&mut entries);
     let names = crate::clients::CallerNames::for_entries(&entries);
     let mut groups =
         std::collections::BTreeMap::<String, (Value, std::collections::HashSet<String>)>::new();
@@ -659,18 +692,45 @@ fn read_recent_matching(
     // first let an unparseable line consume a slot, so one corrupt row among the
     // newest entries returned a short page and dropped older valid history that
     // should have filled it.
-    let entries: Vec<_> = content
+    let mut entries: Vec<_> = content
         .lines()
         .rev()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(visible)
         .take(limit)
         .collect();
+    fill_session_clients(&mut entries);
     let names = crate::clients::CallerNames::for_entries(&entries);
     Ok(entries
         .into_iter()
         .map(|entry| activity_client_name(entry, &names))
         .collect())
+}
+
+/// Older gateways recorded the caller's client ID on calls but not on session
+/// rows. Give each session row the ID its own calls carry.
+fn fill_session_clients(entries: &mut [Value]) {
+    let mut by_session = std::collections::HashMap::new();
+    for entry in entries.iter() {
+        if let (Some(session), Some(client)) =
+            (entry["sessionId"].as_str(), entry["client"].as_str())
+        {
+            by_session
+                .entry(session.to_string())
+                .or_insert_with(|| client.to_string());
+        }
+    }
+    for entry in entries.iter_mut() {
+        if entry.get("client").is_some_and(|client| !client.is_null()) {
+            continue;
+        }
+        if let Some(client) = entry["sessionId"]
+            .as_str()
+            .and_then(|session| by_session.get(session))
+        {
+            entry["client"] = json!(client);
+        }
+    }
 }
 
 pub fn activity_client_name(mut entry: Value, names: &crate::clients::CallerNames) -> Value {
@@ -751,6 +811,10 @@ pub fn read_all() -> std::io::Result<Vec<Value>> {
 ///   error-rate numerator)
 pub fn tool_call_ok(entry: &Value) -> Option<bool> {
     let ok = entry.get("ok").and_then(Value::as_bool)?;
+    // Preview builds logged a refused sync change as a failed call.
+    if entry.get("tool").and_then(Value::as_str) == Some("sync_environment_refused") {
+        return None;
+    }
     match entry.get("kind").and_then(Value::as_str) {
         Some(
             "approval" | "routine" | "advisor" | "suggestion" | "candidate" | "telemetry_gap"
@@ -1200,6 +1264,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn session_rows_take_the_client_id_their_calls_carry() {
+        let mut entries = vec![
+            json!({"kind":"session","sessionId":"s1","clientName":"Unknown app (via python3.14)","clientLabel":"inbox 1"}),
+            json!({"sessionId":"s1","client":"adapter:inbox","clientName":"Unknown app (via python3.14)","tool":"t","ok":true}),
+            json!({"kind":"session","sessionId":"s2","clientName":"Unknown app (via node)"}),
+        ];
+        fill_session_clients(&mut entries);
+        assert_eq!(entries[0]["client"], "adapter:inbox");
+        assert!(entries[2].get("client").is_none());
+        let names = crate::clients::CallerNames::for_entries(&entries);
+        assert_eq!(activity_client_name(entries[0].clone(), &names)["clientName"], "inbox");
+        assert_eq!(
+            activity_client_name(entries[2].clone(), &names)["clientName"],
+            "Unknown app (via node)"
+        );
+    }
 
     fn oversized_audit_content() -> String {
         let padding = "x".repeat(420);

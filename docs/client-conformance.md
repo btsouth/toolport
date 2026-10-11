@@ -45,6 +45,20 @@ with real processes and a scripted old-version daemon. It is not acceptance of
 an actual pair of released gateway artifacts. Both tests also run in the normal
 headless CI integration-test command.
 
+## Tool name budgets
+
+Client profiles in `clients.rs` declare combined name budgets. Cursor has a
+60-character combined budget based on [Cursor's support report](https://forum.cursor.com/t/google-gws-cli-tool-names-too-long/153918/4).
+Subtract the registered server key (`toolport`, eight characters) and the profile's
+separator overhead (zero for Cursor) for a 52-character tool alias. Other profiles keep the 64-character default, and
+names already within their budget keep their spelling. A bounded prefix and
+identity digest keep longer names deterministic, including collisions.
+
+Aliases route back to the same server and original tool. Access, overrides,
+integrity pins, approvals and quarantine use that canonical policy identity across
+client budgets. Fixture tests cover Cursor and Claude views; they do not establish
+acceptance by a running Cursor application.
+
 ## Opt-in real client tracing
 
 Build the gateway and mock with `test-support`, then supply an absolute executable

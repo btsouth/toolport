@@ -30,6 +30,10 @@ pub struct ToolDefinition {
     value: Value,
     pub(crate) arguments: Option<Arc<crate::schema_compat::ArgumentMap>>,
     pub digest: [u8; 32],
+    /// Hash of the input schema exactly as the server sent it, before Toolport rewrote it
+    /// for client compatibility. Drift pins use this, so a Toolport update that changes the
+    /// rewriting never looks like the server changing its tools.
+    pub(crate) source_input_schema: Option<String>,
 }
 impl ToolDefinition {
     pub(crate) fn with_arguments(
@@ -40,13 +44,19 @@ impl ToolDefinition {
             digest: content_digest(&value),
             value,
             arguments,
+            source_input_schema: None,
         }
+    }
+    pub(crate) fn with_source_input_schema(mut self, hash: Option<String>) -> Self {
+        self.source_input_schema = hash;
+        self
     }
     pub fn new(value: Value) -> Self {
         Self {
             digest: content_digest(&value),
             value,
             arguments: None,
+            source_input_schema: None,
         }
     }
 }
@@ -173,6 +183,10 @@ pub trait ToolCatalog {
     fn to_vec(&self) -> Vec<Value> {
         self.values().cloned().collect()
     }
+    /// Each tool with the hash of its input schema as the server sent it, when known.
+    fn pin_values(&self) -> Box<dyn Iterator<Item = (&Value, Option<&str>)> + '_> {
+        Box::new(self.values().map(|tool| (tool, None)))
+    }
 }
 impl dyn ToolCatalog + '_ {
     pub fn iter(&self) -> Box<dyn Iterator<Item = &Value> + '_> {
@@ -197,6 +211,13 @@ impl ToolCatalog for SharedTools {
     }
     fn shared(&self) -> SharedTools {
         self.clone()
+    }
+    fn pin_values(&self) -> Box<dyn Iterator<Item = (&Value, Option<&str>)> + '_> {
+        Box::new(
+            self.0
+                .iter()
+                .map(|tool| (&tool.value, tool.source_input_schema.as_deref())),
+        )
     }
 }
 impl ToolCatalog for Vec<Value> {
@@ -290,11 +311,19 @@ impl SerializedCatalog {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ToolPolicyMetadata {
     pub destructive: bool,
+    pub model_hidden: bool,
 }
 impl From<&Value> for ToolPolicyMetadata {
     fn from(tool: &Value) -> Self {
         Self {
             destructive: crate::router::is_destructive(tool),
+            model_hidden: tool
+                .pointer("/_meta/ui/visibility")
+                .is_some_and(|visibility| {
+                    visibility
+                        .as_array()
+                        .is_none_or(|audiences| !audiences.iter().any(|a| a == "model"))
+                }),
         }
     }
 }

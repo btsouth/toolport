@@ -48,7 +48,7 @@ export function SecretReferenceField({
           value={provider.scheme}
           disabled={busy}
           onChange={(e) =>
-            change(SECRET_PROVIDERS.find((p) => p.scheme === e.target.value)!.example)
+            change(SECRET_PROVIDERS.find((p) => p.scheme === e.target.value)!.scheme)
           }
         >
           {SECRET_PROVIDERS.map((p) => (

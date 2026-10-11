@@ -421,7 +421,7 @@ it("shows a migrated default without rewriting the client and explicitly applies
     />,
   );
   expect(screen.getByRole("combobox", { name: "Access" })).toHaveTextContent(
-    "Default access (Default)",
+    /^Default access$/,
   );
   expect(installGateway).not.toHaveBeenCalled();
   await userEvent.click(screen.getByRole("combobox", { name: "Access" }));

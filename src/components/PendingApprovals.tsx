@@ -51,7 +51,9 @@ const REASON: Record<Reason, { label: string; className: string; Icon: typeof Tr
  * safety net and refreshes immediately on the gateway's `approval-pending` /
  * `approval-resolved` events.
  */
-export function PendingApprovals() {
+export function PendingApprovals({
+  onCountChange,
+}: { onCountChange?: (count: number) => void } = {}) {
   const [pending, setPending] = useState<PendingApproval[]>([]);
   // Ids with a decision in flight: shown dimmed + disabled, removed authoritatively by the
   // resolved event / poll (NOT optimistically), so a poll landing before the backend
@@ -101,6 +103,10 @@ export function PendingApprovals() {
       void unlisten.then((fns) => fns.forEach((f) => f()));
     };
   }, [refresh]);
+
+  useEffect(() => {
+    onCountChange?.(pending.length);
+  }, [pending.length, onCountChange]);
 
   // Tick once a second while anything is pending, to drive the countdown.
   useEffect(() => {
@@ -164,7 +170,7 @@ export function PendingApprovals() {
         role="alertdialog"
         aria-modal="false"
         aria-label="Tool calls awaiting your approval"
-        className="animate-in fade-in slide-in-from-top-2 pointer-events-auto relative flex max-h-[calc(100dvh-2rem)] w-full max-w-lg flex-col overflow-hidden rounded-xl border border-warning/40 bg-popover shadow-2xl ring-1 ring-warning/10 outline-none focus-visible:ring-2 focus-visible:ring-warning"
+        className="animate-in fade-in slide-in-from-top-2 pointer-events-auto relative flex max-h-[calc(100dvh-2rem)] w-full max-w-lg flex-col overflow-hidden rounded-r-[10px] border-l-[3px] border-warning bg-popover shadow-2xl outline-none focus-visible:ring-2 focus-visible:ring-warning"
       >
         {/* Announce count changes to screen readers without re-announcing on every countdown
          * tick (the visible timer lives elsewhere; this text only changes when the count does). */}
@@ -276,7 +282,7 @@ export function PendingApprovals() {
                     <div className="mb-1 text-[0.7rem] font-medium uppercase tracking-wide text-muted-foreground">
                       Would send to {piiRelease.server}
                     </div>
-                    <ul className="divide-y divide-border/60 rounded-md border border-destructive/40 bg-destructive/5">
+                    <ul className="divide-y divide-border/60 toolport-alert border-destructive bg-destructive/8">
                       {piiRelease.values.map((v) => (
                         <li key={v.token} className="p-2.5 text-xs">
                           <div className="font-mono break-all text-foreground">

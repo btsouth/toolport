@@ -1,6 +1,12 @@
+import { SETTINGS_PAGES, type SettingsSubpage } from "@/lib/settingsPages";
+import { isPersonalSync } from "@/lib/personalSync";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
+  Shield,
+  KeyRound,
+  Globe,
+  Wrench,
   ArrowUpCircle,
   ClipboardList,
   Compass,
@@ -179,10 +185,13 @@ function VersionFooter({
     const visibleUnlisten = listen<boolean>("team-window-visible", (event) => {
       if (event.payload) void runUpdateCheck(false);
     });
+    const settingsCheck = () => void runUpdateCheck(true, true);
+    window.addEventListener("toolport-check-updates", settingsCheck);
     const trayUnlisten = listen("tray-check-updates", () => {
       void runUpdateCheck(true, true);
     });
     return () => {
+      window.removeEventListener("toolport-check-updates", settingsCheck);
       window.clearInterval(interval);
       void visibleUnlisten.then((unlisten) => unlisten());
       void trayUnlisten.then((unlisten) => unlisten());
@@ -382,6 +391,12 @@ function UpdateNotes({
               {systemPackageUpdateAdvice(systemPackage)}
             </p>
           )}
+          {!systemPackage && (
+            <p className="text-sm text-muted-foreground">
+              Toolport connections may restart during installation; restart your MCP
+              client if it disconnects.
+            </p>
+          )}
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={() => onOpenChange(false)}>
               {installing ? "Hide" : "Later"}
@@ -416,6 +431,9 @@ function UpdateNotes({
 }
 
 interface Props {
+  settingsPage?: SettingsSubpage;
+  onSettingsPageChange?: (page: SettingsSubpage) => void;
+  pendingCount?: number;
   registry: Registry | null;
   onRegistryChange: (registry: Registry) => void;
   view: View;
@@ -425,6 +443,9 @@ interface Props {
 }
 
 export function AppSidebar({
+  settingsPage = "general",
+  onSettingsPageChange,
+  pendingCount = 0,
   registry,
   onRegistryChange,
   view,
@@ -513,7 +534,7 @@ export function AppSidebar({
       aria-label={label}
       title={`${label}${["Servers", "Clients", "Activity", "Settings"].includes(label) ? ` (${/Mac/.test(navigator.platform) ? "⌘" : "Ctrl"}${["Servers", "Clients", "Activity", "Settings"].indexOf(label) + 1})` : ""}`}
       aria-current={active ? "page" : undefined}
-      className={`${NAV_ITEM} ${active ? "bg-accent font-medium text-foreground" : "text-muted-foreground"}`}
+      className={`${NAV_ITEM} ${label === "Settings" ? "font-semibold" : ""} ${active ? "bg-accent font-medium text-foreground" : "text-muted-foreground"}`}
     >
       <Icon
         className={`size-4 shrink-0 ${active ? "text-primary" : "text-muted-foreground"}`}
@@ -596,8 +617,36 @@ export function AppSidebar({
             quarantinedCount,
             quarantineStale,
           )}
-          {paired &&
-            navItem(Users, "Team", view === "teams", () => onSelectView("teams"))}
+          {view === "settings" && (
+            <div className="ml-5 flex flex-col gap-0.5" aria-label="Settings pages">
+              {SETTINGS_PAGES.map((item, index) => (
+                <div key={item.id} className="relative">
+                  {navItem(
+                    [Settings, Wrench, Shield, KeyRound, Globe, CircleHelp][index],
+                    item.label,
+                    settingsPage === item.id,
+                    () => onSettingsPageChange?.(item.id),
+                  )}
+                  {item.id === "safety" && pendingCount > 0 && (
+                    <span
+                      className="absolute right-2 top-2 rounded-full bg-warning/15 px-1.5 text-xs text-warning"
+                      aria-label={`${pendingCount} pending approvals`}
+                    >
+                      {pendingCount}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {navItem(
+            Users,
+            paired ? (isPersonalSync(registry) ? "Sync" : "Team") : "Sign in to sync",
+            view === "teams",
+            () => onSelectView("teams"),
+            registry?.servers.filter((s) => s.teamEnableReview === true && !s.enabled)
+              .length ?? 0,
+          )}
         </nav>
 
         {savings && (savings.tokenizedLoads ?? 0) > 0 && (
@@ -611,7 +660,7 @@ export function AppSidebar({
               <span className="font-semibold text-foreground">
                 {fmtTokens(savings.tokensSaved)}
               </span>{" "}
-              catalog tokens avoided{savingsStale ? " (stale)" : ""}
+              tokens saved{savingsStale ? " (stale)" : ""}
             </span>
           </button>
         )}

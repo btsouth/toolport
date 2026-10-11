@@ -510,7 +510,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
               {registryState === "error" && (
                 <div
                   role="alert"
-                  className="flex items-center justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-2.5 py-2 text-xs text-destructive"
+                  className="flex items-center justify-between gap-2 toolport-alert border-destructive bg-destructive/8 px-2.5 py-2 text-xs text-destructive"
                 >
                   <span>Couldn&apos;t load your servers: {registryError}</span>
                   <Button size="sm" variant="outline" onClick={() => void loadServers()}>
@@ -526,7 +526,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
               {registryState === "ready" && exportState === "error" && (
                 <div
                   role="alert"
-                  className="flex items-center justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-2.5 py-2 text-xs text-destructive"
+                  className="flex items-center justify-between gap-2 toolport-alert border-destructive bg-destructive/8 px-2.5 py-2 text-xs text-destructive"
                 >
                   <span>Couldn&apos;t build this setup: {exportError}</span>
                   <Button

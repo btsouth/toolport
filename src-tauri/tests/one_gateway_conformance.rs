@@ -20,6 +20,7 @@
 //! `--stdio-adapter` roles, the real rendezvous files, and the real
 //! `mock-mcp-server` fixture as the downstream. Every wait is bounded, so a
 //! case that hangs fails its own deadline rather than the CI job.
+use conduit_lib::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 mod discovery_support;
 
@@ -801,12 +802,17 @@ fn wait_for_descriptor(dir: &Path, within: Duration) -> Value {
 
 /// A JSON-RPC response body, whether the server answered with `application/json`
 /// or a one-shot `text/event-stream` frame (mirrors `tests/daemon_cold_start.rs`).
-fn json_body(response: ureq::Response) -> Value {
+fn json_body(response: ureq::http::Response<ureq::Body>) -> Value {
     let content_type = response
-        .header("Content-Type")
+        .headers()
+        .get("Content-Type")
+        .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let body = response.into_string().expect("response body");
+    let body = response
+        .into_body()
+        .read_to_string()
+        .expect("response body");
     if content_type.contains("text/event-stream") {
         body.lines()
             .filter_map(|line| line.strip_prefix("data:"))
@@ -824,10 +830,14 @@ fn json_body(response: ureq::Response) -> Value {
 /// errors, and a wrong bearer alike: from a caller's point of view none of them
 /// is a daemon it may talk to.
 fn probe_identity(endpoint: &str, token: &str) -> Result<Value, String> {
-    let response = ureq::get(&format!("http://{endpoint}/host/identity"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .timeout(Duration::from_secs(10))
+    let response = conduit_lib::http_client::agent()
+        .get(&format!("http://{endpoint}/host/identity"))
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .config()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
         .call()
+        .retain_status_body()
         .map_err(|e| format!("identity probe failed: {e}"))?;
     Ok(json_body(response))
 }
@@ -1674,31 +1684,48 @@ fn matrix_rollout_default_selects_the_shared_daemon() {
     let token = descriptor["token"].as_str().expect("daemon bearer");
     let url = format!("http://{endpoint}{}", conduit_lib::daemon::TOPOLOGY_PATH);
     assert!(
-        matches!(ureq::get(&url).call(), Err(ureq::Error::Status(401, _))),
+        matches!(
+            conduit_lib::http_client::agent()
+                .get(&url)
+                .call()
+                .retain_status_body(),
+            Err(conduit_lib::http_client::Error::Status(401, _))
+        ),
         "topology probe must require the private bearer"
     );
-    let public_route = ureq::get(&format!("http://{endpoint}/openapi.json"))
-        .set("Authorization", "Bearer registered-probe-token")
+    let public_route = conduit_lib::http_client::agent()
+        .get(&format!("http://{endpoint}/openapi.json"))
+        .set_header("Authorization", "Bearer registered-probe-token")
         .call()
+        .retain_status_body()
         .expect("registered client can reach an ordinary HTTP route");
-    assert_eq!(public_route.status(), 200);
+    assert_eq!(public_route.status().as_u16(), 200);
     for path in [
         conduit_lib::daemon::IDENTITY_PATH,
         conduit_lib::daemon::TOPOLOGY_PATH,
     ] {
-        let response = ureq::get(&format!("http://{endpoint}{path}"))
-            .set("Authorization", "Bearer registered-probe-token")
-            .call();
+        let response = conduit_lib::http_client::agent()
+            .get(&format!("http://{endpoint}{path}"))
+            .set_header("Authorization", "Bearer registered-probe-token")
+            .call()
+            .retain_status_body();
         assert!(
-            matches!(&response, Err(ureq::Error::Status(401, _))),
+            matches!(
+                &response,
+                Err(conduit_lib::http_client::Error::Status(401, _))
+            ),
             "a registered HTTP client token reached private {path}: {response:?}"
         );
     }
     let topology = json_body(
-        ureq::get(&url)
-            .set("Authorization", &format!("Bearer {token}"))
-            .timeout(Duration::from_secs(10))
+        conduit_lib::http_client::agent()
+            .get(&url)
+            .set_header("Authorization", &format!("Bearer {token}"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build()
             .call()
+            .retain_status_body()
             .expect("authenticated topology probe"),
     );
     assert_eq!(topology["role"], "daemon");
@@ -1719,31 +1746,41 @@ fn matrix_rollout_default_selects_the_shared_daemon() {
         "bindHost": "bridge.example"
     });
     assert!(matches!(
-        ureq::post(&lease_url)
-            .set("Authorization", "Bearer registered-probe-token")
-            .send_json(lease_body.clone()),
-        Err(ureq::Error::Status(401, _))
+        conduit_lib::http_client::agent()
+            .post(&lease_url)
+            .set_header("Authorization", "Bearer registered-probe-token")
+            .send_json(lease_body.clone())
+            .retain_status_body(),
+        Err(conduit_lib::http_client::Error::Status(401, _))
     ));
-    ureq::post(&lease_url)
-        .set("Authorization", &format!("Bearer {token}"))
+    conduit_lib::http_client::agent()
+        .post(&lease_url)
+        .set_header("Authorization", &format!("Bearer {token}"))
         .send_json(lease_body.clone())
+        .retain_status_body()
         .expect("private bearer acquires public bridge lease");
-    ureq::get(&format!("http://{endpoint}/openapi.json"))
-        .set("Authorization", "Bearer registered-probe-token")
-        .set("Origin", "http://127.0.0.1")
+    conduit_lib::http_client::agent()
+        .get(&format!("http://{endpoint}/openapi.json"))
+        .set_header("Authorization", "Bearer registered-probe-token")
+        .set_header("Origin", "http://127.0.0.1")
         .call()
+        .retain_status_body()
         .expect("service lease keeps registered clients' Origin policy");
-    ureq::get(&format!("http://{endpoint}/openapi.json"))
-        .set("Authorization", &format!("Bearer {bridge_token}"))
-        .set("Origin", "http://bridge.example")
+    conduit_lib::http_client::agent()
+        .get(&format!("http://{endpoint}/openapi.json"))
+        .set_header("Authorization", &format!("Bearer {bridge_token}"))
+        .set_header("Origin", "http://bridge.example")
         .call()
+        .retain_status_body()
         .expect("leased bridge token reaches its public origin");
     assert!(matches!(
-        ureq::get(&format!("http://{endpoint}/openapi.json"))
-            .set("Authorization", &format!("Bearer {bridge_token}"))
-            .set("Origin", "http://attacker.example")
-            .call(),
-        Err(ureq::Error::Status(403, _))
+        conduit_lib::http_client::agent()
+            .get(&format!("http://{endpoint}/openapi.json"))
+            .set_header("Authorization", &format!("Bearer {bridge_token}"))
+            .set_header("Origin", "http://attacker.example")
+            .call()
+            .retain_status_body(),
+        Err(conduit_lib::http_client::Error::Status(403, _))
     ));
     for path in [
         conduit_lib::daemon::IDENTITY_PATH,
@@ -1751,35 +1788,49 @@ fn matrix_rollout_default_selects_the_shared_daemon() {
         conduit_lib::daemon::HTTP_SERVICE_LEASE_PATH,
         conduit_lib::daemon::SHUTDOWN_IF_IDLE_PATH,
     ] {
-        let response = ureq::get(&format!("http://{endpoint}{path}"))
-            .set("Authorization", &format!("Bearer {bridge_token}"))
-            .call();
+        let response = conduit_lib::http_client::agent()
+            .get(&format!("http://{endpoint}{path}"))
+            .set_header("Authorization", &format!("Bearer {bridge_token}"))
+            .call()
+            .retain_status_body();
         assert!(
-            matches!(response, Err(ureq::Error::Status(401, _))),
+            matches!(
+                response,
+                Err(conduit_lib::http_client::Error::Status(401, _))
+            ),
             "leased public bearer reached private {path}"
         );
     }
     for bearer in [bridge_token, "registered-probe-token"] {
-        let response = ureq::post(&format!(
-            "http://{endpoint}{}",
-            conduit_lib::daemon::SHUTDOWN_IF_IDLE_PATH
-        ))
-        .set("Authorization", &format!("Bearer {bearer}"))
-        .call();
+        let response = conduit_lib::http_client::agent()
+            .post(&format!(
+                "http://{endpoint}{}",
+                conduit_lib::daemon::SHUTDOWN_IF_IDLE_PATH
+            ))
+            .set_header("Authorization", &format!("Bearer {bearer}"))
+            .send_empty()
+            .retain_status_body();
         assert!(
-            matches!(response, Err(ureq::Error::Status(401, _))),
+            matches!(
+                response,
+                Err(conduit_lib::http_client::Error::Status(401, _))
+            ),
             "a non-private bearer reached the shutdown endpoint: {response:?}"
         );
     }
-    ureq::delete(&lease_url)
-        .set("Authorization", &format!("Bearer {token}"))
-        .send_json(lease_body)
+    conduit_lib::http_client::agent()
+        .delete(&lease_url)
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .force_send_body().send_json(lease_body)
+        .retain_status_body()
         .expect("private bearer releases public bridge lease");
     assert!(matches!(
-        ureq::get(&format!("http://{endpoint}/openapi.json"))
-            .set("Authorization", &format!("Bearer {bridge_token}"))
-            .call(),
-        Err(ureq::Error::Status(401, _))
+        conduit_lib::http_client::agent()
+            .get(&format!("http://{endpoint}/openapi.json"))
+            .set_header("Authorization", &format!("Bearer {bridge_token}"))
+            .call()
+            .retain_status_body(),
+        Err(conduit_lib::http_client::Error::Status(401, _))
     ));
 }
 
@@ -1833,12 +1884,19 @@ fn matrix_desktop_http_proxy_shares_daemon_and_releases_lease() {
             proxy.0.try_wait().unwrap().is_none(),
             "HTTP proxy exited before readiness"
         );
-        if let Ok(response) = ureq::get(&format!("{public_url}/"))
-            .timeout(Duration::from_millis(300))
-            .set("Authorization", &format!("Bearer {public_token}"))
+        if let Ok(response) = conduit_lib::http_client::agent()
+            .get(&format!("{public_url}/"))
+            .config()
+            .timeout_global(Some(Duration::from_millis(300)))
+            .build()
+            .set_header("Authorization", &format!("Bearer {public_token}"))
             .call()
+            .retain_status_body()
         {
-            let banner = response.into_string().expect("read proxy readiness banner");
+            let banner = response
+                .into_body()
+                .read_to_string()
+                .expect("read proxy readiness banner");
             assert!(
                 banner.starts_with("Toolport gateway (HTTP mode)."),
                 "desktop readiness requires the HTTP-mode banner: {banner}"
@@ -1849,31 +1907,38 @@ fn matrix_desktop_http_proxy_shares_daemon_and_releases_lease() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(
-        ureq::get(&format!("{public_url}/openapi.json"))
-            .set("Authorization", "Bearer registered-proxy-token")
-            .set("Origin", "http://127.0.0.1")
+        conduit_lib::http_client::agent()
+            .get(&format!("{public_url}/openapi.json"))
+            .set_header("Authorization", "Bearer registered-proxy-token")
+            .set_header("Origin", "http://127.0.0.1")
             .call()
+            .retain_status_body()
             .expect("registered client reaches Shared HTTP through the proxy")
-            .status(),
+            .status()
+            .as_u16(),
         200
     );
 
     let request = |id: u64, method: &str, mut params: Value| {
         params["_meta"] = json!({ "io.modelcontextprotocol/protocolVersion": "2026-07-28" });
-        let mut request = ureq::post(&format!("{public_url}/mcp"))
-            .timeout(Duration::from_secs(10))
-            .set("Authorization", &format!("Bearer {public_token}"))
-            .set("MCP-Protocol-Version", "2026-07-28")
-            .set("Mcp-Method", method)
-            .set("Accept", "application/json");
+        let mut request = conduit_lib::http_client::agent()
+            .post(&format!("{public_url}/mcp"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build()
+            .set_header("Authorization", &format!("Bearer {public_token}"))
+            .set_header("MCP-Protocol-Version", "2026-07-28")
+            .set_header("Mcp-Method", method)
+            .set_header("Accept", "application/json");
         if let Some(name) = params.get("name").and_then(Value::as_str) {
-            request = request.set("Mcp-Name", name);
+            request = request.set_header("Mcp-Name", name);
         }
         json_body(
             request
                 .send_json(json!({
                     "jsonrpc": "2.0", "id": id, "method": method, "params": params
                 }))
+                .retain_status_body()
                 .expect("public MCP request through proxy"),
         )
     };
@@ -1906,15 +1971,19 @@ fn matrix_desktop_http_proxy_shares_daemon_and_releases_lease() {
         assert!(Instant::now() < deadline, "HTTP proxy ignored parent EOF");
         std::thread::sleep(Duration::from_millis(25));
     }
-    ureq::get(&identity_url)
-        .set("Authorization", &format!("Bearer {private_token}"))
+    conduit_lib::http_client::agent()
+        .get(&identity_url)
+        .set_header("Authorization", &format!("Bearer {private_token}"))
         .call()
+        .retain_status_body()
         .expect("shared daemon survives desktop bridge exit");
     assert!(matches!(
-        ureq::get(&format!("http://{endpoint}/openapi.json"))
-            .set("Authorization", &format!("Bearer {public_token}"))
-            .call(),
-        Err(ureq::Error::Status(401, _))
+        conduit_lib::http_client::agent()
+            .get(&format!("http://{endpoint}/openapi.json"))
+            .set_header("Authorization", &format!("Bearer {public_token}"))
+            .call()
+            .retain_status_body(),
+        Err(conduit_lib::http_client::Error::Status(401, _))
     ));
 }
 
@@ -2160,23 +2229,25 @@ fn matrix_pooling_sessionless_modern_requests_keep_a_warm_root_launch() {
         "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}
     });
     let request = || {
-        let response = ureq::post(&format!("http://{endpoint}/mcp"))
-            .set("Authorization", &format!("Bearer {token}"))
-            .set(
+        let response = conduit_lib::http_client::agent()
+            .post(&format!("http://{endpoint}/mcp"))
+            .set_header("Authorization", &format!("Bearer {token}"))
+            .set_header(
                 conduit_lib::stdio_adapter::ADAPTER_CLIENT_ID_HEADER,
                 "sessionless-root",
             )
-            .set(
+            .set_header(
                 conduit_lib::stdio_adapter::ADAPTER_CWD_HEADER,
                 &encoded_root,
             )
-            .set("MCP-Protocol-Version", "2026-07-28")
-            .set("Mcp-Method", "tools/list")
-            .set("Accept", "application/json")
-            .set("Content-Type", "application/json")
-            .send_string(&body.to_string())
+            .set_header("MCP-Protocol-Version", "2026-07-28")
+            .set_header("Mcp-Method", "tools/list")
+            .set_header("Accept", "application/json")
+            .set_header("Content-Type", "application/json")
+            .send(&body.to_string())
+            .retain_status_body()
             .expect("modern rooted tools/list");
-        let value: Value = serde_json::from_reader(response.into_reader()).unwrap();
+        let value: Value = serde_json::from_reader(response.into_body().into_reader()).unwrap();
         assert!(
             value["result"]["tools"]
                 .as_array()
@@ -3129,38 +3200,53 @@ fn matrix_routing_profiles_cannot_reach_servers_outside_their_scope() {
     let descriptor = wait_for_descriptor(&dir, Duration::from_secs(10));
     let endpoint = descriptor["endpoint"].as_str().expect("endpoint");
     let token = descriptor["token"].as_str().expect("token");
-    let rejected = ureq::post(&format!("http://{endpoint}/mcp"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set(
+    let rejected = conduit_lib::http_client::agent()
+        .post(&format!("http://{endpoint}/mcp"))
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .set_header(
             conduit_lib::stdio_adapter::ADAPTER_PROFILE_HEADER,
             "scope-two",
         )
-        .set("Content-Type", "application/json")
-        .send_string(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+        .set_header("Content-Type", "application/json")
+        .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .retain_status_body();
     assert!(
-        matches!(rejected, Err(ureq::Error::Status(401, _))),
+        matches!(
+            rejected,
+            Err(conduit_lib::http_client::Error::Status(401, _))
+        ),
         "a profile claim without a client id must be refused"
     );
-    let rejected_root = ureq::post(&format!("http://{endpoint}/mcp"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set(conduit_lib::stdio_adapter::ADAPTER_CWD_HEADER, "!!!")
-        .set("Content-Type", "application/json")
-        .send_string(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    let rejected_root = conduit_lib::http_client::agent()
+        .post(&format!("http://{endpoint}/mcp"))
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .set_header(conduit_lib::stdio_adapter::ADAPTER_CWD_HEADER, "!!!")
+        .set_header("Content-Type", "application/json")
+        .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .retain_status_body();
     assert!(
-        matches!(rejected_root, Err(ureq::Error::Status(401, _))),
+        matches!(
+            rejected_root,
+            Err(conduit_lib::http_client::Error::Status(401, _))
+        ),
         "a root claim without a client id must be refused"
     );
-    let malformed_root = ureq::post(&format!("http://{endpoint}/mcp"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set(
+    let malformed_root = conduit_lib::http_client::agent()
+        .post(&format!("http://{endpoint}/mcp"))
+        .set_header("Authorization", &format!("Bearer {token}"))
+        .set_header(
             conduit_lib::stdio_adapter::ADAPTER_CLIENT_ID_HEADER,
             "matrix-root",
         )
-        .set(conduit_lib::stdio_adapter::ADAPTER_CWD_HEADER, "!!!")
-        .set("Content-Type", "application/json")
-        .send_string(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+        .set_header(conduit_lib::stdio_adapter::ADAPTER_CWD_HEADER, "!!!")
+        .set_header("Content-Type", "application/json")
+        .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .retain_status_body();
     assert!(
-        matches!(malformed_root, Err(ureq::Error::Status(401, _))),
+        matches!(
+            malformed_root,
+            Err(conduit_lib::http_client::Error::Status(401, _))
+        ),
         "a malformed root claim must be refused"
     );
 
@@ -4082,4 +4168,691 @@ fn matrix_routing_server_request_is_refused_while_another_client_has_a_call_in_f
     assert_eq!(text_of(&slept), "slept 3000 ms");
     assert_eq!(origin.elicitation_queries.load(Ordering::Relaxed), 0);
     assert_eq!(other.elicitation_queries.load(Ordering::Relaxed), 0);
+}
+
+// Protocol lane: every call below crosses the real adapter and daemon boundary.
+fn protocol_lane_tool(name: &str, destructive: bool) -> Value {
+    json!({"name":name, "description":"Protocol fixture tool.",
+        "annotations":{"destructiveHint":destructive},
+        "inputSchema":{"type":"object","properties":{}}})
+}
+
+fn protocol_lane_server(dir: &Path, id: &str, tools: &[Value]) -> ServerEntry {
+    let catalog = dir.join(format!("catalog-{}.json", registry::sha256_hex(id)));
+    std::fs::write(&catalog, serde_json::to_vec(tools).unwrap()).unwrap();
+    let mut server = mock_server_entry(id, &dir.join(format!("transcript-{id}.jsonl")), None);
+    server.env.push(EnvVar {
+        key: "MOCK_MCP_TOOLS_FILE".into(),
+        value: Some(catalog.display().to_string()),
+        secret: false,
+        unknown_fields: Default::default(),
+    });
+    server
+}
+
+fn protocol_lane_error(result: &Value, expected: &str) -> String {
+    assert_eq!(result["isError"], true, "{result}");
+    let text = text_of(result);
+    assert!(text.contains(expected), "expected {expected:?}, got {text}");
+    let tokens = conduit_lib::savings::count_tokens(&text);
+    assert!(tokens <= 140, "error grew to {tokens} tokens: {text}");
+    println!("PROTOCOL_ERROR tokens={tokens} text={text:?}");
+    text
+}
+
+#[test]
+fn protocol_lane_unknown_names_never_request_approval_or_leak_hidden_matches() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (_fixture, dir) = Fixture::new("protocol-unknown");
+    let tools = [
+        protocol_lane_tool("read_item", false),
+        protocol_lane_tool("read_items", false),
+        protocol_lane_tool("read_itam", false),
+        protocol_lane_tool("read_itum", false),
+        {
+            let mut app = protocol_lane_tool("read_itma", false);
+            app["_meta"] = json!({"ui":{"visibility":["app"]}});
+            app
+        },
+        protocol_lane_tool("delete_item", true),
+    ];
+    let mut scoped = profile("visible", &["files"]);
+    scoped.tool_scope.insert(
+        "files".into(),
+        vec!["read_item".into(), "delete_item".into()],
+    );
+    write_registry(
+        &dir,
+        vec![protocol_lane_server(&dir, "files", &tools)],
+        vec![scoped, profile("full", &["files"]), profile("none", &[])],
+    );
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("visible"),
+            ..Default::default()
+        },
+    );
+    client.initialize("protocol-unknown");
+    client.wait_for_tool("__read_item", Duration::from_secs(30));
+    protocol_lane_error(
+        &client.call_tool(
+            "toolport_call_tool",
+            json!({"name":"invented","arguments":{}}),
+        ),
+        "Unknown tool: invented",
+    );
+    let message = protocol_lane_error(
+        &client.call_tool("files__read_itm", json!({})),
+        "Unknown tool: files__read_itm",
+    );
+    assert!(
+        message.contains("Close matches: files__read_item"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("read_items") && !message.contains("read_itam"),
+        "{message}"
+    );
+    assert!(message.contains("toolport_search_tools"));
+    let mut none = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("none"),
+            ..Default::default()
+        },
+    );
+    none.initialize("protocol-no-access");
+    for name in ["files__read_item", "files__private_guessed"] {
+        let text = protocol_lane_error(
+            &none.call_tool(name, json!({})),
+            "Unknown tool:",
+        );
+        assert!(
+            text.contains("toolport_search_tools") && !text.contains("Mock files"),
+            "{text}"
+        );
+    }
+    let audit = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(
+        !audit.contains("\"kind\":\"approval\""),
+        "unknown call raised approval: {audit}"
+    );
+    let mut full = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("full"),
+            ..Default::default()
+        },
+    );
+    full.initialize("protocol-unknown-full");
+    full.wait_for_tool("__read_item", Duration::from_secs(30));
+    let text = protocol_lane_error(
+        &full.call_tool("files__read_itm", json!({})),
+        "Unknown tool:",
+    );
+    let matches = text
+        .lines()
+        .find(|line| line.starts_with("Close matches:"))
+        .unwrap();
+    assert_eq!(matches.split(',').count(), 3, "{text}");
+    assert!(
+        !text.contains("read_itma"),
+        "app-only suggestion leaked: {text}"
+    );
+    // A known destructive tool still fails closed without a broker.
+    protocol_lane_error(
+        &client.call_tool("files__delete_item", json!({})),
+        "approval",
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let rows = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
+        if let Some(row) = rows
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|row| row["decision"] == "requested")
+        {
+            assert_eq!(row["safetyLevel"], "ask");
+            assert_eq!(row["safetySource"], "personal");
+            assert_eq!(row["gatewayVersion"], env!("CARGO_PKG_VERSION"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no approval safety snapshot: {rows}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn protocol_lane_cursor_name_budget_routes_the_same_tools_as_claude() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (_fixture, dir) = Fixture::new("protocol-client-name-budget");
+    let medium = format!("read_{}", "x".repeat(49));
+    let long = format!("read_{}", "item_".repeat(20));
+    let tools = [protocol_lane_tool(&medium, false), protocol_lane_tool(&long, false)];
+    write_registry(&dir, vec![protocol_lane_server(&dir, "files", &tools)], vec![]);
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).unwrap();
+    for client in ["cursor", "claude-code"] { reg.set_client_discovery(client, Some("full")); }
+    registry::save_to(&path, &reg).unwrap();
+    let default_aliases = conduit_lib::router::Router::server_tool_aliases("files", &tools, Default::default());
+    for (client_id, budget) in [("cursor", 52), ("claude-code", 64)] {
+        let mut client = spawn_adapter(&dir, &AdapterOptions {
+            client_id: Some(client_id), ..Default::default()
+        });
+        client.initialize(client_id);
+        client.wait_for_tool_where("client budget catalog", |name| name.starts_with("files__"), Duration::from_secs(30));
+        let listed = client.request("tools/list", json!({}));
+        let aliases: Vec<_> = listed["result"]["tools"].as_array().unwrap().iter()
+            .filter_map(|tool| tool["name"].as_str()).filter(|name| name.starts_with("files__"))
+            .map(str::to_string).collect();
+        assert_eq!(aliases.len(), 2, "{listed}");
+        assert!(aliases.iter().all(|name| name.len() <= budget), "{aliases:?}");
+        let mut originals = Vec::new();
+        for alias in aliases {
+            let response = client.call_tool(&alias, json!({}));
+            originals.push(text_of(&response));
+            if client_id == "claude-code" {
+                assert!(default_aliases.values().any(|name| name == &alias));
+            }
+        }
+        originals.sort();
+        let mut expected = vec![medium.clone(), long.clone()];
+        expected.sort();
+        assert_eq!(originals, expected);
+    }
+}
+
+#[test]
+fn protocol_lane_policy_refusals_explain_the_reason_and_fix() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for case in [
+        "strict",
+        "client",
+        "disabled",
+        "quarantine",
+        "reserved",
+        "team",
+    ] {
+        let (_fixture, dir) = Fixture::new(&format!("protocol-{case}"));
+        let tools = [
+            protocol_lane_tool("read_item", false),
+            protocol_lane_tool("delete_item", true),
+        ];
+        write_registry(
+            &dir,
+            vec![protocol_lane_server(&dir, "files", &tools)],
+            vec![],
+        );
+        let path = dir.join("registry.json");
+        let mut reg = registry::load_from(&path).unwrap();
+        let profile_id = reg.active_profile_id.clone().unwrap();
+        let (name, reason, fix) = match case {
+            "strict" => {
+                reg.set_safety_level(registry::SafetyLevel::Strict);
+                ("files__delete_item", "Strict safety", "Toolport > Settings")
+            }
+            "team" => {
+                reg.set_safety_level(registry::SafetyLevel::Off);
+                reg.team_min_safety_level = registry::SafetyLevel::Strict;
+                ("files__delete_item", "team's Strict safety", "team admin")
+            }
+            "client" => {
+                reg.profiles
+                    .iter_mut()
+                    .find(|p| p.id == profile_id)
+                    .unwrap()
+                    .tool_scope
+                    .insert("files".into(), vec!["read_item".into()]);
+                (
+                    "files__delete_item",
+                    "Unknown tool:",
+                    "toolport_search_tools",
+                )
+            }
+            "disabled" => {
+                reg.servers[0].disabled_tools.push("delete_item".into());
+                ("files__delete_item", "turned off", "Toolport > Servers")
+            }
+            _ => {
+                let legacy = if case == "reserved" {
+                    reg.tool_overrides.insert(
+                        "files".into(),
+                        std::collections::HashMap::from([(
+                            "delete_item".into(),
+                            registry::ToolOverride {
+                                name: Some("toolport_old_delete".into()),
+                                description: None,
+                                unknown_fields: Default::default(),
+                            },
+                        )]),
+                    );
+                    "toolport_old_delete"
+                } else {
+                    "files__delete_item"
+                };
+                reg.team_forced_quarantine_on_drift = true;
+                for store in [
+                    dir.join("quarantine.json"),
+                    dir.join(format!(
+                        "quarantine-v2-{}.json",
+                        registry::profile_store_key(&profile_id)
+                    )),
+                ] {
+                    std::fs::write(store, json!({(legacy):{"server":"files","tool":"delete_item","change":"changed"}}).to_string()).unwrap();
+                }
+                (
+                    "files__delete_item",
+                    "quarantined after a tool change",
+                    "Toolport > Settings > Quarantined tools",
+                )
+            }
+        };
+        registry::save_to(&path, &reg).unwrap();
+        let mut client = spawn_adapter(
+            &dir,
+            &AdapterOptions {
+                profile: Some(&profile_id),
+                ..AdapterOptions::default()
+            },
+        );
+        client.initialize(&format!("protocol-{case}"));
+        client.wait_for_tool("__read_item", Duration::from_secs(30));
+        for result in [
+            client.call_tool(name, json!({})),
+            client.call_tool("toolport_call_tool", json!({"name":name,"arguments":{}})),
+        ] {
+            let text = protocol_lane_error(&result, if case == "client" { "Unknown tool:" } else { "Blocked by Toolport:" });
+            assert!(
+                text.contains(reason) && text.contains(fix),
+                "{case}: {text}"
+            );
+        }
+        assert_eq!(
+            transcript_method_count(&dir.join("transcript-files.jsonl"), "tools/call"),
+            0
+        );
+    }
+}
+
+#[test]
+fn protocol_lane_cold_calls_wait_for_catalog_or_report_starting() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for delay in [400, 4000] {
+        let (_fixture, dir) = Fixture::new("protocol-cold");
+        let mut server =
+            protocol_lane_server(&dir, "files", &[protocol_lane_tool("read_item", false)]);
+        server.args.push(format!("--start-delay-ms={delay}"));
+        write_registry(&dir, vec![server], vec![]);
+        let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+        client.initialize("protocol-cold");
+        let started = Instant::now();
+        let result = client.call_tool("files__read_item", json!({}));
+        if delay == 400 {
+            assert_eq!(text_of(&result), "read_item", "{result}");
+            assert_ne!(result["isError"], true);
+        } else {
+            let text = protocol_lane_error(&result, "has not connected yet");
+            assert!(
+                text.contains("connecting") && !text.contains("approval"),
+                "{text}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(4),
+                "first catalog budget was exceeded"
+            );
+            client.wait_for_tool("__read_item", Duration::from_secs(30));
+            assert_eq!(
+                text_of(&client.call_tool("files__read_item", json!({}))),
+                "read_item"
+            );
+        }
+        let audit = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
+        assert!(
+            !audit.contains("\"kind\":\"approval\""),
+            "cold read raised approval: {audit}"
+        );
+    }
+}
+
+#[test]
+fn protocol_lane_unknown_on_loaded_owner_does_not_wait_for_other_catalogs() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (_fixture, dir) = Fixture::new("protocol-loaded-owner");
+    let mut slow = protocol_lane_server(&dir, "slow", &[protocol_lane_tool("read_item", false)]);
+    slow.args.push("--start-delay-ms=20000".into());
+    write_registry(
+        &dir,
+        vec![
+            protocol_lane_server(&dir, "files", &[protocol_lane_tool("read_item", false)]),
+            slow,
+        ],
+        vec![],
+    );
+    let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+    client.initialize("protocol-loaded-owner");
+    client.wait_for_tool("files__read_item", Duration::from_secs(30));
+    assert_eq!(
+        transcript_method_count(&dir.join("transcript-slow.jsonl"), "tools/list"),
+        0
+    );
+    let started = Instant::now();
+    protocol_lane_error(
+        &client.call_tool(
+            "toolport_call_tool",
+            json!({"name":"files__read_itm","arguments":{}}),
+        ),
+        "Unknown tool: files__read_itm",
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "loaded owner waited for another server"
+    );
+}
+
+#[test]
+fn protocol_lane_cached_routes_refresh_safety_before_approval() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (_fixture, dir) = Fixture::new("protocol-cached-safety");
+    write_registry(
+        &dir,
+        vec![protocol_lane_server(
+            &dir,
+            "files",
+            &[protocol_lane_tool("read_item", false)],
+        )],
+        vec![],
+    );
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).unwrap();
+    reg.set_safety_level(registry::SafetyLevel::Ask);
+    registry::save_to(&path, &reg).unwrap();
+    let mut first = spawn_adapter(&dir, &AdapterOptions::default());
+    first.initialize("protocol-cached-safety");
+    first.wait_for_tool("files__read_item", Duration::from_secs(30));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let cached = std::fs::read(dir.join("tool-cache.servers.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        if cached.is_some_and(|cache| {
+            cache["servers"]["files"]["tools"]
+                .as_array()
+                .is_some_and(|tools| {
+                    tools.iter().any(|tool| {
+                        tool["name"] == "read_item"
+                            && tool["annotations"]["destructiveHint"] == false
+                    })
+                })
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "read-only catalog was not persisted"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    drop(first);
+    kill_daemons(&dir);
+    // The launch identity stays unchanged, so restart restores the old read-only
+    // catalog. Current metadata must be loaded before deciding whether to approve.
+    protocol_lane_server(&dir, "files", &[protocol_lane_tool("read_item", true)]);
+    let mut second = spawn_adapter(&dir, &AdapterOptions::default());
+    second.initialize("protocol-cached-safety-restart");
+    protocol_lane_error(
+        &second.call_tool("files__read_item", json!({})),
+        "approval service was unreachable",
+    );
+    assert_eq!(
+        transcript_method_count(&dir.join("transcript-files.jsonl"), "tools/call"),
+        0
+    );
+}
+
+#[test]
+fn protocol_lane_long_aliases_route_and_survive_reorder_restart_and_old_policy() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _data_lock = registry::data_dir_test_lock();
+    let (_fixture, dir) = Fixture::new("protocol-long");
+    let _data_dir = registry::DataDirOverride::set(&dir);
+    let long = format!("read_{}", "customer_account_details_".repeat(4));
+    let twin = long.replace('_', "-");
+    let unicode = format!("read_{}", "用戶".repeat(40));
+    let override_name = format!("custom_{}", "account_".repeat(12));
+    let tools = [
+        protocol_lane_tool(&long, false),
+        protocol_lane_tool(&twin, false),
+        protocol_lane_tool(&unicode, false),
+        protocol_lane_tool("short", false),
+        protocol_lane_tool("renamed", false),
+    ];
+    write_registry(
+        &dir,
+        vec![protocol_lane_server(&dir, "files", &tools)],
+        vec![],
+    );
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).unwrap();
+    reg.set_safety_level(registry::SafetyLevel::Strict);
+    reg.tool_overrides.insert(
+        "files".into(),
+        std::collections::HashMap::from([(
+            "renamed".into(),
+            registry::ToolOverride {
+                name: Some(override_name.clone()),
+                description: None,
+                unknown_fields: Default::default(),
+            },
+        )]),
+    );
+    registry::save_to(&path, &reg).unwrap();
+    let profile = reg.active_profile_id.as_deref();
+    // Seed pins using the exact old client-facing definitions. Bounding the name
+    // must keep these records and fingerprints rather than silently re-pin them.
+    let mut old_tools = tools.to_vec();
+    for tool in &mut old_tools {
+        let original = tool["name"].as_str().unwrap();
+        let old_name = if original == "renamed" {
+            override_name.clone()
+        } else {
+            let suffix = if original == long { "_2" } else { "" };
+            format!(
+                "files__{}{suffix}",
+                conduit_lib::router::sanitize_segment(original)
+            )
+        };
+        tool["name"] = json!(old_name);
+        conduit_lib::router::normalize_tool_schema(&mut tool["inputSchema"]);
+    }
+    conduit_lib::integrity::check(profile, &old_tools).unwrap();
+    let old_pins = serde_json::to_value(conduit_lib::integrity::baselines(profile)).unwrap();
+    let aliases = conduit_lib::router::Router::server_tool_aliases(
+        "files",
+        &tools,
+        reg.tool_overrides.clone(),
+    );
+    assert_eq!(aliases["short"], "files__short");
+    assert_eq!(aliases.len(), tools.len());
+    assert_ne!(aliases[&long], aliases[&twin]);
+    assert!(aliases.values().all(
+        |name| name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    ));
+    for restart in 0..2 {
+        let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+        client.initialize("protocol-long");
+        client.wait_for_tool("__short", Duration::from_secs(30));
+        let names = client.tool_names();
+        for (original, alias) in &aliases {
+            assert!(names.contains(alias), "alias missing: {alias}: {names:?}");
+            assert_eq!(text_of(&client.call_tool(alias, json!({}))), *original);
+        }
+        assert_eq!(
+            serde_json::to_value(conduit_lib::integrity::baselines(profile)).unwrap(),
+            old_pins,
+            "alias change rewrote old pins"
+        );
+        drop(client);
+        kill_daemons(&dir);
+        if restart == 0 {
+            let mut reversed = tools.to_vec();
+            reversed.reverse();
+            protocol_lane_server(&dir, "files", &reversed);
+        }
+    }
+    // Existing quarantine names still block their bounded aliases after restart.
+    let legacy = format!("files__{}_2", conduit_lib::router::sanitize_segment(&long));
+    for store in [
+        dir.join("quarantine.json"),
+        dir.join(format!(
+            "quarantine-v2-{}.json",
+            registry::profile_store_key(profile.unwrap())
+        )),
+    ] {
+        std::fs::write(store, json!({(legacy.clone()):{"server":"files","tool":long,"change":"changed"}, (override_name.clone()):{"server":"files","tool":"renamed","change":"changed"}}).to_string()).unwrap();
+    }
+    let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+    client.initialize("protocol-long-quarantine");
+    client.wait_for_tool("__short", Duration::from_secs(30));
+    for original in [&long, &"renamed".to_string()] {
+        protocol_lane_error(
+            &client.call_tool(&aliases[original], json!({})),
+            "quarantined after a tool change",
+        );
+    }
+    assert_eq!(text_of(&client.call_tool(&aliases[&twin], json!({}))), twin);
+}
+
+#[test]
+fn protocol_lane_long_destructive_names_keep_approval_and_team_source() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (_fixture, dir) = Fixture::new("protocol-long-approval");
+    let original = format!("{}_delete", "account_".repeat(12));
+    let mut tool = protocol_lane_tool(&original, true);
+    tool.as_object_mut().unwrap().remove("annotations");
+    let aliases = conduit_lib::router::Router::server_tool_aliases(
+        "files",
+        &[tool.clone()],
+        Default::default(),
+    );
+    write_registry(
+        &dir,
+        vec![protocol_lane_server(&dir, "files", &[tool])],
+        vec![],
+    );
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).unwrap();
+    reg.set_safety_level(registry::SafetyLevel::Off);
+    reg.team_min_safety_level = registry::SafetyLevel::Ask;
+    registry::save_to(&path, &reg).unwrap();
+    let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+    client.initialize("protocol-long-approval");
+    let alias = &aliases[&original];
+    client.wait_for_tool_where("long alias", |name| name == alias, Duration::from_secs(30));
+    protocol_lane_error(
+        &client.call_tool(alias, json!({})),
+        "approval service was unreachable",
+    );
+    assert_eq!(
+        transcript_method_count(&dir.join("transcript-files.jsonl"), "tools/call"),
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let rows = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
+        if let Some(row) = rows
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|row| row["decision"] == "requested")
+        {
+            assert_eq!(row["safetyLevel"], "ask");
+            assert_eq!(row["safetySource"], "team_floor");
+            assert_eq!(row["gatewayVersion"], env!("CARGO_PKG_VERSION"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no team approval snapshot: {rows}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn protocol_lane_long_server_aliases_keep_both_identity_parts_and_cached_routes() {
+    let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for prefix in ["service_", "service__"] {
+        let (_fixture, dir) = Fixture::new("protocol-long-server");
+        let server = format!("{prefix}{}", "account_".repeat(12));
+        let tools = [
+            protocol_lane_tool("read_item", false),
+            protocol_lane_tool("read__item", false),
+        ];
+        let aliases =
+            conduit_lib::router::Router::server_tool_aliases(&server, &tools, Default::default());
+        let alias = &aliases["read_item"];
+        assert!(
+            alias.len() <= 64 && alias.contains("__read_item_"),
+            "{alias}"
+        );
+        write_registry(
+            &dir,
+            vec![protocol_lane_server(&dir, &server, &tools)],
+            vec![],
+        );
+        let registry_path = dir.join("registry.json");
+        let mut reg = registry::load_from(&registry_path).unwrap();
+        reg.profiles.push(profile("none", &[]));
+        registry::save_to(&registry_path, &reg).unwrap();
+        let mut first = spawn_adapter(&dir, &AdapterOptions::default());
+        first.initialize("protocol-long-server");
+        first.wait_for_tool_where(
+            "long server alias",
+            |name| name == alias,
+            Duration::from_secs(30),
+        );
+        let found = first.call_tool("toolport_search_tools", json!({"query":"","server":server}));
+        assert!(
+            text_of(&found).contains(alias),
+            "raw server selector lost its bounded alias: {found}"
+        );
+        for (original, alias) in &aliases {
+            assert_eq!(text_of(&first.call_tool(alias, json!({}))), *original);
+        }
+        let calls_before = transcript_method_count(
+            &dir.join(format!("transcript-{server}.jsonl")),
+            "tools/call",
+        );
+        let mut none = spawn_adapter(
+            &dir,
+            &AdapterOptions {
+                profile: Some("none"),
+                ..Default::default()
+            },
+        );
+        none.initialize("protocol-long-server-no-access");
+        let refused = protocol_lane_error(
+            &none.call_tool(alias, json!({})),
+            "Unknown tool:",
+        );
+        assert!(refused.contains("toolport_search_tools"), "{refused}");
+        assert_eq!(
+            transcript_method_count(
+                &dir.join(format!("transcript-{server}.jsonl")),
+                "tools/call"
+            ),
+            calls_before
+        );
+        drop(none);
+        drop(first);
+        kill_daemons(&dir);
+        let mut second = spawn_adapter(&dir, &AdapterOptions::default());
+        second.initialize("protocol-long-server-restart");
+        for (original, alias) in &aliases {
+            assert_eq!(text_of(&second.call_tool(alias, json!({}))), *original);
+        }
+    }
 }

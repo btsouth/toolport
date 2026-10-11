@@ -20,6 +20,7 @@
 //! Gaps were tracked here as `#[ignore]`d acceptance criteria while the work was
 //! in flight, which is a good pattern to reuse. Every test in this file runs
 //! today.
+use conduit_lib::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -812,13 +813,20 @@ fn http_fixture_enforces_header_body_agreement() {
     });
 
     // Header disagrees with the body: the exact shape of the bug that shipped.
-    let mismatched = ureq::post(&fixture.url)
-        .set("MCP-Protocol-Version", "2025-06-18")
-        .set("Mcp-Method", "tools/list")
-        .send_json(body.clone());
+    let mismatched = conduit_lib::http_client::agent()
+        .post(&fixture.url)
+        .set_header("MCP-Protocol-Version", "2025-06-18")
+        .set_header("Mcp-Method", "tools/list")
+        .send_json(body.clone())
+        .retain_status_body();
     match mismatched {
-        Err(ureq::Error::Status(400, resp)) => {
-            let err: Value = resp.into_json().expect("json error body");
+        Err(conduit_lib::http_client::Error::Status(400, resp)) => {
+            let err: Value = resp
+                .into_body()
+                .with_config()
+                .limit(u64::MAX)
+                .read_json()
+                .expect("json error body");
             assert_eq!(
                 err["error"]["code"], -32020,
                 "a header/body mismatch must be HeaderMismatch, got {err}"
@@ -828,31 +836,49 @@ fn http_fixture_enforces_header_body_agreement() {
     }
 
     // Absent header is equally invalid under this revision.
-    let missing = ureq::post(&fixture.url).send_json(body.clone());
+    let missing = conduit_lib::http_client::agent()
+        .post(&fixture.url)
+        .send_json(body.clone())
+        .retain_status_body();
     assert!(
-        matches!(missing, Err(ureq::Error::Status(400, _))),
+        matches!(
+            missing,
+            Err(conduit_lib::http_client::Error::Status(400, _))
+        ),
         "a missing MCP-Protocol-Version must be rejected"
     );
 
     // ...and the matching header is accepted, so the gate is not simply refusing
     // everything.
-    let ok = ureq::post(&fixture.url)
-        .set("MCP-Protocol-Version", MODERN)
-        .set("Mcp-Method", "tools/list")
+    let ok = conduit_lib::http_client::agent()
+        .post(&fixture.url)
+        .set_header("MCP-Protocol-Version", MODERN)
+        .set_header("Mcp-Method", "tools/list")
         .send_json(body)
+        .retain_status_body()
         .expect("agreeing header and body must be accepted");
-    let parsed: Value = ok.into_json().expect("json body");
+    let parsed: Value = ok
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_json()
+        .expect("json body");
     assert!(parsed["result"]["tools"].is_array(), "got {parsed}");
 
     let missing_method_header_body = json!({
         "jsonrpc": "2.0", "id": 2, "method": "tools/list",
         "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": MODERN } }
     });
-    let missing_method = ureq::post(&fixture.url)
-        .set("MCP-Protocol-Version", MODERN)
-        .send_json(missing_method_header_body);
+    let missing_method = conduit_lib::http_client::agent()
+        .post(&fixture.url)
+        .set_header("MCP-Protocol-Version", MODERN)
+        .send_json(missing_method_header_body)
+        .retain_status_body();
     assert!(
-        matches!(missing_method, Err(ureq::Error::Status(400, _))),
+        matches!(
+            missing_method,
+            Err(conduit_lib::http_client::Error::Status(400, _))
+        ),
         "a missing Mcp-Method must be rejected"
     );
 
@@ -864,13 +890,18 @@ fn http_fixture_enforces_header_body_agreement() {
             "_meta": { "io.modelcontextprotocol/protocolVersion": MODERN }
         }
     });
-    let wrong_name = ureq::post(&fixture.url)
-        .set("MCP-Protocol-Version", MODERN)
-        .set("Mcp-Method", "tools/call")
-        .set("Mcp-Name", "other")
-        .send_json(wrong_name_body);
+    let wrong_name = conduit_lib::http_client::agent()
+        .post(&fixture.url)
+        .set_header("MCP-Protocol-Version", MODERN)
+        .set_header("Mcp-Method", "tools/call")
+        .set_header("Mcp-Name", "other")
+        .send_json(wrong_name_body)
+        .retain_status_body();
     assert!(
-        matches!(wrong_name, Err(ureq::Error::Status(400, _))),
+        matches!(
+            wrong_name,
+            Err(conduit_lib::http_client::Error::Status(400, _))
+        ),
         "a mismatched Mcp-Name must be rejected"
     );
 
@@ -881,12 +912,17 @@ fn http_fixture_enforces_header_body_agreement() {
             "_meta": { "io.modelcontextprotocol/protocolVersion": MODERN }
         }
     });
-    let missing_name = ureq::post(&fixture.url)
-        .set("MCP-Protocol-Version", MODERN)
-        .set("Mcp-Method", "tools/call")
-        .send_json(missing_name_body);
+    let missing_name = conduit_lib::http_client::agent()
+        .post(&fixture.url)
+        .set_header("MCP-Protocol-Version", MODERN)
+        .set_header("Mcp-Method", "tools/call")
+        .send_json(missing_name_body)
+        .retain_status_body();
     assert!(
-        matches!(missing_name, Err(ureq::Error::Status(400, _))),
+        matches!(
+            missing_name,
+            Err(conduit_lib::http_client::Error::Status(400, _))
+        ),
         "a missing routing name must be rejected"
     );
 }

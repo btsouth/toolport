@@ -1,5 +1,5 @@
-//! Real process inventory: client sessions survive deferral, foreign paths survive
-//! idle installation, and authenticated idle daemons can exit without a kill.
+//! Real process inventory: Windows stops owned clients as in 1.x, other systems
+//! defer, foreign paths survive, and idle daemons exit without a kill.
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -55,7 +55,7 @@ fn copied_gateway(root: &Path, name: &str) -> PathBuf {
 }
 
 #[test]
-fn busy_client_defers_and_foreign_gateway_is_never_stopped() {
+fn busy_client_uses_platform_policy_and_foreign_gateway_is_never_stopped() {
     let temp = TempDir::new("busy");
     let installed = copied_gateway(temp.path(), "install");
     let foreign = copied_gateway(temp.path(), "foreign");
@@ -75,7 +75,7 @@ fn busy_client_defers_and_foreign_gateway_is_never_stopped() {
     // A bare positional fixture argument selects direct stdio, avoiding the
     // default shared-host adapter role without changing normal CLI behavior.
     // The OS process handle exists before preflight inventories it. There is no
-    // need to wait for gateway startup: an open stdio process is already a veto.
+    // need to wait for gateway startup: the image is already held open.
     let output = command(Path::new(env!("CARGO_BIN_EXE_toolport-gateway")), &data)
         .args([
             "--installer-preflight",
@@ -84,12 +84,24 @@ fn busy_client_defers_and_foreign_gateway_is_never_stopped() {
         .stdout(Stdio::piped())
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("cancel to defer"));
-    assert!(client.0.try_wait().unwrap().is_none());
-    assert!(other.0.try_wait().unwrap().is_none());
-    client.0.kill().unwrap();
-    client.0.wait().unwrap();
+    #[cfg(windows)]
+    {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(client.0.try_wait().unwrap().is_some());
+    }
+    #[cfg(not(windows))]
+    {
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("cancel to defer"));
+        assert!(client.0.try_wait().unwrap().is_none());
+        assert!(other.0.try_wait().unwrap().is_none());
+        client.0.kill().unwrap();
+        client.0.wait().unwrap();
+    }
     let status = command(Path::new(env!("CARGO_BIN_EXE_toolport-gateway")), &data)
         .args([
             "--installer-preflight",

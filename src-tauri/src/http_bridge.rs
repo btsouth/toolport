@@ -3,6 +3,7 @@
 //! Desktop shells own persistence and user-facing policy. This module owns the
 //! child process, authenticated readiness check, and clean shutdown so every
 //! shell supervises the same runtime implementation.
+use crate::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -63,16 +64,21 @@ pub fn alive(bridge: &mut HttpBridge) -> bool {
 pub fn identity_ready(port: u16, token: &str) -> bool {
     use std::io::Read as _;
 
-    let response = match ureq::get(&format!("http://127.0.0.1:{port}/"))
-        .timeout(Duration::from_millis(300))
-        .set("Authorization", &format!("Bearer {token}"))
+    let response = match crate::http_client::agent()
+        .get(&format!("http://127.0.0.1:{port}/"))
+        .config()
+        .timeout_global(Some(Duration::from_millis(300)))
+        .build()
+        .set_header("Authorization", &format!("Bearer {token}"))
         .call()
+        .retain_status_body()
     {
-        Ok(response) if response.status() == 200 => response,
+        Ok(response) if response.status().as_u16() == 200 => response,
         _ => return false,
     };
     let mut body = String::new();
     response
+        .into_body()
         .into_reader()
         .take(4 * 1024)
         .read_to_string(&mut body)

@@ -206,7 +206,7 @@ fn token_budget_audit() {
                 }
                 record(&format!("{prefix}.raw"), result.to_string());
                 integrity::neutralize_untrusted_result(&mut result);
-                integrity::label_untrusted_result_with_notice("public-fixture", &mut result, false);
+                integrity::label_untrusted_result("public-fixture", &mut result);
                 record(&format!("{prefix}.provenance"), result.to_string());
                 let shaped = shaping::shape_result(
                     &mut result,

@@ -5,6 +5,7 @@
 //! one downstream server over a transport, does the handshake, and lists/calls
 //! its tools. The transport is abstracted so the router can be tested with a mock
 //! instead of spawning real processes.
+use crate::http_client::{RequestHeaderExt as _, ResponseResultExt as _};
 
 use crate::tool_definitions::SerializedTools;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1586,9 +1587,13 @@ impl From<String> for TransportError {
 
 /// Read up to `max` bytes of a ureq response body, lossily as text, never more than
 /// the cap even if the server keeps streaming.
-fn read_capped(resp: ureq::Response, max: u64) -> String {
+fn read_capped(resp: ureq::http::Response<ureq::Body>, max: u64) -> String {
     let mut buf = Vec::new();
-    let _ = resp.into_reader().take(max).read_to_end(&mut buf);
+    let _ = resp
+        .into_body()
+        .into_reader()
+        .take(max)
+        .read_to_end(&mut buf);
     String::from_utf8_lossy(&buf).into_owned()
 }
 
@@ -1617,8 +1622,15 @@ fn retry_after_delay(value: &str) -> Option<Duration> {
 /// Record a 429 into the shared cross-process backoff window and return the
 /// parsed Retry-After, so every egress path (POST, inline POST, and the
 /// subscriptions/listen worker) records and reports rate limits identically.
-fn record_shared_rate_limit(url: &str, resp: &ureq::Response) -> Option<Duration> {
-    let retry_after = resp.header("retry-after").and_then(retry_after_delay);
+fn record_shared_rate_limit(
+    url: &str,
+    resp: &ureq::http::Response<ureq::Body>,
+) -> Option<Duration> {
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(retry_after_delay);
     crate::downstream_backoff::record_rate_limited(url, retry_after);
     retry_after
 }
@@ -1627,14 +1639,42 @@ fn record_shared_rate_limit(url: &str, resp: &ureq::Response) -> Option<Duration
 /// connection failure), so even a non-idempotent `tools/call` is safe to retry.
 /// Post-send I/O errors (e.g. a read timeout after the server got the request)
 /// are deliberately excluded, since the call may already have run.
-fn is_retryable_transport(t: &ureq::Transport) -> bool {
+fn is_retryable_transport(error: &ureq::Error) -> bool {
+    let cause = crate::http_client::connect_error(error).unwrap_or(error);
+    // A resolver policy denial is permanent, even though no request was sent.
+    if matches!(cause, ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied) {
+        return false;
+    }
+    if crate::http_client::connect_error(error).is_some() {
+        return true;
+    }
     matches!(
-        t.kind(),
-        ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed
-    )
+        error,
+        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed
+    ) || matches!(error, ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
 fn http_read_error(error: std::io::Error) -> TransportError {
+    if let Some(ureq) = error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<ureq::Error>())
+    {
+        if http_metadata_rejected(ureq) {
+            return http_metadata_error(ureq, true);
+        }
+        if matches!(ureq, ureq::Error::Timeout(_)) {
+            return TransportError::Classified(
+                crate::call_failure::CallFailureKind::Timeout { after_send: true },
+                error.to_string(),
+            );
+        }
+    }
+    if error
+        .to_string()
+        .starts_with("downstream frame exceeded the ")
+    {
+        return TransportError::FrameRejected(error.to_string());
+    }
     use crate::call_failure::CallFailureKind as K;
     let kind = match error.kind() {
         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
@@ -1646,19 +1686,49 @@ fn http_read_error(error: std::io::Error) -> TransportError {
     TransportError::Classified(kind, error.to_string())
 }
 
-fn http_transport_io_error(error: &ureq::Transport) -> TransportError {
-    use std::error::Error;
-    let mut source = error.source();
-    while let Some(cause) = source {
-        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            return http_read_error(std::io::Error::new(io.kind(), error.to_string()));
-        }
-        source = cause.source();
+fn http_transport_io_error(error: ureq::Error) -> TransportError {
+    if http_metadata_rejected(&error) {
+        return http_metadata_error(&error, false);
     }
-    TransportError::Classified(
-        crate::call_failure::CallFailureKind::Unavailable { after_send: true },
-        error.to_string(),
-    )
+    if matches!(&error, ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied) {
+        return TransportError::Fatal(error.to_string());
+    }
+    match error {
+        ureq::Error::Timeout(_) => http_read_error(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            error.to_string(),
+        )),
+        ureq::Error::Io(_) => http_read_error(error.into_io()),
+        _ => TransportError::Fatal(crate::http_client::transport_error_message(&error)),
+    }
+}
+
+const HTTP_METADATA_BYTES: usize = 64 * 1024;
+
+fn http_metadata_rejected(error: &ureq::Error) -> bool {
+    matches!(
+        error,
+        ureq::Error::BodyStalled | ureq::Error::LargeResponseHeader(..)
+    ) || matches!(error, ureq::Error::Protocol(error)
+            if matches!(error, ureq_proto::Error::ChunkExpectedCrLf | ureq_proto::Error::HttpParseTooManyHeaders))
+}
+
+fn http_metadata_error(error: &ureq::Error, response_body: bool) -> TransportError {
+    let message = if matches!(
+        error,
+        ureq::Error::Protocol(ureq_proto::Error::ChunkExpectedCrLf)
+    ) || (response_body && matches!(error, ureq::Error::BodyStalled))
+    {
+        "malformed or unsupported chunked framing from the server".to_string()
+    } else if matches!(
+        error,
+        ureq::Error::Protocol(ureq_proto::Error::HttpParseTooManyHeaders)
+    ) {
+        "downstream response contained too many header fields".to_string()
+    } else {
+        format!("downstream response headers exceeded the {HTTP_METADATA_BYTES}-byte limit")
+    };
+    TransportError::FrameRejected(message)
 }
 
 /// Build an `Authorization` header value from a raw token, adding the `Bearer`
@@ -1789,6 +1859,7 @@ fn cwd_validation_error(dir: &str, expanded: &Path, empty_variables: &[String]) 
             "; expanded empty environment variables: {variables}"
         ));
     }
+    message.push_str(". Create the directory on this machine or update the working directory in Servers, then retry.");
     message
 }
 
@@ -4958,15 +5029,33 @@ fn inherited_environment() -> std::collections::BTreeMap<String, String> {
     return process_env_map();
     #[cfg(not(windows))]
     {
+        let process = process_env_map();
         let mut cached = LOGIN_ENV
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cached
-            .get_or_insert_with(|| {
-                login_environment_or_process(&process_env_map(), Duration::from_secs(5))
-            })
-            .clone()
+        let login = cached
+            .get_or_insert_with(|| login_environment_or_process(&process, Duration::from_secs(5)))
+            .clone();
+        with_client_environment(login, &process)
     }
+}
+
+/// The login environment, plus any name only the client's environment has.
+/// 1.x children inherited the client's environment, so variables a user
+/// exported in the terminal that started the client keep working. Login values
+/// win where both define a name, so a GUI client's bare PATH cannot hide the
+/// user's shell PATH.
+#[cfg(not(windows))]
+fn with_client_environment(
+    mut login: std::collections::BTreeMap<String, String>,
+    process: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    for (name, value) in process {
+        login
+            .entry(name.clone())
+            .or_insert_with(|| value.clone());
+    }
+    login
 }
 
 #[cfg(not(windows))]
@@ -5261,7 +5350,17 @@ impl StdioTransport {
         #[cfg(windows)]
         let job = WindowsJob::new()?;
         let mut child =
-            spawn_server(cmd).map_err(|e| format!("failed to spawn '{command}': {e}"))?;
+            spawn_server(cmd).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    let install = match command.rsplit(['/', '\\']).next().unwrap_or(command) {
+                        "npx" | "npx.cmd" => "Install Node.js (which includes npx)",
+                        "uvx" => "Install uv (which includes uvx)",
+                        "docker" => "Install Docker and start its service",
+                        _ => "Install this executable or correct its path in Servers",
+                    };
+                    format!("Executable '{command}' was not found on this machine. {install}, then restart your MCP client and retry.")
+                } else { format!("failed to spawn '{command}': {e}") }
+            })?;
         #[cfg(windows)]
         if let Err(error) = job.assign(&child).and_then(|_| WindowsJob::resume(&child)) {
             let _ = child.kill();
@@ -5684,10 +5783,11 @@ pub type RefreshFn =
 pub type ScopeReauthorizeFn = Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 
 fn insufficient_scope_challenge(
-    response: &ureq::Response,
+    response: &ureq::http::Response<ureq::Body>,
 ) -> Option<crate::oauth::BearerChallenge> {
-    let values = response.all("www-authenticate");
-    let challenge = crate::oauth::bearer_challenge(values.iter().copied())?;
+    let values = response.headers().get_all("www-authenticate");
+    let challenge =
+        crate::oauth::bearer_challenge(values.iter().filter_map(|value| value.to_str().ok()))?;
     challenge
         .error
         .as_deref()
@@ -5746,13 +5846,13 @@ fn screen_resolved_addrs(
         if crate::oauth::ip_is_link_local(&ip) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("SSRF guard: refusing link-local / cloud-metadata address {ip}"),
+                format!("blocked: private or local address (link-local / cloud-metadata {ip})"),
             ));
         }
         if block_private && crate::oauth::ip_is_private(&ip) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("SSRF guard: refusing private / loopback address {ip}"),
+                format!("blocked: private or local address ({ip})"),
             ));
         }
     }
@@ -5769,20 +5869,15 @@ pub(crate) fn guarded_agent_with_timeout(
     block_private: bool,
     timeout: std::time::Duration,
 ) -> ureq::Agent {
-    use std::net::{SocketAddr, ToSocketAddrs};
-    ureq::AgentBuilder::new()
-        .timeout(timeout)
-        // Never follow redirects. MCP Streamable HTTP doesn't need cross-host
-        // redirects, and following one would let a malicious server bounce us to an
-        // internal address (SSRF, e.g. cloud metadata) or replay our Authorization
-        // bearer to a host of its choosing (token theft).
-        .redirects(0)
-        .resolver(move |netloc: &str| -> std::io::Result<Vec<SocketAddr>> {
-            let addrs: Vec<SocketAddr> = netloc.to_socket_addrs()?.collect();
-            screen_resolved_addrs(&addrs, block_private)?;
-            Ok(addrs)
-        })
-        .build()
+    let config = crate::http_client::config_builder!()
+        .timeout_global(Some(timeout))
+        // Metadata must fit in one fixed buffer; decoded bodies keep their own cap.
+        .input_buffer_size(HTTP_METADATA_BYTES)
+        .max_response_header_size(HTTP_METADATA_BYTES)
+        // Credential-bearing MCP calls never follow redirects.
+        .max_redirects(0)
+        .build();
+    crate::http_client::screened_agent(config, block_private, screen_resolved_addrs)
 }
 
 /// Talks to a remote MCP server over the Streamable HTTP transport: each request
@@ -5811,6 +5906,7 @@ pub struct HttpTransport {
     refresh: Option<Arc<RefreshFn>>,
     /// Read only after a bearer rejection, to adopt another process's credential.
     auth_owner: Option<String>,
+    auth_credential_owner: Option<String>,
     /// Separate from token refresh: `insufficient_scope` requires interactive
     /// consent and a new authorization, not another token from the old grant.
     scope_reauthorize: Option<Arc<ScopeReauthorizeFn>>,
@@ -6424,6 +6520,7 @@ impl HttpTransport {
             auth: Arc::new(Mutex::new(auth)),
             refresh: refresh.map(Arc::new),
             auth_owner: None,
+            auth_credential_owner: None,
             scope_reauthorize: None,
             scope_upgrade_attempts: Arc::new(Mutex::new(HashSet::new())),
             forced_refresh_token: Arc::new(Mutex::new(None)),
@@ -6568,6 +6665,7 @@ impl HttpTransport {
             auth: Arc::clone(&self.auth),
             refresh: self.refresh.clone(),
             auth_owner: self.auth_owner.clone(),
+            auth_credential_owner: self.auth_credential_owner.clone(),
             scope_reauthorize: self.scope_reauthorize.clone(),
             scope_upgrade_attempts: Arc::clone(&self.scope_upgrade_attempts),
             forced_refresh_token: Arc::clone(&self.forced_refresh_token),
@@ -6659,16 +6757,16 @@ impl HttpTransport {
             });
             let mut request = agent
                 .post(&url)
-                .set("Content-Type", "application/json")
-                .set("Accept", "application/json, text/event-stream")
-                .set("MCP-Protocol-Version", &wire_version);
+                .set_header("Content-Type", "application/json")
+                .set_header("Accept", "application/json, text/event-stream")
+                .set_header("MCP-Protocol-Version", &wire_version);
             if protocol_meta.is_none() {
                 if let Some(session_id) = session_id.as_deref() {
-                    request = request.set("Mcp-Session-Id", session_id);
+                    request = request.set_header("Mcp-Session-Id", session_id);
                 }
             } else if let Ok(headers) = modern_standard_headers(&body) {
                 for (name, value) in headers {
-                    request = request.set(&name, &value);
+                    request = request.set_header(&name, &value);
                 }
             }
             let token = auth
@@ -6676,12 +6774,12 @@ impl HttpTransport {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             if let Some(token) = token.as_deref() {
-                request = request.set("Authorization", &bearer_header(token));
+                request = request.set_header("Authorization", &bearer_header(token));
             }
             for (name, value) in &credential_headers {
-                request = request.set(name, value);
+                request = request.set_header(name, value);
             }
-            if let Err(error) = request.send_string(&body.to_string()) {
+            if let Err(error) = request.send(&body.to_string()).retain_status_body() {
                 downstream_trace(&format!("HTTP cancellation forward failed: {error}"));
             }
             HTTP_CANCEL_THREADS_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
@@ -6860,6 +6958,10 @@ impl HttpTransport {
         let Some(owner) = &self.auth_owner else {
             return Ok(false);
         };
+        let _owner = self
+            .auth_credential_owner
+            .as_ref()
+            .map(|physical| crate::local_auth::pin_credential_owner(owner, physical));
         let stored = match rejected.as_deref() {
             Some(rejected) => crate::remote::newer_credential(owner, rejected),
             None => crate::remote::current_credential(owner),
@@ -7167,9 +7269,9 @@ impl HttpTransport {
             let mut req = self
                 .inline_agent
                 .post(&self.url)
-                .set("Content-Type", "application/json")
-                .set("Accept", "application/json, text/event-stream")
-                .set("MCP-Protocol-Version", &wire_version);
+                .set_header("Content-Type", "application/json")
+                .set_header("Accept", "application/json, text/event-stream")
+                .set_header("MCP-Protocol-Version", &wire_version);
             if !self.is_modern() {
                 if let Some(sid) = self
                     .session_id
@@ -7177,12 +7279,12 @@ impl HttpTransport {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .as_ref()
                 {
-                    req = req.set("Mcp-Session-Id", sid);
+                    req = req.set_header("Mcp-Session-Id", sid);
                 }
             }
             if self.is_modern() {
                 for (name, value) in modern_standard_headers(body)? {
-                    req = req.set(&name, &value);
+                    req = req.set_header(&name, &value);
                 }
             }
             let auth = self
@@ -7191,10 +7293,10 @@ impl HttpTransport {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             if let Some(token) = auth.as_deref() {
-                req = req.set("Authorization", &bearer_header(token));
+                req = req.set_header("Authorization", &bearer_header(token));
             }
             for (name, value) in &self.credential_headers {
-                req = req.set(name, value);
+                req = req.set_header(name, value);
             }
             if cancel.is_some_and(|signal| !signal.mark_sending()) {
                 return Err(TransportError::Cancelled(
@@ -7202,10 +7304,13 @@ impl HttpTransport {
                 ));
             }
             if let Some(deadline) = self.deadline {
-                req = req.timeout(deadline.saturating_duration_since(Instant::now()));
+                req = req
+                    .config()
+                    .timeout_global(Some(deadline.saturating_duration_since(Instant::now())))
+                    .build();
             }
-            let response = req.send_string(&payload);
-            if matches!(&response, Err(ureq::Error::Status(_, _))) {
+            let response = req.send(&payload).retain_status_body();
+            if matches!(&response, Err(crate::http_client::Error::Status(_, _))) {
                 self.concurrency.responses.fetch_add(1, Ordering::AcqRel);
             }
             if cancel.is_some_and(HttpCancelSignal::is_cancelled) {
@@ -7215,7 +7320,7 @@ impl HttpTransport {
             }
             match response {
                 Ok(resp) => break (resp, auth),
-                Err(ureq::Error::Status(code, resp))
+                Err(crate::http_client::Error::Status(code, resp))
                     if (code == 401 || code == 403)
                         && insufficient_scope_challenge(&resp).is_some() =>
                 {
@@ -7227,14 +7332,14 @@ impl HttpTransport {
                     refreshed = true;
                     scope_upgraded = true;
                 }
-                Err(ureq::Error::Status(code, resp))
+                Err(crate::http_client::Error::Status(code, resp))
                     if code == 401 && !refreshed && self.refresh.is_some() =>
                 {
                     let _ = read_capped(resp, 8 * 1024);
                     refreshed = true;
                     self.force_refresh_for_token(code, auth)?;
                 }
-                Err(ureq::Error::Status(429, r)) => {
+                Err(crate::http_client::Error::Status(429, r)) => {
                     // Record into the shared window like the main POST path
                     // and surface a Retry signal so the Router backs off.
                     let retry_after = record_shared_rate_limit(&self.url, &r);
@@ -7244,7 +7349,7 @@ impl HttpTransport {
                         message: "HTTP 429: rate limited".to_string(),
                     });
                 }
-                Err(ureq::Error::Status(code, response)) => {
+                Err(crate::http_client::Error::Status(code, response)) => {
                     let detail = read_capped(response, 8 * 1024);
                     return Err(TransportError::Classified(
                         if code == 401 && scope_upgraded {
@@ -7260,11 +7365,17 @@ impl HttpTransport {
                         ),
                     ));
                 }
-                Err(e) => return Err(TransportError::Fatal(e.to_string())),
+                Err(crate::http_client::Error::Transport(error)) => {
+                    return Err(http_transport_io_error(error));
+                }
             }
         };
         if !self.is_modern() {
-            if let Some(sid) = resp.header("Mcp-Session-Id") {
+            if let Some(sid) = resp
+                .headers()
+                .get("Mcp-Session-Id")
+                .and_then(|value| value.to_str().ok())
+            {
                 *self
                     .session_id
                     .lock()
@@ -7283,7 +7394,7 @@ impl HttpTransport {
     /// server waits for our inline reply before sending the final response).
     fn read_sse_response(
         &mut self,
-        resp: ureq::Response,
+        resp: ureq::http::Response<ureq::Body>,
         request: &Value,
     ) -> Result<Option<Value>, TransportError> {
         let wanted = request.get("id").cloned().unwrap_or(Value::Null);
@@ -7292,7 +7403,8 @@ impl HttpTransport {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-        let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(resp.into_reader()));
+        let reader: Box<dyn BufRead + Send> =
+            Box::new(BufReader::new(resp.into_body().into_reader()));
         self.read_sse_stream(reader, wanted, method, &params, 0)
     }
 
@@ -7484,9 +7596,9 @@ impl HttpTransport {
             let mut req = self
                 .agent
                 .post(&self.url)
-                .set("Content-Type", "application/json")
-                .set("Accept", "application/json, text/event-stream")
-                .set("MCP-Protocol-Version", &wire_version);
+                .set_header("Content-Type", "application/json")
+                .set_header("Accept", "application/json, text/event-stream")
+                .set_header("MCP-Protocol-Version", &wire_version);
             if !self.is_modern() {
                 if let Some(sid) = self
                     .session_id
@@ -7494,15 +7606,15 @@ impl HttpTransport {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .as_ref()
                 {
-                    req = req.set("Mcp-Session-Id", sid);
+                    req = req.set_header("Mcp-Session-Id", sid);
                 }
             }
             if self.is_modern() {
                 for (name, value) in modern_standard_headers(body)? {
-                    req = req.set(&name, &value);
+                    req = req.set_header(&name, &value);
                 }
                 for (name, value) in extra_headers {
-                    req = req.set(name, value);
+                    req = req.set_header(name, value);
                 }
             }
             let auth = self
@@ -7511,11 +7623,11 @@ impl HttpTransport {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             if let Some(token) = auth.as_deref() {
-                req = req.set("Authorization", &bearer_header(token));
+                req = req.set_header("Authorization", &bearer_header(token));
             }
 
             for (name, value) in &self.credential_headers {
-                req = req.set(name, value);
+                req = req.set_header(name, value);
             }
             if cancel.is_some_and(|signal| !signal.mark_sending()) {
                 return Err(TransportError::Cancelled(
@@ -7523,13 +7635,16 @@ impl HttpTransport {
                 ));
             }
             if let Some(deadline) = self.deadline {
-                req = req.timeout(deadline.saturating_duration_since(Instant::now()));
+                req = req
+                    .config()
+                    .timeout_global(Some(deadline.saturating_duration_since(Instant::now())))
+                    .build();
             }
             if let Some(started) = &self.send_started {
                 started.store(true, Ordering::Release);
             }
-            let response = req.send_string(&payload);
-            if matches!(&response, Err(ureq::Error::Status(_, _))) {
+            let response = req.send(&payload).retain_status_body();
+            if matches!(&response, Err(crate::http_client::Error::Status(_, _))) {
                 self.concurrency.responses.fetch_add(1, Ordering::AcqRel);
             }
             // Cancellation wins even when the socket becomes readable at the same
@@ -7544,7 +7659,7 @@ impl HttpTransport {
                 Ok(r) => break (r, auth),
                 // Rate limited: return a Retry signal so the Router sleeps
                 // *outside* the per-server Mutex.
-                Err(ureq::Error::Status(429, r)) => {
+                Err(crate::http_client::Error::Status(429, r)) => {
                     // Persist the window so the other gateway processes on this
                     // host (one per client session) also hold off instead of
                     // re-hitting the same provider limit at their next start.
@@ -7555,7 +7670,7 @@ impl HttpTransport {
                         message: "HTTP 429: rate limited".to_string(),
                     });
                 }
-                Err(ureq::Error::Status(code, r))
+                Err(crate::http_client::Error::Status(code, r))
                     if (code == 401 || code == 403)
                         && insufficient_scope_challenge(&r).is_some() =>
                 {
@@ -7571,7 +7686,7 @@ impl HttpTransport {
                 // The access token likely expired: refresh it once and retry with
                 // the new token, so a long-running session self-heals instead of
                 // 401ing until the server is manually reconnected.
-                Err(ureq::Error::Status(code, r))
+                Err(crate::http_client::Error::Status(code, r))
                     if code == 401 && !refreshed && self.refresh.is_some() =>
                 {
                     let _ = read_capped(r, 8 * 1024);
@@ -7579,7 +7694,7 @@ impl HttpTransport {
                     self.force_refresh_for_token(code, auth)?;
                     continue;
                 }
-                Err(ureq::Error::Status(code, r)) => {
+                Err(crate::http_client::Error::Status(code, r)) => {
                     let detail = read_capped(r, 64 * 1024);
                     if code == 400 && expect_response {
                         if let Ok(response) = serde_json::from_str::<Value>(&detail) {
@@ -7612,16 +7727,18 @@ impl HttpTransport {
                 }
                 // Transport error (DNS / connection failure): retryable, but
                 // the Router owns the backoff sleep so the Mutex is released.
-                Err(ureq::Error::Transport(t)) if is_retryable_transport(&t) => {
+                Err(crate::http_client::Error::Transport(t)) if is_retryable_transport(&t) => {
                     return Err(TransportError::Retry {
                         retry_after: None,
-                        message: format!("transport error (retryable): {t}"),
+                        message: format!(
+                            "transport error (retryable): {}",
+                            crate::http_client::transport_error_message(&t)
+                        ),
                     });
                 }
-                Err(ureq::Error::Transport(t)) if t.kind() == ureq::ErrorKind::Io => {
-                    return Err(http_transport_io_error(&t));
+                Err(crate::http_client::Error::Transport(t)) => {
+                    return Err(http_transport_io_error(t));
                 }
-                Err(e) => return Err(TransportError::Fatal(e.to_string())),
             }
         };
         // The server accepted this token, so its forced-refresh budget is spent
@@ -7630,7 +7747,11 @@ impl HttpTransport {
         self.accept_auth(accepted_auth);
 
         if !self.is_modern() {
-            if let Some(sid) = resp.header("Mcp-Session-Id") {
+            if let Some(sid) = resp
+                .headers()
+                .get("Mcp-Session-Id")
+                .and_then(|value| value.to_str().ok())
+            {
                 *self
                     .session_id
                     .lock()
@@ -7643,14 +7764,16 @@ impl HttpTransport {
         }
 
         let is_sse = resp
-            .header("content-type")
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
             .map(|c| c.to_lowercase().contains("text/event-stream"))
             .unwrap_or(false);
         if is_sse {
             return self.read_sse_response(resp, body);
         }
 
-        let mut reader = BufReader::new(resp.into_reader());
+        let mut reader = BufReader::new(resp.into_body().into_reader());
         let mut bytes = Vec::new();
         read_downstream_frame(&mut reader, &mut bytes, MAX_RESPONSE_BYTES as usize, None)
             .map_err(http_read_error)?;
@@ -7688,6 +7811,7 @@ impl Transport for HttpTransport {
 
     fn set_server_id(&mut self, id: &str) {
         self.auth_owner = Some(id.to_string());
+        self.auth_credential_owner = crate::local_auth::pinned_owner(id);
     }
 
     fn connection_closed(&self) -> Option<bool> {
@@ -7748,7 +7872,7 @@ impl Transport for HttpTransport {
             ));
         }
 
-        // ureq 2.x has no request abort handle. Move the complete mutable transport
+        // ureq has no request abort handle. Move the complete mutable transport
         // state to exactly one bounded wire worker, leaving this slot with only a
         // receiver and immutable cancellation context. On cancellation the caller
         // returns within HTTP_CANCEL_POLL; the worker owns no Router/ServerSlot borrow
@@ -7920,26 +8044,26 @@ impl Transport for HttpTransport {
                     }
                     let mut request = agent
                         .post(&url)
-                        .set("Content-Type", "application/json")
-                        .set("Accept", "text/event-stream")
-                        .set("MCP-Protocol-Version", &wire_version)
-                        .set("Mcp-Method", "subscriptions/listen");
+                        .set_header("Content-Type", "application/json")
+                        .set_header("Accept", "text/event-stream")
+                        .set_header("MCP-Protocol-Version", &wire_version)
+                        .set_header("Mcp-Method", "subscriptions/listen");
                     let token = auth
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone();
                     if let Some(token) = token.as_deref() {
-                        request = request.set("Authorization", &bearer_header(token));
+                        request = request.set_header("Authorization", &bearer_header(token));
                     }
                     for (name, value) in &credential_headers {
-                        request = request.set(name, value);
+                        request = request.set_header(name, value);
                     }
-                    match request.send_string(&payload) {
+                    match request.send(&payload).retain_status_body() {
                         Ok(response) => {
                             auth_shell.accept_auth(token);
                             break Some(response);
                         }
-                        Err(ureq::Error::Status(code, response))
+                        Err(crate::http_client::Error::Status(code, response))
                             if (code == 401 || code == 403) && auth_shell.reference_credentials =>
                         {
                             let _ = read_capped(response, 8 * 1024);
@@ -7954,7 +8078,7 @@ impl Transport for HttpTransport {
                             );
                             return;
                         }
-                        Err(ureq::Error::Status(429, response)) => {
+                        Err(crate::http_client::Error::Status(429, response)) => {
                             // Rate limited: record the shared window like
                             // every other egress path, then fall into the
                             // reconnect backoff below, which re-consults the
@@ -7966,7 +8090,7 @@ impl Transport for HttpTransport {
                             );
                             break None;
                         }
-                        Err(ureq::Error::Status(code, response))
+                        Err(crate::http_client::Error::Status(code, response))
                             if (code == 401 || code == 403)
                                 && insufficient_scope_challenge(&response).is_some() =>
                         {
@@ -7989,7 +8113,7 @@ impl Transport for HttpTransport {
                                 }
                             }
                         }
-                        Err(ureq::Error::Status(code, response))
+                        Err(crate::http_client::Error::Status(code, response))
                             if code == 401 && !forced_refresh && auth_shell.refresh.is_some() =>
                         {
                             let _ = read_capped(response, 8 * 1024);
@@ -8016,7 +8140,9 @@ impl Transport for HttpTransport {
                     continue;
                 };
                 let is_sse = response
-                    .header("content-type")
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
                     .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
                 if !is_sse {
                     // Provider bodies can echo API keys, including fragments. Drain
@@ -8029,7 +8155,7 @@ impl Transport for HttpTransport {
                 }
 
                 retry_delay = Duration::from_millis(250);
-                let mut reader = BufReader::new(response.into_reader());
+                let mut reader = BufReader::new(response.into_body().into_reader());
                 loop {
                     if live_generation.load(Ordering::SeqCst) != generation {
                         return;
@@ -9626,6 +9752,33 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn resolver_policy_denials_are_fatal_without_transport_retry() {
+        for (url, block_private) in [
+            ("http://127.0.0.1:9/", true),
+            ("http://[::1]:9/", true),
+            ("http://169.254.169.254/", false),
+        ] {
+            let error =
+                super::guarded_agent_with_timeout(block_private, std::time::Duration::from_secs(1))
+                    .get(url)
+                    .call()
+                    .unwrap_err();
+            assert!(!super::is_retryable_transport(&error));
+            let error = super::http_transport_io_error(error);
+            assert!(matches!(error, TransportError::Fatal(_)), "{error}");
+            assert!(!error.is_health_failure());
+            assert!(error
+                .to_string()
+                .contains("blocked: private or local address"));
+        }
+        let error = crate::http_client::mark_connect_failure(ureq::Error::Io(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        ));
+        assert!(!super::is_retryable_transport(&error));
+        assert!(super::is_retryable_transport(&ureq::Error::HostNotFound));
+    }
 
     #[test]
     fn classified_connect_preserves_auth_and_timeout_categories() {
@@ -12811,7 +12964,7 @@ for line in sys.stdin:
                 .request("tools/call", json!({"name":"oversized"}))
                 .unwrap_err();
             assert!(
-                matches!(error, TransportError::Fatal(message) if message.contains("16777216-byte limit"))
+                matches!(error, TransportError::FrameRejected(message) if message.contains("16777216-byte limit"))
             );
             assert_eq!(
                 transport
@@ -16417,6 +16570,39 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn old_http_transport_cannot_adopt_the_new_destinations_credential() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            let mut reg = crate::registry::Registry::default();
+            let server: crate::registry::ServerEntry = serde_json::from_value(serde_json::json!({"id":"scoped","name":"scoped","transport":"http","url":"https://old.example/mcp"})).unwrap();
+            reg.unknown_fields.insert("personalSyncCredentialDestinations".into(), serde_json::json!({"scoped":crate::local_auth::personal_credential_destination(&server)}));
+            reg.unknown_fields.insert(
+                "personalSyncCredentialOwners".into(),
+                serde_json::json!({"scoped":"scoped"}),
+            );
+            reg.servers.push(server);
+            crate::registry::save(&reg).unwrap();
+            crate::secrets::set_secret("scoped", crate::secrets::HTTP_AUTH_KEY, "old").unwrap();
+            let mut old = HttpTransport::with_auth("https://old.example/mcp", Some("old".into()));
+            {
+                let _scope =
+                    crate::local_auth::pin_http_destination("scoped", "https://old.example/mcp")
+                        .unwrap();
+                old.set_server_id("scoped");
+            }
+            reg.servers[0].url = Some("https://new.example/mcp".into());
+            crate::registry::save(&reg).unwrap();
+            crate::secrets::set_secret("scoped", crate::secrets::HTTP_AUTH_KEY, "new").unwrap();
+            assert!(!old.reuse_stored_auth(&Some("old".into())).unwrap());
+            assert_eq!(old.auth.lock().unwrap().as_deref(), Some("old"));
+            assert_eq!(
+                crate::remote::current_credential("scoped")
+                    .unwrap()
+                    .as_deref(),
+                Some("new")
+            );
+        });
+    }
+    #[test]
     fn http_refresh_failure_rereads_the_vault_before_retrying_callbacks() {
         use crate::secrets;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18126,6 +18312,24 @@ mod login_environment_tests {
         );
         assert!(!env.contains_key("AMBIENT_SECRET"));
         assert!(!env.contains_key("TOOLPORT_SECRET_KEY"));
+    }
+
+    #[test]
+    fn inherited_environment_adds_client_only_names_under_login_values() {
+        let login = BTreeMap::from([
+            ("PATH".to_string(), "/home/u/.local/bin:/usr/bin".to_string()),
+            ("LOGIN_KEY".to_string(), "login".to_string()),
+        ]);
+        let process = BTreeMap::from([
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("AWS_PROFILE".to_string(), "work".to_string()),
+        ]);
+        let env = with_client_environment(login, &process);
+        assert_eq!(env["PATH"], "/home/u/.local/bin:/usr/bin");
+        assert_eq!(env["LOGIN_KEY"], "login");
+        assert_eq!(env["AWS_PROFILE"], "work");
+        let child: BTreeMap<_, _> = child_environment(&env, &[], false).into_iter().collect();
+        assert!(!child.contains_key("AWS_PROFILE"), "opt-out servers keep the allowlist");
     }
 
     #[test]

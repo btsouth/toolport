@@ -157,11 +157,17 @@ enum Format {
     YamlMcpServersList,
 }
 
+struct CombinedToolNameBudget {
+    total: usize,
+    separator: usize,
+}
+
 struct ClientDef {
     id: &'static str,
     name: &'static str,
     format: Format,
     discovery: DiscoveryCapabilities,
+    combined_tool_name_budget: Option<CombinedToolNameBudget>,
     uses_connectors: bool,
     /// Resolves the absolute config path for the current OS, if determinable.
     path: fn() -> Option<PathBuf>,
@@ -173,10 +179,14 @@ struct ClientDef {
 /// Resolve Auto without changing serialized per-client overrides. The global default
 /// remains for anonymous connections; identified clients use their capability table.
 pub fn client_discovery_mode(registry: &crate::registry::Registry, id: &str) -> &'static str {
-    let mode = registry.client_discovery_mode(id).or_else(|| {
-        id.strip_prefix("client:")
-            .and_then(|adapter| registry.client_discovery_mode(adapter))
-    });
+    let mode = registry
+        .client_discovery_mode(id)
+        .or_else(|| {
+            id.strip_prefix("client:")
+                .and_then(|adapter| registry.client_discovery_mode(adapter))
+        })
+        // A global mode the user chose beats the client's built-in default.
+        .or_else(|| registry.chosen_global_discovery_mode());
     discovery_capabilities(id).resolve_mode(mode)
 }
 
@@ -185,6 +195,24 @@ pub fn discovery_capabilities(id: &str) -> DiscoveryCapabilities {
     // uses this spelling; authorization and result ownership keep the wire ID.
     let id = id.strip_prefix("adapter:").unwrap_or(id);
     discovery::capabilities(id.strip_prefix("client:").unwrap_or(id))
+}
+
+/// Client limits apply to the registered server key, profile separator overhead and alias.
+pub fn client_tool_name_limit(id: Option<&str>, registered_key: &str) -> usize {
+    let id = id.unwrap_or("");
+    let id = id.strip_prefix("adapter:").unwrap_or(id);
+    let id = id.strip_prefix("client:").unwrap_or(id);
+    defs()
+        .into_iter()
+        .find(|profile| profile.id == id)
+        .and_then(|profile| profile.combined_tool_name_budget)
+        .map(|combined| {
+            combined
+                .total
+                .saturating_sub(registered_key.len() + combined.separator)
+                .min(64)
+        })
+        .unwrap_or(64)
 }
 
 /// The name Toolport uses for its own entry when installed into a client config.
@@ -371,6 +399,7 @@ fn resolve_client_config_path(
         "kiro" => home.join(".kiro").join("settings").join("mcp.json"),
         "kimi-code" => home.join(".kimi-code").join("mcp.json"),
         "zcode" => home.join(".zcode").join("cli").join("config.json"),
+        "command-code" => home.join(".commandcode").join("mcp.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
         "jan" => data.join("Jan").join("data").join("mcp_config.json"),
         "zed" => match platform {
@@ -898,6 +927,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "kiro" => home.join(".kiro").join("settings").join("mcp.json"),
         "kimi-code" => home.join(".kimi-code").join("mcp.json"),
         "zcode" => home.join(".zcode").join("cli").join("config.json"),
+        "command-code" => home.join(".commandcode").join("mcp.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
         "jan" => data.join("Jan").join("data").join("mcp_config.json"),
         "zed" => config.join("zed").join("settings.json"),
@@ -1009,6 +1039,7 @@ fn resolve_rules_target(
         },
         "pi" => block(home.join(".pi").join("agent").join("AGENTS.md")),
         "omp" => block(home.join(".omp").join("agent").join("AGENTS.md")),
+        "command-code" => block(home.join(".commandcode").join("AGENTS.md")),
         "zed" => match platform {
             Platform::Windows => block(config.join("Zed").join("AGENTS.md")),
             Platform::MacOs | Platform::Linux => {
@@ -1565,7 +1596,24 @@ fn recorded_client_name<'a>(
             )
             && !name.starts_with("adapter-pid-")
             && !client.is_some_and(|c| c.strip_prefix("adapter:") == Some(*name))
+            // A process guess loses to the client ID the caller was configured with.
+            && !(name.starts_with("Unknown app") && client.is_some_and(configured_adapter))
     })
+}
+
+/// "inbox 1" or "Claude Code 2.1" adds nothing to the name it follows.
+pub fn label_only_adds_version(name: &str, label: &str) -> bool {
+    let (name, label) = (name.to_lowercase(), label.to_lowercase());
+    label == name
+        || label
+            .strip_prefix(&format!("{name} "))
+            .is_some_and(|version| !version.contains(' '))
+}
+
+fn configured_adapter(client: &str) -> bool {
+    client
+        .strip_prefix("adapter:")
+        .is_some_and(|id| !id.is_empty() && !id.starts_with("adapter-pid-"))
 }
 
 fn trusted_client_name_with(
@@ -1638,6 +1686,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "claude-desktop",
             discovery: discovery::capabilities("claude-desktop"),
+            combined_tool_name_budget: None,
             name: "Claude Desktop",
             format: Format::JsonMcpServers,
             uses_connectors: true,
@@ -1647,6 +1696,10 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "cursor",
             discovery: discovery::capabilities("cursor"),
+            combined_tool_name_budget: Some(CombinedToolNameBudget {
+                total: 60,
+                separator: 0,
+            }),
             name: "Cursor",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1656,6 +1709,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "droid",
             discovery: discovery::capabilities("droid"),
+            combined_tool_name_budget: None,
             name: "Factory Droid",
             format: Format::JsonDroidMcpServers,
             uses_connectors: false,
@@ -1665,6 +1719,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "crush",
             discovery: discovery::capabilities("crush"),
+            combined_tool_name_budget: None,
             name: "Crush",
             format: Format::JsonMcp,
             uses_connectors: false,
@@ -1674,6 +1729,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "anythingllm",
             discovery: discovery::capabilities("anythingllm"),
+            combined_tool_name_budget: None,
             name: "AnythingLLM",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1683,6 +1739,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "vscode",
             discovery: discovery::capabilities("vscode"),
+            combined_tool_name_budget: None,
             name: "VS Code",
             format: Format::JsonServers,
             uses_connectors: false,
@@ -1692,6 +1749,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "amp",
             discovery: discovery::capabilities("amp"),
+            combined_tool_name_budget: None,
             name: "Amp",
             format: Format::JsonAmpMcpServers,
             uses_connectors: false,
@@ -1701,6 +1759,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "windsurf",
             discovery: discovery::capabilities("windsurf"),
+            combined_tool_name_budget: None,
             name: "Devin Desktop (Cascade)",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1710,6 +1769,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "devin-cli",
             discovery: discovery::capabilities("devin-cli"),
+            combined_tool_name_budget: None,
             name: "Devin Local / CLI",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1719,6 +1779,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "opencode",
             discovery: discovery::capabilities("opencode"),
+            combined_tool_name_budget: None,
             name: "OpenCode",
             format: Format::JsonOpenCodeMcp,
             uses_connectors: false,
@@ -1730,6 +1791,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "kilo-code",
             discovery: discovery::capabilities("kilo-code"),
+            combined_tool_name_budget: None,
             name: "Kilo Code",
             format: Format::JsonOpenCodeMcp,
             uses_connectors: false,
@@ -1743,6 +1805,7 @@ fn defs() -> Vec<ClientDef> {
             // [mcp_servers.<name>] - same TOML shape as Codex.
             id: "grok",
             discovery: discovery::capabilities("grok"),
+            combined_tool_name_budget: None,
             name: "Grok Build",
             format: Format::TomlMcpServers,
             uses_connectors: false,
@@ -1754,6 +1817,7 @@ fn defs() -> Vec<ClientDef> {
             // `CODEX_HOME` (default ~/.codex).
             id: "codex",
             discovery: discovery::capabilities("codex"),
+            combined_tool_name_budget: None,
             name: "Codex",
             format: Format::TomlMcpServers,
             uses_connectors: false,
@@ -1763,6 +1827,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "github-copilot-cli",
             discovery: discovery::capabilities("github-copilot-cli"),
+            combined_tool_name_budget: None,
             name: "GitHub Copilot CLI",
             format: Format::JsonCopilotMcpServers,
             uses_connectors: false,
@@ -1772,6 +1837,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "antigravity",
             discovery: discovery::capabilities("antigravity"),
+            combined_tool_name_budget: None,
             name: "Antigravity",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1781,6 +1847,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "claude-code",
             discovery: discovery::capabilities("claude-code"),
+            combined_tool_name_budget: None,
             name: "Claude Code",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1790,6 +1857,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "gemini-cli",
             discovery: discovery::capabilities("gemini-cli"),
+            combined_tool_name_budget: None,
             name: "Gemini CLI",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1799,6 +1867,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "qwen-code",
             discovery: discovery::capabilities("qwen-code"),
+            combined_tool_name_budget: None,
             name: "Qwen Code",
             format: Format::JsonQwenMcpServers,
             uses_connectors: false,
@@ -1808,6 +1877,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "junie",
             discovery: discovery::capabilities("junie"),
+            combined_tool_name_budget: None,
             name: "JetBrains Junie",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1819,6 +1889,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "cline",
             discovery: discovery::capabilities("cline"),
+            combined_tool_name_budget: None,
             name: "Cline",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1828,6 +1899,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "roo-code",
             discovery: discovery::capabilities("roo-code"),
+            combined_tool_name_budget: None,
             name: "Roo Code",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1837,6 +1909,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "warp",
             discovery: discovery::capabilities("warp"),
+            combined_tool_name_budget: None,
             name: "Warp",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1848,6 +1921,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "amazon-q",
             discovery: discovery::capabilities("amazon-q"),
+            combined_tool_name_budget: None,
             name: "Amazon Q",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1860,6 +1934,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "kiro",
             discovery: discovery::capabilities("kiro"),
+            combined_tool_name_budget: None,
             name: "Kiro",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1871,6 +1946,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "kimi-code",
             discovery: discovery::capabilities("kimi-code"),
+            combined_tool_name_budget: None,
             name: "Kimi Code",
             format: Format::JsonKimiMcpServers,
             uses_connectors: false,
@@ -1880,6 +1956,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "zcode",
             discovery: discovery::capabilities("zcode"),
+            combined_tool_name_budget: None,
             name: "ZCode",
             format: Format::JsonZCodeMcp,
             uses_connectors: false,
@@ -1887,8 +1964,23 @@ fn defs() -> Vec<ClientDef> {
             plugin_scan: None,
         },
         ClientDef {
+            id: "command-code",
+            discovery: discovery::capabilities("command-code"),
+            combined_tool_name_budget: None,
+            name: "Command Code",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            // Command Code's user-scope MCP config: `~/.commandcode/mcp.json` (`mcpServers`).
+            // It also merges a project `.mcp.json` and a per-project local file over it; we
+            // manage the user one so the gateway is available everywhere. Bare `command` and
+            // `url` entries read as stdio and http, and `type` is accepted for `transport`.
+            path: || client_config_path("command-code"),
+            plugin_scan: None,
+        },
+        ClientDef {
             id: "zed",
             discovery: discovery::capabilities("zed"),
+            combined_tool_name_budget: None,
             name: "Zed",
             format: Format::JsonContextServers,
             uses_connectors: false,
@@ -1901,6 +1993,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "lm-studio",
             discovery: discovery::capabilities("lm-studio"),
+            combined_tool_name_budget: None,
             name: "LM Studio",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1912,6 +2005,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "jan",
             discovery: discovery::capabilities("jan"),
+            combined_tool_name_budget: None,
             name: "Jan",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1925,6 +2019,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "boltai",
             discovery: discovery::capabilities("boltai"),
+            combined_tool_name_budget: None,
             name: "BoltAI",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1934,6 +2029,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "pi",
             discovery: discovery::capabilities("pi"),
+            combined_tool_name_budget: None,
             name: "Pi",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1946,6 +2042,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "omp",
             discovery: discovery::capabilities("omp"),
+            combined_tool_name_budget: None,
             name: "Oh My Pi",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1957,6 +2054,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "goose",
             discovery: discovery::capabilities("goose"),
+            combined_tool_name_budget: None,
             name: "Goose",
             format: Format::YamlExtensions,
             uses_connectors: false,
@@ -1966,6 +2064,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "hermes",
             discovery: discovery::capabilities("hermes"),
+            combined_tool_name_budget: None,
             name: "Hermes",
             format: Format::YamlMcpServers,
             uses_connectors: false,
@@ -1975,6 +2074,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "continue",
             discovery: discovery::capabilities("continue"),
+            combined_tool_name_budget: None,
             name: "Continue",
             format: Format::YamlMcpServersList,
             uses_connectors: false,
@@ -1984,6 +2084,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "witsy",
             discovery: discovery::capabilities("witsy"),
+            combined_tool_name_budget: None,
             name: "Witsy",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -8328,6 +8429,19 @@ mod tests {
     #[test]
     fn f6_configured_names_are_display_only_and_private() {
         assert_eq!(trusted_client_name(Some("adapter:inbox"), None), "inbox");
+        // Preview.6 recorded a process guess; the configured client ID wins.
+        assert_eq!(
+            trusted_client_name(Some("adapter:inbox"), Some("Unknown app (via python3.14)")),
+            "inbox"
+        );
+        assert_eq!(
+            trusted_client_name(None, Some("Unknown app (via python3.14)")),
+            "Unknown app (via python3.14)"
+        );
+        assert!(label_only_adds_version("inbox", "inbox 1"));
+        assert!(label_only_adds_version("Claude Code", "claude code 2.1"));
+        assert!(!label_only_adds_version("Codex", "codex-mcp-client 0.162.1"));
+        assert!(!label_only_adds_version("inbox", "inbox but not really"));
         assert_eq!(
             trusted_client_name(Some("adapter:/private/customer.env"), None),
             "[private]"
@@ -11577,6 +11691,7 @@ command = "npx"
             "witsy",
             "junie",
             "devin-cli",
+            "command-code",
         ] {
             let d = defs()
                 .into_iter()
@@ -11718,6 +11833,21 @@ command = "npx"
         assert!(matches!(definition.format, Format::JsonKimiMcpServers));
         assert!(!definition.uses_connectors);
         assert!((definition.path)().is_some());
+    }
+
+    #[test]
+    fn command_code_paths_are_under_its_home_dir() {
+        for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
+            let home = mock_home(platform);
+            assert_eq!(
+                resolve_client_config_path("command-code", &home, platform),
+                Some(home.join(".commandcode").join("mcp.json")),
+                "command-code MCP path on {platform:?}"
+            );
+            let rules = team_rules_target("command-code", &home, platform).expect("supported");
+            assert_eq!(rules.path, home.join(".commandcode").join("AGENTS.md"));
+            assert_eq!(rules.strategy, crate::instructions::Strategy::SentinelBlock);
+        }
     }
 
     #[test]

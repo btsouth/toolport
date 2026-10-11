@@ -74,7 +74,7 @@ function ClientRow({
     <button
       type="button"
       onClick={onSelect}
-      className={`grid min-h-14 w-full grid-cols-[32px_minmax(0,1fr)_auto_16px] items-center gap-3 border-b border-border/60 px-3.5 py-2.5 text-left transition-colors last:border-b-0 hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring ${
+      className={`grid min-h-14 w-full grid-cols-[32px_minmax(0,1fr)_auto_16px] items-center gap-3 border-b border-border/60 px-1 py-3 text-left transition-colors last:border-b-0 hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring ${
         status === "missing" ? "opacity-60" : ""
       }`}
     >
@@ -183,7 +183,7 @@ export function ClientsView({
       {connected.length > 0 && (
         <section>
           <SectionHeader count={connected.length}>Connected to Toolport</SectionHeader>
-          <div className="overflow-hidden rounded-xl border border-success/20 bg-success/5">
+          <div className="toolport-list">
             {connected.map((client) => (
               <ClientRow
                 key={client.id}
@@ -202,7 +202,7 @@ export function ClientsView({
           <p className="mb-2 text-xs text-muted-foreground">
             Select an installed client to connect it or review its configuration.
           </p>
-          <div className="overflow-hidden rounded-xl border border-border/60 bg-card/40">
+          <div className="toolport-list">
             {available.map((client) => (
               <ClientRow
                 key={client.id}
@@ -231,7 +231,7 @@ export function ClientsView({
             <span>{missing.length}</span>
           </button>
           {showMissing && (
-            <div className="mt-2 overflow-hidden rounded-xl border border-border/60 bg-card/30">
+            <div className="mt-2 toolport-list">
               {missing.map((client) => (
                 <ClientRow
                   key={client.id}
@@ -259,11 +259,11 @@ export function ClientsView({
             Recent client activity <span>{sessions.length}</span>
           </button>
           {showRecent && (
-            <div className="mt-2 overflow-hidden rounded-xl border border-border/60 bg-card/40">
+            <div className="mt-2 toolport-list">
               {sessions.map((client) => (
                 <div
                   key={trustedClientName(client)}
-                  className="border-b border-border/60 px-3.5 py-2.5 last:border-b-0"
+                  className="border-b border-border/60 px-1 py-3 last:border-b-0"
                 >
                   <p
                     className="truncate text-sm font-medium"

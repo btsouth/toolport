@@ -466,6 +466,18 @@
       "observedSessionKind": null
     },
     {
+      "id": "command-code",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://commandcode.ai/docs/mcp",
+      "observedSessionKind": null
+    },
+    {
       "id": "zed",
       "evidence": "documentation only",
       "initialize": null,

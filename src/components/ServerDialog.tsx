@@ -26,6 +26,7 @@ import {
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
 import { formatArgs, parseArgs } from "@/lib/args";
 import { isDownloadLauncher } from "@/lib/launcher";
+import { riskySyncEnv, syncsByDefault } from "@/lib/personalSync";
 import type {
   LaunchConfig,
   Registry,
@@ -44,6 +45,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -82,6 +84,19 @@ type TestResult = Extract<TestState, { status: "ok" | "fail" }>;
 
 const IDLE_TEST: TestState = { status: "idle", message: "" };
 
+/** What "Same on every machine" shows for a plain value. A saved or chosen
+ * answer wins. A name the server did not have yet gets sync's default; an old
+ * value nobody marked stays on this machine. */
+export function envRowSyncs(
+  row: { key: string; value: string; portable?: boolean },
+  saved: { key: string }[],
+): boolean {
+  if (riskySyncEnv(row.key)) return false;
+  if (row.portable !== undefined) return row.portable;
+  const key = row.key.trim();
+  return !saved.some((e) => e.key === key) && syncsByDefault(key, row.value);
+}
+
 export function ServerDialog({
   trigger,
   onSaved,
@@ -100,6 +115,7 @@ export function ServerDialog({
     args: formatArgs(initial?.args ?? []),
     url: initial?.url ?? "",
     cwd: initial?.cwd ?? "",
+    inheritEnv: initial?.inheritEnv ?? false,
     initializeTimeoutSeconds:
       initial?.initializeTimeoutMs == null
         ? ""
@@ -108,13 +124,20 @@ export function ServerDialog({
   // Env vars (API keys etc.). Values are vaulted in the OS keychain, never stored
   // in the registry, so existing secrets show as declared keys with empty values.
   const [envRows, setEnvRows] = useState<
-    { key: string; value: string; secret?: boolean; source?: { ref: string } }[]
+    {
+      key: string;
+      value: string;
+      secret?: boolean;
+      portable?: boolean;
+      source?: { ref: string };
+    }[]
   >(
     initial?.env.map((e) => ({
       key: e.key,
       value: e.secret ? "" : (e.value ?? ""),
       secret: e.secret,
       source: e.source,
+      portable: e.portable,
     })) ?? [],
   );
   const [launch, setLaunch] = useState<LaunchConfig | null>(initial?.launch ?? null);
@@ -126,6 +149,7 @@ export function ServerDialog({
       ]) ?? [],
     ),
   );
+  const [localOnly, setLocalOnly] = useState(initial?.syncLocalOnly === true);
   const [bindingCleared, setBindingCleared] = useState(false);
   const [touched, setTouched] = useState<Set<string>>(() => new Set());
   const [pasteReview, setPasteReview] = useState<ParsedSnippetServer[] | null>(null);
@@ -169,6 +193,7 @@ export function ServerDialog({
     }
     if (next) {
       setPartialEdit(null);
+      setLocalOnly(initial?.syncLocalOnly === true);
       setForm({
         name: initial?.name ?? "",
         transport: (initial?.transport ?? "stdio") as Transport,
@@ -176,6 +201,7 @@ export function ServerDialog({
         args: formatArgs(initial?.args ?? []),
         url: initial?.url ?? "",
         cwd: initial?.cwd ?? "",
+        inheritEnv: initial?.inheritEnv ?? false,
         initializeTimeoutSeconds:
           initial?.initializeTimeoutMs == null
             ? ""
@@ -187,6 +213,7 @@ export function ServerDialog({
           value: e.secret ? "" : (e.value ?? ""),
           secret: e.secret,
           source: e.source,
+          portable: e.portable,
         })) ?? [],
       );
       setLaunch(initial?.launch ?? null);
@@ -251,6 +278,7 @@ export function ServerDialog({
         args: formatArgs(s.args),
         url: s.url ?? "",
         cwd: "",
+        inheritEnv: false,
         initializeTimeoutSeconds: "",
       });
       setEnvRows(
@@ -280,8 +308,12 @@ export function ServerDialog({
   function buildEntry(withSecretValues: boolean): ServerEntry {
     const declared = envRows.filter((r) => r.key.trim());
     return {
+      // Saving replaces the whole entry, so an edit starts from the saved one
+      // and keeps what this dialog doesn't show, like switched-off tools.
+      ...(editing ? initial : undefined),
       id: currentEditId ?? "",
       enabled: initial?.enabled ?? false,
+      syncLocalOnly: localOnly,
       name: form.name.trim(),
       transport: form.transport,
       command: isStdio ? form.command.trim() || null : null,
@@ -312,10 +344,16 @@ export function ServerDialog({
             : null,
         secret: r.source ? true : r.secret !== false,
         ...(r.source ? { source: r.source } : {}),
+        // Left out unless saved or chosen, so sync's default for a new
+        // value applies (the box shows that default).
+        ...(!r.source && r.secret === false && r.portable !== undefined
+          ? { portable: r.portable && !riskySyncEnv(r.key) }
+          : {}),
       })),
       url: isStdio ? null : form.url.trim() || null,
       source: bindingCleared ? "manual" : (initial?.source ?? "manual"),
       cwd: isStdio ? form.cwd.trim() || null : null,
+      inheritEnv: isStdio && form.inheritEnv,
       requestTimeoutMs:
         isStdio || initialUsesLocalCommand ? null : initial?.requestTimeoutMs,
       initializeTimeoutMs: form.initializeTimeoutSeconds.trim()
@@ -563,6 +601,16 @@ export function ServerDialog({
 
         <div className="flex flex-col gap-4 py-2">
           <div className="flex flex-col gap-2">
+            {!editing && (
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={localOnly}
+                  onChange={(e) => setLocalOnly(e.target.checked)}
+                />
+                This machine only
+              </label>
+            )}
             <Label htmlFor="srv-name">Name</Label>
             <Input
               id="srv-name"
@@ -723,6 +771,21 @@ export function ServerDialog({
                   <code className="font-mono">{"${VAR}"}</code> are expanded.
                 </p>
               </div>
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex flex-col gap-1">
+                  <Label htmlFor="srv-inherit-env">Use my shell environment</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Gives this server every variable from your shell, such as AWS, GitHub
+                    or kube settings. When off it gets only PATH, HOME and other basics,
+                    plus the variables you set here.
+                  </p>
+                </div>
+                <Switch
+                  id="srv-inherit-env"
+                  checked={form.inheritEnv}
+                  onCheckedChange={(checked) => set("inheritEnv", checked)}
+                />
+              </div>
             </>
           ) : (
             <div className="flex flex-col gap-2">
@@ -854,6 +917,30 @@ export function ServerDialog({
                   />
                   Keychain
                 </label>
+                {row.secret === false && (
+                  <label
+                    className="flex shrink-0 items-center gap-1 text-xs"
+                    title={
+                      riskySyncEnv(row.key)
+                        ? "This variable changes how programs run, so it always stays on this machine."
+                        : undefined
+                    }
+                  >
+                    <input
+                      type="checkbox"
+                      disabled={riskySyncEnv(row.key)}
+                      checked={envRowSyncs(row, editing ? (initial?.env ?? []) : [])}
+                      onChange={(e) =>
+                        setEnvRows((rows) =>
+                          rows.map((r, j) =>
+                            j === i ? { ...r, portable: e.target.checked } : r,
+                          ),
+                        )
+                      }
+                    />{" "}
+                    Same on every machine
+                  </label>
+                )}
                 <Button
                   size="icon"
                   variant="ghost"
