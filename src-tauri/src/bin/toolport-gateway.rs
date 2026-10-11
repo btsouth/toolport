@@ -6898,6 +6898,12 @@ impl GatewayResponse {
 const TOOL_SURFACE_CACHE_VIEWS: usize = 8;
 const TOOL_SURFACE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
+fn over_client_tool_limit(client: Option<&str>, tools: usize) -> bool {
+    clients::discovery_capabilities(client.unwrap_or(""))
+        .max_tools
+        .is_some_and(|max| tools > max)
+}
+
 fn full_discovery_fallback(client: Option<&str>) -> bool {
     clients::discovery_capabilities(client.unwrap_or("")).tools_list_changed == Some(false)
 }
@@ -7409,6 +7415,13 @@ fn handle_request_with_cancel(
             if mode == DiscoveryMode::Full && full_discovery_fallback(client) {
                 tools.splice(2..2, [search_tool_def(), call_tool_def()]);
             }
+            let mode = if mode == DiscoveryMode::Full && over_client_tool_limit(client, tools.len()) {
+                // The client would drop every tool, so answer with search instead.
+                tools = tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Lazy);
+                DiscoveryMode::Lazy
+            } else {
+                mode
+            };
             if mode != DiscoveryMode::Full {
                 let full = tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Full);
                 savings::record_catalog(
@@ -41414,6 +41427,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn codex_gets_search_instead_of_a_list_it_would_drop() {
+        assert!(!over_client_tool_limit(Some("adapter:codex"), 2_048));
+        assert!(over_client_tool_limit(Some("adapter:codex"), 2_049));
+        assert!(over_client_tool_limit(Some("codex"), 5_000));
+        assert!(!over_client_tool_limit(Some("adapter:cursor"), 5_000));
+        assert!(!over_client_tool_limit(None, 5_000));
     }
 
     #[test]

@@ -8,6 +8,9 @@ pub struct DiscoveryCapabilities {
     pub native_tool_search: Option<bool>,
     pub tools_list_changed: Option<bool>,
     pub cold_full_list_wait_ms: u64,
+    /// Most tools this client accepts from one server. Above it the client drops
+    /// the server's whole list, so Full answers with the search tools instead.
+    pub max_tools: Option<usize>,
     pub evidence: &'static str,
 }
 
@@ -35,6 +38,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             native_tool_search: Some(true),
             tools_list_changed: Some(true),
             cold_full_list_wait_ms: 2_000,
+            max_tools: None,
             evidence: "https://code.claude.com/docs/en/mcp",
         },
         "codex" => DiscoveryCapabilities {
@@ -42,6 +46,8 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             native_tool_search: Some(true),
             tools_list_changed: Some(false),
             cold_full_list_wait_ms: 8_000,
+            // Codex 0.162.1 shows no tools from a server that lists 2,049 or more.
+            max_tools: Some(2_048),
             evidence: "https://developers.openai.com/codex/config-reference",
         },
         "cursor" => DiscoveryCapabilities {
@@ -49,6 +55,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             native_tool_search: Some(true),
             tools_list_changed: Some(false),
             cold_full_list_wait_ms: 5_000,
+            max_tools: None,
             evidence: "https://cursor.com/blog/dynamic-context-discovery",
         },
         "opencode" | "gemini-cli" | "cline" | "zed" => DiscoveryCapabilities {
@@ -58,6 +65,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             // Keep the conservative budget: handler registration alone does not
             // establish how quickly every installed version refreshes its catalog.
             cold_full_list_wait_ms: 5_000,
+            max_tools: None,
             evidence: "docs/client-conformance.md (source and notification evidence)",
         },
         "anthropic-api" => DiscoveryCapabilities {
@@ -65,6 +73,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             native_tool_search: Some(true),
             tools_list_changed: None,
             cold_full_list_wait_ms: 5_000,
+            max_tools: None,
             evidence:
                 "https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool",
         },
@@ -73,6 +82,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             native_tool_search: Some(true),
             tools_list_changed: None,
             cold_full_list_wait_ms: 5_000,
+            max_tools: None,
             evidence: "https://developers.openai.com/api/docs/guides/tools-tool-search",
         },
         "lm-studio" | "jan" | "anythingllm" => DiscoveryCapabilities {
@@ -80,6 +90,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             native_tool_search: None,
             tools_list_changed: None,
             cold_full_list_wait_ms: 5_000,
+            max_tools: None,
             evidence: "docs/clients.md (local-model clients)",
         },
         _ => DiscoveryCapabilities {
@@ -87,6 +98,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             native_tool_search: None,
             tools_list_changed: None,
             cold_full_list_wait_ms: 5_000,
+            max_tools: None,
             evidence: "docs/clients.md (adapter notes; discovery support unverified)",
         },
     }
@@ -248,6 +260,7 @@ mod tests {
                 native_tool_search: None,
                 tools_list_changed: Some(true),
                 cold_full_list_wait_ms: 2_000,
+                max_tools: None,
                 evidence: "fixture"
             }
             .auto_mode(),
