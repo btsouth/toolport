@@ -908,7 +908,7 @@ export function SecretsDialog({
                   Remove button is simply missing, which reads as "nothing is
                   saved here" (SBS-841). */}
               {secretProbeError && (
-                <div className="rounded-md border border-warning/40 bg-warning/5 p-2.5 text-xs text-warning">
+                <div className="toolport-alert border-warning bg-warning/8 p-2.5 text-xs text-warning">
                   <p>
                     Couldn't check the keychain, so saved keys aren't shown below. Unlock
                     it and retry; saving now overwrites anything already stored.

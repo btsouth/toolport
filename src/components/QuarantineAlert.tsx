@@ -172,7 +172,7 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
       <div
         role="region"
         aria-label={`Toolport paused ${items.length} changed tool${many ? "s" : ""}`}
-        className="animate-in fade-in slide-in-from-bottom-2 pointer-events-auto relative w-full max-w-lg overflow-hidden rounded-xl border border-warning/40 bg-popover/95 shadow-2xl ring-1 ring-warning/10 backdrop-blur"
+        className="animate-in fade-in slide-in-from-bottom-2 pointer-events-auto relative w-full max-w-lg overflow-hidden rounded-r-[10px] border-l-[3px] border-warning bg-popover/95 shadow-2xl backdrop-blur"
       >
         {/* Announced politely rather than moving focus. This card appears while you are
             working, so stealing focus would be hostile; it is a status surface, not a

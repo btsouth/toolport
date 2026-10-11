@@ -1,13 +1,13 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import "@fontsource-variable/geist";
+@import "@fontsource-variable/inter";
 
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
   --font-heading: var(--font-sans);
-  --font-sans: "Geist Variable", sans-serif;
+  --font-sans: "Inter Variable", Inter, system-ui, sans-serif;
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -58,104 +58,85 @@
 
 :root {
   color-scheme: light;
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  /* Softened brand orange as the primary action color (the pure logo shade lives in
-     --brand, reserved for the mark). One hero accent; semantics stay success/warn/etc. */
-  --primary: oklch(0.68 0.16 48);
-  --primary-foreground: oklch(0.24 0.055 48);
+  --background: #fafbfc;
+  --foreground: #20232b;
+  --card: #ffffff;
+  --card-foreground: #20232b;
+  --popover: #ffffff;
+  --popover-foreground: #20232b;
+  --primary: #2862b9;
+  --primary-foreground: #ffffff;
   --brand: oklch(0.7 0.17 47);
   --brand-foreground: oklch(0.22 0.05 55);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  /* Accent doubles as the hover + selected-row fill. On near-white surfaces the old 0.97
-     was invisible (a "grey bar you can't see"); 0.922 (== border strength) reads clearly
-     as a selection without going heavy. Dark keeps its own brighter accent below. */
-  --accent: oklch(0.922 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  /* A hair less lightness/chroma than the raw red so error counts don't scream on white. */
+  --secondary: #f0f2f5;
+  --secondary-foreground: #20232b;
+  --muted: #f0f2f5;
+  --muted-foreground: #626b7a;
+  --accent: #e8edf5;
+  --accent-foreground: #20232b;
   --destructive: oklch(0.55 0.21 27.325);
-  /* Semantic accent tokens, one shade each, so success/warning/info/owned render
-       identically across every view (the audit found these drifting 300/400/500).
-       LIGHT uses the darker *-600 shades: the *-400 palette is tuned for dark navy and
-       reads as neon/low-contrast on white. Dark restores the *-400 values below. */
-  --success: oklch(0.6 0.14 163.223);
-  --warning: oklch(0.68 0.145 70);
+  --success: #24774b;
+  --warning: #956016;
   --info: oklch(0.56 0.2 293.541);
   --owned: oklch(0.6 0.15 232.661);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
+  --border: #dce1e8;
+  --input: #dce1e8;
+  --ring: #2862b9;
   --chart-1: oklch(0.87 0 0);
   --chart-2: oklch(0.556 0 0);
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
   --radius: 0.625rem;
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.922 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+  --sidebar: #f3f5f8;
+  --sidebar-foreground: #20232b;
+  --sidebar-primary: #2862b9;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e8edf5;
+  --sidebar-accent-foreground: #20232b;
+  --sidebar-border: #dce1e8;
+  --sidebar-ring: #2862b9;
 }
 
 .dark {
   color-scheme: dark;
-  /* Deep-NAVY neutral ramp keyed to the brand navy (#1E3A66, H~258). The greys carry a
-     real blue chroma so the app reads navy + orange (the brand), not black + orange. Dark
-     enough to stay a comfortable dark UI; lightness rises through the ramp for elevation. */
-  --background: oklch(0.19 0.046 258);
-  --foreground: oklch(0.965 0.008 250);
-  --card: oklch(0.238 0.052 258);
-  --card-foreground: oklch(0.965 0.008 250);
-  --popover: oklch(0.238 0.052 258);
-  --popover-foreground: oklch(0.965 0.008 250);
-  /* The real brand orange (#F97316) at the logo's coral hue (~48) - one hero accent. A
-     hair lighter than --brand so dark ink stays legible on filled buttons. */
-  --primary: oklch(0.71 0.185 48);
-  --primary-foreground: oklch(0.24 0.06 48);
+  --background: #1d2027;
+  --foreground: #e8e9ec;
+  --card: #252931;
+  --card-foreground: #e8e9ec;
+  --popover: #252931;
+  --popover-foreground: #e8e9ec;
+  --primary: #7cb0ff;
+  --primary-foreground: #0f1726;
   --brand: oklch(0.705 0.19 48);
   --brand-foreground: oklch(0.24 0.06 48);
-  --secondary: oklch(0.305 0.05 258);
-  --secondary-foreground: oklch(0.965 0.008 250);
-  --muted: oklch(0.305 0.05 258);
-  /* Raised from 0.735 to reach ~4.5:1 (AA) on the navy card/bg for secondary text. */
-  --muted-foreground: oklch(0.78 0.03 255);
-  --accent: oklch(0.345 0.056 258);
-  --accent-foreground: oklch(0.965 0.008 250);
+  --secondary: #2b3039;
+  --secondary-foreground: #e8e9ec;
+  --muted: #2b3039;
+  --muted-foreground: #a1a9b8;
+  --accent: #2c3442;
+  --accent-foreground: #e8e9ec;
   --destructive: oklch(0.704 0.191 22.216);
-  /* Restore the vivid *-400 semantics for dark (light darkens these for white surfaces).
-     These are the values the ramp was tuned against on navy - keep dark unchanged. */
-  --success: oklch(0.765 0.177 163.223);
-  --warning: oklch(0.828 0.189 84.429);
+  --success: #7fd0a0;
+  --warning: #f0c674;
   --info: oklch(0.74 0.165 293.541);
   --owned: oklch(0.746 0.16 232.661);
-  /* 22% (was 16%) so card edges and row dividers actually read against the navy. */
-  --border: oklch(0.72 0.05 258 / 22%);
-  --input: oklch(0.72 0.05 258 / 22%);
-  --ring: oklch(0.71 0.16 48);
+  --border: #323843;
+  --input: #323843;
+  --ring: #7cb0ff;
   --chart-1: oklch(0.71 0.185 48);
   --chart-2: oklch(0.746 0.16 232.661);
   --chart-3: oklch(0.765 0.177 163.223);
   --chart-4: oklch(0.828 0.189 84.429);
   --chart-5: oklch(0.702 0.183 293.541);
-  --sidebar: oklch(0.165 0.045 258);
-  --sidebar-foreground: oklch(0.965 0.008 250);
-  --sidebar-primary: oklch(0.71 0.185 48);
-  --sidebar-primary-foreground: oklch(0.24 0.06 48);
-  --sidebar-accent: oklch(0.305 0.05 258);
-  --sidebar-accent-foreground: oklch(0.965 0.008 250);
-  --sidebar-border: oklch(0.72 0.05 258 / 22%);
-  --sidebar-ring: oklch(0.71 0.16 48);
+  --sidebar: #20232b;
+  --sidebar-foreground: #e8e9ec;
+  --sidebar-primary: #7cb0ff;
+  --sidebar-primary-foreground: #0f1726;
+  --sidebar-accent: #2c3442;
+  --sidebar-accent-foreground: #e8e9ec;
+  --sidebar-border: #323843;
+  --sidebar-ring: #7cb0ff;
 }
 
 @layer base {
@@ -164,6 +145,8 @@
   }
   body {
     @apply bg-background text-foreground;
+    font-size: 14px;
+    line-height: 1.5;
   }
   html {
     @apply font-sans;
@@ -217,5 +200,32 @@
   }
   .onboarding-hero {
     display: none;
+  }
+}
+
+/* Shared visual language for notices and flat rows. */
+@layer components {
+  .toolport-alert {
+    border-width: 0 0 0 3px;
+    border-radius: 0 10px 10px 0;
+    color: var(--foreground);
+    font-size: 13px;
+  }
+  .toolport-alert p {
+    color: var(--muted-foreground);
+  }
+  .toolport-alert p.font-medium,
+  .toolport-alert p.font-semibold,
+  .toolport-alert strong {
+    color: var(--foreground);
+    font-weight: 600;
+  }
+  .toolport-alert + .toolport-alert {
+    margin-top: 0;
+    border-top: 1px solid var(--border);
+    border-top-right-radius: 0;
+  }
+  .toolport-list {
+    border-top: 1px solid var(--border);
   }
 }

@@ -171,7 +171,7 @@ export function RegistryServerRow({
           button, so the toggle and Authenticate controls aren't nested inside one. */}
       <div
         onClick={() => setExpanded((v) => !v)}
-        className="flex cursor-pointer items-center gap-3 px-3.5 py-2 transition-colors hover:bg-accent/40"
+        className="flex cursor-pointer items-center gap-3 px-1 py-3 transition-colors hover:bg-accent/40"
       >
         <span className="flex items-center" onClick={stop}>
           <Switch
@@ -184,7 +184,7 @@ export function RegistryServerRow({
 
         <ServerLogo name={server.name} transport={server.transport} size={28} />
 
-        <span title={server.name} className="min-w-0 flex-1 truncate text-sm font-medium">
+        <span title={server.name} className="min-w-0 flex-1 truncate text-sm font-[550]">
           {server.name}
           {providers.length > 0 && (
             <span className="ml-2 text-[10px] font-normal text-muted-foreground">
@@ -510,8 +510,11 @@ function StatusLabel({
   const text = (
     <span
       aria-hidden="true"
-      className={`text-xs font-medium whitespace-nowrap ${STATUS_TEXT[status]}`}
+      className={`inline-flex items-center gap-1.5 text-[13px] whitespace-nowrap ${STATUS_TEXT[status]}`}
     >
+      <span
+        className={`size-[7px] shrink-0 rounded-full ${status === "connected" ? "bg-success" : status === "needs-auth" ? "bg-warning" : status === "error" ? "bg-destructive" : "bg-muted-foreground/60"}`}
+      />
       {label}
     </span>
   );

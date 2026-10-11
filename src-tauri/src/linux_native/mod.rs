@@ -2461,7 +2461,7 @@ fn client_section_title(title: &str, count: usize) -> gtk::Box {
             .label(title)
             .halign(gtk::Align::Start)
             .hexpand(true)
-            .css_classes(["heading"])
+            .css_classes(["toolport-section-label"])
             .build(),
     );
     let count = gtk::Label::new(Some(&count.to_string()));
@@ -9944,7 +9944,7 @@ fn section_heading(title: &str, subtitle: &str) -> gtk::Box {
         &gtk::Label::builder()
             .label(title)
             .halign(gtk::Align::Start)
-            .css_classes(["heading"])
+            .css_classes(["toolport-section-label"])
             .build(),
     );
     heading.append(

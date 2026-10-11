@@ -475,11 +475,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       {client.error && (
         <div
           role="alert"
-          className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-sm text-warning"
+          className="flex items-start gap-2 toolport-alert border-warning bg-warning/8 px-3 py-2 text-sm text-warning"
         >
           <TriangleAlert className="mt-0.5 size-4 shrink-0" />
           <div className="min-w-0">
-            <p className="font-medium">Couldn't read this client's configuration</p>
+            <p className="font-semibold">Couldn't read this client's configuration</p>
             <p className="mt-0.5 break-words text-xs">{client.error}</p>
           </div>
         </div>
@@ -488,11 +488,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       {showRestartNotice && (
         <div
           role="status"
-          className="flex items-start gap-2 rounded-lg border border-info/30 bg-info/10 px-3 py-2 text-sm text-info"
+          className="flex items-start gap-2 toolport-alert border-info bg-info/8 px-3 py-2 text-sm text-info"
         >
           <RefreshCw className="mt-0.5 size-4 shrink-0" />
           <div className="min-w-0 flex-1">
-            <p className="font-medium">{showRestartNotice.title}</p>
+            <p className="font-semibold">{showRestartNotice.title}</p>
             <p className="mt-0.5 break-words text-xs">{showRestartNotice.text}</p>
           </div>
           <button

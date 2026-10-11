@@ -6,15 +6,15 @@ use adw::prelude::*;
 use gtk::gio;
 use serde::Deserialize;
 
-const FALLBACK_BACKGROUND: &str = "#101315";
-const FALLBACK_DARK_BACKGROUND: &str = "#0b0d0f";
-const FALLBACK_LIGHTER_BACKGROUND: &str = "#1a1f22";
-const FALLBACK_FOREGROUND: &str = "#e8eaed";
-const FALLBACK_MUTED: &str = "#92999f";
-const FALLBACK_ACCENT: &str = "#8ab4f8";
+const FALLBACK_BACKGROUND: &str = "#1d2027";
+const FALLBACK_DARK_BACKGROUND: &str = "#20232b";
+const FALLBACK_LIGHTER_BACKGROUND: &str = "#252931";
+const FALLBACK_FOREGROUND: &str = "#e8e9ec";
+const FALLBACK_MUTED: &str = "#a1a9b8";
+const FALLBACK_ACCENT: &str = "#7cb0ff";
 const FALLBACK_SELECTION: &str = "#334155";
 const FALLBACK_RED: &str = "#f38ba8";
-const FALLBACK_GREEN: &str = "#a6e3a1";
+const FALLBACK_GREEN: &str = "#7fd0a0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThemeMode {
@@ -145,6 +145,7 @@ impl OmarchyPalette {
 window {{
   background-color: @toolport_bg;
   color: @toolport_fg;
+  font-family: "Inter", system-ui, sans-serif;
   font-size: 14px;
 }}
 
@@ -201,11 +202,12 @@ dialog-host > dialog.alert .response-area > button.destructive-action {{
      fractional raster size Pango drops the top stroke of capitals such as E,
      F, P, and T. Keep the chosen family and weights, but use the nearest whole
      CSS pixel so glyph hinting remains intact. */
+  font-family: "Inter", system-ui, sans-serif;
   font-size: 14px;
 }}
 
 .toolport-native .caption {{
-  font-size: 12px;
+  font-size: 13px;
 }}
 
 .toolport-shell {{ background-color: transparent; }}
@@ -453,10 +455,13 @@ dropdown popover row:selected {{
 }}
 
 .toolport-feedback {{
-  padding: 9px 12px;
-  border-radius: 9px;
-  background-color: alpha(@toolport_fg, 0.04);
-  border: 1px solid alpha(@toolport_fg, 0.10);
+  padding: 10px 14px;
+  border-radius: 0 10px 10px 0;
+  background-color: alpha(@toolport_accent, 0.08);
+  border: none;
+  border-left: 3px solid @toolport_accent;
+  color: @toolport_fg;
+  font-size: 13px;
 }}
 
 /* Holds its place so rows and open menus do not jump, but shows nothing. */
@@ -466,14 +471,14 @@ dropdown popover row:selected {{
 }}
 
 .toolport-feedback.success {{
-  color: @toolport_success;
-  border-color: alpha(@toolport_success, 0.22);
+  color: @toolport_fg;
+  border-color: @toolport_success;
   background-color: alpha(@toolport_success, 0.08);
 }}
 
 .toolport-feedback.error {{
-  color: @toolport_error;
-  border-color: alpha(@toolport_error, 0.24);
+  color: @toolport_fg;
+  border-color: @toolport_error;
   background-color: alpha(@toolport_error, 0.08);
 }}
 
@@ -564,10 +569,11 @@ dropdown popover row:selected {{
 }}
 
 .toolport-form-section {{
-  padding: 14px;
-  border-radius: 12px;
-  background-color: alpha(@toolport_surface, 0.46);
-  border: 1px solid alpha(@toolport_fg, 0.11);
+  padding: 14px 4px;
+  border-radius: 0;
+  background-color: transparent;
+  border: none;
+  border-top: 1px solid alpha(@toolport_fg, 0.12);
 }}
 
 .toolport-paste-expander {{
@@ -649,10 +655,11 @@ dropdown popover row:selected {{
 }}
 
 .toolport-credential-row {{
-  padding: 13px;
-  border-radius: 11px;
-  border: 1px solid alpha(@toolport_fg, 0.10);
-  background-color: alpha(@toolport_bg_dark, 0.24);
+  padding: 13px 4px;
+  border-radius: 0;
+  border: none;
+  border-bottom: 1px solid alpha(@toolport_fg, 0.12);
+  background-color: transparent;
 }}
 
 .toolport-approvals {{
@@ -662,8 +669,9 @@ dropdown popover row:selected {{
 .toolport-global-alert {{
   color: @toolport_fg;
   background-color: @toolport_bg;
-  border: 1px solid alpha(@toolport_accent, 0.34);
-  border-radius: 13px;
+  border: none;
+  border-left: 3px solid @toolport_accent;
+  border-radius: 0 10px 10px 0;
   box-shadow: 0 12px 34px alpha(@toolport_bg_dark, 0.58);
 }}
 
@@ -689,9 +697,10 @@ dropdown popover row:selected {{
 
 .toolport-approval-card {{
   padding: 14px 16px;
-  border: 1px solid alpha(@toolport_accent, 0.28);
-  border-radius: 11px;
-  background-color: alpha(@toolport_surface, 0.48);
+  border: none;
+  border-left: 3px solid {warning};
+  border-radius: 0 10px 10px 0;
+  background-color: alpha({warning}, 0.08);
 }}
 
 .toolport-approval-deadline {{
@@ -703,10 +712,11 @@ dropdown popover row:selected {{
 
 .toolport-sensitive-review {{
   padding: 10px 12px;
-  border-radius: 9px;
-  color: @toolport_error;
-  background-color: alpha(@toolport_error, 0.07);
-  border: 1px solid alpha(@toolport_error, 0.20);
+  border-radius: 0 10px 10px 0;
+  color: @toolport_fg;
+  background-color: alpha(@toolport_error, 0.08);
+  border: none;
+  border-left: 3px solid @toolport_error;
 }}
 
 .toolport-arguments {{
@@ -718,7 +728,7 @@ dropdown popover row:selected {{
 }}
 
 .toolport-page {{
-  background-image: radial-gradient(circle at 90% 0%, alpha(@toolport_accent, 0.10), transparent 34%);
+  background-color: transparent;
 }}
 
 .toolport-dialog-content {{
@@ -731,9 +741,10 @@ dropdown popover row:selected {{
 }}
 
 .toolport-summary-item {{
-  background-color: alpha(@toolport_surface, 0.32);
-  border: 1px solid alpha(@toolport_fg, 0.09);
-  border-radius: 11px;
+  background-color: transparent;
+  border: none;
+  border-bottom: 1px solid alpha(@toolport_fg, 0.12);
+  border-radius: 0;
   padding: 10px 13px;
 }}
 
@@ -742,8 +753,9 @@ dropdown popover row:selected {{
   padding: 8px 12px;
   color: @toolport_fg;
   background-color: alpha(@toolport_surface, 0.28);
-  border: 1px solid alpha(@toolport_success, 0.16);
-  border-radius: 10px;
+  border: none;
+  border-left: 3px solid @toolport_success;
+  border-radius: 0 10px 10px 0;
   box-shadow: none;
 }}
 
@@ -793,16 +805,16 @@ button.toolport-activity-filter {{
 }}
 
 .toolport-card {{
-  background-color: alpha(@toolport_surface, 0.42);
-  border: 1px solid alpha(@toolport_fg, 0.11);
-  border-radius: 11px;
-  padding: 10px 14px;
+  background-color: transparent;
+  border: none;
+  border-bottom: 1px solid alpha(@toolport_fg, 0.12);
+  border-radius: 0;
+  padding: 12px 4px;
   transition: 120ms ease;
 }}
 
 .toolport-card:hover {{
-  background-color: alpha(@toolport_surface, 0.56);
-  border-color: alpha(@toolport_accent, 0.30);
+  background-color: alpha(@toolport_accent, 0.04);
 }}
 
 /* The name is a flat button for opening details; drop button padding so it
@@ -852,9 +864,10 @@ button.toolport-activity-filter {{
 }}
 
 .toolport-settings-group {{
-  background-color: alpha(@toolport_surface, 0.38);
-  border: 1px solid alpha(@toolport_fg, 0.10);
-  border-radius: 11px;
+  background-color: transparent;
+  border: none;
+  border-top: 1px solid alpha(@toolport_fg, 0.12);
+  border-radius: 0;
 }}
 
 /* Groups whose children are plain form fields rather than `toolport-setting-row`,
@@ -878,9 +891,10 @@ button.toolport-activity-filter {{
 /* Wider than `toolport-summary-item`, which is sized for a number over a
    one-word label rather than a heading over a wrapped sentence. */
 .toolport-value-card {{
-  background-color: alpha(@toolport_surface, 0.32);
-  border: 1px solid alpha(@toolport_fg, 0.09);
-  border-radius: 11px;
+  background-color: transparent;
+  border: none;
+  border-bottom: 1px solid alpha(@toolport_fg, 0.12);
+  border-radius: 0;
   padding: 15px 17px;
 }}
 
@@ -1049,6 +1063,27 @@ button.toolport-catalog-action {{
 }}
 .toolport-state-card.error .toolport-state-icon {{ color: @toolport_error; }}
 
+.toolport-native .title-2 {{ font-size: 22px; font-weight: 650; }}
+.toolport-native .heading {{ font-weight: 600; }}
+.toolport-section-label {{
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: @toolport_muted;
+}}
+.toolport-muted {{ font-size: 13px; }}
+.toolport-native button {{ border-radius: 8px; font-weight: 600; }}
+.toolport-feedback.warning {{
+  border-color: {warning};
+  background-color: alpha({warning}, 0.08);
+  color: @toolport_fg;
+}}
+.toolport-feedback .heading {{ color: @toolport_fg; }}
+.toolport-feedback + .toolport-feedback {{
+  border-top: 1px solid alpha(@toolport_fg, 0.12);
+}}
+
 selection {{
   background: @toolport_selection;
   color: @toolport_bg_dark;
@@ -1063,6 +1098,11 @@ window:backdrop .toolport-summary-item {{
   border-color: alpha(@toolport_fg, 0.06);
 }}
 "#,
+            warning = if self.mode == ThemeMode::Light {
+                "#956016"
+            } else {
+                "#f0c674"
+            },
             background = self.background,
             dark_background = self.dark_background,
             lighter_background = self.lighter_background,

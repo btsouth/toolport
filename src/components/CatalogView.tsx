@@ -204,7 +204,7 @@ export function CatalogView({ registry, onAdded }: Props) {
           <div
             role="status"
             aria-live="polite"
-            className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5"
+            className="flex items-center justify-between gap-3 border-b border-border px-1 py-3"
           >
             <p className="text-sm">
               {registryStatus === "timedOut"
@@ -379,7 +379,7 @@ function CatalogCard({
     ? [entry.command, ...entry.args].join(" ")
     : (entry.url ?? "");
   return (
-    <div className="flex flex-col gap-2 rounded-lg border p-3 transition-colors hover:border-ring/40">
+    <div className="flex flex-col gap-2 border-b border-border px-1 py-3 transition-colors hover:bg-accent/30">
       <div className="flex items-start justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1.5">
           <ServerLogo name={entry.name} transport={entry.transport} size={28} />
