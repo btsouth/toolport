@@ -150,6 +150,19 @@ fn server_logo_key(name: &str) -> Option<&'static str> {
         ("figma", "figma"),
         ("resend", "resend"),
         ("n8n", "n8n"),
+        ("apify", "apify"),
+        ("browserbase", "browserbase"),
+        ("composio", "composio"),
+        ("context7", "context7"),
+        ("dataforseo", "dataforseo"),
+        ("deepwiki", "deepwiki"),
+        ("firecrawl", "firecrawl"),
+        ("langfuse", "langfuse"),
+        ("linode", "linode"),
+        ("microsoft", "microsoft"),
+        ("parallel search", "parallel"),
+        ("playwright", "playwright"),
+        ("tavily", "tavily"),
     ]
     .into_iter()
     .find_map(|(needle, key)| name.contains(needle).then_some(key))
@@ -157,6 +170,24 @@ fn server_logo_key(name: &str) -> Option<&'static str> {
     // finds it inside unrelated names: "digitalocean" carries "git" at offset 2
     // and would otherwise wear the Git logo. `github` is matched above, by name.
     .or_else(|| name_has_word(&name, "git").then_some("git"))
+    .or_else(|| name_has_word(&name, "exa").then_some("exa"))
+    // The reference servers have no brand. Match them only as the leading word,
+    // so a "Team memory" or "Showtime" server keeps its transport badge.
+    .or_else(|| {
+        [
+            ("fetch", "fetch"),
+            ("filesystem", "filesystem"),
+            ("memory", "memory"),
+            ("sequential thinking", "sequentialthinking"),
+            ("time", "time"),
+        ]
+        .into_iter()
+        .find_map(|(lead, key)| {
+            name.strip_prefix(lead)
+                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric()))
+                .then_some(key)
+        })
+    })
 }
 
 pub(super) fn server_logo(name: &str, transport: &str) -> gtk::Image {
@@ -200,6 +231,25 @@ pub(super) fn server_logo(name: &str, transport: &str) -> gtk::Image {
         Some("resend") => Some(include_bytes!("../../icons/server-logos/resend.png")),
         Some("n8n") => Some(include_bytes!("../../icons/server-logos/n8n.png")),
         Some("git") => Some(include_bytes!("../../icons/server-logos/git.png")),
+        Some("apify") => Some(include_bytes!("../../icons/server-logos/apify.png")),
+        Some("browserbase") => Some(include_bytes!("../../icons/server-logos/browserbase.png")),
+        Some("composio") => Some(include_bytes!("../../icons/server-logos/composio.png")),
+        Some("context7") => Some(include_bytes!("../../icons/server-logos/context7.png")),
+        Some("dataforseo") => Some(include_bytes!("../../icons/server-logos/dataforseo.png")),
+        Some("deepwiki") => Some(include_bytes!("../../icons/server-logos/deepwiki.png")),
+        Some("exa") => Some(include_bytes!("../../icons/server-logos/exa.png")),
+        Some("fetch") => Some(include_bytes!("../../icons/server-logos/fetch.png")),
+        Some("filesystem") => Some(include_bytes!("../../icons/server-logos/filesystem.png")),
+        Some("firecrawl") => Some(include_bytes!("../../icons/server-logos/firecrawl.png")),
+        Some("langfuse") => Some(include_bytes!("../../icons/server-logos/langfuse.png")),
+        Some("linode") => Some(include_bytes!("../../icons/server-logos/linode.png")),
+        Some("memory") => Some(include_bytes!("../../icons/server-logos/memory.png")),
+        Some("microsoft") => Some(include_bytes!("../../icons/server-logos/microsoft.png")),
+        Some("parallel") => Some(include_bytes!("../../icons/server-logos/parallel.png")),
+        Some("playwright") => Some(include_bytes!("../../icons/server-logos/playwright.png")),
+        Some("sequentialthinking") => Some(include_bytes!("../../icons/server-logos/sequentialthinking.png")),
+        Some("tavily") => Some(include_bytes!("../../icons/server-logos/tavily.png")),
+        Some("time") => Some(include_bytes!("../../icons/server-logos/time.png")),
         _ => None,
     };
     bytes.map_or_else(
@@ -272,6 +322,27 @@ mod tests {
         assert_eq!(server_logo_key("git"), Some("git"));
         assert_eq!(server_logo_key("Git MCP"), Some("git"));
         assert_eq!(server_logo_key("GitHub"), Some("github"));
+    }
+
+    #[test]
+    fn every_curated_catalog_server_has_a_logo() {
+        let missing: Vec<String> = crate::catalog::curated()
+            .into_iter()
+            .map(|entry| entry.name)
+            .filter(|name| server_logo_key(name).is_none())
+            .collect();
+        assert!(missing.is_empty(), "catalog servers without a logo: {missing:?}");
+    }
+
+    #[test]
+    fn reference_server_icons_match_only_the_leading_word() {
+        assert_eq!(server_logo_key("Time"), Some("time"));
+        assert_eq!(server_logo_key("Memory"), Some("memory"));
+        assert_eq!(server_logo_key("Sequential Thinking"), Some("sequentialthinking"));
+        assert_eq!(server_logo_key("Showtime"), None);
+        assert_eq!(server_logo_key("Team memory"), None);
+        assert_eq!(server_logo_key("Exa Search"), Some("exa"));
+        assert_eq!(server_logo_key("Hexagon"), None);
     }
     use super::server_logo_key;
 
