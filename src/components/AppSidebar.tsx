@@ -534,7 +534,7 @@ export function AppSidebar({
       aria-label={label}
       title={`${label}${["Servers", "Clients", "Activity", "Settings"].includes(label) ? ` (${/Mac/.test(navigator.platform) ? "⌘" : "Ctrl"}${["Servers", "Clients", "Activity", "Settings"].indexOf(label) + 1})` : ""}`}
       aria-current={active ? "page" : undefined}
-      className={`${NAV_ITEM} ${active ? "bg-accent font-medium text-foreground" : "text-muted-foreground"}`}
+      className={`${NAV_ITEM} ${label === "Settings" ? "font-semibold" : ""} ${active ? "bg-accent font-medium text-foreground" : "text-muted-foreground"}`}
     >
       <Icon
         className={`size-4 shrink-0 ${active ? "text-primary" : "text-muted-foreground"}`}

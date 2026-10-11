@@ -1695,8 +1695,8 @@ impl SettingsPage {
         self.pages[index].connect_visible_notify(move |page| callback(page.is_visible()));
     }
 
-    pub(super) fn pending_count(&self) -> usize {
-        self.broker.list().len()
+    pub(super) fn approval_broker(&self) -> crate::approval_broker::ApprovalBroker {
+        self.broker.clone()
     }
 
     pub(super) fn refresh(&self) {

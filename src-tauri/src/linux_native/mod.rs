@@ -925,13 +925,26 @@ fn build_sidebar(
                 child.add_css_class("toolport-nav-item");
                 let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
                 row.append(&gtk::Image::from_icon_name(icon));
-                row.append(&gtk::Label::builder().label(*label).xalign(0.0).hexpand(true).build());
+                row.append(
+                    &gtk::Label::builder()
+                        .label(*label)
+                        .xalign(0.0)
+                        .hexpand(true)
+                        .build(),
+                );
                 if index == 2 {
-                    let badge = gtk::Label::builder().visible(false).css_classes(["toolport-badge", "review"]).build();
+                    let badge = gtk::Label::builder()
+                        .visible(false)
+                        .css_classes(["toolport-badge", "review"])
+                        .build();
                     row.append(&badge);
-                    let page = settings_page.clone();
+                    let broker = settings_page.approval_broker();
+                    let badge = badge.downgrade();
                     gtk::glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
-                        let count = page.pending_count();
+                        let Some(badge) = badge.upgrade() else {
+                            return gtk::glib::ControlFlow::Break;
+                        };
+                        let count = broker.list().len();
                         badge.set_label(&count.to_string());
                         badge.set_tooltip_text(Some(&format!("{count} pending approvals")));
                         badge.set_visible(count > 0);
@@ -941,30 +954,20 @@ fn build_sidebar(
                 child.set_child(Some(&row));
                 let selected = child.clone();
                 settings_page.connect_page_selected(index, move |visible| {
-                    if visible { selected.add_css_class("selected"); } else { selected.remove_css_class("selected"); }
+                    if visible {
+                        selected.add_css_class("selected");
+                    } else {
+                        selected.remove_css_class("selected");
+                    }
                 });
                 children.append(&child);
                 subbuttons.push(child);
             }
             for (index, child) in subbuttons.iter().enumerate() {
                 let page = settings_page.clone();
-                let siblings = subbuttons.clone();
-                child.connect_clicked(move |_| {
-                    page.select_page(index);
-                    for (current, sibling) in siblings.iter().enumerate() {
-                        if current == index { sibling.add_css_class("selected"); } else { sibling.remove_css_class("selected"); }
-                    }
-                });
+                child.connect_clicked(move |_| page.select_page(index));
             }
             subbuttons[0].add_css_class("selected");
-            let page = settings_page.clone();
-            let siblings = subbuttons.clone();
-            button.connect_clicked(move |_| {
-                page.select_page(0);
-                for (index, sibling) in siblings.iter().enumerate() {
-                    if index == 0 { sibling.add_css_class("selected"); } else { sibling.remove_css_class("selected"); }
-                }
-            });
             stack.connect_visible_child_name_notify(move |stack| {
                 children.set_visible(stack.visible_child_name().as_deref() == Some("settings"));
             });

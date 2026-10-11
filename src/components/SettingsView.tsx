@@ -651,7 +651,7 @@ export function SettingsView({
       setRestartCheckFailed(true);
       toastError("Couldn't check for apps using an old gateway");
     }
-  }, []);
+  }, [setNeedsRestart, setRestartCheckFailed]);
   useEffect(() => {
     void loadNeedsRestart();
   }, [loadNeedsRestart]);
@@ -1069,7 +1069,7 @@ export function SettingsView({
           </p>
           <p
             role="status"
-            className="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground"
+            className="toolport-alert rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground"
           >
             {effectiveLevel === "off"
               ? "Safety is set to Off. Toolport does not ask before destructive calls. Server sign-in and client permissions may still ask for approval."
@@ -1119,7 +1119,7 @@ export function SettingsView({
             </div>
           )}
           {quarantined.length > 0 && (
-            <div className="flex flex-col gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
+            <div className="toolport-alert flex flex-col gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
               <div className="flex items-center gap-2">
                 <ShieldX className="size-4 shrink-0 text-destructive" />
                 <span className="text-sm font-medium">Quarantined tools</span>
@@ -1368,7 +1368,7 @@ export function SettingsView({
             )}
           </div>
 
-          {bridge?.running ? (
+          {bridge?.running && bridge.url ? (
             <div className="mt-1 flex flex-col gap-2 rounded border bg-muted/20 p-2.5">
               <div className="flex items-baseline justify-between gap-2">
                 <span className="text-[11px] font-medium text-muted-foreground">
