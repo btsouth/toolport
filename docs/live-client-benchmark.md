@@ -2,13 +2,23 @@
 
 This opt-in driver runs authenticated CLI clients against a disposable gateway and a deterministic local mock. It uses the public 1,707-tool catalog and only the search evaluation development split. Results measure real client discovery and dispatch against fictional data, not production services.
 
-Supply an existing gateway build and authenticated client executable:
+Build the headless gateway, then supply an authenticated client executable. The driver needs Node.js and the repository's development dependencies. Codex and Cursor also require Linux and bubblewrap with overlay support.
+
+```sh
+npm ci
+npm run build:gateway
+```
+
+The checked-in inputs are `src-tauri/tests/fixtures/search-eval-scale/catalog.json` and `src-tauri/tests/fixtures/search-eval-scale/dev.json`. Keep the gateway revision, client version and model with each result. For example:
 
 ```sh
 node scripts/live-client-bench.mjs \
-  --catalog /path/to/catalog.json --dev /path/to/dev.json \
-  --gateway /path/to/toolport-gateway --executable /path/to/client \
-  --client codex --mode lazy --out /path/outside/the/repo
+  --catalog src-tauri/tests/fixtures/search-eval-scale/catalog.json \
+  --dev src-tauri/tests/fixtures/search-eval-scale/dev.json \
+  --gateway "$PWD/src-tauri/target/debug/toolport-gateway" \
+  --executable /absolute/path/to/claude \
+  --client claude-code --model claude-haiku-5-5 --mode lazy \
+  --out /path/outside/the/repo
 ```
 
 Clients: `claude-code`, `codex`, `cursor`, `opencode`. Modes: `full`, `lazy`, `grouped`. Use `--model` to pin the CLI model and `--timeout` for the per-task deadline in milliseconds. The default deadline is 90 seconds. Every model invocation has its own registry, data directory and MCP configuration. Credentials are read by the existing CLI login and are never copied by the driver. Codex and Cursor use a read-only filesystem with disposable runtime writes. Cursor loads a workspace MCP file while its real global MCP file is hidden.
@@ -34,5 +44,7 @@ node scripts/live-client-bench-report.mjs \
   --catalog /path/to/catalog.json --dev /path/to/dev.json \
   --runs /path/to/evidence/matrix --out /path/to/evidence/analysis.json
 ```
+
+Run each selected client and model once with `--mode full` and once with `--mode lazy`, using separate output directories. `--limit 1` is useful for checking the setup before running all 30 tasks. The authenticated runs consume the client account's usage; they are opt-in and are excluded from `npm run verify` and shipped packages. The scoring tests above need no client login or network.
 
 The report sums and compares CLI-reported usage. Codex input includes cached tokens. The other CLI input fields exclude separate cache reads, and Claude also reports cache writes. Missing usage stays unknown. Latency includes process startup and model time. Do not treat concurrent samples as controlled performance or billing estimates. Discovery defaults are not selected by this driver.
