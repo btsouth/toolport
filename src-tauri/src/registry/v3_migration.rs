@@ -8,6 +8,19 @@ pub(super) fn migrate_v2_to_v3(value: &mut Value, _: &MigrationContext) -> Resul
         return Ok(());
     }
     let document = value.as_object_mut().ok_or("registry must be an object")?;
+    // 1.x ran every client in Lazy unless the user picked another mode. 2.0 treats an
+    // unset mode as Auto, which moves some clients to Full, so keep what upgraders had.
+    let lazy = document
+        .get("lazyDiscovery")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mode_set = document
+        .get("discoveryMode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| !mode.trim().is_empty());
+    if lazy && !mode_set {
+        document.insert("discoveryMode".into(), Value::String("lazy".into()));
+    }
     // Malformed typed fields are left to the framework's deserialization/recovery path.
     let Some(profiles) = document.get("profiles").and_then(Value::as_array) else {
         return Ok(());
@@ -164,6 +177,40 @@ mod tests {
         )
         .is_err());
         assert_eq!(value, original);
+    }
+
+    #[test]
+    fn upgraders_keep_the_lazy_discovery_they_had() {
+        let context = MigrationContext {
+            date: "2026-10-11".into(),
+            data_dir: std::env::temp_dir(),
+        };
+        for (lazy, mode, expected) in [
+            (None, None, Some("lazy")),
+            (Some(true), None, Some("lazy")),
+            (Some(false), None, None),
+            (Some(true), Some("grouped"), Some("grouped")),
+            (Some(true), Some(""), Some("lazy")),
+        ] {
+            let mut value = fixture(false);
+            if let Some(lazy) = lazy {
+                value["lazyDiscovery"] = json!(lazy);
+            }
+            if let Some(mode) = mode {
+                value["discoveryMode"] = json!(mode);
+            }
+            migrate_v2_to_v3(&mut value, &context).unwrap();
+            let reg: Registry = serde_json::from_value(value).unwrap();
+            assert_eq!(reg.discovery_mode.as_deref(), expected, "{lazy:?} {mode:?}");
+            // Codex and Cursor would resolve to Full under Auto.
+            for client in ["codex", "cursor", "claude-code"] {
+                let resolved = crate::clients::client_discovery_mode(&reg, client);
+                let want = if lazy == Some(false) { "full" } else { expected.unwrap() };
+                assert_eq!(resolved, want, "{client} {lazy:?} {mode:?}");
+            }
+        }
+        // A new install keeps Auto.
+        assert_eq!(Registry::default().discovery_mode, None);
     }
 
     #[test]
