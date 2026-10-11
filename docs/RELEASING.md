@@ -116,7 +116,9 @@ version, installer URL/hash and release notes URL filled from the release.
 
 Linux system packages now ship the GTK shell as `.deb` and `.rpm`, built once on
 Ubuntu 24.04 and tested before upload to the draft. The Tauri AppImage remains the
-fallback for Ubuntu 22.04 and keeps its in-app updater. Stable releases also
+fallback for Ubuntu 22.04, Debian 12 and older RPM distributions, and keeps its
+in-app updater. GTK debs require Ubuntu 24.04+ or Debian 13+; RPMs require
+GTK 4.14+, libadwaita 1.5+, GLib 2.80+ and glibc 2.39+. Stable releases also
 update AUR `toolport-bin` by repackaging the GTK deb, so existing AUR users can
 upgrade with their helper. The native pacman package remains an alternative. See
 [`docs/linux-packages.md`](linux-packages.md) for build and upgrade checks.

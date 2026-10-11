@@ -11,7 +11,7 @@
 # just made will not reach anyone using the short URL.
 #
 # Installs the latest signed release for your OS/arch:
-#   - Linux (x86_64): the .deb via apt where available, else the portable AppImage
+#   - Linux (x86_64): the GTK .deb on supported Debian/Ubuntu, else the Tauri AppImage
 #     into ~/.local/bin with a desktop entry.
 #   - macOS: copies Toolport.app from the signed .dmg into /Applications (Homebrew is
 #     the cleaner path, and this script points you there).
@@ -40,12 +40,91 @@ err() {
 }
 need() { command -v "$1" >/dev/null 2>&1 || err "This installer needs '$1' on your PATH."; }
 
-need curl
 os="$(uname -s)"
 arch="$(uname -m)"
 
-# Fetch the latest-release metadata once (unauthenticated API is rate-limited, so don't
-# hammer it), then resolve pieces out of the JSON with grep/sed (no jq dependency).
+# Read values as data, never execute os-release (also used by fixture tests).
+os_value() {
+  sed -n "s/^$1=//p" "${TOOLPORT_OS_RELEASE:-/etc/os-release}" 2>/dev/null |
+    tr -d "\"'" | head -n1
+}
+
+version_at_least() {
+  [[ "$1" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
+  awk -v actual="$1" -v floor="$2" 'BEGIN {
+    n = split(actual, a, "."); m = split(floor, b, ".")
+    for (i = 1; i <= n || i <= m; i++) {
+      if (a[i]+0 > b[i]+0) exit 0
+      if (a[i]+0 < b[i]+0) exit 1
+    }
+    exit 0
+  }'
+}
+
+# Known releases meet every ABI floor in packaging/linux/native/nfpm.yaml.
+# Derivatives can report their Ubuntu base; otherwise inspect apt candidates
+# without refreshing repositories or installing anything. Unknown means portable.
+deb_supported() {
+  local distro version package floor candidate
+  distro="$(os_value ID)"
+  version="$(os_value VERSION_ID)"
+  case "$distro" in
+    ubuntu) version_at_least "$version" 24.04; return ;;
+    debian) version_at_least "$version" 13; return ;;
+  esac
+  version="$(os_value UBUNTU_VERSION_ID)"
+  if [ -n "$version" ]; then
+    version_at_least "$version" 24.04
+    return
+  fi
+  command -v apt-cache >/dev/null 2>&1 || return 1
+  for package in libgtk-4-1 libadwaita-1-0 libglib2.0-0t64 libc6; do
+    case "$package" in
+      libgtk-4-1) floor=4.14 ;;
+      libadwaita-1-0) floor=1.5 ;;
+      libglib2.0-0t64) floor=2.80 ;;
+      libc6) floor=2.39 ;;
+    esac
+    candidate="$(apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+    [ -n "$candidate" ] && [ "$candidate" != "(none)" ] &&
+      dpkg --compare-versions "$candidate" ge "$floor" || return 1
+  done
+}
+
+linux_plan() {
+  linux_package=appimage
+  linux_reason=""
+  local os_release="${TOOLPORT_OS_RELEASE:-/etc/os-release}"
+  if grep -qE '^(ID|ID_LIKE)=.*\b(debian|ubuntu)\b' "$os_release" 2>/dev/null &&
+    command -v dpkg >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+    if deb_supported; then
+      linux_package=deb
+    else
+      linux_reason="Using AppImage: the GTK .deb needs Ubuntu 24.04+/Debian 13+ or equivalent libraries; this system does not meet the detected requirements."
+    fi
+  elif command -v pacman >/dev/null 2>&1 &&
+    grep -qE '^(ID|ID_LIKE)=.*\barch\b' "$os_release" 2>/dev/null; then
+    linux_package=pacman
+  elif grep -qE '^(ID|ID_LIKE)=.*\b(fedora|rhel|centos)\b' "$os_release" 2>/dev/null; then
+    linux_reason="Using AppImage on this RPM distro; the manual GTK RPM needs GTK 4.14+, libadwaita 1.5+, GLib 2.80+ and glibc 2.39+ (older Fedora/RHEL do not meet these requirements)."
+  fi
+}
+
+# Offline and read-only: useful before installing and in minimal distro containers.
+case "${1:-}" in
+  --print-plan)
+    [ "$os" = Linux ] && [ "$arch" = x86_64 ] || err "Print-plan supports Linux x86_64 only."
+    linux_plan
+    [ -z "$linux_reason" ] || say "$linux_reason"
+    printf 'package=%s\n' "$linux_package"
+    exit 0
+    ;;
+  "") ;;
+  *) err "Usage: bash install.sh [--print-plan]" ;;
+esac
+
+need curl
+# Fetch release metadata once, after print-plan so that mode needs no network.
 release_json="$(curl -fsSL "$API")" || err "Couldn't reach the GitHub releases API."
 tag_name="$(printf '%s' "$release_json" |
   grep -o '"tag_name": *"[^"]*"' | sed 's/.*: *"\([^"]*\)".*/\1/' | head -n1)"
@@ -250,15 +329,9 @@ install_linux() {
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
 
-  # Prefer the .deb on Debian/Ubuntu: it links the system WebKitGTK and is the most
-  # reliable package (see README). Fall back to the no-root AppImage everywhere else.
-  # Detected from os-release like the Arch branch below, not from `command -v dpkg`
-  # alone: dpkg and apt-get exist on hosts that are not Debian (an Ubuntu CI runner
-  # simulating another distribution, a box with them installed for other reasons),
-  # and the tests need to simulate either host regardless of what they run on.
-  os_release="${TOOLPORT_OS_RELEASE:-/etc/os-release}"
-  if grep -qE '^(ID|ID_LIKE)=.*\b(debian|ubuntu)\b' "$os_release" 2>/dev/null &&
-    command -v dpkg >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+  linux_plan
+  [ -z "$linux_reason" ] || say "$linux_reason"
+  if [ "$linux_package" = deb ]; then
     url="$(asset_url '_amd64[.]deb')"
     [ -n "$url" ] || err "No .deb found in $tag_name."
     digest="$(asset_field '_amd64[.]deb' digest)"
@@ -272,28 +345,18 @@ install_linux() {
     fi
     say "Installing with apt${sudo:+ (you may be prompted for your password)}"
     $sudo apt-get install -y "$tmp/toolport.deb"
-    # The .deb still ships the crate binary as `conduit` and adds a `toolport`
-    # wrapper on PATH (see packaging/linux/deb/toolport). AppImage below is
-    # installed as `$bindir/toolport` as well.
+    # The GTK package keeps toolport/conduit CLI aliases for existing installs.
     say "Installed. Launch Toolport from your app menu, or run: toolport"
     return
   fi
 
-  # Arch and derivatives get the native GTK package from Toolport's own pacman
-  # repository, so updates arrive with `pacman -Syu` like everything else rather
-  # than needing a Toolport-specific command or a self-updater fighting pacman.
-  # The AppImage below stays the fallback for every other distribution.
-  # Detected from os-release, not from `command -v pacman`: a Debian box can have
-  # pacman installed without being Arch, and the tests need to simulate either
-  # host regardless of what they are running on. Omarchy reports ID=omarchy with
-  # ID_LIKE=arch, so both fields are checked.
-  if command -v pacman >/dev/null 2>&1 &&
-    grep -qE '^(ID|ID_LIKE)=.*\barch\b' "$os_release" 2>/dev/null; then
+  # Preserve the signed pacman repository path on Arch and derivatives.
+  if [ "$linux_package" = pacman ]; then
     install_arch_repo
     return
   fi
 
-  url="$(asset_url '_amd64[.]AppImage')"
+  url="$(asset_url '_amd64[.]AppImage' || true)"
   [ -n "$url" ] || err "No AppImage found in $tag_name."
   bindir="${XDG_BIN_HOME:-$HOME/.local/bin}"
   mkdir -p "$bindir"

@@ -119,7 +119,7 @@ EOF
   # box, where the real pacman is on PATH and cannot be shadowed away, nor on
   # the Ubuntu CI runner, where dpkg and apt-get are.
   printf 'ID=fedora\n' > "$shim_dir/os-release-generic"
-  printf 'ID=ubuntu\nID_LIKE=debian\n' > "$shim_dir/os-release-debian"
+  printf 'ID=ubuntu\nID_LIKE=debian\nVERSION_ID=24.04\n' > "$shim_dir/os-release-debian"
   printf 'ID=omarchy\nID_LIKE=arch\n' > "$shim_dir/os-release-arch"
 
   # Shadowing the AUR helpers still matters on an Arch box: without it a stray
@@ -393,6 +393,66 @@ else
   echo "  FAIL: an AppImage was installed on Debian"; fail=$((fail + 1))
 fi
 rm -rf "$deb_workdir"
+
+echo "Linux compatibility: native packages or portable fallback"
+compat_dir="$(mktemp -d)"
+make_shim "$compat_dir/shim" "$(fake_release "sha256:$fake_sha256" 64)
+$(fake_release_deb "sha256:$fake_sha256" 64)"
+mkdir -p "$compat_dir/home" "$compat_dir/bin"
+for helper in dpkg apt-get sudo; do
+  cat > "$compat_dir/shim/$helper" <<EOF
+#!/usr/bin/env bash
+printf '%s %s\n' "$helper" "\$*" >> "$compat_dir/native.log"
+exit 0
+EOF
+  chmod +x "$compat_dir/shim/$helper"
+done
+# Unknown derivatives must not accidentally use the host's apt repositories.
+printf '#!/usr/bin/env bash\necho "  Candidate: (none)"\n' > "$compat_dir/shim/apt-cache"
+chmod +x "$compat_dir/shim/apt-cache"
+while IFS='|' read -r label release expected; do
+  printf '%b\n' "$release" > "$compat_dir/os-release"
+  rm -f "$compat_dir/native.log" "$compat_dir/bin/toolport"
+  result="$(PATH="$compat_dir/shim:$PATH" HOME="$compat_dir/home" XDG_BIN_HOME="$compat_dir/bin" \
+    TOOLPORT_OS_RELEASE="$compat_dir/os-release" bash "$INSTALL_SH" 2>&1)"
+  if [ "$expected" = deb ]; then
+    check "$label installs with apt" "Installing with apt" "$result"
+    if [ -s "$compat_dir/native.log" ] && [ ! -e "$compat_dir/bin/toolport" ]; then
+      pass=$((pass + 1))
+    else
+      echo "  FAIL: $label selected wrong artifact"; fail=$((fail + 1))
+    fi
+  else
+    check "$label explains fallback" "Using AppImage" "$result"
+    check "$label verifies AppImage" "sha256 verified: $fake_sha256" "$result"
+    if [ -x "$compat_dir/bin/toolport" ] && [ ! -e "$compat_dir/native.log" ]; then
+      pass=$((pass + 1))
+    else
+      echo "  FAIL: $label touched a package manager or missed AppImage"; fail=$((fail + 1))
+    fi
+  fi
+  # No curl invocation allowed in the offline plan, and no file changes.
+  printf '#!/usr/bin/env bash\nexit 99\n' > "$compat_dir/shim/curl"
+  plan="$(PATH="$compat_dir/shim:$PATH" TOOLPORT_OS_RELEASE="$compat_dir/os-release" bash "$INSTALL_SH" --print-plan)"
+  check "$label offline plan" "package=$expected" "$plan"
+  make_shim "$compat_dir/shim" "$(fake_release "sha256:$fake_sha256" 64)
+$(fake_release_deb "sha256:$fake_sha256" 64)"
+done <<'CASES'
+Ubuntu 22.04|ID=ubuntu\nVERSION_ID="22.04"|appimage
+Ubuntu 24.04|ID=ubuntu\nVERSION_ID="24.04"|deb
+Ubuntu 24.10|ID=ubuntu\nVERSION_ID=24.10|deb
+Debian 12|ID=debian\nVERSION_ID="12"|appimage
+Debian 13|ID=debian\nVERSION_ID="13"|deb
+Mint old base|ID=linuxmint\nID_LIKE="ubuntu debian"\nVERSION_ID=21.3\nUBUNTU_VERSION_ID=22.04|appimage
+Mint new base|ID=linuxmint\nID_LIKE="ubuntu debian"\nVERSION_ID=22\nUBUNTU_VERSION_ID=24.04|deb
+Unknown derivative|ID=example\nID_LIKE=debian|appimage
+Missing version|ID=ubuntu|appimage
+Invalid version|ID=ubuntu\nVERSION_ID=unknown|appimage
+Fedora 39|ID=fedora\nVERSION_ID=39|appimage
+Fedora 44|ID=fedora\nVERSION_ID=44|appimage
+RHEL 9|ID=rhel\nVERSION_ID=9.6|appimage
+CASES
+rm -rf "$compat_dir"
 
 echo
 echo "$pass passed, $fail failed"
