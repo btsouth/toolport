@@ -681,11 +681,11 @@ it("shows indented settings pages with an active row and pending count", async (
       />
     </TooltipProvider>,
   );
-  expect(screen.getByRole("button", { name: "Tools", exact: true })).toHaveAttribute(
+  expect(screen.getByRole("button", { name: "Tools" })).toHaveAttribute(
     "aria-current",
     "page",
   );
   expect(screen.getByLabelText("3 pending approvals")).toHaveTextContent("3");
-  await userEvent.click(screen.getByRole("button", { name: "Safety", exact: true }));
+  await userEvent.click(screen.getByRole("button", { name: "Safety" }));
   expect(selectPage).toHaveBeenCalledWith("safety");
 });
