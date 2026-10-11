@@ -11715,6 +11715,9 @@ struct ToolScopeViews {
 struct ToolScopeBase {
     base: Arc<Router>,
     by_profile: HashMap<String, ProfileToolView>,
+    /// The base router's own catalog, for requests that need no scoped view.
+    /// Building it indexes every tool, so it must not happen per request.
+    unscoped: Option<Arc<CatalogSnapshot>>,
 }
 
 struct ProfileToolView {
@@ -12932,14 +12935,12 @@ impl HostState {
             .map(|profile| reg.resolve_profile_id(profile))
             .unwrap_or_default();
         let limit = clients::client_tool_name_limit(client, clients::GATEWAY_ENTRY_NAME);
-        if limit == 64
+        let unscoped = limit == 64
             && !resolved.starts_with("@all-enabled:")
-            && reg.access_profile(&resolved).is_none()
-        {
-            let catalog = Arc::new(CatalogSnapshot::new(base.shared_tools()));
-            return (base, catalog);
-        }
-        let allow: HashMap<String, HashSet<String>> = if profile.is_some() {
+            && reg.access_profile(&resolved).is_none();
+        let allow: HashMap<String, HashSet<String>> = if unscoped {
+            HashMap::new()
+        } else if profile.is_some() {
             adapter_tool_scope(reg, &resolved)
                 .into_iter()
                 .map(|(server, tools)| (server, tools.into_iter().collect()))
@@ -12953,13 +12954,17 @@ impl HostState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let rooted_live = self
+        let rooted: Vec<Arc<Router>> = self
             .root_launch_pool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .views
             .values()
-            .any(|view| Arc::ptr_eq(view, &base));
+            .cloned()
+            .collect();
+        let rooted_live = rooted.iter().any(|view| Arc::ptr_eq(view, &base));
+        // Declared before the lock guard so retired views drop after it is released.
+        let mut retired = Vec::new();
         let mut views = self
             .tool_scope_views
             .lock()
@@ -12967,11 +12972,30 @@ impl HostState {
         if !Arc::ptr_eq(&live, &base) && !rooted_live {
             // A rebuild won after this request took its snapshot. Keep serving
             // that snapshot, but never pin its old downstream slots in the host.
+            if unscoped {
+                drop(views);
+                let catalog = Arc::new(CatalogSnapshot::new(base.shared_tools()));
+                return (base, catalog);
+            }
             let view = Arc::new(base.with_client_tool_view(allow, limit));
             let catalog = Arc::new(CatalogSnapshot::new(view.shared_tools()));
             return (view, catalog);
         }
         let key = Arc::as_ptr(&base) as usize;
+        if !views.by_base.contains_key(&key) {
+            // Views of routers that are neither live nor rooted are never served
+            // again, but each pins a router and an indexed catalog.
+            let stale: Vec<usize> = views
+                .by_base
+                .iter()
+                .filter(|(_, view)| {
+                    !Arc::ptr_eq(&view.base, &live)
+                        && !rooted.iter().any(|root| Arc::ptr_eq(root, &view.base))
+                })
+                .map(|(key, _)| *key)
+                .collect();
+            retired.extend(stale.iter().filter_map(|key| views.by_base.remove(key)));
+        }
         if !views.by_base.contains_key(&key) && views.by_base.len() >= 32 {
             if let Some(oldest) = views.by_base.keys().next().copied() {
                 views.by_base.remove(&oldest);
@@ -12980,8 +13004,16 @@ impl HostState {
         let scoped = views.by_base.entry(key).or_insert_with(|| ToolScopeBase {
             base: Arc::clone(&base),
             by_profile: HashMap::new(),
+            unscoped: None,
         });
         debug_assert!(Arc::ptr_eq(&scoped.base, &base));
+        if unscoped {
+            let catalog = scoped
+                .unscoped
+                .get_or_insert_with(|| Arc::new(CatalogSnapshot::new(base.shared_tools())));
+            let catalog = Arc::clone(catalog);
+            return (base, catalog);
+        }
         if let Some(view) = scoped.by_profile.get(&view_key) {
             if view.allow == allow {
                 return (Arc::clone(&view.router), Arc::clone(&view.catalog));
@@ -23744,6 +23776,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn unscoped_requests_reuse_one_catalog_snapshot() {
+        let _env = DataDirTestEnv::new("unscoped-snapshot-reuse");
+        let state = http_state(false);
+        let (reg, router, catalog) = tool_surface_fixture();
+        *state.registry.lock().unwrap() = reg.clone();
+        *state.router.lock().unwrap() = Arc::clone(&router);
+        *state.cached_tools.lock().unwrap() = catalog;
+        let (_, first) = state.router_for_client_view(Arc::clone(&router), &reg, None, Some("adapter:claude-code"));
+        let builds = CATALOG_SNAPSHOT_BUILDS.with(|count| count.get());
+        for _ in 0..3 {
+            let (view, again) =
+                state.router_for_client_view(Arc::clone(&router), &reg, None, Some("adapter:claude-code"));
+            assert!(Arc::ptr_eq(&view, &router));
+            assert!(Arc::ptr_eq(&again, &first), "unscoped catalog was rebuilt");
+        }
+        assert_eq!(CATALOG_SNAPSHOT_BUILDS.with(|count| count.get()), builds);
+        // A rebuilt router gets its own snapshot, and the old one is not pinned.
+        let rebuilt = Arc::new((*router).clone());
+        *state.router.lock().unwrap() = Arc::clone(&rebuilt);
+        let (_, fresh) = state.router_for_client_view(Arc::clone(&rebuilt), &reg, None, Some("adapter:claude-code"));
+        assert!(!Arc::ptr_eq(&fresh, &first));
+        let views = state.tool_scope_views.lock().unwrap();
+        assert!(views.by_base.values().all(|view| Arc::ptr_eq(&view.base, &rebuilt)));
     }
 
     #[test]
