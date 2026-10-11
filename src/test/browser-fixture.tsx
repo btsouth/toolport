@@ -626,6 +626,15 @@ mockIPC(
         if (server) server.enabled = args.enabled as boolean;
         return structuredClone(registry);
       }
+      case "personal_sync_local_only": {
+        const server = registry.servers.find((server) => server.id === args.serverId);
+        if (server) server.syncLocalOnly = args.localOnly as boolean;
+        return structuredClone(registry);
+      }
+      case "personal_sync_new_servers_local_only":
+        if (registry.team?.personalSyncState)
+          registry.team.personalSyncState.newServersLocalOnly = args.localOnly as boolean;
+        return structuredClone(registry);
       case "plugin:process|exit":
         return null;
       case "export_config":
