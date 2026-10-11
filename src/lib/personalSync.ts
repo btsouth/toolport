@@ -19,6 +19,7 @@ export interface PersonalSyncState {
   warnings?: Record<string, string>;
   signInRequired?: boolean;
   chooseLocalServers?: boolean;
+  newServersLocalOnly?: boolean;
 }
 export function isPersonalSync(registry: Registry | null | undefined): boolean {
   return (
