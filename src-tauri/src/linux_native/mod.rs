@@ -2607,6 +2607,29 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             // Access is not repeated here: the card's access button shows it.
         }
         detail
+    } else if client.gateway_state == state::ClientGatewayState::Connected {
+        // Toolport's own entry is the gateway, not one of the client's servers.
+        let mut detail = "Toolport gateway".to_string();
+        if client.other_server_count > 0 {
+            detail.push_str(&format!(
+                " · {} other {}",
+                client.other_server_count,
+                if client.other_server_count == 1 {
+                    "server"
+                } else {
+                    "servers"
+                }
+            ));
+        }
+        if client.movable_server_count > 0 {
+            detail.push_str(&format!(" · {} to import", client.movable_server_count));
+        }
+        detail.push_str(if client.shared_http {
+            " · Shared HTTP"
+        } else {
+            " · stdio"
+        });
+        detail
     } else {
         let mut detail = format!(
             "{} local MCP {}",
@@ -10399,7 +10422,7 @@ mod tests {
         let clients = ClientPage::new(&app, server_page);
         let fixture_clients = [("codex", "Codex", state::ClientGatewayState::Connected), ("cursor", "Cursor", state::ClientGatewayState::Disconnected), ("claude-code", "Claude Code", state::ClientGatewayState::Customized)].into_iter().map(|(id, name, gateway_state)| state::ClientView {
             id: id.into(), name: name.into(), app_present: true, config_exists: true,
-            uses_connectors: false, server_count: 2, movable_server_count: 0, gateway_state,
+            uses_connectors: false, server_count: 2, movable_server_count: 0, other_server_count: 2, gateway_state,
             shared_http: false, legacy_bearer_argv: false, scope_id: None, scope_name: None,
             discovery_mode: Some("lazy".into()), config_error: false,
         }).collect();
@@ -10552,6 +10575,7 @@ mod tests {
             uses_connectors: false,
             server_count: 2,
             movable_server_count: 0,
+            other_server_count: 2,
             gateway_state: state::ClientGatewayState::Disconnected,
             shared_http: false,
             legacy_bearer_argv: false,
@@ -10572,12 +10596,12 @@ mod tests {
             let name = copy.first_child().unwrap();
             assert!(name.tooltip_text().unwrap().contains("Client id: cursor"));
             let detail = name.next_sibling().unwrap();
-            assert!(detail
-                .clone()
-                .downcast::<gtk::Label>()
-                .unwrap()
-                .text()
-                .starts_with("2 local MCP servers"));
+            let text = detail.clone().downcast::<gtk::Label>().unwrap().text();
+            if state == state::ClientGatewayState::Connected {
+                assert_eq!(text, "Toolport gateway · 2 other servers · stdio");
+            } else {
+                assert!(text.starts_with("2 local MCP servers"));
+            }
             assert_eq!(
                 detail.next_sibling().is_some(),
                 state == state::ClientGatewayState::Connected
@@ -10619,6 +10643,7 @@ mod tests {
             uses_connectors: false,
             server_count: 1,
             movable_server_count: 0,
+            other_server_count: 2,
             gateway_state: state::ClientGatewayState::Customized,
             shared_http: true,
             legacy_bearer_argv: true,

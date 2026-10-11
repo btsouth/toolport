@@ -369,6 +369,8 @@ pub(super) struct ClientView {
     /// migration would import and then move out of the client. Plugin-detected
     /// servers are excluded because migration leaves them untouched.
     pub(super) movable_server_count: usize,
+    /// Servers the client lists besides Toolport's own entry, plugins included.
+    pub(super) other_server_count: usize,
     pub(super) gateway_state: ClientGatewayState,
     pub(super) shared_http: bool,
     pub(super) legacy_bearer_argv: bool,
@@ -392,6 +394,12 @@ impl ClientView {
                 .iter()
                 .filter(|server| !crate::clients::detected_is_gateway(server))
                 .count(),
+            other_server_count: client
+                .servers
+                .iter()
+                .filter(|server| !crate::clients::detected_is_gateway(server))
+                .count()
+                + client.plugin_servers.len(),
             gateway_state: match client.entry_state {
                 crate::clients::GatewayEntryState::Managed => ClientGatewayState::Connected,
                 crate::clients::GatewayEntryState::Customized => ClientGatewayState::Customized,

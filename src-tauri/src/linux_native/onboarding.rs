@@ -951,6 +951,7 @@ mod tests {
                 uses_connectors: false,
                 server_count: 1,
                 movable_server_count: 0,
+                other_server_count: 0,
                 gateway_state: ClientGatewayState::Connected,
                 shared_http: false,
                 legacy_bearer_argv: false,
