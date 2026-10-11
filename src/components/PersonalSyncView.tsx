@@ -222,7 +222,10 @@ export function PersonalSyncView({
           Math.floor((now - sync.lastSyncedAt) / 60_000) === 1 ? "minute" : "minutes"
         } ago`
     : null;
-  const summary = Object.keys(sync?.conflicts ?? {}).length
+  const failed = !!(error || sync?.error || team?.accountStatusError);
+  const summary = failed
+    ? "Last sync did not finish"
+    : Object.keys(sync?.conflicts ?? {}).length
     ? "Changes need your choice"
     : arrivals.length
       ? `${arrivals.length} ${arrivals.length === 1 ? "server is" : "servers are"} waiting for review on this machine`
@@ -246,7 +249,7 @@ export function PersonalSyncView({
   }
   return (
     <div className="mx-auto max-w-2xl space-y-4">
-      <h2 className="text-base font-semibold">Sync</h2>
+      <h2 className="text-[22px] font-[650] tracking-tight">Sync</h2>
       {!team && (
         <p className="text-sm text-muted-foreground">
           Set up once. Your servers follow you to every machine. Secret values and
