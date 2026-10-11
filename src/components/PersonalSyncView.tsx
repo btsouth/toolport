@@ -204,15 +204,23 @@ export function PersonalSyncView({
     (s) => s.teamEnableReview === true && !s.enabled && !s.syncLocalOnly,
   );
   const [comparing, setComparing] = useState<string | null>(null);
+  // Read the clock in state so "Last synced" stays current without impure renders.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, []);
   const needsYou =
     !!sync?.chooseLocalServers ||
     arrivals.length > 0 ||
     !!Object.keys(sync?.conflicts ?? {}).length ||
     !!Object.keys(sync?.publishErrors ?? {}).length;
   const lastSynced = sync?.lastSyncedAt
-    ? Date.now() - sync.lastSyncedAt < 60_000
+    ? now - sync.lastSyncedAt < 60_000
       ? "Last synced just now"
-      : `Last synced ${Math.floor((Date.now() - sync.lastSyncedAt) / 60_000)} minutes ago`
+      : `Last synced ${Math.floor((now - sync.lastSyncedAt) / 60_000)} ${
+          Math.floor((now - sync.lastSyncedAt) / 60_000) === 1 ? "minute" : "minutes"
+        } ago`
     : null;
   const summary = Object.keys(sync?.conflicts ?? {}).length
     ? "Changes need your choice"
