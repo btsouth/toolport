@@ -216,12 +216,12 @@ function Welcome({
     {
       icon: Sparkles,
       title: "Up to 91% fewer tokens",
-      body: "Your agent loads a few meta-tools instead of hundreds of schemas.",
+      body: "In Lazy mode your agent loads a few tools and searches for the rest.",
     },
     {
       icon: ShieldCheck,
       title: "Watched for tampering",
-      body: "Tool definitions are screened for suspicious changes. All returned content is labeled as untrusted data.",
+      body: "Changed tool definitions are flagged for review, and results that look like prompt injection show up in Activity.",
     },
   ];
   return (
@@ -694,10 +694,10 @@ function Done({
         {ready ? (
           <>
             {servingSummary(health ?? [], connectedCount)} Toggle one on or off and your
-            clients update live, no restart. Each client loads a handful of Toolport
-            meta-tools instead of every downstream tool, up to 91% fewer tokens at the
-            same task success. And Toolport watches every server for tampering and prompt
-            injection, see Activity.
+            clients update live, no restart. In Lazy mode a client loads a handful of
+            Toolport tools instead of every downstream tool, up to 91% fewer tokens at the
+            same task success in our benchmark. Toolport also flags changed tool
+            definitions and results that look like prompt injection in Activity.
           </>
         ) : configured && checkingHealth ? (
           <>
