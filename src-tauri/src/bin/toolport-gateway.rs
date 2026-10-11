@@ -4711,11 +4711,13 @@ fn execute_call(
         return json!({"content": [{"type": "text", "text": STALE_LIVE_VIEW}], "isError": true});
     }
     // A visible server the user turned off is a block, not an unknown tool.
+    // A tool blocked for a more specific reason (quarantine, safety) says that instead.
+    let turned_off =
+        |id: &str| reg.servers.iter().any(|server| server.id == id) && !reg.server_enabled(id);
     if view.route_of(name).is_none()
+        && !view.is_blocked(name)
         && !candidates.is_empty()
-        && candidates
-            .iter()
-            .all(|id| visible(id) && !reg.server_enabled(id))
+        && candidates.iter().all(|id| visible(id) && turned_off(id))
     {
         let text = format!(
             "Blocked by Toolport: {name} is on a server that is turned off. Change it in Toolport > Servers."
