@@ -1294,7 +1294,10 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
             .build(),
     );
     let target = crate::personal_sync::execution_review_lines(&server).join("\n");
-    copy.append(&execution_review_content(&server));
+    // A server turned off on another machine has nothing to confirm here.
+    if server.needs_team_enable_review() {
+        copy.append(&execution_review_content(&server));
+    }
     row.append(&copy);
     let original = crate::registry::load().ok().and_then(|r| {
         let id = r.team.as_ref()?.managed_server_ids.get(&server.id)?;
@@ -1786,6 +1789,8 @@ mod tests {
         let mut text = String::new(); collect(page.root.upcast_ref(), &mut text);
         assert!(text.contains("Toolport docs changed on both machines")); assert!(text.contains("This machine")); assert!(text.contains("Other machine")); assert!(text.contains("URL:"));
         assert!(!text.contains("Sync is up to date")); assert!(!text.contains("Review and enable")); assert!(text.contains("Turned off")); assert!(!page.plan_badge.is_visible());
+        // Turned off elsewhere, nothing to confirm: no review text.
+        assert!(!text.contains("New server")); assert!(!text.contains("Nothing in this definition changed"));
     }
 
     use super::share_preview_dialog;
