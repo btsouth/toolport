@@ -563,7 +563,9 @@ describe("ClientDetail Auto discovery", () => {
     );
     expect(screen.getByText("Auto (lazy)")).toBeInTheDocument();
     expect(
-      screen.getByText("Search, then call tools. Client per-tool permission rules need Full mode."),
+      screen.getByText(
+        "Search, then call tools. Client per-tool permission rules need Full mode.",
+      ),
     ).toBeInTheDocument();
   });
   it.each(["grouped", " GROUPED "])(
