@@ -16174,7 +16174,7 @@ fn process_request_wire_inner(
                 .map(str::to_string),
         );
         let _capabilities = UpstreamCapabilitiesGuard::enter(req);
-        let (full, exposed) = cached_tool_surfaces(
+        let (mut full, mut exposed) = cached_tool_surfaces(
             state,
             &reg,
             &router,
@@ -16183,6 +16183,23 @@ fn process_request_wire_inner(
             profile_snapshot.as_deref(),
             discovery,
         );
+        let discovery = if discovery == DiscoveryMode::Full
+            && over_client_tool_limit(client, exposed.tool_count())
+        {
+            // The client would drop every tool, so answer with search instead.
+            (full, exposed) = cached_tool_surfaces(
+                state,
+                &reg,
+                &router,
+                &cache_snapshot,
+                allowed,
+                profile_snapshot.as_deref(),
+                DiscoveryMode::Lazy,
+            );
+            DiscoveryMode::Lazy
+        } else {
+            discovery
+        };
         if discovery != DiscoveryMode::Full {
             savings::record_catalog_surfaces(
                 &guard.catalog,
