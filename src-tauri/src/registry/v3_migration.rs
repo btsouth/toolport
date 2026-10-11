@@ -122,6 +122,8 @@ fn keep_v1_lazy_discovery(document: &mut serde_json::Map<String, Value>) {
         .and_then(Value::as_str)
         .is_some_and(|mode| !mode.trim().is_empty());
     if lazy && !mode_set {
+        // A blank mode meant the same default; 2.0 never writes one.
+        document.remove("discoveryMode");
         document.insert("legacyLazyDiscovery".into(), Value::Bool(true));
     }
 }
