@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ArgBinding, Registry } from "@/lib/types";
 import {
@@ -9,7 +9,7 @@ import {
   getRegistry,
   reconnectSync,
 } from "@/lib/api";
-import { HOSTED_TEAMS_URL, teamUrlError } from "@/lib/teamUrl";
+import { HOSTED_TEAMS_URL, TEAMS_CREATE_URL, teamUrlError } from "@/lib/teamUrl";
 import { accountStatusText, planName, syncSignInUrl } from "@/lib/personalSync";
 import { argumentValues } from "@/lib/executionReview";
 import { PRO_LINE, TEAMS_FREE_LINE } from "@/lib/teamsPlan";
@@ -18,6 +18,55 @@ import { visibleExecutionText as visibleText } from "@/lib/visibleExecutionText"
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Callout } from "./Callout";
+import { ServerLogo } from "./ServerLogo";
+
+function SectionLabel({
+  children,
+  className = "",
+}: {
+  children: string;
+  className?: string;
+}) {
+  return (
+    <h3
+      className={`mb-2 text-xs font-semibold tracking-[0.05em] text-muted-foreground uppercase ${className}`}
+    >
+      {children}
+    </h3>
+  );
+}
+
+/** One line in the Needs you block: a bold title, a muted detail, one action. */
+function AttentionItem({
+  title,
+  detail,
+  label,
+  role,
+  open,
+  expanded,
+  children,
+}: {
+  title: string;
+  detail?: string;
+  label?: string;
+  role?: string;
+  open?: boolean;
+  expanded?: ReactNode;
+  children?: ReactNode;
+}) {
+  return (
+    <div className="px-3.5 py-2.5" aria-label={label} role={role}>
+      <div className="flex items-center gap-3">
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-semibold">{title}</p>
+          {detail && <p className="text-xs text-muted-foreground">{detail}</p>}
+        </div>
+        {children}
+      </div>
+      {open && <div className="mt-3">{expanded}</div>}
+    </div>
+  );
+}
 
 function conflictFields(value: unknown): Record<string, string> {
   if (!value || typeof value !== "object") return { Server: "Removed" };
@@ -151,9 +200,42 @@ export function PersonalSyncView({
   const sync = team?.personalSyncState;
   // The sidebar badge counts these, so name them here and point to where the
   // review happens.
-  const waiting = registry.servers.filter(
-    (s) => s.teamEnableReview === true && !s.enabled,
-  ).length;
+  const arrivals = registry.servers.filter(
+    (s) => s.teamEnableReview === true && !s.enabled && !s.syncLocalOnly,
+  );
+  const [comparing, setComparing] = useState<string | null>(null);
+  // Read the clock in state so "Last synced" stays current without impure renders.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+  const needsYou =
+    !!sync?.chooseLocalServers ||
+    arrivals.length > 0 ||
+    !!Object.keys(sync?.conflicts ?? {}).length ||
+    !!Object.keys(sync?.publishErrors ?? {}).length;
+  const lastSynced = sync?.lastSyncedAt
+    ? now - sync.lastSyncedAt < 60_000
+      ? "Last synced just now"
+      : `Last synced ${Math.floor((now - sync.lastSyncedAt) / 60_000)} ${
+          Math.floor((now - sync.lastSyncedAt) / 60_000) === 1 ? "minute" : "minutes"
+        } ago`
+    : null;
+  const failed = !!(error || sync?.error || team?.accountStatusError);
+  const summary = failed
+    ? "Last sync did not finish"
+    : Object.keys(sync?.conflicts ?? {}).length
+      ? "Changes need your choice"
+      : arrivals.length
+        ? `${arrivals.length} ${arrivals.length === 1 ? "server is" : "servers are"} waiting for review on this machine`
+        : !lastSynced
+          ? "Waiting for first sync"
+          : Object.keys(sync?.pending ?? {}).length
+            ? "Changes waiting to sync"
+            : "Sync is up to date";
+  const healthy = summary === "Sync is up to date";
+  const statusLine = lastSynced ? `${summary} · ${lastSynced}` : summary;
   async function run(work: () => Promise<void>) {
     setBusy(true);
     setError(null);
@@ -167,11 +249,13 @@ export function PersonalSyncView({
   }
   return (
     <div className="mx-auto max-w-2xl space-y-4">
-      <h2 className="text-base font-semibold">Sync</h2>
-      <p className="text-sm text-muted-foreground">
-        Set up once. Your servers follow you to every machine. Secret values and approvals
-        stay on this machine.
-      </p>
+      <h2 className="text-[22px] font-[650] tracking-tight">Sync</h2>
+      {!team && (
+        <p className="text-sm text-muted-foreground">
+          Set up once. Your servers follow you to every machine. Secret values and
+          approvals stay on this machine.
+        </p>
+      )}
       {(error || sync?.error || team?.accountStatusError) && (
         <Callout variant="danger">
           <p role="alert">{error || sync?.error || team?.accountStatusError}</p>
@@ -249,184 +333,298 @@ export function PersonalSyncView({
         </>
       ) : (
         <>
-          <section className="space-y-3 rounded-lg border p-4" aria-label="Your account">
-            <h3 className="font-medium">Your account</h3>
+          <div className="flex items-center gap-3">
+            <p
+              className={`flex-1 text-sm ${healthy ? "text-success" : "text-muted-foreground"}`}
+            >
+              {statusLine}
+            </p>
             {sync?.signInRequired ? (
-              <p>
-                Saved account plan: {planName(status?.plan)}. Sign in to confirm your
-                account and resume sync.
-              </p>
-            ) : status ? (
-              accountStatusText(status).map((line) => (
-                <p key={line} className="text-sm">
-                  {line}
-                </p>
-              ))
-            ) : (
-              <p>Account status unavailable. Retry sync.</p>
-            )}
-            {!sync?.signInRequired && (
-              <p className="text-sm">
-                {sync?.lastSyncedAt
-                  ? `Last synced ${new Date(sync.lastSyncedAt).toLocaleString()}`
-                  : "Waiting for first sync"}
-              </p>
-            )}
-            {!!Object.keys(sync?.pending ?? {}).length && (
-              <p className="text-sm">Changes waiting to sync</p>
-            )}
-            {waiting > 0 && (
-              <p className="text-sm">
-                {waiting === 1
-                  ? "1 server is waiting for review on this machine."
-                  : `${waiting} servers are waiting for review on this machine.`}
-              </p>
-            )}
-            <div className="flex gap-2">
-              {sync?.signInRequired ? (
-                // Sync cannot succeed without sign-in. Sign out stays: it clears
-                // the saved account and its token.
-                <Button disabled={busy} onClick={() => void run(() => reconnectSync())}>
-                  Sign in
-                </Button>
-              ) : (
-                <Button
-                  disabled={busy}
-                  onClick={() =>
-                    void run(async () => {
-                      await teamSync();
-                      onRegistryChange(await getRegistry());
-                    })
-                  }
-                >
-                  Sync now
-                </Button>
-              )}
-              {waiting > 0 && onOpenServers && (
-                <Button variant="outline" onClick={onOpenServers}>
-                  Review in Servers
-                </Button>
-              )}
-              <Button
-                variant="outline"
-                onClick={() => void run(() => openExternal(team.serverUrl))}
-              >
-                Your account
+              // Sync cannot succeed without sign-in.
+              <Button disabled={busy} onClick={() => void run(() => reconnectSync())}>
+                Sign in
               </Button>
+            ) : (
               <Button
-                variant="outline"
                 disabled={busy}
                 onClick={() =>
-                  void run(async () => onRegistryChange(await teamDisconnect()))
+                  void run(async () => {
+                    await teamSync();
+                    onRegistryChange(await getRegistry());
+                  })
                 }
               >
-                Sign out
+                Sync now
               </Button>
-            </div>
-          </section>
-          {sync?.chooseLocalServers && (
-            <section
-              className="space-y-3 rounded-lg border p-4"
-              aria-label="Choose local servers to sync"
-            >
-              <h3 className="font-medium">Choose local servers to sync</h3>
-              <p className="text-sm">
-                Your account now has one person. Existing local servers stay on this
-                machine unless you choose them here.
-              </p>
-              {registry.servers
-                .filter((s) => !s.source?.startsWith("team:"))
-                .map((s) => (
-                  <label key={s.id} className="flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={!s.syncLocalOnly}
+            )}
+          </div>
+          {needsYou && (
+            <section aria-label="Needs you">
+              <SectionLabel>Needs you</SectionLabel>
+              <div className="divide-y divide-warning/15 rounded-r-lg border-l-3 border-warning bg-warning/7">
+                {sync?.chooseLocalServers && (
+                  <AttentionItem
+                    title="Choose which servers sync"
+                    detail="Servers you already had start on This machine. Switch any you want everywhere below."
+                  >
+                    <Button
+                      size="sm"
+                      variant="outline"
                       disabled={busy}
-                      onChange={(e) => {
-                        const localOnly = !e.target.checked;
+                      onClick={() =>
                         void run(async () =>
                           onRegistryChange(
-                            await invoke<Registry>("personal_sync_local_only", {
-                              serverId: s.id,
-                              localOnly,
-                            }),
+                            await invoke<Registry>("personal_sync_finish_selection"),
                           ),
-                        );
-                      }}
-                    />
-                    {s.name}
-                  </label>
+                        )
+                      }
+                    >
+                      Done
+                    </Button>
+                  </AttentionItem>
+                )}
+                {arrivals.map((s) => (
+                  <AttentionItem
+                    key={s.id}
+                    title={`${visibleText(s.name)} arrived from another machine`}
+                    detail="Review it in Servers before it runs here."
+                  >
+                    {onOpenServers && (
+                      <Button size="sm" variant="outline" onClick={onOpenServers}>
+                        Open in Servers
+                      </Button>
+                    )}
+                  </AttentionItem>
                 ))}
-              <Button
-                disabled={busy}
-                onClick={() =>
-                  void run(async () =>
-                    onRegistryChange(
-                      await invoke<Registry>("personal_sync_finish_selection"),
-                    ),
-                  )
-                }
-              >
-                Done
-              </Button>
+                {Object.entries(sync?.conflicts ?? {}).map(([id, remote]) => {
+                  const name =
+                    registry.servers.find((s) => s.id === sync?.pending?.[id]?.localId)
+                      ?.name ??
+                    (remote as { name?: string } | null)?.name ??
+                    id;
+                  return (
+                    <AttentionItem
+                      key={id}
+                      label={`Sync conflict ${id}`}
+                      title={`${visibleText(name)} changed on two machines`}
+                      detail="Pick which version to keep. This machine's version is saved until you choose."
+                      open={comparing === id}
+                      expanded={
+                        <div className="space-y-3">
+                          <ConflictVersions
+                            local={sync?.pending?.[id]?.after}
+                            remote={remote}
+                          />
+                          {[true, false].map((keepMine) => (
+                            <Button
+                              key={String(keepMine)}
+                              className="mr-2"
+                              size="sm"
+                              variant="outline"
+                              disabled={busy}
+                              onClick={() =>
+                                void run(async () => {
+                                  onRegistryChange(
+                                    await invoke<Registry>(
+                                      "personal_sync_resolve_conflict",
+                                      {
+                                        id,
+                                        expected: sync?.conflictVersions?.[id],
+                                        keepMine,
+                                      },
+                                    ),
+                                  );
+                                  await teamSync();
+                                  onRegistryChange(await getRegistry());
+                                })
+                              }
+                            >
+                              {keepMine
+                                ? "Keep this machine's version"
+                                : "Use synced version"}
+                            </Button>
+                          ))}
+                        </div>
+                      }
+                    >
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        aria-expanded={comparing === id}
+                        onClick={() => setComparing(comparing === id ? null : id)}
+                      >
+                        Compare
+                      </Button>
+                    </AttentionItem>
+                  );
+                })}
+                {Object.entries(sync?.publishErrors ?? {}).map(([id, message]) => (
+                  <AttentionItem
+                    key={id}
+                    role="alert"
+                    title={`${
+                      registry.servers.find((s) => s.id === sync?.pending?.[id]?.localId)
+                        ?.name ?? id
+                    } could not sync`}
+                    detail={message}
+                  />
+                ))}
+              </div>
             </section>
           )}
-          {Object.entries(sync?.publishErrors ?? {}).map(([id, message]) => (
-            <Callout key={id} variant="warning">
-              <p role="alert">
-                {registry.servers.find((s) => s.id === sync?.pending?.[id]?.localId)
-                  ?.name ?? id}
-                : {message}
-              </p>
-            </Callout>
-          ))}
-          {Object.entries(sync?.conflicts ?? {}).map(([id, remote]) => (
-            <section
-              key={id}
-              className="space-y-2 rounded-lg border p-4"
-              aria-label={`Sync conflict ${id}`}
-            >
-              <h3 className="font-medium">
-                {registry.servers.find((s) => s.id === sync?.pending?.[id]?.localId)
-                  ?.name ??
-                  (remote as { name?: string } | null)?.name ??
-                  id}{" "}
-                changed on both machines
-              </h3>
-              <p className="text-sm">
-                Choose which version to keep. Your local version is saved until you
-                choose.
-              </p>
-              <ConflictVersions local={sync?.pending?.[id]?.after} remote={remote} />
-              {[true, false].map((keepMine) => (
+          <section aria-label="Servers">
+            <div className="flex items-center gap-2">
+              <SectionLabel className="flex-1">Servers</SectionLabel>
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                Sync new servers
+                <select
+                  className="rounded-md border bg-background px-2 py-1 text-xs text-foreground"
+                  value={sync?.newServersLocalOnly ? "here" : "every"}
+                  disabled={busy}
+                  onChange={(e) => {
+                    const localOnly = e.target.value === "here";
+                    void run(async () =>
+                      onRegistryChange(
+                        await invoke<Registry>("personal_sync_new_servers_local_only", {
+                          localOnly,
+                        }),
+                      ),
+                    );
+                  }}
+                >
+                  <option value="every">Every machine</option>
+                  <option value="here">This machine</option>
+                </select>
+              </label>
+            </div>
+            <ul className="divide-y">
+              {registry.servers.map((s) => {
+                const conflict = sync?.conflicts?.[s.teamOriginalId ?? s.id];
+                const tag = conflict
+                  ? "changed on two machines"
+                  : arrivals.includes(s)
+                    ? "needs review"
+                    : null;
+                return (
+                  <li key={s.id} className="flex items-center gap-3 py-2.5">
+                    <ServerLogo name={s.name} transport={s.transport} />
+                    <span className="min-w-0 flex-1 truncate font-medium" title={s.name}>
+                      {visibleText(s.name)}
+                      {tag && <span className="ml-2 text-xs text-warning">{tag}</span>}
+                    </span>
+                    <div
+                      role="radiogroup"
+                      aria-label={`Where ${s.name} lives`}
+                      className="flex shrink-0 rounded-lg border bg-muted/40 p-0.5"
+                    >
+                      {[false, true].map((localOnly) => {
+                        const active = !!s.syncLocalOnly === localOnly;
+                        return (
+                          <button
+                            key={String(localOnly)}
+                            type="button"
+                            role="radio"
+                            aria-checked={active}
+                            disabled={busy}
+                            title={
+                              localOnly
+                                ? "Stop syncing. Other machines keep their copy."
+                                : "Sync this server to your other machines"
+                            }
+                            className={`rounded-md px-2.5 py-1 text-xs ${
+                              active
+                                ? "bg-background font-semibold text-foreground shadow-sm"
+                                : "text-muted-foreground"
+                            }`}
+                            onClick={() => {
+                              if (active) return;
+                              void run(async () =>
+                                onRegistryChange(
+                                  await invoke<Registry>("personal_sync_local_only", {
+                                    serverId: s.id,
+                                    localOnly,
+                                  }),
+                                ),
+                              );
+                            }}
+                          >
+                            {localOnly ? "This machine" : "Every machine"}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </li>
+                );
+              })}
+              {!registry.servers.length && (
+                <li className="py-2.5 text-sm text-muted-foreground">
+                  No servers yet. Servers you add here show up on your other machines.
+                </li>
+              )}
+            </ul>
+            <p className="mt-2 text-xs text-muted-foreground">
+              Keys and sign-ins never leave a machine. Switching a server to This machine
+              stops syncing it; other machines keep their copy until you remove it there.
+            </p>
+          </section>
+          <section aria-label="Your account">
+            <SectionLabel>Account</SectionLabel>
+            <div className="divide-y">
+              <div className="flex items-center gap-3 py-2.5">
+                <div className="min-w-0 flex-1">
+                  <p className="font-medium">Your account</p>
+                  {sync?.signInRequired ? (
+                    <p className="text-xs text-muted-foreground">
+                      Saved account plan: {planName(status?.plan)}. Sign in to confirm
+                      your account and resume sync.
+                    </p>
+                  ) : status ? (
+                    accountStatusText(status).map((line) => (
+                      <p key={line} className="text-xs text-muted-foreground">
+                        {line}
+                      </p>
+                    ))
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      Account status unavailable. Retry sync.
+                    </p>
+                  )}
+                </div>
                 <Button
-                  key={String(keepMine)}
-                  className="mr-2"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void run(() => openExternal(team.serverUrl))}
+                >
+                  Manage plan
+                </Button>
+                <Button
+                  size="sm"
                   variant="outline"
                   disabled={busy}
                   onClick={() =>
-                    void run(async () => {
-                      onRegistryChange(
-                        await invoke<Registry>("personal_sync_resolve_conflict", {
-                          id,
-                          expected: sync?.conflictVersions?.[id],
-                          keepMine,
-                        }),
-                      );
-                      await teamSync();
-                      onRegistryChange(await getRegistry());
-                    })
+                    void run(async () => onRegistryChange(await teamDisconnect()))
                   }
                 >
-                  {keepMine ? "Keep this machine's version" : "Use synced version"}
+                  Sign out
                 </Button>
-              ))}
-            </section>
-          ))}
-          <p className="text-sm text-muted-foreground">
-            Edit your servers in Servers. Changes sync automatically. New commands need
-            approval on each machine. Use “Keep on this machine only” for a local setup.
-          </p>
+              </div>
+              <div className="flex items-center gap-3 py-2.5">
+                <div className="min-w-0 flex-1">
+                  <p className="font-medium">Teams</p>
+                  <p className="text-xs text-muted-foreground">
+                    Share servers with other people. Your own servers stay yours.
+                  </p>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void run(() => openExternal(TEAMS_CREATE_URL))}
+                >
+                  Create a team
+                </Button>
+              </div>
+            </div>
+          </section>
         </>
       )}
     </div>

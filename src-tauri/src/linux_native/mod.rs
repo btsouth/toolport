@@ -7498,12 +7498,24 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
                 action.activate(None);
             }
         });
+        // A server synced from another machine is reviewed right here; only
+        // team servers still go to the Teams page.
+        badge.set_visible(!personal);
         card.append(&badge);
-        let review = gtk::Button::with_label("Review references");
-        review.set_visible(!server.secret_references.is_empty());
+        let review = gtk::Button::with_label(if personal {
+            "Review and enable"
+        } else {
+            "Review references"
+        });
+        review.set_visible(personal || !server.secret_references.is_empty());
+        if personal {
+            review.add_css_class("suggested-action");
+        }
+        review.set_valign(gtk::Align::Center);
         let page = page.clone();
         let id = server.id.clone();
         let profile = profile_id.to_string();
+        let view = server.clone();
         review.connect_clicked(move |_| {
             let Ok(reg) = crate::registry::load() else {
                 return;
@@ -7511,7 +7523,7 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
             let Some(entry) = reg.servers.iter().find(|s| s.id == id).cloned() else {
                 return;
             };
-            if !crate::secret_refs::has_references(&entry) {
+            if !personal && !crate::secret_refs::has_references(&entry) {
                 return;
             }
             let Some(parent) = page.app.active_window() else {
@@ -7519,8 +7531,16 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
             };
             let dialog = adw::MessageDialog::new(
                 Some(&parent),
-                Some("Approve references and enable?"),
-                Some("Review the definition and saved authentication. Enable only a setup you trust."),
+                Some(&if personal {
+                    format!("Enable {}?", entry.name)
+                } else {
+                    "Approve references and enable?".into()
+                }),
+                Some(if personal {
+                    "This server arrived from another machine. Check what it runs before turning it on here. Keys stay on each machine."
+                } else {
+                    "Review the definition and saved authentication. Enable only a setup you trust."
+                }),
             );
             dialog.set_size_request(620, -1);
             dialog.set_extra_child(Some(&teams::execution_review_scroll(&entry)));
@@ -7529,6 +7549,7 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
             dialog.set_default_response(Some("cancel"));
             let profile = profile.clone();
             let page = page.clone();
+            let view = view.clone();
             dialog.connect_response(None, move |_, response| {
                 if response != "enable" {
                     return;
@@ -7536,11 +7557,25 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
                 let profile = profile.clone();
                 let entry = entry.clone();
                 let page = page.clone();
+                let view = view.clone();
                 gtk::glib::spawn_future_local(async move {
                     let result = gtk::gio::spawn_blocking(move || crate::registry_controller::set_server_enabled_after_reference_review(&profile, &entry)).await;
                     match result {
                         Ok(Ok(reg)) => page.render(state::RegistryState::Ready(state::RegistrySnapshot::from_registry(reg))),
-                        Ok(Err(e)) => page.show_feedback(&e, true),
+                        // A key this machine still needs: open where it goes.
+                        Ok(Err(e)) => match missing_value_editor(&e, &view.secret_keys) {
+                            Some(editor) => {
+                                page.show_feedback(
+                                    &format!("Could not turn on {}: {}", view.name, missing_value_hint(&e, &editor)),
+                                    true,
+                                );
+                                match editor {
+                                    MissingValueEditor::Credentials => open_credentials_editor(view, page.clone()),
+                                    MissingValueEditor::EditServer => open_server_editor(Some(view), page.clone()),
+                                }
+                            }
+                            None => page.show_feedback(&e, true),
+                        },
                         Err(_) => page.show_feedback("The reference review stopped. Retry enabling the server.", true),
                     }
                 });

@@ -2145,6 +2145,14 @@ fn personal_sync_portable(
     reload_into_state(state.inner())
 }
 #[tauri::command]
+fn personal_sync_new_servers_local_only(
+    state: State<RegistryState>,
+    local_only: bool,
+) -> Result<Registry, String> {
+    crate::personal_sync::set_new_servers_local_only(local_only)?;
+    reload_into_state(state.inner())
+}
+#[tauri::command]
 fn personal_sync_finish_selection(state: State<RegistryState>) -> Result<Registry, String> {
     crate::personal_sync::finish_local_selection()?;
     reload_into_state(state.inner())
@@ -4239,6 +4247,7 @@ pub fn run() {
             reconnect_sync,
             personal_sync_resolve_conflict,
             personal_sync_finish_selection,
+            personal_sync_new_servers_local_only,
             team_connect,
             team_join_poll,
             team_sync,

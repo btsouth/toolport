@@ -681,12 +681,13 @@ describe("Sync setup", () => {
     };
     invoke.mockResolvedValue(personal);
     render(<TeamsView registry={personal} onRegistryChange={vi.fn()} />);
-    expect(screen.getByLabelText("Choose local servers to sync")).toBeInTheDocument();
-    expect(screen.getByRole("checkbox", { name: "Private local" })).not.toBeChecked();
+    expect(screen.getByText("Choose which servers sync")).toBeInTheDocument();
+    const where = screen.getByRole("radiogroup", { name: "Where Private local lives" });
+    expect(within(where).getByRole("radio", { name: "This machine" })).toBeChecked();
     expect(screen.getByRole("alert")).toHaveTextContent(
-      "Private local: env: references cannot sync",
+      "Private local could not syncenv: references cannot sync",
     );
-    await userEvent.click(screen.getByRole("checkbox", { name: "Private local" }));
+    await userEvent.click(within(where).getByRole("radio", { name: "Every machine" }));
     expect(invoke).toHaveBeenCalledWith("personal_sync_local_only", {
       serverId: "local",
       localOnly: false,
@@ -711,6 +712,7 @@ describe("Sync setup", () => {
     invoke.mockResolvedValue(personal);
     api.getRegistry.mockResolvedValue(personal);
     render(<TeamsView registry={personal} onRegistryChange={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Compare" }));
     await userEvent.click(
       screen.getByRole("button", { name: "Keep this machine's version" }),
     );
@@ -973,7 +975,7 @@ it("does not show another team's successful sync time after switching teams", as
   await screen.findByText("Last successful sync: not recorded yet");
 });
 
-it("shows both conflict versions as fields with the server name and highlighted differences", () => {
+it("shows both conflict versions as fields with the server name and highlighted differences", async () => {
   const personal = structuredClone(registry);
   personal.team!.accountStatus = {
     personalSync: true,
@@ -1023,8 +1025,9 @@ it("shows both conflict versions as fields with the server name and highlighted 
     },
   ];
   render(<TeamsView registry={personal} onRegistryChange={vi.fn()} />);
-  expect(screen.getByText("Toolport docs changed on both machines")).toBeInTheDocument();
-  expect(screen.getByText("This machine")).toBeInTheDocument();
+  expect(screen.getByText("Toolport docs changed on two machines")).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Compare" }));
+  expect(screen.getByRole("heading", { name: "This machine" })).toBeInTheDocument();
   expect(screen.getByText("Other machine")).toBeInTheDocument();
   expect(screen.getByText("machine A v2")).toBeInTheDocument();
   expect(screen.getByText("machine B v2")).toBeInTheDocument();
@@ -1074,9 +1077,10 @@ it("names servers waiting for review and opens Servers to review them", async ()
     />,
   );
   expect(
-    screen.getByText("2 servers are waiting for review on this machine."),
+    screen.getByText(/2 servers are waiting for review on this machine/),
   ).toBeInTheDocument();
-  await userEvent.click(screen.getByRole("button", { name: "Review in Servers" }));
+  expect(screen.getAllByText(/arrived from another machine/)).toHaveLength(2);
+  await userEvent.click(screen.getAllByRole("button", { name: "Open in Servers" })[0]);
   expect(onOpenServers).toHaveBeenCalled();
 });
 

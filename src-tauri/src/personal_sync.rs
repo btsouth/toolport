@@ -40,6 +40,8 @@ pub struct SyncState {
     pub publish_errors: BTreeMap<String, String>,
     pub warnings: BTreeMap<String, String>,
     pub choose_local_servers: bool,
+    /// New servers start on this machine only instead of syncing.
+    pub new_servers_local_only: bool,
     #[serde(skip_serializing)]
     pub last_synced_at: Option<i64>,
     pub error: Option<String>,
@@ -1042,6 +1044,18 @@ pub(crate) fn record(before: &Registry, reg: &mut Registry) -> Result<(), String
     }
     default_new_values_portable(before, reg);
     let mut st = state(reg)?;
+    if st.new_servers_local_only {
+        for server in reg.servers.iter_mut().filter(|s| {
+            !before.servers.iter().any(|old| old.id == s.id)
+                && !s.source.as_deref().unwrap_or("").starts_with("team:")
+                && !crate::clients::is_gateway_server(s)
+        }) {
+            server
+                .unknown_fields
+                .entry("syncLocalOnly")
+                .or_insert(json!(true));
+        }
+    }
     for server in &mut reg.servers {
         if server.enabled
             && before
@@ -1929,6 +1943,18 @@ pub fn set_local_only(server_id: &str, local_only: bool) -> Result<Registry, Str
             server.source = Some("shared".into());
         }
         Ok(())
+    })
+    .map(|(r, ())| r)
+}
+/// Whether servers added on this machine start synced or stay here.
+pub fn set_new_servers_local_only(local_only: bool) -> Result<Registry, String> {
+    crate::registry::update(|r| {
+        if !is_personal(r) {
+            return Err("This option requires personal sync".into());
+        }
+        let mut st = state(r)?;
+        st.new_servers_local_only = local_only;
+        save(r, &st)
     })
     .map(|(r, ())| r)
 }
@@ -3373,6 +3399,30 @@ mod tests {
         assert_eq!(merge(&cloud, &state(&r).unwrap().pending).unwrap().0, cloud);
         apply(&mut r, &config(vec![]), 2).unwrap();
         assert_eq!(r.servers.len(), 1);
+    }
+    #[test]
+    fn new_servers_can_default_to_this_machine_only() {
+        let _data = crate::registry::DataDirTestEnv::new("sync-new-local");
+        let mut r = machine();
+        apply(&mut r, &config(vec![http("a")]), 1).unwrap();
+        crate::registry::save(&r).unwrap();
+        set_new_servers_local_only(true).unwrap();
+        let (r, ()) = crate::registry::update(|r| {
+            r.servers.push(local(http("fresh")));
+            Ok(())
+        })
+        .unwrap();
+        assert!(keep_local(r.servers.iter().find(|s| s.id == "fresh").unwrap()));
+        assert!(!keep_local(r.servers.iter().find(|s| s.id != "fresh").unwrap()));
+        assert!(!state(&r).unwrap().pending.contains_key("fresh"));
+        set_new_servers_local_only(false).unwrap();
+        let (r, ()) = crate::registry::update(|r| {
+            r.servers.push(local(http("later")));
+            Ok(())
+        })
+        .unwrap();
+        assert!(!keep_local(r.servers.iter().find(|s| s.id == "later").unwrap()));
+        assert!(state(&r).unwrap().pending.contains_key("later"));
     }
     #[test]
     fn becoming_personal_asks_once_and_defaults_private_locals_to_none() {
