@@ -7434,9 +7434,20 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
                 action.activate(None);
             }
         });
+        // A server synced from another machine is reviewed right here; only
+        // team servers still go to the Teams page.
+        badge.set_visible(!personal);
         card.append(&badge);
-        let review = gtk::Button::with_label("Review references");
-        review.set_visible(!server.secret_references.is_empty());
+        let review = gtk::Button::with_label(if personal {
+            "Review and enable"
+        } else {
+            "Review references"
+        });
+        review.set_visible(personal || !server.secret_references.is_empty());
+        if personal {
+            review.add_css_class("suggested-action");
+        }
+        review.set_valign(gtk::Align::Center);
         let page = page.clone();
         let id = server.id.clone();
         let profile = profile_id.to_string();
@@ -7447,7 +7458,7 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
             let Some(entry) = reg.servers.iter().find(|s| s.id == id).cloned() else {
                 return;
             };
-            if !crate::secret_refs::has_references(&entry) {
+            if !personal && !crate::secret_refs::has_references(&entry) {
                 return;
             }
             let Some(parent) = page.app.active_window() else {
@@ -7455,8 +7466,16 @@ fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -
             };
             let dialog = adw::MessageDialog::new(
                 Some(&parent),
-                Some("Approve references and enable?"),
-                Some("Review the definition and saved authentication. Enable only a setup you trust."),
+                Some(&if personal {
+                    format!("Enable {}?", entry.name)
+                } else {
+                    "Approve references and enable?".into()
+                }),
+                Some(if personal {
+                    "This server arrived from another machine. Check what it runs before turning it on here. Keys stay on each machine."
+                } else {
+                    "Review the definition and saved authentication. Enable only a setup you trust."
+                }),
             );
             dialog.set_size_request(620, -1);
             dialog.set_extra_child(Some(&teams::execution_review_scroll(&entry)));
