@@ -863,6 +863,14 @@ button.toolport-activity-filter {{
   font-variant-numeric: tabular-nums;
 }}
 
+.toolport-settings-parent {{ font-weight: 600; }}
+.toolport-safety-card {{ border: 1px solid alpha(@toolport_fg, 0.12); border-radius: 10px; padding: 16px; }}
+.toolport-safety-card:checked {{ border-color: {accent}; background: alpha({accent}, 0.08); }}
+.toolport-settings-group.toolport-switch-group {{
+  border: 1px solid alpha(@toolport_fg, 0.12);
+  border-radius: 10px;
+  background-color: alpha(@toolport_bg_dark, 0.18);
+}}
 .toolport-settings-group {{
   background-color: transparent;
   border: none;

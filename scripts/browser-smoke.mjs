@@ -105,18 +105,50 @@ try {
   await page.screenshot({ path: path.join(output, "client-access.png") });
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await page.getByText("Access", { exact: true }).click();
+  await page.getByRole("button", { name: "Access", exact: true }).click();
   await expect(
     page.getByRole("combobox", { name: "Default access", exact: true }),
   ).toBeVisible();
   await expect(page.getByText("Access sets", { exact: true })).toBeVisible();
   await page
-    .getByText("Access", { exact: true })
+    .getByRole("heading", { name: "Access", exact: true })
     .evaluate((element) => element.scrollIntoView({ block: "start" }));
   await page.screenshot({
     path: path.join(output, "settings-advanced.png"),
     fullPage: true,
   });
+
+  // Settings navigation and visual evidence for every page in both themes.
+  for (const theme of ["dark", "light"]) {
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page
+      .getByRole("button", { name: theme === "dark" ? "Dark" : "Light", exact: true })
+      .click();
+    for (const [id, label] of [
+      ["general", "General"],
+      ["tools", "Tools"],
+      ["safety", "Safety"],
+      ["access", "Access"],
+      ["connections", "Connections"],
+      ["help", "Help and data"],
+    ]) {
+      await page.getByRole("button", { name: label, exact: true }).click();
+      await expect(page.getByRole("heading", { name: label, exact: true })).toBeVisible();
+      await expect(page.locator(".settings-page")).toHaveCount(1);
+      await expect(page.locator(".settings-page details")).toHaveCount(0);
+      await expect(
+        page.getByRole("button", { name: label, exact: true }),
+      ).toHaveAttribute("aria-current", "page");
+      await page.screenshot({
+        path: path.join(output, `settings-${id}-${theme}.png`),
+        fullPage: true,
+      });
+    }
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await expect(
+      page.getByRole("heading", { name: "General", exact: true }),
+    ).toBeVisible();
+  }
   await page.goto(`${baseURL}/fixtures/?long-names=1`);
   await page.setViewportSize({ width: 480, height: 360 });
   const longServer = "A".repeat(70);
@@ -201,8 +233,10 @@ try {
   await page.getByRole("button", { name: "View log", exact: true }).first().click();
   await expect(page.getByRole("tab", { name: "Overview", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await expect(page.getByRole("combobox", { name: "Safety" })).toHaveValue("off");
+  await page.getByRole("button", { name: "Safety", exact: true }).click();
+  await expect(page.getByRole("radio", { name: "Off", exact: true })).toBeChecked();
   await expect(page.getByText(/Safety is set to Off/)).toBeVisible();
+  await page.getByRole("button", { name: "Tools", exact: true }).click();
   await expect(page.getByText("Find tools as needed", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Team", exact: true }).click();
   await expect(

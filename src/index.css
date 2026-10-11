@@ -229,3 +229,26 @@
     border-top: 1px solid var(--border);
   }
 }
+
+/* Related switches share a single surface with thin row dividers. */
+.settings-page > .settings-switches {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  overflow: hidden;
+}
+.settings-switches > label {
+  border: 0;
+  border-radius: 0;
+  border-bottom: 1px solid var(--border);
+}
+.settings-switches > label:last-child {
+  border-bottom: 0;
+}
+
+.settings-page .toolport-alert {
+  border-width: 0 0 0 3px;
+  border-radius: 0 10px 10px 0;
+}
+.settings-page [role="status"].toolport-alert {
+  border-left-color: var(--primary);
+}

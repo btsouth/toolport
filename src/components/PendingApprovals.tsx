@@ -51,7 +51,9 @@ const REASON: Record<Reason, { label: string; className: string; Icon: typeof Tr
  * safety net and refreshes immediately on the gateway's `approval-pending` /
  * `approval-resolved` events.
  */
-export function PendingApprovals() {
+export function PendingApprovals({
+  onCountChange,
+}: { onCountChange?: (count: number) => void } = {}) {
   const [pending, setPending] = useState<PendingApproval[]>([]);
   // Ids with a decision in flight: shown dimmed + disabled, removed authoritatively by the
   // resolved event / poll (NOT optimistically), so a poll landing before the backend
@@ -101,6 +103,10 @@ export function PendingApprovals() {
       void unlisten.then((fns) => fns.forEach((f) => f()));
     };
   }, [refresh]);
+
+  useEffect(() => {
+    onCountChange?.(pending.length);
+  }, [pending.length, onCountChange]);
 
   // Tick once a second while anything is pending, to drive the countdown.
   useEffect(() => {

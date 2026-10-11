@@ -663,3 +663,29 @@ it("shows negative net savings with the tokenizer method and excludes legacy est
   expect(badge).toHaveAttribute("title", expect.stringContaining("once per session"));
   expect(badge).not.toHaveTextContent("1.0M");
 });
+
+it("shows indented settings pages with an active row and pending count", async () => {
+  const selectPage = vi.fn();
+  render(
+    <TooltipProvider>
+      <AppSidebar
+        registry={null}
+        onRegistryChange={vi.fn()}
+        view="settings"
+        onSelectView={vi.fn()}
+        onReplayOnboarding={vi.fn()}
+        onShortcuts={vi.fn()}
+        settingsPage="tools"
+        onSettingsPageChange={selectPage}
+        pendingCount={3}
+      />
+    </TooltipProvider>,
+  );
+  expect(screen.getByRole("button", { name: "Tools" })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  expect(screen.getByLabelText("3 pending approvals")).toHaveTextContent("3");
+  await userEvent.click(screen.getByRole("button", { name: "Safety" }));
+  expect(selectPage).toHaveBeenCalledWith("safety");
+});

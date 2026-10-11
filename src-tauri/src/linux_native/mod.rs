@@ -428,6 +428,7 @@ fn build_window(
         let stack_for_stop = stack.clone();
         stop.connect_clicked(move |_| {
             stack_for_stop.set_visible_child_name("settings");
+            settings.select_page(4);
             settings.stop_stale.emit_clicked();
         });
         actions.append(&stop);
@@ -456,10 +457,12 @@ fn build_window(
     let review_quarantine = gtk::gio::SimpleAction::new("review-quarantine", None);
     let app_for_quarantine = app.clone();
     let window_for_quarantine = window.clone();
+    let settings_for_quarantine = settings_page.clone();
     review_quarantine.connect_activate(move |_, _| {
         if let Some(action) = app_for_quarantine.lookup_action("show-settings") {
             action.activate(None);
         }
+        settings_for_quarantine.select_page(2);
         window_for_quarantine.present();
     });
     app.add_action(&review_quarantine);
@@ -888,6 +891,7 @@ fn build_sidebar(
         );
         if target == "settings" {
             row.append(&quarantine_badge);
+            button.add_css_class("toolport-settings-parent");
         }
         if let Some(index) = NAV_SHORTCUTS.iter().position(|name| *name == target) {
             button.set_tooltip_text(Some(&format!("{label} (Ctrl+{})", index + 1)));
@@ -908,6 +912,65 @@ fn build_sidebar(
             // in place instead of waiting for the next launch.
             button.set_visible(false);
             nav.append(&button);
+        }
+        if target == "settings" {
+            let children = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            children.set_margin_start(20);
+            children.set_visible(false);
+            nav.append(&children);
+            let mut subbuttons = Vec::new();
+            for (index, (label, icon)) in settings::SETTINGS_PAGES.iter().enumerate() {
+                let child = gtk::Button::new();
+                child.add_css_class("flat");
+                child.add_css_class("toolport-nav-item");
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+                row.append(&gtk::Image::from_icon_name(icon));
+                row.append(
+                    &gtk::Label::builder()
+                        .label(*label)
+                        .xalign(0.0)
+                        .hexpand(true)
+                        .build(),
+                );
+                if index == 2 {
+                    let badge = gtk::Label::builder()
+                        .visible(false)
+                        .css_classes(["toolport-badge", "review"])
+                        .build();
+                    row.append(&badge);
+                    let broker = settings_page.approval_broker();
+                    let badge = badge.downgrade();
+                    gtk::glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
+                        let Some(badge) = badge.upgrade() else {
+                            return gtk::glib::ControlFlow::Break;
+                        };
+                        let count = broker.list().len();
+                        badge.set_label(&count.to_string());
+                        badge.set_tooltip_text(Some(&format!("{count} pending approvals")));
+                        badge.set_visible(count > 0);
+                        gtk::glib::ControlFlow::Continue
+                    });
+                }
+                child.set_child(Some(&row));
+                let selected = child.clone();
+                settings_page.connect_page_selected(index, move |visible| {
+                    if visible {
+                        selected.add_css_class("selected");
+                    } else {
+                        selected.remove_css_class("selected");
+                    }
+                });
+                children.append(&child);
+                subbuttons.push(child);
+            }
+            for (index, child) in subbuttons.iter().enumerate() {
+                let page = settings_page.clone();
+                child.connect_clicked(move |_| page.select_page(index));
+            }
+            subbuttons[0].add_css_class("selected");
+            stack.connect_visible_child_name_notify(move |stack| {
+                children.set_visible(stack.visible_child_name().as_deref() == Some("settings"));
+            });
         }
         if target == "teams" {
             team_button = Some(button.clone());
@@ -1574,6 +1637,7 @@ fn show_native_page(
     } else if target == "teams" {
         teams_page.refresh();
     } else if target == "settings" {
+        settings_page.select_page(0);
         settings_page.refresh();
     }
 }
