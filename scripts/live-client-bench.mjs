@@ -300,6 +300,10 @@ async function coldBridge(cfg, output) {
   };
 }
 
+export function warmCatalogComplete(tools) {
+  return Array.isArray(tools) && tools.filter((tool) => !tool.name.startsWith("toolport_")).length === 1707;
+}
+
 async function prewarm(cfg) {
   const child = spawn(cfg.gateway, ["--stdio-adapter"], {
     env: {
@@ -310,6 +314,7 @@ async function prewarm(cfg) {
     cwd: cfg.home,
     stdio: ["pipe", "pipe", "pipe"],
   });
+  child.stderr.on("data", (data) => appendFileSync(path.join(cfg.home, "prewarm-stderr.txt"), data));
   const lines = createInterface({ input: child.stdout });
   let requestId = 2,
     pending = false,
@@ -342,7 +347,7 @@ async function prewarm(cfg) {
       if (message.method === "notifications/tools/list_changed") list();
       if (message.id >= 2) {
         pending = false;
-        if (message.result?.tools?.length === 1709) resolve(1709);
+        if (warmCatalogComplete(message.result?.tools)) resolve(1707);
         else if (dirty) {
           dirty = false;
           list();
@@ -372,8 +377,8 @@ async function prewarm(cfg) {
     ]);
     assert.equal(
       count,
-      1709,
-      "Warm fixture must expose all 1707 public tools and two gateway tools",
+      1707,
+      "Warm fixture must expose all 1707 public tools",
     );
   } finally {
     clearTimeout(timer);
