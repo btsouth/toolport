@@ -63,6 +63,9 @@ jobs:
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           draft: true
+          # A suffixed tag (v2.0.0-rc.1, v2.0.0-preview.9) is a pre-release at creation, so
+          # publishing the draft cannot move releases/latest and the v1 updater manifest.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           name: Toolport ${{ github.ref_name }}
           files: |
             gtk-packages/*.deb
@@ -368,6 +371,9 @@ jobs:
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           draft: true
+          # A suffixed tag (v2.0.0-rc.1, v2.0.0-preview.9) is a pre-release at creation, so
+          # publishing the draft cannot move releases/latest and the v1 updater manifest.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           # Without this the release is titled with the bare tag. Every release since
           # 1.10.0 has been "Toolport vX.Y.Z", set by hand each time.
           name: Toolport ${{ github.ref_name }}
@@ -427,6 +433,9 @@ jobs:
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           draft: true
+          # A suffixed tag (v2.0.0-rc.1, v2.0.0-preview.9) is a pre-release at creation, so
+          # publishing the draft cannot move releases/latest and the v1 updater manifest.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           name: Toolport ${{ github.ref_name }}
           body_path: ${{ steps.notes.outputs.have_notes == 'true' && 'release-notes.md' || '' }}
           generate_release_notes: ${{ steps.notes.outputs.have_notes != 'true' }}
