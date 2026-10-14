@@ -250,9 +250,15 @@ describe("CI required merge gate (SBS-874)", () => {
       'base="$(git rev-parse HEAD^)"',
     );
     expect(runScripts(jobs.rustfmt).join("\n")).not.toContain("--max-parents=0");
+    // The Linux suite is split into disjoint groups that together cover
+    // everything `npm run test:rust` runs (--lib --bins --tests).
     expect(runScripts(jobs["build-test"]).join("\n")).toContain(
-      "dbus-run-session -- npm run test:rust",
+      "dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --features test-support,search-static ${{ matrix.targets }}",
     );
+    const groups = (jobs["build-test"].strategy?.matrix?.include ?? []) as {
+      targets: string;
+    }[];
+    expect(groups.map((group) => group.targets)).toEqual(["--lib --bins", "--test '*'"]);
     const manifest = JSON.parse(
       readFileSync(join(process.cwd(), "package.json"), "utf8"),
     );
@@ -260,7 +266,7 @@ describe("CI required merge gate (SBS-874)", () => {
   });
 
   it("keeps the Linux suite under a different check name", () => {
-    expect(jobs["build-test"]?.name).toBe("Linux build + test");
+    expect(jobs["build-test"]?.name).toBe("Linux build + test (${{ matrix.group }})");
   });
 
   it("still runs install.ps1 Pester as Installer script tests", () => {
