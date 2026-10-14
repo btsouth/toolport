@@ -18,9 +18,18 @@ permissions:
 jobs:
   windows-installer:
     name: Windows NSIS bundle validation
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
+    needs: changes
+    if: needs.changes.outputs.installers == 'true'
     runs-on: windows-latest
     timeout-minutes: 90
+    # CI-only release-profile overrides reach both Tauri and prepare-sidecar.
+    # Keep release assertions, bundling, signing and artifact paths unchanged.
+    env:
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -34,9 +43,9 @@ jobs:
         with:
           workspaces: src-tauri
           cache-bin: "false"
-          save-if: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/next/2.0' }}
       - run: npm ci
-      # Use release bundle settings; installers stay in CI and are not published.
+      # Use real bundle settings; installers stay in CI and are not published.
       - name: Set the numeric MSI version for CI previews
         run: node .github/scripts/ci-msi-config.mjs
       - name: Build the real NSIS and MSI installers
@@ -63,9 +72,18 @@ jobs:
 
   macos-payload:
     name: macOS app payload validation
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    needs: changes
+    if: needs.changes.outputs.installers == 'true'
     runs-on: macos-latest
     timeout-minutes: 90
+    # CI-only release-profile overrides reach both Tauri and prepare-sidecar.
+    # Keep release assertions, bundling, signing and artifact paths unchanged.
+    env:
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -80,7 +98,7 @@ jobs:
           workspaces: src-tauri
           key: macos-payload
           cache-bin: "false"
-          save-if: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/next/2.0' }}
       - run: npm ci
       - name: Build the app without release signing or publishing
         run: npx tauri build --config src-tauri/tauri.bundle.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --bundles app -- --bin conduit
@@ -106,6 +124,7 @@ jobs:
     outputs:
       rust: ${{ steps.select.outputs.rust }}
       linux_packages: ${{ steps.select.outputs.linux_packages }}
+      installers: ${{ steps.select.outputs.installers }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -213,7 +232,7 @@ jobs:
           workspaces: src-tauri
           key: ci-gtk
           cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next/2.0') }}
       - name: Build the native GTK shell
         run: cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --features gtk-desktop --bin toolport-gtk
 
@@ -312,7 +331,7 @@ jobs:
           workspaces: src-tauri
           key: ci-clippy-${{ matrix.shell }}
           cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next/2.0') }}
 
       # Bump this job's toolchain only after reviewing new lints and running
       # all three Clippy feature sets with -D warnings on devbox; other build jobs stay on stable.
@@ -322,7 +341,15 @@ jobs:
   build-test:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    name: Linux build + test
+    name: Linux build + test (${{ matrix.group }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: core
+            targets: --lib --bins
+          - group: integration
+            targets: --test '*'
     # Same gap as clippy above, and this one feeds the required merge gate, so a
     # hang here stalls every PR rather than one advisory check. Higher than the
     # rest because this job does strictly the most: frontend build and tests,
@@ -358,22 +385,24 @@ jobs:
           workspaces: src-tauri
           key: ci-desktop
           cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ matrix.group == 'integration' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next/2.0') }}
       - run: npm ci
       - name: Build frontend assets for the desktop Rust tests
         run: npm run build
 
-      # Run the library, standalone binary, and integration targets explicitly.
-      # Keeping all three flags prevents any test class from silently dropping
-      # out of CI when the command is updated.
-      - name: Rust tests (lib + binaries + integration)
+      # Core covers library/binary unit tests; the wildcard covers every
+      # integration target, including future ones. Cargo --tests includes unit
+      # targets too, so use --test '*' to keep the groups disjoint.
+      - name: Rust tests (${{ matrix.group }})
         # Notification fixtures register a mock endpoint on this private bus.
-        run: dbus-run-session -- npm run test:rust
+        run: dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --features test-support,search-static ${{ matrix.targets }}
 
       - name: Build headless gateway for smoke tests
+        if: matrix.group == 'integration'
         run: npm run build:gateway
 
       - name: Headless gateway security smoke
+        if: matrix.group == 'integration'
         run: npm run smoke:headless
 
   chaos:
@@ -398,10 +427,9 @@ jobs:
           workspaces: src-tauri
           key: ci-chaos
           cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next/2.0') }}
 
-      # The chaos cases are separate integration binaries; `cargo test` has no
-      # glob for `--test`, so run each one explicitly.
+      # Run only the five chaos integration targets in this dedicated job.
       - name: Chaos suite
         run: |
           for test in chaos_concurrency chaos_env_allowlist chaos_faulty_servers chaos_process_kill chaos_registry; do
@@ -411,7 +439,7 @@ jobs:
   cross-platform-rust:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    name: Headless Rust tests (${{ matrix.os }})
+    name: Headless Rust tests (${{ matrix.os }}, ${{ matrix.group }})
     # 30 minutes covered macOS runs of 27:11 (626c17d6) and 27:25 (644a8199),
     # but a35863c7 hit the cap at 30:10 as test compilation rose to 4:58.
     # The test-only idle timer saves about five minutes, leaving about 25 minutes
@@ -423,6 +451,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, macos-latest, windows-latest]
+        group: [core, integration]
+        include:
+          - group: core
+            targets: --lib --bins
+          - group: integration
+            targets: --test '*'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -450,51 +484,50 @@ jobs:
           workspaces: src-tauri
           key: ci-headless
           cache-bin: "false"
-          # macOS PRs otherwise repeatedly restore the base cache without Candle
-          # and GEMM. PR caches are scoped to the PR ref, preserving base caches.
-          save-if: ${{ matrix.os == 'macos-latest' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next/2.0')) }}
+          # Only one group saves the shared dependency cache, after desktop checks.
+          save-if: ${{ matrix.group == 'integration' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next/2.0') }}
       - name: Compile Rust tests and record build timings
         if: matrix.os != 'windows-latest'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static --lib --bins --tests --no-run --timings
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static ${{ matrix.targets }} --no-run --timings
 
       - name: Compile Windows Rust tests and record build timings
         if: matrix.os == 'windows-latest'
-        run: powershell -ExecutionPolicy Bypass -File scripts/test-rust-windows.ps1 -NoDefaultFeatures -BuildOnly
+        run: powershell -ExecutionPolicy Bypass -File scripts/test-rust-windows.ps1 -NoDefaultFeatures -TestGroup ${{ matrix.group }} -BuildOnly
 
-      - name: Rust tests (lib + binaries + integration, no desktop)
+      - name: Rust tests (${{ matrix.group }}, no desktop)
         if: matrix.os != 'windows-latest'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static --lib --bins --tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static ${{ matrix.targets }}
 
       # Reuse the local Windows helper so a stale debug gateway cannot lock the
       # executable while Cargo rebuilds it.
       - name: Rust tests (Windows, no desktop)
         if: matrix.os == 'windows-latest'
-        run: powershell -ExecutionPolicy Bypass -File scripts/test-rust-windows.ps1 -NoDefaultFeatures
+        run: powershell -ExecutionPolicy Bypass -File scripts/test-rust-windows.ps1 -NoDefaultFeatures -TestGroup ${{ matrix.group }}
 
       - name: Build headless gateway for cross-platform smoke
-        if: matrix.os != 'ubuntu-22.04'
+        if: matrix.os != 'ubuntu-22.04' && matrix.group == 'integration'
         run: cargo build --manifest-path src-tauri/Cargo.toml --bin toolport-gateway --bin mock-mcp-server --no-default-features --features test-support,search-static
 
       - name: Headless gateway security smoke (macOS)
-        if: matrix.os == 'macos-latest'
+        if: matrix.os == 'macos-latest' && matrix.group == 'integration'
         run: node scripts/smoke-headless.mjs
 
       - name: Headless gateway security smoke (Windows)
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-latest' && matrix.group == 'integration'
         run: powershell -ExecutionPolicy Bypass -File scripts/smoke-headless.ps1
 
       # Approval OS toasts use desktop-only APIs. Headless checks cannot compile
       # the Windows/macOS notification branches.
       - name: Install frontend dependencies for desktop approval checks
-        if: matrix.os != 'ubuntu-22.04'
+        if: matrix.os != 'ubuntu-22.04' && matrix.group == 'integration'
         run: npm ci
 
       - name: Build frontend assets for desktop approval checks
-        if: matrix.os != 'ubuntu-22.04'
+        if: matrix.os != 'ubuntu-22.04' && matrix.group == 'integration'
         run: npm run build
 
       - name: Compile desktop approval notifications (Windows and macOS)
-        if: matrix.os != 'ubuntu-22.04'
+        if: matrix.os != 'ubuntu-22.04' && matrix.group == 'integration'
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --lib
 
       # scripts/install.ps1 is piped into `iex` from a pinned commit, so a
@@ -505,7 +538,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: one-gateway-failures-${{ matrix.os }}
+          name: one-gateway-failures-${{ matrix.os }}-${{ matrix.group }}
           path: .verify/one-gateway-failures/
           include-hidden-files: true
           if-no-files-found: ignore
@@ -515,7 +548,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: rust-build-timings-${{ matrix.os }}
+          name: rust-build-timings-${{ matrix.os }}-${{ matrix.group }}
           path: src-tauri/target/cargo-timings/*.html
           if-no-files-found: ignore
           retention-days: 7
@@ -626,6 +659,8 @@ jobs:
       - cross-platform-rust
       - linux-native
       - linux-packages
+      - windows-installer
+      - macos-payload
       - chaos
       - installer-script
       - installer-script-bash

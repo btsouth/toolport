@@ -70,6 +70,31 @@ export function needsLinuxPackages(event, files) {
   );
 }
 
+// Frontend and docs edits do not change the native installer machinery. Empty
+// diffs and manual/unknown events stay conservative, like Linux packages.
+export function needsInstallers(event, files) {
+  return (
+    !["pull_request", "push"].includes(event) ||
+    files.length === 0 ||
+    files.some(
+      (file) =>
+        file.startsWith("src-tauri/") ||
+        file.startsWith("packaging/") ||
+        file.startsWith(".github/workflows/") ||
+        file.startsWith(".github/scripts/ci-") ||
+        file.startsWith(".github/scripts/package-") ||
+        /(^|\/)Cargo\.(toml|lock)$/.test(file) ||
+        [
+          "package.json",
+          "package-lock.json",
+          "scripts/prepare-sidecar.mjs",
+          "scripts/test-windows-installer.py",
+          "scripts/test-nsis-hooks.sh",
+        ].includes(file),
+    )
+  );
+}
+
 export function requireResults(needs) {
   for (const job of [
     "changes",
@@ -103,6 +128,14 @@ export function requireResults(needs) {
     throw new Error(
       `linux-packages: expected ${expected}, got ${needs["linux-packages"]?.result}`,
     );
+  const installers = needs.changes.outputs?.installers;
+  if (installers !== "true" && installers !== "false")
+    throw new Error("Installer selection is missing or invalid");
+  for (const job of ["windows-installer", "macos-payload"]) {
+    const expected = installers === "true" ? "success" : "skipped";
+    if (needs[job]?.result !== expected)
+      throw new Error(`${job}: expected ${expected}, got ${needs[job]?.result}`);
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
@@ -129,6 +162,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     appendFileSync(process.env.GITHUB_OUTPUT, `rust=${rust}\n`);
     const packages = needsLinuxPackages(event, files);
     appendFileSync(process.env.GITHUB_OUTPUT, `linux_packages=${packages}\n`);
+    const installers = needsInstallers(event, files);
+    appendFileSync(process.env.GITHUB_OUTPUT, `installers=${installers}\n`);
+    console.log(`Installers ${installers ? "selected" : "unchanged"}`);
     console.log(`Linux packages ${packages ? "selected" : "unchanged"}`);
     console.log(`Native checks ${rust ? "selected" : "unchanged"}`);
   } else throw new Error("Expected select or gate");

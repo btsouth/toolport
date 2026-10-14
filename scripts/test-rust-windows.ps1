@@ -1,6 +1,8 @@
 param(
   [switch]$NoDefaultFeatures,
-  [switch]$BuildOnly
+  [switch]$BuildOnly,
+  [ValidateSet("all", "core", "integration")]
+  [string]$TestGroup = "all"
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,11 +23,13 @@ if ($resolvedGateway) {
 $cargoArgs = @(
   "test",
   "--features", "test-support,search-static",
-  "--manifest-path", (Join-Path $repoRoot "src-tauri\Cargo.toml"),
-  "--lib",
-  "--bins",
-  "--tests"
+  "--manifest-path", (Join-Path $repoRoot "src-tauri\Cargo.toml")
 )
+switch ($TestGroup) {
+  "core" { $cargoArgs += @("--lib", "--bins") }
+  "integration" { $cargoArgs += @("--test", "*") }
+  "all" { $cargoArgs += @("--lib", "--bins", "--tests") }
+}
 if ($NoDefaultFeatures) { $cargoArgs += "--no-default-features" }
 
 if ($BuildOnly) { $cargoArgs += @("--no-run", "--timings") }
