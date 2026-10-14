@@ -1,3 +1,4 @@
+import { useI18n, Trans } from "@/lib/i18n";
 import { useState } from "react";
 import { Check, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -19,10 +20,11 @@ export function ImportReviewDialog({
   open,
   items,
   busy = false,
-  title = "Review servers to import",
+  title,
   onOpenChange,
   onConfirm,
 }: Props) {
+  const { t } = useI18n();
   if (!open) return null;
 
   return (
@@ -31,7 +33,7 @@ export function ImportReviewDialog({
         <ImportReviewContent
           items={items}
           busy={busy}
-          title={title}
+          title={title ?? t("Review servers to import")}
           onOpenChange={onOpenChange}
           onConfirm={onConfirm}
         />
@@ -43,10 +45,11 @@ export function ImportReviewDialog({
 function ImportReviewContent({
   items,
   busy = false,
-  title = "Review servers to import",
+  title,
   onOpenChange,
   onConfirm,
 }: Omit<Props, "open">) {
+  const { t } = useI18n();
   const keyedItems = items.map((item, index) => ({
     item,
     key: item.key ?? `${item.name}-${index}`,
@@ -59,12 +62,13 @@ function ImportReviewContent({
   return (
     <>
       <DialogHeader>
-        <DialogTitle>{title}</DialogTitle>
+        <DialogTitle>{title ?? t("Review servers to import")}</DialogTitle>
       </DialogHeader>
       <div className="flex flex-col gap-4 py-1">
         <p className="text-xs text-muted-foreground">
-          Review the commands and URLs before adding them. You can leave any server
-          unchecked and import only the ones you want.
+          {t(
+            "Review the commands and URLs before adding them. You can leave any server unchecked and import only the ones you want. ",
+          )}
         </p>
         <div className="flex max-h-72 flex-col gap-2 overflow-y-auto">
           {keyedItems.map(({ item, key }) => {
@@ -93,7 +97,7 @@ function ImportReviewContent({
         </div>
         <div className="flex items-center justify-between gap-2 border-t pt-3">
           <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
-            Cancel
+            {t("Cancel ")}
           </Button>
           <Button
             onClick={() => onConfirm(Array.from(selected))}
@@ -101,8 +105,13 @@ function ImportReviewContent({
           >
             <Check className="size-4" />
             {selectedCount === 0
-              ? "Select a server"
-              : `Import ${selectedCount} server${selectedCount === 1 ? "" : "s"}`}
+              ? t("Select a server")
+              : t(
+                  selectedCount === 1
+                    ? "Import {value1} server"
+                    : "Import {value1} servers",
+                  { value1: selectedCount },
+                )}
           </Button>
         </div>
       </div>
@@ -112,6 +121,7 @@ function ImportReviewContent({
 
 /** One reviewable server: name, what it runs, and the relevant safety flags. */
 export function ImportRow({ item, selected }: { item: ImportItem; selected?: boolean }) {
+  const { t } = useI18n();
   const runs =
     item.command != null ? [item.command, ...item.args].join(" ") : (item.url ?? "");
   const shell = runsShell(item.command, item.args);
@@ -131,7 +141,7 @@ export function ImportRow({ item, selected }: { item: ImportItem; selected?: boo
         <TransportPill transport={item.transport} />
         {!item.isNew && (
           <span className="ml-auto shrink-0 text-xs text-muted-foreground">
-            already added
+            {t("already added ")}
           </span>
         )}
       </div>
@@ -140,14 +150,20 @@ export function ImportRow({ item, selected }: { item: ImportItem; selected?: boo
       )}
       {shell && (
         <p className="mt-1.5 flex items-center gap-1.5 text-xs text-warning">
-          <ShieldAlert className="size-3.5 shrink-0" />
-          Runs a shell command. Only import setups you trust.
+          <Trans
+            message={"{value1}Runs a shell command. Only import setups you trust."}
+            values={{ value1: <ShieldAlert className="size-3.5 shrink-0" /> }}
+          />
         </p>
       )}
       {privateHost && (
         <p className="mt-1.5 flex items-center gap-1.5 text-xs text-warning">
-          <ShieldAlert className="size-3.5 shrink-0" />
-          Connects to a private or internal address. Only import setups you trust.
+          <Trans
+            message={
+              "{value1}Connects to a private or internal address. Only import setups you trust."
+            }
+            values={{ value1: <ShieldAlert className="size-3.5 shrink-0" /> }}
+          />
         </p>
       )}
     </div>

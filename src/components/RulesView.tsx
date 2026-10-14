@@ -1,3 +1,4 @@
+import { useI18n, Trans } from "@/lib/i18n";
 import { useEffect, useRef, useState } from "react";
 import { Eye, FileText, FileUp, FolderPlus, Plus, RefreshCw, X } from "lucide-react";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
@@ -73,6 +74,7 @@ const RESERVED_MARKERS = [
  * Needs no MCP server and no gateway, so it works on a fresh install.
  */
 export function RulesView() {
+  const { t: tr } = useI18n();
   const [data, setData] = useState<RulesViewData | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -243,7 +245,9 @@ export function RulesView() {
   function assertDraftHasNoMarkers() {
     if (RESERVED_MARKERS.some((marker) => draft.includes(marker))) {
       throw new Error(
-        "Remove Toolport's generated markers before saving. Paste only your rules, not the preview wrapper.",
+        tr(
+          "Remove Toolport's generated markers before saving. Paste only your rules, not the preview wrapper.",
+        ),
       );
     }
   }
@@ -290,7 +294,7 @@ export function RulesView() {
   async function newSet() {
     const known = new Set((data?.sets ?? []).map((s) => s.id));
     await act(async () => {
-      const created = await rulesSaveSet("New rules", "");
+      const created = await rulesSaveSet(tr("New rules"), "");
       const fresh = created.sets.find((s) => !known.has(s.id));
       return fresh ? rulesSetActive(fresh.id) : created;
     });
@@ -317,11 +321,11 @@ export function RulesView() {
       const picked = await openFileDialog({
         directory: true,
         multiple: false,
-        title: "Choose a project folder",
+        title: tr("Choose a project folder"),
       });
       if (typeof picked === "string") await run(() => rulesProjectAdd(picked), true);
     } catch (e) {
-      setError(`Couldn't open the folder picker: ${e}`);
+      setError(tr("Couldn't open the folder picker: {value1}", { value1: String(e) }));
     }
   }
 
@@ -379,11 +383,17 @@ export function RulesView() {
       const nowActive = created.activeSetId !== data?.activeSetId;
       note =
         (imported.strippedOurs
-          ? `Created "${imported.name}" from your own text in ${imported.path}; the block Toolport had written there was left out. `
-          : `Created "${imported.name}" from ${imported.path}. `) +
+          ? tr(
+              'Created "{value1}" from your own text in {value2}; the block Toolport had written there was left out. ',
+              { value1: imported.name, value2: imported.path },
+            )
+          : tr('Created "{value1}" from {value2}. ', {
+              value1: imported.name,
+              value2: imported.path,
+            })) +
         (nowActive
-          ? "It is now your applied set. The file itself was not changed."
-          : "Pick it above to edit and apply it. The file itself was not changed.");
+          ? tr("It is now your applied set. The file itself was not changed.")
+          : tr("Pick it above to edit and apply it. The file itself was not changed."));
       return created;
     }, true);
     setImportNote(note);
@@ -394,11 +404,11 @@ export function RulesView() {
       const picked = await openFileDialog({
         multiple: false,
         directory: false,
-        title: "Choose a rules file",
+        title: tr("Choose a rules file"),
       });
       if (typeof picked === "string") await importFrom(picked);
     } catch (e) {
-      setError(`Couldn't open the file picker: ${e}`);
+      setError(tr("Couldn't open the file picker: {value1}", { value1: String(e) }));
     }
   }
 
@@ -426,7 +436,7 @@ export function RulesView() {
   }
 
   if (loading) {
-    return <p className="text-sm text-muted-foreground">Loading…</p>;
+    return <p className="text-sm text-muted-foreground">{tr("Loading…")}</p>;
   }
 
   // A failed load has no data, and every empty-state line below reads off `data`. Rendering them
@@ -436,7 +446,7 @@ export function RulesView() {
     return (
       <div className="flex flex-col gap-3">
         <Callout variant="danger" role="alert">
-          {error ?? "Could not load your agent rules."}
+          {error ?? tr("Could not load your agent rules.")}
         </Callout>
         <Button
           size="sm"
@@ -445,8 +455,10 @@ export function RulesView() {
           disabled={busy}
           onClick={() => run(rulesView, true)}
         >
-          <RefreshCw className="size-3.5" />
-          Try again
+          <Trans
+            message="{value1} Try again"
+            values={{ value1: <RefreshCw className="size-3.5" /> }}
+          />
         </Button>
       </div>
     );
@@ -481,11 +493,12 @@ export function RulesView() {
       <div className="rounded-xl border bg-card p-5">
         <div className="mb-1 flex items-center gap-2">
           <FileText className="size-4 text-muted-foreground" />
-          <h2 className="text-sm font-medium">Your agent rules</h2>
+          <h2 className="text-sm font-medium">{tr("Your agent rules")}</h2>
         </div>
         <p className="mb-4 text-xs text-muted-foreground">
-          Written into each client's own rules file next to, never over, anything you
-          already have there. Turning a client off removes what Toolport put in it.
+          {tr(
+            "Written into each client's own rules file next to, never over, anything you already have there. Turning a client off removes what Toolport put in it.",
+          )}
         </p>
 
         <div className="mb-3 flex flex-wrap items-center gap-1.5">
@@ -513,8 +526,8 @@ export function RulesView() {
               <button
                 type="button"
                 disabled={busy}
-                aria-label={`Delete ${s.name}`}
-                title={`Delete ${s.name}`}
+                aria-label={tr("Delete {value1}", { value1: s.name })}
+                title={tr("Delete {value1}", { value1: s.name })}
                 onClick={() => setConfirmDelete(s.id)}
                 className="rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-destructive"
               >
@@ -523,12 +536,16 @@ export function RulesView() {
             </span>
           ))}
           <Button variant="outline" size="sm" disabled={busy} onClick={newSet}>
-            <Plus className="size-3.5" />
-            New set
+            <Trans
+              message="{value1} New set"
+              values={{ value1: <Plus className="size-3.5" /> }}
+            />
           </Button>
           <Button variant="outline" size="sm" disabled={busy} onClick={openImport}>
-            <FileUp className="size-3.5" />
-            Start from a file
+            <Trans
+              message="{value1} Start from a file"
+              values={{ value1: <FileUp className="size-3.5" /> }}
+            />
           </Button>
         </div>
 
@@ -536,26 +553,28 @@ export function RulesView() {
           <div className="mb-3 rounded-lg border bg-muted/20 p-3 text-xs">
             <div className="mb-2 flex items-center justify-between gap-3">
               <span className="font-medium text-foreground">
-                Start a new set from a file
+                {tr("Start a new set from a file")}
               </span>
               <button
                 type="button"
                 className="text-muted-foreground hover:text-foreground"
                 onClick={() => setImporting(null)}
               >
-                Close
+                {tr("Close")}
               </button>
             </div>
             <p className="mb-2 text-muted-foreground">
-              Toolport reads the file and creates a new set from your text. Anything
-              Toolport itself wrote into the file is left out, and the file is not
-              changed. Nothing is applied until you pick the new set.
+              {tr(
+                "Toolport reads the file and creates a new set from your text. Anything Toolport itself wrote into the file is left out, and the file is not changed. Nothing is applied until you pick the new set.",
+              )}
             </p>
             {importing.candidates === null ? (
-              <p className="mb-2 text-muted-foreground">Looking for rules files…</p>
+              <p className="mb-2 text-muted-foreground">
+                {tr("Looking for rules files…")}
+              </p>
             ) : importing.candidates.length === 0 ? (
               <p className="mb-2 text-muted-foreground">
-                No rules files found for the detected clients.
+                {tr("No rules files found for the detected clients.")}
               </p>
             ) : (
               <ul className="mb-2 grid gap-1">
@@ -585,7 +604,7 @@ export function RulesView() {
               disabled={busy}
               onClick={importFromPicker}
             >
-              Choose a file…
+              {tr("Choose a file…")}
             </Button>
           </div>
         )}
@@ -601,33 +620,37 @@ export function RulesView() {
             <Input
               value={draftName}
               disabled={busy}
-              aria-label="Rule set name"
+              aria-label={tr("Rule set name")}
               onChange={(e) => editDraft({ name: e.target.value })}
               className="mb-2 h-9"
             />
             <textarea
               value={draft}
               disabled={busy}
-              aria-label="Rules"
+              aria-label={tr("Rules")}
               onChange={(e) => editDraft({ content: e.target.value })}
               rows={12}
               spellCheck={false}
-              placeholder="Always run the tests before you say you're done."
+              placeholder={tr("Always run the tests before you say you're done.")}
               className="mb-3 w-full resize-y rounded-lg border bg-background p-3 font-mono text-xs text-foreground"
             />
             <div className="flex flex-wrap items-center gap-2">
               <Button size="sm" disabled={busy || !dirty} onClick={() => run(saveDraft)}>
-                {dirty ? "Save and apply" : "Saved"}
+                {dirty ? tr("Save and apply") : tr("Saved")}
               </Button>
               <Button
                 variant="outline"
                 size="sm"
                 disabled={busy}
-                title="Rewrite every switched-on client's file from this set, including a block you edited on disk"
+                title={tr(
+                  "Rewrite every switched-on client's file from this set, including a block you edited on disk",
+                )}
                 onClick={() => act(rulesApply)}
               >
-                <RefreshCw className="size-3.5" />
-                Re-apply
+                <Trans
+                  message="{value1} Re-apply"
+                  values={{ value1: <RefreshCw className="size-3.5" /> }}
+                />
               </Button>
             </div>
           </>
@@ -636,22 +659,28 @@ export function RulesView() {
           // other sets are still right there. Saying "no rule set yet" would be a plain lie about
           // what is on screen.
           <p className="text-sm text-muted-foreground">
-            No set is applied right now. Pick one above to edit and apply it.
+            {tr("No set is applied right now. Pick one above to edit and apply it.")}
           </p>
         ) : (
           <p className="text-sm text-muted-foreground">
-            No rule set yet. Create one, or start from a rules file you already have, and
-            it applies to the clients you switch on below.
+            {tr(
+              "No rule set yet. Create one, or start from a rules file you already have, and it applies to the clients you switch on below.",
+            )}
           </p>
         )}
       </div>
 
       <div className="rounded-xl border bg-card p-5">
-        <h2 className="mb-1 text-sm font-medium">Clients</h2>
+        <h2 className="mb-1 text-sm font-medium">{tr("Clients")}</h2>
         <p className="mb-3 text-xs text-muted-foreground">
           {supported.length === 0
-            ? "No AI clients with a rules file Toolport can manage were found on this machine."
-            : `${onCount} of ${supported.length} switched on. Nothing is written to a client until you turn it on.`}
+            ? tr(
+                "No AI clients with a rules file Toolport can manage were found on this machine.",
+              )
+            : tr(
+                "{value1} of {value2} switched on. Nothing is written to a client until you turn it on.",
+                { value1: onCount, value2: supported.length },
+              )}
         </p>
 
         <ul className="grid gap-1.5">
@@ -686,11 +715,11 @@ export function RulesView() {
                   <button
                     type="button"
                     disabled={busy}
-                    title="See how the file differs from this set"
+                    title={tr("See how the file differs from this set")}
                     onClick={() => openDrift(c.id, c.name, c.onDisk ?? "")}
                     className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
                   >
-                    View diff
+                    {tr("View diff")}
                   </button>
                 )}
                 <button
@@ -698,16 +727,18 @@ export function RulesView() {
                   disabled={busy || !active}
                   title={
                     active
-                      ? "See exactly what would be written"
+                      ? tr("See exactly what would be written")
                       : data.sets.length > 0
-                        ? "Pick a rule set first"
-                        : "Create a rule set first"
+                        ? tr("Pick a rule set first")
+                        : tr("Create a rule set first")
                   }
                   onClick={() => openPreview(c.id)}
                   className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
                 >
-                  <Eye className="size-3" />
-                  Preview
+                  <Trans
+                    message="{value1} Preview"
+                    values={{ value1: <Eye className="size-3" /> }}
+                  />
                 </button>
               </span>
             </li>
@@ -718,21 +749,30 @@ export function RulesView() {
           <div className="mt-3 space-y-1 text-xs text-muted-foreground">
             {projectOnly.length > 0 && (
               <p>
-                No global rules file for {projectOnly.map((c) => c.name).join(", ")}, but
-                project rules reach {projectOnly.length === 1 ? "it" : "them"}: add a
-                folder under Projects below.
+                {projectOnly.length === 1
+                  ? tr(
+                      "No global rules file for {value1}, but project rules reach it: add a folder under Projects below.",
+                      { value1: projectOnly.map((c) => c.name).join(", ") },
+                    )
+                  : tr(
+                      "No global rules file for {value1}, but project rules reach them: add a folder under Projects below.",
+                      { value1: projectOnly.map((c) => c.name).join(", ") },
+                    )}
               </p>
             )}
             {chatDesktop.length > 0 && (
               <p>
-                Claude Desktop is the chat app and has no rules file; Claude Code inside
-                it is covered by the Claude Code row above.
+                {tr(
+                  "Claude Desktop is the chat app and has no rules file; Claude Code inside it is covered by the Claude Code row above.",
+                )}
               </p>
             )}
             {manualOnly.length > 0 && (
               <p>
-                No rules file Toolport can write for{" "}
-                {manualOnly.map((c) => c.name).join(", ")}. Paste your rules in by hand.
+                {tr(
+                  "No rules file Toolport can write for  {value1}. Paste your rules in by hand.",
+                  { value1: manualOnly.map((c) => c.name).join(", ") },
+                )}
               </p>
             )}
           </div>
@@ -741,21 +781,23 @@ export function RulesView() {
 
       <div className="rounded-xl border bg-card p-5">
         <div className="mb-1 flex items-center justify-between gap-3">
-          <h2 className="text-sm font-medium">Projects</h2>
+          <h2 className="text-sm font-medium">{tr("Projects")}</h2>
           <Button variant="outline" size="sm" disabled={busy} onClick={addProject}>
-            <FolderPlus className="size-3.5" />
-            Add a project folder
+            <Trans
+              message="{value1} Add a project folder"
+              values={{ value1: <FolderPlus className="size-3.5" /> }}
+            />
           </Button>
         </div>
         <p className="mb-3 text-xs text-muted-foreground">
-          Project rules go into the folder itself, beside your repo&rsquo;s own files, and
-          will show up in <span className="font-mono">git status</span>. Toolport writes
-          only its own marked block (or its own file) and only when you press Apply for
-          that project, never at startup. Each file names the clients that read it there.
+          <Trans
+            message="Project rules go into the folder itself, beside your repo&rsquo;s own files, and will show up in {value1}. Toolport writes only its own marked block (or its own file) and only when you press Apply for that project, never at startup. Each file names the clients that read it there."
+            values={{ value1: <span className="font-mono">{"git status"}</span> }}
+          />
         </p>
         {data.projects.length === 0 ? (
           <p className="text-sm text-muted-foreground">
-            No project folders registered. Add one to apply a rule set inside it.
+            {tr("No project folders registered. Add one to apply a rule set inside it.")}
           </p>
         ) : (
           <ul className="grid gap-3">
@@ -777,8 +819,8 @@ export function RulesView() {
                     <button
                       type="button"
                       disabled={busy}
-                      aria-label={`Remove project ${p.name}`}
-                      title="Remove this project and what Toolport wrote in it"
+                      aria-label={tr("Remove project {value1}", { value1: p.name })}
+                      title={tr("Remove this project and what Toolport wrote in it")}
                       onClick={() => setConfirmRemoveProject(p.id)}
                       className="rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-destructive"
                     >
@@ -786,9 +828,9 @@ export function RulesView() {
                     </button>
                   </div>
                   <label className="mb-2 flex items-center gap-2 text-xs">
-                    <span className="text-muted-foreground">Rule set</span>
+                    <span className="text-muted-foreground">{tr("Rule set")}</span>
                     <select
-                      aria-label={`Rule set for ${p.name}`}
+                      aria-label={tr("Rule set for {value1}", { value1: p.name })}
                       value={p.setId ?? ""}
                       disabled={busy}
                       onChange={(e) => {
@@ -797,7 +839,7 @@ export function RulesView() {
                       }}
                       className="rounded-md border bg-background px-2 py-1 text-xs"
                     >
-                      <option value="">None</option>
+                      <option value="">{tr("None")}</option>
                       {data.sets.map((s) => (
                         <option key={s.id} value={s.id}>
                           {s.name}
@@ -828,7 +870,7 @@ export function RulesView() {
                           <span className="min-w-0">
                             <span className="font-mono text-xs">{f.relPath}</span>{" "}
                             <span className="text-xs text-muted-foreground">
-                              for {f.clients.join(", ")}
+                              {tr("for {value1}", { value1: f.clients.join(", ") })}
                             </span>
                           </span>
                         </label>
@@ -841,14 +883,16 @@ export function RulesView() {
                             disabled={busy || !set}
                             title={
                               set
-                                ? "See exactly what would be written"
-                                : "Pick a rule set first"
+                                ? tr("See exactly what would be written")
+                                : tr("Pick a rule set first")
                             }
                             onClick={() => openProjectPreview(p, f)}
                             className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
                           >
-                            <Eye className="size-3" />
-                            Preview
+                            <Trans
+                              message="{value1} Preview"
+                              values={{ value1: <Eye className="size-3" /> }}
+                            />
                           </button>
                         </span>
                       </li>
@@ -859,14 +903,14 @@ export function RulesView() {
                     disabled={busy || !set || !anyOn}
                     title={
                       !set
-                        ? "Pick a rule set first"
+                        ? tr("Pick a rule set first")
                         : !anyOn
-                          ? "Switch on a file first"
-                          : "Write the switched-on files from this set"
+                          ? tr("Switch on a file first")
+                          : tr("Write the switched-on files from this set")
                     }
                     onClick={() => run(() => rulesProjectApply(p.id), true)}
                   >
-                    Apply to {p.name}
+                    {tr("Apply to {value1}", { value1: p.name })}
                   </Button>
                 </li>
               );
@@ -879,19 +923,20 @@ export function RulesView() {
         <div ref={previewRef} className="scroll-mt-4 rounded-xl border bg-card p-5">
           <div className="mb-1 flex items-center justify-between gap-3">
             <h2 className="text-sm font-medium">
-              Preview
-              {previewTitle
-                ? `: ${previewTitle}`
-                : previewClientName
-                  ? `: ${previewClientName}`
-                  : ""}
+              {tr("Preview{value1}", {
+                value1: previewTitle
+                  ? `: ${previewTitle}`
+                  : previewClientName
+                    ? `: ${previewClientName}`
+                    : "",
+              })}
             </h2>
             <button
               type="button"
               onClick={() => setPreview(null)}
               className="text-xs text-muted-foreground hover:text-foreground"
             >
-              Close
+              {tr("Close")}
             </button>
           </div>
           <p className="mb-3 font-mono text-xs break-all text-muted-foreground">
@@ -899,16 +944,20 @@ export function RulesView() {
           </p>
           <p className="mb-2 text-xs text-muted-foreground">
             {preview.strategy === "ownedFile"
-              ? "Toolport owns this whole file. Nothing of yours lives in it."
-              : "Toolport owns only the marked block. Every other byte in this file is left exactly as it is."}
+              ? tr("Toolport owns this whole file. Nothing of yours lives in it.")
+              : tr(
+                  "Toolport owns only the marked block. Every other byte in this file is left exactly as it is.",
+                )}
           </p>
           {/* The bytes below are what an unblocked write would produce. When this client refuses
               the write, saying so here matters more than the bytes do: a preview that looks like
               a normal write, followed by nothing landing, reads as a bug rather than a rule. */}
           {BLOCKING_STATES.has(preview.state) && (
             <Callout variant="warning" className="mb-2 text-xs">
-              This is what Toolport would write, but it will not be written to this
-              client: {PREVIEW_BLOCKED_REASON[preview.state]}
+              {tr(
+                "This is what Toolport would write, but it will not be written to this client: {value1}",
+                { value1: tr(PREVIEW_BLOCKED_REASON[preview.state] ?? "") },
+              )}
             </Callout>
           )}
           <pre className="max-h-64 overflow-auto rounded-lg border bg-muted/20 p-3 font-mono text-xs whitespace-pre-wrap text-foreground">
@@ -920,21 +969,22 @@ export function RulesView() {
       {drift && active && (
         <div className="rounded-xl border bg-card p-5">
           <div className="mb-1 flex items-center justify-between gap-3">
-            <h2 className="text-sm font-medium">Edited on disk: {drift.clientName}</h2>
+            <h2 className="text-sm font-medium">
+              {tr("Edited on disk: {value1}", { value1: drift.clientName })}
+            </h2>
             <button
               type="button"
               onClick={() => setDrift(null)}
               className="text-xs text-muted-foreground hover:text-foreground"
             >
-              Close
+              {tr("Close")}
             </button>
           </div>
           <p className="mb-3 text-xs text-muted-foreground">
-            Toolport wrote this block from the set &ldquo;{active.name}&rdquo; and it has
-            been changed in the file since. Nothing is written here until you choose: pull
-            the file&rsquo;s version into the set (it becomes an unsaved draft you can
-            still edit), or overwrite the file with the set. Lines starting with &minus;
-            are the set as saved; lines starting with + are what the file has now.
+            {tr(
+              "Toolport wrote this block from the set “{value1}” and it has been changed in the file since. Nothing is written here until you choose: pull the file&rsquo;s version into the set (it becomes an unsaved draft you can still edit), or overwrite the file with the set. Lines starting with &minus; are the set as saved; lines starting with + are what the file has now.",
+              { value1: active.name },
+            )}
           </p>
           <pre className="mb-3 max-h-64 overflow-auto rounded-lg border bg-muted/20 p-3 font-mono text-xs whitespace-pre-wrap">
             {lineDiff(active.content, drift.onDisk).map((line, i) => (
@@ -967,13 +1017,15 @@ export function RulesView() {
                 editDraft({ content: onDisk });
               }}
             >
-              Pull into set
+              {tr("Pull into set")}
             </Button>
             <Button
               variant="outline"
               size="sm"
               disabled={busy}
-              title="Rewrite only this client's file from the set as saved; other clients and your unsaved edits are left as they are"
+              title={tr(
+                "Rewrite only this client's file from the set as saved; other clients and your unsaved edits are left as they are",
+              )}
               onClick={() => {
                 // Not through `act`: that would save the draft first, and a saved content
                 // change reconcile-writes a new revision to EVERY client, which is the
@@ -983,8 +1035,10 @@ export function RulesView() {
                 void run(() => rulesApplyClient(id), true);
               }}
             >
-              <RefreshCw className="size-3.5" />
-              Overwrite this file
+              <Trans
+                message="{value1} Overwrite this file"
+                values={{ value1: <RefreshCw className="size-3.5" /> }}
+              />
             </Button>
           </div>
         </div>
@@ -993,9 +1047,11 @@ export function RulesView() {
       <ConfirmDialog
         open={confirmPull !== null}
         onOpenChange={(o) => !o && setConfirmPull(null)}
-        title="Replace your unsaved edits?"
-        description="The editor has changes you have not saved. Pulling the file's version in replaces them. Nothing is written to disk either way."
-        confirmLabel="Replace"
+        title={tr("Replace your unsaved edits?")}
+        description={tr(
+          "The editor has changes you have not saved. Pulling the file's version in replaces them. Nothing is written to disk either way.",
+        )}
+        confirmLabel={tr("Replace")}
         destructive
         onConfirm={() => {
           const onDisk = confirmPull;
@@ -1008,9 +1064,11 @@ export function RulesView() {
       <ConfirmDialog
         open={confirmRemoveProject !== null}
         onOpenChange={(o) => !o && setConfirmRemoveProject(null)}
-        title="Remove this project?"
-        description="Toolport removes what it wrote in the folder. Your repo's own files are left alone."
-        confirmLabel="Remove"
+        title={tr("Remove this project?")}
+        description={tr(
+          "Toolport removes what it wrote in the folder. Your repo's own files are left alone.",
+        )}
+        confirmLabel={tr("Remove")}
         destructive
         onConfirm={() => {
           const id = confirmRemoveProject;
@@ -1022,26 +1080,38 @@ export function RulesView() {
       <ConfirmDialog
         open={confirmDelete !== null}
         onOpenChange={(o) => !o && setConfirmDelete(null)}
-        title="Delete this rule set?"
+        title={tr("Delete this rule set?")}
         description={(() => {
           // A set can be in use by projects even when it is not the global active set;
           // deleting it cleans Toolport's files out of those folders too, so say so.
           const projects = data.projects.filter((p) => p.setId === confirmDelete);
           const projectNote =
             projects.length > 0
-              ? ` It is also applied to ${projects.length === 1 ? "the project" : "projects"} ${projects
-                  .map((p) => `\u201C${p.name}\u201D`)
-                  .join(
-                    ", ",
-                  )}: Toolport removes what it wrote in ${projects.length === 1 ? "that folder" : "those folders"}. Your repo's own files are left alone.`
+              ? tr(
+                  " It is also applied to {value1} {value2}: Toolport removes what it wrote in {value3}. Your repo's own files are left alone.",
+                  {
+                    value1: projects.length === 1 ? tr("the project") : tr("projects"),
+                    value2: projects.map((p) => `\u201C${p.name}\u201D`).join(", "),
+                    value3:
+                      projects.length === 1 ? tr("that folder") : tr("those folders"),
+                  },
+                )
               : "";
           return confirmDelete === data.activeSetId
-            ? `Toolport removes what it wrote from every client. Your own content in those files is left alone.${projectNote}`
+            ? tr(
+                "Toolport removes what it wrote from every client. Your own content in those files is left alone.{value1}",
+                { value1: projectNote },
+              )
             : projects.length > 0
-              ? `This rule set is deleted. The active set and client files stay unchanged.${projectNote}`
-              : "This unused rule set is deleted. The active set and client files stay unchanged.";
+              ? tr(
+                  "This rule set is deleted. The active set and client files stay unchanged.{value1}",
+                  { value1: projectNote },
+                )
+              : tr(
+                  "This unused rule set is deleted. The active set and client files stay unchanged.",
+                );
         })()}
-        confirmLabel="Delete"
+        confirmLabel={tr("Delete")}
         destructive
         onConfirm={() => {
           const id = confirmDelete;

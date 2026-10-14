@@ -8,7 +8,10 @@ const host = process.env.TAURI_DEV_HOST;
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [react(), tailwindcss()],
-  build: { manifest: true },
+  build: {
+    manifest: true,
+    ...(process.env.TOOLPORT_BUILD_DIR ? { outDir: process.env.TOOLPORT_BUILD_DIR } : {}),
+  },
 
   resolve: {
     alias: {

@@ -1,3 +1,4 @@
+import { LANGUAGES, type LanguageChoice, useI18n, translate } from "@/lib/i18n";
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import {
   Activity,
@@ -91,6 +92,7 @@ import {
  * persists - the card carries the same disclosure the approval prompt would, so the
  * click IS the persistence authorization and no second prompt fires. */
 function RoutineSuggestions() {
+  const { t } = useI18n();
   const [suggestions, setSuggestions] = useState<RoutineSuggestion[]>([]);
   const [names, setNames] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
@@ -164,7 +166,7 @@ function RoutineSuggestions() {
       forget(fingerprint);
       await refresh();
     } catch (e) {
-      toastError(`Couldn't save the routine: ${e}`);
+      toastError(translate("Couldn't save the routine: {value1}", { value1: String(e) }));
     } finally {
       setBusy(null);
     }
@@ -177,7 +179,9 @@ function RoutineSuggestions() {
       forget(fingerprint);
       await refresh();
     } catch (e) {
-      toastError(`Couldn't dismiss the suggestion: ${e}`);
+      toastError(
+        translate("Couldn't dismiss the suggestion: {value1}", { value1: String(e) }),
+      );
     } finally {
       setBusy(null);
     }
@@ -191,7 +195,7 @@ function RoutineSuggestions() {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-muted/20 p-3 text-xs text-muted-foreground">
         <Braces className="size-3.5 shrink-0 text-warning" />
-        <span>Couldn&apos;t load suggested routines.</span>
+        <span>{t("Couldn't load suggested routines.")}</span>
         <Button
           size="sm"
           variant="ghost"
@@ -199,8 +203,7 @@ function RoutineSuggestions() {
           disabled={refreshing}
           onClick={() => void refresh()}
         >
-          <RefreshCw className="size-3.5" />
-          Retry
+          <RefreshCw className="size-3.5" /> {t("Retry")}{" "}
         </Button>
       </div>
     );
@@ -209,18 +212,24 @@ function RoutineSuggestions() {
     <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
       <div className="flex items-center gap-2 text-xs">
         <Braces className="size-3.5 shrink-0 text-warning" />
-        <span className="font-medium">Suggested routines</span>
+        <span className="font-medium">{t("Suggested routines")}</span>
         <span className="rounded-full bg-muted px-1.5 py-0.5 text-muted-foreground">
           {suggestions.length}
         </span>
         <span className="ml-auto text-muted-foreground">
-          repeated patterns Toolport verified; saving advertises them to every client
+          {" "}
+          {t(
+            "repeated patterns Toolport verified; saving advertises them to every client",
+          )}{" "}
         </span>
       </div>
       {status === "stale" && (
         <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
           <span>
-            Couldn&apos;t refresh suggested routines; showing the last loaded queue.
+            {" "}
+            {t(
+              "Couldn't refresh suggested routines; showing the last loaded queue.",
+            )}{" "}
           </span>
           <Button
             size="sm"
@@ -229,8 +238,7 @@ function RoutineSuggestions() {
             disabled={refreshing}
             onClick={() => void refresh()}
           >
-            <RefreshCw className="size-3.5" />
-            Retry
+            <RefreshCw className="size-3.5" /> {t("Retry")}{" "}
           </Button>
         </div>
       )}
@@ -245,7 +253,7 @@ function RoutineSuggestions() {
               className="space-y-2 rounded-md border border-border/60 bg-background/60 p-2.5 text-sm"
             >
               <input
-                aria-label="Routine name"
+                aria-label={t("Routine name")}
                 className="w-full rounded border border-border/60 bg-background px-2 py-1 text-sm font-medium"
                 value={names[fingerprint] ?? suggestion.suggestedName}
                 onChange={(e) =>
@@ -254,28 +262,35 @@ function RoutineSuggestions() {
               />
               {synthesized && (
                 <div className="rounded border border-warning/40 bg-warning/10 px-2 py-1 text-xs leading-relaxed text-warning">
-                  Synthesized by Toolport from observed direct calls: every listed call
-                  really ran, but the surrounding script was generated and statically
-                  validated, not yet executed.
+                  {" "}
+                  {t(
+                    "Synthesized by Toolport from observed direct calls: every listed call really ran, but the surrounding script was generated and statically validated, not yet executed.",
+                  )}{" "}
                 </div>
               )}
               <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                <span>Risk: {suggestion.evidence.riskClass}</span>
-                <span>Calls: {suggestion.evidence.calls}</span>
                 <span>
-                  Dependencies:{" "}
+                  {t("Risk:")} {suggestion.evidence.riskClass}
+                </span>
+                <span>
+                  {t("Calls:")} {suggestion.evidence.calls}
+                </span>
+                <span>
+                  {" "}
+                  {t("Dependencies:")}{" "}
                   {suggestion.evidence.observedDependencies
                     .map((dependency) => dependency.name)
                     .join(", ")}
                 </span>
                 <span>
-                  ~{Math.max(1, Math.round(suggestion.intermediateBytes / 1024))} KB/run
-                  not returned by Toolport
+                  ~{Math.max(1, Math.round(suggestion.intermediateBytes / 1024))}{" "}
+                  {t("KB/run not returned by Toolport")}{" "}
                 </span>
               </div>
               <details>
                 <summary className="cursor-pointer text-xs font-medium text-muted-foreground hover:text-foreground">
-                  Source and schema
+                  {" "}
+                  {t("Source and schema")}{" "}
                 </summary>
                 <pre className="mt-2 max-h-36 overflow-auto rounded border border-border/60 bg-background/60 p-2 font-mono text-[0.7rem] leading-relaxed">
                   {suggestion.source}
@@ -290,14 +305,16 @@ function RoutineSuggestions() {
                   disabled={busy === fingerprint}
                   onClick={() => void dismiss(fingerprint)}
                 >
-                  Dismiss
+                  {" "}
+                  {t("Dismiss")}{" "}
                 </Button>
                 <Button
                   size="sm"
                   disabled={busy === fingerprint}
                   onClick={() => void save(suggestion)}
                 >
-                  Save routine
+                  {" "}
+                  {t("Save routine")}{" "}
                 </Button>
               </div>
             </li>
@@ -318,6 +335,7 @@ function PinnedPrerequisites({
   registry: Registry | null;
   onRegistryChange: (registry: Registry) => void;
 }) {
+  const { t } = useI18n();
   const [busy, setBusy] = useState<string | null>(null);
   const nameOf = useMemo(() => {
     const m = new Map<string, string>();
@@ -341,7 +359,7 @@ function PinnedPrerequisites({
     try {
       onRegistryChange(await setToolPinned(serverId, tool, false));
     } catch (e) {
-      toastError(`Couldn't unpin the tool: ${e}`);
+      toastError(translate("Couldn't unpin the tool: {value1}", { value1: String(e) }));
     } finally {
       setBusy(null);
     }
@@ -351,19 +369,21 @@ function PinnedPrerequisites({
     <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
       <div className="flex items-center gap-2 text-xs">
         <Pin className="size-3.5 shrink-0 text-info" />
-        <span className="font-medium">Pinned prerequisites</span>
+        <span className="font-medium">{t("Pinned prerequisites")}</span>
         <span className="rounded-full bg-muted px-1.5 py-0.5 text-muted-foreground">
           {pins.length}
         </span>
         <span className="ml-auto text-muted-foreground">
-          always surfaced in search, with full schema
+          {" "}
+          {t("always surfaced in search, with full schema")}{" "}
         </span>
       </div>
       {pins.length === 0 ? (
         <p className="mt-2 max-w-2xl text-xs text-muted-foreground">
-          None yet. Pin a load-bearing tool (auth, list-before-act, or one whose
-          description doesn&apos;t match your keywords) from its card in Playground, so
-          lazy discovery never hides it.
+          {" "}
+          {t(
+            "None yet. Pin a load-bearing tool (auth, list-before-act, or one whose description doesn't match your keywords) from its card in Playground, so lazy discovery never hides it.",
+          )}{" "}
         </p>
       ) : (
         <ul className="mt-2 space-y-1">
@@ -379,7 +399,7 @@ function PinnedPrerequisites({
               <button
                 onClick={() => unpin(p.serverId, p.tool)}
                 disabled={busy === `${p.serverId}:${p.tool}`}
-                aria-label={`Unpin ${p.tool}`}
+                aria-label={t("Unpin {value1}", { value1: p.tool })}
                 className="ml-auto rounded p-0.5 text-muted-foreground/60 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-border disabled:opacity-50"
               >
                 <X className="size-3.5" />
@@ -402,6 +422,7 @@ function FolderRouting({
   registry: Registry | null;
   onRegistryChange: (registry: Registry) => void;
 }) {
+  const { t } = useI18n();
   const mappings = registry?.folderProfiles ?? [];
   const profiles = registry?.profiles ?? [];
   const [path, setPath] = useState("");
@@ -413,7 +434,9 @@ function FolderRouting({
     try {
       onRegistryChange(await setFolderProfiles(next));
     } catch (e) {
-      toastError(`Couldn't save folder routing: ${e}`);
+      toastError(
+        translate("Couldn't save folder routing: {value1}", { value1: String(e) }),
+      );
     } finally {
       setBusy(false);
     }
@@ -424,11 +447,13 @@ function FolderRouting({
       const picked = await openFolderDialog({
         directory: true,
         multiple: false,
-        title: "Choose a project folder",
+        title: translate("Choose a project folder"),
       });
       if (typeof picked === "string") setPath(picked);
     } catch (e) {
-      toastError(`Couldn't open the folder picker: ${e}`);
+      toastError(
+        translate("Couldn't open the folder picker: {value1}", { value1: String(e) }),
+      );
     }
   }
 
@@ -450,12 +475,13 @@ function FolderRouting({
     <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
       <div className="flex items-center gap-2 text-xs">
         <FolderTree className="size-3.5 shrink-0 text-info" />
-        <span className="font-medium">Project folder routing</span>
+        <span className="font-medium">{t("Project folder routing")}</span>
         <span className="rounded-full bg-muted px-1.5 py-0.5 text-muted-foreground">
           {mappings.length}
         </span>
         <span className="ml-auto text-muted-foreground">
-          auto-scope a client by the folder it opens in
+          {" "}
+          {t("auto-scope a client by the folder it opens in")}{" "}
         </span>
       </div>
       {mappings.length > 0 && (
@@ -470,7 +496,7 @@ function FolderRouting({
               <button
                 onClick={() => save(mappings.filter((x) => x.path !== m.path))}
                 disabled={busy}
-                aria-label={`Remove routing for ${m.path}`}
+                aria-label={t("Remove routing for {value1}", { value1: m.path })}
                 className="ml-auto rounded p-0.5 text-muted-foreground/60 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-border disabled:opacity-50"
               >
                 <X className="size-3.5" />
@@ -481,7 +507,8 @@ function FolderRouting({
       )}
       {profiles.length === 0 ? (
         <p className="mt-2 text-xs text-muted-foreground">
-          Create a profile first, then map a folder to it here.
+          {" "}
+          {t("Create a profile first, then map a folder to it here.")}{" "}
         </p>
       ) : (
         <div className="mt-2 flex items-center gap-2">
@@ -498,16 +525,15 @@ function FolderRouting({
             type="button"
             onClick={() => void browse()}
             disabled={busy}
-            aria-label="Browse for a project folder"
-            title="Browse…"
+            aria-label={t("Browse for a project folder")}
+            title={t("Browse…")}
             className="flex shrink-0 items-center gap-1 rounded border px-2 py-1 text-xs font-medium hover:bg-muted disabled:opacity-50"
           >
-            <FolderOpen className="size-3.5" />
-            Browse
+            <FolderOpen className="size-3.5" /> {t("Browse")}{" "}
           </button>
           <Select value={profile} onValueChange={setProfile}>
             <SelectTrigger className="h-7 w-32 text-xs">
-              <SelectValue placeholder="Profile" />
+              <SelectValue placeholder={t("Profile")} />
             </SelectTrigger>
             <SelectContent>
               {profiles.map((p) => (
@@ -522,7 +548,8 @@ function FolderRouting({
             disabled={busy || !path.trim() || !profile}
             className="shrink-0 rounded border px-2 py-1 text-xs font-medium hover:bg-muted disabled:opacity-50"
           >
-            Add
+            {" "}
+            {t("Add")}{" "}
           </button>
         </div>
       )}
@@ -580,12 +607,13 @@ function PostureSummary({
   quarantineOnDrift: boolean;
   blockOnInjection: boolean;
 }) {
+  const { t } = useI18n();
   const active = [
-    humanApproval && "human approval on",
-    denyDestructive && "destructive tools denied",
-    confirmDestructive && "destructive calls ask first",
-    quarantineOnDrift && "changed tools paused",
-    blockOnInjection && "injection-like output blocked",
+    humanApproval && t("human approval on"),
+    denyDestructive && t("destructive tools denied"),
+    confirmDestructive && t("destructive calls ask first"),
+    quarantineOnDrift && t("changed tools paused"),
+    blockOnInjection && t("injection-like output blocked"),
   ].filter(Boolean) as string[];
   // A hard gate (block or human-approval) = guarded; softer measures alone = partial.
   const gated = humanApproval || denyDestructive || blockOnInjection;
@@ -595,19 +623,19 @@ function PostureSummary({
       Icon: ShieldCheck,
       ring: "border-success/30 bg-success/5",
       tint: "text-success",
-      label: "Guardrails active",
+      label: t("Guardrails active"),
     },
     partial: {
       Icon: ShieldAlert,
       ring: "border-warning/35 bg-warning/5",
       tint: "text-warning",
-      label: "Some guardrails active",
+      label: t("Some guardrails active"),
     },
     open: {
       Icon: ShieldAlert,
       ring: "border-warning/35 bg-warning/5",
       tint: "text-warning",
-      label: "Approval gates are off",
+      label: t("Approval gates are off"),
     },
   }[state];
   const { Icon } = meta;
@@ -615,11 +643,11 @@ function PostureSummary({
     <div className={`flex items-start gap-3 rounded-lg border p-3 ${meta.ring}`}>
       <Icon className={`mt-0.5 size-4 shrink-0 ${meta.tint}`} />
       <p className="text-sm">
-        <span className={`font-medium ${meta.tint}`}>{meta.label}.</span>{" "}
+        <span className={`font-medium ${meta.tint}`}>{t(meta.label)}.</span>{" "}
         <span className="text-muted-foreground">
           {state === "open"
-            ? "Tool calls run without a Toolport approval or blocking gate."
-            : `Active: ${active.join(", ")}.`}
+            ? t("Tool calls run without a Toolport approval or blocking gate.")
+            : t("Active: {value1}.", { value1: active.join(", ") })}
         </span>
       </p>
     </div>
@@ -639,6 +667,7 @@ function ProfileToolScope({
   registry: Registry;
   onRegistryChange: (r: Registry) => void;
 }) {
+  const { t } = useI18n();
   const serverName = useMemo(() => {
     const m = new Map<string, string>();
     // Toolport's own gateway is infrastructure, not a scopable server, so keep it out.
@@ -676,7 +705,12 @@ function ProfileToolScope({
       if (requestIdByServer.current[serverId] !== requestId) {
         return;
       }
-      toastError(`Couldn't load ${serverName.get(serverId) ?? serverId} tools: ${e}`);
+      toastError(
+        translate("Couldn't load {value1} tools: {value2}", {
+          value1: serverName.get(serverId) ?? serverId,
+          value2: String(e),
+        }),
+      );
       setErrorByServer((m) => ({ ...m, [serverId]: true }));
     } finally {
       if (requestIdByServer.current[serverId] === requestId) {
@@ -714,7 +748,9 @@ function ProfileToolScope({
     try {
       onRegistryChange(await setProfileServerTools(profile.id, serverId, next));
     } catch (e) {
-      toastError(`Couldn't update tool scope: ${e}`);
+      toastError(
+        translate("Couldn't update tool scope: {value1}", { value1: String(e) }),
+      );
     } finally {
       setBusy(false);
     }
@@ -730,9 +766,12 @@ function ProfileToolScope({
         const scoped = scope[serverId];
         const badge = scoped
           ? allTools
-            ? `${scoped.length} of ${allTools.length} tools`
-            : `${scoped.length} tools`
-          : "all tools";
+            ? t("{value1} of {value2} tools", {
+                value1: scoped.length,
+                value2: allTools.length,
+              })
+            : t("{value1} tools", { value1: scoped.length })
+          : t("all tools");
         const open = expanded === serverId;
         return (
           <div key={serverId} className="rounded border border-border/50 bg-muted/10">
@@ -755,21 +794,24 @@ function ProfileToolScope({
             {open && (
               <div className="border-t border-border/40 px-2 py-1.5">
                 {loadingByServer[serverId] ? (
-                  <p className="text-xs text-muted-foreground">Loading tools…</p>
+                  <p className="text-xs text-muted-foreground">{t("Loading tools…")}</p>
                 ) : errorByServer[serverId] ? (
                   <div
                     role="status"
                     aria-live="polite"
                     className="flex flex-col gap-2 rounded-md border border-border p-3"
                   >
-                    <p className="text-xs text-muted-foreground">Couldn't load tools</p>
+                    <p className="text-xs text-muted-foreground">
+                      {t("Couldn't load tools")}
+                    </p>
                     <Button
                       variant="outline"
                       size="xs"
                       className="w-fit"
                       onClick={() => loadTools(serverId)}
                     >
-                      Retry
+                      {" "}
+                      {t("Retry")}{" "}
                     </Button>
                   </div>
                 ) : allTools && allTools.length > 0 ? (
@@ -789,7 +831,8 @@ function ProfileToolScope({
                   </div>
                 ) : (
                   <p className="text-xs text-muted-foreground">
-                    This server exposes no tools.
+                    {" "}
+                    {t("This server exposes no tools.")}{" "}
                   </p>
                 )}
               </div>
@@ -804,6 +847,13 @@ function ProfileToolScope({
 /** Global discovery + security policy. These apply to every client uniformly, so
  * they live here rather than in the per-server Playground. */
 export function SettingsView({ registry, onRegistryChange }: Props) {
+  const {
+    t,
+    language,
+    setLanguage,
+    loading: languageLoading,
+    error: languageError,
+  } = useI18n();
   const { theme, setTheme } = useTheme();
   const lazyDiscovery = registry?.lazyDiscovery ?? true;
   // On by default (SOU-397); only treat explicit false as off when the field is missing
@@ -856,7 +906,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       setRestartCheckFailed(false);
     } catch {
       setRestartCheckFailed(true);
-      toastError("Couldn't check for apps using an old gateway");
+      toastError(translate("Couldn't check for apps using an old gateway"));
     }
   }, []);
   useEffect(() => {
@@ -901,7 +951,11 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       else await disableAutostart();
       setAutostart({ status: "ready", enabled: on });
     } catch (e) {
-      toastError(`Couldn't ${on ? "enable" : "disable"} launch at login: ${e}`);
+      toastError(
+        on
+          ? t("Couldn't enable launch at login: {value2}", { value2: String(e) })
+          : t("Couldn't disable launch at login: {value2}", { value2: String(e) }),
+      );
     } finally {
       setBusySettings((current) => {
         const next = new Set(current);
@@ -920,7 +974,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       setNewToken(res.token);
       setNewLabel("");
     } catch (e) {
-      toastError(`Couldn't add client: ${e}`);
+      toastError(translate("Couldn't add client: {value1}", { value1: String(e) }));
     } finally {
       setClientBusy(false);
     }
@@ -930,7 +984,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     try {
       onRegistryChange(await removeHttpClient(id));
     } catch (e) {
-      toastError(`Couldn't remove client: ${e}`);
+      toastError(translate("Couldn't remove client: {value1}", { value1: String(e) }));
     }
   }
 
@@ -970,7 +1024,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       await releaseQuarantine(q.profile, q.tool);
       setQuarantined(await listQuarantined());
     } catch (e) {
-      toastError(`Couldn't re-approve: ${e}`);
+      toastError(t("Couldn't re-approve: {value1}", { value1: String(e) }));
     }
   };
 
@@ -994,7 +1048,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       await revokeAllowedTool(key);
       setAllowedTools(await listAllowedTools());
     } catch (e) {
-      toastError(`Couldn't revoke: ${e}`);
+      toastError(t("Couldn't revoke: {value1}", { value1: String(e) }));
     }
   };
 
@@ -1004,7 +1058,11 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       setBridge(on ? await startHttpBridge() : await stopHttpBridge());
       setBridgeError(false);
     } catch (e) {
-      toastError(`Couldn't ${on ? "start" : "stop"} the HTTP endpoint: ${e}`);
+      toastError(
+        on
+          ? t("Couldn't start the HTTP endpoint: {value2}", { value2: String(e) })
+          : t("Couldn't stop the HTTP endpoint: {value2}", { value2: String(e) }),
+      );
     } finally {
       setBridgeBusy(false);
     }
@@ -1036,7 +1094,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       try {
         publishRegistrySetting(key, await fn(v));
       } catch (e) {
-        toastError(`Couldn't update the setting: ${e}`);
+        toastError(t("Couldn't update the setting: {value1}", { value1: String(e) }));
       } finally {
         setBusySettings((current) => {
           const next = new Set(current);
@@ -1055,7 +1113,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       if (!on) await clearInspectLog();
       publishRegistrySetting("live-inspect", reg);
     } catch (e) {
-      toastError(`Couldn't update the setting: ${e}`);
+      toastError(t("Couldn't update the setting: {value1}", { value1: String(e) }));
     } finally {
       setBusySettings((current) => {
         const next = new Set(current);
@@ -1104,8 +1162,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       />
       {extra?.onRetry && (
         <Button size="sm" variant="ghost" className="gap-1.5" onClick={extra.onRetry}>
-          <RefreshCw className="size-3.5" />
-          Retry
+          <RefreshCw className="size-3.5" /> {t("Retry")}{" "}
         </Button>
       )}
     </label>
@@ -1115,23 +1172,62 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     <div className="mx-auto flex max-w-2xl flex-col gap-6">
       <section className="flex flex-col gap-2">
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          General
+          {" "}
+          {t("General")}{" "}
         </h2>
+        <div className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm">
+          <Globe className="size-4 shrink-0 text-info" />
+          <label
+            htmlFor="interface-language"
+            className="flex min-w-0 flex-1 flex-col leading-tight"
+          >
+            <span className="font-medium">{t("Language")}</span>
+            <span className="text-xs text-muted-foreground">
+              {t("Choose the language used in Toolport.")}
+            </span>
+          </label>
+          <select
+            id="interface-language"
+            value={language}
+            onChange={(event) => void setLanguage(event.target.value as LanguageChoice)}
+            aria-busy={languageLoading}
+            className="max-w-48 rounded-md border bg-background px-2 py-1.5 text-sm"
+          >
+            <option value="system">{t("System language")}</option>
+            {LANGUAGES.map(({ code, label }) => (
+              <option key={code} value={code}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </div>
+        {languageLoading && (
+          <p role="status" className="text-xs text-muted-foreground">
+            {t("Loading language…")}
+          </p>
+        )}
+        {languageError && (
+          <p role="alert" className="text-xs text-destructive">
+            {t("Couldn't load this language. Reload Toolport to retry.")}
+          </p>
+        )}
         {toggle(
           Power,
           autostart.status === "ready" && autostart.enabled,
           "text-info",
-          "Launch at login",
-          "Start Toolport in the tray when you sign in, so it can hold tool calls for approval even before you open it",
+          t("Launch at login"),
+          t(
+            "Start Toolport in the tray when you sign in, so it can hold tool calls for approval even before you open it",
+          ),
           toggleAutostart,
           "autostart",
           {
             switchDisabled: autostart.status !== "ready",
             hint:
               autostart.status === "loading"
-                ? "Checking the current OS setting…"
+                ? t("Checking the current OS setting…")
                 : autostart.status === "error"
-                  ? "Couldn't read the OS setting — launch-at-login state is unknown."
+                  ? t("Couldn't read the OS setting — launch-at-login state is unknown.")
                   : undefined,
             hintTone: autostart.status === "error" ? "destructive" : "muted",
             onRetry:
@@ -1141,24 +1237,25 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         <div className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm">
           <Sun className="size-4 shrink-0 text-info" />
           <span className="flex min-w-0 flex-1 flex-col leading-tight">
-            <span className="font-medium">Appearance</span>
+            <span className="font-medium">{t("Appearance")}</span>
             <span className="text-xs text-muted-foreground">
-              Light, dark, or follow your system setting.
+              {" "}
+              {t("Light, dark, or follow your system setting.")}{" "}
             </span>
           </span>
           <div className="flex shrink-0 gap-0.5 rounded-md border bg-background p-0.5">
             {(
               [
-                ["light", Sun, "Light"],
-                ["system", Monitor, "System"],
-                ["dark", Moon, "Dark"],
+                ["light", Sun, t("Light")],
+                ["system", Monitor, t("System")],
+                ["dark", Moon, t("Dark")],
               ] as [Theme, typeof Sun, string][]
             ).map(([value, Icon, label]) => (
               <button
                 key={value}
                 onClick={() => setTheme(value)}
                 aria-pressed={theme === value}
-                title={label}
+                title={t(label)}
                 className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors ${
                   theme === value
                     ? "bg-muted font-medium text-foreground"
@@ -1166,7 +1263,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                 }`}
               >
                 <Icon className="size-3.5" />
-                {label}
+                {t(label)}
               </button>
             ))}
           </div>
@@ -1175,14 +1272,14 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       {profiles.length > 0 && (
         <section className="flex flex-col gap-2">
           <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-            Profiles
+            {" "}
+            {t("Profiles")}{" "}
           </h2>
           <p className="text-xs text-muted-foreground">
-            A profile is a named set of servers you can scope a client to. Expand a server
-            to narrow it to specific tools (a "FeatureSet"); leaving every tool checked
-            exposes the whole server. Tool narrowing applies to stdio clients (Claude
-            Desktop, Cursor, VS Code, and the like); HTTP-bridge clients still see the
-            whole server for now.
+            {" "}
+            {t(
+              'A profile is a named set of servers you can scope a client to. Expand a server to narrow it to specific tools (a "FeatureSet"); leaving every tool checked exposes the whole server. Tool narrowing applies to stdio clients (Claude Desktop, Cursor, VS Code, and the like); HTTP-bridge clients still see the whole server for now.',
+            )}{" "}
           </p>
           <div className="flex flex-col divide-y rounded-lg border">
             {profiles.map((p) => {
@@ -1209,23 +1306,25 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                     className="flex items-center gap-2 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-border disabled:cursor-default"
                   >
                     <ChevronRight
-                      className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${
-                        isOpen ? "rotate-90" : ""
-                      } ${names.length === 0 ? "invisible" : ""}`}
+                      className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${isOpen ? "rotate-90" : ""} ${names.length === 0 ? "invisible" : ""}`}
                     />
                     <span className="text-sm font-medium">{p.name}</span>
                     {active && (
                       <span className="rounded-full bg-info/15 px-1.5 py-0.5 text-[10px] font-medium text-info">
-                        active
+                        {" "}
+                        {t("active")}{" "}
                       </span>
                     )}
                     <span className="ml-auto text-xs text-muted-foreground">
-                      {names.length} {names.length === 1 ? "server" : "servers"}
+                      {t(names.length === 1 ? "{count} server" : "{count} servers", {
+                        count: names.length,
+                      })}
                     </span>
                   </button>
                   {names.length === 0 ? (
                     <p className="pl-5 text-xs text-muted-foreground italic">
-                      No servers in this profile.
+                      {" "}
+                      {t("No servers in this profile.")}{" "}
                     </p>
                   ) : isOpen ? (
                     registry && (
@@ -1249,14 +1348,15 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       )}
       <section className="flex flex-col gap-2">
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Discovery
+          {" "}
+          {t("Discovery")}{" "}
         </h2>
         {toggle(
           Layers,
           lazyDiscovery,
           "text-info",
-          "Lazy discovery",
-          "Expose 4 meta-tools, not the full catalog (all clients)",
+          t("Lazy discovery"),
+          t("Expose 4 meta-tools, not the full catalog (all clients)"),
           apply("lazy-discovery", setLazyDiscovery),
           "lazy-discovery",
         )}
@@ -1277,8 +1377,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           Braces,
           codeMode,
           "text-info",
-          "Code mode",
-          "On by default: agents can run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary; turn off to hide toolport_run_script.",
+          t("Code mode"),
+          t(
+            "On by default: agents can run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary; turn off to hide toolport_run_script.",
+          ),
           apply("code-mode", setCodeMode),
           "code-mode",
         )}
@@ -1287,8 +1389,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               Braces,
               allowRoutineWrites,
               "text-warning",
-              "Allow routine writes",
-              "Allow agents to request saving persistent routines. Every save still requires your approval.",
+              t("Allow routine writes"),
+              t(
+                "Allow agents to request saving persistent routines. Every save still requires your approval.",
+              ),
               apply("allow-routine-writes", setAllowRoutineWrites),
               "allow-routine-writes",
             )
@@ -1301,7 +1405,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       </section>
       <section className="flex flex-col gap-2">
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Security
+          {" "}
+          {t("Security")}{" "}
         </h2>
         <PostureSummary
           denyDestructive={denyDestructive}
@@ -1314,8 +1419,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           ShieldAlert,
           denyDestructive,
           "text-warning",
-          "Block destructive tools",
-          "Hide any tool the server marks as able to delete or change data, from every client",
+          t("Block destructive tools"),
+          t(
+            "Hide any tool the server marks as able to delete or change data, from every client",
+          ),
           apply("deny-destructive", setDenyDestructive),
           "deny-destructive",
         )}
@@ -1323,8 +1430,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           ShieldCheck,
           confirmDestructive,
           "text-info",
-          "Confirm destructive tools",
-          "Hold each destructive call for the agent to confirm before it runs",
+          t("Confirm destructive tools"),
+          t("Hold each destructive call for the agent to confirm before it runs"),
           apply("confirm-destructive", setConfirmDestructive),
           "confirm-destructive",
         )}
@@ -1332,8 +1439,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           UserCheck,
           humanApproval,
           "text-info",
-          "Require human approval",
-          "Hold destructive or untrusted-server calls until you approve them in the app",
+          t("Require human approval"),
+          t(
+            "Hold destructive or untrusted-server calls until you approve them in the app",
+          ),
           apply("human-approval", setHumanApproval),
           "human-approval",
         )}
@@ -1341,8 +1450,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           ShieldX,
           quarantineOnDrift,
           "text-destructive",
-          "Quarantine changed high-risk tools",
-          "Block a destructive or poisoned tool that changes from its approved version, until you re-approve it",
+          t("Quarantine changed high-risk tools"),
+          t(
+            "Block a destructive or poisoned tool that changes from its approved version, until you re-approve it",
+          ),
           apply("quarantine-on-drift", setQuarantineOnDrift),
           "quarantine-on-drift",
         )}
@@ -1350,8 +1461,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           ShieldAlert,
           blockOnInjection,
           "text-destructive",
-          "Block high-confidence injection",
-          "Fail a tool call when content defense finds a high-confidence prompt-injection hit, instead of only labeling the text. Off by default; medium-confidence hits still label only",
+          t("Block high-confidence injection"),
+          t(
+            "Fail a tool call when content defense finds a high-confidence prompt-injection hit, instead of only labeling the text. Off by default; medium-confidence hits still label only",
+          ),
           apply("block-on-injection", setBlockOnInjection),
           "block-on-injection",
         )}
@@ -1359,8 +1472,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           EyeOff,
           piiRedaction,
           "text-info",
-          "Hide personal data from the model",
-          "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. A value only goes back to the server it came from, so a call that would send one server's data to another is refused. Real data stays on this machine and is forgotten when the conversation ends. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
+          t("Hide personal data from the model"),
+          t(
+            "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. A value only goes back to the server it came from, so a call that would send one server's data to another is refused. Real data stays on this machine and is forgotten when the conversation ends. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
+          ),
           apply("pii-redaction", setPiiRedaction),
           "pii-redaction",
         )}
@@ -1368,8 +1483,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           Bot,
           allowAgentControl,
           "text-success",
-          "Allow agent control",
-          "Let an agent turn servers on/off; your destructive-tool block always stays yours",
+          t("Allow agent control"),
+          t(
+            "Let an agent turn servers on/off; your destructive-tool block always stays yours",
+          ),
           apply("allow-agent-control", setAllowAgentControl),
           "allow-agent-control",
         )}
@@ -1377,24 +1494,28 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           Activity,
           liveInspect,
           "text-info",
-          "Live request/response inspection",
-          "Off by default. While on, Toolport captures each tool call's arguments and results to a small local, ephemeral buffer (the last 50 calls) so you can inspect them in Activity. This is separate from the audit log, never leaves your machine, and is cleared when you turn it off or restart the gateway.",
+          t("Live request/response inspection"),
+          t(
+            "Off by default. While on, Toolport captures each tool call's arguments and results to a small local, ephemeral buffer (the last 50 calls) so you can inspect them in Activity. This is separate from the audit log, never leaves your machine, and is cleared when you turn it off or restart the gateway.",
+          ),
           applyLiveInspect,
           "live-inspect",
         )}
         {quarantined.length === 0 && quarantineError && (
           <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
             <ShieldX className="size-4 shrink-0 text-destructive" />
-            <span>Couldn&apos;t read quarantine status. Retrying every 15s.</span>
+            <span>{t("Couldn't read quarantine status. Retrying every 15s.")}</span>
           </div>
         )}
         {quarantined.length > 0 && (
           <div className="flex flex-col gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
             <div className="flex items-center gap-2">
               <ShieldX className="size-4 shrink-0 text-destructive" />
-              <span className="text-sm font-medium">Quarantined tools</span>
+              <span className="text-sm font-medium">{t("Quarantined tools")}</span>
               <span className="text-xs text-muted-foreground">
-                {quarantineError ? "status may be stale" : "blocked until you re-approve"}
+                {quarantineError
+                  ? t("status may be stale")
+                  : t("blocked until you re-approve")}
               </span>
             </div>
             <ul className="flex flex-col gap-1.5">
@@ -1415,7 +1536,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                     onClick={() => reapprove(q)}
                     className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
                   >
-                    Re-approve
+                    {" "}
+                    {t("Re-approve")}{" "}
                   </button>
                 </li>
               ))}
@@ -1425,33 +1547,34 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         {allowedTools.length === 0 && allowedError && (
           <div className="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
             <UserCheck className="size-4 shrink-0 text-info" />
-            <span>Couldn&apos;t read the allowed-tools list. Retrying every 10s.</span>
+            <span>{t("Couldn't read the allowed-tools list. Retrying every 10s.")}</span>
           </div>
         )}
         {allowedTools.length > 0 && (
           <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/20 px-3 py-2.5">
             <div className="flex items-center gap-2">
               <UserCheck className="size-4 shrink-0 text-info" />
-              <span className="text-sm font-medium">Allowed tools</span>
+              <span className="text-sm font-medium">{t("Allowed tools")}</span>
               <span className="text-xs text-muted-foreground">
-                {allowedError ? "list may be stale" : "skip human approval"}
+                {allowedError ? t("list may be stale") : t("skip human approval")}
               </span>
             </div>
             <ul className="flex flex-col gap-1.5">
-              {allowedTools.map((t) => (
-                <li key={t.key} className="flex items-center gap-2 text-xs">
+              {allowedTools.map((tool) => (
+                <li key={tool.key} className="flex items-center gap-2 text-xs">
                   <span className="min-w-0 truncate font-mono">
-                    {t.server}/{t.tool}
+                    {tool.server}/{tool.tool}
                   </span>
                   <span className="shrink-0 text-muted-foreground">
-                    {t.persistent ? "always" : "this session"}
+                    {tool.persistent ? t("Always") : t("this session")}
                   </span>
                   <button
                     type="button"
-                    onClick={() => void revokeAllowed(t.key)}
+                    onClick={() => void revokeAllowed(tool.key)}
                     className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
                   >
-                    Revoke
+                    {" "}
+                    {t("Revoke")}{" "}
                   </button>
                 </li>
               ))}
@@ -1461,7 +1584,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       </section>
       <section className="flex flex-col gap-2">
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          Integrations
+          {" "}
+          {t("Integrations")}{" "}
         </h2>
         <div className="flex flex-col gap-2 rounded-md border px-3 py-2.5">
           <label className="flex items-center gap-2.5 text-sm">
@@ -1469,9 +1593,12 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               className={`size-4 shrink-0 ${bridge?.running ? "text-success" : "text-muted-foreground"}`}
             />
             <span className="flex min-w-0 flex-1 flex-col leading-tight">
-              <span className="font-medium">Open WebUI / HTTP endpoint</span>
+              <span className="font-medium">{t("Open WebUI / HTTP endpoint")}</span>
               <span className="text-xs text-muted-foreground">
-                Serve your tools over HTTP/OpenAPI for Open WebUI and any OpenAPI client
+                {" "}
+                {t(
+                  "Serve your tools over HTTP/OpenAPI for Open WebUI and any OpenAPI client",
+                )}{" "}
               </span>
             </span>
             <Switch
@@ -1483,15 +1610,18 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           {bridgeError && bridge === null && (
             <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <span>
-                Couldn&apos;t read the HTTP endpoint status. The gateway may be starting
-                up.
+                {" "}
+                {t(
+                  "Couldn't read the HTTP endpoint status. The gateway may be starting up.",
+                )}{" "}
               </span>
               <button
                 type="button"
                 onClick={loadBridge}
                 className="shrink-0 font-medium text-foreground underline underline-offset-2 hover:text-primary"
               >
-                Retry
+                {" "}
+                {t("Retry")}{" "}
               </button>
             </p>
           )}
@@ -1499,13 +1629,14 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             <>
               <div className="flex items-center gap-2 rounded border bg-muted/40 px-2 py-1.5">
                 <span className="shrink-0 text-[11px] font-medium text-muted-foreground">
-                  URL
+                  {" "}
+                  {"URL"}{" "}
                 </span>
                 <code className="min-w-0 flex-1 truncate text-xs">{bridge.url}</code>
                 <button
                   type="button"
                   onClick={() => copy(bridge.url!, "url")}
-                  title="Copy URL"
+                  title={t("Copy URL")}
                   className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                 >
                   {copied === "url" ? (
@@ -1518,7 +1649,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               {bridge.token && (
                 <div className="flex items-center gap-2 rounded border bg-muted/40 px-2 py-1.5">
                   <span className="shrink-0 text-[11px] font-medium text-muted-foreground">
-                    Token
+                    {" "}
+                    {t("Token")}{" "}
                   </span>
                   <code className="min-w-0 flex-1 truncate text-xs">
                     {showToken ? bridge.token : "•".repeat(24)}
@@ -1526,8 +1658,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   <button
                     type="button"
                     onClick={() => setShowToken((s) => !s)}
-                    title={showToken ? "Hide token" : "Reveal token"}
-                    aria-label={showToken ? "Hide token" : "Reveal token"}
+                    title={showToken ? t("Hide token") : t("Reveal token")}
+                    aria-label={showToken ? t("Hide token") : t("Reveal token")}
                     className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                   >
                     {showToken ? (
@@ -1539,7 +1671,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   <button
                     type="button"
                     onClick={() => copy(bridge.token!, "token")}
-                    title="Copy token"
+                    title={t("Copy token")}
                     className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                   >
                     {copied === "token" ? (
@@ -1551,19 +1683,21 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                 </div>
               )}
               <p className="text-xs text-muted-foreground">
-                In Open WebUI: Settings &rarr; Tools &rarr; add the URL as an OpenAPI
-                server and paste the token as its API key (Bearer auth), then set Function
-                Calling to Native (per chat). The token stops other local apps from
-                calling your tools.
+                {" "}
+                {t(
+                  "In Open WebUI: Settings → Tools → add the URL as an OpenAPI server and paste the token as its API key (Bearer auth), then set Function Calling to Native (per chat). The token stops other local apps from calling your tools.",
+                )}{" "}
               </p>
 
               <div className="mt-1 flex flex-col gap-2 rounded border bg-muted/20 p-2.5">
                 <div className="flex items-baseline justify-between gap-2">
                   <span className="text-[11px] font-medium text-muted-foreground">
-                    Scoped clients
+                    {" "}
+                    {t("Scoped clients")}{" "}
                   </span>
                   <span className="text-[11px] text-muted-foreground/70">
-                    each gets its own token and server set
+                    {" "}
+                    {t("each gets its own token and server set")}{" "}
                   </span>
                 </div>
 
@@ -1572,15 +1706,15 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                     {httpClients.map((c) => (
                       <li key={c.id} className="flex items-center gap-2 text-xs">
                         <span className="truncate font-medium">
-                          {c.label || "(unnamed)"}
+                          {c.label || t("(unnamed)")}
                         </span>
                         <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                          {c.profile || "all servers"}
+                          {c.profile || t("all servers")}
                         </span>
                         <button
                           type="button"
                           onClick={() => removeClient(c.id)}
-                          aria-label={`Revoke ${c.label}`}
+                          aria-label={t("Revoke {value1}", { value1: c.label })}
                           className="ml-auto shrink-0 rounded p-1 text-muted-foreground/60 hover:bg-destructive/10 hover:text-destructive"
                         >
                           <Trash2 className="size-3.5" />
@@ -1594,13 +1728,14 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   <>
                     <div className="flex items-center gap-2 rounded border border-success/30 bg-success/5 px-2 py-1.5">
                       <span className="shrink-0 text-[11px] font-medium text-success">
-                        New token
+                        {" "}
+                        {t("New token")}{" "}
                       </span>
                       <code className="min-w-0 flex-1 truncate text-xs">{newToken}</code>
                       <button
                         type="button"
                         onClick={() => copy(newToken, "newtoken")}
-                        title="Copy token"
+                        title={t("Copy token")}
                         className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                       >
                         {copied === "newtoken" ? (
@@ -1612,14 +1747,15 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                       <button
                         type="button"
                         onClick={() => setNewToken(null)}
-                        aria-label="Dismiss"
+                        aria-label={t("Dismiss")}
                         className="shrink-0 rounded p-1 text-muted-foreground/60 hover:text-foreground"
                       >
                         <X className="size-3.5" />
                       </button>
                     </div>
                     <p className="text-[11px] text-warning">
-                      Copy this token now, it won't be shown again.
+                      {" "}
+                      {t("Copy this token now, it won't be shown again.")}{" "}
                     </p>
                   </>
                 )}
@@ -1628,7 +1764,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   <input
                     value={newLabel}
                     onChange={(e) => setNewLabel(e.target.value)}
-                    placeholder="Client name (e.g. Open WebUI)"
+                    placeholder={t("Client name (e.g. Open WebUI)")}
                     className="h-8 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-xs focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none"
                   />
                   {profiles.length > 0 && (
@@ -1638,13 +1774,13 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                     >
                       <SelectTrigger
                         size="sm"
-                        aria-label="Scope"
+                        aria-label={t("Scope")}
                         className="h-8 w-32 shrink-0 text-xs"
                       >
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="__all__">All servers</SelectItem>
+                        <SelectItem value="__all__">{t("All servers")}</SelectItem>
                         {profiles.map((p) => (
                           <SelectItem key={p.id} value={p.name}>
                             {p.name}
@@ -1659,7 +1795,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                     disabled={clientBusy || !newLabel.trim()}
                     className="h-8 shrink-0 rounded-md border bg-background px-2.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
                   >
-                    Add
+                    {" "}
+                    {t("Add")}{" "}
                   </button>
                 </div>
               </div>
@@ -1672,13 +1809,12 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               className={`size-4 shrink-0 text-muted-foreground ${reapBusy ? "animate-spin" : ""}`}
             />
             <span className="flex min-w-0 flex-1 flex-col leading-tight">
-              <span className="font-medium">Stop old gateways</span>
+              <span className="font-medium">{t("Stop old gateways")}</span>
               <span className="text-xs text-muted-foreground">
-                End leftover gateway processes from earlier installs. Where the gateway
-                path stays the same across upgrades, a host that respawns MCP picks up the
-                new binary on its own. Where the filename carries its version, or the old
-                one sits at a path an upgrade never touches, an app that was already
-                running keeps launching it until you restart that app.
+                {" "}
+                {t(
+                  "End leftover gateway processes from earlier installs. Where the gateway path stays the same across upgrades, a host that respawns MCP picks up the new binary on its own. Where the filename carries its version, or the old one sits at a path an upgrade never touches, an app that was already running keeps launching it until you restart that app.",
+                )}{" "}
               </span>
             </span>
             <button
@@ -1702,14 +1838,20 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   const parts: string[] = [];
                   if (outcome.killed.length > 0) {
                     parts.push(
-                      `Stopped ${outcome.killed.length}: ${outcome.killed.join("; ")}`,
+                      t("Stopped {value1}: {value2}", {
+                        value1: outcome.killed.length,
+                        value2: outcome.killed.join("; "),
+                      }),
                     );
                   }
                   // Reporting "found nothing" while a process is still running would
                   // be the same lie the panel exists to prevent.
                   if (outcome.failed.length > 0) {
                     parts.push(
-                      `Could not stop ${outcome.failed.length}: ${outcome.failed.join("; ")}`,
+                      t("Could not stop {value1}: {value2}", {
+                        value1: outcome.failed.length,
+                        value2: outcome.failed.join("; "),
+                      }),
                     );
                   }
                   setReapResult(
@@ -1725,32 +1867,40 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                           // reason, because that is what makes both true at once — a
                           // client spawns the gateway on its next tool call, not
                           // continuously.
-                          "Nothing to stop: these apps spawn the old gateway on their " +
-                          "next tool call, so there is no process running between calls."
-                        : "No old gateway processes found.",
+                          t(
+                            "Nothing to stop: these apps spawn the old gateway on their ",
+                          ) +
+                          t(
+                            "next tool call, so there is no process running between calls.",
+                          )
+                        : t("No old gateway processes found."),
                   );
                 } catch (e) {
-                  toastError(`Couldn't stop old gateways: ${e}`);
+                  toastError(
+                    t("Couldn't stop old gateways: {value1}", { value1: String(e) }),
+                  );
                 } finally {
                   setReapBusy(false);
                 }
               }}
               className="h-8 shrink-0 rounded-md border bg-background px-2.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
             >
-              {reapBusy ? "Working…" : "Run"}
+              {reapBusy ? t("Working…") : t("Run")}
             </button>
           </div>
           {reapResult && <p className="text-xs text-muted-foreground">{reapResult}</p>}
           {restartCheckFailed && (
             <p className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
-              Couldn&apos;t check for apps using an old gateway.
+              {" "}
+              {t("Couldn't check for apps using an old gateway.")}{" "}
               <button
                 type="button"
-                aria-label="Retry checking for old gateway"
+                aria-label={t("Retry checking for old gateway")}
                 onClick={() => void loadNeedsRestart()}
                 className="shrink-0 font-medium text-foreground underline underline-offset-2 hover:text-primary"
               >
-                Retry
+                {" "}
+                {t("Retry")}{" "}
               </button>
             </p>
           )}
@@ -1758,8 +1908,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             <div className="rounded-md border border-warning/40 bg-warning/5 p-3">
               <p className="text-xs font-medium text-warning">
                 {needsRestart.length === 1
-                  ? "1 app is still launching an old gateway"
-                  : `${needsRestart.length} apps are still launching an old gateway`}
+                  ? t("1 app is still launching an old gateway")
+                  : t("{value1} apps are still launching an old gateway", {
+                      value1: needsRestart.length,
+                    })}
               </p>
               <ul className="mt-1.5 space-y-1">
                 {needsRestart.map((c) => (
@@ -1770,18 +1922,18 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                         lines that read as a duplicate-row bug, and "restart each one"
                         cannot be followed when a dozen are running. */}
                     <span className="ml-1 font-mono text-muted-foreground/70">
-                      (pid {c.clientPid})
+                      {" "}
+                      {t("(pid")} {c.clientPid})
                     </span>{" "}
-                    keeps starting <code className="font-mono">{c.gateway}</code>
+                    {t("keeps starting")} <code className="font-mono">{c.gateway}</code>
                   </li>
                 ))}
               </ul>
               <p className="mt-2 text-xs text-muted-foreground">
-                These apps cached the old gateway path when they started, so stopping the
-                process only makes them launch it again — and they only launch it when
-                they next use a tool, which is why none may be running this moment.
-                Restart each one to pick up the current gateway. This list clears itself
-                as you do.
+                {" "}
+                {t(
+                  "These apps cached the old gateway path when they started, so stopping the process only makes them launch it again — and they only launch it when they next use a tool, which is why none may be running this moment. Restart each one to pick up the current gateway. This list clears itself as you do.",
+                )}{" "}
               </p>
             </div>
           )}

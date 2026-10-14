@@ -4,8 +4,10 @@
  * leaves the user thinking the product is broken until they happen to restart
  * (SOU-317). Universal wording: a restart never hurts clients that hot-reload.
  */
+import { translate } from "./i18n";
+
 export function clientRestartHint(clientName: string): string {
-  return `Restart ${clientName} so it loads Toolport.`;
+  return translate("Restart {client} so it loads Toolport.", { client: clientName });
 }
 
 /**
@@ -17,7 +19,9 @@ export function clientRestartHint(clientName: string): string {
  * though the disconnect failed.
  */
 export function clientRestartHintAfterRemoval(clientName: string): string {
-  return `Restart ${clientName} so it stops loading Toolport.`;
+  return translate("Restart {client} so it stops loading Toolport.", {
+    client: clientName,
+  });
 }
 
 /** Connect/rescope toast body: restart first, then optional scope/backup notes. */

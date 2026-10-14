@@ -1,19 +1,23 @@
+import { useI18n } from "@/lib/i18n";
 import type { TeamPushPreview } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { teamShareAction, teamShareUploads } from "@/lib/teamShare";
 
 /** Only the backend's display allowlist, never a registry entry or resolved credentials. */
 export function TeamSharePreview({ preview }: { preview: TeamPushPreview }) {
+  const { t } = useI18n();
   const showChanges = teamShareUploads(preview) || preview.selections.length === 0;
   return (
     <div className="grid max-h-[60vh] gap-3 overflow-y-auto text-left">
       <p>
-        Other team servers, instructions and policies stay unchanged. Your personal
-        servers remain saved, and other profiles stay unchanged.
+        {t(
+          "Other team servers, instructions and policies stay unchanged. Your personal servers remain saved, and other profiles stay unchanged. ",
+        )}
       </p>
       <p>
-        Credential values are never uploaded. Each member uses their own credentials
-        locally.
+        {t(
+          "Credential values are never uploaded. Each member uses their own credentials locally. ",
+        )}
       </p>
       {preview.selections.map((selection) => (
         <section key={selection.id} className="min-w-0 rounded-md border p-2">
@@ -41,8 +45,8 @@ export function TeamSharePreview({ preview }: { preview: TeamPushPreview }) {
       {!showChanges && (
         <p>
           {teamShareAction(preview)
-            ? "Nothing new is uploaded to the team. Only this profile changes."
-            : "Nothing to upload or switch for this selection."}
+            ? t("Nothing new is uploaded to the team. Only this profile changes.")
+            : t("Nothing to upload or switch for this selection.")}
         </p>
       )}
       {showChanges &&
@@ -51,10 +55,10 @@ export function TeamSharePreview({ preview }: { preview: TeamPushPreview }) {
           return (
             <section key={label}>
               <div className="font-medium text-foreground">
-                {label} ({names.length})
+                {t(label)} ({names.length})
               </div>
               {names.length === 0 ? (
-                <p className="mt-1">None</p>
+                <p className="mt-1">{t("None")}</p>
               ) : label === "Removed" ? (
                 <ul className="mt-1 list-disc pl-5">
                   {names.map((name, i) => (
@@ -80,7 +84,7 @@ export function TeamSharePreview({ preview }: { preview: TeamPushPreview }) {
                         <dl className="mt-2 grid gap-2">
                           {d.fields.map((field) => (
                             <div key={field.label}>
-                              <dt className="text-xs font-medium">{field.label}</dt>
+                              <dt className="text-xs font-medium">{t(field.label)}</dt>
                               <dd className="mt-0.5 whitespace-pre-wrap break-all font-mono text-xs text-foreground">
                                 {field.value}
                               </dd>
@@ -95,8 +99,9 @@ export function TeamSharePreview({ preview }: { preview: TeamPushPreview }) {
           );
         })}
       <p>
-        If the team or your local servers change before saving, Toolport stops and asks
-        you to review again.
+        {t(
+          "If the team or your local servers change before saving, Toolport stops and asks you to review again. ",
+        )}
       </p>
     </div>
   );

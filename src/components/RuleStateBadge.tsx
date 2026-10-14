@@ -1,3 +1,4 @@
+import { useI18n } from "@/lib/i18n";
 import { AlertTriangle, Ban, Check, Clock, Minus, Pencil } from "lucide-react";
 import type { InstructionsApplyState } from "@/lib/types";
 
@@ -49,15 +50,16 @@ const EXPLANATION: Record<InstructionsApplyState, string> = {
 
 /** The state badge for one client, icon + label. */
 export function RuleStateBadge({ state }: { state: InstructionsApplyState }) {
+  const { t: tr } = useI18n();
   const meta = RULE_STATE_META[state];
   const Icon = meta.Icon;
   return (
     <span
-      title={EXPLANATION[state]}
+      title={tr(EXPLANATION[state])}
       className={`flex shrink-0 items-center gap-1 text-xs ${meta.className}`}
     >
       <Icon className="size-3.5" />
-      {meta.label}
+      {tr(meta.label)}
     </span>
   );
 }

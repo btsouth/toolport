@@ -10,36 +10,38 @@
 
 // Recognized signals, checked in order; first match wins. Each returns a short
 // headline. Kept deliberately small: these are the failures users actually hit.
+import { translate } from "./i18n";
+
 const PATTERNS: Array<[RegExp, (m: RegExpMatchArray) => string]> = [
   [
     /EADDRINUSE[^\n]*?(\d{1,3}(?:\.\d{1,3}){3}:\d+|:\d+)/i,
-    (m) => `Port already in use (${m[1]})`,
+    (m) => translate("Port already in use ({port})", { port: m[1] }),
   ],
-  [/EADDRINUSE/i, () => "Port already in use"],
-  [/ENOENT/i, () => "Command or file not found (ENOENT)"],
-  [/ENOTFOUND/i, () => "Host not found (ENOTFOUND)"],
-  [/EAI_AGAIN/i, () => "Temporary DNS failure (EAI_AGAIN)"],
-  [/ECONNREFUSED/i, () => "Connection refused"],
-  [/ECONNRESET/i, () => "Connection reset"],
-  [/EACCES/i, () => "Permission denied (EACCES)"],
-  [/EPERM/i, () => "Permission denied (EPERM)"],
+  [/EADDRINUSE/i, () => translate("Port already in use")],
+  [/ENOENT/i, () => translate("Command or file not found (ENOENT)")],
+  [/ENOTFOUND/i, () => translate("Host not found (ENOTFOUND)")],
+  [/EAI_AGAIN/i, () => translate("Temporary DNS failure (EAI_AGAIN)")],
+  [/ECONNREFUSED/i, () => translate("Connection refused")],
+  [/ECONNRESET/i, () => translate("Connection reset")],
+  [/EACCES/i, () => translate("Permission denied (EACCES)")],
+  [/EPERM/i, () => translate("Permission denied (EPERM)")],
   [
     /timed out waiting for initialize|timed? ?out/i,
-    () => "Timed out waiting for the server",
+    () => translate("Timed out waiting for the server"),
   ],
-  [/\b401\b|unauthorized/i, () => "Authentication required (401)"],
-  [/\b403\b|forbidden/i, () => "Access forbidden (403)"],
+  [/\b401\b|unauthorized/i, () => translate("Authentication required (401)")],
+  [/\b403\b|forbidden/i, () => translate("Access forbidden (403)")],
   [
     /(?:HTTP\s+|status\s+|returned\s+)429\b|\b429\s+Too Many Requests/i,
-    () => "Rate limited (429)",
+    () => translate("Rate limited (429)"),
   ],
   [
     /(?:HTTP\s+|status\s+|returned\s+)(5\d{2})\b|\b(5\d{2})\s+(?:Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout|error)/i,
-    (m) => `Server error (${m[1] ?? m[2]})`,
+    (m) => translate("Server error ({status})", { status: m[1] ?? m[2] }),
   ],
   [
     /UNABLE_TO_VERIFY_LEAF_SIGNATURE|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN/i,
-    () => "TLS certificate not trusted",
+    () => translate("TLS certificate not trusted"),
   ],
 ];
 
@@ -66,7 +68,7 @@ export function shortenUrls(s: string, max = 80): string {
  */
 export function errorHeadline(raw: string | null | undefined): string {
   const text = (raw ?? "").trim();
-  if (!text) return "Unknown error";
+  if (!text) return translate("Unknown error");
 
   for (const [re, fmt] of PATTERNS) {
     const m = text.match(re);
@@ -74,7 +76,7 @@ export function errorHeadline(raw: string | null | undefined): string {
   }
 
   const exit = text.match(/exit(?:ed)?\s+(?:with\s+)?(?:status|code)\s+(\d+)/i);
-  if (exit) return `Exited with status ${exit[1]}`;
+  if (exit) return translate("Exited with status {status}", { status: exit[1] });
 
   const lastLine =
     text

@@ -1,3 +1,4 @@
+import { useI18n, translate, Trans } from "@/lib/i18n";
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -32,7 +33,7 @@ function routineApprovalView(value: unknown) {
       : undefined;
   const dependencies = evidence?.observedDependencies;
   return {
-    name: typeof payload.name === "string" ? payload.name : "Unnamed routine",
+    name: typeof payload.name === "string" ? payload.name : translate("Unnamed routine"),
     description: typeof payload.description === "string" ? payload.description : null,
     risk: typeof payload.riskClass === "string" ? payload.riskClass : "unknown",
     calls: evidence?.calls,
@@ -85,6 +86,7 @@ const REASON: Record<Reason, { label: string; className: string; Icon: typeof Tr
  * `approval-resolved` events.
  */
 export function PendingApprovals() {
+  const { t } = useI18n();
   const [pending, setPending] = useState<PendingApproval[]>([]);
   // Ids with a decision in flight: shown dimmed + disabled, removed authoritatively by the
   // resolved event / poll (NOT optimistically), so a poll landing before the backend
@@ -154,7 +156,7 @@ export function PendingApprovals() {
       await decideApproval(id, approved, scope);
       // Intentionally NOT removed here — the approval-resolved event + poll remove it.
     } catch (e) {
-      toastError(`Couldn't record your decision: ${e}`);
+      toastError(t("Couldn't record your decision: {value1}", { value1: String(e) }));
       setResolving((s) => {
         const n = new Set(s);
         n.delete(id);
@@ -192,24 +194,38 @@ export function PendingApprovals() {
         onKeyDown={onKeyDown}
         role="alertdialog"
         aria-modal="false"
-        aria-label="Tool calls awaiting your approval"
+        aria-label={t("Tool calls awaiting your approval")}
         className="animate-in fade-in slide-in-from-top-2 pointer-events-auto relative w-full max-w-lg overflow-hidden rounded-xl border border-warning/40 bg-popover/95 shadow-2xl ring-1 ring-warning/10 backdrop-blur outline-none focus-visible:ring-2 focus-visible:ring-warning"
       >
         {/* Announce count changes to screen readers without re-announcing on every countdown
          * tick (the visible timer lives elsewhere; this text only changes when the count does). */}
         <div aria-live="assertive" className="sr-only">
-          {pending.length} request{pending.length > 1 ? "s" : ""} awaiting your action.
-          Press Escape to cancel.
+          <Trans
+            message={
+              pending.length > 1
+                ? "{value1} requests awaiting your action. Press Escape to cancel."
+                : "{value1} request awaiting your action. Press Escape to cancel."
+            }
+            values={{ value1: pending.length }}
+          />
         </div>
         <header className="flex items-center gap-3 border-b border-border/60 px-4 py-3">
           <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-warning/15 text-warning">
             <ShieldAlert className="size-4" />
           </span>
           <div className="min-w-0">
-            <div className="text-sm font-semibold leading-tight">Action required</div>
+            <div className="text-sm font-semibold leading-tight">
+              {t("Action required")}
+            </div>
             <div className="text-xs text-muted-foreground">
-              {pending.length} request{pending.length > 1 ? "s" : ""} held — no action
-              cancels it
+              <Trans
+                message={
+                  pending.length > 1
+                    ? "{value1} requests held — no action cancels it"
+                    : "{value1} request held — no action cancels it"
+                }
+                values={{ value1: pending.length }}
+              />
             </div>
           </div>
         </header>
@@ -255,27 +271,43 @@ export function PendingApprovals() {
                     </div>
                     {a.client && (
                       <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
-                        <Monitor className="size-3" />
-                        Requested by {a.client}
+                        <Trans
+                          message={"{value1}Requested by {value2}"}
+                          values={{
+                            value1: <Monitor className="size-3" />,
+                            value2: a.client,
+                          }}
+                        />
                       </div>
                     )}
                     {a.agentRule && (
                       <div className="mt-1 text-xs text-muted-foreground">
-                        Your rule{" "}
-                        <span className="font-mono text-foreground">{a.agentRule}</span>{" "}
-                        asks before this.
+                        <Trans
+                          message={"Your rule{value1}{value2}{value3}asks before this."}
+                          values={{
+                            value1: " ",
+                            value2: (
+                              <span className="font-mono text-foreground">
+                                {a.agentRule}
+                              </span>
+                            ),
+                            value3: " ",
+                          }}
+                        />
                       </div>
                     )}
                   </div>
                   {urlElicitation ? (
                     <Badge className="bg-warning/15 text-warning">
-                      <Globe className="size-3" />
-                      External link
+                      <Trans
+                        message={"{value1}External link"}
+                        values={{ value1: <Globe className="size-3" /> }}
+                      />
                     </Badge>
                   ) : (
                     <Badge className={reason.className}>
                       <reason.Icon className="size-3" />
-                      {reason.label}
+                      {t(reason.label)}
                     </Badge>
                   )}
                 </div>
@@ -287,7 +319,10 @@ export function PendingApprovals() {
                 {piiRelease && (
                   <div className="mb-3">
                     <div className="mb-1 text-[0.7rem] font-medium uppercase tracking-wide text-muted-foreground">
-                      Would send to {piiRelease.server}
+                      <Trans
+                        message={"Would send to {value1}"}
+                        values={{ value1: piiRelease.server }}
+                      />
                     </div>
                     <ul className="divide-y divide-border/60 rounded-md border border-destructive/40 bg-destructive/5">
                       {piiRelease.values.map((v) => (
@@ -296,16 +331,23 @@ export function PendingApprovals() {
                             {v.value}
                           </div>
                           <div className="mt-0.5 text-muted-foreground">
-                            {v.token} · from {v.origins.join(", ")}
+                            <Trans
+                              message={"{value1} · from {value2}"}
+                              values={{ value1: v.token, value2: v.origins.join(", ") }}
+                            />
                           </div>
                         </li>
                       ))}
                     </ul>
                     <p className="mt-1.5 text-xs text-muted-foreground">
-                      {piiRelease.server} has never seen{" "}
-                      {piiRelease.values.length === 1 ? "this value" : "these values"}.
-                      Approving releases {piiRelease.values.length === 1 ? "it" : "them"}{" "}
-                      to that server for the rest of this session, and nothing else.
+                      <Trans
+                        message={
+                          piiRelease.values.length === 1
+                            ? "{value1} has never seen this value. Approving releases it to that server for the rest of this session, and nothing else."
+                            : "{value1} has never seen these values. Approving releases them to that server for the rest of this session, and nothing else."
+                        }
+                        values={{ value1: piiRelease.server }}
+                      />
                     </p>
                   </div>
                 )}
@@ -313,10 +355,10 @@ export function PendingApprovals() {
                 <div className="mb-3">
                   <div className="mb-1 text-[0.7rem] font-medium uppercase tracking-wide text-muted-foreground">
                     {urlElicitation
-                      ? "Why this is needed"
+                      ? t("Why this is needed")
                       : a.reason === "persistent_code_write"
-                        ? "Routine definition"
-                        : "Arguments"}
+                        ? t("Routine definition")
+                        : t("Arguments")}
                   </div>
                   {urlElicitation ? (
                     <div className="rounded-md border border-border/60 bg-muted/40 p-2.5 text-sm leading-relaxed">
@@ -347,36 +389,52 @@ export function PendingApprovals() {
                           )}
                           {routine.synthesized && (
                             <div className="rounded border border-warning/40 bg-warning/10 px-2 py-1 text-xs leading-relaxed text-warning">
-                              Synthesized by Toolport from observed direct calls: every
-                              listed call really ran, but the surrounding script was
-                              generated and statically validated, not yet executed.
+                              {t(
+                                "Synthesized by Toolport from observed direct calls: every listed call really ran, but the surrounding script was generated and statically validated, not yet executed. ",
+                              )}
                             </div>
                           )}
                           <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                            <span>Risk: {routine.risk}</span>
+                            <span>
+                              <Trans
+                                message={"Risk: {value1}"}
+                                values={{ value1: routine.risk }}
+                              />
+                            </span>
                             {routine.calls !== undefined && (
-                              <span>Calls: {String(routine.calls)}</span>
+                              <span>
+                                <Trans
+                                  message={"Calls: {value1}"}
+                                  values={{ value1: String(routine.calls) }}
+                                />
+                              </span>
                             )}
                             {routine.dependencies.length > 0 && (
                               <span>
-                                Dependencies:{" "}
-                                {routine.dependencies
-                                  .map((dependency) =>
-                                    dependency &&
-                                    typeof dependency === "object" &&
-                                    "name" in dependency
-                                      ? String(
-                                          (dependency as Record<string, unknown>).name,
-                                        )
-                                      : String(dependency),
-                                  )
-                                  .join(", ")}
+                                <Trans
+                                  message={"Dependencies:{value1}{value2}"}
+                                  values={{
+                                    value1: " ",
+                                    value2: routine.dependencies
+                                      .map((dependency) =>
+                                        dependency &&
+                                        typeof dependency === "object" &&
+                                        "name" in dependency
+                                          ? String(
+                                              (dependency as Record<string, unknown>)
+                                                .name,
+                                            )
+                                          : String(dependency),
+                                      )
+                                      .join(", "),
+                                  }}
+                                />
                               </span>
                             )}
                           </div>
                           <details>
                             <summary className="cursor-pointer text-xs font-medium text-muted-foreground hover:text-foreground">
-                              Technical details
+                              {t("Technical details ")}
                             </summary>
                             <pre className="mt-2 max-h-36 overflow-auto rounded border border-border/60 bg-background/60 p-2 font-mono text-[0.7rem] leading-relaxed">
                               {JSON.stringify(routine.technical, null, 2)}
@@ -399,19 +457,26 @@ export function PendingApprovals() {
                       (urgent ? "text-destructive" : "text-muted-foreground")
                     }
                   >
-                    <span
-                      aria-hidden
-                      className="inline-block h-1 w-16 overflow-hidden rounded-full bg-border"
-                    >
-                      <span
-                        className={
-                          "block h-full rounded-full transition-[width] duration-1000 ease-linear " +
-                          (urgent ? "bg-destructive" : "bg-warning")
-                        }
-                        style={{ width: `${pct}%` }}
-                      />
-                    </span>
-                    {remaining}s left
+                    <Trans
+                      message={"{value1}{value2}s left"}
+                      values={{
+                        value1: (
+                          <span
+                            aria-hidden
+                            className="inline-block h-1 w-16 overflow-hidden rounded-full bg-border"
+                          >
+                            <span
+                              className={
+                                "block h-full rounded-full transition-[width] duration-1000 ease-linear " +
+                                (urgent ? "bg-destructive" : "bg-warning")
+                              }
+                              style={{ width: `${pct}%` }}
+                            />
+                          </span>
+                        ),
+                        value2: remaining,
+                      }}
+                    />
                   </div>
                   <div className="flex shrink-0 gap-2">
                     <Button
@@ -421,7 +486,7 @@ export function PendingApprovals() {
                       onClick={() => void decide(a.id, false)}
                     >
                       {isBusy ? <Loader2 className="animate-spin" /> : <X />}
-                      {urlElicitation ? "Cancel" : "Deny"}
+                      {urlElicitation ? t("Cancel") : t("Deny")}
                     </Button>
                     {urlElicitation && (
                       <Button
@@ -430,8 +495,10 @@ export function PendingApprovals() {
                         disabled={isBusy}
                         onClick={() => void openExternal(urlElicitation.url)}
                       >
-                        <Globe />
-                        Open link
+                        <Trans
+                          message={"{value1}Open link"}
+                          values={{ value1: <Globe /> }}
+                        />
                       </Button>
                     )}
                     <Button
@@ -441,7 +508,7 @@ export function PendingApprovals() {
                       className="bg-[color-mix(in_oklch,var(--success),black_16%)] text-white shadow-sm hover:bg-[color-mix(in_oklch,var(--success),black_26%)]"
                     >
                       {isBusy ? <Loader2 className="animate-spin" /> : <Check />}
-                      {urlElicitation ? "Continue" : "Approve"}
+                      {urlElicitation ? t("Continue") : t("Approve")}
                     </Button>
                   </div>
                 </div>
@@ -459,13 +526,13 @@ export function PendingApprovals() {
                   a.reason !== "agent_permission" &&
                   !piiRelease && (
                     <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-muted-foreground">
-                      <span>Skip next time?</span>
+                      <span>{t("Skip next time?")}</span>
                       <button
                         disabled={isBusy}
                         onClick={() => void decide(a.id, true, "session")}
                         className="font-medium text-foreground/80 underline-offset-2 hover:text-foreground hover:underline disabled:opacity-50"
                       >
-                        Allow for this session
+                        {t("Allow for this session ")}
                       </button>
                       <span className="text-muted-foreground/40">·</span>
                       <button
@@ -473,7 +540,7 @@ export function PendingApprovals() {
                         onClick={() => void decide(a.id, true, "always")}
                         className="font-medium text-foreground/80 underline-offset-2 hover:text-foreground hover:underline disabled:opacity-50"
                       >
-                        Always allow this tool
+                        {t("Always allow this tool ")}
                       </button>
                     </div>
                   )}

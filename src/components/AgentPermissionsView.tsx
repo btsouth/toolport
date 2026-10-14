@@ -1,3 +1,4 @@
+import { useI18n } from "@/lib/i18n";
 import { useEffect, useState } from "react";
 import { Eye, Plus, ShieldCheck, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -53,6 +54,7 @@ const STATE_LABEL: Record<string, { label: string; className: string }> = {
  * removed: a rule you already had in the file is left exactly where it is.
  */
 export function AgentPermissionsView() {
+  const { t } = useI18n();
   const [data, setData] = useState<PermissionsViewData | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -187,11 +189,11 @@ export function AgentPermissionsView() {
     }
   }
 
-  if (loading) return <p className="text-sm text-muted-foreground">Loading…</p>;
+  if (loading) return <p className="text-sm text-muted-foreground">{t("Loading…")}</p>;
   if (!data) {
     return (
       <Callout variant="danger" role="alert">
-        {error ?? "Could not load the permission policy."}
+        {error ?? t("Could not load the permission policy.")}
       </Callout>
     );
   }
@@ -214,7 +216,7 @@ export function AgentPermissionsView() {
             className="mt-1"
             checked={data.enabled}
             disabled={busy || preview !== null}
-            aria-label="Enforce my permission rules in Claude Code"
+            aria-label={t("Enforce my permission rules in Claude Code")}
             onChange={(e) => {
               const next = e.target.checked;
               void act(() => agentPermissionsSetEnabled(next));
@@ -222,16 +224,17 @@ export function AgentPermissionsView() {
           />
           <span className="min-w-0">
             <span className="text-sm font-medium">
-              Enforce my permission rules in Claude Code
+              {" "}
+              {t("Enforce my permission rules in Claude Code")}{" "}
             </span>
             <span className="mt-1 block text-xs text-muted-foreground">
-              Toolport writes the rules below into every Claude Code profile&rsquo;s{" "}
-              <span className="font-mono">settings.json</span>, under{" "}
-              <span className="font-mono">permissions</span>. Claude Code itself then
-              refuses, or asks before, a matching native tool call &mdash; shell commands,
-              file reads and edits, web fetches, MCP tools &mdash; on every call, whatever
-              any hook says. Turning this off removes only what Toolport added; a rule you
-              already had stays.
+              {" "}
+              {t("Toolport writes the rules below into every Claude Code profile’s")}{" "}
+              <span className="font-mono">{"settings.json"}</span>
+              {t(", under")} <span className="font-mono">{"permissions"}</span>
+              {t(
+                ". Claude Code itself then refuses, or asks before, a matching native tool call — shell commands, file reads and edits, web fetches, MCP tools — on every call, whatever any hook says. Turning this off removes only what Toolport added; a rule you already had stays.",
+              )}{" "}
             </span>
           </span>
         </label>
@@ -242,8 +245,7 @@ export function AgentPermissionsView() {
             disabled={busy || guardPreview !== null}
             onClick={openPreview}
           >
-            <Eye className="size-3.5" />
-            Preview what would be written
+            <Eye className="size-3.5" /> {t("Preview what would be written")}{" "}
           </Button>
         </div>
       </div>
@@ -251,21 +253,26 @@ export function AgentPermissionsView() {
       <div className="rounded-xl border bg-card p-5">
         <div className="mb-1 flex items-center gap-2">
           <ShieldCheck className="size-4 text-muted-foreground" />
-          <h2 className="text-sm font-medium">Rules</h2>
+          <h2 className="text-sm font-medium">{t("Rules")}</h2>
         </div>
         <p className="mb-3 text-xs text-muted-foreground">
-          Claude Code&rsquo;s own rule syntax: a tool name, optionally with a pattern in
-          parentheses &mdash; <span className="font-mono">Bash(rm -rf *)</span>,{" "}
-          <span className="font-mono">Read(./.env)</span>,{" "}
-          <span className="font-mono">WebFetch(domain:example.com)</span>,{" "}
-          <span className="font-mono">mcp__github__create_issue</span>. A bare tool name
-          covers every use of it. &ldquo;Never&rdquo; beats &ldquo;Ask first&rdquo; beats
-          &ldquo;Always allow&rdquo; when more than one matches.
+          {" "}
+          {t(
+            "Claude Code’s own rule syntax: a tool name, optionally with a pattern in parentheses —",
+          )}{" "}
+          <span className="font-mono">{"Bash(rm -rf *)"}</span>,{" "}
+          <span className="font-mono">{"Read(./.env)"}</span>,{" "}
+          <span className="font-mono">{"WebFetch(domain:example.com)"}</span>,{" "}
+          <span className="font-mono">{"mcp__github__create_issue"}</span>
+          {t(
+            ". A bare tool name covers every use of it. “Never” beats “Ask first” beats “Always allow” when more than one matches.",
+          )}{" "}
         </p>
 
         {data.rules.length === 0 ? (
           <p className="mb-3 text-sm text-muted-foreground">
-            No rules yet. Add one below, or start from a preset.
+            {" "}
+            {t("No rules yet. Add one below, or start from a preset.")}{" "}
           </p>
         ) : (
           <ul className="mb-3 grid gap-1.5">
@@ -277,15 +284,15 @@ export function AgentPermissionsView() {
                 >
                   <span className="min-w-0 truncate">
                     <span className="mr-2 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
-                      {ACTION_LABEL[a]}
+                      {t(ACTION_LABEL[a])}
                     </span>
                     <span className="font-mono text-xs">{r.pattern}</span>
                   </span>
                   <button
                     type="button"
                     disabled={busy}
-                    aria-label={`Remove rule ${r.pattern}`}
-                    title="Remove this rule"
+                    aria-label={t("Remove rule {value1}", { value1: r.pattern })}
+                    title={t("Remove this rule")}
                     onClick={() =>
                       void withRules(
                         data.rules.filter(
@@ -311,33 +318,35 @@ export function AgentPermissionsView() {
           }}
         >
           <select
-            aria-label="Action"
+            aria-label={t("Action")}
             value={action}
             disabled={busy}
             onChange={(e) => setAction(e.target.value as PermissionAction)}
             className="h-9 rounded-md border bg-background px-2 text-sm"
           >
-            <option value="deny">Never</option>
-            <option value="ask">Ask first</option>
-            <option value="allow">Always allow</option>
+            <option value="deny">{t("Never")}</option>
+            <option value="ask">{t("Ask first")}</option>
+            <option value="allow">{t("Always allow")}</option>
           </select>
           <Input
             value={pattern}
             disabled={busy}
-            aria-label="Rule pattern"
-            placeholder="Bash(rm -rf *)"
+            aria-label={t("Rule pattern")}
+            placeholder={"Bash(rm -rf *)"}
             onChange={(e) => setPattern(e.target.value)}
             className="h-9 w-72 font-mono text-xs"
           />
           <Button type="submit" size="sm" disabled={busy || !pattern.trim()}>
-            <Plus className="size-3.5" />
-            Add rule
+            <Plus className="size-3.5" /> {t("Add rule")}{" "}
           </Button>
         </form>
 
         <div className="mt-3 border-t pt-3">
           <p className="mb-2 text-xs text-muted-foreground">
-            Presets (added to the list, nothing written until the switch is on):
+            {" "}
+            {t(
+              "Presets (added to the list, nothing written until the switch is on):",
+            )}{" "}
           </p>
           <div className="flex flex-wrap gap-1.5">
             {data.presets.map((p) => {
@@ -355,9 +364,9 @@ export function AgentPermissionsView() {
                   disabled={busy || already}
                   title={
                     already
-                      ? "Every pattern in this preset is already in the list"
+                      ? t("Every pattern in this preset is already in the list")
                       : p.rules
-                          .map((r) => `${ACTION_LABEL[r.action]}: ${r.pattern}`)
+                          .map((r) => `${t(ACTION_LABEL[r.action])}: ${r.pattern}`)
                           .join("\n")
                   }
                   onClick={() => {
@@ -368,7 +377,7 @@ export function AgentPermissionsView() {
                     void withRules(merged);
                   }}
                 >
-                  {p.label}
+                  {t(p.label)}
                 </Button>
               );
             })}
@@ -377,14 +386,19 @@ export function AgentPermissionsView() {
       </div>
 
       <div className="rounded-xl border bg-card p-5">
-        <h2 className="mb-1 text-sm font-medium">Claude Code profiles</h2>
+        <h2 className="mb-1 text-sm font-medium">{t("Claude Code profiles")}</h2>
         <p className="mb-3 text-xs text-muted-foreground">
-          Every profile on this machine is covered, including ones selected with{" "}
-          <span className="font-mono">CLAUDE_CONFIG_DIR</span>; a rule in only one of them
-          would quietly not apply in the others.
+          {" "}
+          {t(
+            "Every profile on this machine is covered, including ones selected with",
+          )}{" "}
+          <span className="font-mono">{"CLAUDE_CONFIG_DIR"}</span>
+          {t("; a rule in only one of them would quietly not apply in the others.")}{" "}
         </p>
         {data.profiles.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No Claude Code profile found.</p>
+          <p className="text-sm text-muted-foreground">
+            {t("No Claude Code profile found.")}
+          </p>
         ) : (
           <ul className="grid gap-1.5 text-sm">
             {data.profiles.map((p) => {
@@ -398,12 +412,12 @@ export function AgentPermissionsView() {
                     className={`flex shrink-0 items-center gap-2 text-xs ${meta.className}`}
                     title={p.error}
                   >
-                    {meta.label}
+                    {t(meta.label)}
                     {p.state === "applied" &&
                       p.added < data.rules.length &&
                       data.rules.length > 0 && (
                         <span className="text-muted-foreground">
-                          ({data.rules.length - p.added} already yours)
+                          ({data.rules.length - p.added} {t("already yours)")}{" "}
                         </span>
                       )}
                   </span>
@@ -417,43 +431,61 @@ export function AgentPermissionsView() {
       <div className="rounded-xl border bg-card p-5">
         <h2 className="mb-1 text-sm font-medium">Cursor</h2>
         <p className="mb-3 text-xs text-muted-foreground">
-          Cursor has no settings-level rule list, so Toolport installs a small guard hook
-          into <span className="font-mono">~/.cursor/hooks.json</span> that evaluates the
-          same rules before a shell command runs, an MCP tool is called, or a file is
-          read. <span className="font-mono">Bash(&hellip;)</span> rules guard shell
-          commands, <span className="font-mono">Read(&hellip;)</span> rules guard file
-          reads, <span className="font-mono">mcp__server__tool</span> rules guard MCP
-          tools (Cursor names the tool, not the server, so the server part is not
-          checked); <span className="font-mono">Edit</span> and{" "}
-          <span className="font-mono">WebFetch</span> rules have no Cursor event and do
-          nothing there. &ldquo;Ask first&rdquo; uses Cursor&rsquo;s own confirmation.
-          Every decision is recorded in Agent activity.
+          {" "}
+          {t(
+            "Cursor has no settings-level rule list, so Toolport installs a small guard hook into",
+          )}{" "}
+          <span className="font-mono">{"~/.cursor/hooks.json"}</span>{" "}
+          {t(
+            "that evaluates the same rules before a shell command runs, an MCP tool is called, or a file is read.",
+          )}{" "}
+          <span className="font-mono">{"Bash(…)"}</span>{" "}
+          {t("rules guard shell commands,")}{" "}
+          <span className="font-mono">{"Read(…)"}</span> {t("rules guard file reads,")}{" "}
+          <span className="font-mono">{"mcp__server__tool"}</span>{" "}
+          {t(
+            "rules guard MCP tools (Cursor names the tool, not the server, so the server part is not checked);",
+          )}{" "}
+          <span className="font-mono">Edit</span> {t("and")}{" "}
+          <span className="font-mono">WebFetch</span>{" "}
+          {t(
+            "rules have no Cursor event and do nothing there. “Ask first” uses Cursor’s own confirmation. Every decision is recorded in Agent activity.",
+          )}{" "}
         </p>
         {guardError ? (
           <div className="flex items-center gap-2 text-sm text-destructive">
-            <span>Could not load the Cursor guard: {guardError}</span>
+            <span>
+              {t("Could not load the Cursor guard:")} {guardError}
+            </span>
             <Button variant="outline" size="sm" onClick={loadGuard}>
-              Retry
+              {" "}
+              {t("Retry")}{" "}
             </Button>
           </div>
         ) : guard === null ? (
-          <p className="text-sm text-muted-foreground">Loading&hellip;</p>
+          <p className="text-sm text-muted-foreground">{t("Loading…")}</p>
         ) : (
           <>
             <div
               role="radiogroup"
-              aria-label="Cursor guard mode"
+              aria-label={t("Cursor guard mode")}
               className="mb-2 flex flex-wrap gap-3 text-sm"
             >
               {(
                 [
-                  ["off", "Off", "No hook installed."],
+                  ["off", t("Off"), t("No hook installed.")],
                   [
                     "observe",
-                    "Observe",
-                    "Hook installed; every call is recorded with what the rules would decide, but nothing is blocked or asked.",
+                    t("Observe"),
+                    t(
+                      "Hook installed; every call is recorded with what the rules would decide, but nothing is blocked or asked.",
+                    ),
                   ],
-                  ["enforce", "Enforce", "Never and Ask first take effect in Cursor."],
+                  [
+                    "enforce",
+                    t("Enforce"),
+                    t("Never and Ask first take effect in Cursor."),
+                  ],
                 ] as [GuardMode, string, string][]
               ).map(([value, label, help]) => (
                 <label key={value} className="flex items-start gap-2" title={help}>
@@ -468,12 +500,12 @@ export function AgentPermissionsView() {
                       guardPreview !== null ||
                       (value !== "off" && !guard.binary)
                     }
-                    aria-label={`Cursor guard ${label}`}
+                    aria-label={t("Cursor guard {value1}", { value1: label })}
                     onChange={() => void setCursorMode(value)}
                     className="mt-1"
                   />
                   <span>
-                    <span className="font-medium">{label}</span>
+                    <span className="font-medium">{t(label)}</span>
                     <span className="block text-xs text-muted-foreground">{help}</span>
                   </span>
                 </label>
@@ -485,19 +517,23 @@ export function AgentPermissionsView() {
                 {guard.cursor.error ? (
                   <span className="text-destructive">&mdash; {guard.cursor.error}</span>
                 ) : guard.cursor.installed ? (
-                  <span className="text-success">&mdash; guard installed</span>
+                  <span className="text-success">{t("— guard installed")}</span>
                 ) : (
-                  <span>&mdash; no guard installed</span>
+                  <span>{t("— no guard installed")}</span>
                 )}
               </p>
             ) : (
               <p className="mb-2 text-xs text-muted-foreground">
-                Cursor&rsquo;s config folder could not be resolved.
+                {" "}
+                {t("Cursor’s config folder could not be resolved.")}{" "}
               </p>
             )}
             {!guard.binary && (
               <p className="mb-2 text-xs text-warning">
-                No gateway binary has been published yet, so the hook cannot be installed.
+                {" "}
+                {t(
+                  "No gateway binary has been published yet, so the hook cannot be installed.",
+                )}{" "}
               </p>
             )}
             <Button
@@ -510,32 +546,32 @@ export function AgentPermissionsView() {
                 )
               }
             >
-              <Eye className="size-3.5" />
-              Preview hooks.json
+              <Eye className="size-3.5" /> {t("Preview hooks.json")}{" "}
             </Button>
           </>
         )}
       </div>
 
       <div className="rounded-xl border bg-card p-5">
-        <h2 className="mb-1 text-sm font-medium">Which agents this reaches</h2>
+        <h2 className="mb-1 text-sm font-medium">{t("Which agents this reaches")}</h2>
         <ul className="grid gap-1 text-xs text-muted-foreground">
           <li>
-            <span className="text-foreground">Claude Code</span> &mdash; enforced through
-            its own <span className="font-mono">permissions</span> settings, on every
-            native tool call.
+            <span className="text-foreground">Claude Code</span>{" "}
+            {t("— enforced through its own")}{" "}
+            <span className="font-mono">{"permissions"}</span>{" "}
+            {t("settings, on every native tool call.")}{" "}
           </li>
           <li>
-            <span className="text-foreground">Cursor</span> &mdash; enforced by the guard
-            hook above for shell commands, file reads and MCP tools, once you set it to
-            Enforce.
+            <span className="text-foreground">Cursor</span>{" "}
+            {t(
+              "— enforced by the guard hook above for shell commands, file reads and MCP tools, once you set it to Enforce.",
+            )}{" "}
           </li>
           <li>
-            <span className="text-foreground">Codex, Gemini CLI</span> &mdash; not yet.
-            Codex uses approval and sandbox settings of a different shape; Gemini CLI is
-            mixed. Toolport says so rather than pretending. The gateway&rsquo;s own
-            approval and destructive-call gates still cover every MCP call from every
-            client.
+            <span className="text-foreground">Codex, Gemini CLI</span>{" "}
+            {t(
+              "— not yet. Codex uses approval and sandbox settings of a different shape; Gemini CLI is mixed. Toolport says so rather than pretending. The gateway’s own approval and destructive-call gates still cover every MCP call from every client.",
+            )}{" "}
           </li>
         </ul>
       </div>
@@ -545,7 +581,9 @@ export function AgentPermissionsView() {
         previews={guardPreview}
         onClose={() => setGuardPreview(null)}
         keyName="hooks"
-        emptyText="Cursor's config folder could not be resolved, so there is nothing to write."
+        emptyText={t(
+          "Cursor's config folder could not be resolved, so there is nothing to write.",
+        )}
       />
     </div>
   );
@@ -563,11 +601,12 @@ function PreviewDialog({
   keyName?: string;
   emptyText?: string;
 }) {
+  const { t } = useI18n();
   return (
     <Dialog open={previews !== null} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="sm:max-w-3xl">
         <DialogHeader>
-          <DialogTitle>What would be written</DialogTitle>
+          <DialogTitle>{t("What would be written")}</DialogTitle>
         </DialogHeader>
         <div className="grid gap-4 overflow-auto">
           {previews?.length === 0 && (
@@ -578,7 +617,8 @@ function PreviewDialog({
               <p className="font-mono text-xs text-muted-foreground">{p.path}</p>
               {p.error ? (
                 <p className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">
-                  No preview for this profile: {p.error}
+                  {" "}
+                  {t("No preview for this profile:")} {p.error}
                 </p>
               ) : (
                 <>
@@ -587,7 +627,8 @@ function PreviewDialog({
                   </pre>
                   {p.before === "" && (
                     <p className="text-xs text-muted-foreground">
-                      This file does not exist yet and would be created.
+                      {" "}
+                      {t("This file does not exist yet and would be created.")}{" "}
                     </p>
                   )}
                 </>
@@ -596,9 +637,12 @@ function PreviewDialog({
           ))}
         </div>
         <DialogFooter className="text-xs text-muted-foreground sm:justify-start">
-          Nothing has been written. Only the <span className="font-mono">{keyName}</span>{" "}
-          key changes; everything else in the file, including your comments, is left
-          exactly as it is.
+          {" "}
+          {t("Nothing has been written. Only the")}{" "}
+          <span className="font-mono">{keyName}</span>{" "}
+          {t(
+            "key changes; everything else in the file, including your comments, is left exactly as it is.",
+          )}{" "}
         </DialogFooter>
       </DialogContent>
     </Dialog>

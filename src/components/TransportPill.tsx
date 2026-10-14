@@ -1,3 +1,4 @@
+import { useI18n } from "@/lib/i18n";
 import { Globe, HelpCircle, Radio, Terminal } from "lucide-react";
 import type { Transport } from "@/lib/types";
 
@@ -12,16 +13,17 @@ const meta: Record<Transport, { label: string; icon: typeof Terminal }> = {
 };
 
 export function TransportPill({ transport }: { transport: Transport }) {
+  const { t } = useI18n();
   const m = meta[transport];
   const Icon = m.icon;
   return (
     <span
       role="img"
-      aria-label={`Transport: ${m.label}`}
+      aria-label={t("Transport: {value1}", { value1: t(m.label) })}
       className="inline-flex items-center gap-1 font-mono text-2xs text-muted-foreground"
     >
       <Icon className="size-3 opacity-70" aria-hidden="true" />
-      <span aria-hidden="true">{m.label}</span>
+      <span aria-hidden="true">{t(m.label)}</span>
     </span>
   );
 }

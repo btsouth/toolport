@@ -1,3 +1,4 @@
+import { useI18n } from "@/lib/i18n";
 import { useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
@@ -29,6 +30,7 @@ interface Props {
 }
 
 export function ProfileBar({ registry, onChange }: Props) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const activeId = registry.activeProfileId ?? registry.profiles[0]?.id;
@@ -37,7 +39,7 @@ export function ProfileBar({ registry, onChange }: Props) {
     try {
       onChange(await setActiveProfile(id));
     } catch (e) {
-      toastError(`Couldn't switch profile: ${e}`);
+      toastError(t("Couldn't switch profile: {value1}", { value1: String(e) }));
     }
   }
 
@@ -46,11 +48,11 @@ export function ProfileBar({ registry, onChange }: Props) {
     if (!trimmed) return;
     try {
       onChange(await createProfile(trimmed));
-      toast.success(`Created profile "${trimmed}"`);
+      toast.success(t('Created profile "{value1}"', { value1: trimmed }));
       setName("");
       setOpen(false);
     } catch (e) {
-      toastError(`Couldn't create profile: ${e}`);
+      toastError(t("Couldn't create profile: {value1}", { value1: String(e) }));
     }
   }
 
@@ -59,7 +61,7 @@ export function ProfileBar({ registry, onChange }: Props) {
     try {
       onChange(await deleteProfile(activeId));
     } catch (e) {
-      toastError(`Couldn't delete profile: ${e}`);
+      toastError(t("Couldn't delete profile: {value1}", { value1: String(e) }));
     }
   }
 
@@ -74,7 +76,7 @@ export function ProfileBar({ registry, onChange }: Props) {
     <div className="flex items-center gap-1.5">
       <Select value={activeId} onValueChange={handleSwitch}>
         <SelectTrigger size="sm" className="flex-1">
-          <SelectValue placeholder="Profile" />
+          <SelectValue placeholder={t("Profile")} />
         </SelectTrigger>
         <SelectContent>
           {registry.profiles.map((p) => (
@@ -89,7 +91,7 @@ export function ProfileBar({ registry, onChange }: Props) {
         variant="ghost"
         size="icon"
         className="size-8 shrink-0"
-        aria-label="New profile"
+        aria-label={t("New profile")}
         onClick={() => setOpen(true)}
       >
         <Plus className="size-4" />
@@ -102,14 +104,19 @@ export function ProfileBar({ registry, onChange }: Props) {
               variant="ghost"
               size="icon"
               className="size-8 shrink-0 text-muted-foreground hover:text-destructive"
-              aria-label="Delete current profile"
+              aria-label={t("Delete current profile")}
             >
               <Trash2 className="size-4" />
             </Button>
           }
-          title={`Delete "${registry.profiles.find((p) => p.id === activeId)?.name ?? "this profile"}"?`}
-          description="This removes the profile and its server scoping. Your servers and their secrets are not deleted."
-          confirmLabel="Delete"
+          title={t('Delete "{value1}"?', {
+            value1:
+              registry.profiles.find((p) => p.id === activeId)?.name ?? "this profile",
+          })}
+          description={t(
+            "This removes the profile and its server scoping. Your servers and their secrets are not deleted.",
+          )}
+          confirmLabel={t("Delete")}
           destructive
           onConfirm={handleDelete}
         />
@@ -118,20 +125,20 @@ export function ProfileBar({ registry, onChange }: Props) {
       <Dialog open={open} onOpenChange={handleOpenChange}>
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
-            <DialogTitle>New profile</DialogTitle>
+            <DialogTitle>{t("New profile")}</DialogTitle>
           </DialogHeader>
           <p className="text-xs text-muted-foreground">
-            A profile is a set of servers a client can see. Credentials live on each
-            server, not the profile, so to keep separate work and personal accounts, add
-            the server twice and put one in each profile.
+            {t(
+              "A profile is a set of servers a client can see. Credentials live on each server, not the profile, so to keep separate work and personal accounts, add the server twice and put one in each profile. ",
+            )}
           </p>
           <div className="flex flex-col gap-2 py-2">
-            <Label htmlFor="profile-name">Name</Label>
+            <Label htmlFor="profile-name">{t("Name")}</Label>
             <Input
               id="profile-name"
               value={name}
               autoFocus
-              placeholder="Work"
+              placeholder={t("Work")}
               onChange={(e) => setName(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") handleCreate();
@@ -140,10 +147,10 @@ export function ProfileBar({ registry, onChange }: Props) {
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => handleOpenChange(false)}>
-              Cancel
+              {t("Cancel ")}
             </Button>
             <Button onClick={handleCreate} disabled={!name.trim()}>
-              Create
+              {t("Create ")}
             </Button>
           </DialogFooter>
         </DialogContent>

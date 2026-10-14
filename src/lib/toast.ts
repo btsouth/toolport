@@ -1,4 +1,5 @@
 import { toast, type ExternalToast } from "sonner";
+import { translate } from "./i18n";
 
 function errorClipboardText(
   message: string,
@@ -12,7 +13,7 @@ function errorClipboardText(
 
 function copyToastAction(text: string) {
   return {
-    label: "Copy",
+    label: translate("Copy"),
     onClick: () => void navigator.clipboard.writeText(text),
   };
 }

@@ -1,3 +1,4 @@
+import { useI18n, translate } from "@/lib/i18n";
 import { useCallback, useEffect, useState } from "react";
 import {
   ArrowLeft,
@@ -86,6 +87,7 @@ export function Onboarding({
   onOpenRules,
   onFinish,
 }: Props) {
+  const { t } = useI18n();
   const [step, setStep] = useState(initialStep);
   /**
    * Which door the user came through (SBS-826).
@@ -186,15 +188,16 @@ export function Onboarding({
                   aria-valuenow={step + 1}
                   aria-valuemin={1}
                   aria-valuemax={steps.length}
-                  aria-label={`Setup step ${step + 1} of ${steps.length}`}
+                  aria-label={t("Setup step {value1} of {value2}", {
+                    value1: step + 1,
+                    value2: steps.length,
+                  })}
                 >
                   {steps.map((_, i) => (
                     <span
                       key={i}
                       aria-hidden="true"
-                      className={`size-1.5 rounded-full transition-colors ${
-                        i === step ? "bg-success" : "bg-muted-foreground/30"
-                      }`}
+                      className={`size-1.5 rounded-full transition-colors ${i === step ? "bg-success" : "bg-muted-foreground/30"}`}
                     />
                   ))}
                 </div>
@@ -204,7 +207,8 @@ export function Onboarding({
                     onClick={onFinish}
                     className="text-xs text-muted-foreground transition hover:text-foreground"
                   >
-                    Skip setup
+                    {" "}
+                    {t("Skip setup")}{" "}
                   </button>
                 )}
               </div>
@@ -253,32 +257,41 @@ function Welcome({
   onChoosePath: (path: "mcp" | "rules") => void;
   onJoinTeam: () => void;
 }) {
+  const { t } = useI18n();
   const names = present.map((c) => c.name);
   const found =
     names.length === 0
-      ? "No MCP clients detected yet, you can still add servers now and connect a client once it's installed."
-      : `Found ${listJoin(names)} on your machine, ready to point at the gateway.`;
+      ? t(
+          "No MCP clients detected yet, you can still add servers now and connect a client once it's installed.",
+        )
+      : t("Found {value1} on your machine, ready to point at the gateway.", {
+          value1: listJoin(names),
+        });
   const benefits = [
     {
       icon: Workflow,
-      title: "One gateway for every tool",
-      body: "Set each MCP server up once; every AI client shares it.",
+      title: t("One gateway for every tool"),
+      body: t("Set each MCP server up once; every AI client shares it."),
     },
     {
       icon: Sparkles,
-      title: "Up to 91% fewer tokens",
-      body: "Your agent loads a few meta-tools instead of hundreds of schemas.",
+      title: t("Up to 91% fewer tokens"),
+      body: t("Your agent loads a few meta-tools instead of hundreds of schemas."),
     },
     {
       icon: ShieldCheck,
-      title: "Watched for tampering",
-      body: "Every server is checked for rug-pulls and prompt injection.",
+      title: t("Watched for tampering"),
+      body: t("Every server is checked for rug-pulls and prompt injection."),
     },
   ];
   return (
     <>
-      <StepHeader icon={<Waypoints className="size-5" />} title="Welcome to Toolport">
-        One place to set up and control every AI tool on your machine.
+      <StepHeader
+        icon={<Waypoints className="size-5" />}
+        title={t("Welcome to Toolport")}
+      >
+        {" "}
+        {t("One place to set up and control every AI tool on your machine.")}{" "}
       </StepHeader>
       <div className="grid gap-2.5">
         {benefits.map(({ icon: Icon, title, body }) => (
@@ -305,9 +318,10 @@ function Welcome({
         >
           <Waypoints className="size-4" />
           <span className="flex flex-col items-start">
-            <span>Set up MCP servers</span>
+            <span>{t("Set up MCP servers")}</span>
             <span className="text-2xs font-normal opacity-80">
-              Connect servers once and share them with every AI tool
+              {" "}
+              {t("Connect servers once and share them with every AI tool")}{" "}
             </span>
           </span>
         </Button>
@@ -318,9 +332,12 @@ function Welcome({
         >
           <FileText className="size-4" />
           <span className="flex flex-col items-start">
-            <span>Write rules for my agents</span>
+            <span>{t("Write rules for my agents")}</span>
             <span className="text-2xs font-normal text-muted-foreground">
-              One set of instructions, applied to every AI tool. No MCP server needed
+              {" "}
+              {t(
+                "One set of instructions, applied to every AI tool. No MCP server needed",
+              )}{" "}
             </span>
           </span>
         </Button>
@@ -331,8 +348,8 @@ function Welcome({
           onClick={onJoinTeam}
           className="flex items-center gap-2 text-left text-sm font-medium text-foreground transition hover:text-primary"
         >
-          <Users className="size-4 shrink-0 text-muted-foreground" />
-          Joining a team? Enter your invite code
+          <Users className="size-4 shrink-0 text-muted-foreground" />{" "}
+          {t("Joining a team? Enter your invite code")}{" "}
           <ArrowRight className="size-3.5 shrink-0 text-muted-foreground" />
         </button>
         <button
@@ -340,7 +357,8 @@ function Welcome({
           onClick={() => openExternal(TEAMS_MARKETING_URL)}
           className="self-start text-2xs text-muted-foreground transition hover:text-foreground"
         >
-          What is Toolport for Teams? →
+          {" "}
+          {t("What is Toolport for Teams? →")}{" "}
         </button>
       </div>
     </>
@@ -362,6 +380,7 @@ function JoinTeam({
   onClientsRefresh: () => void;
   onFinish: () => void;
 }) {
+  const { t } = useI18n();
   const [code, setCode] = useState("");
   const [name, setName] = useState("");
   const [serverUrl, setServerUrl] = useState(HOSTED_TEAMS_URL);
@@ -396,10 +415,12 @@ function JoinTeam({
           setJoined(true);
         } else if (r.status === "denied") {
           setPending(null);
-          setError("An admin declined your request to join this team.");
+          setError(translate("An admin declined your request to join this team."));
         } else if (r.status === "unknown") {
           setPending(null);
-          setError("This join request expired. Ask for the link again and reconnect.");
+          setError(
+            translate("This join request expired. Ask for the link again and reconnect."),
+          );
         }
       } catch {
         // Transient: the next tick retries.
@@ -422,7 +443,7 @@ function JoinTeam({
       return;
     }
     if (!code.trim()) {
-      setError("Enter the invite or connect code your team gave you.");
+      setError(t("Enter the invite or connect code your team gave you."));
       return;
     }
     setBusy(true);
@@ -438,7 +459,7 @@ function JoinTeam({
         onClientsRefresh();
         setJoined(true);
       } else {
-        setError("The server returned an unexpected connect response.");
+        setError(t("The server returned an unexpected connect response."));
       }
     } catch (e) {
       setError(String(e));
@@ -450,13 +471,15 @@ function JoinTeam({
   if (joined) {
     return (
       <>
-        <StepHeader icon={<Check className="size-5" />} title="You're on the team">
-          Your team's shared servers were added to your active profile. Local and LAN
-          servers stay off until you review and enable them.
+        <StepHeader icon={<Check className="size-5" />} title={t("You're on the team")}>
+          {" "}
+          {t(
+            "Your team's shared servers were added to your active profile. Local and LAN servers stay off until you review and enable them.",
+          )}{" "}
         </StepHeader>
         <Button onClick={onFinish} className="self-start">
-          Finish setup
-          <ArrowRight className="size-4" />
+          {" "}
+          {t("Finish setup")} <ArrowRight className="size-4" />
         </Button>
       </>
     );
@@ -464,23 +487,25 @@ function JoinTeam({
 
   return (
     <>
-      <StepHeader icon={<Users className="size-5" />} title="Join your team">
-        Paste the invite code your team shared. Toolport connects this device and pulls
-        the team's server set.
+      <StepHeader icon={<Users className="size-5" />} title={t("Join your team")}>
+        {" "}
+        {t(
+          "Paste the invite code your team shared. Toolport connects this device and pulls the team's server set.",
+        )}{" "}
       </StepHeader>
       <div className="grid gap-3">
         <label className="grid gap-1 text-sm">
-          <span className="text-muted-foreground">Invite or connect code</span>
+          <span className="text-muted-foreground">{t("Invite or connect code")}</span>
           <Input
             autoFocus
-            placeholder="Paste your invite or connect code"
+            placeholder={t("Paste your invite or connect code")}
             value={code}
             onChange={(e) => setCode(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && !busy && join()}
           />
         </label>
         <label className="grid gap-1 text-sm">
-          <span className="text-muted-foreground">Your name (optional)</span>
+          <span className="text-muted-foreground">{t("Your name (optional)")}</span>
           <Input
             placeholder="e.g. Tyler"
             value={name}
@@ -489,14 +514,17 @@ function JoinTeam({
         </label>
         {advanced ? (
           <label className="grid gap-1 text-sm">
-            <span className="text-muted-foreground">Team server URL</span>
+            <span className="text-muted-foreground">{t("Team server URL")}</span>
             <Input
               placeholder="https://toolport.yourcompany.com"
               value={serverUrl}
               onChange={(e) => setServerUrl(e.target.value)}
             />
             <span className="text-xs text-muted-foreground">
-              Only change this if your team runs its own self-hosted Toolport server.
+              {" "}
+              {t(
+                "Only change this if your team runs its own self-hosted Toolport server.",
+              )}{" "}
             </span>
           </label>
         ) : (
@@ -505,8 +533,8 @@ function JoinTeam({
             onClick={() => setAdvanced(true)}
             className="flex items-center gap-1.5 self-start text-2xs text-muted-foreground transition hover:text-foreground"
           >
-            <KeyRound className="size-3" />
-            Self-hosted server? Set a custom URL
+            <KeyRound className="size-3" />{" "}
+            {t("Self-hosted server? Set a custom URL")}{" "}
           </button>
         )}
       </div>
@@ -521,21 +549,22 @@ function JoinTeam({
           onClick={onBack}
           className="flex items-center gap-1.5 text-xs text-muted-foreground transition hover:text-foreground"
         >
-          <ArrowLeft className="size-3.5" />
-          Back
+          <ArrowLeft className="size-3.5" /> {t("Back")}{" "}
         </button>
         {pending ? (
           <div className="flex items-center gap-2.5 rounded-lg border border-primary/40 bg-primary/5 px-3 py-2 text-sm">
             <Loader2 className="size-4 shrink-0 animate-spin text-primary" />
             <span className="text-muted-foreground">
-              Waiting for an admin to approve you…
+              {" "}
+              {t("Waiting for an admin to approve you…")}{" "}
             </span>
             <button
               type="button"
               onClick={() => setPending(null)}
               className="ml-1 text-xs text-muted-foreground underline transition hover:text-foreground"
             >
-              Cancel
+              {" "}
+              {t("Cancel")}{" "}
             </button>
           </div>
         ) : (
@@ -544,8 +573,8 @@ function JoinTeam({
               <Loader2 className="size-4 animate-spin" />
             ) : (
               <Users className="size-4" />
-            )}
-            Join team
+            )}{" "}
+            {t("Join team")}{" "}
           </Button>
         )}
       </div>
@@ -566,6 +595,7 @@ function AddServers({
   onBrowseCatalog: () => void;
   onNext: () => void;
 }) {
+  const { t } = useI18n();
   const [busy, setBusy] = useState(false);
   const [importPreview, setImportPreview] = useState<ImportItem[] | null>(null);
   const [imported, setImported] = useState<{ added: number; on: number } | null>(null);
@@ -598,12 +628,12 @@ function AddServers({
     try {
       const preview = await previewImportServers();
       if (preview.length === 0) {
-        toast.success("No new servers found in your clients");
+        toast.success(translate("No new servers found in your clients"));
         return;
       }
       setImportPreview(preview);
     } catch (e) {
-      toastError(`Couldn't prepare import: ${e}`);
+      toastError(translate("Couldn't prepare import: {value1}", { value1: String(e) }));
     } finally {
       setBusy(false);
     }
@@ -621,10 +651,10 @@ function AddServers({
         on: added.filter((s) => isEnabled(next, s.id)).length,
       });
       setTouched(true);
-      toast.success("Imported servers from your clients");
+      toast.success(translate("Imported servers from your clients"));
       setImportPreview(null);
     } catch (e) {
-      toastError(`Import failed: ${e}`);
+      toastError(translate("Import failed: {value1}", { value1: String(e) }));
     } finally {
       setBusy(false);
     }
@@ -653,17 +683,35 @@ function AddServers({
       setTouched(true);
       toast.success(
         added > 0
-          ? `Added ${added} server${added === 1 ? "" : "s"} from ${s.name}`
-          : `${s.name}: every server is already in Toolport`,
+          ? added === 1
+            ? translate("Added {value1} server from {value3}", {
+                value1: added,
+                value3: s.name,
+              })
+            : translate("Added {value1} servers from {value3}", {
+                value1: added,
+                value3: s.name,
+              })
+          : translate("{value1}: every server is already in Toolport", {
+              value1: s.name,
+            }),
         {
           description:
             needCreds > 0
-              ? `${needCreds} need setup values. Complete their Launch setup or credentials under Servers, then enable them.`
-              : "Enable them next.",
+              ? translate(
+                  "{value1} need setup values. Complete their Launch setup or credentials under Servers, then enable them.",
+                  { value1: needCreds },
+                )
+              : translate("Enable them next."),
         },
       );
     } catch (e) {
-      toastError(`Couldn't set up ${s.name}: ${e}`);
+      toastError(
+        translate("Couldn't set up {value1}: {value2}", {
+          value1: s.name,
+          value2: String(e),
+        }),
+      );
     } finally {
       setApplying(false);
     }
@@ -671,9 +719,14 @@ function AddServers({
 
   return (
     <>
-      <StepHeader icon={<Download className="size-5" />} title="Add your first servers">
-        Pick what you work on and Toolport sets up a matching stack. You can also import
-        from your other tools or browse the full catalog.
+      <StepHeader
+        icon={<Download className="size-5" />}
+        title={t("Add your first servers")}
+      >
+        {" "}
+        {t(
+          "Pick what you work on and Toolport sets up a matching stack. You can also import from your other tools or browse the full catalog.",
+        )}{" "}
       </StepHeader>
 
       <div className="flex flex-col gap-3">
@@ -681,7 +734,7 @@ function AddServers({
         {stacksLoading ? (
           <div
             role="status"
-            aria-label="Loading starter stacks"
+            aria-label={t("Loading starter stacks")}
             className="flex flex-wrap gap-1.5"
           >
             {Array.from({ length: 3 }).map((_, i) => (
@@ -695,18 +748,22 @@ function AddServers({
             className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5"
           >
             <div>
-              <p className="text-sm font-medium">Starter stacks couldn't load</p>
+              <p className="text-sm font-medium">{t("Starter stacks couldn't load")}</p>
               <p className="text-xs text-muted-foreground">
-                Try again to see role-based recommendations.
+                {" "}
+                {t("Try again to see role-based recommendations.")}{" "}
               </p>
             </div>
             <Button variant="outline" size="sm" onClick={reloadStacks}>
-              Try again
+              {" "}
+              {t("Try again")}{" "}
             </Button>
           </div>
         ) : stacks.length > 0 ? (
           <div className="flex flex-col gap-1.5">
-            <span className="text-xs text-muted-foreground">What do you work on?</span>
+            <span className="text-xs text-muted-foreground">
+              {t("What do you work on?")}
+            </span>
             <div className="flex flex-wrap gap-1.5">
               {stacks.map((s) => (
                 <button
@@ -745,7 +802,8 @@ function AddServers({
                       onClick={() => openExternal(e.credentialsUrl)}
                       className="text-info hover:underline"
                     >
-                      get key
+                      {" "}
+                      {t("get key")}{" "}
                     </button>
                   )}
                 </div>
@@ -761,8 +819,8 @@ function AddServers({
                 <Loader2 className="size-3.5 animate-spin" />
               ) : (
                 <Plus className="size-3.5" />
-              )}
-              Add this stack
+              )}{" "}
+              {t("Add this stack")}{" "}
             </Button>
           </div>
         )}
@@ -773,8 +831,8 @@ function AddServers({
               <Loader2 className="size-4 animate-spin" />
             ) : (
               <Download className="size-4" />
-            )}
-            Import {importable} from your clients
+            )}{" "}
+            {t("Import")} {importable} {t("from your clients")}{" "}
           </Button>
         )}
         {imported !== null && (
@@ -785,13 +843,12 @@ function AddServers({
         )}
 
         <Button variant="outline" onClick={onBrowseCatalog}>
-          <Store className="size-4" />
-          Browse the full catalog
+          <Store className="size-4" /> {t("Browse the full catalog")}{" "}
         </Button>
       </div>
 
       <Button variant="ghost" onClick={onNext} className="self-start">
-        {touched ? "Next" : "I'll add servers later"}
+        {touched ? t("Next") : t("I'll add servers later")}
         <ArrowRight className="size-4" />
       </Button>
       <ImportReviewDialog
@@ -816,6 +873,7 @@ function ConnectClients({
   onConnected: () => void;
   onNext: () => void;
 }) {
+  const { t } = useI18n();
   const [busyId, setBusyId] = useState<string | null>(null);
   const [done, setDone] = useState<Set<string>>(new Set());
 
@@ -828,11 +886,14 @@ function ConnectClients({
       // Same trap as ClientDetail (SOU-317): config is written now, but the client
       // usually only loads it on restart. Verify step also says this; put it on the
       // success toast so it is not delayed until that step.
-      toast.success(`Connected Toolport to ${client.name}`, {
-        description: clientRestartHint(client.name),
-      });
+      toast.success(
+        translate("Connected Toolport to {value1}", { value1: client.name }),
+        {
+          description: clientRestartHint(client.name),
+        },
+      );
     } catch (e) {
-      toastError(`Couldn't connect: ${e}`);
+      toastError(translate("Couldn't connect: {value1}", { value1: String(e) }));
     } finally {
       setBusyId(null);
     }
@@ -840,15 +901,19 @@ function ConnectClients({
 
   return (
     <>
-      <StepHeader icon={<Link2 className="size-5" />} title="Connect a client">
-        Point a tool at Toolport. It connects once, then sees every server you enable
-        here, no per-tool setup.
+      <StepHeader icon={<Link2 className="size-5" />} title={t("Connect a client")}>
+        {" "}
+        {t(
+          "Point a tool at Toolport. It connects once, then sees every server you enable here, no per-tool setup.",
+        )}{" "}
       </StepHeader>
 
       {present.length === 0 ? (
         <p className="rounded-md bg-muted/50 px-3 py-2 text-sm text-muted-foreground">
-          No clients detected yet. Install Claude Desktop, Cursor, VS Code, or another
-          supported tool, then connect it from Clients.
+          {" "}
+          {t(
+            "No clients detected yet. Install Claude Desktop, Cursor, VS Code, or another supported tool, then connect it from Clients.",
+          )}{" "}
         </p>
       ) : (
         <div className="flex flex-col gap-2">
@@ -862,8 +927,7 @@ function ConnectClients({
                 <span className="truncate text-sm">{client.name}</span>
                 {connected ? (
                   <span className="flex shrink-0 items-center gap-1.5 text-xs text-success">
-                    <Check className="size-3.5" />
-                    Connected
+                    <Check className="size-3.5" /> {t("Connected")}{" "}
                   </span>
                 ) : (
                   <Button
@@ -877,8 +941,8 @@ function ConnectClients({
                       <Loader2 className="size-3.5 animate-spin" />
                     ) : (
                       <Link2 className="size-3.5" />
-                    )}
-                    Connect
+                    )}{" "}
+                    {t("Connect")}{" "}
                   </Button>
                 )}
               </div>
@@ -888,7 +952,7 @@ function ConnectClients({
       )}
 
       <Button onClick={onNext} className="self-start">
-        {done.size > 0 ? "Next" : "Skip for now"}
+        {done.size > 0 ? t("Next") : t("Skip for now")}
         <ArrowRight className="size-4" />
       </Button>
     </>
@@ -896,13 +960,19 @@ function ConnectClients({
 }
 
 function plural(n: number, word: string): string {
-  return `${n} ${word}${n === 1 ? "" : "s"}`;
+  return translate(`{count} ${n === 1 ? word : `${word}s`}`, { count: n });
 }
 
 /** What an import actually turned on, not just what Toolport now lists (UX-01). */
 function importedSummary(added: number, on: number): string {
-  if (on === added) return `Imported ${plural(added, "server")} and turned them on.`;
-  return `Imported ${plural(added, "server")}, ${on} turned on. Turn on the rest from Servers.`;
+  if (on === added)
+    return translate("Imported {value1} and turned them on.", {
+      value1: plural(added, "server"),
+    });
+  return translate(
+    "Imported {value1}, {value2} turned on. Turn on the rest from Servers.",
+    { value1: plural(added, "server"), value2: on },
+  );
 }
 
 /** Count servers that answered the health probe, not every server in the registry (UX-01). */
@@ -910,9 +980,20 @@ function servingSummary(health: ProbeResult[], connectedCount: number): string {
   const serving = health.filter((r) => r.ok).length;
   const signIn = health.filter((r) => !r.ok && r.authRequired).length;
   const tools = plural(connectedCount, "connected tool");
-  const base = `Toolport is serving ${plural(serving, "server")} to ${tools}`;
+  const base = translate("Toolport is serving {value1} to {value2}", {
+    value1: plural(serving, "server"),
+    value2: tools,
+  });
   return signIn > 0
-    ? `${base}, and ${signIn} need${signIn === 1 ? "s" : ""} sign-in.`
+    ? signIn === 1
+      ? translate("{value1}, and {value2} needs sign-in.", {
+          value1: base,
+          value2: signIn,
+        })
+      : translate("{value1}, and {value2} need sign-in.", {
+          value1: base,
+          value2: signIn,
+        })
     : `${base}.`;
 }
 
@@ -937,6 +1018,7 @@ function Done({
   onOpenRules: () => void;
   onFinish: () => void;
 }) {
+  const { t } = useI18n();
   // Someone who came for rules has no servers ON PURPOSE. Judging their setup by server
   // count would tell them they have not finished when they have, which is the bounce
   // SBS-826 exists to remove.
@@ -997,62 +1079,71 @@ function Done({
   // The client to verify against: the first one Toolport is actually wired into.
   const verifyClient = clients.find((c) => c.gatewayInstalled) ?? null;
   const missingParts = [
-    !rulesPath && serverCount === 0 ? "added a server" : null,
-    connectedCount === 0 ? "connected a client" : null,
+    !rulesPath && serverCount === 0 ? t("added a server") : null,
+    connectedCount === 0 ? t("connected a client") : null,
   ].filter((part): part is string => part !== null);
-  const missing = missingParts.join(" or ");
+  const missing = missingParts.join(` ${t("or")} `);
   return (
     <>
       <StepHeader
         icon={<Check className="size-5" />}
         title={
           ready
-            ? "You're set up"
+            ? t("You're set up")
             : configured && checkingHealth
-              ? "Checking your setup"
+              ? t("Checking your setup")
               : configured && probeFailed
-                ? "Setup couldn't be verified"
-                : "Setup started"
+                ? t("Setup couldn't be verified")
+                : t("Setup started")
         }
       >
         {ready && rulesPath ? (
           <>
-            Toolport is wired into {connectedCount} tool
-            {connectedCount === 1 ? "" : "s"}. Write your rules once on the next screen
-            and Toolport puts them in each tool&apos;s own rules file, so they all follow
-            the same instructions without you editing each tool's file by hand.
+            {" "}
+            {t("Toolport is wired into")} {plural(connectedCount, "tool")}
+            {t(
+              ". Write your rules once on the next screen and Toolport puts them in each tool's own rules file, so they all follow the same instructions without you editing each tool's file by hand.",
+            )}{" "}
           </>
         ) : ready ? (
           <>
-            {servingSummary(health ?? [], connectedCount)} Toggle one on or off and your
-            clients update live, no restart. Each client loads a handful of Toolport
-            meta-tools instead of every downstream tool, up to 91% fewer tokens at the
-            same task success. And Toolport watches every server for tampering and prompt
-            injection, see Activity.
+            {servingSummary(health ?? [], connectedCount)}{" "}
+            {t(
+              "Toggle one on or off and your clients update live, no restart. Each client loads a handful of Toolport meta-tools instead of every downstream tool, up to 91% fewer tokens at the same task success. And Toolport watches every server for tampering and prompt injection, see Activity.",
+            )}{" "}
           </>
         ) : configured && checkingHealth ? (
           <>
-            Toolport is checking that your servers can start before marking setup ready.
+            {" "}
+            {t(
+              "Toolport is checking that your servers can start before marking setup ready.",
+            )}{" "}
           </>
         ) : configured && probeFailed ? (
           <>
-            Your servers and client are connected, but Toolport could not verify server
-            health. Retry the check below or continue without verification.
+            {" "}
+            {t(
+              "Your servers and client are connected, but Toolport could not verify server health. Retry the check below or continue without verification.",
+            )}{" "}
           </>
         ) : rulesPath ? (
           // The MCP wording below would send a rules user to add the very thing they
           // just declined, and "do both" is wrong when only one thing is missing
           // (SBS-826 review).
           <>
-            You haven't connected a client yet. Connect one any time from the main screen
-            and Toolport writes your rules into that tool's own rules file. No MCP server
-            needed.
+            {" "}
+            {t(
+              "You haven't connected a client yet. Connect one any time from the main screen and Toolport writes your rules into that tool's own rules file. No MCP server needed.",
+            )}{" "}
           </>
         ) : (
           <>
-            You haven't {missing} yet. You can{" "}
-            {missingParts.length > 1 ? "do both" : "do that"} any time from the main
-            screen: add or import servers, then connect a client so your tools share them.
+            {" "}
+            {t("You haven't")} {missing} {t("yet. You can")}{" "}
+            {missingParts.length > 1 ? t("do both") : t("do that")}{" "}
+            {t(
+              "any time from the main screen: add or import servers, then connect a client so your tools share them.",
+            )}{" "}
           </>
         )}
       </StepHeader>
@@ -1062,15 +1153,20 @@ function Done({
           role="status"
           className="flex items-center gap-2 rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
         >
-          <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
-          Checking server health…
+          <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />{" "}
+          {t("Checking server health…")}{" "}
         </div>
       )}
 
       {broken.length > 0 && (
         <div className="flex flex-col gap-2 rounded-md bg-warning/10 px-3 py-2 text-sm">
           <span className="font-medium text-warning">
-            {broken.length} server{broken.length === 1 ? "" : "s"} couldn't start
+            {t(
+              broken.length === 1
+                ? "{value1} server couldn't start"
+                : "{value1} servers couldn't start",
+              { value1: broken.length },
+            )}{" "}
           </span>
           <ul className="flex flex-col gap-1.5">
             {broken.map((r) => (
@@ -1087,9 +1183,10 @@ function Done({
             ))}
           </ul>
           <span className="text-xs text-muted-foreground">
-            Most first-run failures are a missing runtime (Node/npx or Python/uvx) or a
-            command that needs a fix. Sort it out, then retry from that server's card (the
-            button below takes you to the main screen).
+            {" "}
+            {t(
+              "Most first-run failures are a missing runtime (Node/npx or Python/uvx) or a command that needs a fix. Sort it out, then retry from that server's card (the button below takes you to the main screen).",
+            )}{" "}
           </span>
         </div>
       )}
@@ -1097,7 +1194,8 @@ function Done({
       {verificationFailed && (
         <div className="flex items-center gap-2 rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
           <span>
-            Couldn&apos;t verify your servers started, the health check didn&apos;t run.
+            {" "}
+            {t("Couldn't verify your servers started, the health check didn't run.")}{" "}
           </span>
           <Button
             type="button"
@@ -1105,7 +1203,8 @@ function Done({
             variant="outline"
             onClick={() => setProbeAttempt((attempt) => attempt + 1)}
           >
-            Retry
+            {" "}
+            {t("Retry")}{" "}
           </Button>
         </div>
       )}
@@ -1117,20 +1216,21 @@ function Done({
       {rulesPath ? (
         <div className="flex flex-wrap items-center gap-2">
           <Button onClick={onOpenRules}>
-            Set up agent rules
-            <ArrowRight className="size-4" />
+            {" "}
+            {t("Set up agent rules")} <ArrowRight className="size-4" />
           </Button>
           <Button variant="ghost" onClick={onFinish}>
-            Not now
+            {" "}
+            {t("Not now")}{" "}
           </Button>
         </div>
       ) : (
         <Button onClick={onFinish} className="self-start">
           {checkingHealth || verificationFailed
-            ? "Continue without verification"
+            ? t("Continue without verification")
             : ready
-              ? "Start using Toolport"
-              : "Got it"}
+              ? t("Start using Toolport")
+              : t("Got it")}
           <ArrowRight className="size-4" />
         </Button>
       )}
@@ -1153,7 +1253,8 @@ export function VerifyCall({
   pollMs?: number;
   timeoutMs?: number;
 }) {
-  const prompt = "List the tools you can use through Toolport.";
+  const { t } = useI18n();
+  const prompt = t("List the tools you can use through Toolport.");
   const [status, setStatus] = useState<
     "snapshot" | "waiting" | "success" | "timeout" | "snapshot-failed"
   >("snapshot");
@@ -1210,9 +1311,9 @@ export function VerifyCall({
   async function copyPrompt() {
     try {
       await navigator.clipboard.writeText(prompt);
-      toast.success("Prompt copied");
+      toast.success(translate("Prompt copied"));
     } catch {
-      toastError("Couldn't copy; select the text and copy it manually.");
+      toastError(translate("Couldn't copy; select the text and copy it manually."));
     }
   }
 
@@ -1220,23 +1321,28 @@ export function VerifyCall({
     <div className="flex flex-col gap-2.5 rounded-md border bg-muted/20 p-3">
       <div className="flex items-center gap-2 text-sm font-medium">
         <ClientLogo id={client.id} name={client.name} size={18} />
-        <span>Prove it works in {client.name}</span>
+        <span>
+          {t("Prove it works in")} {client.name}
+        </span>
       </div>
 
       {status === "success" && hit ? (
         <div className="flex items-start gap-2 rounded-md bg-success/10 px-3 py-2 text-sm">
           <Check className="mt-0.5 size-4 shrink-0 text-success" />
           <span>
-            <span className="font-medium text-success">It works.</span> A call reached
-            Toolport after this check started: <code className="text-xs">{hit.tool}</code>
+            <span className="font-medium text-success">{t("It works.")}</span>{" "}
+            {t("A call reached Toolport after this check started:")}{" "}
+            <code className="text-xs">{hit.tool}</code>
             {hit.server ? (
               <>
                 {" "}
-                on <code className="text-xs">{hit.server}</code>
+                {t("on")} <code className="text-xs">{hit.server}</code>
               </>
-            ) : null}
-            . Local stdio calls are not tagged with a client, so this is not proof it came
-            from {client.name}.
+            ) : null}{" "}
+            {t(
+              ". Local stdio calls are not tagged with a client, so this is not proof it came from",
+            )}{" "}
+            {client.name}.
           </span>
         </div>
       ) : (
@@ -1244,15 +1350,18 @@ export function VerifyCall({
           {status === "waiting" && (
             <>
               <p className="text-xs text-muted-foreground">
-                In {client.name}, ask your agent to run this. It's read-only, it just
-                lists your tools through Toolport.
+                {" "}
+                {t("In")} {client.name}
+                {t(
+                  ", ask your agent to run this. It's read-only, it just lists your tools through Toolport.",
+                )}{" "}
               </p>
               <div className="flex items-center gap-2 rounded border bg-background px-2 py-1.5">
                 <code className="min-w-0 flex-1 truncate text-xs">{prompt}</code>
                 <button
                   type="button"
                   onClick={() => void copyPrompt()}
-                  aria-label="Copy the prompt"
+                  aria-label={t("Copy the prompt")}
                   className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                 >
                   <Copy className="size-3.5" />
@@ -1266,35 +1375,46 @@ export function VerifyCall({
               <Loader2 className="mt-0.5 size-3.5 shrink-0 animate-spin" />
               <span>
                 {status === "snapshot"
-                  ? "Reading the audit log so older calls cannot count as proof."
-                  : `Waiting for a new call after this check started. Just connected ${client.name}? ${clientRestartHint(client.name)}`}
+                  ? t("Reading the audit log so older calls cannot count as proof.")
+                  : t(
+                      "Waiting for a new call after this check started. Just connected {value1}? {value2}",
+                      { value1: client.name, value2: clientRestartHint(client.name) },
+                    )}
               </span>
             </div>
           ) : status === "snapshot-failed" ? (
             <div className="flex flex-col gap-1.5 rounded-md bg-warning/10 px-3 py-2 text-xs">
               <span className="font-medium text-warning">
-                Couldn&apos;t read the audit log, so this check did not start.
+                {" "}
+                {t("Couldn't read the audit log, so this check did not start.")}{" "}
               </span>
               <span className="text-muted-foreground">
-                An older or unrelated call will not be treated as proof. Retry when the
-                log is available, or use the Playground.
+                {" "}
+                {t(
+                  "An older or unrelated call will not be treated as proof. Retry when the log is available, or use the Playground.",
+                )}{" "}
               </span>
               <button
                 type="button"
                 onClick={() => setSnapshotAttempt((n) => n + 1)}
                 className="self-start font-medium text-primary hover:underline"
               >
-                Retry the check
+                {" "}
+                {t("Retry the check")}{" "}
               </button>
             </div>
           ) : (
             <div className="flex flex-col gap-1.5 rounded-md bg-warning/10 px-3 py-2 text-xs">
-              <span className="font-medium text-warning">No call yet. Common fixes:</span>
+              <span className="font-medium text-warning">
+                {t("No call yet. Common fixes:")}
+              </span>
               <ul className="ml-3 list-disc space-y-0.5 text-muted-foreground">
                 <li>{clientRestartHint(client.name)}</li>
-                <li>Make sure it's scoped to a profile that has servers (Settings).</li>
-                <li>If a server needs sign-in, authenticate it first.</li>
-                <li>Check that each server started on the main screen.</li>
+                <li>
+                  {t("Make sure it's scoped to a profile that has servers (Settings).")}
+                </li>
+                <li>{t("If a server needs sign-in, authenticate it first.")}</li>
+                <li>{t("Check that each server started on the main screen.")}</li>
               </ul>
             </div>
           )}
@@ -1304,7 +1424,8 @@ export function VerifyCall({
             onClick={onOpenPlayground}
             className="self-start text-xs font-medium text-primary hover:underline"
           >
-            Or test a tool in the Playground instead
+            {" "}
+            {t("Or test a tool in the Playground instead")}{" "}
           </button>
         </>
       )}
@@ -1315,6 +1436,10 @@ export function VerifyCall({
 /** "Claude", "Claude and Cursor", "Claude, Cursor, and VS Code". */
 function listJoin(items: string[]): string {
   if (items.length <= 1) return items[0] ?? "";
-  if (items.length === 2) return `${items[0]} and ${items[1]}`;
-  return `${items.slice(0, -1).join(", ")}, and ${items[items.length - 1]}`;
+  if (items.length === 2)
+    return translate("{value1} and {value2}", { value1: items[0], value2: items[1] });
+  return translate("{value1}, and {value2}", {
+    value1: items.slice(0, -1).join(", "),
+    value2: items[items.length - 1],
+  });
 }

@@ -1,3 +1,4 @@
+import { useI18n, Trans } from "@/lib/i18n";
 import { useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
@@ -65,7 +66,13 @@ interface Props {
 type TestState =
   | { status: "idle"; message: "" }
   | { status: "testing"; message: ""; requestId: number; stale: boolean }
-  | { status: "ok" | "fail"; message: string };
+  | {
+      status: "ok" | "fail";
+      message: string;
+      values?: Record<string, string | number>;
+      authFallback?: boolean;
+      localized?: boolean;
+    };
 
 type TestResult = Extract<TestState, { status: "ok" | "fail" }>;
 
@@ -81,6 +88,7 @@ export function ServerDialog({
   onClose,
   urlHint,
 }: Props) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(autoOpen ?? false);
   const [form, setForm] = useState({
     name: initial?.name ?? "",
@@ -206,7 +214,7 @@ export function ServerDialog({
     try {
       const servers = await parseServerSnippet(pasteText);
       if (servers.length === 0) {
-        toast.error("No servers found in the pasted config");
+        toast.error(t("No servers found in the pasted config"));
         return;
       }
       const s = servers[0];
@@ -231,15 +239,18 @@ export function ServerDialog({
       clearTest();
       if (servers.length > 1) {
         toast.info(
-          `Found ${servers.length} servers, filled "${s.name}". Add the rest separately.`,
+          t('Found {value1} servers, filled "{value2}". Add the rest separately.', {
+            value1: servers.length,
+            value2: s.name,
+          }),
         );
       } else {
-        toast.success(`Parsed "${s.name}" from config`);
+        toast.success(t('Parsed "{value1}" from config', { value1: s.name }));
       }
       setShowPaste(false);
       setPasteText("");
     } catch (e) {
-      toastError(`Couldn't parse: ${e}`);
+      toastError(t("Couldn't parse: {value1}", { value1: String(e) }));
     } finally {
       setParsing(false);
     }
@@ -292,22 +303,24 @@ export function ServerDialog({
   const urlTrim = form.url.trim();
   const cmdTrim = form.command.trim();
   const errors: string[] = [];
-  if (!nameTrim) errors.push("Give the server a name.");
+  if (!nameTrim) errors.push(t("Give the server a name."));
   if (isStdio) {
-    if (!cmdTrim) errors.push("Enter the command to run (e.g. npx).");
+    if (!cmdTrim) errors.push(t("Enter the command to run (e.g. npx)."));
     if (bindingCleared && parseArgs(form.args).includes("<launch-input>")) {
-      errors.push("Replace <launch-input> with a literal argument before saving.");
+      errors.push(t("Replace <launch-input> with a literal argument before saving."));
     }
   } else if (!urlTrim) {
-    errors.push("Enter the server URL.");
+    errors.push(t("Enter the server URL."));
   } else if (!/^https?:\/\//i.test(urlTrim)) {
-    errors.push("The URL must start with http:// or https://.");
+    errors.push(t("The URL must start with http:// or https://."));
   }
   if (form.initializeTimeoutSeconds.trim()) {
     const seconds = Number(form.initializeTimeoutSeconds);
     const milliseconds = Math.round(seconds * 1000);
     if (!Number.isFinite(seconds) || milliseconds < 1 || milliseconds > 86_400_000) {
-      errors.push("Startup timeout must be greater than 0 and at most 86,400 seconds.");
+      errors.push(
+        t("Startup timeout must be greater than 0 and at most 86,400 seconds."),
+      );
     }
   }
   const ownName = editing
@@ -334,14 +347,22 @@ export function ServerDialog({
       if (r.ok) {
         finishTest(requestId, {
           status: "ok",
-          message: `Connected. Found ${r.toolCount} tool${r.toolCount === 1 ? "" : "s"}.`,
+          message:
+            r.toolCount === 1
+              ? "Connected. Found {value1} tool."
+              : "Connected. Found {value1} tools.",
+          values: { value1: r.toolCount },
+          localized: true,
         });
       } else {
         finishTest(requestId, {
           status: "fail",
           message: r.authRequired
-            ? `Reachable, but needs credentials: ${r.error ?? "authentication required"}`
+            ? "Reachable, but needs credentials: {value1}"
             : (r.error ?? "Couldn't connect."),
+          values: r.authRequired ? { value1: r.error ?? "" } : undefined,
+          authFallback: r.authRequired && !r.error,
+          localized: r.authRequired || !r.error,
         });
       }
     } catch (e) {
@@ -387,14 +408,25 @@ export function ServerDialog({
       if (failedKeys.length > 0) {
         if (!wasEditing && id) setPartialEdit({ id, name: entry.name });
         toast.warning(
-          `${wasEditing ? "Saved" : "Added"} ${entry.name}, but couldn't save: ${failedKeys.join(", ")}`,
+          t(
+            wasEditing
+              ? "Saved {value2}, but couldn't save: {value3}"
+              : "Added {value2}, but couldn't save: {value3}",
+            { value2: entry.name, value3: failedKeys.join(", ") },
+          ),
         );
         return;
       }
-      toast.success(wasEditing ? `Saved ${entry.name}` : `Added ${entry.name}`);
+      toast.success(
+        wasEditing
+          ? t("Saved {value1}", { value1: entry.name })
+          : t("Added {value1}", { value1: entry.name }),
+      );
       onOpenChange(false);
     } catch (e) {
-      toastError(`Couldn't save ${entry.name}: ${e}`);
+      toastError(
+        t("Couldn't save {value1}: {value2}", { value1: entry.name, value2: String(e) }),
+      );
     } finally {
       setBusy(false);
     }
@@ -405,7 +437,7 @@ export function ServerDialog({
       {trigger && <DialogTrigger asChild>{trigger}</DialogTrigger>}
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>{editing ? "Edit server" : "Add MCP server"}</DialogTitle>
+          <DialogTitle>{editing ? t("Edit server") : t("Add MCP server")}</DialogTitle>
         </DialogHeader>
 
         {/* Paste-from-config: collapsible textarea that auto-detects format.
@@ -417,21 +449,25 @@ export function ServerDialog({
               className="flex w-full items-center gap-2 px-3 py-2 text-sm font-medium text-muted-foreground transition hover:text-foreground"
               onClick={() => setShowPaste((v) => !v)}
             >
-              {showPaste ? (
-                <ChevronDown className="size-4" />
-              ) : (
-                <ChevronRight className="size-4" />
-              )}
-              <ClipboardPaste className="size-4" />
-              Paste from client config
+              <Trans
+                message={"{value1}{value2}Paste from client config"}
+                values={{
+                  value1: showPaste ? (
+                    <ChevronDown className="size-4" />
+                  ) : (
+                    <ChevronRight className="size-4" />
+                  ),
+                  value2: <ClipboardPaste className="size-4" />,
+                }}
+              />
             </button>
             {showPaste && (
               <div className="flex flex-col gap-2 border-t px-3 pb-3 pt-2">
                 <textarea
                   className="min-h-[100px] w-full resize-y rounded-md bg-muted/50 p-2 font-mono text-xs"
-                  placeholder={
-                    'Paste a config snippet from any client:\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Devin/Antigravity: {"mcpServers": ...}\n• VS Code: {"servers": ...}\n• Codex: [mcp_servers.name]\n• Zed: {"context_servers": ...}'
-                  }
+                  placeholder={t(
+                    'Paste a config snippet from any client:\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Devin/Antigravity: {"mcpServers": ...}\n• VS Code: {"servers": ...}\n• Codex: [mcp_servers.name]\n• Zed: {"context_servers": ...}',
+                  )}
                   value={pasteText}
                   onChange={(e) => setPasteText(e.target.value)}
                 />
@@ -442,7 +478,7 @@ export function ServerDialog({
                   disabled={!pasteText.trim() || parsing}
                   onClick={handleParse}
                 >
-                  {parsing ? "Parsing…" : "Parse & fill"}
+                  {parsing ? t("Parsing…") : t("Parse & fill")}
                 </Button>
               </div>
             )}
@@ -451,41 +487,41 @@ export function ServerDialog({
 
         <div className="flex flex-col gap-4 py-2">
           <div className="flex flex-col gap-2">
-            <Label htmlFor="srv-name">Name</Label>
+            <Label htmlFor="srv-name">{t("Name")}</Label>
             <Input
               id="srv-name"
               autoFocus
-              placeholder="revenuecat (work)"
+              placeholder={t("revenuecat (work)")}
               value={form.name}
               onChange={(e) => set("name", e.target.value)}
             />
           </div>
 
           <div className="flex flex-col gap-2">
-            <Label>Transport</Label>
+            <Label>{t("Transport")}</Label>
             <Select
               value={form.transport}
               onValueChange={(v) => set("transport", v as Transport)}
             >
-              <SelectTrigger aria-label="Transport">
+              <SelectTrigger aria-label={t("Transport")}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="stdio">stdio (local command)</SelectItem>
-                <SelectItem value="http">http (remote)</SelectItem>
-                <SelectItem value="sse">sse (remote)</SelectItem>
+                <SelectItem value="stdio">{t("stdio (local command)")}</SelectItem>
+                <SelectItem value="http">{t("http (remote)")}</SelectItem>
+                <SelectItem value="sse">{t("sse (remote)")}</SelectItem>
               </SelectContent>
             </Select>
 
             <p className="text-xs text-muted-foreground">
-              Use stdio for a local command, or http/sse for a remote URL.
+              {t("Use stdio for a local command, or http/sse for a remote URL. ")}
             </p>
           </div>
 
           {isStdio ? (
             <>
               <div className="flex flex-col gap-2">
-                <Label htmlFor="srv-cmd">Command</Label>
+                <Label htmlFor="srv-cmd">{t("Command")}</Label>
                 <Input
                   id="srv-cmd"
                   placeholder="npx"
@@ -494,26 +530,26 @@ export function ServerDialog({
                 />
               </div>
               <div className="flex flex-col gap-2">
-                <Label htmlFor="srv-args">Arguments</Label>
+                <Label htmlFor="srv-args">{t("Arguments")}</Label>
                 <Input
                   id="srv-args"
-                  placeholder={
-                    '-y @scope/package  (quote paths with spaces, e.g. "/Applications/My App.app/tool")'
-                  }
+                  placeholder={t(
+                    '-y @scope/package  (quote paths with spaces, e.g. "/Applications/My App.app/tool")',
+                  )}
                   value={form.args}
                   onChange={(e) => set("args", e.target.value)}
                 />
                 {bindingCleared && (
                   <p className="text-xs text-warning">
-                    Catalog launch setup was removed when you edited the command or
-                    arguments. Add any required values to the new command or restore the
-                    catalog preset.
+                    {t(
+                      "Catalog launch setup was removed when you edited the command or arguments. Add any required values to the new command or restore the catalog preset. ",
+                    )}
                   </p>
                 )}
               </div>
               {!!launch?.inputs.length && (
                 <div className="flex flex-col gap-2 rounded-md border p-3">
-                  <Label>Launch setup</Label>
+                  <Label>{t("Launch setup")}</Label>
                   {launch.inputs.map((input) => (
                     <div className="flex flex-col gap-1" key={input.key}>
                       <Label htmlFor={`launch-${input.key}`}>
@@ -526,7 +562,7 @@ export function ServerDialog({
                         value={launchValues[input.key] ?? ""}
                         placeholder={
                           input.secret && editing
-                            ? "Leave blank to keep vaulted value"
+                            ? t("Leave blank to keep vaulted value")
                             : input.label
                         }
                         onChange={(event) => {
@@ -540,13 +576,14 @@ export function ServerDialog({
                     </div>
                   ))}
                   <p className="text-xs text-muted-foreground">
-                    Secret inputs are saved in Toolport's vault. This server stays
-                    disabled until required inputs are configured.
+                    {t(
+                      "Secret inputs are saved in Toolport's vault. This server stays disabled until required inputs are configured. ",
+                    )}
                   </p>
                 </div>
               )}
               <div className="flex flex-col gap-2">
-                <Label htmlFor="srv-cwd">Working directory (optional)</Label>
+                <Label htmlFor="srv-cwd">{t("Working directory (optional)")}</Label>
                 <Input
                   id="srv-cwd"
                   placeholder="~/projects/my-app"
@@ -554,16 +591,22 @@ export function ServerDialog({
                   onChange={(e) => set("cwd", e.target.value)}
                 />
                 <p className="text-xs text-muted-foreground">
-                  Where this server runs. Leave blank to inherit Toolport's directory.
-                  Useful for tools that work on a project (a filesystem or code-search
-                  server). <code className="font-mono">~</code> and{" "}
-                  <code className="font-mono">{"${VAR}"}</code> are expanded.
+                  <Trans
+                    message={
+                      "Where this server runs. Leave blank to inherit Toolport's directory. Useful for tools that work on a project (a filesystem or code-search server). {value1} and{value2}{value3} are expanded."
+                    }
+                    values={{
+                      value1: <code className="font-mono">~</code>,
+                      value2: " ",
+                      value3: <code className="font-mono">{"${VAR}"}</code>,
+                    }}
+                  />
                 </p>
               </div>
             </>
           ) : (
             <div className="flex flex-col gap-2">
-              <Label htmlFor="srv-url">URL</Label>
+              <Label htmlFor="srv-url">{t("URL")}</Label>
               <Input
                 id="srv-url"
                 placeholder={urlHint ?? "https://mcp.example.com/mcp"}
@@ -572,15 +615,24 @@ export function ServerDialog({
               />
               {urlHint && (
                 <p className="text-xs text-muted-foreground">
-                  Enter the URL of your self-hosted instance. For example:{" "}
-                  <code className="font-mono">{urlHint}</code>
+                  <Trans
+                    message={
+                      "Enter the URL of your self-hosted instance. For example:{value1}{value2}"
+                    }
+                    values={{
+                      value1: " ",
+                      value2: <code className="font-mono">{urlHint}</code>,
+                    }}
+                  />
                 </p>
               )}
             </div>
           )}
 
           <div className="flex flex-col gap-2">
-            <Label htmlFor="srv-initialize-timeout">Startup timeout (optional)</Label>
+            <Label htmlFor="srv-initialize-timeout">
+              {t("Startup timeout (optional)")}
+            </Label>
             <Input
               id="srv-initialize-timeout"
               type="number"
@@ -602,17 +654,24 @@ export function ServerDialog({
               onChange={(e) => set("initializeTimeoutSeconds", e.target.value)}
             />
             <p className="text-xs text-muted-foreground">
-              Seconds to wait for this server to initialize. Raise this for a slow first
-              start, such as a model download or index build.
+              {t(
+                "Seconds to wait for this server to initialize. Raise this for a slow first start, such as a model download or index build. ",
+              )}
             </p>
           </div>
 
           <div className="flex flex-col gap-2">
-            <Label>Environment variables</Label>
+            <Label>{t("Environment variables")}</Label>
             <p className="-mt-1 text-xs text-muted-foreground">
-              API keys and other secrets the server needs (e.g.{" "}
-              <code className="font-mono">RESEND_API_KEY</code>). Values are stored in
-              your OS keychain, never in the config.
+              <Trans
+                message={
+                  "API keys and other secrets the server needs (e.g.{value1}{value2}). Values are stored in your OS keychain, never in the config."
+                }
+                values={{
+                  value1: " ",
+                  value2: <code className="font-mono">RESEND_API_KEY</code>,
+                }}
+              />
             </p>
             {envRows.map((row, i) => (
               <div key={i} className="flex items-center gap-2">
@@ -625,7 +684,9 @@ export function ServerDialog({
                 <Input
                   type="password"
                   placeholder={
-                    initial?.env.some((e) => e.key === row.key) ? "•••• (saved)" : "value"
+                    initial?.env.some((e) => e.key === row.key)
+                      ? t("•••• (saved)")
+                      : t("value")
                   }
                   value={row.value}
                   onChange={(e) => setEnvRow(i, "value", e.target.value)}
@@ -634,7 +695,7 @@ export function ServerDialog({
                   size="icon"
                   variant="ghost"
                   className="size-8 shrink-0 text-muted-foreground hover:text-destructive"
-                  aria-label="Remove variable"
+                  aria-label={t("Remove variable")}
                   onClick={() => removeEnvRow(i)}
                 >
                   <X className="size-4" />
@@ -647,8 +708,10 @@ export function ServerDialog({
               className="self-start"
               onClick={addEnvRow}
             >
-              <Plus className="size-4" />
-              Add variable
+              <Trans
+                message={"{value1}Add variable"}
+                values={{ value1: <Plus className="size-4" /> }}
+              />
             </Button>
           </div>
 
@@ -666,21 +729,43 @@ export function ServerDialog({
                 <p className="flex items-start gap-1.5 text-warning">
                   <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
                   <span>
-                    Another server is already named "{nameTrim}". That's fine for multiple
-                    accounts; it'll be saved as a separate entry.
+                    <Trans
+                      message={
+                        "Another server is already named \"{value1}\". That's fine for multiple accounts; it'll be saved as a separate entry."
+                      }
+                      values={{ value1: nameTrim }}
+                    />
                   </span>
                 </p>
               )}
               {test.status === "ok" && (
                 <p className="flex items-start gap-1.5 text-success">
                   <CheckCircle2 className="mt-0.5 size-3.5 shrink-0" />
-                  <span>{test.message}</span>
+                  <span>
+                    {test.localized
+                      ? t(
+                          test.message,
+                          test.authFallback
+                            ? { value1: t("Authentication required") }
+                            : test.values,
+                        )
+                      : test.message}
+                  </span>
                 </p>
               )}
               {test.status === "fail" && (
                 <p className="flex items-start gap-1.5 text-destructive">
                   <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-                  <span>{test.message}</span>
+                  <span>
+                    {test.localized
+                      ? t(
+                          test.message,
+                          test.authFallback
+                            ? { value1: t("Authentication required") }
+                            : test.values,
+                        )
+                      : test.message}
+                  </span>
                 </p>
               )}
             </div>
@@ -695,26 +780,26 @@ export function ServerDialog({
             {test.status === "testing" ? (
               <>
                 <Loader2 className="size-4 animate-spin" />
-                Testing…
+                {t("Testing… ")}
               </>
             ) : (
-              "Test connection"
+              t("Test connection")
             )}
           </Button>
           <div className="flex gap-2">
             <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
-              Cancel
+              {t("Cancel ")}
             </Button>
             <Button onClick={handleSave} disabled={!canSave}>
               {busy ? (
                 <>
                   <Loader2 className="size-4 animate-spin" />
-                  {editing ? "Saving…" : "Adding…"}
+                  {editing ? t("Saving…") : t("Adding…")}
                 </>
               ) : editing ? (
-                "Save"
+                t("Save")
               ) : (
-                "Add"
+                t("Add")
               )}
             </Button>
           </div>

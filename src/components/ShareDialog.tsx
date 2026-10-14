@@ -1,3 +1,4 @@
+import { useI18n, translate, Trans } from "@/lib/i18n";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ArrowLeft,
@@ -53,6 +54,7 @@ type LoadState = "idle" | "loading" | "ready" | "error";
  * the server is enabled. So importing is two steps - preview exactly what would be
  * added (command/args/url), then confirm - rather than applying a pasted blob blind. */
 export function ShareDialog({ trigger, onImported }: Props) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -197,15 +199,15 @@ export function ShareDialog({ trigger, onImported }: Props) {
       try {
         await navigator.clipboard.writeText(url);
         if (request !== linkRequest.current) return;
-        toast.success("Share link created and copied");
+        toast.success(t("Share link created and copied"));
       } catch {
         if (request !== linkRequest.current) return;
-        toast.success("Share link created");
-        toastError("Couldn't copy automatically. Select the link and copy it.");
+        toast.success(t("Share link created"));
+        toastError(t("Couldn't copy automatically. Select the link and copy it."));
       }
     } catch (e) {
       if (request !== linkRequest.current) return;
-      toastError(`Couldn't create a link: ${e}`);
+      toastError(t("Couldn't create a link: {value1}", { value1: String(e) }));
     } finally {
       if (request === linkRequest.current) setLinking(false);
     }
@@ -217,7 +219,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      toastError("Couldn't copy automatically. Select the text and copy it.");
+      toastError(t("Couldn't copy automatically. Select the text and copy it."));
     }
   }
 
@@ -227,7 +229,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
       setLinkCopied(true);
       setTimeout(() => setLinkCopied(false), 1500);
     } catch {
-      toastError("Couldn't copy automatically. Select the link and copy it.");
+      toastError(t("Couldn't copy automatically. Select the link and copy it."));
     }
   }
 
@@ -235,15 +237,15 @@ export function ShareDialog({ trigger, onImported }: Props) {
     setSaving(true);
     try {
       const path = await save({
-        title: "Save Toolport setup",
+        title: t("Save Toolport setup"),
         defaultPath: `${slug(name) || "toolport-setup"}.json`,
-        filters: [{ name: "Toolport setup", extensions: ["json"] }],
+        filters: [{ name: t("Toolport setup"), extensions: ["json"] }],
       });
       if (!path) return;
       await exportConfigToPath(path, name, description, shareFilter);
-      toast.success("Saved setup to file");
+      toast.success(t("Saved setup to file"));
     } catch (e) {
-      toastError(`Couldn't save: ${e}`);
+      toastError(t("Couldn't save: {value1}", { value1: String(e) }));
     } finally {
       setSaving(false);
     }
@@ -264,7 +266,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
       setPreview(items);
     } catch (e) {
       if (request !== previewRequest.current) return;
-      toastError(`Couldn't read that setup: ${e}`);
+      toastError(t("Couldn't read that setup: {value1}", { value1: String(e) }));
     } finally {
       if (request === previewRequest.current) setBusyAction(null);
     }
@@ -275,10 +277,10 @@ export function ShareDialog({ trigger, onImported }: Props) {
     setBusyAction("preview-file");
     try {
       const path = await openFile({
-        title: "Open a Toolport setup",
+        title: t("Open a Toolport setup"),
         multiple: false,
         directory: false,
-        filters: [{ name: "Toolport setup", extensions: ["json"] }],
+        filters: [{ name: t("Toolport setup"), extensions: ["json"] }],
       });
       if (request !== previewRequest.current || !path || typeof path !== "string") return;
       const json = await readSetupFile(path);
@@ -286,7 +288,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
       await startPreview(json, "preview-file", request);
     } catch (e) {
       if (request !== previewRequest.current) return;
-      toastError(`Couldn't open that file: ${e}`);
+      toastError(t("Couldn't open that file: {value1}", { value1: String(e) }));
     } finally {
       if (request === previewRequest.current) setBusyAction(null);
     }
@@ -301,16 +303,16 @@ export function ShareDialog({ trigger, onImported }: Props) {
       // The write already happened. Always update the parent registry.
       onImported(imported);
       if (request !== previewRequest.current) {
-        toast.success("Imported the setup you already confirmed");
+        toast.success(t("Imported the setup you already confirmed"));
         return;
       }
-      toast.success("Imported shared setup", {
-        description: "Add any API keys each server needs, then enable them.",
+      toast.success(t("Imported shared setup"), {
+        description: t("Add any API keys each server needs, then enable them."),
       });
       onOpenChange(false);
     } catch (e) {
       if (request !== previewRequest.current) return;
-      toastError(`Couldn't import: ${e}`);
+      toastError(t("Couldn't import: {value1}", { value1: String(e) }));
     } finally {
       if (request === previewRequest.current) setBusyAction(null);
     }
@@ -333,7 +335,9 @@ export function ShareDialog({ trigger, onImported }: Props) {
         await startPreview(json, "preview-paste", request);
       } catch (e) {
         if (cancelled || request !== previewRequest.current) return;
-        toastError(`Couldn't open that shared stack: ${e}`);
+        toastError(
+          translate("Couldn't open that shared stack: {value1}", { value1: String(e) }),
+        );
       } finally {
         if (!cancelled && request === previewRequest.current) setBusyAction(null);
       }
@@ -371,14 +375,15 @@ export function ShareDialog({ trigger, onImported }: Props) {
       <DialogTrigger asChild>{trigger}</DialogTrigger>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>{preview ? "Review this setup" : "Share setup"}</DialogTitle>
+          <DialogTitle>{preview ? t("Review this setup") : t("Share setup")}</DialogTitle>
         </DialogHeader>
 
         {preview ? (
           <div className="flex flex-col gap-4 py-1">
             <p className="text-xs text-muted-foreground">
-              These servers come from a shared file. Each runs the command shown when you
-              enable it, so review them before importing. You'll add your own keys after.
+              {t(
+                "These servers come from a shared file. Each runs the command shown when you enable it, so review them before importing. You'll add your own keys after. ",
+              )}
             </p>
             <div className="flex max-h-72 flex-col gap-2 overflow-y-auto">
               {preview.map((item, i) => (
@@ -391,8 +396,10 @@ export function ShareDialog({ trigger, onImported }: Props) {
                 onClick={() => setPreview(null)}
                 disabled={busyAction !== null}
               >
-                <ArrowLeft className="size-4" />
-                Back
+                <Trans
+                  message={"{value1}Back"}
+                  values={{ value1: <ArrowLeft className="size-4" /> }}
+                />
               </Button>
               <Button
                 onClick={confirmImport}
@@ -401,14 +408,19 @@ export function ShareDialog({ trigger, onImported }: Props) {
                 {busyAction === "import" ? (
                   <>
                     <Loader2 className="size-4 animate-spin" />
-                    Importing…
+                    {t("Importing… ")}
                   </>
                 ) : (
                   <>
                     <Check className="size-4" />
                     {newCount === 0
-                      ? "Nothing new to import"
-                      : `Import ${newCount} server${newCount === 1 ? "" : "s"}`}
+                      ? t("Nothing new to import")
+                      : t(
+                          newCount === 1
+                            ? "Import {value1} server"
+                            : "Import {value1} servers",
+                          { value1: newCount },
+                        )}
                   </>
                 )}
               </Button>
@@ -417,10 +429,11 @@ export function ShareDialog({ trigger, onImported }: Props) {
         ) : (
           <div className="flex flex-col gap-5 py-1">
             <div className="flex flex-col gap-2">
-              <Label className="text-sm">Your setup</Label>
+              <Label className="text-sm">{t("Your setup")}</Label>
               <p className="text-xs text-muted-foreground">
-                Send this to a teammate to share your server set. Secrets are never
-                included, each person adds their own keys after importing.
+                {t(
+                  "Send this to a teammate to share your server set. Secrets are never included, each person adds their own keys after importing. ",
+                )}
               </p>
               <div className="grid grid-cols-2 gap-2">
                 <Input
@@ -429,7 +442,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
                     invalidateShareOutput();
                     setName(e.target.value);
                   }}
-                  placeholder="Name (optional)"
+                  placeholder={t("Name (optional)")}
                   className="h-8 text-sm"
                 />
                 <Input
@@ -438,7 +451,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
                     invalidateShareOutput();
                     setDescription(e.target.value);
                   }}
-                  placeholder="Description (optional)"
+                  placeholder={t("Description (optional)")}
                   className="h-8 text-sm"
                 />
               </div>
@@ -447,7 +460,10 @@ export function ShareDialog({ trigger, onImported }: Props) {
                 <div className="flex flex-col gap-1.5">
                   <div className="flex items-center justify-between">
                     <span className="text-xs text-muted-foreground">
-                      Servers to include ({selected.size}/{servers.length})
+                      <Trans
+                        message={"Servers to include ({value1}/{value2})"}
+                        values={{ value1: selected.size, value2: servers.length }}
+                      />
                     </span>
                     <div className="flex gap-2 text-[11px]">
                       <button
@@ -458,7 +474,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
                           setSelected(new Set(servers.map((s) => s.id)));
                         }}
                       >
-                        All
+                        {t("All ")}
                       </button>
                       <button
                         type="button"
@@ -468,7 +484,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
                           setSelected(new Set());
                         }}
                       >
-                        None
+                        {t("None ")}
                       </button>
                     </div>
                   </div>
@@ -504,7 +520,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
 
               {registryState === "loading" && (
                 <p role="status" className="text-xs text-muted-foreground">
-                  Loading servers…
+                  {t("Loading servers… ")}
                 </p>
               )}
               {registryState === "error" && (
@@ -512,15 +528,20 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   role="alert"
                   className="flex items-center justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-2.5 py-2 text-xs text-destructive"
                 >
-                  <span>Couldn&apos;t load your servers: {registryError}</span>
+                  <span>
+                    <Trans
+                      message={"Couldn't load your servers: {value1}"}
+                      values={{ value1: registryError }}
+                    />
+                  </span>
                   <Button size="sm" variant="outline" onClick={() => void loadServers()}>
-                    Retry
+                    {t("Retry ")}
                   </Button>
                 </div>
               )}
               {registryState === "ready" && exportState === "loading" && (
                 <p role="status" className="text-xs text-muted-foreground">
-                  Updating setup…
+                  {t("Updating setup… ")}
                 </p>
               )}
               {registryState === "ready" && exportState === "error" && (
@@ -528,7 +549,12 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   role="alert"
                   className="flex items-center justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-2.5 py-2 text-xs text-destructive"
                 >
-                  <span>Couldn&apos;t build this setup: {exportError}</span>
+                  <span>
+                    <Trans
+                      message={"Couldn't build this setup: {value1}"}
+                      values={{ value1: exportError }}
+                    />
+                  </span>
                   <Button
                     size="sm"
                     variant="outline"
@@ -537,14 +563,14 @@ export function ShareDialog({ trigger, onImported }: Props) {
                       setExportRetry((value) => value + 1);
                     }}
                   >
-                    Retry
+                    {t("Retry ")}
                   </Button>
                 </div>
               )}
 
               <Textarea
                 readOnly
-                aria-label="Exported setup"
+                aria-label={t("Exported setup")}
                 value={exported}
                 rows={5}
                 className="resize-none font-mono text-xs"
@@ -558,11 +584,13 @@ export function ShareDialog({ trigger, onImported }: Props) {
                 >
                   {linking ? (
                     <>
-                      <Loader2 className="size-3.5 animate-spin" /> Creating link…
+                      <Loader2 className="size-3.5 animate-spin" />
+                      {t(" Creating link… ")}
                     </>
                   ) : (
                     <>
-                      <Link2 className="size-3.5" /> Create share link
+                      <Link2 className="size-3.5" />
+                      {t(" Create share link ")}
                     </>
                   )}
                 </Button>
@@ -575,11 +603,13 @@ export function ShareDialog({ trigger, onImported }: Props) {
                 >
                   {copied ? (
                     <>
-                      <Check className="size-3.5" /> Copied
+                      <Check className="size-3.5" />
+                      {t(" Copied ")}
                     </>
                   ) : (
                     <>
-                      <Copy className="size-3.5" /> Copy
+                      <Copy className="size-3.5" />
+                      {t(" Copy ")}
                     </>
                   )}
                 </Button>
@@ -592,11 +622,13 @@ export function ShareDialog({ trigger, onImported }: Props) {
                 >
                   {saving ? (
                     <>
-                      <Loader2 className="size-3.5 animate-spin" /> Saving…
+                      <Loader2 className="size-3.5 animate-spin" />
+                      {t(" Saving… ")}
                     </>
                   ) : (
                     <>
-                      <FileDown className="size-3.5" /> Save to file
+                      <FileDown className="size-3.5" />
+                      {t(" Save to file ")}
                     </>
                   )}
                 </Button>
@@ -607,7 +639,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   <code className="min-w-0 flex-1 truncate text-xs">{shareLink}</code>
                   <button
                     type="button"
-                    title={linkCopied ? "Copied" : "Copy link"}
+                    title={linkCopied ? t("Copied") : t("Copy link")}
                     onClick={copyLink}
                     className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                   >
@@ -622,10 +654,10 @@ export function ShareDialog({ trigger, onImported }: Props) {
             </div>
 
             <div className="flex flex-col gap-2 border-t pt-4">
-              <Label className="text-sm">Import a setup</Label>
+              <Label className="text-sm">{t("Import a setup")}</Label>
               <Textarea
-                placeholder="Paste a shared setup here"
-                aria-label="Paste a shared setup"
+                placeholder={t("Paste a shared setup here")}
+                aria-label={t("Paste a shared setup")}
                 value={paste}
                 onChange={(e) => setPaste(e.target.value)}
                 rows={5}
@@ -639,12 +671,12 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   {busyAction === "preview-paste" ? (
                     <>
                       <Loader2 className="size-4 animate-spin" />
-                      Reviewing…
+                      {t("Reviewing… ")}
                     </>
                   ) : (
                     <>
                       <Upload className="size-4" />
-                      Review and import
+                      {t("Review and import ")}
                     </>
                   )}
                 </Button>
@@ -656,12 +688,12 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   {busyAction === "preview-file" ? (
                     <>
                       <Loader2 className="size-4 animate-spin" />
-                      Loading…
+                      {t("Loading… ")}
                     </>
                   ) : (
                     <>
                       <FileUp className="size-4" />
-                      Load from file
+                      {t("Load from file ")}
                     </>
                   )}
                 </Button>

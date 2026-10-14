@@ -1,5 +1,6 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { getLocale } from "./i18n";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -61,7 +62,7 @@ export function fmtMs(ms: number | null): string {
 
 /** Dollar value of saved input tokens, scaled to the number's size. */
 export function fmtDollars(n: number): string {
-  if (n >= 1000) return `$${Math.round(n).toLocaleString()}`;
+  if (n >= 1000) return `$${Math.round(n).toLocaleString(getLocale())}`;
   if (n >= 10) return `$${n.toFixed(0)}`;
   return `$${n.toFixed(2)}`;
 }
@@ -89,16 +90,16 @@ export function fmtPercent(
  */
 export function fmtTs(timestamp: number, format?: "time" | "date" | "monthDay"): string {
   if (format === "time") {
-    return new Date(timestamp).toLocaleTimeString();
+    return new Date(timestamp).toLocaleTimeString(getLocale());
   } else if (format === "date") {
-    return new Date(timestamp).toLocaleDateString();
+    return new Date(timestamp).toLocaleDateString(getLocale());
   } else if (format === "monthDay") {
-    return new Date(timestamp).toLocaleDateString(undefined, {
+    return new Date(timestamp).toLocaleDateString(getLocale(), {
       month: "short",
       day: "numeric",
     });
   } else {
-    return new Date(timestamp).toLocaleString(undefined, {
+    return new Date(timestamp).toLocaleString(getLocale(), {
       month: "short",
       day: "numeric",
       hour: "2-digit",

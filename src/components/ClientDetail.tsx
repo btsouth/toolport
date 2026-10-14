@@ -1,3 +1,4 @@
+import { useI18n, Trans } from "@/lib/i18n";
 import { useEffect, useState } from "react";
 import {
   ArrowRight,
@@ -90,6 +91,7 @@ function recommendedMode(clientId: string): { mode: string; why: string } {
 }
 
 export function ClientDetail({ client, registry, onChanged, onRegistryChange }: Props) {
+  const { t } = useI18n();
   const [busy, setBusy] = useState(false);
   // Snapshotted at dialog-open time so a registry-changed event mid-review can't
   // reshuffle `toImport` out from under the indices the user already confirmed.
@@ -172,8 +174,13 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       onRegistryChange(next);
       toast.success(
         mode
-          ? `${client.name} discovery set to "${mode}".`
-          : `${client.name} now inherits the global discovery mode.`,
+          ? t('{value1} discovery set to "{value2}".', {
+              value1: client.name,
+              value2: mode,
+            })
+          : t("{value1} now inherits the global discovery mode.", {
+              value1: client.name,
+            }),
       );
     } catch (e) {
       toastError(`${e}`);
@@ -232,8 +239,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       const scopeName = profiles.find((p) => p.id === profile)?.name ?? profile;
       toast.success(
         profile
-          ? `${client.name} scoped to "${scopeName}".`
-          : `${client.name} now follows the active profile.`,
+          ? t('{value1} scoped to "{value2}".', {
+              value1: client.name,
+              value2: scopeName,
+            })
+          : t("{value1} now follows the active profile.", { value1: client.name }),
         { description: clientRestartHint(client.name) },
       );
       noteRestartNeeded("applied");
@@ -250,9 +260,12 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     setBusy(true);
     try {
       await installGateway(client.id, profile || undefined, true, transport);
-      toast.success(`Reset ${client.name} to the default Toolport gateway`, {
-        description: clientRestartHint(client.name),
-      });
+      toast.success(
+        t("Reset {value1} to the default Toolport gateway", { value1: client.name }),
+        {
+          description: clientRestartHint(client.name),
+        },
+      );
       noteRestartNeeded("applied");
       setResetOpen(false);
       onChanged();
@@ -281,11 +294,19 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       );
       onRegistryChange(result.registry);
       toast.success(
-        `Moved ${result.moved.length} server${result.moved.length === 1 ? "" : "s"} into Toolport`,
+        t(
+          result.moved.length === 1
+            ? "Moved {value1} server into Toolport"
+            : "Moved {value1} servers into Toolport",
+          { value1: result.moved.length },
+        ),
         {
           // Migrate rewrites the whole gateway slot, so it needs the restart line for
           // the same reason Connect does.
-          description: `${client.name} now uses only the Toolport gateway. Config backed up. ${clientRestartHint(client.name)}`,
+          description: t(
+            "{value1} now uses only the Toolport gateway. Config backed up. {value2}",
+            { value1: client.name, value2: clientRestartHint(client.name) },
+          ),
         },
       );
       noteRestartNeeded("applied");
@@ -363,16 +384,28 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     }
     setBusy(false);
     if (failed.length === 0) {
-      toast.success(`Imported ${ok} server${ok === 1 ? "" : "s"} into Toolport`);
+      toast.success(
+        t(
+          ok === 1
+            ? "Imported {value1} server into Toolport"
+            : "Imported {value1} servers into Toolport",
+          { value1: ok },
+        ),
+      );
       setBulkImportServers(null);
     } else {
       // Some imports failed. Drop ONLY the rows that succeeded so a re-confirm can't
       // re-import them; the failures (and any rows the user didn't select this time)
       // stay in the dialog to retry or import next.
       if (ok > 0) {
-        toast.warning(`Imported ${ok}, couldn't import ${failed.join(", ")}`);
+        toast.warning(
+          t("Imported {value1}, couldn't import {value2}", {
+            value1: ok,
+            value2: failed.join(", "),
+          }),
+        );
       } else {
-        toastError(`Couldn't import ${failed.join(", ")}`);
+        toastError(t("Couldn't import {value1}", { value1: failed.join(", ") }));
       }
       setBulkImportServers(servers.filter((_, i) => !succeeded.has(String(i))));
     }
@@ -386,8 +419,13 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         const restored = outcome.restored?.length ?? 0;
         toast.success(
           restored > 0
-            ? `Disconnected Toolport from ${client.name} and put back ${restored} server${restored === 1 ? "" : "s"}`
-            : `Disconnected Toolport from ${client.name}`,
+            ? t(
+                restored === 1
+                  ? "Disconnected Toolport from {value1} and put back {value2} server"
+                  : "Disconnected Toolport from {value1} and put back {value2} servers",
+                { value1: client.name, value2: restored },
+              )
+            : t("Disconnected Toolport from {value1}", { value1: client.name }),
           { description: clientRestartHintAfterRemoval(client.name) },
         );
         noteRestartNeeded("removed");
@@ -400,15 +438,17 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         );
         // Restart is the load-bearing line (SOU-317): MCP clients typically do not
         // pick up a new gateway entry until relaunch. Scope/backup are secondary.
-        toast.success(`Connected Toolport to ${client.name}`, {
+        toast.success(t("Connected Toolport to {value1}", { value1: client.name }), {
           description: connectSuccessDescription(client.name, [
             transport === "sharedHttp"
-              ? "Uses the shared HTTP bridge (one gateway process)."
+              ? t("Uses the shared HTTP bridge (one gateway process).")
               : null,
             profile
-              ? `Scoped to the "${profiles.find((p) => p.id === profile)?.name ?? profile}" profile.`
+              ? t('Scoped to the "{value1}" profile.', {
+                  value1: profiles.find((p) => p.id === profile)?.name ?? profile,
+                })
               : null,
-            !profile && outcome.backup ? "Previous config backed up." : null,
+            !profile && outcome.backup ? t("Previous config backed up.") : null,
           ]),
         });
         noteRestartNeeded("applied");
@@ -428,51 +468,76 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         <div className="min-w-0">
           {customized ? (
             <Badge variant="warning" className="mb-1">
-              <TriangleAlert className="size-3" />
-              custom configuration
+              <Trans
+                message={"{value1}custom configuration"}
+                values={{ value1: <TriangleAlert className="size-3" /> }}
+              />
             </Badge>
           ) : installed ? (
             <Badge variant="success" className="mb-1">
-              <Link2 className="size-3" />
-              connected
+              <Trans
+                message={"{value1}connected"}
+                values={{ value1: <Link2 className="size-3" /> }}
+              />
             </Badge>
           ) : present ? (
             <Badge variant="info" className="mb-1">
-              <Monitor className="size-3" />
-              ready to connect
+              <Trans
+                message={"{value1}ready to connect"}
+                values={{ value1: <Monitor className="size-3" /> }}
+              />
             </Badge>
           ) : (
             <Badge variant="outline" className="mb-1 text-muted-foreground">
-              not installed
+              {t("not installed ")}
             </Badge>
           )}
           <p className="truncate font-mono text-xs text-muted-foreground">
             {client.configExists
               ? client.configPath
               : present
-                ? "installed - no MCP config yet"
-                : "not installed on this machine"}
+                ? t("installed - no MCP config yet")
+                : t("not installed on this machine")}
           </p>
           {customized && (
             <p className="mt-1 text-xs text-muted-foreground">
-              Toolport is leaving your hand-edited gateway entry as-is. Reset it only if
-              you want Toolport to manage the entry.
+              {t(
+                "Toolport is leaving your hand-edited gateway entry as-is. Reset it only if you want Toolport to manage the entry. ",
+              )}
             </p>
           )}
           {installed && !customized && (
             <p className="mt-1 text-xs text-muted-foreground">
-              Sees{" "}
-              <span className="font-medium text-foreground">
-                {currentScope ? `the "${currentScope}" profile` : "the active profile"}
-              </span>{" "}
-              · {scopeServerCount(currentScope)} server
-              {scopeServerCount(currentScope) === 1 ? "" : "s"}
-              {managedTransport === "sharedHttp" ? " · shared HTTP" : ""}
+              <Trans
+                message={
+                  scopeServerCount(currentScope) === 1
+                    ? "Sees{value1}{value2}{value3}\n              · {value4} server{value6}"
+                    : "Sees{value1}{value2}{value3}\n              · {value4} servers{value6}"
+                }
+                values={{
+                  value1: " ",
+                  value2: (
+                    <span className="font-medium text-foreground">
+                      {currentScope
+                        ? t('the "{value1}" profile', { value1: currentScope })
+                        : t("the active profile")}
+                    </span>
+                  ),
+                  value3: " ",
+                  value4: scopeServerCount(currentScope),
+                  value6: managedTransport === "sharedHttp" ? t(" · shared HTTP") : "",
+                }}
+              />
             </p>
           )}
           {!present && !installed && (
             <p className="mt-1 text-xs text-muted-foreground">
-              Install {client.name} on this machine before connecting it to Toolport.
+              <Trans
+                message={
+                  "Install {value1} on this machine before connecting it to Toolport."
+                }
+                values={{ value1: client.name }}
+              />
             </p>
           )}
         </div>
@@ -488,8 +553,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="stdio">Spawn (stdio)</SelectItem>
-                <SelectItem value="sharedHttp">Shared HTTP</SelectItem>
+                <SelectItem value="stdio">{t("Spawn (stdio)")}</SelectItem>
+                <SelectItem value="sharedHttp">{t("Shared HTTP")}</SelectItem>
               </SelectContent>
             </Select>
           )}
@@ -502,10 +567,10 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="__all__">Follow active profile</SelectItem>
+                <SelectItem value="__all__">{t("Follow active profile")}</SelectItem>
                 {profiles.map((p) => (
                   <SelectItem key={p.id} value={p.id}>
-                    Only: {p.name}
+                    <Trans message={"Only: {value1}"} values={{ value1: p.name }} />
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -513,8 +578,10 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           )}
           {installed && !customized && profile !== currentScope && (
             <Button size="sm" onClick={applyScope} disabled={busy}>
-              <Check className="size-4" />
-              Apply scope
+              <Trans
+                message={"{value1}Apply scope"}
+                values={{ value1: <Check className="size-4" /> }}
+              />
             </Button>
           )}
           {customized && (
@@ -523,13 +590,19 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               onOpenChange={setResetOpen}
               trigger={
                 <Button size="sm" variant="default" disabled={busy}>
-                  <Check className="size-4" />
-                  Reset to default
+                  <Trans
+                    message={"{value1}Reset to default"}
+                    values={{ value1: <Check className="size-4" /> }}
+                  />
                 </Button>
               }
-              title={`Reset ${client.name} to the default Toolport gateway?`}
-              description="This overwrites the hand-edited toolport entry with the standard stdio gateway command. Your other MCP servers are left alone."
-              confirmLabel="Reset to default"
+              title={t("Reset {value1} to the default Toolport gateway?", {
+                value1: client.name,
+              })}
+              description={t(
+                "This overwrites the hand-edited toolport entry with the standard stdio gateway command. Your other MCP servers are left alone.",
+              )}
+              confirmLabel={t("Reset to default")}
               onConfirm={resetToDefault}
             />
           )}
@@ -537,17 +610,23 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             <ConfirmDialog
               trigger={
                 <Button size="sm" variant="outline" disabled={busy}>
-                  <Plug className="size-4" />
-                  Disconnect
+                  <Trans
+                    message={"{value1}Disconnect"}
+                    values={{ value1: <Plug className="size-4" /> }}
+                  />
                 </Button>
               }
-              title={`Disconnect Toolport from ${client.name}?`}
+              title={t("Disconnect Toolport from {value1}?", { value1: client.name })}
               description={
                 customized
-                  ? "This removes the custom toolport entry from the client's MCP config. You can reconnect anytime."
-                  : "This rewrites the client's MCP config to remove the gateway and puts back any servers Toolport moved out of it. You can reconnect anytime."
+                  ? t(
+                      "This removes the custom toolport entry from the client's MCP config. You can reconnect anytime.",
+                    )
+                  : t(
+                      "This rewrites the client's MCP config to remove the gateway and puts back any servers Toolport moved out of it. You can reconnect anytime.",
+                    )
               }
-              confirmLabel="Disconnect"
+              confirmLabel={t("Disconnect")}
               destructive
               onConfirm={toggleInstall}
             />
@@ -558,8 +637,10 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               onClick={toggleInstall}
               disabled={busy || !present}
             >
-              <PlugZap className="size-4" />
-              Connect to Toolport
+              <Trans
+                message={"{value1}Connect to Toolport"}
+                values={{ value1: <PlugZap className="size-4" /> }}
+              />
             </Button>
           )}
         </div>
@@ -572,7 +653,9 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         >
           <TriangleAlert className="mt-0.5 size-4 shrink-0" />
           <div className="min-w-0">
-            <p className="font-medium">Couldn't read this client's configuration</p>
+            <p className="font-medium">
+              {t("Couldn't read this client's configuration")}
+            </p>
             <p className="mt-0.5 break-words text-xs">{client.error}</p>
           </div>
         </div>
@@ -585,13 +668,17 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         >
           <RefreshCw className="mt-0.5 size-4 shrink-0" />
           <div className="min-w-0 flex-1">
-            <p className="font-medium">{showRestartNotice.title}</p>
-            <p className="mt-0.5 break-words text-xs">{showRestartNotice.text}</p>
+            <p className="font-medium">{t(showRestartNotice.title)}</p>
+            <p className="mt-0.5 break-words text-xs">
+              {showRestartNotice.title === "Not live yet"
+                ? clientRestartHint(client.name)
+                : clientRestartHintAfterRemoval(client.name)}
+            </p>
           </div>
           <button
             type="button"
             onClick={() => setRestartNotice(null)}
-            aria-label="Dismiss restart reminder"
+            aria-label={t("Dismiss restart reminder")}
             className="rounded p-0.5 text-info/70 transition-colors hover:bg-info/10 hover:text-info focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-info"
           >
             <X className="size-3.5" />
@@ -603,25 +690,45 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
           <div className="min-w-0">
             <div className="text-xs font-medium text-foreground">
-              Discovery mode
-              {!clientMode && (
-                <span className="ml-1.5 font-normal text-muted-foreground">
-                  inheriting {globalMode}
-                </span>
-              )}
+              <Trans
+                message={"Discovery mode {value1}"}
+                values={{
+                  value1: !clientMode && (
+                    <span className="ml-1.5 font-normal text-muted-foreground">
+                      <Trans
+                        message={"inheriting {value1}"}
+                        values={{ value1: globalMode }}
+                      />
+                    </span>
+                  ),
+                }}
+              />
             </div>
             <p className="mt-0.5 text-2xs text-muted-foreground">
-              {DISCOVERY_HINT[effectiveMode] ?? DISCOVERY_HINT.lazy}
+              {t(DISCOVERY_HINT[effectiveMode] ?? DISCOVERY_HINT.lazy)}
             </p>
             {effectiveMode === recommended.mode ? (
               <p className="mt-0.5 text-2xs text-success">
-                Recommended ({recommended.mode}), {recommended.why}.
+                <Trans
+                  message={"Recommended ({value1}), {value2}."}
+                  values={{ value1: recommended.mode, value2: t(recommended.why) }}
+                />
               </p>
             ) : (
               <p className="mt-0.5 text-2xs text-muted-foreground/80">
-                Recommended:{" "}
-                <span className="font-medium text-foreground">{recommended.mode}</span>,{" "}
-                {recommended.why}.
+                <Trans
+                  message={"Recommended:{value1}{value2},{value3}{value4}."}
+                  values={{
+                    value1: " ",
+                    value2: (
+                      <span className="font-medium text-foreground">
+                        {recommended.mode}
+                      </span>
+                    ),
+                    value3: " ",
+                    value4: t(recommended.why),
+                  }}
+                />
               </p>
             )}
           </div>
@@ -633,10 +740,12 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="__inherit__">Inherit ({globalMode})</SelectItem>
-              <SelectItem value="lazy">Lazy · fewest tokens</SelectItem>
-              <SelectItem value="grouped">Grouped · per-server</SelectItem>
-              <SelectItem value="full">Full · every tool</SelectItem>
+              <SelectItem value="__inherit__">
+                <Trans message={"Inherit ({value1})"} values={{ value1: globalMode }} />
+              </SelectItem>
+              <SelectItem value="lazy">{t("Lazy · fewest tokens")}</SelectItem>
+              <SelectItem value="grouped">{t("Grouped · per-server")}</SelectItem>
+              <SelectItem value="full">{t("Full · every tool")}</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -645,11 +754,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       {installed && !customized ? (
         <div>
           <div className="mb-1.5 text-xs font-medium tracking-wide text-muted-foreground uppercase">
-            Servers it can reach
+            {t("Servers it can reach ")}
           </div>
           {scopeServers(currentScope).length === 0 ? (
             <p className="text-xs text-muted-foreground">
-              No enabled servers in this scope yet. Enable some under All servers.
+              {t("No enabled servers in this scope yet. Enable some under All servers. ")}
             </p>
           ) : (
             <div className="flex flex-wrap gap-1.5">
@@ -667,13 +776,28 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       ) : !customized && scopeServerCount(profile) > 0 ? (
         <div className="flex flex-col gap-4">
           <p className="max-w-prose text-sm text-muted-foreground">
-            Connect {client.name} once and it reaches your{" "}
-            <span className="font-medium text-foreground">
-              {scopeServerCount(profile)} managed server
-              {scopeServerCount(profile) === 1 ? "" : "s"}
-            </span>{" "}
-            through one gateway, no re-wiring per project. Your keys stay in your
-            keychain.
+            <Trans
+              message={
+                "Connect {value1} once and it reaches your{value2}{value3}{value4}through one gateway, no re-wiring per project. Your keys stay in your keychain."
+              }
+              values={{
+                value1: client.name,
+                value2: " ",
+                value3: (
+                  <span className="font-medium text-foreground">
+                    <Trans
+                      message={
+                        scopeServerCount(profile) === 1
+                          ? "{value1} managed server"
+                          : "{value1} managed servers"
+                      }
+                      values={{ value1: scopeServerCount(profile) }}
+                    />
+                  </span>
+                ),
+                value4: " ",
+              }}
+            />
           </p>
           <GatewayFlow
             clientName={client.name}
@@ -682,9 +806,18 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         </div>
       ) : !customized ? (
         <p className="max-w-prose text-sm text-muted-foreground">
-          Connect {client.name}, then enable servers under{" "}
-          <span className="font-medium text-foreground">All servers</span> and
-          they&apos;ll all route through Toolport, no per-client setup.
+          <Trans
+            message={
+              "Connect {value1}, then enable servers under{value2}{value3} and they'll all route through Toolport, no per-client setup."
+            }
+            values={{
+              value1: client.name,
+              value2: " ",
+              value3: (
+                <span className="font-medium text-foreground">{t("All servers")}</span>
+              ),
+            }}
+          />
         </p>
       ) : null}
 
@@ -693,12 +826,19 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           <CardContent className="flex gap-3 p-4">
             <Puzzle className="mt-0.5 size-4 shrink-0 text-info" />
             <div className="text-sm">
-              <p className="font-medium">{client.name} manages servers as connectors</p>
+              <p className="font-medium">
+                <Trans
+                  message={"{value1} manages servers as connectors"}
+                  values={{ value1: client.name }}
+                />
+              </p>
               <p className="mt-1 text-muted-foreground">
-                Those live in {client.name}'s Customize → Connectors and sync to your
-                account, outside the local config files Toolport reads. Connecting
-                Toolport adds a local gateway entry so your Toolport-managed servers
-                appear in {client.name} too.
+                <Trans
+                  message={
+                    "Those live in {value1}'s Customize → Connectors and sync to your account, outside the local config files Toolport reads. Connecting Toolport adds a local gateway entry so your Toolport-managed servers appear in {value2} too."
+                  }
+                  values={{ value1: client.name, value2: client.name }}
+                />
               </p>
             </div>
           </CardContent>
@@ -713,7 +853,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         <div>
           <div className="mb-1 flex items-center justify-between gap-2">
             <span className="text-2xs font-semibold tracking-[0.09em] text-muted-foreground uppercase">
-              Import into Toolport
+              {t("Import into Toolport ")}
             </span>
             <div className="flex items-center gap-1.5">
               {toImport.length > 0 && (
@@ -724,8 +864,13 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                   onClick={handleImportAll}
                   disabled={busy}
                 >
-                  <Download className="size-3" />
-                  Import all ({toImport.length})
+                  <Trans
+                    message={"{value1}Import all ({value2})"}
+                    values={{
+                      value1: <Download className="size-3" />,
+                      value2: toImport.length,
+                    }}
+                  />
                 </Button>
               )}
               {movable.length > 0 && (
@@ -736,27 +881,51 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                   onClick={() => setMigrateOpen(true)}
                   disabled={busy}
                 >
-                  <Shuffle className="size-3" />
-                  Move into gateway ({movable.length})
+                  <Trans
+                    message={"{value1}Move into gateway ({value2})"}
+                    values={{
+                      value1: <Shuffle className="size-3" />,
+                      value2: movable.length,
+                    }}
+                  />
                 </Button>
               )}
             </div>
           </div>
           <details className="mb-2">
             <summary className="cursor-pointer text-xs font-medium text-muted-foreground/80 hover:text-foreground">
-              How importing works
+              {t("How importing works ")}
             </summary>
             <ul className="mt-1.5 mb-1 space-y-0.5 text-xs text-muted-foreground">
               <li>
-                <span className="font-medium text-foreground">Import</span> copies a
-                server into Toolport; {client.name} keeps its own copy.
+                <Trans
+                  message={
+                    "{value1} copies a server into Toolport; {value2} keeps its own copy."
+                  }
+                  values={{
+                    value1: (
+                      <span className="font-medium text-foreground">{t("Import")}</span>
+                    ),
+                    value2: client.name,
+                  }}
+                />
               </li>
               {movable.length > 0 && (
                 <li>
-                  <span className="font-medium text-foreground">Move into gateway</span>{" "}
-                  copies it, then removes it from {client.name}'s config so the gateway is
-                  the only source (plugin servers stay). The cutover that actually saves
-                  context.
+                  <Trans
+                    message={
+                      "{value1}{value2}copies it, then removes it from {value3}'s config so the gateway is the only source (plugin servers stay). The cutover that actually saves context."
+                    }
+                    values={{
+                      value1: (
+                        <span className="font-medium text-foreground">
+                          {t("Move into gateway")}
+                        </span>
+                      ),
+                      value2: " ",
+                      value3: client.name,
+                    }}
+                  />
                 </li>
               )}
             </ul>
@@ -765,10 +934,15 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             <p className="mb-3 -mt-1 inline-flex items-start gap-1.5 rounded-md bg-warning/10 px-2 py-1 text-xs text-warning">
               <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
               <span>
-                {client.name} is already connected to Toolport. Import on its own leaves a
-                copy here too, so these tools load twice, once directly and once through
-                the gateway. Use <span className="font-medium">Move into gateway</span> to
-                avoid that.
+                <Trans
+                  message={
+                    "{value1} is already connected to Toolport. Import on its own leaves a copy here too, so these tools load twice, once directly and once through the gateway. Use {value2} to avoid that."
+                  }
+                  values={{
+                    value1: client.name,
+                    value2: <span className="font-medium">{t("Move into gateway")}</span>,
+                  }}
+                />
               </span>
             </p>
           )}
@@ -790,11 +964,23 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
 
           {toImport.length === 0 && (
             <p className="mt-3 inline-flex items-center gap-1.5 text-xs text-success">
-              <Check className="size-3.5" />
-              Everything here is already in Toolport. Manage it under{" "}
-              <span className="inline-flex items-center gap-0.5 font-medium">
-                All servers <ArrowRight className="size-3" />
-              </span>
+              <Trans
+                message={
+                  "{value1}Everything here is already in Toolport. Manage it under{value2}{value3}"
+                }
+                values={{
+                  value1: <Check className="size-3.5" />,
+                  value2: " ",
+                  value3: (
+                    <span className="inline-flex items-center gap-0.5 font-medium">
+                      <Trans
+                        message={"All servers {value1}"}
+                        values={{ value1: <ArrowRight className="size-3" /> }}
+                      />
+                    </span>
+                  ),
+                }}
+              />
             </p>
           )}
         </div>
@@ -803,31 +989,54 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       <Dialog open={migrateOpen} onOpenChange={setMigrateOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Move {client.name} onto Toolport</DialogTitle>
+            <DialogTitle>
+              <Trans
+                message={"Move {value1} onto Toolport"}
+                values={{ value1: client.name }}
+              />
+            </DialogTitle>
           </DialogHeader>
           <div className="flex flex-col gap-3 py-1 text-sm">
             <p className="text-muted-foreground">
-              This imports{" "}
-              <span className="font-medium text-foreground">
-                {movable.length} server{movable.length === 1 ? "" : "s"}
-              </span>{" "}
-              from {client.name} into Toolport and turns them on, then rewrites{" "}
-              {client.name}'s config so it uses{" "}
-              <span className="font-medium text-foreground">
-                only the Toolport gateway
-              </span>
-              . The original config is backed up first, and Disconnect puts these servers
-              back.
+              <Trans
+                message={
+                  "This imports{value1}{value2}{value3}from {value4} into Toolport and turns them on, then rewrites{value5}{value6}'s config so it uses{value7}{value8}. The original config is backed up first, and Disconnect puts these servers back."
+                }
+                values={{
+                  value1: " ",
+                  value2: (
+                    <span className="font-medium text-foreground">
+                      <Trans
+                        message={
+                          movable.length === 1 ? "{value1} server" : "{value1} servers"
+                        }
+                        values={{ value1: movable.length }}
+                      />
+                    </span>
+                  ),
+                  value3: " ",
+                  value4: client.name,
+                  value5: " ",
+                  value6: client.name,
+                  value7: " ",
+                  value8: (
+                    <span className="font-medium text-foreground">
+                      {t("only the Toolport gateway ")}
+                    </span>
+                  ),
+                }}
+              />
             </p>
             <p className="rounded-md bg-warning/10 p-2 text-xs text-warning">
-              Secret values (API keys, tokens) aren't carried over, they stay only in the
-              backed-up config. After migrating, re-enter them under each server's secrets
-              so the gateway can connect.
+              {t(
+                "Secret values (API keys, tokens) aren't carried over, they stay only in the backed-up config. After migrating, re-enter them under each server's secrets so the gateway can connect. ",
+              )}
             </p>
             {customized && (
               <p className="rounded-md bg-warning/10 p-2 text-xs text-warning">
-                This client has a custom Toolport entry. Migrating replaces it with the
-                default gateway command.
+                {t(
+                  "This client has a custom Toolport entry. Migrating replaces it with the default gateway command. ",
+                )}
               </p>
             )}
             <div className="rounded-md bg-muted/40 p-2 font-mono text-xs text-muted-foreground">
@@ -835,16 +1044,24 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             </div>
             {client.pluginServers.length > 0 && (
               <p className="text-xs text-muted-foreground">
-                Note: {client.pluginServers.length} server
-                {client.pluginServers.length === 1 ? "" : "s"} managed by {client.name}'s
-                plugins or extensions can't be moved, only {client.name} controls those.
-                They stay where they are (you can still import a copy above).
+                <Trans
+                  message={
+                    client.pluginServers.length === 1
+                      ? "Note: {value1} server managed by {value3}'s plugins or extensions can't be moved, only {value4} controls those. They stay where they are (you can still import a copy above)."
+                      : "Note: {value1} servers managed by {value3}'s plugins or extensions can't be moved, only {value4} controls those. They stay where they are (you can still import a copy above)."
+                  }
+                  values={{
+                    value1: client.pluginServers.length,
+                    value3: client.name,
+                    value4: client.name,
+                  }}
+                />
               </p>
             )}
             {profiles.length > 1 && (
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs text-muted-foreground">
-                  Scope this client to
+                  {t("Scope this client to ")}
                 </span>
                 <Select
                   value={profile || "__all__"}
@@ -854,10 +1071,10 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="__all__">Follow active profile</SelectItem>
+                    <SelectItem value="__all__">{t("Follow active profile")}</SelectItem>
                     {profiles.map((p) => (
                       <SelectItem key={p.id} value={p.id}>
-                        Only: {p.name}
+                        <Trans message={"Only: {value1}"} values={{ value1: p.name }} />
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -871,11 +1088,16 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               onClick={() => setMigrateOpen(false)}
               disabled={busy}
             >
-              Cancel
+              {t("Cancel ")}
             </Button>
             <Button onClick={migrate} disabled={busy}>
-              <Shuffle className="size-4" />
-              Move {movable.length} into Toolport
+              <Trans
+                message={"{value1}Move {value2} into Toolport"}
+                values={{
+                  value1: <Shuffle className="size-4" />,
+                  value2: movable.length,
+                }}
+              />
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -884,7 +1106,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         open={bulkImportPreview !== null}
         items={bulkImportPreview ?? []}
         busy={busy}
-        title={`Review ${client.name} servers`}
+        title={t("Review {value1} servers", { value1: client.name })}
         onOpenChange={(open) => {
           if (!open && !busy) setBulkImportServers(null);
         }}
@@ -897,6 +1119,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
 /** The product in one glance: client -> Toolport gateway -> the servers it reaches. Shows
  * the pitch concretely instead of describing it in prose. */
 function GatewayFlow({ clientName, servers }: { clientName: string; servers: string[] }) {
+  const { t } = useI18n();
   const shown = servers.slice(0, 4);
   const extra = servers.length - shown.length;
   const link = "mb-7 h-px w-8 shrink-0";
@@ -924,8 +1147,16 @@ function GatewayFlow({ clientName, servers }: { clientName: string; servers: str
           </svg>
         </div>
         <div className="text-2xs font-semibold">
-          Toolport
-          <span className="block font-normal text-muted-foreground">gateway</span>
+          <Trans
+            message={"Toolport {value1}"}
+            values={{
+              value1: (
+                <span className="block font-normal text-muted-foreground">
+                  {t("gateway")}
+                </span>
+              ),
+            }}
+          />
         </div>
       </div>
       <div className={`${link} bg-border`} />
@@ -940,7 +1171,7 @@ function GatewayFlow({ clientName, servers }: { clientName: string; servers: str
         ))}
         {extra > 0 && (
           <span className="px-2 font-mono text-2xs text-muted-foreground/60">
-            +{extra} more
+            <Trans message={"+{value1} more"} values={{ value1: extra }} />
           </span>
         )}
       </div>
@@ -961,6 +1192,7 @@ function ServerMiniCard({
   busy: boolean;
   onImport: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <Card aria-disabled={imported} className={`gap-0 ${imported ? "opacity-70" : ""}`}>
       <CardContent className="flex flex-col gap-2 p-3">
@@ -969,7 +1201,7 @@ function ServerMiniCard({
             <span className="truncate text-sm font-medium">{server.name}</span>
             {isPlugin && (
               <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                plugin
+                {t("plugin ")}
               </span>
             )}
           </div>
@@ -983,8 +1215,10 @@ function ServerMiniCard({
         <div className="flex justify-end">
           {imported ? (
             <span className="inline-flex items-center gap-1 text-xs text-success">
-              <Check className="size-3" />
-              in Toolport
+              <Trans
+                message={"{value1}in Toolport"}
+                values={{ value1: <Check className="size-3" /> }}
+              />
             </span>
           ) : (
             <Button
@@ -994,8 +1228,10 @@ function ServerMiniCard({
               onClick={onImport}
               disabled={busy}
             >
-              <Download className="size-3" />
-              Import
+              <Trans
+                message={"{value1}Import"}
+                values={{ value1: <Download className="size-3" /> }}
+              />
             </Button>
           )}
         </div>

@@ -52,11 +52,14 @@ const savingsSummary: SavingsSummary = {
 };
 const calls: Record<string, number> = {};
 const missing: string[] = [];
-Object.assign(window, { toolportFixture: { calls, missing } });
+const writes: Array<{ command: string; args: unknown }> = [];
+const vaulted = new Set<string>();
+const auth = new Set<string>();
+Object.assign(window, { toolportFixture: { calls, missing, writes } });
 localStorage.setItem("toolport.onboarded", "1");
 
 mockIPC(
-  (command) => {
+  (command, args) => {
     calls[command] = (calls[command] ?? 0) + 1;
     switch (command) {
       case "get_registry":
@@ -90,9 +93,35 @@ mockIPC(
         return false;
       case "take_pending_shared":
       case "take_registry_recovery_notice":
-      case "team_pair_state":
       case "plugin:updater|check":
         return null;
+      case "team_pair_state":
+        return new URLSearchParams(location.search).has("pairing")
+          ? { state: "pending", check: "fixture-check", message: null }
+          : null;
+      case "secret_status": {
+        const request = args as { serverId: string; keys: string[] };
+        return request.keys.map((key) => [
+          key,
+          vaulted.has(`${request.serverId}/${key}`),
+        ]);
+      }
+      case "set_secret": {
+        const request = args as { serverId: string; key: string };
+        writes.push({ command, args });
+        vaulted.add(`${request.serverId}/${request.key}`);
+        return registry;
+      }
+      case "has_auth_token":
+        return auth.has((args as { serverId: string }).serverId);
+      case "has_client_secret":
+        return false;
+      case "set_auth_token":
+        writes.push({ command, args });
+        auth.add((args as { serverId: string }).serverId);
+        return null;
+      case "probe_auth":
+        return { kind: "token", vendor: null, tokenUrl: null, instructions: null };
       case "savings_summary":
         return savingsSummary;
       case "plugin:app|version":
@@ -101,6 +130,17 @@ mockIPC(
         return auditRows;
       case "audit_stats":
         return { total: 200, errors: 0, errorRate: 0, servers: [] };
+      case "http_bridge_status":
+        return {
+          running: true,
+          port: 9123,
+          url: "http://127.0.0.1:9123/mcp",
+          token: "fixture-only-token",
+        };
+      case "is_launch_at_login_enabled":
+        return false;
+      case "clients_needing_restart":
+      case "list_allowed_tools":
       case "list_quarantined":
       case "list_pending_approvals":
       case "list_routine_suggestions":
@@ -156,6 +196,17 @@ if (new URLSearchParams(location.search).has("logos")) {
         </section>
       ))}
     </main>,
+  );
+} else if (new URLSearchParams(location.search).has("localization-controls")) {
+  const { LocalizationControls } = await import("./localization-controls");
+  const { LanguageProvider } = await import("@/lib/i18n");
+  const { ThemeProvider } = await import("@/lib/theme");
+  createRoot(document.getElementById("root")!).render(
+    <LanguageProvider>
+      <ThemeProvider>
+        <LocalizationControls server={servers[0]} />
+      </ThemeProvider>
+    </LanguageProvider>,
   );
 } else {
   await import("../main");

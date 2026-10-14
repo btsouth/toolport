@@ -1,3 +1,4 @@
+import { useI18n, translate } from "@/lib/i18n";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, Clock, Eye, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -49,6 +50,7 @@ const LIVE_TICK_MS = 3000;
  * or a profile edited by hand - would still be reported here as "Recording".
  */
 export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
+  const { t } = useI18n();
   const [data, setData] = useState<HooksViewData | null>(null);
   const [recent, setRecent] = useState<HookEvent[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -222,7 +224,7 @@ export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
   }
 
   if (loading) {
-    return <p className="text-sm text-muted-foreground">Loading…</p>;
+    return <p className="text-sm text-muted-foreground">{t("Loading…")}</p>;
   }
   if (!data) {
     // A dead end is worse than the failure: without a way to look again, the only recovery is
@@ -231,8 +233,10 @@ export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
     return (
       <div className="flex flex-col gap-3">
         <Callout variant="danger" role="alert">
-          <strong className="font-medium">Agent activity could not be read.</strong>{" "}
-          {error ?? "Unknown error."}
+          <strong className="font-medium">
+            {t("Agent activity could not be read.")}
+          </strong>{" "}
+          {error ?? t("Unknown error.")}
         </Callout>
         <Button
           size="sm"
@@ -241,8 +245,7 @@ export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
           disabled={busy}
           onClick={() => void load()}
         >
-          <RefreshCw className="size-3.5" />
-          Try again
+          <RefreshCw className="size-3.5" /> {t("Try again")}{" "}
         </Button>
       </div>
     );
@@ -262,7 +265,7 @@ export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
     <div className="grid gap-4">
       {error && (
         <Callout variant="danger" role="alert">
-          <strong className="font-medium">That did not work.</strong> {error}
+          <strong className="font-medium">{t("That did not work.")}</strong> {error}
         </Callout>
       )}
 
@@ -276,7 +279,7 @@ export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
             // NEXT, and letting the toggle write behind it would leave the user reading a
             // prediction of something that already happened.
             disabled={busy || preview !== null || (!data.enabled && !canInstall)}
-            aria-label="Record what my agents do"
+            aria-label={t("Record what my agents do")}
             onChange={(e) => {
               // Read the new value now, before the await: React re-renders this controlled input
               // back to `data.enabled` while the call is in flight, so a lazy read inside the
@@ -286,11 +289,12 @@ export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
             }}
           />
           <span className="min-w-0">
-            <span className="text-sm font-medium">Record what my agents do</span>
+            <span className="text-sm font-medium">{t("Record what my agents do")}</span>
             <span className="mt-1 block text-xs text-muted-foreground">
-              Claude Code runs a small Toolport recorder when a session starts, after each
-              tool it uses, and when the session ends. You get one line per event: which
-              tool, in which folder, in which session.
+              {" "}
+              {t(
+                "Claude Code runs a small Toolport recorder when a session starts, after each tool it uses, and when the session ends. You get one line per event: which tool, in which folder, in which session.",
+              )}{" "}
             </span>
           </span>
         </label>
@@ -300,87 +304,107 @@ export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
             <Check className="mt-0.5 size-3.5 shrink-0 text-success" />
             <span>
               <strong className="font-medium text-foreground">
-                It cannot stop your agent.
+                {" "}
+                {t("It cannot stop your agent.")}{" "}
               </strong>{" "}
-              The recorder is not attached to the step that can refuse a tool call, so
-              nothing it does can block your work.
+              {t(
+                "The recorder is not attached to the step that can refuse a tool call, so nothing it does can block your work.",
+              )}{" "}
             </span>
           </li>
           <li className="flex items-start gap-2">
             <Check className="mt-0.5 size-3.5 shrink-0 text-success" />
             <span>
               <strong className="font-medium text-foreground">
-                It does not read your work.
+                {" "}
+                {t("It does not read your work.")}{" "}
               </strong>{" "}
-              Commands, file contents and tool output are dropped. A row keeps the tool
-              name, the folder, the session, and a fingerprint that cannot be turned back
-              into the input.
+              {t(
+                "Commands, file contents and tool output are dropped. A row keeps the tool name, the folder, the session, and a fingerprint that cannot be turned back into the input.",
+              )}{" "}
             </span>
           </li>
           <li className="flex items-start gap-2">
             <Check className="mt-0.5 size-3.5 shrink-0 text-success" />
             <span>
               <strong className="font-medium text-foreground">
-                It stays on this machine.
+                {" "}
+                {t("It stays on this machine.")}{" "}
               </strong>{" "}
-              Rows are appended to a local file. Turning this off removes the recorder
-              from every file Toolport wrote.
+              {t(
+                "Rows are appended to a local file. Turning this off removes the recorder from every file Toolport wrote.",
+              )}{" "}
             </span>
           </li>
         </ul>
 
         {!canInstall && !data.enabled && (
           <p className="mt-3 text-xs text-warning">
-            No gateway binary has been published yet, so there is nothing to install.
-            Connect a client first, then come back.
+            {" "}
+            {t(
+              "No gateway binary has been published yet, so there is nothing to install. Connect a client first, then come back.",
+            )}{" "}
           </p>
         )}
       </div>
 
       <div className="rounded-xl border bg-card p-5">
         <div className="mb-1 flex items-center justify-between gap-3">
-          <h2 className="text-sm font-medium">Claude Code profiles</h2>
+          <h2 className="text-sm font-medium">{t("Claude Code profiles")}</h2>
           <span className="flex shrink-0 items-center gap-2">
             <button
               type="button"
               disabled={busy || !canInstall}
               title={
                 canInstall
-                  ? "See exactly what would be written"
-                  : "No gateway binary has been published yet"
+                  ? t("See exactly what would be written")
+                  : t("No gateway binary has been published yet")
               }
               onClick={() => void openPreview()}
               className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
             >
-              <Eye className="size-3.5" />
-              Preview
+              <Eye className="size-3.5" /> {t("Preview")}{" "}
             </button>
             <button
               type="button"
               disabled={busy}
-              title="Re-read the profiles on disk"
+              title={t("Re-read the profiles on disk")}
               onClick={() => void reload()}
               className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
             >
-              <RefreshCw className={`size-3.5 ${busy ? "animate-spin" : ""}`} />
-              Refresh
+              <RefreshCw className={`size-3.5 ${busy ? "animate-spin" : ""}`} />{" "}
+              {t("Refresh")}{" "}
             </button>
           </span>
         </div>
         <p className="mb-3 text-xs text-muted-foreground">
           {profiles.length === 0
-            ? "No Claude Code profile was found on this machine."
+            ? t("No Claude Code profile was found on this machine.")
             : readable.length === 0
-              ? `No profile could be read, so whether ${
-                  profiles.length === 1 ? "it carries" : "they carry"
-                } the recorder is unknown.`
-              : `${installed} of ${readable.length} carry the recorder. A machine can have more than one profile, and each needs it separately.${
-                  broken > 0
-                    ? ` ${broken} more could not be read and ${
-                        broken === 1 ? "is" : "are"
-                      } not counted.`
-                    : ""
-                }`}
+              ? profiles.length === 1
+                ? t(
+                    "No profile could be read, so whether it carries the recorder is unknown.",
+                  )
+                : t(
+                    "No profile could be read, so whether they carry the recorder is unknown.",
+                  )
+              : t(
+                  "{value1} of {value2} carry the recorder. A machine can have more than one profile, and each needs it separately.{value3}",
+                  {
+                    value1: installed,
+                    value2: readable.length,
+                    value3:
+                      broken > 0
+                        ? broken === 1
+                          ? t(" {count} more could not be read and is not counted.", {
+                              count: broken,
+                            })
+                          : t(" {count} more could not be read and are not counted.", {
+                              count: broken,
+                            })
+                        : "",
+                  },
+                )}
         </p>
 
         {profiles.length > 0 && (
@@ -401,33 +425,46 @@ export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
 
         {broken > 0 && (
           <p className="mt-3 text-xs text-warning">
-            {broken === 1 ? "One profile" : `${broken} profiles`} could not be read or
-            written, so
-            {broken === 1 ? " it was" : " they were"} left untouched. Nothing was
-            overwritten.
+            {broken === 1 ? t("One profile") : t("{value1} profiles", { value1: broken })}{" "}
+            {t("could not be read or written, so")}{" "}
+            {broken === 1 ? t(" it was") : t(" they were")}{" "}
+            {t("left untouched. Nothing was overwritten.")}{" "}
           </p>
         )}
       </div>
 
       <div className="rounded-xl border bg-card p-5">
-        <h2 className="mb-1 text-sm font-medium">Recorded so far</h2>
+        <h2 className="mb-1 text-sm font-medium">{t("Recorded so far")}</h2>
         <p className="text-xs text-muted-foreground">
           {recent === null ? (
             // Unreadable is NOT the same as empty. Saying "no activity" for a log we failed to
             // read would be a comfortable lie about whether anything is being recorded.
             <span className="text-warning">
-              The activity log could not be read, so this count is unknown.
+              {" "}
+              {t("The activity log could not be read, so this count is unknown.")}{" "}
             </span>
           ) : recent.length === 0 ? (
             data.enabled ? (
-              "Nothing yet. Start a Claude Code session and events will appear here."
+              t("Nothing yet. Start a Claude Code session and events will appear here.")
             ) : (
-              "Nothing recorded. Turn the recorder on above to start."
+              t("Nothing recorded. Turn the recorder on above to start.")
             )
+          ) : recent.length === 1 ? (
+            t("{value1} recent event{value3}", {
+              value1:
+                Number(recent.length) === RECENT_SAMPLE
+                  ? `${RECENT_SAMPLE}+`
+                  : recent.length,
+              value3: lastToolLabel(recent),
+            })
           ) : (
-            `${recent.length === RECENT_SAMPLE ? `${RECENT_SAMPLE}+` : recent.length} recent ${
-              recent.length === 1 ? "event" : "events"
-            }${lastToolLabel(recent)}`
+            t("{value1} recent events{value3}", {
+              value1:
+                Number(recent.length) === RECENT_SAMPLE
+                  ? `${RECENT_SAMPLE}+`
+                  : recent.length,
+              value3: lastToolLabel(recent),
+            })
           )}
         </p>
 
@@ -442,15 +479,13 @@ export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
                 className="flex items-center gap-3 text-xs"
               >
                 <span className="min-w-0 flex-1 truncate font-mono text-foreground">
-                  {r.tool ?? r.event ?? "unknown"}
+                  {r.tool ?? r.event ?? t("Unknown")}
                   {r.event === "guard" && r.decision && (
                     // A guard row (Cursor hook): what the hook answered, and in observe mode
                     // what it would have answered, so the user can read the policy's effect
                     // before letting it act.
                     <span
                       className={`ml-2 rounded px-1 text-[10px] ${
-                        // In observe mode the answer is always allow; colour by what the
-                        // rules WOULD have done, which is the thing worth seeing.
                         (r.mode === "observe" ? (r.wouldBe ?? "allow") : r.decision) ===
                         "deny"
                           ? "bg-destructive/15 text-destructive"
@@ -460,11 +495,17 @@ export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
                             ? "bg-warning/15 text-warning"
                             : "bg-muted text-muted-foreground"
                       }`}
-                      title={r.rule ? `rule ${r.rule}` : undefined}
+                      title={r.rule ? t("rule {value1}", { value1: r.rule }) : undefined}
                     >
                       {r.mode === "observe" && r.wouldBe && r.wouldBe !== "allow"
-                        ? `would ${r.wouldBe}`
-                        : r.decision}
+                        ? r.wouldBe === "deny"
+                          ? t("Would deny")
+                          : t("Would ask")
+                        : r.decision === "deny"
+                          ? t("Denied")
+                          : r.decision === "ask"
+                            ? t("Ask first")
+                            : t("Allowed")}
                     </span>
                   )}
                 </span>
@@ -476,7 +517,11 @@ export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
                 </span>
                 <span
                   className="shrink-0 font-mono text-muted-foreground/70"
-                  title={r.sessionId ? `Session ${r.sessionId}` : "No session recorded"}
+                  title={
+                    r.sessionId
+                      ? t("Session {value1}", { value1: r.sessionId })
+                      : t("No session recorded")
+                  }
                 >
                   {sessionLabel(r.sessionId) ?? "—"}
                 </span>
@@ -494,7 +539,7 @@ export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
 /** The most recent named tool, when there is one, as a "you can see it working" signal. */
 function lastToolLabel(recent: HookEvent[]): string {
   const tool = recent.find((r) => typeof r.tool === "string" && r.tool.length > 0)?.tool;
-  return tool ? `, most recently ${tool}.` : ".";
+  return tool ? translate(", most recently {value1}.", { value1: tool }) : ".";
 }
 
 /** Last path segment, so a row reads "toolport" rather than a full home directory. */
@@ -523,25 +568,24 @@ function ProfileBadge({
   profile: HookProfileStatus;
   enabled: boolean;
 }) {
+  const { t } = useI18n();
   if (profile.error) {
     return (
       <span
         title={profile.error}
         className="flex shrink-0 items-center gap-1 text-xs text-destructive"
       >
-        <AlertTriangle className="size-3.5" />
-        Could not read
+        <AlertTriangle className="size-3.5" /> {t("Could not read")}{" "}
       </span>
     );
   }
   if (profile.installed) {
     return (
       <span
-        title="This profile runs the recorder."
+        title={t("This profile runs the recorder.")}
         className="flex shrink-0 items-center gap-1 text-xs text-success"
       >
-        <Check className="size-3.5" />
-        Recording
+        <Check className="size-3.5" /> {t("Recording")}{" "}
       </span>
     );
   }
@@ -549,15 +593,15 @@ function ProfileBadge({
     <span
       title={
         enabled
-          ? "The recorder is on but has not been written to this profile yet."
-          : "Nothing is written to this profile."
+          ? t("The recorder is on but has not been written to this profile yet.")
+          : t("Nothing is written to this profile.")
       }
       className={`flex shrink-0 items-center gap-1 text-xs ${
         enabled ? "text-warning" : "text-muted-foreground"
       }`}
     >
       <Clock className="size-3.5" />
-      {enabled ? "Not written yet" : "Off"}
+      {enabled ? t("Not written yet") : t("Off")}
     </span>
   );
 }
@@ -576,16 +620,18 @@ function PreviewDialog({
   previews: HooksPreview[] | null;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <Dialog open={previews !== null} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="sm:max-w-3xl">
         <DialogHeader>
-          <DialogTitle>What would be written</DialogTitle>
+          <DialogTitle>{t("What would be written")}</DialogTitle>
         </DialogHeader>
         <div className="grid gap-4 overflow-auto">
           {previews?.length === 0 && (
             <p className="text-sm text-muted-foreground">
-              No Claude Code profile was found, so there is nothing to write.
+              {" "}
+              {t("No Claude Code profile was found, so there is nothing to write.")}{" "}
             </p>
           )}
           {previews?.map((p) => {
@@ -600,7 +646,8 @@ function PreviewDialog({
                   // not. Say what actually happened, and leave the healthy profiles above
                   // and below it alone.
                   <p className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">
-                    No preview for this profile: {p.error}
+                    {" "}
+                    {t("No preview for this profile:")} {p.error}
                   </p>
                 ) : (
                   <>
@@ -620,7 +667,8 @@ function PreviewDialog({
                     </pre>
                     {p.before === "" && (
                       <p className="text-xs text-muted-foreground">
-                        This file does not exist yet and would be created.
+                        {" "}
+                        {t("This file does not exist yet and would be created.")}{" "}
                       </p>
                     )}
                   </>
@@ -630,8 +678,10 @@ function PreviewDialog({
           })}
         </div>
         <DialogFooter className="text-xs text-muted-foreground sm:justify-start">
-          Nothing has been written. Everything outside the highlighted block, including
-          your comments, is left exactly as it is.
+          {" "}
+          {t(
+            "Nothing has been written. Everything outside the highlighted block, including your comments, is left exactly as it is.",
+          )}{" "}
         </DialogFooter>
       </DialogContent>
     </Dialog>

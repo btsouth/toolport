@@ -1,4 +1,5 @@
 import type { View } from "./types";
+import { translate } from "./i18n";
 
 /** Views in the order their number key selects them (SBS-143). */
 export const SHORTCUT_VIEWS: View[] = [
@@ -104,11 +105,11 @@ export interface ShortcutHelpRow {
 export function shortcutHelp(isMac: boolean): ShortcutHelpRow[] {
   const mod = isMac ? "⌘" : "Ctrl";
   return [
-    { keys: `${mod}1 – ${mod}7`, what: "Switch view" },
-    { keys: `/ or ${mod}F`, what: "Focus the server search" },
-    { keys: `${mod}N`, what: "Add a server" },
-    { keys: `${mod}R`, what: "Refresh servers and clients" },
-    { keys: "?", what: "Show this list" },
-    { keys: "Esc", what: "Close this list" },
+    { keys: `${mod}1 – ${mod}7`, what: translate("Switch view") },
+    { keys: `/ ${translate("or")} ${mod}F`, what: translate("Focus the server search") },
+    { keys: `${mod}N`, what: translate("Add a server") },
+    { keys: `${mod}R`, what: translate("Refresh servers and clients") },
+    { keys: "?", what: translate("Show this list") },
+    { keys: "Esc", what: translate("Close this list") },
   ];
 }

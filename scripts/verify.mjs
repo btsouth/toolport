@@ -14,7 +14,10 @@ for (const arg of args) {
 }
 if (args.size > 1)
   throw new Error("Choose --frontend or --headless, or omit both for all checks");
-const output = path.join(root, ".verify", `run-${Date.now()}-${process.pid}`);
+const output = path.join(
+  process.env.TOOLPORT_VERIFY_DIR || path.join(root, ".verify"),
+  `run-${Date.now()}-${process.pid}`,
+);
 await mkdir(output, { recursive: true });
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 const steps = [];
@@ -23,10 +26,12 @@ if (!args.has("--headless")) {
   for (const name of [
     "format:check",
     "lint",
+    "check:locales",
     "build",
     "test",
     "bench:bundle",
     "smoke:browser",
+    "smoke:localization",
   ])
     runNpm(name);
 }

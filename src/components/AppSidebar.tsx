@@ -1,3 +1,4 @@
+import { useI18n, translate } from "@/lib/i18n";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -52,19 +53,21 @@ const ICON_BTN = `rounded text-muted-foreground transition hover:text-foreground
 const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 function updateProgressLabel(progress: UpdateProgress | null): string {
-  if (!progress) return "Preparing update…";
-  if (progress.phase === "installing") return "Installing…";
+  if (!progress) return translate("Preparing update…");
+  if (progress.phase === "installing") return translate("Installing…");
   if (progress.totalBytes && progress.totalBytes > 0) {
     const percent = Math.min(
       100,
       Math.round((progress.downloadedBytes / progress.totalBytes) * 100),
     );
-    return `Downloading ${percent}%`;
+    return translate("Downloading {value1}%", { value1: percent });
   }
   const megabytes = progress.downloadedBytes / (1024 * 1024);
   return megabytes > 0
-    ? `Downloading ${megabytes.toFixed(megabytes >= 10 ? 0 : 1)} MB…`
-    : "Downloading…";
+    ? translate("Downloading {value1} MB…", {
+        value1: megabytes.toFixed(megabytes >= 10 ? 0 : 1),
+      })
+    : translate("Downloading…");
 }
 
 /** Footer showing the running version, and an in-app update button when a newer
@@ -79,6 +82,7 @@ function VersionFooter({
   onImport: (r: Registry) => void;
   onReplay: () => void;
 }) {
+  const { t } = useI18n();
   const [version, setVersion] = useState("");
   const [update, setUpdate] = useState<Update | null>(null);
   const [systemPackage, setSystemPackage] = useState<SystemPackage | null>(null);
@@ -119,7 +123,7 @@ function VersionFooter({
       return;
     }
     if (installingRef.current) {
-      if (announce) toast.info("An update is already in progress");
+      if (announce) toast.info(translate("An update is already in progress"));
       return;
     }
     if (
@@ -156,10 +160,10 @@ function VersionFooter({
         if (shouldAnnounce) setShowNotes(true);
       } else if (result.kind === "current") {
         setUpdate(null);
-        if (shouldAnnounce) toast.success("You're on the latest version");
+        if (shouldAnnounce) toast.success(translate("You're on the latest version"));
       } else if (shouldAnnounce) {
-        toastError("Couldn't check for updates", {
-          description: "You may be offline. Try again in a moment.",
+        toastError(translate("Couldn't check for updates"), {
+          description: translate("You may be offline. Try again in a moment."),
         });
       }
     } finally {
@@ -196,9 +200,10 @@ function VersionFooter({
     installingRef.current = true;
     setInstalling(true);
     setInstallProgress(null);
-    toast.info(`Updating to v${update.version}…`, {
-      description:
+    toast.info(translate("Updating to v{value1}…", { value1: update.version }), {
+      description: translate(
         "Downloading first; MCP clients stay connected until the installer is ready to replace files.",
+      ),
     });
     try {
       await installUpdate(update, (progress) => {
@@ -216,11 +221,12 @@ function VersionFooter({
         typeof e.recoveryAdvice === "string"
           ? e.recoveryAdvice
           : null;
-      toastError(`Update failed: ${message}`, {
+      toastError(translate("Update failed: {value1}", { value1: message }), {
         description:
-          recoveryAdvice || "You can download it manually from the releases page.",
+          recoveryAdvice ||
+          translate("You can download it manually from the releases page."),
         action: {
-          label: "Open",
+          label: translate("Open"),
           onClick: () =>
             openExternal("https://github.com/btsouth/toolport/releases/latest"),
         },
@@ -245,17 +251,19 @@ function VersionFooter({
             <ArrowUpCircle className="size-3.5 shrink-0" />
           )}
           <span className="truncate">
-            {installing ? progressLabel : `Update to v${update.version}`}
+            {installing
+              ? progressLabel
+              : t("Update to v{value1}", { value1: update.version })}
           </span>
         </button>
       ) : (
         <button
           onClick={manualCheck}
           disabled={checking}
-          title="Check for updates"
+          title={t("Check for updates")}
           className={`rounded text-muted-foreground transition hover:text-foreground disabled:opacity-70 ${FOCUS_RING}`}
         >
-          {checking ? "Checking…" : `Toolport v${version}`}
+          {checking ? t("Checking…") : `Toolport v${version}`}
         </button>
       )}
 
@@ -273,8 +281,8 @@ function VersionFooter({
           onImported={onImport}
           trigger={
             <button
-              title="Share or import a setup"
-              aria-label="Share setup"
+              title={t("Share or import a setup")}
+              aria-label={t("Share setup")}
               className={ICON_BTN}
             >
               <Share2 className="size-3.5" />
@@ -283,18 +291,18 @@ function VersionFooter({
         />
         <button
           onClick={onReplay}
-          title="Run setup again"
-          aria-label="Run setup again"
+          title={t("Run setup again")}
+          aria-label={t("Run setup again")}
           className={ICON_BTN}
         >
           <Compass className="size-3.5" />
         </button>
         <button
           onClick={() =>
-            openDataDir().catch(() => toastError("Couldn't open data folder"))
+            openDataDir().catch(() => toastError(t("Couldn't open data folder")))
           }
-          title="Open data folder (config, logs)"
-          aria-label="Open data folder"
+          title={t("Open data folder (config, logs)")}
+          aria-label={t("Open data folder")}
           className={ICON_BTN}
         >
           <FolderOpen className="size-3.5" />
@@ -303,13 +311,13 @@ function VersionFooter({
           onClick={async () => {
             try {
               await navigator.clipboard.writeText(await gatherDiagnostics());
-              toast.success("Diagnostics copied, paste them into your bug report");
+              toast.success(t("Diagnostics copied, paste them into your bug report"));
             } catch {
-              toastError("Couldn't copy diagnostics");
+              toastError(t("Couldn't copy diagnostics"));
             }
           }}
-          title="Copy diagnostics for a bug report"
-          aria-label="Copy diagnostics"
+          title={t("Copy diagnostics for a bug report")}
+          aria-label={t("Copy diagnostics")}
           className={ICON_BTN}
         >
           <ClipboardList className="size-3.5" />
@@ -338,12 +346,16 @@ function UpdateNotes({
   progressLabel: string;
   onInstall: () => void;
 }) {
+  const { t } = useI18n();
   if (!update) return null;
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Update available: v{update.version}</DialogTitle>
+          <DialogTitle>
+            {t("Update available: v")}
+            {update.version}
+          </DialogTitle>
         </DialogHeader>
         <div className="flex flex-col gap-3">
           {update.body ? (
@@ -352,19 +364,22 @@ function UpdateNotes({
             </div>
           ) : (
             <p className="text-sm text-muted-foreground">
-              A new version is ready to install.
+              {" "}
+              {t("A new version is ready to install.")}{" "}
             </p>
           )}
           {systemPackage && (
             <p className="text-sm text-muted-foreground">
-              This copy was installed from a .{systemPackage} package, so Toolport can't
-              replace it itself. Download the new .{systemPackage} and install it the same
-              way.
+              {" "}
+              {t("This copy was installed from a .")}
+              {systemPackage}{" "}
+              {t("package, so Toolport can't replace it itself. Download the new .")}
+              {systemPackage} {t("and install it the same way.")}{" "}
             </p>
           )}
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={() => onOpenChange(false)}>
-              {installing ? "Hide" : "Later"}
+              {installing ? t("Hide") : t("Later")}
             </Button>
             {systemPackage ? (
               <Button
@@ -373,7 +388,7 @@ function UpdateNotes({
                   void openExternal(releasePageUrl(update.version));
                 }}
               >
-                <ExternalLink className="size-4" /> Open download page
+                <ExternalLink className="size-4" /> {t("Open download page")}{" "}
               </Button>
             ) : (
               <Button onClick={onInstall} disabled={installing}>
@@ -383,7 +398,7 @@ function UpdateNotes({
                   </>
                 ) : (
                   <>
-                    <ArrowUpCircle className="size-4" /> Install and restart
+                    <ArrowUpCircle className="size-4" /> {t("Install and restart")}{" "}
                   </>
                 )}
               </Button>
@@ -410,6 +425,7 @@ export function AppSidebar({
   onSelectView,
   onReplayOnboarding,
 }: Props) {
+  const { t } = useI18n();
   const [savings, setSavings] = useState<SavingsSummary | null>(null);
   const [savingsStale, setSavingsStale] = useState(false);
   // `null` means "no confirmed count": the first poll hasn't answered yet. It
@@ -494,14 +510,18 @@ export function AppSidebar({
       <Icon
         className={`size-4 shrink-0 ${active ? "text-primary" : "text-muted-foreground"}`}
       />
-      <span>{label}</span>
+      <span>{t(label)}</span>
       {badge !== undefined && badge !== null && badge > 0 && (
         <span
           className="ml-auto inline-flex shrink-0 items-center rounded-full bg-warning/15 px-1.5 text-[10px] font-medium text-warning"
-          aria-label={`${badge} tool${badge === 1 ? "" : "s"} blocked`}
+          aria-label={
+            badge === 1
+              ? t("{value1} tool blocked", { value1: badge })
+              : t("{value1} tools blocked", { value1: badge })
+          }
           title={
             stale
-              ? "Could not reach the gateway — quarantine count may be stale"
+              ? t("Could not reach the gateway — quarantine count may be stale")
               : undefined
           }
         >
@@ -511,8 +531,8 @@ export function AppSidebar({
       {badge === null && stale && (
         <span
           className="ml-auto inline-flex shrink-0 items-center rounded-full bg-warning/15 px-1.5 text-[10px] font-medium text-warning"
-          aria-label="Quarantine status unknown"
-          title="Could not reach the gateway — quarantine status unknown"
+          aria-label={t("Quarantine status unknown")}
+          title={t("Could not reach the gateway — quarantine status unknown")}
         >
           ?
         </span>
@@ -549,7 +569,7 @@ export function AppSidebar({
         </svg>
         <div className="leading-tight">
           <div className="font-semibold tracking-tight">Toolport</div>
-          <div className="text-xs text-muted-foreground">MCP control center</div>
+          <div className="text-xs text-muted-foreground">{t("MCP control center")}</div>
         </div>
       </div>
 
@@ -557,41 +577,42 @@ export function AppSidebar({
         {registry && (
           <div className="px-3 pb-2">
             <div className="px-2.5 pb-1.5 text-xs font-medium tracking-wide text-muted-foreground uppercase">
-              Profile
+              {" "}
+              {t("Profile")}{" "}
             </div>
             <ProfileBar registry={registry} onChange={onRegistryChange} />
           </div>
         )}
 
-        <nav aria-label="Views" className="flex flex-col gap-0.5 px-3 pt-2">
-          {navItem(Layers, "All servers", view === "servers", () =>
+        <nav aria-label={t("Views")} className="flex flex-col gap-0.5 px-3 pt-2">
+          {navItem(Layers, t("All servers"), view === "servers", () =>
             onSelectView("servers"),
           )}
-          {navItem(MonitorCog, "Clients", view === "clients", () =>
+          {navItem(MonitorCog, t("Clients"), view === "clients", () =>
             onSelectView("clients"),
           )}
-          {navItem(Store, "Browse catalog", view === "catalog", () =>
+          {navItem(Store, t("Browse catalog"), view === "catalog", () =>
             onSelectView("catalog"),
           )}
-          {navItem(FlaskConical, "Playground", view === "playground", () =>
+          {navItem(FlaskConical, t("Playground"), view === "playground", () =>
             onSelectView("playground"),
           )}
-          {navItem(ScrollText, "Activity", view === "activity", () =>
+          {navItem(ScrollText, t("Activity"), view === "activity", () =>
             onSelectView("activity"),
           )}
-          {navItem(FileText, "Agent rules", view === "rules", () =>
+          {navItem(FileText, t("Agent rules"), view === "rules", () =>
             onSelectView("rules"),
           )}
-          {navItem(Activity, "Agent activity", view === "hooks", () =>
+          {navItem(Activity, t("Agent activity"), view === "hooks", () =>
             onSelectView("hooks"),
           )}
-          {navItem(ShieldCheck, "Agent permissions", view === "permissions", () =>
+          {navItem(ShieldCheck, t("Agent permissions"), view === "permissions", () =>
             onSelectView("permissions"),
           )}
-          {navItem(Users, "Teams", view === "teams", () => onSelectView("teams"))}
+          {navItem(Users, t("Teams"), view === "teams", () => onSelectView("teams"))}
           {navItem(
             Settings,
-            "Settings",
+            t("Settings"),
             view === "settings",
             () => onSelectView("settings"),
             quarantinedCount,
@@ -603,14 +624,22 @@ export function AppSidebar({
           <button
             onClick={() => onSelectView("activity")}
             className="mx-3 mt-2 flex items-center gap-2 rounded-lg border border-success/30 bg-success/5 px-3 py-2 text-left text-xs transition-colors hover:bg-success/10"
-            title={`${savingsStale ? "Catalog telemetry unavailable; showing the last loaded estimate. " : ""}Tool-definition tokens Toolport kept out of your agent's context, estimated from their serialized size. Actual model usage depends on the client and caching. Click for the breakdown.`}
+            title={t(
+              "{value1}Tool-definition tokens Toolport kept out of your agent's context, estimated from their serialized size. Actual model usage depends on the client and caching. Click for the breakdown.",
+              {
+                value1: savingsStale
+                  ? t("Catalog telemetry unavailable; showing the last loaded estimate. ")
+                  : "",
+              },
+            )}
           >
             <Zap className="size-3.5 shrink-0 text-success" />
             <span className="text-muted-foreground">
               <span className="font-semibold text-foreground">
                 ≈{fmtTokens(savings.tokensSaved)}
               </span>{" "}
-              tokens saved{savingsStale ? " (stale)" : ""}
+              {t("tokens saved")}
+              {savingsStale ? t(" (stale)") : ""}
             </span>
           </button>
         )}

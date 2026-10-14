@@ -1,3 +1,4 @@
+import { useI18n, Trans } from "@/lib/i18n";
 import { useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
@@ -24,6 +25,7 @@ interface Props {
 
 /** Setup values are member-local even when the server definition comes from a team. */
 export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [values, setValues] = useState<Record<string, string>>({});
@@ -56,11 +58,11 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
         onSaved(result);
         onChanged?.();
       }
-      toast.success(result ? "Launch setup saved" : "Launch setup unchanged");
+      toast.success(result ? t("Launch setup saved") : t("Launch setup unchanged"));
       setOpen(false);
     } catch (error) {
       if (result) onSaved(result);
-      toastError(`Could not save launch setup: ${error}`);
+      toastError(t("Could not save launch setup: {value1}", { value1: String(error) }));
     } finally {
       setBusy(false);
     }
@@ -71,7 +73,12 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
       <DialogTrigger asChild>{trigger}</DialogTrigger>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Launch setup for {server.name}</DialogTitle>
+          <DialogTitle>
+            <Trans
+              message={"Launch setup for {value1}"}
+              values={{ value1: server.name }}
+            />
+          </DialogTitle>
         </DialogHeader>
         <div className="flex flex-col gap-3 py-2">
           {inputs.map((input) => (
@@ -85,7 +92,7 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
                 type={input.secret ? "password" : "text"}
                 value={values[input.key] ?? ""}
                 placeholder={
-                  input.secret ? "Leave blank to keep any vaulted value" : input.label
+                  input.secret ? t("Leave blank to keep any vaulted value") : input.label
                 }
                 onChange={(event) =>
                   setValues((current) => ({
@@ -97,13 +104,14 @@ export function LaunchSetupDialog({ server, trigger, onSaved, onChanged }: Props
             </div>
           ))}
           <p className="text-xs text-muted-foreground">
-            Secret values stay in Toolport's vault. This server can be enabled after its
-            required setup and credentials are present.
+            {t(
+              "Secret values stay in Toolport's vault. This server can be enabled after its required setup and credentials are present. ",
+            )}
           </p>
         </div>
         <DialogFooter>
           <Button disabled={busy} onClick={save}>
-            {busy ? "Saving…" : "Save setup"}
+            {busy ? t("Saving…") : t("Save setup")}
           </Button>
         </DialogFooter>
       </DialogContent>

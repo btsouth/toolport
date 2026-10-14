@@ -1,3 +1,4 @@
+import { useI18n, Trans } from "@/lib/i18n";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
@@ -73,6 +74,7 @@ function ToolOverrideEditor({
   registry: Registry | null;
   onRegistryChange: (r: Registry) => void;
 }) {
+  const { t: tr } = useI18n();
   const current = registry?.toolOverrides?.[serverId]?.[tool.name];
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
@@ -96,7 +98,7 @@ function ToolOverrideEditor({
         await setToolOverride(serverId, tool.name, name || null, description || null),
       );
     } catch (e) {
-      toastError(`Couldn't save override: ${e}`);
+      toastError(tr("Couldn't save override: {value1}", { value1: String(e) }));
     } finally {
       setBusy(false);
     }
@@ -108,7 +110,7 @@ function ToolOverrideEditor({
       setName("");
       setDescription("");
     } catch (e) {
-      toastError(`Couldn't clear override: ${e}`);
+      toastError(tr("Couldn't clear override: {value1}", { value1: String(e) }));
     } finally {
       setBusy(false);
     }
@@ -124,11 +126,11 @@ function ToolOverrideEditor({
       >
         <Pencil className="size-3.5 shrink-0" />
         <span className="font-medium text-foreground/80">
-          Override how clients see this tool
+          {tr("Override how clients see this tool")}
         </span>
         {hasOverride && (
           <span className="rounded-full bg-info/15 px-1.5 py-0.5 text-[10px] font-medium text-info">
-            active
+            {tr("active")}
           </span>
         )}
         <ChevronRight
@@ -138,16 +140,27 @@ function ToolOverrideEditor({
       {open && (
         <div className="flex flex-col gap-2.5 border-t border-border/60 px-3 py-3">
           <p className="text-xs text-muted-foreground">
-            Rename the tool or replace its description as every client sees it, e.g. to
-            neutralize a misleading or injection-laden description. The call still runs
-            the original server tool.
+            {tr(
+              "Rename the tool or replace its description as every client sees it, e.g. to neutralize a misleading or injection-laden description. The call still runs the original server tool.",
+            )}
           </p>
           <label className="flex flex-col gap-1 text-xs">
             <span className="text-muted-foreground">
-              Name{" "}
-              <span className="text-muted-foreground/60">
-                (blank keeps <span className="font-mono">{tool.name}</span>)
-              </span>
+              <Trans
+                message="Name  {value1}"
+                values={{
+                  value1: (
+                    <span className="text-muted-foreground/60">
+                      <Trans
+                        message="(blank keeps {value1})"
+                        values={{
+                          value1: <span className="font-mono">{tool.name}</span>,
+                        }}
+                      />
+                    </span>
+                  ),
+                }}
+              />
             </span>
             <input
               value={name}
@@ -158,19 +171,19 @@ function ToolOverrideEditor({
           </label>
           <label className="flex flex-col gap-1 text-xs">
             <span className="text-muted-foreground">
-              Description (blank keeps the server's)
+              {tr("Description (blank keeps the server's)")}
             </span>
             <textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               rows={3}
-              placeholder={tool.description ?? "(server's description)"}
+              placeholder={tool.description ?? tr("(server's description)")}
               className="rounded-md border border-input bg-transparent px-2.5 py-1.5 text-xs shadow-sm focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
             />
           </label>
           <div className="flex gap-2">
             <Button size="sm" onClick={() => void save()} disabled={busy}>
-              Save override
+              {tr("Save override")}
             </Button>
             {hasOverride && (
               <Button
@@ -179,7 +192,7 @@ function ToolOverrideEditor({
                 onClick={() => void reset()}
                 disabled={busy}
               >
-                Reset to original
+                {tr("Reset to original")}
               </Button>
             )}
           </div>
@@ -236,6 +249,7 @@ interface FieldProps {
 
 /** One argument input, shaped by the property's JSON-schema type. */
 function ArgField({ name, schema, required, value, onChange }: FieldProps) {
+  const { t: tr } = useI18n();
   const t = primaryType(schema);
   const id = `arg-${name}`;
   const enumVals = schema.enum;
@@ -245,7 +259,7 @@ function ArgField({ name, schema, required, value, onChange }: FieldProps) {
     control = (
       <Select value={value === undefined ? "" : String(value)} onValueChange={onChange}>
         <SelectTrigger id={id} className="h-9">
-          <SelectValue placeholder="Select…" />
+          <SelectValue placeholder={tr("Select…")} />
         </SelectTrigger>
         <SelectContent>
           {enumVals.map((e) => (
@@ -282,7 +296,11 @@ function ArgField({ name, schema, required, value, onChange }: FieldProps) {
         type={t === "number" || t === "integer" ? "number" : "text"}
         value={value === undefined ? "" : String(value)}
         onChange={(e) => onChange(e.target.value)}
-        placeholder={schema.default != null ? `default: ${String(schema.default)}` : ""}
+        placeholder={
+          schema.default != null
+            ? tr("default: {value1}", { value1: String(schema.default) })
+            : ""
+        }
         className="h-9"
       />
     );
@@ -313,21 +331,23 @@ function looksLikeAuthError(message: string): boolean {
 }
 
 /** Inline "connecting…" line shared by the resource/prompt panels. */
-function Connecting({ label = "Connecting to server…" }: { label?: string }) {
+function Connecting({ label }: { label?: string }) {
+  const { t: tr } = useI18n();
   return (
     <div className="flex items-center gap-2 text-sm text-muted-foreground">
-      <Loader2 className="size-4 animate-spin" /> {label}
+      <Loader2 className="size-4 animate-spin" /> {label ?? tr("Connecting to server…")}
     </div>
   );
 }
 
 /** Copy-to-clipboard button with a brief confirmation, for raw result / JSON blocks. */
 function CopyButton({ text }: { text: string }) {
+  const { t: tr } = useI18n();
   const [copied, setCopied] = useState(false);
   return (
     <button
       type="button"
-      aria-label="Copy to clipboard"
+      aria-label={tr("Copy to clipboard")}
       onClick={async () => {
         try {
           await navigator.clipboard.writeText(text);
@@ -340,13 +360,14 @@ function CopyButton({ text }: { text: string }) {
       className="ml-auto inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
     >
       {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
-      {copied ? "Copied" : "Copy"}
+      {copied ? tr("Copied") : tr("Copy")}
     </button>
   );
 }
 
 /** A raw MCP result rendered as pretty JSON (or text), with a copy button. */
 function ResultBlock({ title, value }: { title: string; value: unknown }) {
+  useI18n();
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
   return (
     <div className="flex flex-col gap-2">
@@ -363,6 +384,7 @@ function ResultBlock({ title, value }: { title: string; value: unknown }) {
 
 /** Resources tab: list what the server advertises and read one on click. */
 function ResourcesPanel({ serverId }: { serverId: string }) {
+  const { t: tr } = useI18n();
   const [resources, setResources] = useState<McpResource[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -407,7 +429,7 @@ function ResourcesPanel({ serverId }: { serverId: string }) {
   if (!resources || resources.length === 0) {
     return (
       <p className="text-sm text-muted-foreground">
-        This server advertises no resources.
+        {tr("This server advertises no resources.")}
       </p>
     );
   }
@@ -416,7 +438,7 @@ function ResourcesPanel({ serverId }: { serverId: string }) {
     <div className="flex flex-col gap-4">
       <div className="flex flex-col gap-1.5">
         <Label className="text-xs text-muted-foreground">
-          Resources ({resources.length})
+          {tr("Resources ({value1})", { value1: resources.length })}
         </Label>
         <div className="flex flex-col divide-y rounded-lg border">
           {resources.map((r) => (
@@ -450,15 +472,16 @@ function ResourcesPanel({ serverId }: { serverId: string }) {
           ))}
         </div>
       </div>
-      {reading && <Connecting label="Reading resource…" />}
+      {reading && <Connecting label={tr("Reading resource…")} />}
       {readError && <Callout variant="danger">{readError}</Callout>}
-      {result != null && <ResultBlock title="Resource contents" value={result} />}
+      {result != null && <ResultBlock title={tr("Resource contents")} value={result} />}
     </div>
   );
 }
 
 /** Prompts tab: list prompts, fill any arguments, and render one. */
 function PromptsPanel({ serverId }: { serverId: string }) {
+  const { t: tr } = useI18n();
   const [prompts, setPrompts] = useState<McpPrompt[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -500,7 +523,9 @@ function PromptsPanel({ serverId }: { serverId: string }) {
       .map((a) => a.name);
     if (missing.length > 0) {
       setRunError(
-        `Fill in required argument${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}`,
+        missing.length === 1
+          ? tr("Fill in required argument: {value2}", { value2: missing.join(", ") })
+          : tr("Fill in required arguments: {value2}", { value2: missing.join(", ") }),
       );
       return;
     }
@@ -520,7 +545,9 @@ function PromptsPanel({ serverId }: { serverId: string }) {
   if (error) return <Callout variant="danger">{error}</Callout>;
   if (!prompts || prompts.length === 0) {
     return (
-      <p className="text-sm text-muted-foreground">This server advertises no prompts.</p>
+      <p className="text-sm text-muted-foreground">
+        {tr("This server advertises no prompts.")}
+      </p>
     );
   }
 
@@ -528,7 +555,7 @@ function PromptsPanel({ serverId }: { serverId: string }) {
     <div className="flex flex-col gap-4">
       <div className="flex flex-col gap-1.5">
         <Label className="text-xs text-muted-foreground">
-          Prompts ({prompts.length})
+          {tr("Prompts ({value1})", { value1: prompts.length })}
         </Label>
         <div className="flex flex-col divide-y rounded-lg border">
           {prompts.map((p) => (
@@ -558,7 +585,7 @@ function PromptsPanel({ serverId }: { serverId: string }) {
           )}
           {(prompt.arguments ?? []).length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              This prompt takes no arguments.
+              {tr("This prompt takes no arguments.")}
             </p>
           ) : (
             <div className="flex flex-col gap-4">
@@ -593,14 +620,14 @@ function PromptsPanel({ serverId }: { serverId: string }) {
               ) : (
                 <Play className="size-4" />
               )}
-              {running ? "Getting…" : "Get prompt"}
+              {running ? tr("Getting…") : tr("Get prompt")}
             </Button>
           </div>
         </div>
       )}
 
       {runError && <Callout variant="danger">{runError}</Callout>}
-      {result != null && <ResultBlock title="Prompt messages" value={result} />}
+      {result != null && <ResultBlock title={tr("Prompt messages")} value={result} />}
     </div>
   );
 }
@@ -611,6 +638,7 @@ interface PlaygroundProps {
 }
 
 export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) {
+  const { t: tr } = useI18n();
   const servers = registry?.servers ?? [];
   const denyDestructive = registry?.denyDestructive ?? false;
 
@@ -732,7 +760,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
     try {
       onRegistryChange(await setToolEnabled(serverId, toolName, enabled));
     } catch (e) {
-      toastError(`Couldn't update the tool: ${e}`);
+      toastError(tr("Couldn't update the tool: {value1}", { value1: String(e) }));
     } finally {
       setPolicyBusy(false);
     }
@@ -744,7 +772,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
     try {
       onRegistryChange(await setToolPinned(serverId, toolName, pinned));
     } catch (e) {
-      toastError(`Couldn't pin the tool: ${e}`);
+      toastError(tr("Couldn't pin the tool: {value1}", { value1: String(e) }));
     } finally {
       setPolicyBusy(false);
     }
@@ -771,11 +799,11 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
       try {
         const parsed = JSON.parse(rawJson || "{}");
         if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-          return { error: "Arguments must be a JSON object." };
+          return { error: tr("Arguments must be a JSON object.") };
         }
         return parsed as Record<string, unknown>;
       } catch (e) {
-        return { error: `Invalid JSON: ${String(e)}` };
+        return { error: tr("Invalid JSON: {value1}", { value1: String(e) }) };
       }
     }
     const out: Record<string, unknown> = {};
@@ -787,7 +815,10 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
     const missing = [...required].filter((k) => !(k in out));
     if (missing.length > 0) {
       return {
-        error: `Fill in required field${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}`,
+        error:
+          missing.length === 1
+            ? tr("Fill in required field: {value2}", { value2: missing.join(", ") })
+            : tr("Fill in required fields: {value2}", { value2: missing.join(", ") }),
       };
     }
     return out;
@@ -825,7 +856,10 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
       if (callSeq.current !== myId) return;
       setCallError(
         e instanceof Error && e.message === "__timeout__"
-          ? `No response after ${CALL_TIMEOUT_MS / 1000}s. The server may be slow or unreachable; check its status under Servers, then retry.`
+          ? tr(
+              "No response after {value1}s. The server may be slow or unreachable; check its status under Servers, then retry.",
+              { value1: CALL_TIMEOUT_MS / 1000 },
+            )
           : String(e),
       );
     } finally {
@@ -856,10 +890,11 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
       <div className="flex flex-col items-center justify-center gap-3 py-24 text-center">
         <FlaskConical className="size-10 text-muted-foreground/50" />
         <div>
-          <p className="font-medium">No servers to test</p>
+          <p className="font-medium">{tr("No servers to test")}</p>
           <p className="max-w-md text-sm text-muted-foreground">
-            Add a server to Toolport, then come back here to invoke its tools and see the
-            raw results, without wiring up a client first.
+            {tr(
+              "Add a server to Toolport, then come back here to invoke its tools and see the raw results, without wiring up a client first.",
+            )}
           </p>
         </div>
       </div>
@@ -870,10 +905,10 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
     <div className="flex max-w-3xl flex-col gap-5">
       {/* Server picker */}
       <div className="flex w-64 flex-col gap-1.5">
-        <Label className="text-xs text-muted-foreground">Server</Label>
+        <Label className="text-xs text-muted-foreground">{tr("Server")}</Label>
         <Select value={serverId ?? ""} onValueChange={setServerId}>
           <SelectTrigger className="h-9">
-            <SelectValue placeholder="Pick a server…" />
+            <SelectValue placeholder={tr("Pick a server…")} />
           </SelectTrigger>
           <SelectContent>
             {servers.map((s) => (
@@ -884,7 +919,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
           </SelectContent>
         </Select>
         <p className="text-[11px] text-muted-foreground">
-          Tests any server directly, regardless of the active profile.
+          {tr("Tests any server directly, regardless of the active profile.")}
         </p>
       </div>
 
@@ -920,22 +955,35 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
         <>
           {loadingTools && (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="size-4 animate-spin" /> Connecting to server…
+              <Trans
+                message="{value1} Connecting to server…"
+                values={{ value1: <Loader2 className="size-4 animate-spin" /> }}
+              />
             </div>
           )}
 
           {toolsError &&
             (looksLikeAuthError(toolsError) ? (
               <Callout variant="warning">
-                <span className="font-medium">
-                  Sign in to {serverEntry?.name ?? "this server"} first.
-                </span>{" "}
-                Toolport couldn&apos;t list its tools without credentials. Open{" "}
-                <span className="font-medium">Servers</span>, choose this server, and use{" "}
-                <span className="font-medium">Authenticate</span>.
-                <p className="mt-1.5 font-mono text-xs break-words opacity-70">
-                  {toolsError}
-                </p>
+                <Trans
+                  message="{value1}  Toolport couldn't list its tools without credentials. Open  {value2}, choose this server, and use  {value3}. {value4}"
+                  values={{
+                    value1: (
+                      <span className="font-medium">
+                        {tr("Sign in to {value1} first.", {
+                          value1: serverEntry?.name ?? tr("this server"),
+                        })}
+                      </span>
+                    ),
+                    value2: <span className="font-medium">{tr("Servers")}</span>,
+                    value3: <span className="font-medium">{tr("Authenticate")}</span>,
+                    value4: (
+                      <p className="mt-1.5 font-mono text-xs break-words opacity-70">
+                        {toolsError}
+                      </p>
+                    ),
+                  }}
+                />
               </Callout>
             ) : (
               <Callout variant="danger">{toolsError}</Callout>
@@ -944,7 +992,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
           {/* Server connected but exposes no tools at all. */}
           {!loadingTools && !toolsError && tools && tools.length === 0 && (
             <p className="text-sm text-muted-foreground">
-              This server advertises no tools.
+              {tr("This server advertises no tools.")}
             </p>
           )}
 
@@ -959,8 +1007,10 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
               )}
               {!isExposed(tool) && (
                 <p className="flex items-center gap-1.5 text-xs text-warning">
-                  <ShieldAlert className="size-3.5" />
-                  Hidden from clients by policy. You can still test it here.
+                  <Trans
+                    message="{value1} Hidden from clients by policy. You can still test it here."
+                    values={{ value1: <ShieldAlert className="size-3.5" /> }}
+                  />
                 </p>
               )}
 
@@ -975,19 +1025,33 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
 
               <div className="flex items-center justify-between">
                 <span className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-                  Arguments
+                  {tr("Arguments")}
                 </span>
-                <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                  Raw JSON
-                  <Switch checked={rawMode} onCheckedChange={setRawMode} />
+                <label
+                  htmlFor="playground-raw-json"
+                  className="flex items-center gap-2 text-xs text-muted-foreground"
+                >
+                  <Trans
+                    message="Raw JSON {value1}"
+                    values={{
+                      value1: (
+                        <Switch
+                          id="playground-raw-json"
+                          checked={rawMode}
+                          onCheckedChange={setRawMode}
+                        />
+                      ),
+                    }}
+                  />
                 </label>
               </div>
 
               {rawMode ? (
                 <div className="flex flex-col gap-1.5">
                   <span className="text-xs text-muted-foreground">
-                    Raw-JSON mode: type the full arguments object yourself. The generated
-                    form is bypassed.
+                    {tr(
+                      "Raw-JSON mode: type the full arguments object yourself. The generated form is bypassed.",
+                    )}
                   </span>
                   <textarea
                     value={rawJson}
@@ -999,7 +1063,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
                 </div>
               ) : Object.keys(props).length === 0 ? (
                 <p className="text-sm text-muted-foreground">
-                  This tool takes no arguments.
+                  {tr("This tool takes no arguments.")}
                 </p>
               ) : (
                 <div className="flex flex-col gap-4">
@@ -1023,12 +1087,16 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
                   ) : (
                     <Play className="size-4" />
                   )}
-                  {calling ? `Calling… ${elapsed}s` : "Call tool"}
+                  {calling
+                    ? tr("Calling… {value1}s", { value1: elapsed })
+                    : tr("Call tool")}
                 </Button>
                 {calling && (
                   <Button onClick={cancelCall} variant="outline" size="sm">
-                    <X className="size-4" />
-                    Cancel
+                    <Trans
+                      message="{value1} Cancel"
+                      values={{ value1: <X className="size-4" /> }}
+                    />
                   </Button>
                 )}
               </div>
@@ -1047,7 +1115,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
                 ) : (
                   <CheckCircle2 className="size-4 text-success" />
                 )}
-                {result.isError ? "Tool returned an error" : "Result"}
+                {result.isError ? tr("Tool returned an error") : tr("Result")}
                 <CopyButton text={renderResult(result)} />
               </div>
               <pre
@@ -1065,10 +1133,11 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
           {tools && tools.length > 0 && (
             <div className="flex flex-col gap-1.5">
               <Label className="text-xs text-muted-foreground">
-                Tools{" "}
-                {toolFilter.trim()
-                  ? `(${filteredTools.length} of ${tools.length})`
-                  : `(${tools.length})`}
+                {tr("Tools  {value1}", {
+                  value1: toolFilter.trim()
+                    ? `(${filteredTools.length} of ${tools.length})`
+                    : `(${tools.length})`,
+                })}
               </Label>
               {/* A search box once the list is long enough to be worth scanning. */}
               {tools.length > 7 && (
@@ -1077,23 +1146,25 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
                   <Input
                     value={toolFilter}
                     onChange={(e) => setToolFilter(e.target.value)}
-                    placeholder="Filter tools by name or description"
+                    placeholder={tr("Filter tools by name or description")}
                     className="h-9 pl-8"
-                    aria-label="Filter tools"
+                    aria-label={tr("Filter tools")}
                   />
                 </div>
               )}
               {filteredTools.length === 0 ? (
                 <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed px-3 py-6 text-center">
                   <p className="text-sm text-muted-foreground">
-                    No tools match "{toolFilter.trim()}".
+                    {tr('No tools match "{value1}".', { value1: toolFilter.trim() })}
                   </p>
                   <button
                     onClick={() => setToolFilter("")}
                     className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
                   >
-                    <X className="size-3.5" />
-                    Clear filter
+                    <Trans
+                      message="{value1} Clear filter"
+                      values={{ value1: <X className="size-3.5" /> }}
+                    />
                   </button>
                 </div>
               ) : (
@@ -1129,10 +1200,12 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
                               />
                             )}
                             <span className="truncate font-mono text-sm">{t.name}</span>
-                            {destructive && <Badge variant="warning">destructive</Badge>}
+                            {destructive && (
+                              <Badge variant="warning">{tr("destructive")}</Badge>
+                            )}
                             {!exposed && (
                               <span className="text-xs text-muted-foreground">
-                                hidden
+                                {tr("hidden")}
                               </span>
                             )}
                           </span>
@@ -1148,9 +1221,13 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
                           title={
                             pinned
                               ? "Pinned: always surfaced in lazy-discovery search"
-                              : "Pin as a prerequisite (always surfaced in search)"
+                              : tr("Pin as a prerequisite (always surfaced in search)")
                           }
-                          aria-label={pinned ? `Unpin ${t.name}` : `Pin ${t.name}`}
+                          aria-label={
+                            pinned
+                              ? tr("Unpin {value1}", { value1: t.name })
+                              : tr("Pin {value1}", { value1: t.name })
+                          }
                           aria-pressed={pinned}
                           className="shrink-0 rounded p-1 hover:bg-muted disabled:opacity-50"
                         >
@@ -1164,7 +1241,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
                           checked={!perToolOff}
                           onCheckedChange={(on) => toggleTool(t.name, on)}
                           disabled={policyBusy}
-                          aria-label={`Enable ${t.name}`}
+                          aria-label={tr("Enable {value1}", { value1: t.name })}
                         />
                       </div>
                     );
@@ -1173,8 +1250,9 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
               )}
               {denyDestructive && (
                 <p className="text-xs text-muted-foreground">
-                  Destructive tools are hidden from clients by the global switch even when
-                  individually enabled.
+                  {tr(
+                    "Destructive tools are hidden from clients by the global switch even when individually enabled.",
+                  )}
                 </p>
               )}
             </div>

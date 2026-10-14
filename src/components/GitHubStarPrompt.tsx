@@ -1,3 +1,4 @@
+import { useI18n } from "@/lib/i18n";
 import { useEffect, useState, type ReactNode } from "react";
 import { CircleCheck, Star, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -47,6 +48,7 @@ export function GitHubStarPrompt({
   enabledCount,
   onVisibleChange,
 }: Props) {
+  const { t } = useI18n();
   // Frozen at mount, so a stage change made during this session cannot promote
   // one surface into another. A "Later" answered by a chip minutes later would
   // be nagging; the chip belongs to the next launch.
@@ -151,8 +153,7 @@ export function GitHubStarPrompt({
             onClick={star}
             className={`inline-flex items-center gap-1.5 rounded-full text-xs font-medium transition hover:text-primary ${FOCUS_RING}`}
           >
-            <Star className="size-3.5" />
-            Star Toolport on GitHub
+            <Star className="size-3.5" /> {t("Star Toolport on GitHub")}{" "}
           </button>
           <CloseButton onClick={() => setDismissed(true)} className="rounded-full p-1" />
         </div>
@@ -164,7 +165,7 @@ export function GitHubStarPrompt({
     <Corner>
       <div
         role="status"
-        aria-label="Star Toolport on GitHub"
+        aria-label={t("Star Toolport on GitHub")}
         className={`${SHELL} w-[min(20rem,calc(100vw-2rem))] rounded-xl p-4`}
       >
         <div className="flex items-start gap-2">
@@ -174,7 +175,7 @@ export function GitHubStarPrompt({
             <Star className="mt-0.5 size-4 shrink-0 text-warning" />
           )}
           <p className="flex-1 text-sm font-medium">
-            {surface === "card" ? "You're all set" : "Enjoying Toolport?"}
+            {surface === "card" ? t("You're all set") : t("Enjoying Toolport?")}
           </p>
           <CloseButton
             onClick={() => setDismissed(true)}
@@ -183,18 +184,17 @@ export function GitHubStarPrompt({
         </div>
         <p className="mt-1.5 text-sm text-muted-foreground">
           {surface === "card"
-            ? "If Toolport is useful, a GitHub star helps other developers find it."
-            : "A GitHub star helps other developers find it."}
+            ? t("If Toolport is useful, a GitHub star helps other developers find it.")
+            : t("A GitHub star helps other developers find it.")}
         </p>
         <div className="mt-3 flex items-center gap-2">
           <Button size="sm" onClick={star}>
-            <Star className="size-3.5" />
-            Star on GitHub
+            <Star className="size-3.5" /> {t("Star on GitHub")}{" "}
           </Button>
           <Button size="sm" variant="ghost" onClick={() => setDismissed(true)}>
             {/* "Later" is only honest on the new-user card, which really does
                 get a second (and final) chance as the chip. */}
-            {surface === "card" ? "Later" : "No thanks"}
+            {surface === "card" ? t("Later") : t("No thanks")}
           </Button>
         </div>
       </div>
@@ -213,11 +213,12 @@ function Corner({ children }: { children: ReactNode }) {
 /** Closing is always a "not now", never a separate refusal: the stage was
  *  already spent when the surface appeared, so this only hides it. */
 function CloseButton({ onClick, className }: { onClick: () => void; className: string }) {
+  const { t } = useI18n();
   return (
     <button
       type="button"
       onClick={onClick}
-      aria-label="Dismiss"
+      aria-label={t("Dismiss")}
       className={`text-muted-foreground transition hover:text-foreground ${FOCUS_RING} ${className}`}
     >
       <X className="size-3.5" />

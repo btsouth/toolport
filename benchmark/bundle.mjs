@@ -5,8 +5,9 @@ import { gzipSync } from "node:zlib";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const buildDir = process.env.TOOLPORT_BUILD_DIR || path.join(root, "dist");
 const manifest = JSON.parse(
-  await readFile(path.join(root, "dist/.vite/manifest.json"), "utf8"),
+  await readFile(path.join(buildDir, ".vite/manifest.json"), "utf8"),
 );
 const visited = new Set();
 function visit(key) {
@@ -18,7 +19,7 @@ for (const [key, item] of Object.entries(manifest)) if (item.isEntry) visit(key)
 let bytes = 0;
 let gzipBytes = 0;
 for (const key of visited) {
-  const content = await readFile(path.join(root, "dist", manifest[key].file));
+  const content = await readFile(path.join(buildDir, manifest[key].file));
   bytes += content.length;
   gzipBytes += gzipSync(content).length;
 }

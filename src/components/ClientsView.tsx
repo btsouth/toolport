@@ -1,3 +1,4 @@
+import { useI18n, Trans } from "@/lib/i18n";
 import { useState } from "react";
 import { ChevronRight, Download, MonitorCog, Puzzle } from "lucide-react";
 import { ClientLogo } from "@/components/ClientLogo";
@@ -36,17 +37,18 @@ function sortClients(clients: DetectedClient[]): DetectedClient[] {
 }
 
 function StatusBadge({ status }: { status: ClientStatus }) {
+  const { t } = useI18n();
   switch (status) {
     case "connected":
-      return <Badge variant="success">Connected</Badge>;
+      return <Badge variant="success">{t("Connected")}</Badge>;
     case "ready":
-      return <Badge variant="info">Ready to connect</Badge>;
+      return <Badge variant="info">{t("Ready to connect")}</Badge>;
     case "customized":
-      return <Badge variant="warning">Custom configuration</Badge>;
+      return <Badge variant="warning">{t("Custom configuration")}</Badge>;
     case "error":
-      return <Badge variant="warning">Couldn&apos;t read config</Badge>;
+      return <Badge variant="warning">{t("Couldn't read config")}</Badge>;
     case "missing":
-      return <Badge variant="outline">Not installed</Badge>;
+      return <Badge variant="outline">{t("Not installed")}</Badge>;
   }
 }
 
@@ -59,12 +61,15 @@ function ClientRow({
   importCount: number;
   onSelect: () => void;
 }) {
+  const { t } = useI18n();
   const status = statusOf(client);
   const detail =
     status === "missing"
-      ? "Install this client to configure it with Toolport"
+      ? t("Install this client to configure it with Toolport")
       : client.configPath ||
-        (client.usesConnectors ? "Uses account connectors" : "Config path unavailable");
+        (client.usesConnectors
+          ? t("Uses account connectors")
+          : t("Config path unavailable"));
 
   return (
     <button
@@ -81,7 +86,7 @@ function ClientRow({
           {client.usesConnectors && (
             <Puzzle
               className="size-3.5 shrink-0 text-info"
-              aria-label="Uses connectors"
+              aria-label={t("Uses connectors")}
             />
           )}
         </span>
@@ -92,8 +97,10 @@ function ClientRow({
       <span className="flex items-center gap-2">
         {importCount > 0 && status !== "error" && status !== "missing" && (
           <Badge variant="owned">
-            <Download />
-            {importCount} to import
+            <Trans
+              message={"{value1}{value2} to import"}
+              values={{ value1: <Download />, value2: importCount }}
+            />
           </Badge>
         )}
         <StatusBadge status={status} />
@@ -114,6 +121,7 @@ export function ClientsView({
   loading?: boolean;
   onSelectClient: (id: string) => void;
 }) {
+  const { t } = useI18n();
   const [showMissing, setShowMissing] = useState(false);
   const sorted = sortClients(clients);
   const present = sorted.filter((client) => statusOf(client) !== "missing");
@@ -123,7 +131,7 @@ export function ClientsView({
 
   if (loading && clients.length === 0) {
     return (
-      <div className="flex flex-col gap-2" aria-label="Loading AI clients">
+      <div className="flex flex-col gap-2" aria-label={t("Loading AI clients")}>
         {Array.from({ length: 4 }).map((_, i) => (
           <Skeleton key={i} className="h-14 w-full rounded-lg" />
         ))}
@@ -135,8 +143,10 @@ export function ClientsView({
     return (
       <EmptyState
         icon={<MonitorCog />}
-        title="No AI clients detected"
-        description="Install Claude Desktop, Cursor, VS Code, or another supported client, then refresh."
+        title={t("No AI clients detected")}
+        description={t(
+          "Install Claude Desktop, Cursor, VS Code, or another supported client, then refresh.",
+        )}
       />
     );
   }
@@ -146,15 +156,19 @@ export function ClientsView({
       {present.length === 0 && (
         <EmptyState
           icon={<MonitorCog />}
-          title="No supported clients installed"
-          description="Install Claude Desktop, Cursor, VS Code, or another supported client, then refresh."
+          title={t("No supported clients installed")}
+          description={t(
+            "Install Claude Desktop, Cursor, VS Code, or another supported client, then refresh.",
+          )}
           className="py-12"
         />
       )}
 
       {connected.length > 0 && (
         <section>
-          <SectionHeader count={connected.length}>Connected to Toolport</SectionHeader>
+          <SectionHeader count={connected.length}>
+            {t("Connected to Toolport")}
+          </SectionHeader>
           <div className="overflow-hidden rounded-xl border border-success/20 bg-success/5">
             {connected.map((client) => (
               <ClientRow
@@ -170,9 +184,11 @@ export function ClientsView({
 
       {available.length > 0 && (
         <section>
-          <SectionHeader count={available.length}>Available to connect</SectionHeader>
+          <SectionHeader count={available.length}>
+            {t("Available to connect")}
+          </SectionHeader>
           <p className="mb-2 text-xs text-muted-foreground">
-            Select an installed client to connect it or review its configuration.
+            {t("Select an installed client to connect it or review its configuration. ")}
           </p>
           <div className="overflow-hidden rounded-xl border border-border/60 bg-card/40">
             {available.map((client) => (
@@ -199,7 +215,7 @@ export function ClientsView({
               className={`size-3.5 transition-transform ${showMissing ? "rotate-90" : ""}`}
               aria-hidden="true"
             />
-            <span className="font-medium">Not installed</span>
+            <span className="font-medium">{t("Not installed")}</span>
             <span>{missing.length}</span>
           </button>
           {showMissing && (

@@ -1,3 +1,4 @@
+import { useI18n, translate, Trans } from "@/lib/i18n";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
@@ -38,10 +39,10 @@ function setSignature(items: QuarantinedTool[]): string {
 
 function whenLabel(ts: number): string {
   const mins = Math.floor((Date.now() - ts) / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
+  if (mins < 1) return translate("just now");
+  if (mins < 60) return translate("{value1}m ago", { value1: mins });
   const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
+  if (hrs < 24) return translate("{value1}h ago", { value1: hrs });
   return fmtTs(ts, "date");
 }
 
@@ -61,6 +62,7 @@ function whenLabel(ts: number): string {
  * decision rather than a dismissal. Fast to find, deliberate to act on.
  */
 export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
+  const { t } = useI18n();
   const [items, setItems] = useState<QuarantinedTool[]>([]);
   const [releasing, setReleasing] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
@@ -99,7 +101,12 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
       // on its own tick, and the list is the authority on what is still blocked.
       await refresh();
     } catch (e) {
-      toastError(`Couldn't re-approve ${q.tool}: ${e}`);
+      toastError(
+        t("Couldn't re-approve {value1}: {value2}", {
+          value1: q.tool,
+          value2: String(e),
+        }),
+      );
     } finally {
       setReleasing((s) => {
         const next = new Set(s);
@@ -141,23 +148,35 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
       if (failed.length > 0) {
         // Say what did get through, so the number still on the card adds up.
         toastError(
-          `Re-approved ${released}. ${failed.length} profile${
-            failed.length === 1 ? "" : "s"
-          } could not be re-approved: ${failed[0]}`,
+          t(
+            failed.length === 1
+              ? "Re-approved {value1}. {value2} profile could not be re-approved: {value4}"
+              : "Re-approved {value1}. {value2} profiles could not be re-approved: {value4}",
+            { value1: released, value2: failed.length, value4: failed[0] },
+          ),
         );
       } else if (skipped.length > 0) {
         // Not a success: these are still blocked, and saying otherwise would send the
         // user away believing the catalog is whole.
         toastError(
-          `Re-approved ${released}. ${skipped.length} could not be repaired and ${
-            skipped.length === 1 ? "is" : "are"
-          } still blocked.`,
+          t(
+            skipped.length === 1
+              ? "Re-approved {value1}. {value2} could not be repaired and is still blocked."
+              : "Re-approved {value1}. {value2} could not be repaired and are still blocked.",
+            { value1: released, value2: skipped.length },
+          ),
         );
       } else {
-        toast.success(`Re-approved ${released} tool${released === 1 ? "" : "s"}`);
+        toast.success(
+          t(released === 1 ? "Re-approved {value1} tool" : "Re-approved {value1} tools", {
+            value1: released,
+          }),
+        );
       }
     } catch (e) {
-      toastError(`Couldn't re-approve the blocked tools: ${e}`);
+      toastError(
+        t("Couldn't re-approve the blocked tools: {value1}", { value1: String(e) }),
+      );
     } finally {
       setBulkBusy(false);
     }
@@ -171,14 +190,26 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
     <div className="pointer-events-none fixed inset-x-0 bottom-0 z-40 flex justify-center px-4 pb-4">
       <div
         role="region"
-        aria-label={`Toolport paused ${items.length} changed tool${many ? "s" : ""}`}
+        aria-label={t(
+          many
+            ? "Toolport paused {value1} changed tools"
+            : "Toolport paused {value1} changed tool",
+          { value1: items.length },
+        )}
         className="animate-in fade-in slide-in-from-bottom-2 pointer-events-auto relative w-full max-w-lg overflow-hidden rounded-xl border border-warning/40 bg-popover/95 shadow-2xl ring-1 ring-warning/10 backdrop-blur"
       >
         {/* Announced politely rather than moving focus. This card appears while you are
             working, so stealing focus would be hostile; it is a status surface, not a
             dialog, which is why it is a labelled region rather than an alertdialog. */}
         <div aria-live="polite" className="sr-only">
-          Toolport paused {items.length} changed tool{many ? "s" : ""} for review.
+          <Trans
+            message={
+              many
+                ? "Toolport paused {value1} changed tools for review."
+                : "Toolport paused {value1} changed tool for review."
+            }
+            values={{ value1: items.length }}
+          />
         </div>
         <div className="flex items-start gap-2.5 border-b border-border/60 px-4 py-3">
           <ShieldAlert
@@ -187,11 +218,23 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
           />
           <div className="min-w-0">
             <p className="text-sm font-medium">
-              Toolport paused {items.length} changed tool{many ? "s" : ""}
+              <Trans
+                message={
+                  many
+                    ? "Toolport paused {value1} changed tools"
+                    : "Toolport paused {value1} changed tool"
+                }
+                values={{ value1: items.length }}
+              />
             </p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              {many ? "They can’t" : "It can’t"} run from any client until you review the
-              change. Everything else stays available.
+              <Trans
+                message={
+                  many
+                    ? "They can’t run from any client until you review the change. Everything else stays available."
+                    : "It can’t run from any client until you review the change. Everything else stays available."
+                }
+              />
             </p>
           </div>
         </div>
@@ -225,7 +268,7 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
                   onClick={() => void release(q)}
                   className="shrink-0"
                 >
-                  {busy ? "Re-approving…" : "Re-approve"}
+                  {busy ? t("Re-approving…") : t("Re-approve")}
                 </Button>
               </li>
             );
@@ -238,39 +281,49 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
               the whole catalog at once, so it is the difference between the app being
               usable and not. */}
           <ConfirmDialog
-            title={`Re-approve ${items.length} blocked tool${many ? "s" : ""}?`}
+            title={t(
+              many
+                ? "Re-approve {value1} blocked tools?"
+                : "Re-approve {value1} blocked tool?",
+              { value1: items.length },
+            )}
             description={
               <div className="space-y-2">
                 <p>
-                  This trusts{" "}
-                  {many
-                    ? "these tools' current definitions"
-                    : "this tool's current definition"}{" "}
-                  and makes {many ? "them" : "it"} callable by every client again.
+                  <Trans
+                    message={
+                      many
+                        ? "This trusts these tools' current definitions and makes them callable by every client again."
+                        : "This trusts this tool's current definition and makes it callable by every client again."
+                    }
+                  />
                 </p>
                 <p>
-                  Only do this if you expected the change. If a definition was altered by
-                  something you did not do, re-approving accepts it.
+                  {t(
+                    "Only do this if you expected the change. If a definition was altered by something you did not do, re-approving accepts it. ",
+                  )}
                 </p>
               </div>
             }
-            confirmLabel="Re-approve all"
+            confirmLabel={t("Re-approve all")}
             onConfirm={releaseEverything}
             trigger={
               <Button size="sm" variant="outline" disabled={bulkBusy} className="mr-auto">
-                {bulkBusy ? "Re-approving…" : `Re-approve all (${items.length})`}
+                {bulkBusy
+                  ? t("Re-approving…")
+                  : t("Re-approve all ({value1})", { value1: items.length })}
               </Button>
             }
           />
           {onReview && (
             <Button size="sm" variant="ghost" onClick={onReview}>
-              Review in Settings
+              {t("Review in Settings ")}
             </Button>
           )}
           {/* Scoped to the current set, so a NEW quarantine re-opens the card rather
               than inheriting an earlier dismissal. */}
           <Button size="sm" variant="ghost" onClick={() => setDismissedFor(signature)}>
-            Dismiss
+            {t("Dismiss ")}
           </Button>
         </div>
       </div>

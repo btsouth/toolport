@@ -1,3 +1,4 @@
+import { useI18n, Trans } from "@/lib/i18n";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Check, ExternalLink, Loader2, Plus, Search, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
@@ -28,6 +29,7 @@ interface Props {
 }
 
 export function CatalogView({ registry, onAdded }: Props) {
+  const { t } = useI18n();
   const [query, setQuery] = useState("");
   const [popular, setPopular] = useState<CatalogEntry[]>([]);
   const [results, setResults] = useState<CatalogEntry[] | null>(null);
@@ -143,11 +145,13 @@ export function CatalogView({ registry, onAdded }: Props) {
         source: `catalog:${entry.source}`,
       };
       onAdded(await addServer(server));
-      toast.success(`Added ${entry.name}`, {
-        description: "Enable it, then authenticate if it needs credentials.",
+      toast.success(t("Added {value1}", { value1: entry.name }), {
+        description: t("Enable it, then authenticate if it needs credentials."),
       });
     } catch (e) {
-      toastError(`Couldn't add ${entry.name}: ${e}`);
+      toastError(
+        t("Couldn't add {value1}: {value2}", { value1: entry.name, value2: String(e) }),
+      );
     } finally {
       setBusy(null);
     }
@@ -184,20 +188,35 @@ export function CatalogView({ registry, onAdded }: Props) {
           needCreds++;
       }
       if (added === 0) {
-        toast.success(`${stack.name}: every server is already in Toolport`);
+        toast.success(
+          t("{value1}: every server is already in Toolport", { value1: stack.name }),
+        );
       } else {
         toast.success(
-          `Added ${added} server${added === 1 ? "" : "s"} from ${stack.name}`,
+          t(
+            added === 1
+              ? "Added {value1} server from {value3}"
+              : "Added {value1} servers from {value3}",
+            { value1: added, value3: stack.name },
+          ),
           {
             description:
               needCreds > 0
-                ? `${needCreds} need setup values. Open "Setup steps", then finish setup under Servers.`
-                : "Enable them under Servers.",
+                ? t(
+                    '{value1} need setup values. Open "Setup steps", then finish setup under Servers.',
+                    { value1: needCreds },
+                  )
+                : t("Enable them under Servers."),
           },
         );
       }
     } catch (e) {
-      toastError(`Couldn't finish setting up ${stack.name}: ${e}`);
+      toastError(
+        t("Couldn't finish setting up {value1}: {value2}", {
+          value1: stack.name,
+          value2: String(e),
+        }),
+      );
     } finally {
       setStackBusy(null);
     }
@@ -243,7 +262,9 @@ export function CatalogView({ registry, onAdded }: Props) {
         <Input
           autoFocus
           value={query}
-          placeholder="Search the MCP Registry (e.g. github, postgres, figma, slack)…"
+          placeholder={t(
+            "Search the MCP Registry (e.g. github, postgres, figma, slack)…",
+          )}
           className="h-11 pl-9 text-base"
           onChange={(e) => setQuery(e.target.value)}
         />
@@ -252,12 +273,17 @@ export function CatalogView({ registry, onAdded }: Props) {
       <div className="flex items-center justify-between text-xs text-muted-foreground">
         <span>
           {results !== null
-            ? `${shown.length} result${shown.length === 1 ? "" : "s"} (popular picks first, then the MCP Registry)`
-            : "Popular servers"}
+            ? t(
+                shown.length === 1
+                  ? "{value1} result (popular picks first, then the MCP Registry)"
+                  : "{value1} results (popular picks first, then the MCP Registry)",
+                { value1: shown.length },
+              )
+            : t("Popular servers")}
         </span>
         {results !== null && shown.length > 0 && (
           <button className="hover:text-foreground" onClick={() => setQuery("")}>
-            Clear search
+            {t("Clear search ")}
           </button>
         )}
       </div>
@@ -266,7 +292,7 @@ export function CatalogView({ registry, onAdded }: Props) {
         (stacksLoading ? (
           <div
             role="status"
-            aria-label="Loading stacks"
+            aria-label={t("Loading stacks")}
             className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3"
           >
             {Array.from({ length: 3 }).map((_, i) => (
@@ -280,13 +306,15 @@ export function CatalogView({ registry, onAdded }: Props) {
             className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5"
           >
             <div>
-              <p className="text-sm font-medium">Stacks couldn't load</p>
+              <p className="text-sm font-medium">{t("Stacks couldn't load")}</p>
               <p className="text-xs text-muted-foreground">
-                Toolport couldn't load the one-click bundles. Try again in a moment.
+                {t(
+                  "Toolport couldn't load the one-click bundles. Try again in a moment. ",
+                )}
               </p>
             </div>
             <Button variant="outline" size="sm" onClick={reloadStacks}>
-              Try again
+              {t("Try again ")}
             </Button>
           </div>
         ) : stacks.length > 0 ? (
@@ -312,13 +340,13 @@ export function CatalogView({ registry, onAdded }: Props) {
             className="flex flex-col items-center gap-3 py-20 text-center"
           >
             <div>
-              <p className="font-medium">Catalog couldn't load</p>
+              <p className="font-medium">{t("Catalog couldn't load")}</p>
               <p className="max-w-md text-sm text-muted-foreground">
-                Toolport couldn't load the curated picks. Try again in a moment.
+                {t("Toolport couldn't load the curated picks. Try again in a moment. ")}
               </p>
             </div>
             <Button variant="outline" size="sm" onClick={reloadPopular}>
-              Try again
+              {t("Try again ")}
             </Button>
           </div>
         ) : !browsing && searchError ? (
@@ -328,10 +356,11 @@ export function CatalogView({ registry, onAdded }: Props) {
             className="flex flex-col items-center gap-3 py-20 text-center"
           >
             <div>
-              <p className="font-medium">Search failed</p>
+              <p className="font-medium">{t("Search failed")}</p>
               <p className="max-w-md text-sm text-muted-foreground">
-                Toolport couldn't reach the MCP Registry. Check your connection, then
-                retry.
+                {t(
+                  "Toolport couldn't reach the MCP Registry. Check your connection, then retry. ",
+                )}
               </p>
             </div>
             <Button
@@ -339,7 +368,7 @@ export function CatalogView({ registry, onAdded }: Props) {
               size="sm"
               onClick={() => setSearchNonce((n) => n + 1)}
             >
-              Try again
+              {t("Try again ")}
             </Button>
           </div>
         ) : (
@@ -351,13 +380,17 @@ export function CatalogView({ registry, onAdded }: Props) {
             >
               <p className="font-medium">
                 {results !== null
-                  ? `No catalog results for "${query}"`
-                  : "No popular servers available"}
+                  ? t('No catalog results for "{value1}"', { value1: query })
+                  : t("No popular servers available")}
               </p>
               <p className="max-w-md text-sm text-muted-foreground">
                 {results !== null
-                  ? "Try a provider name, app name, or shorter query. You can also clear the search to browse popular servers."
-                  : "Use search to query the MCP Registry, or try again later if the browse list stays empty."}
+                  ? t(
+                      "Try a provider name, app name, or shorter query. You can also clear the search to browse popular servers.",
+                    )
+                  : t(
+                      "Use search to query the MCP Registry, or try again later if the browse list stays empty.",
+                    )}
               </p>
               {results !== null && (
                 <Button
@@ -366,7 +399,7 @@ export function CatalogView({ registry, onAdded }: Props) {
                   className="mt-2"
                   onClick={() => setQuery("")}
                 >
-                  Clear search
+                  {t("Clear search ")}
                 </Button>
               )}
             </div>
@@ -377,7 +410,7 @@ export function CatalogView({ registry, onAdded }: Props) {
           {byCategory.map(([cat, entries]) => (
             <section key={cat}>
               <h2 className="mb-2 flex items-center gap-2 text-xs font-medium tracking-wide text-muted-foreground uppercase">
-                {cat}
+                {t(cat)}
                 <span className="text-muted-foreground/60">{entries.length}</span>
               </h2>
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
@@ -431,13 +464,20 @@ function StacksSection({
   busyId: string | null;
   onSetup: (s: Stack) => void;
 }) {
+  const { t } = useI18n();
   return (
     <section>
       <h2 className="mb-2 flex items-center gap-2 text-xs font-medium tracking-wide text-muted-foreground uppercase">
-        Stacks
-        <span className="font-normal text-muted-foreground/60 normal-case">
-          one-click bundles for a use case
-        </span>
+        <Trans
+          message={"Stacks {value1}"}
+          values={{
+            value1: (
+              <span className="font-normal text-muted-foreground/60 normal-case">
+                {t("one-click bundles for a use case ")}
+              </span>
+            ),
+          }}
+        />
       </h2>
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
         {stacks.map((s) => (
@@ -465,6 +505,7 @@ function StackCard({
   busy: boolean;
   onSetup: () => void;
 }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const missing = stack.servers.filter((e) => !haveNames.has(e.name.toLowerCase()));
   const allAdded = missing.length === 0;
@@ -473,7 +514,7 @@ function StackCard({
       <div className="flex items-start justify-between gap-2">
         <span className="text-sm font-medium">{stack.name}</span>
         <span className="shrink-0 text-[11px] text-muted-foreground">
-          {stack.servers.length} servers
+          <Trans message={"{value1} servers"} values={{ value1: stack.servers.length }} />
         </span>
       </div>
       <p className="min-h-8 text-xs text-muted-foreground">{stack.description}</p>
@@ -496,12 +537,14 @@ function StackCard({
           onClick={() => setOpen((o) => !o)}
           className="text-[11px] text-muted-foreground hover:text-foreground"
         >
-          {open ? "Hide setup steps" : "Setup steps"}
+          {open ? t("Hide setup steps") : t("Setup steps")}
         </button>
         {allAdded ? (
           <span className="inline-flex items-center gap-1 text-xs text-success">
-            <Check className="size-3" />
-            all added
+            <Trans
+              message={"{value1}all added"}
+              values={{ value1: <Check className="size-3" /> }}
+            />
           </span>
         ) : (
           <Button
@@ -511,12 +554,17 @@ function StackCard({
             disabled={busy}
             onClick={onSetup}
           >
-            {busy ? (
-              <Loader2 className="size-3 animate-spin" />
-            ) : (
-              <Plus className="size-3" />
-            )}
-            Add {missing.length}
+            <Trans
+              message={"{value1}Add {value2}"}
+              values={{
+                value1: busy ? (
+                  <Loader2 className="size-3 animate-spin" />
+                ) : (
+                  <Plus className="size-3" />
+                ),
+                value2: missing.length,
+              }}
+            />
           </Button>
         )}
       </div>
@@ -530,8 +578,14 @@ function StackCard({
               )}
               {!!e.launch?.inputs.length && (
                 <span className="text-muted-foreground">
-                  {e.setupHint ? " · " : ": "}Launch setup:{" "}
-                  {e.launch.inputs.map((input) => input.label).join(", ")}
+                  <Trans
+                    message={"{value1}Launch setup:{value2}{value3}"}
+                    values={{
+                      value1: e.setupHint ? " · " : ": ",
+                      value2: " ",
+                      value3: e.launch.inputs.map((input) => input.label).join(", "),
+                    }}
+                  />
                 </span>
               )}
               {e.credentialsUrl && (
@@ -539,8 +593,10 @@ function StackCard({
                   onClick={() => openExternal(e.credentialsUrl)}
                   className="ml-1 inline-flex items-center gap-0.5 text-info hover:underline"
                 >
-                  get credential
-                  <ExternalLink className="size-2.5" />
+                  <Trans
+                    message={"get credential {value1}"}
+                    values={{ value1: <ExternalLink className="size-2.5" /> }}
+                  />
                 </button>
               )}
             </div>
@@ -554,12 +610,13 @@ function StackCard({
 /** Source-tier + publisher signal. Honest provenance: where the entry came
  * from and who published it, not a cryptographic attestation. */
 function Provenance({ entry }: { entry: CatalogEntry }) {
+  const { t } = useI18n();
   const tier =
     entry.source === "curated"
-      ? { label: "Toolport verified", cls: "text-success" }
+      ? { label: t("Toolport verified"), cls: "text-success" }
       : entry.source === "registry"
         ? { label: "MCP Registry", cls: "text-info" }
-        : { label: "Your pick", cls: "text-owned" };
+        : { label: t("Your pick"), cls: "text-owned" };
   return (
     <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
       <ShieldCheck className={`size-3 shrink-0 ${tier.cls}`} />
@@ -582,6 +639,7 @@ function CatalogCard({
   busy: boolean;
   onAdd: () => void;
 }) {
+  const { t } = useI18n();
   const target = entry.command
     ? [entry.command, ...entry.args].join(" ")
     : (entry.url ?? "");
@@ -594,7 +652,7 @@ function CatalogCard({
           {entry.homepage && (
             <button
               onClick={() => openExternal(entry.homepage)}
-              aria-label="Open docs"
+              aria-label={t("Open docs")}
               className="shrink-0 text-muted-foreground/60 hover:text-foreground"
             >
               <ExternalLink className="size-3" />
@@ -615,8 +673,10 @@ function CatalogCard({
       <div className="mt-auto flex justify-end pt-1">
         {added ? (
           <span className="inline-flex items-center gap-1 text-xs text-success">
-            <Check className="size-3" />
-            in Toolport
+            <Trans
+              message={"{value1}in Toolport"}
+              values={{ value1: <Check className="size-3" /> }}
+            />
           </span>
         ) : (
           <Button
@@ -626,8 +686,10 @@ function CatalogCard({
             disabled={busy}
             onClick={onAdd}
           >
-            <Plus className="size-3" />
-            Add
+            <Trans
+              message={"{value1}Add"}
+              values={{ value1: <Plus className="size-3" /> }}
+            />
           </Button>
         )}
       </div>

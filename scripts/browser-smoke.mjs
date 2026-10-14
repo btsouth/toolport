@@ -8,7 +8,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const output = path.join(root, ".verify", `browser-${Date.now()}-${process.pid}`);
+const output = path.join(
+  process.env.TOOLPORT_VERIFY_DIR || path.join(root, ".verify"),
+  `browser-${Date.now()}-${process.pid}`,
+);
 await mkdir(output, { recursive: true });
 const server = await createServer({
   root,
@@ -36,7 +39,10 @@ try {
       (existsSync("/usr/bin/chromium") ? "/usr/bin/chromium" : undefined),
     headless: true,
   });
-  context = await browser.newContext({ viewport: { width: 1240, height: 900 } });
+  context = await browser.newContext({
+    viewport: { width: 1240, height: 900 },
+    locale: "en-US",
+  });
   await context.tracing.start({ screenshots: true, snapshots: true });
   page = await context.newPage();
   page.on("pageerror", (error) => errors.push(error.message));

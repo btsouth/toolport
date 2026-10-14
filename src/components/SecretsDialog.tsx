@@ -1,3 +1,4 @@
+import { useI18n, translate, Trans } from "@/lib/i18n";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Check, ExternalLink, KeyRound, Loader2, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
@@ -37,7 +38,9 @@ import { Label } from "@/components/ui/label";
 function secretErrorMessage(e: unknown): string {
   const msg = `${e}`;
   if (/secret service|freedesktop\.secret|keyring|dbus|d-bus/i.test(msg)) {
-    return "No system keyring found. Toolport keeps secrets in your OS keyring; on Linux that needs a running Secret Service (e.g. gnome-keyring or KWallet). Start and unlock one, then retry.";
+    return translate(
+      "No system keyring found. Toolport keeps secrets in your OS keyring; on Linux that needs a running Secret Service (e.g. gnome-keyring or KWallet). Start and unlock one, then retry.",
+    );
   }
   return msg;
 }
@@ -82,11 +85,12 @@ const KEY_HINTS: Record<string, { url: string; hint: string }> = {
 /** A readable vendor name from an env-var key, e.g. RESEND_API_KEY -> "Resend". */
 function vendorFromKey(key: string): string {
   const head = key.replace(/_(API_)?KEY$|_TOKEN$|_SECRET$/i, "").split("_")[0];
-  if (!head) return "This server";
+  if (!head) return translate("This server");
   return head.charAt(0).toUpperCase() + head.slice(1).toLowerCase();
 }
 
 export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [vaulted, setVaulted] = useState<Record<string, boolean>>({});
   // Whether the `secretStatus` probe succeeded. Failure must stay unknown
@@ -293,7 +297,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       // earlier failed-probe warning.
       setAuthProbeError(false);
       setAuthInput("");
-      toast.success("Saved auth token");
+      toast.success(t("Saved auth token"));
       onChanged?.();
     } catch (e) {
       toastError(secretErrorMessage(e));
@@ -308,7 +312,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
     try {
       await clearAuthToken(server.id);
       setAuthSet(false);
-      toast.success("Cleared auth token");
+      toast.success(t("Cleared auth token"));
       onChanged?.();
     } catch (e) {
       toastError(secretErrorMessage(e));
@@ -323,7 +327,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
 
   async function saveClientCredentials() {
     if (!ccClientId.trim()) {
-      toastError("Enter the client id issued by your authorization server.");
+      toastError(t("Enter the client id issued by your authorization server."));
       return;
     }
     // A blank secret means "keep the stored one", which is only meaningful when
@@ -332,7 +336,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
     // presence probe has settled: the backend knows authoritatively and returns a
     // clear message, so deferring is always safe, while guessing is not.
     if (ccSecretKnown && !ccSecretSet && !ccSecret.trim()) {
-      toastError("Enter the client secret issued by your authorization server.");
+      toastError(t("Enter the client secret issued by your authorization server."));
       return;
     }
     retireInFlightVaultProbes();
@@ -351,8 +355,8 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       setCcSecretKnown(true);
       setCcSecretProbeError(false);
       setCcSecret("");
-      toast.success("Saved client credentials", {
-        description: "The next connection will request a token. No browser needed.",
+      toast.success(t("Saved client credentials"), {
+        description: t("The next connection will request a token. No browser needed."),
       });
       onChanged?.();
     } catch (e) {
@@ -375,7 +379,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       setCcScope("");
       setCcMethod("");
       setCcOpen(false);
-      toast.success("Removed client credentials");
+      toast.success(t("Removed client credentials"));
       onChanged?.();
     } catch (e) {
       toastError(`${e}`);
@@ -431,7 +435,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       setAuthSet(true);
       setAuthProbeError(false);
       setOauthMessage("Browser sign-in completed. Your token is stored in the keychain.");
-      toast.success("Authenticated");
+      toast.success(t("Authenticated"));
       onChanged?.();
     } catch (e) {
       if (!fresh()) return;
@@ -469,7 +473,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       onSaved(await setSecret(server.id, key, value));
       setVaulted((v) => ({ ...v, [key]: true }));
       setInputs((i) => ({ ...i, [key]: "" }));
-      toast.success(`Saved ${key}`);
+      toast.success(t("Saved {value1}", { value1: key }));
       onChanged?.();
     } catch (e) {
       toastError(secretErrorMessage(e));
@@ -484,7 +488,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
     try {
       onSaved(await deleteSecret(server.id, key));
       setVaulted((v) => ({ ...v, [key]: false }));
-      toast.success(`Removed ${key}`);
+      toast.success(t("Removed {value1}", { value1: key }));
       onChanged?.();
     } catch (e) {
       toastError(secretErrorMessage(e));
@@ -502,7 +506,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       onSaved(await setSecret(server.id, k, newValue));
       setVaulted((v) => ({ ...v, [k]: true }));
       setInputs((i) => ({ ...i, [k]: "" }));
-      toast.success(`Saved ${k}`);
+      toast.success(t("Saved {value1}", { value1: k }));
       onChanged?.();
       setNewKey("");
       setNewValue("");
@@ -518,7 +522,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       <DialogTrigger asChild>
         {trigger ?? (
           <button
-            aria-label={`Manage secrets for ${server.name}`}
+            aria-label={t("Manage secrets for {value1}", { value1: server.name })}
             className="rounded p-1 text-muted-foreground/60 transition hover:bg-accent hover:text-foreground"
           >
             <KeyRound className="size-3.5" />
@@ -527,7 +531,9 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       </DialogTrigger>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Secrets for {server.name}</DialogTitle>
+          <DialogTitle>
+            <Trans message={"Secrets for {value1}"} values={{ value1: server.name }} />
+          </DialogTitle>
         </DialogHeader>
 
         <div className="flex flex-col gap-3 py-1">
@@ -535,7 +541,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
             <div className="flex flex-col gap-2.5 border-b pb-3">
               {probing && (
                 <p className="text-xs text-muted-foreground">
-                  Checking what this server needs…
+                  {t("Checking what this server needs… ")}
                 </p>
               )}
 
@@ -543,7 +549,9 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                 <div className="flex items-start gap-2 rounded-md bg-success/10 p-2.5 text-xs text-success">
                   <Check className="mt-0.5 size-3.5 shrink-0" />
                   <span>
-                    This server connects without auth. Just enable it, no token needed.
+                    {t(
+                      "This server connects without auth. Just enable it, no token needed. ",
+                    )}
                   </span>
                 </div>
               ) : (
@@ -559,8 +567,10 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                           onClick={() => openExternal(authInfo.tokenUrl)}
                           className="ml-1 inline-flex items-center gap-0.5 text-owned hover:underline"
                         >
-                          get a token
-                          <ExternalLink className="size-3" />
+                          <Trans
+                            message={"get a token {value1}"}
+                            values={{ value1: <ExternalLink className="size-3" /> }}
+                          />
                         </button>
                       )}
                     </div>
@@ -568,34 +578,39 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
 
                   {authInfo?.kind === "oauth" && (
                     <p className="text-xs text-muted-foreground">
-                      This server supports browser sign-in. A pasted access token is
-                      optional if your provider supplies one.
+                      {t(
+                        "This server supports browser sign-in. A pasted access token is optional if your provider supplies one. ",
+                      )}
                     </p>
                   )}
                   {oauthMessage && (
                     <p role="status" className="text-xs text-muted-foreground">
-                      {oauthMessage}
+                      {t(oauthMessage)}
                     </p>
                   )}
                   <div className="flex flex-col gap-1.5">
                     <div className="flex items-center gap-2">
-                      <Label className="text-xs">Access token</Label>
+                      <Label className="text-xs">{t("Access token")}</Label>
                       {authSet && (
                         <span className="inline-flex items-center gap-1 text-xs text-success">
-                          <Check className="size-3" />
-                          vaulted
+                          <Trans
+                            message={"{value1}vaulted"}
+                            values={{ value1: <Check className="size-3" /> }}
+                          />
                         </span>
                       )}
                       {authProbeError && (
                         <span className="text-xs text-warning">
-                          couldn't check the keychain
+                          {t("couldn't check the keychain ")}
                         </span>
                       )}
                     </div>
                     <div className="flex items-center gap-2">
                       <Input
                         type="password"
-                        placeholder={authSet ? "•••••••• (set)" : "paste access token"}
+                        placeholder={
+                          authSet ? t("•••••••• (set)") : t("paste access token")
+                        }
                         value={authInput}
                         onChange={(e) => setAuthInput(e.target.value)}
                         onKeyDown={(e) => {
@@ -611,25 +626,27 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                         {busyKey === "auth" ? (
                           <>
                             <Loader2 className="size-4 animate-spin" />
-                            Saving…
+                            {t("Saving… ")}
                           </>
                         ) : (
-                          "Save"
+                          t("Save")
                         )}
                       </Button>
                       {authSet && (
                         <ConfirmDialog
                           destructive
-                          title="Remove this credential?"
-                          description="The saved credential is deleted from your keychain. You'll need to authenticate this server again before it works."
-                          confirmLabel="Remove"
+                          title={t("Remove this credential?")}
+                          description={t(
+                            "The saved credential is deleted from your keychain. You'll need to authenticate this server again before it works.",
+                          )}
+                          confirmLabel={t("Remove")}
                           onConfirm={clearAuth}
                           trigger={
                             <Button
                               size="icon"
                               variant="ghost"
                               className="size-8 shrink-0 text-muted-foreground hover:text-destructive"
-                              aria-label="Clear auth token"
+                              aria-label={t("Clear auth token")}
                               disabled={oauthBusy || busyKey !== null}
                             >
                               {busyKey === "auth-clear" ? (
@@ -657,30 +674,29 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                         {oauthBusy ? (
                           <>
                             <Loader2 className="size-4 animate-spin" />
-                            Waiting for browser sign-in…
+                            {t("Waiting for browser sign-in… ")}
                           </>
                         ) : (
-                          "Sign in with browser"
+                          t("Sign in with browser")
                         )}
                       </Button>
                       {oauthBusy && (
                         <Button variant="outline" size="sm" onClick={cancelOauth}>
-                          Cancel sign-in
+                          {t("Cancel sign-in ")}
                         </Button>
                       )}
                       {!oauthBusy && /mac/i.test(navigator.userAgent) && (
                         <p className="text-[11px] text-muted-foreground">
-                          On macOS, set Chrome or Brave as your default browser first.
-                          Safari can block the local sign-in redirect.
+                          {t(
+                            "On macOS, set Chrome or Brave as your default browser first. Safari can block the local sign-in redirect. ",
+                          )}
                         </p>
                       )}
                       {oauthBusy && (
                         <p className="text-[11px] text-muted-foreground">
-                          Finish signing in and approve access in your browser. This
-                          attempt waits up to 3 minutes for the browser callback. If you
-                          closed the browser, cancel sign-in, then sign in again to reopen
-                          it. Closing this panel cancels sign-in. Closing the app window
-                          keeps Toolport running in the tray; use Quit Toolport to exit.
+                          {t(
+                            "Finish signing in and approve access in your browser. This attempt waits up to 3 minutes for the browser callback. If you closed the browser, cancel sign-in, then sign in again to reopen it. Closing this panel cancels sign-in. Closing the app window keeps Toolport running in the tray; use Quit Toolport to exit. ",
+                          )}
                         </p>
                       )}
                     </>
@@ -688,8 +704,9 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
 
                   {authInfo?.kind === "token" && (
                     <p className="text-[11px] text-muted-foreground">
-                      This server needs a pasted token. OAuth sign-in isn't available
-                      here.
+                      {t(
+                        "This server needs a pasted token. OAuth sign-in isn't available here. ",
+                      )}
                     </p>
                   )}
 
@@ -705,35 +722,37 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                         className="text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
                         onClick={() => setCcOpen(true)}
                       >
-                        No browser available? Use a client id and secret instead
+                        {t("No browser available? Use a client id and secret instead ")}
                       </button>
                     ) : (
                       <div className="space-y-2">
                         <div className="flex items-center justify-between gap-2">
                           <p className="text-xs font-medium">
-                            Client credentials (no browser)
+                            {t("Client credentials (no browser) ")}
                           </p>
                           {ccSecretSet && (
                             <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
-                              <Check className="size-3" /> secret stored
+                              <Trans
+                                message={"{value1} secret stored"}
+                                values={{ value1: <Check className="size-3" /> }}
+                              />
                             </span>
                           )}
                           {ccSecretProbeError && (
                             <span className="text-[11px] text-warning">
-                              Couldn&apos;t check the stored secret
+                              {t("Couldn't check the stored secret ")}
                             </span>
                           )}
                         </div>
                         <p className="text-[11px] text-muted-foreground">
-                          For servers that authenticate the application rather than a
-                          person, e.g. on a build machine. Toolport requests a token
-                          directly and renews it automatically; it never opens a browser
-                          for this server.
+                          {t(
+                            "For servers that authenticate the application rather than a person, e.g. on a build machine. Toolport requests a token directly and renews it automatically; it never opens a browser for this server. ",
+                          )}
                         </p>
                         <Input
                           value={ccClientId}
                           onChange={(e) => setCcClientId(e.target.value)}
-                          placeholder="Client ID"
+                          placeholder={t("Client ID")}
                           autoComplete="off"
                         />
                         <Input
@@ -742,26 +761,35 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                           onChange={(e) => setCcSecret(e.target.value)}
                           placeholder={
                             ccSecretSet
-                              ? "Client secret (leave blank to keep the stored one)"
-                              : "Client secret"
+                              ? t("Client secret (leave blank to keep the stored one)")
+                              : t("Client secret")
                           }
                           autoComplete="off"
                         />
                         <Input
                           value={ccScope}
                           onChange={(e) => setCcScope(e.target.value)}
-                          placeholder="Scopes (optional, space separated)"
+                          placeholder={t("Scopes (optional, space separated)")}
                           autoComplete="off"
                         />
                         <p className="text-[11px] text-muted-foreground">
-                          The secret is stored in your OS keychain, never in
-                          Toolport&rsquo;s config file, backups, or shared setups.
-                          {ccSecretSet
-                            ? " It cannot be shown again; leave the field blank to keep it."
-                            : ""}
-                          {ccSecretProbeError
-                            ? " Toolport couldn't check whether one is already stored, so it will not assume the field is empty. Retry or save and let the backend decide."
-                            : ""}
+                          <Trans
+                            message={
+                              "The secret is stored in your OS keychain, never in Toolport&rsquo;s config file, backups, or shared setups. {value1}{value2}"
+                            }
+                            values={{
+                              value1: ccSecretSet
+                                ? t(
+                                    " It cannot be shown again; leave the field blank to keep it.",
+                                  )
+                                : "",
+                              value2: ccSecretProbeError
+                                ? t(
+                                    " Toolport couldn't check whether one is already stored, so it will not assume the field is empty. Retry or save and let the backend decide.",
+                                  )
+                                : "",
+                            }}
+                          />
                         </p>
                         {ccSecretProbeError && (
                           <button
@@ -769,7 +797,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                             className="text-[11px] font-medium text-primary hover:underline"
                             onClick={() => void retrySecretProbe()}
                           >
-                            Retry the secret check
+                            {t("Retry the secret check ")}
                           </button>
                         )}
                         <div className="flex gap-2">
@@ -777,29 +805,31 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                             size="sm"
                             disabled={oauthBusy || ccBusy}
                             onClick={saveClientCredentials}
-                            aria-label="Save client credentials"
+                            aria-label={t("Save client credentials")}
                           >
                             {ccBusy ? (
                               <Loader2 className="size-4 animate-spin" />
                             ) : (
-                              "Save"
+                              t("Save")
                             )}
                           </Button>
                           {(ccSecretSet || server.clientCredentials) && (
                             <ConfirmDialog
                               destructive
-                              title="Remove client credentials?"
-                              description="The client secret is deleted from your keychain and cannot be shown again. You'll need to get a new one from your authorization server to reconnect this way."
-                              confirmLabel="Remove"
+                              title={t("Remove client credentials?")}
+                              description={t(
+                                "The client secret is deleted from your keychain and cannot be shown again. You'll need to get a new one from your authorization server to reconnect this way.",
+                              )}
+                              confirmLabel={t("Remove")}
                               onConfirm={removeClientCredentials}
                               trigger={
                                 <Button
                                   size="sm"
                                   variant="ghost"
                                   disabled={oauthBusy || ccBusy}
-                                  aria-label="Remove client credentials"
+                                  aria-label={t("Remove client credentials")}
                                 >
-                                  Remove
+                                  {t("Remove ")}
                                 </Button>
                               }
                             />
@@ -821,14 +851,16 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                   <span className="font-medium text-foreground">
                     {vendorFromKey(primaryKey)}:{" "}
                   </span>
-                  {keyHint.hint}
+                  {t(keyHint.hint)}
                   {keyHint.url && (
                     <button
                       onClick={() => openExternal(keyHint.url)}
                       className="ml-1 inline-flex items-center gap-0.5 text-owned hover:underline"
                     >
-                      get your key
-                      <ExternalLink className="size-3" />
+                      <Trans
+                        message={"get your key {value1}"}
+                        values={{ value1: <ExternalLink className="size-3" /> }}
+                      />
                     </button>
                   )}
                 </div>
@@ -840,15 +872,16 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
               {secretProbeError && (
                 <div className="rounded-md border border-warning/40 bg-warning/5 p-2.5 text-xs text-warning">
                   <p>
-                    Couldn't check the keychain, so saved keys aren't shown below. Unlock
-                    it and retry; saving now overwrites anything already stored.
+                    {t(
+                      "Couldn't check the keychain, so saved keys aren't shown below. Unlock it and retry; saving now overwrites anything already stored. ",
+                    )}
                   </p>
                   <button
                     type="button"
                     className="mt-1 font-medium underline underline-offset-2"
                     onClick={() => void retryVaultedKeysProbe()}
                   >
-                    Retry the keychain check
+                    {t("Retry the keychain check ")}
                   </button>
                 </div>
               )}
@@ -857,15 +890,20 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                 <div key={key} className="flex flex-col gap-1.5">
                   <div className="flex items-center gap-2">
                     <Label className="text-sm font-medium">
-                      {vendorFromKey(key)} API key
+                      <Trans
+                        message={"{value1} API key"}
+                        values={{ value1: vendorFromKey(key) }}
+                      />
                     </Label>
                     <code className="rounded bg-muted px-1 py-0.5 font-mono text-[10px] text-muted-foreground">
                       {key}
                     </code>
                     {vaulted[key] && (
                       <span className="inline-flex items-center gap-1 text-xs text-success">
-                        <Check className="size-3" />
-                        saved
+                        <Trans
+                          message={"{value1}saved"}
+                          values={{ value1: <Check className="size-3" /> }}
+                        />
                       </span>
                     )}
                   </div>
@@ -874,8 +912,10 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                       type="password"
                       placeholder={
                         vaulted[key]
-                          ? "•••••••• (saved)"
-                          : `paste your ${vendorFromKey(key)} API key`
+                          ? t("•••••••• (saved)")
+                          : t("paste your {value1} API key", {
+                              value1: vendorFromKey(key),
+                            })
                       }
                       value={inputs[key] ?? ""}
                       onChange={(e) =>
@@ -893,25 +933,29 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                       {busyKey === key ? (
                         <>
                           <Loader2 className="size-4 animate-spin" />
-                          Saving…
+                          {t("Saving… ")}
                         </>
                       ) : (
-                        "Save"
+                        t("Save")
                       )}
                     </Button>
                     {vaulted[key] && (
                       <ConfirmDialog
                         destructive
-                        title={`Remove the ${vendorFromKey(key)} API key?`}
-                        description="The saved key is deleted from your keychain. You'll need to paste it again before this server works."
-                        confirmLabel="Remove"
+                        title={t("Remove the {value1} API key?", {
+                          value1: vendorFromKey(key),
+                        })}
+                        description={t(
+                          "The saved key is deleted from your keychain. You'll need to paste it again before this server works.",
+                        )}
+                        confirmLabel={t("Remove")}
                         onConfirm={() => remove(key)}
                         trigger={
                           <Button
                             size="icon"
                             variant="ghost"
                             className="size-8 shrink-0 text-muted-foreground hover:text-destructive"
-                            aria-label={`Remove ${key}`}
+                            aria-label={t("Remove {value1}", { value1: key })}
                             disabled={busyKey !== null}
                           >
                             {busyKey === `remove:${key}` ? (
@@ -931,8 +975,9 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
 
           {secretKeys.length === 0 && !isRemote && (
             <p className="text-sm text-muted-foreground">
-              This server didn't declare an API key. If it needs one, add it as an
-              environment variable below.
+              {t(
+                "This server didn't declare an API key. If it needs one, add it as an environment variable below. ",
+              )}
             </p>
           )}
 
@@ -943,7 +988,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
             open={secretKeys.length === 0 && !isRemote}
           >
             <summary className="cursor-pointer text-xs text-muted-foreground select-none">
-              Add another environment secret
+              {t("Add another environment secret ")}
             </summary>
             <div className="mt-2 flex items-center gap-2">
               <Input
@@ -954,14 +999,14 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
               />
               <Input
                 type="password"
-                placeholder="value"
+                placeholder={t("value")}
                 value={newValue}
                 onChange={(e) => setNewValue(e.target.value)}
               />
               <Button
                 size="icon"
                 className="size-8 shrink-0"
-                aria-label="Add secret"
+                aria-label={t("Add secret")}
                 disabled={busyKey !== null || !newKey.trim() || !newValue}
                 onClick={addNew}
               >

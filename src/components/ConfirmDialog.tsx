@@ -1,3 +1,4 @@
+import { useI18n } from "@/lib/i18n";
 import { useId, useState, type ReactNode } from "react";
 import {
   Dialog,
@@ -47,6 +48,7 @@ export function ConfirmDialog({
   open: openProp,
   onOpenChange,
 }: Props) {
+  const { t } = useI18n();
   const [openState, setOpenState] = useState(false);
   const [busy, setBusy] = useState(false);
   // Rich (element) descriptions contain block elements (div/p/ul), which are
@@ -87,7 +89,7 @@ export function ConfirmDialog({
         aria-describedby={richDescription ? descriptionId : undefined}
       >
         <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
+          <DialogTitle>{t(title)}</DialogTitle>
           {description &&
             (richDescription ? (
               <div
@@ -97,19 +99,19 @@ export function ConfirmDialog({
                 {description}
               </div>
             ) : (
-              <DialogDescription>{description}</DialogDescription>
+              <DialogDescription>{t(description as string)}</DialogDescription>
             ))}
         </DialogHeader>
         <DialogFooter>
           <Button variant="ghost" onClick={() => setOpen(false)} disabled={busy}>
-            {cancelLabel}
+            {t(cancelLabel)}
           </Button>
           <Button
             variant={destructive ? "destructive" : "default"}
             onClick={handleConfirm}
             disabled={busy || confirmDisabled}
           >
-            {confirmLabel}
+            {t(confirmLabel)}
           </Button>
         </DialogFooter>
       </DialogContent>
