@@ -45,6 +45,18 @@ Toolport on your normal update path.
 Working with a team? [Toolport Teams](https://toolport.app/teams) shares server
 configuration and policies while each member keeps their own credentials.
 
+## Interface language
+
+Open **Settings → General → Language** to choose English, Japanese, Simplified
+or Traditional Chinese, Korean, Spanish, French, German, or Brazilian Portuguese.
+Choose **System language** to follow your system language; unsupported languages
+fall back to English. Changes apply immediately and preserve unsaved input.
+Your choice is saved locally, and translations work without a translation service.
+
+Native tray menus, the separate GTK interface, and raw backend or MCP diagnostics
+retain their original wording. If a language dictionary fails to load, the UI
+falls back to English and shows an error; reload Toolport to retry.
+
 ## Documentation
 
 - [Supported clients and setup](docs/clients.md)
@@ -59,21 +71,9 @@ configuration and policies while each member keeps their own credentials.
 
 ## Development
 
-Requires Node.js and stable Rust, plus the platform dependencies described in
-[Contributing](CONTRIBUTING.md).
-
-```sh
-npm ci
-npm run build:gateway
-npm run tauri dev
-```
-
-See [Contributing](CONTRIBUTING.md) for testing and build instructions.
-
-## Toolport Teams
-
-Share server configuration and policies across a team while each member keeps
-their own credentials. [Hosted and self-hosted options](https://toolport.app/teams).
+See [Contributing](CONTRIBUTING.md) for building from source and testing,
+[DESIGN.md](DESIGN.md) for the system design, and [AGENTS.md](AGENTS.md) for
+agent work and verification requirements.
 
 ## License
 
