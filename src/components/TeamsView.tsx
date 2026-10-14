@@ -50,6 +50,9 @@ import { isEnabled, activeProfile } from "@/lib/types";
 import type { TeamPushPreview } from "@/lib/api";
 import type { Registry, InstructionsStatusView } from "@/lib/types";
 
+// アプリ生成の文言はキー、バックエンドの自由文は原文で保持する。
+type TeamsFeedback = string | { key: string };
+
 /**
  * Toolport Teams: join a team and have its shared MCP server set appear locally. The
  * team server holds only the server set + non-secret config, never a key, so after
@@ -74,9 +77,11 @@ export function TeamsView({
   const [inviteCode, setInviteCode] = useState("");
   const [memberName, setMemberName] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [skipNote, setSkipNote] = useState<string | null>(null);
+  const [error, setError] = useState<TeamsFeedback | null>(null);
+  const [notice, setNotice] = useState<TeamsFeedback | null>(null);
+  const [skipNote, setSkipNote] = useState<
+    string | { review: number; blocked: number } | null
+  >(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const personalServers = (registry?.servers ?? []).filter(
     (s) =>
@@ -127,38 +132,54 @@ export function TeamsView({
   // Local commands, LAN addresses and changed remote definitions require review
   // below; link-local/metadata URLs are blocked outright. The
   // backend emits the counts so the state is explained, not a silent mystery.
+  // イベントの件数を保持し、購読をやり直さず現在の言語で表示する。
+  const skipNoteText =
+    typeof skipNote === "string"
+      ? skipNote
+      : skipNote
+        ? (() => {
+            const { review, blocked } = skipNote;
+            const parts: string[] = [];
+            if (review > 0)
+              parts.push(
+                review === 1
+                  ? tr(
+                      "{value1} team server is off until you review and enable it below. Check the command, address and authentication before enabling.",
+                      { value1: review },
+                    )
+                  : tr(
+                      "{value1} team servers are off until you review and enable them below. Check the command, address and authentication before enabling.",
+                      { value1: review },
+                    ),
+              );
+            if (blocked > 0)
+              parts.push(
+                blocked === 1
+                  ? tr(
+                      "{value1} was blocked as unsafe (link-local or cloud-metadata URLs).",
+                      {
+                        value1: blocked,
+                      },
+                    )
+                  : tr(
+                      "{value1} were blocked as unsafe (link-local or cloud-metadata URLs).",
+                      {
+                        value1: blocked,
+                      },
+                    ),
+              );
+            return parts.join(" ");
+          })()
+        : null;
+
   useEffect(() => {
     const un = listen<{ review: number; blocked: number }>("team-servers-review", (e) => {
-      const { review, blocked } = e.payload;
-      const parts: string[] = [];
-      if (review > 0)
-        parts.push(
-          review === 1
-            ? tr(
-                "{value1} team server is off until you review and enable it below. Check the command, address and authentication before enabling.",
-                { value1: review },
-              )
-            : tr(
-                "{value1} team servers are off until you review and enable them below. Check the command, address and authentication before enabling.",
-                { value1: review },
-              ),
-        );
-      if (blocked > 0)
-        parts.push(
-          blocked === 1
-            ? tr("{value1} was blocked as unsafe (link-local or cloud-metadata URLs).", {
-                value1: blocked,
-              })
-            : tr("{value1} were blocked as unsafe (link-local or cloud-metadata URLs).", {
-                value1: blocked,
-              }),
-        );
-      setSkipNote(parts.join(" "));
+      setSkipNote(e.payload);
     });
     return () => {
       un.then((f) => f());
     };
-  }, [tr]);
+  }, []);
 
   async function run(label: string, fn: () => Promise<void>) {
     setBusy(label);
@@ -178,10 +199,12 @@ export function TeamsView({
     run("connect", async () => {
       const urlError = teamUrlError(serverUrl);
       if (urlError) {
-        throw new Error(urlError);
+        setError({ key: urlError });
+        return;
       }
       if (!inviteCode.trim()) {
-        throw new Error(tr("An invite or connect code is required."));
+        setError({ key: "An invite or connect code is required." });
+        return;
       }
       const su = serverUrl.trim();
       const mn = memberName.trim() || undefined;
@@ -190,16 +213,18 @@ export function TeamsView({
         // An approval-gated link: nothing is joined yet. Hold here and poll (below) until an
         // admin approves or denies; the fields stay as-is so the request context is preserved.
         setPending({ serverUrl: su, requestToken: r.requestToken, memberName: mn });
-        setNotice("Request sent. Waiting for an admin to approve you.");
+        setNotice({ key: "Request sent. Waiting for an admin to approve you." });
         return;
       }
       if (r.status === "connected" && r.registry) {
         onRegistryChange(r.registry);
         setInviteCode("");
-        setNotice("Connected. The team's servers were added to your active profile.");
+        setNotice({
+          key: "Connected. The team's servers were added to your active profile.",
+        });
         return;
       }
-      throw new Error(tr("The server returned an unexpected connect response."));
+      setError({ key: "The server returned an unexpected connect response." });
     });
 
   // While a join is pending admin approval, poll for the verdict. A transient network error
@@ -219,13 +244,17 @@ export function TeamsView({
           setPending(null);
           onRegistryChange(r.registry);
           setInviteCode("");
-          setNotice("Approved. The team's servers were added to your active profile.");
+          setNotice({
+            key: "Approved. The team's servers were added to your active profile.",
+          });
         } else if (r.status === "denied") {
           setPending(null);
-          setError("An admin declined your request to join this team.");
+          setError({ key: "An admin declined your request to join this team." });
         } else if (r.status === "unknown") {
           setPending(null);
-          setError("This join request expired. Ask for the link again and reconnect.");
+          setError({
+            key: "This join request expired. Ask for the link again and reconnect.",
+          });
         }
         // "pending" → keep waiting.
       } catch {
@@ -244,13 +273,15 @@ export function TeamsView({
   const onSync = () =>
     run("sync", async () => {
       onRegistryChange(await teamSync());
-      setNotice("Synced with the team.");
+      setNotice({ key: "Synced with the team." });
     });
 
   const onDisconnect = () =>
     run("disconnect", async () => {
       onRegistryChange(await teamDisconnect());
-      setNotice("Left the team. Its servers were removed; your own are untouched.");
+      setNotice({
+        key: "Left the team. Its servers were removed; your own are untouched.",
+      });
     });
 
   // The same local-only hint the GTK picker shows, from the last sync.
@@ -297,7 +328,7 @@ export function TeamsView({
       // reviewed=true: this runs only from the ConfirmDialog below, which showed
       // the member the exact command/URL. The backend refuses without it.
       onRegistryChange(await setServerEnabled(pid, serverId, true, true));
-      setNotice("Enabled. That server now runs in your active profile.");
+      setNotice({ key: "Enabled. That server now runs in your active profile." });
     });
 
   // One row in the Shared-servers list. Extracted so the review and active groups
@@ -449,17 +480,17 @@ export function TeamsView({
 
       {error && (
         <Callout variant="danger" className="mb-4">
-          {error}
+          {typeof error === "string" ? error : tr(error.key)}
         </Callout>
       )}
       {skipNote && (
         <Callout variant="warning" className="mb-4 whitespace-pre-line">
-          {skipNote}
+          {skipNoteText}
         </Callout>
       )}
       {notice && (
         <Callout variant="success" className="mb-4 whitespace-pre-line">
-          {notice}
+          {typeof notice === "string" ? notice : tr(notice.key)}
         </Callout>
       )}
 

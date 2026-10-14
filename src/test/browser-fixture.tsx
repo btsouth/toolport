@@ -3,7 +3,8 @@ import { mockIPC } from "@tauri-apps/api/mocks";
 import { createRoot } from "react-dom/client";
 import { ClientLogo } from "@/components/ClientLogo";
 import { ServerLogo } from "@/components/ServerLogo";
-import type { Registry, SavingsSummary, ServerEntry } from "@/lib/types";
+import type { Registry, RulesView, SavingsSummary, ServerEntry } from "@/lib/types";
+import type { ReapOutcome } from "@/lib/api";
 import "../index.css";
 
 if (!import.meta.env.DEV) throw new Error("Fixtures require the development server");
@@ -55,7 +56,12 @@ const missing: string[] = [];
 const writes: Array<{ command: string; args: unknown }> = [];
 const vaulted = new Set<string>();
 const auth = new Set<string>();
-Object.assign(window, { toolportFixture: { calls, missing, writes } });
+const cleanup: { outcome: ReapOutcome; fail: boolean } = {
+  outcome: { killed: [], failed: [], needsRestart: [] },
+  fail: false,
+};
+let rulesState: RulesView = { sets: [], clients: [], projects: [] };
+Object.assign(window, { toolportFixture: { calls, missing, writes, cleanup } });
 localStorage.setItem("toolport.onboarded", "1");
 
 mockIPC(
@@ -99,6 +105,54 @@ mockIPC(
         return new URLSearchParams(location.search).has("pairing")
           ? { state: "pending", check: "fixture-check", message: null }
           : null;
+      case "team_instructions_status":
+        return null;
+      case "team_connect":
+        return { status: "pending", requestToken: "fixture-request" };
+      case "team_join_poll":
+        return { status: "denied" };
+      case "plugin:dialog|open":
+        throw new Error("fixture-picker-error");
+      case "rules_view":
+        return structuredClone(rulesState);
+      case "rules_import_candidates":
+        return [
+          {
+            clientId: "codex",
+            clientName: "Codex",
+            path: "/fixture/AGENTS.md",
+            bytes: 30,
+          },
+        ];
+      case "rules_import_file":
+        return {
+          path: "/fixture/AGENTS.md",
+          name: "Fixture rules",
+          content: "fixture text",
+          strippedOurs: true,
+        };
+      case "rules_save_set": {
+        const request = args as { id: string | null; name: string; content: string };
+        const existing = rulesState.sets.find((set) => set.id === request.id);
+        const id = existing?.id ?? `fixture-rules-${rulesState.sets.length + 1}`;
+        const set = {
+          id,
+          name: request.name.trim() || "Rules",
+          content: request.content,
+          revision: existing
+            ? existing.revision + Number(existing.content !== request.content)
+            : 1,
+        };
+        rulesState = {
+          ...rulesState,
+          sets: existing
+            ? rulesState.sets.map((entry) => (entry.id === id ? set : entry))
+            : [...rulesState.sets, set],
+          activeSetId: rulesState.activeSetId ?? id,
+        };
+        writes.push({ command, args });
+        return structuredClone(rulesState);
+      }
       case "secret_status": {
         const request = args as { serverId: string; keys: string[] };
         return request.keys.map((key) => [
@@ -140,6 +194,10 @@ mockIPC(
       case "is_launch_at_login_enabled":
         return false;
       case "clients_needing_restart":
+        return structuredClone(cleanup.outcome.needsRestart);
+      case "stop_stale_gateways":
+        if (cleanup.fail) throw new Error("fixture-cleanup-error");
+        return structuredClone(cleanup.outcome);
       case "list_allowed_tools":
       case "list_quarantined":
       case "list_pending_approvals":
@@ -204,7 +262,7 @@ if (new URLSearchParams(location.search).has("logos")) {
   createRoot(document.getElementById("root")!).render(
     <LanguageProvider>
       <ThemeProvider>
-        <LocalizationControls server={servers[0]} />
+        <LocalizationControls server={servers[0]} registry={registry} />
       </ThemeProvider>
     </LanguageProvider>,
   );

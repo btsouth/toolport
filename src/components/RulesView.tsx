@@ -62,6 +62,18 @@ const RESERVED_MARKERS = [
   "<!-- Toolport personal rules",
 ];
 
+// アプリ生成の文言はキーと値、外部エラーは原文のまま保持する。
+type RulesMessage = {
+  key: string;
+  values?: Record<string, string | number>;
+};
+type RulesImportNote = {
+  name: string;
+  path: string;
+  strippedOurs: boolean;
+  nowActive: boolean;
+};
+
 /**
  * Agent rules: write your own instructions once and have Toolport put them in every AI client's
  * rules file (CLAUDE.md, AGENTS.md, GEMINI.md, and the rest) instead of editing each by hand.
@@ -78,7 +90,9 @@ export function RulesView() {
   const [data, setData] = useState<RulesViewData | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | RulesMessage | null>(null);
+  const errorText =
+    typeof error === "string" ? error : error ? tr(error.key, error.values) : null;
 
   // The editor is a local draft so typing never round-trips to disk. Every view refresh goes
   // through `adopt`, which reseats the draft on the active set, so one set's text can never be
@@ -104,7 +118,7 @@ export function RulesView() {
   const [importing, setImporting] = useState<{
     candidates: RulesImportCandidate[] | null;
   } | null>(null);
-  const [importNote, setImportNote] = useState<string | null>(null);
+  const [importNote, setImportNote] = useState<RulesImportNote | null>(null);
 
   /**
    * The preview card renders after the clients list, so on a window too short to reach it the
@@ -325,7 +339,10 @@ export function RulesView() {
       });
       if (typeof picked === "string") await run(() => rulesProjectAdd(picked), true);
     } catch (e) {
-      setError(tr("Couldn't open the folder picker: {value1}", { value1: String(e) }));
+      setError({
+        key: "Couldn't open the folder picker: {value1}",
+        values: { value1: String(e) },
+      });
     }
   }
 
@@ -370,7 +387,7 @@ export function RulesView() {
    */
   async function importFrom(path: string, clientName?: string) {
     setImporting(null);
-    let note: string | null = null;
+    let note: RulesImportNote | null = null;
     const known = new Set((data?.sets ?? []).map((s) => s.id));
     await run(async () => {
       await flushDraft();
@@ -381,19 +398,13 @@ export function RulesView() {
       const fresh = created.sets.find((s) => !known.has(s.id));
       if (fresh) forgetRulesDraft(fresh.id);
       const nowActive = created.activeSetId !== data?.activeSetId;
-      note =
-        (imported.strippedOurs
-          ? tr(
-              'Created "{value1}" from your own text in {value2}; the block Toolport had written there was left out. ',
-              { value1: imported.name, value2: imported.path },
-            )
-          : tr('Created "{value1}" from {value2}. ', {
-              value1: imported.name,
-              value2: imported.path,
-            })) +
-        (nowActive
-          ? tr("It is now your applied set. The file itself was not changed.")
-          : tr("Pick it above to edit and apply it. The file itself was not changed."));
+      // 原結果だけを保持し、言語を切り替えても再インポートせずに表示を更新する。
+      note = {
+        name: imported.name,
+        path: imported.path,
+        strippedOurs: imported.strippedOurs,
+        nowActive,
+      };
       return created;
     }, true);
     setImportNote(note);
@@ -408,7 +419,10 @@ export function RulesView() {
       });
       if (typeof picked === "string") await importFrom(picked);
     } catch (e) {
-      setError(tr("Couldn't open the file picker: {value1}", { value1: String(e) }));
+      setError({
+        key: "Couldn't open the file picker: {value1}",
+        values: { value1: String(e) },
+      });
     }
   }
 
@@ -446,7 +460,7 @@ export function RulesView() {
     return (
       <div className="flex flex-col gap-3">
         <Callout variant="danger" role="alert">
-          {error ?? tr("Could not load your agent rules.")}
+          {errorText ?? tr("Could not load your agent rules.")}
         </Callout>
         <Button
           size="sm"
@@ -486,7 +500,7 @@ export function RulesView() {
     <div className="flex flex-col gap-5">
       {error && (
         <Callout variant="danger" role="alert">
-          {error}
+          {errorText}
         </Callout>
       )}
 
@@ -611,7 +625,20 @@ export function RulesView() {
 
         {importNote && (
           <Callout variant="info" className="mb-3 text-xs">
-            {importNote}
+            {importNote.strippedOurs
+              ? tr(
+                  'Created "{value1}" from your own text in {value2}; the block Toolport had written there was left out. ',
+                  { value1: importNote.name, value2: importNote.path },
+                )
+              : tr('Created "{value1}" from {value2}. ', {
+                  value1: importNote.name,
+                  value2: importNote.path,
+                })}
+            {importNote.nowActive
+              ? tr("It is now your applied set. The file itself was not changed.")
+              : tr(
+                  "Pick it above to edit and apply it. The file itself was not changed.",
+                )}
           </Callout>
         )}
 

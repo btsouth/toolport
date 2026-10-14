@@ -1075,8 +1075,7 @@ function App() {
                     <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed px-3 py-6 text-center">
                       <p className="text-sm text-muted-foreground">
                         {" "}
-                        {t('No servers match "')}
-                        {query}".
+                        {t('No servers match "{query}".', { query })}
                       </p>
                       <button
                         type="button"

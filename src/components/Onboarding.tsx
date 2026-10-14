@@ -365,11 +365,14 @@ function Welcome({
   );
 }
 
+// アプリ生成のエラーだけ表示時に翻訳し、外部エラー文字列は保持する。
+type JoinError = string | { key: string };
+
 /** The team-member on-ramp. A person handed an invite code lands here from the
  * Welcome step, pastes it, and the team's shared servers arrive locally. The
  * hosted server is the default; self-hosting is a tucked-away advanced toggle so
  * the common case is a single field. */
-function JoinTeam({
+export function JoinTeam({
   onBack,
   onRegistryChange,
   onClientsRefresh,
@@ -386,7 +389,7 @@ function JoinTeam({
   const [serverUrl, setServerUrl] = useState(HOSTED_TEAMS_URL);
   const [advanced, setAdvanced] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<JoinError | null>(null);
   const [joined, setJoined] = useState(false);
   // Set while an approval-gated join waits for an admin; holds the values used to request it.
   const [pending, setPending] = useState<{
@@ -415,12 +418,12 @@ function JoinTeam({
           setJoined(true);
         } else if (r.status === "denied") {
           setPending(null);
-          setError(translate("An admin declined your request to join this team."));
+          setError({ key: "An admin declined your request to join this team." });
         } else if (r.status === "unknown") {
           setPending(null);
-          setError(
-            translate("This join request expired. Ask for the link again and reconnect."),
-          );
+          setError({
+            key: "This join request expired. Ask for the link again and reconnect.",
+          });
         }
       } catch {
         // Transient: the next tick retries.
@@ -439,11 +442,11 @@ function JoinTeam({
     setError(null);
     const urlError = teamUrlError(serverUrl);
     if (urlError) {
-      setError(urlError);
+      setError({ key: urlError });
       return;
     }
     if (!code.trim()) {
-      setError(t("Enter the invite or connect code your team gave you."));
+      setError({ key: "Enter the invite or connect code your team gave you." });
       return;
     }
     setBusy(true);
@@ -459,7 +462,7 @@ function JoinTeam({
         onClientsRefresh();
         setJoined(true);
       } else {
-        setError(t("The server returned an unexpected connect response."));
+        setError({ key: "The server returned an unexpected connect response." });
       }
     } catch (e) {
       setError(String(e));
@@ -540,7 +543,7 @@ function JoinTeam({
       </div>
       {error && (
         <p className="text-sm text-destructive" role="alert">
-          {error}
+          {typeof error === "string" ? error : t(error.key)}
         </p>
       )}
       <div className="flex items-center justify-between border-t pt-4">

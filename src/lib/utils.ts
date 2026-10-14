@@ -62,9 +62,15 @@ export function fmtMs(ms: number | null): string {
 
 /** Dollar value of saved input tokens, scaled to the number's size. */
 export function fmtDollars(n: number): string {
-  if (n >= 1000) return `$${Math.round(n).toLocaleString(getLocale())}`;
-  if (n >= 10) return `$${n.toFixed(0)}`;
-  return `$${n.toFixed(2)}`;
+  const digits = n < 10 ? 2 : 0;
+  const rounded = n >= 1000 ? Math.round(n) : Number(n.toFixed(digits));
+  return new Intl.NumberFormat(getLocale(), {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+    useGrouping: n >= 1000,
+  }).format(rounded);
 }
 
 /**

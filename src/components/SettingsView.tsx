@@ -67,6 +67,7 @@ import {
   type ClientNeedingRestart,
   type HttpBridgeStatus,
   type QuarantinedTool,
+  type ReapOutcome,
 } from "@/lib/api";
 import type {
   AllowedTool,
@@ -894,7 +895,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   const [newToken, setNewToken] = useState<string | null>(null);
   const [clientBusy, setClientBusy] = useState(false);
   const [reapBusy, setReapBusy] = useState(false);
-  const [reapResult, setReapResult] = useState<string | null>(null);
+  const [reapOutcome, setReapOutcome] = useState<ReapOutcome | null>(null);
   // Apps still launching an obsolete gateway. Seeded from stored state because the
   // launch reaper already found them before this view existed; refreshed from the
   // button's own outcome, which merges rather than replaces (SOU-435).
@@ -1167,6 +1168,35 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       )}
     </label>
   );
+
+  // 実行結果を保持し、言語切替では清掃を再実行せず表示だけを再生成する。
+  const reapResultParts: string[] = [];
+  if (reapOutcome?.killed.length) {
+    reapResultParts.push(
+      t("Stopped {value1}: {value2}", {
+        value1: reapOutcome.killed.length,
+        value2: reapOutcome.killed.join("; "),
+      }),
+    );
+  }
+  if (reapOutcome?.failed.length) {
+    reapResultParts.push(
+      t("Could not stop {value1}: {value2}", {
+        value1: reapOutcome.failed.length,
+        value2: reapOutcome.failed.join("; "),
+      }),
+    );
+  }
+  const reapResult = !reapOutcome
+    ? null
+    : reapResultParts.length > 0
+      ? reapResultParts.join(". ")
+      : reapOutcome.needsRestart.length > 0
+        ? // プロセスが今なくても、次のツール呼び出しで旧版を起動するアプリは残る。
+          t(
+            "Nothing to stop: these apps spawn the old gateway on their next tool call, so there is no process running between calls.",
+          )
+        : t("No old gateway processes found.");
 
   return (
     <div className="mx-auto flex max-w-2xl flex-col gap-6">
@@ -1822,7 +1852,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               disabled={reapBusy}
               onClick={async () => {
                 setReapBusy(true);
-                setReapResult(null);
+                setReapOutcome(null);
                 try {
                   const outcome = await stopStaleGateways();
                   // Always from the outcome: it carries the merged advice, so
@@ -1835,46 +1865,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   // the check's own result, which is the same contradiction the
                   // panel exists to prevent (#730).
                   setRestartCheckFailed(false);
-                  const parts: string[] = [];
-                  if (outcome.killed.length > 0) {
-                    parts.push(
-                      t("Stopped {value1}: {value2}", {
-                        value1: outcome.killed.length,
-                        value2: outcome.killed.join("; "),
-                      }),
-                    );
-                  }
-                  // Reporting "found nothing" while a process is still running would
-                  // be the same lie the panel exists to prevent.
-                  if (outcome.failed.length > 0) {
-                    parts.push(
-                      t("Could not stop {value1}: {value2}", {
-                        value1: outcome.failed.length,
-                        value2: outcome.failed.join("; "),
-                      }),
-                    );
-                  }
-                  setReapResult(
-                    parts.length > 0
-                      ? parts.join(". ")
-                      : outcome.needsRestart.length > 0
-                        ? // Saying "found nothing" while the panel below names an app
-                          // still launching an old gateway would be the same
-                          // self-contradiction this panel exists to prevent. Naming
-                          // only the moment ("none right now") was not enough either:
-                          // read directly above "5 apps are still launching an old
-                          // gateway" it still lands as a contradiction. State the
-                          // reason, because that is what makes both true at once — a
-                          // client spawns the gateway on its next tool call, not
-                          // continuously.
-                          t(
-                            "Nothing to stop: these apps spawn the old gateway on their ",
-                          ) +
-                          t(
-                            "next tool call, so there is no process running between calls.",
-                          )
-                        : t("No old gateway processes found."),
-                  );
+                  setReapOutcome(outcome);
                 } catch (e) {
                   toastError(
                     t("Couldn't stop old gateways: {value1}", { value1: String(e) }),
