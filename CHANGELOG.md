@@ -6,6 +6,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.24.2] - 2026-10-15
+
+A security update for the 1.24 line.
+
+### Security
+
+- rustls 0.23.46. (#1185)
+
 ## [1.24.1] - 2026-10-14
 
 The last planned 1.x feature release before Toolport 2.0. The 1.24 line keeps
