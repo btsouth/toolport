@@ -85,13 +85,15 @@ async function baseline(profile) {
   await withFixture(profile, false, async (_fixture, client) => {
     await client.initialize();
     const native = ["codex", "cursor"].includes(profile.id);
-    const tools = await catalog(client, native ? "mock__echo" : "toolport_search_tools");
+    // Claude Code's Auto lists a catalog this small in full.
+    const full = native || profile.id === "claude-code";
+    const tools = await catalog(client, full ? "mock__echo" : "toolport_search_tools");
     assert.equal(
       tools.some((t) => t.name === "toolport_call_tool"),
-      true,
+      !full || native,
       "Auto clients retain scoped call helpers, including non-refreshing Full clients",
     );
-    if (!native) {
+    if (!full) {
       const search = await client.call("toolport_search_tools", {
         query: "mock__echo",
         limit: 1,
@@ -102,7 +104,7 @@ async function baseline(profile) {
     const reply = await client.call(
       "mock__echo",
       { text: "fixture café 東京" },
-      !native,
+      !full,
       "echo-string-id",
     );
     success(reply);
@@ -282,16 +284,13 @@ try {
   await withFixture(codex, true, async (fixture, first) => {
     const second = fixture.client(claude);
     await Promise.all([first.initialize(), second.initialize()]);
-    await Promise.all([
-      catalog(first, "mock__echo"),
-      catalog(second, "toolport_search_tools"),
-    ]);
-    const search = await second.call("toolport_search_tools", { query: "mock__echo" });
+    await Promise.all([catalog(first, "mock__echo"), catalog(second, "mock__echo")]);
+    const search = await first.call("toolport_search_tools", { query: "mock__echo" });
     success(search);
     assert(textOf(search).includes("mock__echo"));
     const replies = await Promise.all([
       first.call("mock__echo", { text: "codex owned" }, false, "same-id"),
-      second.call("mock__echo", { text: "claude owned" }, true, "same-id"),
+      second.call("mock__echo", { text: "claude owned" }, false, "same-id"),
     ]);
     replies.forEach(success);
     assert(textOf(replies[0]).includes("codex owned"));

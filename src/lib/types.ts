@@ -35,6 +35,8 @@ export interface DetectedClient {
   discovery?: {
     autoMode?: "full" | "lazy";
     nativeToolSearch: boolean | null;
+    /** Auto lists the catalog in full at or below this many tools. */
+    autoFullMaxTools?: number | null;
     toolsListChanged: boolean | null;
     coldFullListWaitMs?: number;
     evidence: string;

@@ -206,6 +206,7 @@
   "Authentication required (401)": "認証が必要です（401）",
   "Auto ({mode})": "自動 ({mode})",
   "Auto: {mode}": "自動: {mode}",
+  "full up to {count} tools, then lazy": "ツール{count}件までは full、それ以上は lazy",
   "Available to connect": "接続可能",
   "Avg": "平均",
   "Back": "戻る",

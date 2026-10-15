@@ -206,6 +206,7 @@
   "Authentication required (401)": "인증이 필요합니다 (401)",
   "Auto ({mode})": "자동( {mode} )",
   "Auto: {mode}": "자동: {mode}",
+  "full up to {count} tools, then lazy": "도구 {count}개까지 full, 그 이상은 lazy",
   "Available to connect": "접속 가능",
   "Avg": "평균",
   "Back": "뒤로",

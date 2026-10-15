@@ -11,6 +11,9 @@ pub struct DiscoveryCapabilities {
     /// Most tools this client accepts from one server. Above it the client drops
     /// the server's whole list, so Full answers with the search tools instead.
     pub max_tools: Option<usize>,
+    /// Auto answers Full instead of Lazy when the client's scoped catalog has at
+    /// most this many tools: below it, listing every tool costs less than searching.
+    pub auto_full_max_tools: Option<usize>,
     pub evidence: &'static str,
 }
 
@@ -29,6 +32,10 @@ impl DiscoveryCapabilities {
     }
 }
 
+/// Claude Code's Lazy and Full input cross near 130 tools: 2026-10-15 live CLI
+/// runs, 30 tasks per cell, Lazy +31.5% at 50 tools, -5.0% at 150, -42.0% at 400.
+const CLAUDE_CODE_AUTO_FULL_MAX_TOOLS: usize = 120;
+
 pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
     // Sources and conservative unknowns for every supported adapter are recorded
     // in docs/client-discovery.md. API hosts are not file-based client adapters.
@@ -39,6 +46,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             tools_list_changed: Some(true),
             cold_full_list_wait_ms: 2_000,
             max_tools: None,
+            auto_full_max_tools: Some(CLAUDE_CODE_AUTO_FULL_MAX_TOOLS),
             evidence: "https://code.claude.com/docs/en/mcp",
         },
         "codex" => DiscoveryCapabilities {
@@ -48,6 +56,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             cold_full_list_wait_ms: 8_000,
             // Codex 0.162.1 shows no tools from a server that lists 2,049 or more.
             max_tools: Some(2_048),
+            auto_full_max_tools: None,
             evidence: "https://developers.openai.com/codex/config-reference",
         },
         "cursor" => DiscoveryCapabilities {
@@ -56,6 +65,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             tools_list_changed: Some(false),
             cold_full_list_wait_ms: 5_000,
             max_tools: None,
+            auto_full_max_tools: None,
             evidence: "https://cursor.com/blog/dynamic-context-discovery",
         },
         "opencode" | "gemini-cli" | "cline" | "zed" => DiscoveryCapabilities {
@@ -66,6 +76,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             // establish how quickly every installed version refreshes its catalog.
             cold_full_list_wait_ms: 5_000,
             max_tools: None,
+            auto_full_max_tools: None,
             evidence: "docs/client-conformance.md (source and notification evidence)",
         },
         "anthropic-api" => DiscoveryCapabilities {
@@ -74,6 +85,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             tools_list_changed: None,
             cold_full_list_wait_ms: 5_000,
             max_tools: None,
+            auto_full_max_tools: None,
             evidence:
                 "https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool",
         },
@@ -83,6 +95,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             tools_list_changed: None,
             cold_full_list_wait_ms: 5_000,
             max_tools: None,
+            auto_full_max_tools: None,
             evidence: "https://developers.openai.com/api/docs/guides/tools-tool-search",
         },
         "lm-studio" | "jan" | "anythingllm" => DiscoveryCapabilities {
@@ -91,6 +104,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             tools_list_changed: None,
             cold_full_list_wait_ms: 5_000,
             max_tools: None,
+            auto_full_max_tools: None,
             evidence: "docs/clients.md (local-model clients)",
         },
         _ => DiscoveryCapabilities {
@@ -99,6 +113,7 @@ pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
             tools_list_changed: None,
             cold_full_list_wait_ms: 5_000,
             max_tools: None,
+            auto_full_max_tools: None,
             evidence: "docs/clients.md (adapter notes; discovery support unverified)",
         },
     }
@@ -277,10 +292,54 @@ mod tests {
                 tools_list_changed: Some(true),
                 cold_full_list_wait_ms: 2_000,
                 max_tools: None,
+                auto_full_max_tools: None,
                 evidence: "fixture"
             }
             .auto_mode(),
             "lazy"
+        );
+    }
+    #[test]
+    fn claude_code_auto_lists_small_catalogs_in_full() {
+        assert_eq!(
+            capabilities("claude-code").auto_full_max_tools,
+            Some(CLAUDE_CODE_AUTO_FULL_MAX_TOOLS)
+        );
+        for id in ["opencode", "codex", "cursor", "unknown"] {
+            assert_eq!(capabilities(id).auto_full_max_tools, None, "{id}");
+        }
+
+        let mut registry = crate::registry::Registry::default();
+        for id in ["claude-code", "client:claude-code", "adapter:claude-code"] {
+            assert_eq!(
+                super::super::auto_full_max_tools(&registry, id),
+                Some(CLAUDE_CODE_AUTO_FULL_MAX_TOOLS),
+                "{id}"
+            );
+        }
+        assert_eq!(
+            super::super::auto_full_max_tools(&registry, "opencode"),
+            None
+        );
+        // An explicit per-client or global choice is never second-guessed.
+        registry.set_client_discovery("claude-code", Some("lazy"));
+        assert_eq!(
+            super::super::auto_full_max_tools(&registry, "adapter:claude-code"),
+            None
+        );
+        // An unrecognized stored value falls back to Auto, as in client_discovery_mode.
+        registry
+            .client_discovery
+            .insert("claude-code".into(), "bogus".into());
+        assert_eq!(
+            super::super::auto_full_max_tools(&registry, "claude-code"),
+            Some(CLAUDE_CODE_AUTO_FULL_MAX_TOOLS)
+        );
+        registry.set_client_discovery("claude-code", None);
+        registry.set_discovery_mode("lazy");
+        assert_eq!(
+            super::super::auto_full_max_tools(&registry, "claude-code"),
+            None
         );
     }
 }

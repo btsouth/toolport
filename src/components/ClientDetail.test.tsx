@@ -546,6 +546,36 @@ describe("ClientDetail Auto discovery", () => {
       ),
     ).toBeInTheDocument();
   });
+  it("shows the small-catalog Full limit in Auto unless a global mode was chosen", () => {
+    const discovery = {
+      autoMode: "lazy" as const,
+      autoFullMaxTools: 120,
+      nativeToolSearch: true,
+      toolsListChanged: true,
+      evidence: "fixture",
+    };
+    const { unmount } = render(
+      <ClientDetail
+        client={client({ id: "claude-code", discovery })}
+        registry={emptyRegistry()}
+        onRegistryChange={vi.fn()}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByText("Auto (full up to 120 tools, then lazy)"),
+    ).toBeInTheDocument();
+    unmount();
+    render(
+      <ClientDetail
+        client={client({ id: "claude-code", discovery })}
+        registry={{ ...emptyRegistry(), discoveryMode: "lazy" }}
+        onRegistryChange={vi.fn()}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Auto (lazy)")).toBeInTheDocument();
+  });
   it("shows the Lazy a 1.x upgrade kept instead of the client default", () => {
     render(
       <ClientDetail

@@ -206,6 +206,7 @@
   "Authentication required (401)": "需要驗證（401）",
   "Auto ({mode})": "自動 ({mode})",
   "Auto: {mode}": "自動：{mode}",
+  "full up to {count} tools, then lazy": "{count} 個工具以內為 full，超過則為 lazy",
   "Available to connect": "可連線",
   "Avg": "平均",
   "Back": "返回",

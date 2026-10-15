@@ -135,6 +135,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     (registry?.lazyDiscovery === false ? "full" : "") ||
     (registry?.legacyLazyDiscovery ? "lazy" : "");
   const autoMode = chosenGlobal || client.discovery?.autoMode || "lazy";
+  // Auto lists a small catalog in full for clients with a measured crossover.
+  const autoFullMax = chosenGlobal ? null : client.discovery?.autoFullMaxTools;
+  const autoLabel = autoFullMax
+    ? translate("full up to {count} tools, then lazy", { count: autoFullMax })
+    : autoMode;
   const storedMode = registry?.clientDiscovery?.[client.id]?.trim().toLowerCase();
   const clientMode = storedMode && DISCOVERY_HINT[storedMode] ? storedMode : "";
   const effectiveMode = clientMode || autoMode;
@@ -620,7 +625,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               {translate("Discovery mode")}
               {!clientMode && (
                 <span className="ml-1.5 font-normal text-muted-foreground">
-                  {t("Auto: {mode}", { mode: autoMode })}
+                  {t("Auto: {mode}", { mode: autoLabel })}
                 </span>
               )}
             </div>
@@ -642,7 +647,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="__auto__">
-                {t("Auto ({mode})", { mode: autoMode })}
+                {t("Auto ({mode})", { mode: autoLabel })}
               </SelectItem>
               <SelectItem value="lazy">{translate("Lazy · search")}</SelectItem>
               <SelectItem value="grouped">{translate("Grouped · per-server")}</SelectItem>

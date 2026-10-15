@@ -206,6 +206,7 @@
   "Authentication required (401)": "Authentification requise (401)",
   "Auto ({mode})": "Automatique ({mode})",
   "Auto: {mode}": "Automatique : {mode}",
+  "full up to {count} tools, then lazy": "full jusqu’à {count} outils, puis lazy",
   "Available to connect": "Disponible pour se connecter",
   "Avg": "Moyenne",
   "Back": "Retour",

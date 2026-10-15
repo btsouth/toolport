@@ -8,6 +8,15 @@ fixture successes with 78.7% less mean input. These are fixture results for thos
 builds and models, not production-service acceptance. Other defaults retain the
 capability-based choice below. Unknown means unverified.
 
+Claude Code's Auto lists a small catalog in Full: at most 120 downstream tools
+in its scope. The 2026-10-15 live CLI runs (Claude Code 2.1.300, Haiku 5.5, the
+same 30 dev tasks per cell) found Lazy used 31.5% more mean input than Full at
+50 tools, 5.0% less at 150, 42.0% less at 400 and 80.8% less at 1,707, with equal
+success. Full also finished faster at small sizes. The limit applies once every
+server in the client's scope has finished starting. If the catalog grows past the
+limit, the next list answers Lazy and clients are told the list changed. An
+explicit per-client or global mode, or `TOOLPORT_DISCOVERY`, always wins.
+
 Codex 0.162.1 shows no tools at all from a server that lists more than 2,048.
 When a Full list for Codex would pass that limit, Toolport answers with the Lazy
 search tools instead, so Codex keeps a working search.

@@ -206,6 +206,7 @@
   "Authentication required (401)": "需要身份验证（401）",
   "Auto ({mode})": "自动 ({mode})",
   "Auto: {mode}": "自动：{mode}",
+  "full up to {count} tools, then lazy": "{count} 个工具以内为 full，超过则为 lazy",
   "Available to connect": "可连接",
   "Avg": "平均",
   "Back": "返回",

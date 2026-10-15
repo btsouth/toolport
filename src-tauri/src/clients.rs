@@ -264,6 +264,30 @@ pub fn client_discovery_mode(registry: &crate::registry::Registry, id: &str) -> 
     discovery_capabilities(id).resolve_mode(mode)
 }
 
+/// Auto's small-catalog Full limit for this client, or `None` when a per-client
+/// or global choice decides the mode instead of Auto.
+pub fn auto_full_max_tools(registry: &crate::registry::Registry, id: &str) -> Option<usize> {
+    let id = id.strip_prefix("adapter:").unwrap_or(id);
+    let chosen = registry
+        .client_discovery_mode(id)
+        .or_else(|| {
+            id.strip_prefix("client:")
+                .and_then(|adapter| registry.client_discovery_mode(adapter))
+        })
+        .or_else(|| registry.chosen_global_discovery_mode())
+        .is_some_and(|mode| {
+            matches!(
+                mode.trim().to_ascii_lowercase().as_str(),
+                "full" | "lazy" | "grouped"
+            )
+        });
+    if chosen {
+        None
+    } else {
+        discovery_capabilities(id).auto_full_max_tools
+    }
+}
+
 pub fn discovery_capabilities(id: &str) -> DiscoveryCapabilities {
     // Adapter routing wraps legacy client IDs too. Only the capability lookup
     // uses this spelling; authorization and result ownership keep the wire ID.

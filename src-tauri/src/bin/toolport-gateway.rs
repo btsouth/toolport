@@ -7199,6 +7199,65 @@ fn over_client_tool_limit(client: Option<&str>, tools: usize) -> bool {
         .is_some_and(|max| tools > max)
 }
 
+/// Auto answers Full instead of Lazy when the client's scoped catalog is small
+/// enough that listing every tool costs less than searching it. Explicit modes,
+/// including `TOOLPORT_DISCOVERY`, are never changed (docs/client-discovery.md).
+fn auto_full_small_catalog(
+    reg: &Registry,
+    router: &Router,
+    allowed: Option<&std::collections::HashSet<String>>,
+    client: Option<&str>,
+    mode: DiscoveryMode,
+    downstream_tools: usize,
+) -> bool {
+    mode == DiscoveryMode::Lazy
+        && conduit_lib::brand::env_var("TOOLPORT_DISCOVERY", "CONDUIT_DISCOVERY").is_none()
+        // A catalog still loading only looks small; keep Lazy until it settles.
+        && !router.any_starting(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
+        && client
+            .and_then(|id| clients::auto_full_max_tools(reg, id))
+            .is_some_and(|max| (1..=max).contains(&downstream_tools))
+}
+
+/// The mode `tools/list` would answer with now, for text that has to match it.
+fn listed_discovery_mode(
+    host: &HostState,
+    reg: &Registry,
+    router: &Router,
+    cached: &dyn ToolCatalog,
+    allowed: Option<&std::collections::HashSet<String>>,
+    client: Option<&str>,
+    mode: DiscoveryMode,
+) -> DiscoveryMode {
+    let Some(max) = client.and_then(|id| clients::auto_full_max_tools(reg, id)) else {
+        return mode;
+    };
+    // Scoping only removes tools, so an unscoped catalog over the limit stays Lazy
+    // without building its full surface on every initialize.
+    if mode != DiscoveryMode::Lazy || (allowed.is_none() && cached.len() > max) {
+        return mode;
+    }
+    let catalog = if cached.is_empty() {
+        router.shared_tools()
+    } else {
+        drop_blocked_from_cache(cached.shared(), router, reg)
+    };
+    let full = tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Full);
+    let floor = full_tool_floor(host.code_mode_enabled(), full_discovery_fallback(client)).len();
+    if auto_full_small_catalog(
+        reg,
+        router,
+        allowed,
+        client,
+        mode,
+        full.len().saturating_sub(floor),
+    ) {
+        DiscoveryMode::Full
+    } else {
+        mode
+    }
+}
+
 fn full_discovery_fallback(client: Option<&str>) -> bool {
     clients::discovery_capabilities(client.unwrap_or("")).tools_list_changed == Some(false)
 }
@@ -7663,9 +7722,12 @@ fn handle_request_with_cancel(
                 // reuse one client's answer for another.
                 "cacheScope": "private"
             });
-            if let Some(text) =
-                server_instructions(reg, profile, || discovery_instructions(mode, client))
-            {
+            if let Some(text) = server_instructions(reg, profile, || {
+                discovery_instructions(
+                    listed_discovery_mode(host, reg, router, cached, allowed, client, mode),
+                    client,
+                )
+            }) {
                 result["instructions"] = Value::String(text);
             }
             Some(success(id, result))
@@ -7691,9 +7753,12 @@ fn handle_request_with_cancel(
                 "capabilities": gateway_capabilities(host, router, allowed, reg, mode),
                 "serverInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") },
             });
-            if let Some(text) =
-                server_instructions(reg, profile, || discovery_instructions(mode, client))
-            {
+            if let Some(text) = server_instructions(reg, profile, || {
+                discovery_instructions(
+                    listed_discovery_mode(host, reg, router, cached, allowed, client, mode),
+                    client,
+                )
+            }) {
                 result["instructions"] = Value::String(text);
             }
             Some(success(id, result))
@@ -7710,20 +7775,32 @@ fn handle_request_with_cancel(
             if mode == DiscoveryMode::Full && full_discovery_fallback(client) {
                 tools.splice(2..2, [search_tool_def(), call_tool_def()]);
             }
+            let mut full = tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Full);
+            if full_discovery_fallback(client) {
+                full.splice(2..2, [search_tool_def(), call_tool_def()]);
+            }
+            let full_floor =
+                full_tool_floor(host.code_mode_enabled(), full_discovery_fallback(client)).len();
             let mode = if mode == DiscoveryMode::Full && over_client_tool_limit(client, tools.len())
             {
                 // The client would drop every tool, so answer with search instead.
                 tools = tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Lazy);
                 DiscoveryMode::Lazy
+            } else if auto_full_small_catalog(
+                reg,
+                router,
+                allowed,
+                client,
+                mode,
+                full.len().saturating_sub(full_floor),
+            ) {
+                // Listing a catalog this small costs the client less than searching it.
+                tools = full.clone();
+                DiscoveryMode::Full
             } else {
                 mode
             };
             {
-                let mut full =
-                    tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Full);
-                if full_discovery_fallback(client) {
-                    full.splice(2..2, [search_tool_def(), call_tool_def()]);
-                }
                 guard
                     .catalog
                     .resolve_baseline_eligibility(|| !over_client_tool_limit(client, full.len()));
@@ -16860,6 +16937,11 @@ fn process_request_wire_inner(
             profile_snapshot.as_deref(),
             discovery,
         );
+        let full_floor = full_tool_floor(
+            state.code_mode_enabled(),
+            full_discovery_fallback(active_request_context().connection_identity.as_deref()),
+        )
+        .len();
         let discovery = if discovery == DiscoveryMode::Full
             && over_client_tool_limit(client, exposed.tool_count())
         {
@@ -16874,6 +16956,25 @@ fn process_request_wire_inner(
                 DiscoveryMode::Lazy,
             );
             DiscoveryMode::Lazy
+        } else if auto_full_small_catalog(
+            &reg,
+            &router,
+            allowed,
+            client,
+            discovery,
+            full.summary.tool_count().saturating_sub(full_floor),
+        ) {
+            // Listing a catalog this small costs the client less than searching it.
+            (full, exposed) = cached_tool_surfaces(
+                state,
+                &reg,
+                &router,
+                &cache_snapshot,
+                allowed,
+                profile_snapshot.as_deref(),
+                DiscoveryMode::Full,
+            );
+            DiscoveryMode::Full
         } else {
             discovery
         };
@@ -37753,6 +37854,99 @@ mod tests {
             savings::surface_bytes(reply["result"]["tools"].as_array().unwrap())
         );
         assert_eq!(savings::summary()["tokensSaved"], 0);
+    }
+
+    #[test]
+    fn claude_code_auto_lists_small_catalogs_in_full_on_both_paths() {
+        let _data = DataDirTestEnv::new("auto-small-catalog");
+        let names = |reply: &Value| -> Vec<String> {
+            reply["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for (count, client, override_mode, expect_full) in [
+            (3, "adapter:claude-code", None, true),
+            (120, "claude-code", None, true),
+            (121, "adapter:claude-code", None, false),
+            (3, "adapter:claude-code", Some("lazy"), false),
+            (3, "adapter:opencode", None, false),
+        ] {
+            let state = http_state(true);
+            let tools: Vec<_> = (0..count)
+                .map(|i| json!({"name":format!("fixture__work_{i}"), "inputSchema":{}}))
+                .collect();
+            let snapshot = Arc::new(CatalogSnapshot::lexical_for_test(tools.clone()));
+            *state.cached_tools.lock().unwrap() = Arc::clone(&snapshot);
+            let mut reg = Registry::default();
+            reg.set_client_discovery("claude-code", override_mode);
+            *state.registry.lock().unwrap() = reg.clone();
+            let router = Router::new();
+            let guard = SearchGuard::default();
+            let list = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+            let init = json!({"jsonrpc":"2.0","id":2,"method":"initialize",
+                "params":{"protocolVersion":"2025-06-18","capabilities":{},
+                "clientInfo":{"name":"claude-code","version":"test"}}});
+            let wire = process_request_wire(
+                &state,
+                &list,
+                &guard,
+                None,
+                None,
+                None,
+                None,
+                Some(client),
+                None,
+                DiscoveryMode::Lazy,
+            )
+            .unwrap()
+            .into_value();
+            let direct = |req: &Value| {
+                handle_request_with_cancel(
+                    &state,
+                    req,
+                    &reg,
+                    &router,
+                    &tools,
+                    DiscoveryMode::Lazy,
+                    None,
+                    &guard,
+                    None,
+                    None,
+                    Some(client),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+            let label = format!("{count} tools, {client}, override {override_mode:?}");
+            for (path, reply) in [("wire", &wire), ("direct", &direct(&list))] {
+                let names = names(reply);
+                assert_eq!(
+                    names.contains(&"fixture__work_0".to_string()),
+                    expect_full,
+                    "{label}, {path}: {names:?}"
+                );
+                assert_eq!(
+                    names.contains(&"toolport_search_tools".to_string()),
+                    !expect_full,
+                    "{label}, {path}: {names:?}"
+                );
+            }
+            let instructions = direct(&init)["result"]["instructions"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(
+                instructions.contains("Call the advertised tool name directly."),
+                expect_full,
+                "{label}: {instructions}"
+            );
+        }
     }
 
     // Exercise the real dispatch and durable writer, including both list paths.
