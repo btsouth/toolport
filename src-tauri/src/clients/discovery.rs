@@ -30,6 +30,21 @@ impl DiscoveryCapabilities {
     pub fn auto_mode(self) -> &'static str {
         self.auto_mode
     }
+
+    /// Auto's small-catalog Full limit, or `None` when a chosen mode decides instead.
+    pub fn auto_full_max_tools_for(self, chosen: Option<&str>) -> Option<usize> {
+        let chosen = chosen.is_some_and(|mode| {
+            matches!(
+                mode.trim().to_ascii_lowercase().as_str(),
+                "full" | "lazy" | "grouped"
+            )
+        });
+        if chosen {
+            None
+        } else {
+            self.auto_full_max_tools
+        }
+    }
 }
 
 /// Claude Code's Lazy and Full input cross near 130 tools: 2026-10-15 live CLI
@@ -299,6 +314,26 @@ mod tests {
             "lazy"
         );
     }
+    #[test]
+    fn a_chosen_mode_turns_off_the_small_catalog_limit() {
+        let claude = capabilities("claude-code");
+        for chosen in [None, Some(""), Some("auto"), Some("bogus")] {
+            assert_eq!(
+                claude.auto_full_max_tools_for(chosen),
+                Some(CLAUDE_CODE_AUTO_FULL_MAX_TOOLS),
+                "{chosen:?}"
+            );
+        }
+        for chosen in ["full", "lazy", " Grouped "] {
+            assert_eq!(
+                claude.auto_full_max_tools_for(Some(chosen)),
+                None,
+                "{chosen}"
+            );
+        }
+        assert_eq!(capabilities("codex").auto_full_max_tools_for(None), None);
+    }
+
     #[test]
     fn claude_code_auto_lists_small_catalogs_in_full() {
         assert_eq!(

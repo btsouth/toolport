@@ -274,18 +274,8 @@ pub fn auto_full_max_tools(registry: &crate::registry::Registry, id: &str) -> Op
             id.strip_prefix("client:")
                 .and_then(|adapter| registry.client_discovery_mode(adapter))
         })
-        .or_else(|| registry.chosen_global_discovery_mode())
-        .is_some_and(|mode| {
-            matches!(
-                mode.trim().to_ascii_lowercase().as_str(),
-                "full" | "lazy" | "grouped"
-            )
-        });
-    if chosen {
-        None
-    } else {
-        discovery_capabilities(id).auto_full_max_tools
-    }
+        .or_else(|| registry.chosen_global_discovery_mode());
+    discovery_capabilities(id).auto_full_max_tools_for(chosen)
 }
 
 pub fn discovery_capabilities(id: &str) -> DiscoveryCapabilities {

@@ -3129,27 +3129,44 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             .build(),
     );
     if client.gateway_state == state::ClientGatewayState::Connected {
-        let mode = crate::clients::discovery_capabilities(&client.id).resolve_mode(
-            client
-                .discovery_mode
-                .as_deref()
-                .or(client.inherited_discovery.as_deref()),
-        );
-        let discovery_hint = match mode {
-            "full" => crate::i18n::msg("Full tool list. Client per-tool permission rules need Full mode."),
-            "grouped" => {
-                crate::i18n::msg("Browse a server, then call tools. Client per-tool permission rules need Full mode.")
-            }
-            _ => crate::i18n::msg("Search, then call tools. Client per-tool permission rules need Full mode."),
-        };
-        copy.append(
-            &gtk::Label::builder()
-                .label(discovery_hint)
-                .xalign(0.0)
-                .wrap(true)
-                .css_classes(["toolport-muted"])
-                .build(),
-        );
+        let capabilities = crate::clients::discovery_capabilities(&client.id);
+        let chosen = client
+            .discovery_mode
+            .as_deref()
+            .or(client.inherited_discovery.as_deref());
+        let hint = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["toolport-muted"])
+            .build();
+        if let Some(max) = capabilities.auto_full_max_tools_for(chosen) {
+            // Auto lists a small catalog in full for this client, then switches to search.
+            let max = max.to_string();
+            l10n::bind_label_with(&hint, move || {
+                crate::i18n::trf(
+                    "Auto: {mode}",
+                    &[(
+                        "mode",
+                        &crate::i18n::trf(
+                            "full up to {count} tools, then lazy",
+                            &[("count", &max)],
+                        ),
+                    )],
+                )
+            });
+        } else {
+            l10n::bind_label(
+                &hint,
+                match capabilities.resolve_mode(chosen) {
+                    "full" => crate::i18n::msg("Full tool list. Client per-tool permission rules need Full mode."),
+                    "grouped" => {
+                        crate::i18n::msg("Browse a server, then call tools. Client per-tool permission rules need Full mode.")
+                    }
+                    _ => crate::i18n::msg("Search, then call tools. Client per-tool permission rules need Full mode."),
+                },
+            );
+        }
+        copy.append(&hint);
     }
     heading.append(&copy);
     if client.gateway_state == state::ClientGatewayState::Customized {
