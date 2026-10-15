@@ -322,6 +322,9 @@ test("MSI CI preview config keeps the product version and signing intact", async
   for (const version of ["256.0.0", "2.256.0", "2.0.65536", "bad"]) {
     assert.throws(() => ciMsiConfig(version), /Invalid MSI version/);
   }
+  assert.deepEqual(ciMsiConfig("2.0.1", { signed: false }), {
+    bundle: { windows: { wix: { version: "2.0.1" } }, createUpdaterArtifacts: false },
+  });
 });
 
 test("NSIS manifest scopes standard wizard and dialog assets to the plugin directory", async () => {

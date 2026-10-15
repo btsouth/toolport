@@ -43,11 +43,13 @@ jobs:
         with:
           workspaces: src-tauri
           cache-bin: "false"
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/next/2.0' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: npm ci
       # Use real bundle settings; installers stay in CI and are not published.
       - name: Set the numeric MSI version for CI previews
         run: node .github/scripts/ci-msi-config.mjs
+        env:
+          CI_UPDATER_SIGNING: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
       - name: Build the real NSIS and MSI installers
         run: npx tauri build --config src-tauri/tauri.bundle.conf.json --config src-tauri/tauri.ci-msi.conf.json --bundles nsis,msi -- --bin conduit
         env:
@@ -98,7 +100,7 @@ jobs:
           workspaces: src-tauri
           key: macos-payload
           cache-bin: "false"
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/next/2.0' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: npm ci
       - name: Build the app without release signing or publishing
         run: npx tauri build --config src-tauri/tauri.bundle.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --bundles app -- --bin conduit
