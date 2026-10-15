@@ -6,12 +6,53 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-15
+
+Toolport now speaks nine languages. Like 2.0.0, this release is for manual
+installation: 1.24.x installs are not updated to it automatically yet. Download the
+package for your system from the
+[release assets](https://github.com/btsouth/toolport/releases/tag/v2.1.0), and read
+the [upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+if you are coming from 1.x.
+
+### Added
+
+- Japanese, Korean, Simplified Chinese, Traditional Chinese, German, French, Spanish
+  and Brazilian Portuguese, across the app, the Linux GTK app, tray menus and
+  notifications. Pick a language in Settings > General; the choice is saved per
+  machine and is not synced. New installs follow the system language. Existing
+  installs stay in English and offer the system language once. The translations
+  are new, so if you are fluent and spot awkward wording, fixes are welcome (see
+  [CONTRIBUTING.md](https://github.com/btsouth/toolport/blob/main/CONTRIBUTING.md)).
+  Thanks to @1llum1n4t1s for the original translations. (#1187, #1188, #1197)
+- A Retry button when a server's resources or prompts fail to load. (#1198)
+
+### Changed
+
+- Claude Code on Auto discovery lists the full catalog when it has 120 tools or
+  fewer, and searches above that. In live Claude Code runs, listing a 50-tool
+  catalog in full used about a quarter less input than searching it. Explicit
+  per-client and global modes, `TOOLPORT_DISCOVERY` and 1.x upgraders who kept
+  Lazy are unchanged. (#1200)
+
+### Fixed
+
+- A slow resource read or prompt result no longer replaces the one you picked
+  after it. Thanks @ColumbusLabs. (#1199)
+- Labels, tooltips and dialogs in the Linux GTK app that stayed in English now
+  follow your language, and its client cards describe Claude Code's Auto rule.
+  (#1201)
+
+### Security
+
+- rustls 0.23.46. (#1186)
+
 ## [2.0.0] - 2026-10-14
 
 Toolport 2.0 is here. Existing 1.24.x installs are not updated to it
 automatically yet. To upgrade now, download and install the matching package from
 the [GitHub release assets](https://github.com/btsouth/toolport/releases/tag/v2.0.0).
-Read the [upgrade guide](https://github.com/btsouth/toolport/blob/next/2.0/docs/migration.md)
+Read the [upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
 for preserved settings, removed features and rollback steps.
 
 ### Added
