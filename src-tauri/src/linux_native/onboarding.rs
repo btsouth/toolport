@@ -468,19 +468,23 @@ fn render_clients(list: &gtk::Box, feedback: &gtk::Label, snapshot: ClientSnapsh
                 .build(),
         );
         let connected = client.gateway_state == ClientGatewayState::Connected;
-        copy.append(
-            &gtk::Label::builder()
-                .label(if connected {
-                    "Connected to Toolport"
-                } else if client.gateway_state == ClientGatewayState::Customized {
-                    "Customized Toolport entry. Review it in Clients."
-                } else {
-                    "Ready to connect through stdio"
-                })
+        copy.append(&{
+            let widget = gtk::Label::builder()
                 .halign(gtk::Align::Start)
                 .css_classes(["toolport-muted"])
-                .build(),
-        );
+                .build();
+            l10n::bind_label(
+                &widget,
+                if connected {
+                    crate::i18n::msg("Connected to Toolport")
+                } else if client.gateway_state == ClientGatewayState::Customized {
+                    crate::i18n::msg("Customized Toolport entry. Review it in Clients.")
+                } else {
+                    crate::i18n::msg("Ready to connect through stdio")
+                },
+            );
+            widget
+        });
         row.append(&copy);
         if connected {
             let status = l10n::label("Connected");

@@ -345,16 +345,19 @@ pub(super) fn show_failure(error: &str) {
 fn failure_dialog(app: &adw::Application) -> adw::MessageDialog {
     // A standalone modal MessageDialog advertises an xdg dialog to the
     // compositor without mapping a tiled application window behind it.
+    let heading = crate::i18n::tr("Toolport is still running");
     let dialog = adw::MessageDialog::new(
         None::<&gtk::Window>,
-        Some("Toolport is still running"),
-        Some("The previous version did not close. Quit it from its tray menu, then open Toolport again."),
+        Some(&heading),
+        Some(&crate::i18n::tr(
+            "The previous version did not close. Quit it from its tray menu, then open Toolport again.",
+        )),
     );
     dialog.set_application(Some(app));
-    dialog.set_title(Some("Toolport is still running"));
+    dialog.set_title(Some(&heading));
     dialog.set_modal(true);
     dialog.set_resizable(false);
-    dialog.add_response("close", "Close");
+    dialog.add_response("close", &crate::i18n::tr("Close"));
     dialog.set_close_response("close");
     dialog.set_default_response(Some("close"));
     dialog

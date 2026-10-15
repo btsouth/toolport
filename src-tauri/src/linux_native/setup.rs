@@ -338,13 +338,13 @@ pub(super) fn review(
             );
             let value_row = adw::ActionRow::builder()
                 .title(&env.key)
-                .subtitle(if !env.required {
+                .subtitle(crate::i18n::tr(if !env.required {
                     "Optional"
                 } else if env.present {
                     "Found"
                 } else {
                     "Missing"
-                })
+                }))
                 .build();
             value_row.add_suffix(&choice);
             value_row.set_activatable_widget(Some(&choice));

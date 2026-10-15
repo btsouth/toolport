@@ -479,11 +479,11 @@ fn tool_row(
         })
         .active(!enabled)
         .valign(gtk::Align::Center)
-        .tooltip_text(if enabled {
+        .tooltip_text(crate::i18n::tr(if enabled {
             "Exposed to clients. Hide it."
         } else {
             "Hidden from clients. Expose it."
-        })
+        }))
         .css_classes(["flat"])
         .build();
     // Reverting a failed write re-enters this handler, so the guard keeps the
