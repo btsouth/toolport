@@ -1565,6 +1565,10 @@ impl PendingStatus {
                 _ => "needs sign-in in Toolport",
             };
             format!("{guidance} (last error: {error})")
+        } else if self.connecting && self.last_error.is_empty() {
+            // A first attempt has no error to report. Inventing one sends
+            // people looking for a failure that never happened.
+            "connecting".to_string()
         } else if self.connecting {
             format!("connecting (last error: {error})")
         } else {
@@ -10784,6 +10788,26 @@ for line in sys.stdin:
         assert!(router.kick_pending("secret_team__x", |_| true).is_some());
         assert!(router.kick_pending("secret-team", |_| true).is_some());
     }
+    #[test]
+    fn first_connect_does_not_report_an_invented_error() {
+        let mut status = PendingStatus {
+            id: "s".into(),
+            needs_auth: false,
+            auth_target: None,
+            connecting: true,
+            failures: 0,
+            last_error: String::new(),
+            retry_in: None,
+        };
+        assert_eq!(status.describe(), "connecting");
+        status.failures = 1;
+        status.last_error = "downstream server exited (status 3)".into();
+        assert_eq!(
+            status.describe(),
+            "connecting (last error: the server process exited (status 3); details are in the Toolport log)"
+        );
+    }
+
     #[test]
     fn client_safe_error_never_repeats_downstream_text() {
         for (raw, expected) in [

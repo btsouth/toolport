@@ -229,6 +229,34 @@ impl Gateway {
             .expect("JSON HTTP result")
     }
 
+    /// Wait until the lazy fixture server has published `tool`. A call that
+    /// arrives during its first connect gets "try again shortly" after a short
+    /// bound, and a busy Windows runner can take longer than that to start the
+    /// mock. Searching starts the server without running a downstream tool,
+    /// so transcripts and rate limits stay untouched.
+    fn wait_for_tool(&mut self, http_token: Option<&str>, tool: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let args = json!({ "query": tool });
+            let found = match http_token {
+                Some(token) => self.http_call(token, "toolport_search_tools", args),
+                None => self.request(
+                    "tools/call",
+                    json!({ "name": "toolport_search_tools", "arguments": args }),
+                ),
+            };
+            let text = found.to_string();
+            if !text.contains("No tools matched") && text.contains(tool) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture server never published {tool}: {found}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn audit(&self) -> Vec<Value> {
         std::fs::read_to_string(self.dir.join("audit.jsonl"))
             .unwrap_or_default()
@@ -524,6 +552,7 @@ fn mock_registry(reg: &mut Registry, dir: &Path) {
 #[test]
 fn host_calls_remain_ordered_and_completed_work_survives_worker_failure() {
     let mut gateway = Gateway::configured(mock_registry, None);
+    gateway.wait_for_tool(None, "s__echo");
     let normal = gateway.run(json!({
         "script": "const r = await toolport.callAll(Array.from({ length: 8 }, (_, i) => ({ name: 's__echo', args: { text: String(i) } }))); toolport.checkpoint({ page: 8 }); throw new Error('stop');"
     }));
@@ -566,6 +595,7 @@ fn isolated_host_calls_preserve_confirmation_pii_and_rate_limits() {
         },
         None,
     );
+    gateway.wait_for_tool(None, "s__echo");
     let result = gateway.run(json!({ "script": "const a = toolport.call('s__echo', {text: 'ada@example.com'}); const b = toolport.call('s__echo', {text: 'second'}); const c = toolport.call('s__delete_item', {a:1,b:2}); return {a,b,c};" }));
     assert_eq!(result["isError"], false, "{result}");
     let values = &result["structuredContent"]["result"];
@@ -605,6 +635,7 @@ fn isolated_host_call_cannot_skip_human_approval() {
         },
         None,
     );
+    gateway.wait_for_tool(None, "s__delete_item");
     let result =
         gateway.run(json!({ "script": "return toolport.call('s__delete_item', {a:1,b:2});" }));
     let value = &result["structuredContent"]["result"];
@@ -687,6 +718,7 @@ fn http_client_memory_failure_does_not_stop_other_clients_and_scope_stays_enforc
         },
         Some("client-a"),
     );
+    gateway.wait_for_tool(Some("client-b"), "s__echo");
     let failure = gateway.http_call("client-a", "toolport_run_script", json!({
         "script": "const buffers = []; for (let i = 0; i < 32; i++) buffers.push(new ArrayBuffer(32 * 1024 * 1024)); return 1;"
     }));
