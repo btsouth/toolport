@@ -27,7 +27,7 @@ class RemovalHooks(unittest.TestCase):
             "runuser": 'test "$1" = -u && test "$3" = -- || exit 99\nshift 3\nexec "$@"',
             "stat": f'''path=""; for arg do path=$arg; done
 test -d "$path" || {{ echo 'No such file or directory' >&2; exit 1; }}
-while IFS=: read -r user password uid gid gecos home shell; do
+while IFS=: read -r user _ uid gid gecos home shell; do
   case "$path" in "$home"/.config/*) printf '%s:directory\\n' "$uid"; exit 0 ;; esac
 done < "{self.passwd}"
 exit 1''',
