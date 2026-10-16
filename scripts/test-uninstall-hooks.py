@@ -21,15 +21,15 @@ class RemovalHooks(unittest.TestCase):
         self.gateway = self.bin / "gateway"
         self.gateway.write_text('#!/bin/sh\nprintf "%s|%s|%s|%s\\n" "$HOME" "$USER" "${TOOLPORT_DATA_DIR-unset}" "$*" >> "' + str(self.calls) + '"\n[ "$USER" != bob ]\n')
         self.gateway.chmod(0o755)
-        self.passwd = self.root / "passwd"
+        self.accounts_file = self.root / "accounts"
         for name, body in {
-            "getent": f'cat "{self.passwd}"',
+            "getent": f'cat "{self.accounts_file}"',
             "runuser": 'test "$1" = -u && test "$3" = -- || exit 99\nshift 3\nexec "$@"',
             "stat": f'''path=""; for arg do path=$arg; done
 test -d "$path" || {{ echo 'No such file or directory' >&2; exit 1; }}
 while IFS=: read -r user _ uid gid gecos home shell; do
   case "$path" in "$home"/.config/*) printf '%s:directory\\n' "$uid"; exit 0 ;; esac
-done < "{self.passwd}"
+done < "{self.accounts_file}"
 exit 1''',
         }.items():
             path = self.bin / name
@@ -47,7 +47,7 @@ exit 1''',
             home.mkdir()
             lines.append(f"{name}:x:{1000 + index}:1000:Test:{home}:/bin/false")
         lines.append(f"root:x:0:0:Root:{self.root}/root:/bin/sh")
-        self.passwd.write_text("\n".join(lines) + "\n")
+        self.accounts_file.write_text("\n".join(lines) + "\n")
 
     def run_script(self, script, *args):
         result = subprocess.run(["sh", str(script), *args], env=self.env, capture_output=True, text=True, timeout=10)
@@ -71,7 +71,7 @@ exit 1''',
         self.accounts(["alice"])
         spaced = self.root / "alice home"
         (spaced / ".config/Toolport").mkdir(parents=True)
-        self.passwd.write_text(self.passwd.read_text().replace(str(self.root / "alice") + ":", str(spaced) + ":"))
+        self.accounts_file.write_text(self.accounts_file.read_text().replace(str(self.root / "alice") + ":", str(spaced) + ":"))
         # Model su's shell argument forwarding, without switching a real account.
         su = self.bin / "su"
         su.write_text('#!/bin/sh\ntest "$1" = -s && test "$2" = /bin/sh && test "$3" = -c && test "$5" = -- || exit 99\ncmd=$4\nshift 6\nexec /bin/sh -c "$cmd" "$@"\n')
@@ -106,7 +106,7 @@ exit 1''',
     def test_foreign_owned_state_and_shared_system_homes_are_skipped(self):
         self.accounts(["alice", "system"])
         (self.root / "alice/.config/Toolport").mkdir(parents=True)
-        self.passwd.write_text(self.passwd.read_text().replace(str(self.root / "system") + ":", str(self.root / "alice") + ":"))
+        self.accounts_file.write_text(self.accounts_file.read_text().replace(str(self.root / "system") + ":", str(self.root / "alice") + ":"))
         self.run_script(self.helper)
         self.assertEqual(len(self.calls.read_text().splitlines()), 1)
         self.assertIn("alice|unset", self.calls.read_text())
