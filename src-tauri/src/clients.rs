@@ -691,6 +691,7 @@ fn resolve_client_config_path(
                 .join("anythingllm_mcp_servers.json"),
         },
         "hermes" => home.join(".hermes").join("config.yaml"),
+        "tabnine" => home.join(".tabnine").join("mcp_servers.json"),
         "witsy" => config.join("Witsy").join("settings.json"),
         _ => return None,
     };
@@ -1285,6 +1286,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
             .join("anythingllm_mcp_servers.json"),
         "continue" => home.join(".continue").join("config.yaml"),
         "hermes" => home.join(".hermes").join("config.yaml"),
+        "tabnine" => home.join(".tabnine").join("mcp_servers.json"),
         "witsy" => config.join("Witsy").join("settings.json"),
         _ => return None,
     };
@@ -2536,6 +2538,23 @@ fn defs() -> Vec<ClientDef> {
             // (src/main/mcp.ts reads/writes config.mcpServers directly) and the project's
             // file-location wiki page.
             path: || client_config_path("witsy"),
+            plugin_scan: None,
+        },
+        ClientDef {
+            location: None,
+            id: "tabnine",
+            discovery: discovery::capabilities("tabnine"),
+            combined_tool_name_budget: None,
+            name: "Tabnine Agent",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            // Tabnine Agent documents a user-level `~/.tabnine/mcp_servers.json`
+            // (standard `mcpServers` shape) alongside a project-root `.tabnine/`
+            // file. Toolport manages the home file only and never edits a project
+            // tree; Tabnine reads it only while a workspace folder is open. The
+            // docs prose names the container `mcp_server` but every example uses
+            // `mcpServers`, so the examples win.
+            path: || client_config_path("tabnine"),
             plugin_scan: None,
         },
     ]
@@ -13168,6 +13187,101 @@ command = "npx"
     }
 
     #[test]
+    fn tabnine_agent_is_registered_with_json_mcp_servers() {
+        let definition = defs()
+            .into_iter()
+            .find(|definition| definition.id == "tabnine")
+            .expect("tabnine should be registered");
+        assert_eq!(definition.name, "Tabnine Agent");
+        assert!(matches!(definition.format, Format::JsonMcpServers));
+        assert!(!definition.uses_connectors);
+        assert!((definition.path)().is_some());
+    }
+
+    #[test]
+    fn tabnine_paths_use_the_documented_home_file() {
+        // Tabnine documents the home file at ~/.tabnine/mcp_servers.json on every
+        // platform. The project-root `.tabnine/` file is intentionally not managed.
+        for platform in Platform::ALL {
+            let home = mock_home(platform);
+            assert_eq!(
+                resolve_client_config_path("tabnine", &home, platform),
+                Some(home.join(".tabnine").join("mcp_servers.json")),
+                "tabnine config path on {platform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tabnine_reads_the_documented_mcp_servers_example() {
+        // The official example uses the `mcpServers` object even though the prose
+        // names the container `mcp_server`; Toolport follows the examples.
+        let path = temp_path("tabnine-official-example.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"mcp-atlassian":{"command":"docker","args":["run","-i","--rm","mcp-atlassian:latest"],"env":{"JIRA_URL":"https://mcp.atlassian.com/v1/mcp","JIRA_API_TOKEN":"secret"}}}}"#,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let servers = parse_json(&content, "mcpServers").unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "mcp-atlassian");
+        assert_eq!(servers[0].command.as_deref(), Some("docker"));
+        assert_eq!(
+            servers[0].args,
+            vec!["run", "-i", "--rm", "mcp-atlassian:latest"]
+        );
+        assert!(servers[0].env_keys.iter().any(|key| key == "JIRA_URL"));
+        assert!(servers[0]
+            .env_keys
+            .iter()
+            .any(|key| key == "JIRA_API_TOKEN"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn tabnine_connect_read_and_disconnect_preserve_sibling_servers() {
+        let path = temp_path("tabnine-mcp_servers.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"existing":{"command":"node","args":["server.js"],"env":{"TOKEN":"keep"}}}}"#,
+        )
+        .unwrap();
+
+        let original: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let original_existing = original["mcpServers"]["existing"].clone();
+
+        let before = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].name, "existing");
+
+        {
+            let gateway = sample_gateway(None, "tabnine");
+            edit_json_gateway(&path, "mcpServers", Some(&gateway), false)
+        }
+        .unwrap();
+        let installed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        assert_eq!(installed.len(), 2);
+        assert!(installed.iter().any(|server| server.name == "existing"));
+        assert!(installed
+            .iter()
+            .any(|server| server.name == GATEWAY_ENTRY_NAME));
+        let installed_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(installed_json["mcpServers"]["existing"], original_existing);
+
+        edit_json_gateway(&path, "mcpServers", None, false).unwrap();
+        let removed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].name, "existing");
+        let removed_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(removed_json["mcpServers"]["existing"], original_existing);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn kimi_code_is_registered_with_its_native_transport_format() {
         let definition = defs()
             .into_iter()
@@ -14295,6 +14409,11 @@ rules:
             }),
             ("pi", |home, _| {
                 home.join(".pi").join("agent").join("mcp.json")
+            }),
+            // Tabnine Agent documents the home file on every platform; the
+            // project-root `.tabnine/` file is not managed.
+            ("tabnine", |home, _| {
+                home.join(".tabnine").join("mcp_servers.json")
             }),
             ("vscode", |home, platform| {
                 roaming_config_dir(home, platform)

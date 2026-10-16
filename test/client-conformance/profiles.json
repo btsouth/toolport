@@ -617,6 +617,18 @@
       },
       "source": "https://raw.githubusercontent.com/nbonamy/witsy/main/README.md",
       "observedSessionKind": null
+    },
+    {
+      "id": "tabnine",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://docs.tabnine.com/main/getting-started/tabnine-agent/mcp-intro-and-setup",
+      "observedSessionKind": null
     }
   ]
 }

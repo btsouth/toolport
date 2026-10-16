@@ -42,6 +42,7 @@ below for you, so you never have to edit these by hand.
 | Hermes                  | `~/.hermes/config.yaml`                                                                                | YAML (`mcp_servers`)     |
 | AnythingLLM             | `<config>/anythingllm-desktop/storage/plugins/anythingllm_mcp_servers.json`                            | JSON (`mcpServers`)      |
 | Witsy                   | `<config>/Witsy/settings.json`                                                                         | JSON (`mcpServers`)      |
+| Tabnine Agent           | `~/.tabnine/mcp_servers.json`                                                                          | JSON (`mcpServers`)      |
 | Amp                     | `~/.config/amp/settings.json`                                                                          | JSON (`amp.mcpServers`)  |
 
 `<config>` is your OS application-config dir (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `~/.config` on Linux); `<data>` is the data dir (`~/.local/share` on Linux, the same as `<config>` elsewhere). Zed and Goose paths vary slightly by OS; Toolport resolves the right one automatically.
@@ -68,6 +69,21 @@ disabled for review. Migration and pasted imports refuse disabled ZCode
 entries. Settings that the import model cannot preserve, such as a working
 directory, custom timeout, protocol version, or OAuth configuration, require
 manual setup. Toolport checks these before importing or migrating a ZCode config.
+
+### Tabnine Agent setup
+
+Toolport manages Tabnine Agent's user-level MCP file at
+`~/.tabnine/mcp_servers.json` on every platform. Tabnine also reads a
+project-root `.tabnine/mcp_servers.json`; Toolport does not scan or edit project
+trees, so add the gateway there by hand if a project needs its own entry.
+Existing `mcpServers` entries are preserved.
+
+Tabnine only loads its MCP engine while a workspace folder is open. Open a
+folder, then connect from the **Clients** view and restart Tabnine Agent to pick
+up the gateway entry.
+
+Tabnine's setup prose calls the top-level container `mcp_server`, but every JSON
+example uses `mcpServers`. Toolport follows the examples.
 
 ### Codex setup walkthrough
 
