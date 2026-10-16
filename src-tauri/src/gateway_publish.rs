@@ -2045,10 +2045,45 @@ pub(crate) fn list_gateway_processes() -> Vec<GatewayProcess> {
 
 #[cfg(windows)]
 fn windows_assign_daemon_roles(processes: &mut [GatewayProcess]) {
-    let pids: Vec<u32> = processes.iter().map(|process| process.pid).collect();
+    // A daemon that answers its own descriptor's identity probe is the host daemon.
+    // Only the rest need PowerShell, whose cold start can outlast its limit on a
+    // busy machine and leave every role unknown; an unknown role is stopped
+    // instead of being asked to exit when idle.
+    let verified = verified_host_daemon_pids();
+    let pids: Vec<u32> = processes
+        .iter()
+        .map(|process| process.pid)
+        .filter(|pid| !verified.contains(pid))
+        .collect();
     let roles = windows_gateway_daemon_roles(&pids);
+    merge_daemon_roles(processes, &verified, &roles);
+}
+
+/// Host daemons whose descriptor endpoint answers with the descriptor's own PID.
+#[cfg(windows)]
+fn verified_host_daemon_pids() -> std::collections::HashSet<u32> {
+    live_host_daemons()
+        .into_iter()
+        .filter(|descriptor| {
+            crate::daemon::probe_identity(descriptor)
+                .is_ok_and(|identity| identity.pid == descriptor.pid)
+        })
+        .map(|descriptor| descriptor.pid)
+        .collect()
+}
+
+#[cfg(any(windows, test))]
+fn merge_daemon_roles(
+    processes: &mut [GatewayProcess],
+    verified: &std::collections::HashSet<u32>,
+    roles: &std::collections::HashMap<u32, Option<bool>>,
+) {
     for process in processes {
-        process.is_host_daemon = roles.get(&process.pid).copied().flatten();
+        process.is_host_daemon = if verified.contains(&process.pid) {
+            Some(true)
+        } else {
+            roles.get(&process.pid).copied().flatten()
+        };
     }
 }
 
@@ -3028,6 +3063,21 @@ mod tests {
         assert_eq!(roles.get(&42), Some(&Some(true)));
         assert_eq!(roles.get(&43), Some(&Some(false)));
         assert_eq!(roles.get(&44), Some(&None));
+    }
+
+    #[test]
+    fn a_verified_daemon_keeps_its_role_when_the_command_line_probe_is_unknown() {
+        let mut processes = [
+            proc(42, "toolport-gateway.exe", None),
+            proc(43, "toolport-gateway.exe", None),
+            proc(44, "toolport-gateway.exe", None),
+        ];
+        let verified = std::collections::HashSet::from([42]);
+        // PowerShell timed out for 44 and reported 43 as an adapter.
+        let roles = std::collections::HashMap::from([(42, Some(false)), (43, Some(false))]);
+        merge_daemon_roles(&mut processes, &verified, &roles);
+        let roles: Vec<_> = processes.iter().map(|p| p.is_host_daemon).collect();
+        assert_eq!(roles, [Some(true), Some(false), None]);
     }
 
     #[test]
