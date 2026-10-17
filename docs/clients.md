@@ -32,6 +32,7 @@ below for you, so you never have to edit these by hand.
 | Kimi Code               | `$KIMI_CODE_HOME/mcp.json` (default `~/.kimi-code/mcp.json`)                                           | JSON (`mcpServers`)      |
 | ZCode                   | `~/.zcode/cli/config.json`                                                                             | JSON (`mcp.servers`)     |
 | Command Code            | `~/.commandcode/mcp.json`                                                                              | JSON (`mcpServers`)      |
+| Tabnine Agent           | `~/.tabnine/mcp_servers.json`                                                                          | JSON (`mcpServers`)      |
 | Zed                     | `~/.config/zed/settings.json`                                                                          | JSON (`context_servers`) |
 | LM Studio               | `~/.lmstudio/mcp.json`                                                                                 | JSON (`mcpServers`)      |
 | Jan                     | `<data>/Jan/data/mcp_config.json`                                                                      | JSON (`mcpServers`)      |
@@ -68,6 +69,16 @@ disabled for review. Migration and pasted imports refuse disabled ZCode
 entries. Settings that the import model cannot preserve, such as a working
 directory, custom timeout, protocol version, or OAuth configuration, require
 manual setup. Toolport checks these before importing or migrating a ZCode config.
+
+### Tabnine Agent setup
+
+Toolport manages Tabnine's user config at `~/.tabnine/mcp_servers.json` on all
+platforms. Project files at `.tabnine/mcp_servers.json` are left alone. Tabnine
+only loads MCP servers while a workspace folder is open, so open a folder after
+connecting. Imports read remote headers from `requestInit.headers`.
+
+Tabnine's setup page calls the top-level key `mcp_server`, but every example uses
+`mcpServers`. Toolport follows the examples.
 
 ### Codex setup walkthrough
 
