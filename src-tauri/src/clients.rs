@@ -644,6 +644,7 @@ fn resolve_client_config_path(
         "warp" => home.join(".warp").join(".mcp.json"),
         "amazon-q" => home.join(".aws").join("amazonq").join("mcp.json"),
         "kiro" => home.join(".kiro").join("settings").join("mcp.json"),
+        "auggie" => home.join(".augment").join("settings.json"),
         "kimi-code" => home.join(".kimi-code").join("mcp.json"),
         "zcode" => home.join(".zcode").join("cli").join("config.json"),
         "command-code" => home.join(".commandcode").join("mcp.json"),
@@ -1271,6 +1272,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "warp" => home.join(".warp").join(".mcp.json"),
         "amazon-q" => home.join(".aws").join("amazonq").join("mcp.json"),
         "kiro" => home.join(".kiro").join("settings").join("mcp.json"),
+        "auggie" => home.join(".augment").join("settings.json"),
         "kimi-code" => home.join(".kimi-code").join("mcp.json"),
         "zcode" => home.join(".zcode").join("cli").join("config.json"),
         "command-code" => home.join(".commandcode").join("mcp.json"),
@@ -2368,6 +2370,20 @@ fn defs() -> Vec<ClientDef> {
             // Kiro user-level MCP config: `~/.kiro/settings/mcp.json` (`mcpServers`). A
             // per-workspace `.kiro/settings/mcp.json` also exists and takes precedence.
             path: || client_config_path("kiro"),
+            plugin_scan: None,
+        },
+        ClientDef {
+            location: None,
+            id: "auggie",
+            discovery: discovery::capabilities("auggie"),
+            combined_tool_name_budget: None,
+            name: "Auggie CLI",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            // Auggie's user settings: `~/.augment/settings.json` (JSONC, `mcpServers`).
+            // The same file holds shell, theme, permissions and other settings, so it
+            // is whole-app state. Project and managed settings files are not scanned.
+            path: || client_config_path("auggie"),
             plugin_scan: None,
         },
         ClientDef {
@@ -7405,7 +7421,14 @@ fn config_is_whole_app_state(client_id: &str) -> bool {
     let client_id = client_id.split('@').next().unwrap_or(client_id);
     matches!(
         client_id,
-        "claude-code" | "crush" | "gemini-cli" | "qwen-code" | "opencode" | "kilo-code" | "amp"
+        "claude-code"
+            | "crush"
+            | "gemini-cli"
+            | "qwen-code"
+            | "opencode"
+            | "kilo-code"
+            | "amp"
+            | "auggie"
     )
 }
 
@@ -12111,6 +12134,7 @@ command = "npx"
         assert!(config_is_whole_app_state("qwen-code"));
         assert!(config_is_whole_app_state("opencode"));
         assert!(config_is_whole_app_state("kilo-code"));
+        assert!(config_is_whole_app_state("auggie"));
         // Single-purpose mcpServers files keep the start-fresh behavior.
         assert!(!config_is_whole_app_state("claude-desktop"));
         assert!(!config_is_whole_app_state("vscode"));
@@ -12489,6 +12513,150 @@ command = "npx"
         assert!(after["mcp"].get("existing").is_some());
         assert_eq!(after["model"], "anthropic/claude-sonnet-4-5");
         std::fs::remove_file(&path).ok();
+    }
+
+    const AUGGIE_SETTINGS: &str = r#"// Auggie user settings (JSONC)
+{
+  "shell": "zsh",
+  "startupScript": "source ~/.augment/startup.sh",
+  "autoUpdate": true, // keep current
+  "notificationMode": "desktop_notification",
+  "theme": "ansi",
+  "toolPermissions": [
+    {"toolName": "terminal", "permission": {"type": "deny"}},
+  ],
+  "mcpServers": {
+    "local-tool": {
+      "command": "/usr/local/bin/custom-mcp",
+      "args": ["--serve", "--port", "3000"],
+      "env": {"DEBUG": "true"},
+    },
+    "context7": {
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp",
+      "headers": {"CONTEXT7_API_KEY": "YOUR_API_KEY"},
+    },
+    "weather": {"type": "sse", "url": "https://weather-mcp.example.com/v1"},
+  },
+}
+"#;
+
+    #[test]
+    fn auggie_is_registered_as_a_json_mcp_servers_client() {
+        let def = find_def("auggie").unwrap();
+        assert_eq!(def.name, "Auggie CLI");
+        assert!(matches!(def.format, Format::JsonMcpServers));
+        assert!(!def.uses_connectors);
+        assert!(def.plugin_scan.is_none());
+        // Nothing about Auggie's search or list refresh is verified yet.
+        assert_eq!(def.discovery.auto_mode, "lazy");
+        assert_eq!(def.discovery.native_tool_search, None);
+        assert_eq!(def.discovery.tools_list_changed, None);
+        assert!((def.path)().is_some());
+    }
+
+    #[test]
+    fn auggie_reads_jsonc_settings_and_documented_server_shapes() {
+        let def = find_def("auggie").unwrap();
+        let servers = parse_client_content(def.format, AUGGIE_SETTINGS).unwrap();
+        let by_name = |name: &str| servers.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(servers.len(), 3);
+        let local = by_name("local-tool");
+        assert_eq!(local.transport, "stdio");
+        assert_eq!(local.command.as_deref(), Some("/usr/local/bin/custom-mcp"));
+        assert_eq!(local.args, ["--serve", "--port", "3000"]);
+        assert_eq!(local.env_keys, ["DEBUG"]);
+        let context7 = by_name("context7");
+        assert_eq!(context7.transport, "http");
+        assert_eq!(
+            context7.url.as_deref(),
+            Some("https://mcp.context7.com/mcp")
+        );
+        assert_eq!(context7.env_keys, ["CONTEXT7_API_KEY"]);
+        assert_eq!(by_name("weather").transport, "sse");
+    }
+
+    #[test]
+    fn auggie_connect_and_disconnect_round_trip_in_a_temp_home() {
+        let home =
+            std::env::temp_dir().join(format!("toolport-auggie-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".augment")).unwrap();
+        let _home = TestHome::set(&home);
+        let def = find_def("auggie").unwrap();
+        let path = resolved_definition_path(&def).unwrap();
+        assert_eq!(path, home.join(".augment").join("settings.json"));
+        let lenient = config_is_whole_app_state("auggie");
+
+        // Missing settings file: nothing to import, no error.
+        let missing = read_client(&def);
+        assert!(!missing.config_exists);
+        assert!(missing.error.is_none());
+        assert!(missing.servers.is_empty());
+        assert!(!missing.gateway_installed);
+
+        std::fs::write(&path, AUGGIE_SETTINGS).unwrap();
+        let entry = gateway_entry(Some("Work"), "auggie").unwrap();
+        edit_format(def.format, &path, Some(&entry), lenient).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("// Auggie user settings (JSONC)"),
+            "{content}"
+        );
+        assert!(content.contains("// keep current"), "{content}");
+        let root = parse_json_value(&content).unwrap();
+        assert_eq!(root["shell"], "zsh");
+        assert_eq!(root["startupScript"], "source ~/.augment/startup.sh");
+        assert_eq!(root["autoUpdate"], true);
+        assert_eq!(root["notificationMode"], "desktop_notification");
+        assert_eq!(root["theme"], "ansi");
+        assert_eq!(root["toolPermissions"][0]["toolName"], "terminal");
+        assert_eq!(root["toolPermissions"][0]["permission"]["type"], "deny");
+        let written = &root["mcpServers"][GATEWAY_ENTRY_NAME];
+        assert_eq!(written["env"][crate::brand::CLIENT_ID], "auggie");
+        assert_eq!(written["env"][crate::brand::PROFILE], "Work");
+        assert_eq!(root["mcpServers"]["local-tool"]["env"]["DEBUG"], "true");
+
+        let connected = read_client(&def);
+        assert!(connected.config_exists);
+        assert!(connected.error.is_none());
+        assert!(connected.gateway_installed);
+        assert_eq!(connected.servers.len(), 4);
+        let gateway = connected
+            .servers
+            .iter()
+            .find(|s| s.name == GATEWAY_ENTRY_NAME)
+            .unwrap();
+        assert_eq!(gateway.transport, "stdio");
+        assert_eq!(gateway.command, entry.command);
+        assert_eq!(gateway.args, entry.args);
+        assert!(gateway
+            .env_keys
+            .iter()
+            .any(|key| key == crate::brand::CLIENT_ID));
+
+        edit_format(def.format, &path, None, lenient).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("// keep current"), "{content}");
+        let root = parse_json_value(&content).unwrap();
+        assert_eq!(root["shell"], "zsh");
+        assert_eq!(root["notificationMode"], "desktop_notification");
+        assert_eq!(root["theme"], "ansi");
+        assert_eq!(root["toolPermissions"][0]["toolName"], "terminal");
+        assert_eq!(root["toolPermissions"][0]["permission"]["type"], "deny");
+        let disconnected = read_client(&def);
+        assert!(!disconnected.gateway_installed);
+        let mut names: Vec<_> = disconnected
+            .servers
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["context7", "local-tool", "weather"]);
+
+        drop(_home);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -13029,6 +13197,7 @@ command = "npx"
             "warp",
             "amazon-q",
             "kiro",
+            "auggie",
             "lm-studio",
             "jan",
             "anythingllm",
@@ -14361,6 +14530,11 @@ rules:
                     .join("Witsy")
                     .join("settings.json")
             }),
+            // Auggie documents `~/.augment/settings.json` on macOS/Linux and
+            // `C:\Users\<username>\.augment\settings.json` on Windows.
+            ("auggie", |home, _| {
+                home.join(".augment").join("settings.json")
+            }),
         ];
 
         for (client_id, build_expected) in cases {
@@ -14394,6 +14568,7 @@ rules:
         let _goose_root = EnvRestore::set("GOOSE_PATH_ROOT", Path::new(""));
 
         let home = home().expect("home dir");
+        let auggie = client_config_path("auggie").unwrap();
         let vscode = client_config_path("vscode").unwrap();
         let jan = client_config_path("jan").unwrap();
         let crush = client_config_path("crush").unwrap();
@@ -14412,6 +14587,8 @@ rules:
             vscode,
             xdg_config.join("Code").join("User").join("mcp.json")
         );
+        // Auggie's settings stay home-relative; it does not follow XDG.
+        assert_eq!(auggie, home.join(".augment").join("settings.json"));
         assert_eq!(
             jan,
             xdg_data.join("Jan").join("data").join("mcp_config.json")

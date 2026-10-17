@@ -29,6 +29,7 @@ below for you, so you never have to edit these by hand.
 | Warp                    | `~/.warp/.mcp.json`                                                                                    | JSON (`mcpServers`)      |
 | Amazon Q                | `~/.aws/amazonq/mcp.json`                                                                              | JSON (`mcpServers`)      |
 | Kiro                    | `~/.kiro/settings/mcp.json`                                                                            | JSON (`mcpServers`)      |
+| Auggie CLI              | `~/.augment/settings.json`                                                                             | JSON (`mcpServers`)      |
 | Kimi Code               | `$KIMI_CODE_HOME/mcp.json` (default `~/.kimi-code/mcp.json`)                                           | JSON (`mcpServers`)      |
 | ZCode                   | `~/.zcode/cli/config.json`                                                                             | JSON (`mcp.servers`)     |
 | Command Code            | `~/.commandcode/mcp.json`                                                                              | JSON (`mcpServers`)      |
@@ -45,6 +46,15 @@ below for you, so you never have to edit these by hand.
 | Amp                     | `~/.config/amp/settings.json`                                                                          | JSON (`amp.mcpServers`)  |
 
 `<config>` is your OS application-config dir (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `~/.config` on Linux); `<data>` is the data dir (`~/.local/share` on Linux, the same as `<config>` elsewhere). Zed and Goose paths vary slightly by OS; Toolport resolves the right one automatically.
+
+### Auggie CLI setup
+
+Toolport manages Auggie's user settings at `~/.augment/settings.json`
+(`C:\Users\<username>\.augment\settings.json` on Windows). That file also holds
+Auggie's shell, theme, tool permissions, and other settings, so Toolport
+rewrites only the `mcpServers` key and leaves comments and the rest of the file
+as they are. Project (`<workspace>/.augment/settings.json`) and managed
+settings files are left alone.
 
 ### ZCode setup
 

@@ -442,6 +442,18 @@
       "observedSessionKind": null
     },
     {
+      "id": "auggie",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://docs.augmentcode.com/cli/integrations",
+      "observedSessionKind": null
+    },
+    {
       "id": "kimi-code",
       "evidence": "documentation only",
       "initialize": null,
