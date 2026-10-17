@@ -647,6 +647,7 @@ fn resolve_client_config_path(
         "kimi-code" => home.join(".kimi-code").join("mcp.json"),
         "zcode" => home.join(".zcode").join("cli").join("config.json"),
         "command-code" => home.join(".commandcode").join("mcp.json"),
+        "tabnine" => home.join(".tabnine").join("mcp_servers.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
         "jan" => data.join("Jan").join("data").join("mcp_config.json"),
         "zed" => match platform {
@@ -1274,6 +1275,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "kimi-code" => home.join(".kimi-code").join("mcp.json"),
         "zcode" => home.join(".zcode").join("cli").join("config.json"),
         "command-code" => home.join(".commandcode").join("mcp.json"),
+        "tabnine" => home.join(".tabnine").join("mcp_servers.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
         "jan" => data.join("Jan").join("data").join("mcp_config.json"),
         "zed" => config.join("zed").join("settings.json"),
@@ -2409,6 +2411,20 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             location: None,
+            id: "tabnine",
+            discovery: discovery::capabilities("tabnine"),
+            combined_tool_name_budget: None,
+            name: "Tabnine Agent",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            // Tabnine's user-scope MCP config: `~/.tabnine/mcp_servers.json` (`mcpServers`).
+            // A project `.tabnine/mcp_servers.json` can also exist; we manage only the home
+            // file. Tabnine reads either file only while a workspace folder is open.
+            path: || client_config_path("tabnine"),
+            plugin_scan: None,
+        },
+        ClientDef {
+            location: None,
             id: "zed",
             discovery: discovery::capabilities("zed"),
             combined_tool_name_budget: None,
@@ -2622,10 +2638,11 @@ fn json_server_with_values(name: &str, def: &serde_json::Value) -> ParsedSnippet
         .map(|arr| arr.iter().filter_map(json_value_to_string).collect())
         .unwrap_or_default();
     // Merge `env` and `headers` keys (remote MCP stores credentials under headers;
-    // ownership matching and import need both visible as env_keys).
+    // ownership matching and import need both visible as env_keys). Tabnine nests
+    // remote headers under `requestInit.headers`, the MCP SDK transport option.
     let mut env: Vec<SnippetEnvVar> = Vec::new();
-    for field in ["env", "headers"] {
-        if let Some(o) = def.get(field).and_then(|e| e.as_object()) {
+    for field in ["/env", "/headers", "/requestInit/headers"] {
+        if let Some(o) = def.pointer(field).and_then(|e| e.as_object()) {
             for (k, v) in o {
                 if env.iter().any(|e| e.key == *k) {
                     continue;
@@ -13036,6 +13053,7 @@ command = "npx"
             "junie",
             "devin-cli",
             "command-code",
+            "tabnine",
         ] {
             let d = defs()
                 .into_iter()
@@ -13192,6 +13210,68 @@ command = "npx"
             assert_eq!(rules.path, home.join(".commandcode").join("AGENTS.md"));
             assert_eq!(rules.strategy, crate::instructions::Strategy::SentinelBlock);
         }
+    }
+
+    #[test]
+    fn tabnine_reads_its_documented_examples() {
+        // Shapes from Tabnine's MCP setup page: stdio, Streamable HTTP with
+        // `requestInit.headers`, and legacy SSE marked by `transport`.
+        let content = r#"{
+          "mcpServers": {
+            "filesystem": {
+              "command": "npx",
+              "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/projects"]
+            },
+            "remote-api": {
+              "url": "https://api.example.com/mcp",
+              "requestInit": {
+                "headers": {"Authorization": "Bearer token", "Content-Type": "application/json"}
+              }
+            },
+            "legacy": {"url": "https://legacy.example.com/sse", "transport": "sse"}
+          }
+        }"#;
+        let def = find_def("tabnine").unwrap();
+        let servers = parse_client_content(def.format, content).unwrap();
+        let by_name = |name: &str| servers.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(by_name("filesystem").transport, "stdio");
+        assert_eq!(by_name("filesystem").command.as_deref(), Some("npx"));
+        let remote = by_name("remote-api");
+        assert_eq!(remote.transport, "http");
+        assert_eq!(remote.url.as_deref(), Some("https://api.example.com/mcp"));
+        assert_eq!(remote.env_keys, ["Authorization", "Content-Type"]);
+        assert_eq!(by_name("legacy").transport, "sse");
+    }
+
+    #[test]
+    fn tabnine_connect_and_disconnect_keep_other_servers() {
+        let path = temp_path("tabnine-mcp-servers");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"remote-api":{"url":"https://api.example.com/mcp","requestInit":{"headers":{"Authorization":"Bearer token"}}}}}"#,
+        )
+        .unwrap();
+        let def = find_def("tabnine").unwrap();
+        let lenient = config_is_whole_app_state("tabnine");
+        let entry = sample_gateway(None, "tabnine");
+
+        edit_format(def.format, &path, Some(&entry), lenient).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let servers = root["mcpServers"].as_object().unwrap();
+        assert!(servers.contains_key(GATEWAY_ENTRY_NAME));
+        assert_eq!(
+            servers["remote-api"]["requestInit"]["headers"]["Authorization"],
+            "Bearer token"
+        );
+
+        edit_format(def.format, &path, None, lenient).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+        let servers = root["mcpServers"].as_object().unwrap();
+        assert!(!servers.contains_key(GATEWAY_ENTRY_NAME));
+        assert_eq!(servers["remote-api"]["url"], "https://api.example.com/mcp");
     }
 
     #[test]
@@ -14290,6 +14370,9 @@ rules:
             ("kimi-code", |home, _| {
                 home.join(".kimi-code").join("mcp.json")
             }),
+            ("tabnine", |home, _| {
+                home.join(".tabnine").join("mcp_servers.json")
+            }),
             ("continue", |home, _| {
                 home.join(".continue").join("config.yaml")
             }),
@@ -14403,6 +14486,7 @@ rules:
         let devin_cli = client_config_path("devin-cli").unwrap();
         let opencode = client_config_path("opencode").unwrap();
         let kilo_code = client_config_path("kilo-code").unwrap();
+        let tabnine = client_config_path("tabnine").unwrap();
 
         drop(_config);
         drop(_data);
@@ -14436,6 +14520,7 @@ rules:
             kilo_code,
             home.join(".config").join("kilo").join("kilo.jsonc")
         );
+        assert_eq!(tabnine, home.join(".tabnine").join("mcp_servers.json"));
     }
 
     /// SBS-899: Team Instructions for Goose/Zed must land in the same XDG
