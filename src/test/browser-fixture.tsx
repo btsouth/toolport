@@ -1,6 +1,7 @@
 import { initializeLanguage, isLanguageChoice, LanguageProvider } from "@/lib/i18n";
 import { LocalizationControls } from "./localization-controls";
 import { securityFixture } from "./security-fixture";
+import { applySkillState, skillsFixture } from "./skills-fixture";
 const fixtureLocations: import("@/lib/types").DetectedClient[] = [];
 // Separate development entry. Never imported by the shipping application.
 import { mockIPC } from "@tauri-apps/api/mocks";
@@ -502,6 +503,7 @@ if (connectedImportFixture) {
   localStorage.removeItem("toolport.onboarded");
 } else localStorage.setItem("toolport.onboarded", "1");
 
+let skills = skillsFixture();
 mockIPC(
   (command, payload) => {
     const args: Record<string, unknown> =
@@ -631,6 +633,24 @@ mockIPC(
         };
       }
       case "team_instructions_status":
+        return null;
+      case "skills_inventory":
+        return skills;
+      case "set_skill_state": {
+        const { agent, key, state } = args as {
+          agent: string;
+          key: string;
+          state: "on" | "off" | "name-only";
+        };
+        skills = applySkillState(skills, agent, key, state);
+        return skills;
+      }
+      case "fix_skill_issue": {
+        const { issue } = args as { issue: string };
+        skills = { ...skills, issues: skills.issues.filter((i) => i.id !== issue) };
+        return skills;
+      }
+      case "open_skill_path":
         return null;
       case "team_review": {
         const team = registry.team as NonNullable<Registry["team"]> & {

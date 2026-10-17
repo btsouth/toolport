@@ -22,6 +22,8 @@ import type {
   Registry,
   SavingsSummary,
   SearchTrace,
+  SkillsInventory,
+  SkillWanted,
   ToolIdentity,
   ServerEntry,
   ToolCallResult,
@@ -1141,4 +1143,36 @@ export function getUiLanguageSuggestion(): Promise<boolean> {
 
 export function setUiLanguage(language: string): Promise<void> {
   return invoke<void>("set_ui_language", { language });
+}
+
+/** Skills and rules each installed client loads, with effective on/off state. Read-only. */
+export function skillsInventory(project: string | null): Promise<SkillsInventory> {
+  return invoke<SkillsInventory>("skills_inventory", { project });
+}
+
+/** Change one skill in one client through that client's own setting. Returns a fresh scan. */
+export function setSkillState(
+  agent: string,
+  key: string,
+  state: SkillWanted,
+  project: string | null,
+): Promise<SkillsInventory> {
+  return invoke<SkillsInventory>("set_skill_state", { agent, key, state, project });
+}
+
+/** Apply the automatic fix for one "Needs a look" item. Returns a fresh scan. */
+export function fixSkillIssue(
+  issue: string,
+  project: string | null,
+): Promise<SkillsInventory> {
+  return invoke<SkillsInventory>("fix_skill_issue", { issue, project });
+}
+
+/** Open a skill or rules file, or reveal its folder. Only inventory paths are accepted. */
+export function openSkillPath(
+  path: string,
+  reveal: boolean,
+  project: string | null,
+): Promise<void> {
+  return invoke("open_skill_path", { path, reveal, project });
 }

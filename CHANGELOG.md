@@ -6,6 +6,17 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Added
+
+- A Skills page that shows the skills and rules files each installed agent loads,
+  across Claude Code, Codex, Cursor, Copilot CLI, OpenCode, Grok, Hermes, Gemini CLI
+  and more. See each skill's state in every agent, how each agent reaches your rules
+  files, and turn a skill on or off through the agent's own setting. A Needs a look
+  tab finds skills still on elsewhere, broken links, duplicate names, cut-off
+  descriptions and rules files an agent never reads, with confirmed fixes. Available
+  in the app and the Linux GTK app. See
+  [Skills and rules](https://github.com/btsouth/toolport/blob/main/docs/skills-and-rules.md).
+
 ## [2.1.0] - 2026-10-15
 
 Toolport now speaks nine languages. Like 2.0.0, this release is for manual

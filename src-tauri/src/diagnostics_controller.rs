@@ -206,6 +206,26 @@ pub fn open_exports_dir() -> Result<(), String> {
     open_directory(directory.join("exports"), "exports folder")
 }
 
+/// Open an existing file or folder with the desktop's default handler.
+pub fn open_in_default_app(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!("{} no longer exists", path.display()));
+    }
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "linux")]
+    let program = "xdg-open";
+    let mut command = std::process::Command::new(program);
+    crate::hostenv::strip_bundled_env(&mut command);
+    command
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("could not open {}: {error}", path.display()))
+}
+
 fn open_directory(directory: std::path::PathBuf, what: &str) -> Result<(), String> {
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("could not create the {what}: {error}"))?;

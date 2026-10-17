@@ -19,6 +19,7 @@ import {
   ScrollText,
   Settings,
   Share2,
+  Sparkles,
   CircleHelp,
   LogOut,
   Keyboard,
@@ -625,6 +626,9 @@ export function AppSidebar({
           )}
           {navItem(MonitorCog, msg("Clients"), view === "clients", () =>
             onSelectView("clients"),
+          )}
+          {navItem(Sparkles, msg("Skills"), view === "skills", () =>
+            onSelectView("skills"),
           )}
           {navItem(ScrollText, msg("Activity"), view === "activity", () =>
             onSelectView("activity"),

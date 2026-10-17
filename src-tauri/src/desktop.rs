@@ -2230,6 +2230,58 @@ async fn team_instructions_status() -> Option<teams::InstructionsStatusView> {
         .flatten()
 }
 
+/// Skills and rules each installed client loads, with their effective on/off state. Read-only.
+/// Scans home folders and client settings, so it runs off the UI thread.
+#[tauri::command]
+async fn skills_inventory(project: Option<String>) -> Result<crate::skills::Inventory, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::skills::inventory(project.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Turn one skill on, off, or name-only in one client through that client's own setting.
+#[tauri::command]
+async fn set_skill_state(
+    agent: String,
+    key: String,
+    state: crate::skills::Wanted,
+    project: Option<String>,
+) -> Result<crate::skills::Inventory, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::skills::set_skill_state(&agent, &key, state, project.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Apply the automatic fix for one "Needs a look" item.
+#[tauri::command]
+async fn fix_skill_issue(
+    issue: String,
+    project: Option<String>,
+) -> Result<crate::skills::Inventory, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::skills::fix_issue(&issue, project.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Open a skill or rules file in the default app, or reveal its folder. Only paths from a fresh
+/// inventory are accepted.
+#[tauri::command]
+async fn open_skill_path(
+    path: String,
+    reveal: bool,
+    project: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::skills::open_path(&path, reveal, project.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn team_sync_status() -> crate::team_sync_status::SyncStatus {
     tauri::async_runtime::spawn_blocking(crate::team_sync_status::current)
@@ -4404,6 +4456,10 @@ pub fn run() {
             team_sync_wait,
             main_window_visible,
             team_instructions_status,
+            skills_inventory,
+            set_skill_state,
+            fix_skill_issue,
+            open_skill_path,
             team_sync_status,
             team_disconnect,
             team_push_preview,

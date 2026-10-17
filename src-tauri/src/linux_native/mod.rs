@@ -16,6 +16,7 @@ mod pairing;
 mod settings;
 mod setup;
 mod single_instance;
+mod skills;
 mod state;
 mod teams;
 mod theme;
@@ -27,6 +28,7 @@ use adw::prelude::*;
 use catalog::CatalogPage;
 use gtk::glib::prelude::ToValue;
 use settings::SettingsPage;
+use skills::SkillsPage;
 use teams::TeamsPage;
 use tools::ServerToolsPanel;
 
@@ -465,6 +467,7 @@ fn build_window(
     let server_page_for_reap = server_page.clone();
     let client_page = ClientPage::new(app, server_page.clone());
     let activity_page = ActivityPage::new(app);
+    let skills_page = SkillsPage::new(app);
     let catalog_page = CatalogPage::new(server_page.clone());
     let teams_page = TeamsPage::new(app, server_page.clone());
     let settings_page = SettingsPage::new(bridge, broker);
@@ -476,6 +479,7 @@ fn build_window(
         .build();
     stack.add_named(&content, Some("servers"));
     stack.add_named(&client_page.root, Some("clients"));
+    stack.add_named(&skills_page.root, Some("skills"));
     stack.add_named(&activity_page.root, Some("activity"));
     stack.add_named(&catalog_page.root, Some("catalog"));
     stack.add_named(&teams_page.root, Some("teams"));
@@ -967,6 +971,7 @@ const NAV_SECTIONS: &[(&str, &str, &str)] = &[
         "network-server-symbolic",
     ),
     ("clients", crate::i18n::msg("Clients"), "computer-symbolic"),
+    ("skills", crate::i18n::msg("Skills"), "starred-symbolic"),
     (
         "activity",
         crate::i18n::msg("Activity"),
@@ -13641,11 +13646,11 @@ mod tests {
         assert!(star_should_show(true, true, true));
     }
 
-    /// The 2.0 sidebar is the four fixed views in order, with Team appended only
+    /// The sidebar is the fixed views in order, with Team appended only
     /// on a paired install. Catalog is no longer a row even though
     /// their pages and actions stay reachable.
     #[test]
-    fn sidebar_rows_are_the_four_views_plus_team_only_when_paired() {
+    fn sidebar_rows_are_the_fixed_views_plus_team() {
         let rows = |paired| {
             super::NAV_SECTIONS
                 .iter()
@@ -13655,11 +13660,11 @@ mod tests {
         };
         assert_eq!(
             rows(false),
-            vec!["servers", "clients", "activity", "settings", "teams"]
+            vec!["servers", "clients", "skills", "activity", "settings", "teams"]
         );
         assert_eq!(
             rows(true),
-            vec!["servers", "clients", "activity", "settings", "teams"]
+            vec!["servers", "clients", "skills", "activity", "settings", "teams"]
         );
     }
 

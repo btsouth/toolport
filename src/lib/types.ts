@@ -1,7 +1,8 @@
 export type Transport = "stdio" | "http" | "sse" | "unknown";
 
 /** The main content views, selected from the sidebar. */
-export type View = "servers" | "clients" | "activity" | "catalog" | "teams" | "settings";
+export type View =
+  "servers" | "clients" | "skills" | "activity" | "catalog" | "teams" | "settings";
 
 export interface McpServer {
   name: string;
@@ -817,4 +818,97 @@ export function importableServers(
       !isGatewayIdentity(server.name, server.name, server.command) &&
       !have.has(server.name.toLowerCase()),
   );
+}
+
+// ---- Skills and rules inventory (src-tauri/src/skills.rs) ----
+
+export type SkillSource =
+  "yours" | "package" | "account" | "built-in" | "library" | "parked" | "broken";
+
+/** Effective state of one skill in one client. Absent from `states` means not loaded. */
+export type SkillLoadState = "on" | "name-only" | "off" | "shadowed" | "broken";
+
+/** A state Toolport can ask a client's own setting for. `name-only` is Claude Code only. */
+export type SkillWanted = "on" | "name-only" | "off";
+
+export interface SkillAgentRoot {
+  path: string;
+  label: string;
+  exists: boolean;
+}
+
+export interface SkillAgent {
+  id: string;
+  name: string;
+  supportsSkills: boolean;
+  /** False when the folders come from the client's docs, not a check on a real install. */
+  verified: boolean;
+  /** True when Toolport can write this client's own per-skill switch. */
+  canToggle: boolean;
+  switchNote: string;
+  roots: SkillAgentRoot[];
+  rulesNote: string | null;
+  ruleLocations: string[];
+}
+
+export interface SkillAgentState {
+  state: SkillLoadState;
+  via: string;
+}
+
+export interface SkillEntry {
+  key: string;
+  name: string;
+  description: string;
+  descriptionChars: number;
+  path: string;
+  folder: string;
+  source: SkillSource;
+  sourceNote: string;
+  editable: boolean;
+  sizeBytes: number;
+  lines: number;
+  modifiedSecs: number | null;
+  gitRepo: string | null;
+  links: string[];
+  states: Record<string, SkillAgentState>;
+  preview: string;
+}
+
+export interface RuleFileEntry {
+  key: string;
+  name: string;
+  path: string;
+  scope: "global" | "project";
+  sizeBytes: number;
+  preview: string;
+  /** Load chain per client: the file it opens, then links and imports. */
+  agents: Record<string, RuleChainStep[]>;
+}
+
+export interface RuleChainStep {
+  /** `skipped-import` is an `@path` line this client doesn't follow. */
+  kind: "file" | "link" | "import" | "skipped-import";
+  path: string;
+}
+
+export interface SkillIssue {
+  id: string;
+  level: "warn" | "error" | "info";
+  title: string;
+  detail: string;
+  agents: string[];
+  /** Skill keys the issue covers. */
+  skills: string[];
+  /** Display names for `skills`, without repeats. */
+  skillNames: string[];
+  fixLabel: string | null;
+}
+
+export interface SkillsInventory {
+  agents: SkillAgent[];
+  skills: SkillEntry[];
+  rules: RuleFileEntry[];
+  issues: SkillIssue[];
+  project: string | null;
 }

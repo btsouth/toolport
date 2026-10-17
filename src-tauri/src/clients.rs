@@ -4524,6 +4524,20 @@ fn read_config_file_disk(path: &Path) -> Result<String, String> {
 /// Copy a client's config to a timestamped backup. No-op (Ok(None)) if it doesn't
 /// exist yet, or if it isn't a regular file / is over the size cap (we won't copy
 /// a device or a huge file into the backup dir).
+/// Back up a client file before another module edits it (skills inventory switches).
+pub(crate) fn backup_config(client_id: &str, path: &Path) -> Result<Option<PathBuf>, String> {
+    backup_file(client_id, path)
+}
+
+/// Rewrite one top-level key of a JSON/JSONC client file, keeping comments and formatting.
+pub(crate) fn rewrite_json_key(
+    original: &str,
+    key: &str,
+    new_value: &serde_json::Value,
+) -> Result<String, String> {
+    rewrite_json_key_preserving(original, key, new_value)
+}
+
 fn backup_file(client_id: &str, path: &Path) -> Result<Option<PathBuf>, String> {
     let name = path
         .file_name()

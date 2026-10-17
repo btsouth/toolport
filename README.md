@@ -47,6 +47,7 @@ configuration and policies while each member keeps their own credentials.
 
 - [Upgrade from 1.24.x to 2.0](docs/migration.md)
 - [Supported clients and setup](docs/clients.md)
+- [Skills and rules each agent loads](docs/skills-and-rules.md)
 - [Profiles, environment variables, and configuration](docs/configuration.md)
 - [Headless gateway and Docker](docs/headless.md)
 - [Arch and Omarchy install (pacman repository)](docs/arch-pacman-repo.md)
