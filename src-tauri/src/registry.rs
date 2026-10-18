@@ -4159,7 +4159,6 @@ fn migrate_curated_legacy(registry: &mut Registry) -> bool {
                 &["-y", "@twilio-alpha/mcp"],
                 &["TWILIO_API_KEY", "TWILIO_API_SECRET"],
             ),
-            "PostgreSQL" => (&["-y", "@modelcontextprotocol/server-postgres"], &[]),
             "Filesystem" => (&["-y", "@modelcontextprotocol/server-filesystem"], &[]),
             "Browserbase" => (
                 &["-y", "@browserbasehq/mcp-server-browserbase"],
@@ -4214,7 +4213,7 @@ fn migrate_curated_legacy(registry: &mut Registry) -> bool {
         // Changed requirements must be reviewed and completed before launch.
         if matches!(
             server.name.as_str(),
-            "Twilio" | "PostgreSQL" | "Filesystem" | "Browserbase" | "Qdrant" | "AWS"
+            "Twilio" | "Filesystem" | "Browserbase" | "Qdrant" | "AWS"
         ) {
             server.enabled = false;
             for profile in &mut registry.profiles {
@@ -4364,8 +4363,8 @@ mod catalog_launch_migration_tests {
         registry.servers.push(
             serde_json::from_str(
                 r#"{
-            "id":"postgres-work","name":"PostgreSQL","transport":"stdio",
-            "command":"npx","args":["-y","@modelcontextprotocol/server-postgres"],
+            "id":"files-work","name":"Filesystem","transport":"stdio",
+            "command":"npx","args":["-y","@modelcontextprotocol/server-filesystem"],
             "source":"catalog:curated"
         }"#,
             )
@@ -4374,7 +4373,7 @@ mod catalog_launch_migration_tests {
         save_to(&path, &registry).unwrap();
         let legacy_bytes = std::fs::read(&path).unwrap();
         let migrated = load_from(&path).unwrap();
-        assert_eq!(migrated.servers[0].id, "postgres-work");
+        assert_eq!(migrated.servers[0].id, "files-work");
         assert!(migrated.servers[0].launch.is_some());
         assert_eq!(std::fs::read(backup_path(&path)).unwrap(), legacy_bytes);
         let migrated_bytes = std::fs::read(&path).unwrap();
@@ -4416,22 +4415,22 @@ mod catalog_launch_migration_tests {
     fn removing_a_required_env_declaration_saves_but_blocks_enabling() {
         let template = crate::catalog::curated()
             .into_iter()
-            .find(|entry| entry.name == "Slack")
+            .find(|entry| entry.name == "DataForSEO")
             .unwrap();
         let mut server: ServerEntry = serde_json::from_str(
-            r#"{"id":"slack","name":"Slack","transport":"stdio","command":"npx"}"#,
+            r#"{"id":"seo","name":"DataForSEO","transport":"stdio","command":"npx"}"#,
         )
         .unwrap();
         server.args = template.args;
         server.launch = template.launch;
         server.env = vec![EnvVar {
-            key: "SLACK_BOT_TOKEN".into(),
+            key: "DATAFORSEO_USERNAME".into(),
             value: None,
             secret: true,
             unknown_fields: Default::default(),
         }];
         server.env.push(EnvVar {
-            key: "SLACK_TEAM_ID".into(),
+            key: "DATAFORSEO_PASSWORD".into(),
             value: None,
             secret: true,
             unknown_fields: Default::default(),
@@ -4451,10 +4450,10 @@ mod catalog_launch_migration_tests {
         save_to(&path, &registry).unwrap();
         let profile = registry.active_profile_id();
         let error = registry
-            .set_server_enabled(&profile, "slack", true)
+            .set_server_enabled(&profile, "seo", true)
             .unwrap_err();
-        assert!(error.contains("SLACK_BOT_TOKEN"), "{error}");
-        assert!(!registry.is_enabled(&profile, "slack"));
+        assert!(error.contains("DATAFORSEO_USERNAME"), "{error}");
+        assert!(!registry.is_enabled(&profile, "seo"));
         std::fs::remove_dir_all(directory).ok();
     }
 }

@@ -20,11 +20,6 @@ const contracts = [
   ],
   [
     "-y",
-    spec("npx", "@modelcontextprotocol/server-postgres"),
-    "postgresql://user:review%40secret@localhost/test",
-  ],
-  [
-    "-y",
     spec("npx", "@modelcontextprotocol/server-filesystem"),
     "/fixture/directory with spaces",
   ],

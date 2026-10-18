@@ -136,14 +136,6 @@ fn catalog_values_survive_vault_reload_probe_sharing_and_gateway_launch() {
             ],
         ),
         (
-            "PostgreSQL",
-            vec![(
-                "POSTGRES_URL",
-                "postgresql://user:review%40secret@localhost/test",
-                true,
-            )],
-        ),
-        (
             "Filesystem",
             vec![("ALLOWED_DIRECTORY", "/fixture/directory with spaces", false)],
         ),

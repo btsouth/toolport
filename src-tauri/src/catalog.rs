@@ -71,16 +71,14 @@ fn category_for(name: &str) -> &'static str {
         | "Vercel (Full API)"
         | "Cloudflare (Full API)"
         | "Clerk (Full API)" => "Code & infrastructure",
-        "Supabase" | "Neon" | "PostgreSQL" | "MongoDB" | "Elasticsearch" | "Qdrant" | "Redis" => {
-            "Databases"
-        }
+        "Supabase" | "Neon" | "MongoDB" | "Elasticsearch" | "Qdrant" | "Redis" => "Databases",
         "Context7" | "DeepWiki" | "Microsoft Learn" | "Hugging Face" | "OpenRouter"
         | "Parallel Search" | "Brave Search" | "Exa" | "Tavily" | "Perplexity" | "DataForSEO" => {
             "Search & knowledge"
         }
         "Firecrawl" | "Apify" | "Browserbase" => "Web & automation",
         "Stripe" | "Stripe (Full API)" | "Notion" | "Composio" | "Linear" | "Atlassian"
-        | "Airtable" | "Todoist" | "Slack" | "Resend" | "Figma" | "Postiz" | "Twilio" | "n8n"
+        | "Airtable" | "Todoist" | "Resend" | "Figma" | "Postiz" | "Twilio" | "n8n"
         | "Langfuse" | "Postman" | "Trello" => "Apps & productivity",
         "Filesystem"
         | "Fetch"
@@ -160,10 +158,6 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
             "https://www.figma.com/settings",
             "Create a personal access token (Settings > Security > Personal access tokens).",
         ),
-        "Slack" => (
-            "https://api.slack.com/apps",
-            "Create a Slack app, add a bot token (xoxb-...), and grab your team id.",
-        ),
         "Twilio" => (
             "https://console.twilio.com",
             "Copy your Account SID, API Key SID, and API Secret from the Twilio Console.",
@@ -181,10 +175,6 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
             "Use your Kibana URL plus /api/agent_builder/mcp. Create an API key with Agent Builder read access, then paste ApiKey followed by the key as the server's auth token.",
         ),
         // Config you supply (no single token page).
-        "PostgreSQL" => (
-            "",
-            "Enter your Postgres connection URL in Launch setup. It is vaulted and passed as one argument.",
-        ),
         "Kubernetes" => ("", "Uses your local kubeconfig (~/.kube/config); nothing to paste."),
         "Filesystem" => (
             "",
@@ -286,7 +276,6 @@ pub fn curated() -> Vec<CatalogEntry> {
         // --- Databases ---
         http("Supabase", "Query and manage your Supabase projects.", "https://mcp.supabase.com/mcp", "https://supabase.com/docs/guides/getting-started/mcp"),
         http("Neon", "Serverless Postgres: branches, queries, projects.", "https://mcp.neon.tech/mcp", "https://neon.tech/docs/ai/neon-mcp-server"),
-        cmd("PostgreSQL", "Query a Postgres database (requires a connection URL).", "npx", &["-y", "@modelcontextprotocol/server-postgres@0.6.2", "<launch-input>"], &[], "https://github.com/modelcontextprotocol/servers-archived"),
         cmd("MongoDB", "Query and manage MongoDB databases.", "npx", &["-y", "mongodb-mcp-server@3.1.0"], &["MDB_MCP_CONNECTION_STRING"], "https://github.com/mongodb-js/mongodb-mcp-server"),
         cmd("Qdrant", "Vector search and memory for RAG: store and query embeddings in Qdrant.", "uvx", &["mcp-server-qdrant@0.8.1"], &["QDRANT_URL", "QDRANT_API_KEY", "COLLECTION_NAME"], "https://github.com/qdrant/mcp-server-qdrant"),
         cmd("Redis", "Inspect and manage a Redis database.", "uvx", &["--from", "redis-mcp-server==0.5.1", "redis-mcp-server", "--url", "<launch-input>"], &[], "https://github.com/redis/mcp-redis"),
@@ -300,7 +289,6 @@ pub fn curated() -> Vec<CatalogEntry> {
         http("Airtable", "Read and write records in your Airtable bases.", "https://mcp.airtable.com/mcp", "https://airtable.com/developers/agents/mcp/getting-started"),
         http("Todoist", "Manage Todoist tasks and projects.", "https://ai.todoist.net/mcp", "https://github.com/Doist/todoist-mcp"),
         // --- Communication ---
-        cmd("Slack", "Read and send Slack messages and manage channels.", "npx", &["-y", "@modelcontextprotocol/server-slack@2025.4.25"], &["SLACK_BOT_TOKEN", "SLACK_TEAM_ID"], "https://github.com/modelcontextprotocol/servers-archived"),
         cmd("Twilio", "Send SMS, make calls, and manage Twilio messaging and voice.", "npx", &["-y", "@twilio-alpha/mcp@0.7.0", "<launch-input>"], &[], "https://github.com/twilio-labs/mcp"),
         http("Postiz", "Schedule and publish social media posts across platforms.", "https://mcp.postiz.com/mcp", "https://docs.postiz.com/mcp/setup"),
         // --- Knowledge & search ---
@@ -390,18 +378,6 @@ pub fn curated() -> Vec<CatalogEntry> {
                 });
                 launch.revision = Some(2);
             }
-            "PostgreSQL" => {
-                add_input("POSTGRES_URL", "Postgres connection URL", true);
-                launch.bindings.push(ArgBinding {
-                    index: 2,
-                    parts: vec![ArgPart::Input {
-                        key: "POSTGRES_URL".into(),
-                        unknown_fields: Default::default(),
-                    }],
-                    unknown_fields: Default::default(),
-                });
-                launch.revision = Some(2);
-            }
             "Redis" => {
                 add_input("REDIS_URL", "Redis connection URL", true);
                 launch.bindings.push(ArgBinding {
@@ -457,7 +433,6 @@ pub fn curated() -> Vec<CatalogEntry> {
                 | "Cloudflare (Full API)"
                 | "Clerk (Full API)"
                 | "Linode"
-                | "Slack"
                 | "Brave Search"
                 | "Tavily"
                 | "Perplexity"
@@ -1409,8 +1384,17 @@ mod tests {
             "npx:@apify/actors-mcp-server",
             "npx:exa-mcp-server",
             "npx:@elastic/mcp-server-elasticsearch",
+            "npx:@modelcontextprotocol/server-postgres",
+            "npx:@modelcontextprotocol/server-slack",
         ] {
             assert!(pins.get(retired).is_none(), "{retired} is still pinned");
+        }
+        // Archived reference servers with no maintained replacement are not offered.
+        for archived in ["Slack", "PostgreSQL"] {
+            assert!(
+                entries.iter().all(|e| e.name != archived),
+                "{archived} is still offered"
+            );
         }
     }
 
@@ -1436,7 +1420,6 @@ mod tests {
             "Elasticsearch",
             "Qdrant",
             "MongoDB",
-            "PostgreSQL",
             "Redis",
         ] {
             assert!(

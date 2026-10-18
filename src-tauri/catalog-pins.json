@@ -24,11 +24,6 @@
     "integrity": "sha512-CytJ/5tnzrS+J/74be2P5aCOsS/mmGRHys/Si+IYC4ucrbnWAmES/dYdxGJjeUCECRcoFUilZAysdjlwqUjXIA==",
     "url": "https://registry.npmjs.org/chrome-devtools-mcp/-/chrome-devtools-mcp-1.11.0.tgz"
   },
-  "npx:@modelcontextprotocol/server-postgres": {
-    "version": "0.6.2",
-    "integrity": "sha512-ukbVmVxLAsdZ5pTVWbhf9fc7lqkSf7XqizNH8XAotI21GnRPtkqO+WLWpeBFU+/2Fyv63uXS7/9NnR8Y8wOP1Q==",
-    "url": "https://registry.npmjs.org/@modelcontextprotocol/server-postgres/-/server-postgres-0.6.2.tgz"
-  },
   "npx:mongodb-mcp-server": {
     "version": "3.1.0",
     "integrity": "sha512-sqevTzO/CvrefKDiRmV9CgeNlBq8qLLWoofh5qBJmR+iXSNLexo0RrGkNnomh5LSuJMbSDmrQfUr5oiE1ZiDtg==",
@@ -43,11 +38,6 @@
     "version": "0.5.1",
     "integrity": "sha256-335d9089d4c87a055b362effa7fd718334ccd88b2545d93c4ed9bc2b738b3ed8",
     "url": "https://files.pythonhosted.org/packages/d6/e7/7c7c375285e480d693d240c4adc92012f8dabdfcaf0b09f5e1e385dec383/redis_mcp_server-0.5.1-py3-none-any.whl"
-  },
-  "npx:@modelcontextprotocol/server-slack": {
-    "version": "2025.4.25",
-    "integrity": "sha512-9WBjnxl4OgYZ1kKBqUmHbd2XVoqtnO9u8kaxSaGb4NAWf2Q4D/LV6FoJUAHPPcvKcB7AQLNJa8KO3yNOcU6fvQ==",
-    "url": "https://registry.npmjs.org/@modelcontextprotocol/server-slack/-/server-slack-2025.4.25.tgz"
   },
   "npx:@twilio-alpha/mcp": {
     "version": "0.7.0",

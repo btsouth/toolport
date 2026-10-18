@@ -70,6 +70,8 @@ Entries before the rename below shipped under the project's former name, Conduit
   `ApiKey` tokens are sent as they are. Servers you already added keep working as
   before. Package pins are refreshed, including the reference Filesystem, Memory
   and Sequential Thinking servers, whose date-based versions were deprecated.
+- The catalog no longer offers Slack or PostgreSQL. Both ran archived reference
+  servers that npm marks as unsupported. Servers you already added keep working.
 
 ## [2.2.0] - 2026-10-18
 
