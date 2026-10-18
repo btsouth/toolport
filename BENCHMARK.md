@@ -7,8 +7,8 @@ search and call tools. Whether that saves tokens depends on the client:
   GPT-5.5 harness below) see large reductions at the same accuracy.
 - **Clients with their own tool search** (Claude Code, Codex, Cursor, opencode 2.x)
   already defer definitions. Toolport's Auto mode gives Codex and Cursor the full list,
-  and Claude Code too at 120 tools or fewer. In the REA test below, Claude Code at 207 and
-  375 tools used more input through Toolport than with its own search.
+  and Claude Code too up to 800 tools, so their own search works as it would without
+  Toolport. In the REA test below, Toolport's search beat Claude Code's only at 1,207 tools.
 
 Reproduce it yourself: [`benchmark/`](benchmark/).
 
@@ -45,16 +45,32 @@ context7, mongodb, git, fetch and time (375 tools).
 | --------------------------------- | -----: | -------------: | -------------: | ------------: |
 | REA, every definition             |  10/10 |        365,912 |      2,052,477 |         $0.70 |
 | REA, Claude Code tool search      |  10/10 |         19,098 |        187,063 |         $0.20 |
-| REA through Toolport              |  10/10 |         15,786 |        255,749 |         $0.22 |
+| REA through Toolport, Lazy        |  10/10 |         15,786 |        255,749 |         $0.22 |
 | REA + 11, Claude Code tool search |  10/10 |         21,859 |        179,121 |         $0.19 |
-| REA + 11 through Toolport         |  10/10 |         15,788 |        261,361 |         $0.25 |
+| REA + 11 through Toolport, Lazy   |  10/10 |         15,788 |        261,361 |         $0.25 |
 
 Every run in every setup solved its task. Against every definition, Toolport used 8.0x
-fewer input tokens. Against Claude Code's own search it used 37% and 46% more: each
+fewer input tokens. Against Claude Code's own search, Lazy used 37% and 46% more: each
 Toolport run loaded REA's skill (about 6K tokens, carried on later requests) because REA's
 tools were not visible by name, and made two to five searches. These are short tasks
 (about 30 seconds, 5 to 10 tool calls) on one model; cost is list price with prompt
 caching across runs.
+
+A second round, run the same day, measured where Lazy starts to pay off in Claude Code.
+Toolport in Full hands Claude Code the same list it gets without Toolport. The 707 and
+1,207 tool rows add 500 and 1,000 public tool definitions served by a local mock.
+
+| Tools | Claude Code tool search | Through Toolport, Full | Through Toolport, Lazy |
+| ----: | ----------------------: | ---------------------: | ---------------------: |
+|   207 |                 178,517 |                174,126 |         255,749 (+43%) |
+|   375 |                 197,038 |                204,073 |         261,361 (+33%) |
+|   707 |                 260,570 |                        |          268,232 (+3%) |
+| 1,207 |                 341,697 |                        |         266,148 (-22%) |
+
+Input per task, 10 runs per cell. 39 of 40 runs solved their task in each round; the two
+misses were Claude refusing the keygen task, once with Toolport in Full and once without
+Toolport. Full matched Claude Code alone within 4%, and Lazy first wins somewhere
+between 707 and 1,207 tools, so Toolport's Auto now gives Claude Code Full up to 800 tools.
 
 ## GPT-5.5 harness: method
 

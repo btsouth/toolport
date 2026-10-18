@@ -53,6 +53,16 @@ Entries before the rename below shipped under the project's former name, Conduit
   `~/.openhands/microagents`. See
   [Supported clients](https://github.com/btsouth/toolport/blob/main/docs/clients.md#openhands-setup).
 
+### Changed
+
+- Claude Code's Auto discovery now lists every tool (Full) for catalogs up to 800
+  tools, up from 120, and searches (Lazy) only above that. Full hands Claude Code
+  the same list it gets without Toolport, so its own tool search works as usual.
+  In longer multi-step tasks, Lazy used 33% to 46% more input than Claude Code's own
+  search at 207 and 375 tools, and only came out ahead past 707. A mode you chose
+  for Claude Code, or set globally, is unchanged. See
+  [Client discovery defaults](https://github.com/btsouth/toolport/blob/main/docs/client-discovery.md).
+
 ## [2.2.0] - 2026-10-18
 
 Toolport now shows the skills and rules files each of your AI agents loads. Like

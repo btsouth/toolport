@@ -549,7 +549,7 @@ describe("ClientDetail Auto discovery", () => {
   it("shows the small-catalog Full limit in Auto unless a global mode was chosen", () => {
     const discovery = {
       autoMode: "lazy" as const,
-      autoFullMaxTools: 120,
+      autoFullMaxTools: 800,
       nativeToolSearch: true,
       toolsListChanged: true,
       evidence: "fixture",
@@ -563,7 +563,7 @@ describe("ClientDetail Auto discovery", () => {
       />,
     );
     expect(
-      screen.getByText("Auto (full up to 120 tools, then lazy)"),
+      screen.getByText("Auto (full up to 800 tools, then lazy)"),
     ).toBeInTheDocument();
     unmount();
     render(

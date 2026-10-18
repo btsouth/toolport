@@ -37869,8 +37869,8 @@ mod tests {
         };
         for (count, client, override_mode, expect_full) in [
             (3, "adapter:claude-code", None, true),
-            (120, "claude-code", None, true),
-            (121, "adapter:claude-code", None, false),
+            (800, "claude-code", None, true),
+            (801, "adapter:claude-code", None, false),
             (3, "adapter:claude-code", Some("lazy"), false),
             (3, "adapter:opencode", None, false),
         ] {

@@ -47,9 +47,11 @@ impl DiscoveryCapabilities {
     }
 }
 
-/// Claude Code's Lazy and Full input cross near 130 tools: 2026-10-15 live CLI
-/// runs, 30 tasks per cell, Lazy +31.5% at 50 tools, -5.0% at 150, -42.0% at 400.
-const CLAUDE_CODE_AUTO_FULL_MAX_TOOLS: usize = 120;
+/// Full gives Claude Code the same list it gets without Toolport, and its own tool
+/// search defers it. Lazy wins only for large catalogs: one-call tasks (2026-10-15,
+/// 30 tasks per cell) crossed near 130 tools, but multi-step REA tasks (2026-10-18,
+/// 10 per cell) had Lazy +33% to +46% at 207 and 375 tools, +3% at 707, -22% at 1,207.
+const CLAUDE_CODE_AUTO_FULL_MAX_TOOLS: usize = 800;
 
 pub(super) fn capabilities(id: &str) -> DiscoveryCapabilities {
     // Sources and conservative unknowns for every supported adapter are recorded
