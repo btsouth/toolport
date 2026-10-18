@@ -62,6 +62,14 @@ Entries before the rename below shipped under the project's former name, Conduit
   search at 207 and 375 tools, and only came out ahead past 707. A mode you chose
   for Claude Code, or set globally, is unchanged. See
   [Client discovery defaults](https://github.com/btsouth/toolport/blob/main/docs/client-discovery.md).
+- Catalog servers now use each vendor's own server where one exists. Todoist,
+  Airtable and Apify connect to their hosted servers and sign in with OAuth, so
+  you no longer paste an API token. Exa uses its hosted server, which works
+  without a key. Elasticsearch now connects through Kibana Agent Builder (Elastic
+  9.2 or later, or Serverless), since Elastic deprecated its npm package. Pasted
+  `ApiKey` tokens are sent as they are. Servers you already added keep working as
+  before. Package pins are refreshed, including the reference Filesystem, Memory
+  and Sequential Thinking servers, whose date-based versions were deprecated.
 
 ## [2.2.0] - 2026-10-18
 
