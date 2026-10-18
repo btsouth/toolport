@@ -1,6 +1,6 @@
 # Example headless Toolport gateway. Copy to docker-compose.yml and fill .env.
 #
-# Option A — pull the published image (after GHCR package is public):
+# Option A — pull the published image:
 #   image: ghcr.io/btsouth/toolport-gateway:latest
 # Option B — build locally:
 #   build: .

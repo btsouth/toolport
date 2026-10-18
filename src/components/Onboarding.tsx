@@ -225,7 +225,7 @@ function Welcome({
     },
     {
       icon: Sparkles,
-      title: translate("Up to 91% fewer tokens"),
+      title: translate("Tools load when needed"),
       body: translate(
         "In Lazy mode your agent loads a few tools and searches for the rest.",
       ),
@@ -764,7 +764,7 @@ function Done({
           <>
             {servingSummary(health ?? [], connectedCount)}{" "}
             {translate(
-              "Toggle one on or off and your clients update live, no restart. In Lazy mode a client loads a handful of Toolport tools instead of every downstream tool, up to 91% fewer tokens at the same task success in our benchmark. Toolport also flags changed tool definitions and results that look like prompt injection in Activity.",
+              "Toggle one on or off and your clients update live, no restart. In Lazy mode a client loads a handful of Toolport tools instead of every downstream tool, which saves context in clients that would otherwise load every tool up front. Toolport also flags changed tool definitions and results that look like prompt injection in Activity.",
             )}
           </>
         ) : configured && checkingHealth ? (

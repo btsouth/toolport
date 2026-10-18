@@ -1,18 +1,14 @@
 # Screenshots
 
-Source PNGs for the marketing site (toolport.app), kept here so they live with
-the app they capture. The top-level README and website hero use `servers-tokyo-night.png`, captured
-from the native Linux app with Tokyo Night and a plain dark background.
+Images kept with the app they capture. The top-level README uses `servers.png`,
+the 2.2 Servers view from the browser fixture with sample data, captured at
+1120x700 with device scale 2. The website keeps its own copies under
+`public/shots` in the toolport-site repo.
 
-| File                      | Capture                                                                 |
-| ------------------------- | ----------------------------------------------------------------------- |
-| `servers-tokyo-night.png` | Current native Linux Servers view, used in the README and website hero. |
-| `servers.png`             | The "All servers" view, with a few servers and their status dots.       |
-| `activity.png`            | The Activity view showing the per-server latency / error-rate panel.    |
-| `catalog.png`             | The catalog / add-server view.                                          |
-
-How to capture on Windows: `Win` + `Shift` + `S`, drag over the app window,
-then paste into any image editor and save here, or use the Snipping Tool's
-"Save as". Aim for the window only (no desktop), and a consistent width.
+| File           | Capture                                                              |
+| -------------- | -------------------------------------------------------------------- |
+| `servers.png`  | 2.2 Servers view, eight servers ready and one off. Used in README.   |
+| `activity.png` | Older Activity view with the per-server latency and error panel.     |
+| `catalog.png`  | Older catalog and add-server view.                                   |
 
 Keep them reasonably sized (PNG, under ~500 KB each).

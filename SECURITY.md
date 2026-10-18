@@ -26,11 +26,12 @@ from the [Releases](https://github.com/btsouth/toolport/releases) page.
 Toolport's core is a local gateway that AI clients reach; the desktop app is a
 manager around it. What network surface exists depends on the mode you run:
 
-- **Desktop app + stdio gateway (the default).** Each AI client spawns the
-  gateway as a local child process and talks to it over stdio (standard
-  input/output). In this mode the gateway binds **no listening network port** at
-  all. The only socket it ever opens is a transient `127.0.0.1` loopback listener
-  during an OAuth callback, which closes as soon as that flow completes.
+- **Desktop app + stdio gateway (the default).** Each AI client spawns a small
+  gateway adapter as a local child process and talks to it over stdio (standard
+  input/output). The adapters share one host daemon, which listens on a random
+  `127.0.0.1` port and requires a per-install token. Nothing listens off-host.
+  The only other socket is a transient `127.0.0.1` loopback listener during an
+  OAuth callback, which closes as soon as that flow completes.
 - **Local HTTP / OpenAPI bridge (`TOOLPORT_HTTP`, legacy `CONDUIT_HTTP`).** For clients that speak HTTP
   or OpenAPI instead of stdio, the gateway can bind a listener. It defaults to
   `127.0.0.1:8765` (loopback only), configurable with `TOOLPORT_HTTP_HOST` and the
@@ -181,6 +182,6 @@ and only while neither a token nor a registered client exists.
 
 ## Known issues
 
-See the [Known issues](README.md#known-issues) section of the README for current
+See [Known issues](docs/troubleshooting.md#known-issues) in Troubleshooting for current
 advisories, including the Linux-only `glib` `RUSTSEC-2024-0429` soundness issue
 inherited transitively from Tauri's Linux webview stack.

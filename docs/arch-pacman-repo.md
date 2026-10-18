@@ -2,11 +2,10 @@
 
 Toolport ships as `toolport` in its own signed pacman repository, so updates
 arrive with `pacman -Syu` like the rest of your system. It runs on Arch, Manjaro,
-EndeavourOS, and Omarchy. The package needs GTK 4.10+ and libadwaita 1.4, which
-current Arch systems have.
-
-Desktop integration (theme, tray, launch at login) is covered on the
-[Omarchy page](https://toolport.app/omarchy).
+EndeavourOS, and Omarchy. The repository serves 1.24.2 until the staged 2.x
+rollout finishes; use the AppImage from the
+[download page](https://toolport.app/download/#linux) for 2.x until then. The 2.x
+package needs GTK 4.14+ and libadwaita 1.5+, which current Arch systems have.
 
 ## Install
 

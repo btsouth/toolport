@@ -155,9 +155,9 @@ Clients that install [Agent Plugins 1.0](https://agent-plugins.org) packages
 connect to Toolport by installing one plugin instead of editing MCP config.
 Point your client's plugin install flow at
 [packaging/agent-plugin/toolport/](../packaging/agent-plugin/toolport) from a
-checkout (the folder that contains `plugin.json`). From the first release tagged
-after this lands, the same folder also ships as `toolport-agent-plugin.zip` on
-the [releases page](https://github.com/btsouth/toolport/releases). The plugin
+checkout (the folder that contains `plugin.json`). The same folder also ships
+as `toolport-agent-plugin.zip` on the
+[releases page](https://github.com/btsouth/toolport/releases). The plugin
 bundles the gateway's MCP server entry plus a skill that teaches the agent
 Toolport's search → call workflow, and the same folder also carries the Claude
 Code plugin layout. It launches the gateway already installed by the desktop

@@ -1,17 +1,52 @@
-# Toolport token benchmark
+# Toolport token benchmarks
 
-**Routing MCP servers through Toolport's lazy discovery cut provider-reported total tokens 74-91% at the
-SAME task success rate**, measured on a frontier model and graded for _correct answers_,
-not just completion. Every task completed correctly in both modes, and the savings grow
-as you add servers. The reduction comes from not loading every tool's schema into the
-model's context on every request.
+Toolport's lazy discovery replaces every downstream tool definition with four small
+search and call tools. Whether that saves tokens depends on the client:
+
+- **Clients that send every tool definition on every request** (opencode 1.x, and the
+  GPT-5.5 harness below) see large reductions at the same accuracy.
+- **Clients with their own tool search** (Claude Code, Codex, Cursor, opencode 2.x)
+  already defer definitions. Toolport's Auto mode gives Codex and Cursor the full list,
+  and Claude Code too at 120 tools or fewer. In the REA test below, Claude Code at 207 and
+  375 tools used more input through Toolport than with its own search.
 
 Reproduce it yourself: [`benchmark/`](benchmark/).
 
-## Method
+## REA (Reverse Engineer Anything), 2026-10-18
+
+[REA](https://github.com/morluto/rea) 6.7.0 with Ghidra 12.1.4: 207 tools, about 366K
+Claude tokens of definitions. Two stripped x86-64 crackmes (derive a serial, recover a
+hidden password), graded by running the real binary with the agent's answer. Five runs
+per task per setup, Toolport 2.2.0 in its default mode for each client, REA's own skill
+installed as `rea setup` installs it. Input tokens include cache reads and writes,
+summed over the session.
+
+OPENCODE_SECTION
+
+**Claude Code 2.1.286, Sonnet 5.5.** "Every definition" is Claude Code with
+`ENABLE_TOOL_SEARCH=false`, standing in for a client without tool search. "REA + 11" adds
+playwright, chrome-devtools, github, filesystem, memory, sequential-thinking, notion,
+context7, mongodb, git, fetch and time (375 tools).
+
+| Setup | Solved | Startup tokens | Input per task | Cost per task |
+| ----- | -----: | -------------: | -------------: | ------------: |
+| REA, every definition | 10/10 | 365,912 | 2,052,477 | $0.70 |
+| REA, Claude Code tool search | 10/10 | 19,098 | 187,063 | $0.20 |
+| REA through Toolport | 10/10 | 15,786 | 255,749 | $0.22 |
+| REA + 11, Claude Code tool search | 10/10 | 21,859 | 179,121 | $0.19 |
+| REA + 11 through Toolport | 10/10 | 15,788 | 261,361 | $0.25 |
+
+Every run in every setup solved its task. Against every definition, Toolport used 8.0x
+fewer input tokens. Against Claude Code's own search it used 37% and 46% more: each
+Toolport run loaded REA's skill (about 6K tokens, carried on later requests) because REA's
+tools were not visible by name, and made two to five searches. These are short tasks
+(about 30 seconds, 5 to 10 tool calls) on one model; cost is list price with prompt
+caching across runs.
+
+## GPT-5.5 harness: method
 
 - **Two modes**, same tasks, same model:
-  - **flat**, every downstream tool exposed directly (`TOOLPORT_DISCOVERY=full`), the normal MCP setup.
+  - **flat**, every downstream tool exposed directly (`TOOLPORT_DISCOVERY=full`), as a client without its own tool search sees it.
   - **lazy**, Toolport advertises a small, fixed set of meta-tools and the agent searches and
     calls on demand (`TOOLPORT_DISCOVERY=lazy`). With Code Mode off (the default) that is the
     four core tools: `toolport_status`, `toolport_search_tools`, `toolport_call_tool`, and
@@ -24,7 +59,7 @@ Reproduce it yourself: [`benchmark/`](benchmark/).
   real items from the account, so "completed" can't hide a wrong or "I couldn't" answer.
 - **Swept across catalog size** (3 and 6 connected servers) to show how the gap scales.
 
-## Results
+## GPT-5.5 harness: results
 
 Provider-reported end-to-end tokens to complete the three tasks (median of 5 runs), both modes graded. Search calls and their returned content are included:
 
@@ -91,15 +126,16 @@ against an instant mock downstream so the number is purely Toolport's own overhe
 | A tool call through Toolport vs. calling the server directly | **+~0.75 ms** |
 
 Toolport adds well under a millisecond to a tool call. Real MCP servers take tens to
-hundreds of ms each (a process or a network API), so that overhead is noise, and it
-buys the ~90% token reduction above. (Numbers from a dev laptop over 200 iterations;
+hundreds of ms each (a process or a network API), so that overhead is noise. (Numbers from a dev laptop over 200 iterations;
 run it on yours: `node benchmark/latency.mjs`.)
 
 ## Honest caveats
 
-- **Scope:** one frontier model (GPT-5.5), one machine, three read-only "list" tasks, 5
-  runs each. Treat the _direction_ (a large, consistent reduction at equal correctness) as
-  the signal, not the exact percentage. Serialized UTF-8 byte measurements are exact
+- **Scope:** the GPT-5.5 harness is one frontier model, one machine, three read-only
+  "list" tasks, 5 runs each, against a baseline that sends every definition on every call.
+  Treat the _direction_ (a large reduction at equal correctness for such clients) as the
+  signal, not the exact percentage. Clients with their own tool search are a different
+  comparison; see the REA results. Serialized UTF-8 byte measurements are exact
   at the MCP boundary; bytes/4 token equivalents are estimates. The end-to-end
   result table uses provider-reported model usage.
 - **Correctness is graded, not eyeballed.** A run counts only if the answer contains the
@@ -107,6 +143,6 @@ run it on yours: `node benchmark/latency.mjs`.)
   from the model's reported `usage`.
 - **Lazy adds search round-trips.** The total-token figures are already net of that. The
   trade-off only pays off past a handful of tools; for a single tiny server it's overkill.
-- **Savings scale with your tool surface**, and that's the point: 74% at 63 tools and 91%
+- **Against clients that load everything, savings scale with your tool surface**: 74% at 63 tools and 91%
   at 183 end-to-end, and 78% at 5 servers, 90% at 10, 95% at 20 for the static tool
   definitions. The more you connect, the wider the gap.

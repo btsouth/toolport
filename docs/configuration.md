@@ -109,12 +109,13 @@ embedding similarity for paraphrased queries: `TOOLPORT_SEMANTIC=on`,
 `TOOLPORT_EMBED_ENDPOINT`, `TOOLPORT_EMBED_MODEL`, plus optional `TOOLPORT_EMBED_KEY`
 (endpoint auth) and `TOOLPORT_EMBED_BLEND`.
 
-**Multiple accounts for the same service.** Credentials belong to a server, not a
-profile. To use, say, a work and a personal GitHub, add GitHub twice as two
+**Multiple accounts for the same service.** Credentials belong to a server, not an
+access set. To use, say, a work and a personal GitHub, add GitHub twice as two
 servers ("GitHub (work)", "GitHub (personal)"), authenticate each with its own
-account, and enable one in each profile. A client scoped to the work profile
-(`TOOLPORT_PROFILE`) then only ever sees the work account. Tool names are
-namespaced per server, so the two never collide even in the same profile.
+account, and include one in each access set. A client using the work access set
+(chosen in Clients, or `TOOLPORT_PROFILE`) then only ever sees the work account.
+Tool names are namespaced per server, so the two never collide even in the same
+access set. In `registry.json`, access sets are stored as `profiles`.
 
 **Upgrading from 1.x.** The first 2.0 start upgrades `registry.json` through schema v2 to v3.
 Before changing it, Toolport saves the 1.x file next to it as

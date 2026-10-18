@@ -15,12 +15,12 @@ sudo apt-get update
 sudo apt-get install -y build-essential pkg-config libssl-dev libdbus-1-dev git ca-certificates openssl
 ```
 
-From a checkout of the release you want to run (use tag `v2.0.0` once published):
+From a checkout of the release you want to run, for example `v2.2.0`:
 
 ```bash
 git clone https://github.com/btsouth/toolport.git
 cd toolport
-git checkout v2.0.0
+git checkout v2.2.0
 cargo build --locked --release --manifest-path src-tauri/Cargo.toml \
   --no-default-features --features search-static --bin toolport-gateway
 install -Dm755 src-tauri/target/release/toolport-gateway "$HOME/.local/bin/toolport-gateway"
@@ -143,14 +143,12 @@ curl -s -X POST http://127.0.0.1:8765/mcp \
 Image tags:
 
 - `latest` is the newest published stable release (a plain `vX.Y.Z` tag).
-- `X.Y.Z` (for example `2.0.0`) pins one release. Prefer this in production
+- `vX.Y.Z` (for example `v2.2.0`) pins one release. Prefer this in production
   once you have a known-good deploy.
 - `edge` is the tip of the `main` branch, built from unreleased code. It can
   change or break at any time and should not be used in production.
 
-After the first CI publish, make the package public (GitHub → Packages →
-`toolport-gateway` → Package settings → Change visibility). Then, with a named
-volume so the runtime user (uid 10001) owns `/data`:
+With a named volume so the runtime user (uid 10001) owns `/data`:
 
 ```bash
 cp data/registry.json.example data/registry.json

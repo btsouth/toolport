@@ -96,10 +96,9 @@ Review them in the client if you want the old rules or hooks removed.
 
 ## Package notes
 
-- **Arch and Omarchy:** update the signed repository package with
-  `sudo pacman -Syu`. AUR `toolport-bin` uses your AUR helper. Changing between
-  conflicting package names can disconnect clients during removal; reconnect
-  them in the replacement app.
+- **Arch and Omarchy:** the signed pacman repository stays on 1.24.2 until the
+  staged 2.x rollout finishes, then `sudo pacman -Syu` updates to 2.x. Until
+  then, use the AppImage for 2.x. There is no AUR package.
 - **Debian and Ubuntu:** the GTK `.deb` uses the same `toolport` package name as
   1.x. Install it with `sudo apt install ./<file>.deb`. The installer selects
   GTK for Ubuntu 24.04+ and Debian 13+, and AppImage for older systems or when compatibility cannot
@@ -112,10 +111,12 @@ Review them in the client if you want the old rules or hooks removed.
   in-app updater. It retains the Tauri shell. Native GTK packages use package
   updates or manual downloads and have no in-app updater. There is no Toolport
   apt or dnf repository. See [Linux packages](linux-packages.md).
-- **macOS:** use the DMG for Apple Silicon or Intel, or the Homebrew cask.
-  Replace the app in Applications; keep its Application Support data.
+- **macOS:** use the DMG for Apple Silicon or Intel. The Homebrew cask stays on
+  1.24.2 until the staged rollout finishes. Replace the app in Applications;
+  keep its Application Support data.
 - **Windows:** run the NSIS `-setup.exe` installer. Keep the existing Toolport
-  data folder. Toolport itself does not ship as MSIX.
+  data folder. winget stays on 1.24.2 until the staged rollout finishes.
+  Toolport itself does not ship as MSIX.
 
 ## Return to 1.24
 
@@ -125,8 +126,8 @@ Review them in the client if you want the old rules or hooks removed.
    `registry.json.v1-<time>.bak` over `registry.json` in the same data folder.
    This restores the pre-upgrade setup and excludes later changes made in 2.0.
    A v2 backup is not a substitute for the v1 backup.
-3. Install the 1.24.1 package for your platform from
-   [GitHub Releases](https://github.com/btsouth/toolport/releases/tag/v1.24.1).
+3. Install the 1.24.2 package for your platform from
+   [GitHub Releases](https://github.com/btsouth/toolport/releases/tag/v1.24.2).
    If you changed client connections in 2.0, review their config backups and
    restore or reconnect them with 1.24 as needed. Then restart Toolport and clients.
 

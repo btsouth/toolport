@@ -14,15 +14,17 @@ them across Claude, Cursor, Codex, VS Code, and other clients.
 
 [Download](https://toolport.app/download) · [Website & demo](https://toolport.app) · [Discord](https://discord.gg/Xsn27MxdBA)
 
-![Toolport on Linux with the Tokyo Night theme](docs/screenshots/servers-tokyo-night.png)
+![Toolport Servers screen with eight servers ready and one turned off](docs/screenshots/servers.png)
 
 ## Why Toolport?
 
 - **Less context overhead.** Agents search for tools when they need them instead
-  of loading every tool definition up front. It pays off past roughly 10 to 25
-  tools, so a single small server sees no gain. See the [benchmarks](BENCHMARK.md).
+  of loading every tool definition up front. This helps clients that send every
+  definition on each request, past roughly 10 to 25 tools. Clients with their own
+  tool search, such as Claude Code, Codex and Cursor, already defer definitions.
+  See the [benchmarks](BENCHMARK.md).
 - **One setup for every client.** Add and authenticate each server once. Use
-  profiles to choose which servers each client can access.
+  access sets to choose which servers each client can reach.
 - **Keys stay local.** Credentials live in your OS keychain, outside client configs.
 - **Control over tool calls.** Disable tools, require approval for destructive
   calls, and review activity in one place.
@@ -38,7 +40,8 @@ them across Claude, Cursor, Codex, VS Code, and other clients.
 Installers and release notes are also on
 [GitHub Releases](https://github.com/btsouth/toolport/releases).
 On Arch and Omarchy, the [pacman repository](docs/arch-pacman-repo.md) keeps
-Toolport on your normal update path.
+Toolport on your normal update path. It stays on 1.24.2 until the staged 2.x
+rollout finishes; use the AppImage for 2.x until then.
 
 Working with a team? [Toolport Teams](https://toolport.app/teams) shares server
 configuration and policies while each member keeps their own credentials.
@@ -48,7 +51,7 @@ configuration and policies while each member keeps their own credentials.
 - [Upgrade from 1.24.x to 2.0](docs/migration.md)
 - [Supported clients and setup](docs/clients.md)
 - [Skills and rules each agent loads](docs/skills-and-rules.md)
-- [Profiles, environment variables, and configuration](docs/configuration.md)
+- [Access sets, environment variables, and configuration](docs/configuration.md)
 - [Headless gateway and Docker](docs/headless.md)
 - [Arch and Omarchy install (pacman repository)](docs/arch-pacman-repo.md)
 - [Open WebUI](docs/openwebui.md) and [agent plugin](packaging/agent-plugin/toolport/README.md)

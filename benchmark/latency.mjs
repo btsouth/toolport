@@ -330,11 +330,9 @@ async function main() {
     `\n  => Toolport adds ~${overhead.median.toFixed(2)} ms per tool call vs calling the server directly.`,
   );
   console.log(
-    `     Real servers take tens to hundreds of ms each, so that overhead is noise,`,
+    `     Real servers take tens to hundreds of ms each, so that overhead is noise.`,
   );
-  console.log(
-    `     and it buys ~90% fewer tokens. See BENCHMARK.md for the token numbers.\n`,
-  );
+  console.log(`     See BENCHMARK.md for the token numbers.\n`);
   if (result.budget) {
     console.log(
       result.budget.passed
