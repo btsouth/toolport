@@ -142,7 +142,9 @@ fn an_idle_daemon_exits_and_clears_its_descriptor() {
     let dir = scratch_dir();
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create data dir");
-    let mut child = spawn_daemon(&dir, 300);
+    // Long enough for a loaded runner's 50 ms poll to see the descriptor before the
+    // daemon gives up and clears it; 300 ms lost that race on Windows CI.
+    let mut child = spawn_daemon(&dir, 2_000);
 
     wait_for_descriptor(&mut child, &dir);
     let status = wait_for_exit(&mut child, &dir, Duration::from_secs(30));
