@@ -21,4 +21,16 @@ ignore = [
     # Remove when that stack adopts quick-xml 0.41+.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # zip extraction advisories (SUID/SGID bits kept, symlinks pointing outside
+    # the destination, permissions applied through symlinks). All three are in
+    # `ZipArchive::extract`. zip 4.6.1 comes from tauri-plugin-updater, which
+    # calls `extract` only on Windows and only on a download whose minisign
+    # signature already matched our updater key, so the archive is our own
+    # release artifact. zip 8.6.0 comes from candle-core, which only reads
+    # entries by name and never calls `extract`. The fix needs zip >=9, which
+    # neither crate allows yet (updater requires ^4, candle ^8.6). Remove when
+    # both move to zip 9.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
