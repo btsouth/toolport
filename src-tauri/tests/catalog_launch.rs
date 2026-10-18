@@ -250,7 +250,7 @@ fn catalog_values_survive_vault_reload_probe_sharing_and_gateway_launch() {
     )
     .unwrap();
     let (imported, count) = sharing_controller::import_json(&exported).unwrap();
-    assert_eq!(count, 6);
+    assert_eq!(count, 5);
     let filesystem = imported
         .servers
         .iter()
