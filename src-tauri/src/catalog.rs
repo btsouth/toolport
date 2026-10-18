@@ -130,9 +130,12 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
             "https://cloud.mongodb.com",
             "Paste your MongoDB connection string (Atlas: Database > Connect > Drivers).",
         ),
-        "Exa" => ("https://dashboard.exa.ai/api-keys", "Create an API key."),
+        "Exa" => (
+            "https://dashboard.exa.ai/api-keys",
+            "Works without a key at a lower rate limit. For higher limits, paste an Exa API key as the server's auth token.",
+        ),
         "Perplexity" => (
-            "https://www.perplexity.ai/settings/api",
+            "https://console.perplexity.ai",
             "Create an API key (needs a small credit balance).",
         ),
         "DataForSEO" => (
@@ -173,6 +176,10 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
             "https://langfuse.com/docs/api-and-data-platform/features/mcp-server",
             "Use your instance's /api/public/mcp URL. Paste Basic followed by base64(public-key:secret-key) as the server's auth token.",
         ),
+        "Elasticsearch" => (
+            "https://www.elastic.co/docs/explore-analyze/ai-features/agent-builder/mcp-server-api-keys",
+            "Use your Kibana URL plus /api/agent_builder/mcp. Create an API key with Agent Builder read access, then paste ApiKey followed by the key as the server's auth token.",
+        ),
         // Config you supply (no single token page).
         "PostgreSQL" => (
             "",
@@ -184,7 +191,8 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
             "Enter one allowed directory in Launch setup. Add more directories as literal arguments if needed.",
         ),
         // OAuth: authorize in the browser, no manual token.
-        "GitHub" | "Vercel" | "Sentry" | "Notion" | "Linear" | "Stripe" | "Postman" | "Trello" => (
+        "GitHub" | "Vercel" | "Sentry" | "Notion" | "Linear" | "Stripe" | "Postman" | "Trello"
+        | "Airtable" | "Todoist" | "Apify" => (
             "",
             "OAuth: click Authenticate when prompted; no manual token needed.",
         ),
@@ -280,7 +288,6 @@ pub fn curated() -> Vec<CatalogEntry> {
         http("Neon", "Serverless Postgres: branches, queries, projects.", "https://mcp.neon.tech/mcp", "https://neon.tech/docs/ai/neon-mcp-server"),
         cmd("PostgreSQL", "Query a Postgres database (requires a connection URL).", "npx", &["-y", "@modelcontextprotocol/server-postgres@0.6.2", "<launch-input>"], &[], "https://github.com/modelcontextprotocol/servers-archived"),
         cmd("MongoDB", "Query and manage MongoDB databases.", "npx", &["-y", "mongodb-mcp-server@3.0.5"], &["MDB_MCP_CONNECTION_STRING"], "https://github.com/mongodb-js/mongodb-mcp-server"),
-        cmd("Elasticsearch", "Search and analytics over your Elasticsearch cluster.", "npx", &["-y", "@elastic/mcp-server-elasticsearch@0.3.1"], &["ES_URL", "ES_API_KEY"], "https://github.com/elastic/mcp-server-elasticsearch"),
         cmd("Qdrant", "Vector search and memory for RAG: store and query embeddings in Qdrant.", "uvx", &["mcp-server-qdrant@0.8.1"], &["QDRANT_URL", "QDRANT_API_KEY", "COLLECTION_NAME"], "https://github.com/qdrant/mcp-server-qdrant"),
         cmd("Redis", "Inspect and manage a Redis database.", "uvx", &["--from", "redis-mcp-server==0.5.1", "redis-mcp-server", "--url", "<launch-input>"], &[], "https://github.com/redis/mcp-redis"),
         // --- Project management & docs ---
@@ -290,10 +297,10 @@ pub fn curated() -> Vec<CatalogEntry> {
         http("Trello", "Boards, lists, cards, checklists, and workspace search.", "https://mcp.trello.com/v1", "https://github.com/atlassian/trello-mcp-server"),
         http("Linear", "Issues, projects, and cycles in Linear.", "https://mcp.linear.app/mcp", "https://linear.app/docs"),
         http("Atlassian", "Jira issues and Confluence pages.", "https://mcp.atlassian.com/v2/mcp?tools=all", "https://support.atlassian.com/atlassian-ai-gateway/docs/get-started-with-the-atlassian-remote-mcp-server/"),
-        cmd("Airtable", "Read and write records in your Airtable bases.", "npx", &["-y", "airtable-mcp-server@1.14.0"], &["AIRTABLE_API_KEY"], "https://github.com/domdomegg/airtable-mcp-server"),
-        cmd("Todoist", "Manage Todoist tasks and projects.", "npx", &["-y", "@abhiz123/todoist-mcp-server@0.1.0"], &["TODOIST_API_TOKEN"], "https://github.com/abhiz123/todoist-mcp-server"),
+        http("Airtable", "Read and write records in your Airtable bases.", "https://mcp.airtable.com/mcp", "https://airtable.com/developers/agents/mcp/getting-started"),
+        http("Todoist", "Manage Todoist tasks and projects.", "https://ai.todoist.net/mcp", "https://github.com/Doist/todoist-mcp"),
         // --- Communication ---
-        cmd("Slack", "Read and send Slack messages and manage channels.", "npx", &["-y", "@modelcontextprotocol/server-slack@2025.4.25"], &["SLACK_BOT_TOKEN", "SLACK_TEAM_ID"], "https://github.com/modelcontextprotocol/servers"),
+        cmd("Slack", "Read and send Slack messages and manage channels.", "npx", &["-y", "@modelcontextprotocol/server-slack@2025.4.25"], &["SLACK_BOT_TOKEN", "SLACK_TEAM_ID"], "https://github.com/modelcontextprotocol/servers-archived"),
         cmd("Twilio", "Send SMS, make calls, and manage Twilio messaging and voice.", "npx", &["-y", "@twilio-alpha/mcp@0.7.0", "<launch-input>"], &[], "https://github.com/twilio-labs/mcp"),
         http("Postiz", "Schedule and publish social media posts across platforms.", "https://mcp.postiz.com/mcp", "https://docs.postiz.com/mcp/setup"),
         // --- Knowledge & search ---
@@ -304,12 +311,12 @@ pub fn curated() -> Vec<CatalogEntry> {
         http("OpenRouter", "Live model intelligence: list and compare models, prices, and your credits.", "https://mcp.openrouter.ai/mcp", "https://openrouter.ai/blog/announcements/openrouter-mcp-server/"),
         http("Parallel Search", "Live web search and clean content from URLs. No account or API key required.", "https://search.parallel.ai/mcp", "https://docs.parallel.ai/integrations/mcp/search-mcp"),
         cmd("Brave Search", "Web search via the Brave Search API.", "npx", &["-y", "@brave/brave-search-mcp-server@2.1.4"], &["BRAVE_API_KEY"], "https://github.com/brave/brave-search-mcp-server"),
-        cmd("Exa", "AI-native web search built for agents.", "npx", &["-y", "exa-mcp-server@3.4.2"], &["EXA_API_KEY"], "https://github.com/exa-labs/exa-mcp-server"),
+        http("Exa", "AI-native web search built for agents.", "https://mcp.exa.ai/mcp", "https://github.com/exa-labs/exa-mcp-server"),
         cmd("Tavily", "Web search and content extraction built for LLMs.", "npx", &["-y", "tavily-mcp@0.2.22"], &["TAVILY_API_KEY"], "https://github.com/tavily-ai/tavily-mcp"),
         cmd("Perplexity", "Ask Perplexity for cited, up-to-date answers.", "npx", &["-y", "@perplexity-ai/mcp-server@1.3.0"], &["PERPLEXITY_API_KEY"], "https://github.com/perplexityai/modelcontextprotocol"),
         cmd("DataForSEO", "SEO data: SERP tracking, keyword research, and competitor analysis.", "npx", &["-y", "dataforseo-mcp-server@3.1.3"], &["DATAFORSEO_USERNAME", "DATAFORSEO_PASSWORD"], "https://dataforseo.com"),
         cmd("Firecrawl", "Web scraping and data extraction from websites.", "npx", &["-y", "firecrawl-mcp@3.28.2"], &["FIRECRAWL_API_KEY"], "https://github.com/firecrawl/firecrawl-mcp-server"),
-        cmd("Apify", "Run Apify actors for web scraping and automation.", "npx", &["-y", "@apify/actors-mcp-server@0.17.4"], &["APIFY_TOKEN"], "https://github.com/apify/actors-mcp-server"),
+        http("Apify", "Run Apify actors for web scraping and automation.", "https://mcp.apify.com", "https://docs.apify.com/platform/integrations/mcp"),
         cmd("Browserbase", "Cloud headless browsers agents can drive.", "npx", &["-y", "@browserbasehq/mcp@3.0.0"], &["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "GEMINI_API_KEY"], "https://github.com/browserbase/mcp-server-browserbase"),
         // --- Email & comms already above; Design ---
         cmd("Figma", "Turn Figma designs into code (Framelink).", "npx", &["-y", "figma-developer-mcp@0.13.2", "--stdio"], &["FIGMA_API_KEY"], "https://github.com/GLips/Figma-Context-MCP"),
@@ -317,6 +324,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         cmd("Resend", "Send transactional email through Resend.", "npx", &["-y", "resend-mcp@2.25.0"], &["RESEND_API_KEY"], "https://resend.com/docs"),
         // --- Self-hosted (user supplies URL) ---
         self_hosted("n8n", "Trigger, manage, and edit n8n workflows via MCP.", "https://your-instance.com/mcp-server/http", "https://n8n.io"),
+        self_hosted("Elasticsearch", "Search and analyze your Elasticsearch data through Kibana Agent Builder (Elastic 9.2+ or Serverless).", "https://your-kibana.com/api/agent_builder/mcp", "https://www.elastic.co/docs/explore-analyze/ai-features/agent-builder/mcp-server"),
         self_hosted("Langfuse", "Prompt management and observability. Use /api/public/mcp with Basic auth; see setup docs.", "https://your-langfuse.com/api/public/mcp", "https://langfuse.com/docs/api-and-data-platform/features/mcp-server"),
         // --- Local utilities (no account needed) ---
         cmd("Filesystem", "Read and write files in directories you allow.", "npx", &["-y", "@modelcontextprotocol/server-filesystem@2026.8.31", "<launch-input>"], &[], "https://github.com/modelcontextprotocol/servers"),
@@ -434,6 +442,8 @@ pub fn curated() -> Vec<CatalogEntry> {
             }
             "AWS" => launch.revision = Some(2),
             "Atlassian" => launch.revision = Some(2),
+            // Moved from community or deprecated packages to the vendor's server.
+            "Airtable" | "Todoist" | "Exa" | "Apify" | "Elasticsearch" => launch.revision = Some(2),
             "Perplexity" | "Brave Search" => launch.revision = Some(2),
             _ => {}
         }
@@ -447,17 +457,12 @@ pub fn curated() -> Vec<CatalogEntry> {
                 | "Cloudflare (Full API)"
                 | "Clerk (Full API)"
                 | "Linode"
-                | "Elasticsearch"
-                | "Airtable"
-                | "Todoist"
                 | "Slack"
                 | "Brave Search"
-                | "Exa"
                 | "Tavily"
                 | "Perplexity"
                 | "DataForSEO"
                 | "Firecrawl"
-                | "Apify"
                 | "Figma"
                 | "Resend"
         ) {
@@ -1368,6 +1373,45 @@ mod tests {
         assert!(trello.setup_hint.as_deref().unwrap().contains("OAuth"));
         assert!(trello.credentials_url.is_none());
         assert_eq!(filter_catalog(entries, "trello").len(), 1);
+    }
+
+    #[test]
+    fn vendor_hosted_servers_replace_community_and_deprecated_packages() {
+        let entries = curated();
+        let find = |name: &str| entries.iter().find(|e| e.name == name).unwrap();
+        for (name, url) in [
+            ("Todoist", "https://ai.todoist.net/mcp"),
+            ("Airtable", "https://mcp.airtable.com/mcp"),
+            ("Apify", "https://mcp.apify.com"),
+        ] {
+            let entry = find(name);
+            assert_eq!(entry.transport, "http");
+            assert_eq!(entry.url.as_deref(), Some(url));
+            assert!(entry.command.is_none() && entry.env_keys.is_empty());
+            assert!(entry.setup_hint.as_deref().unwrap().contains("OAuth"));
+            assert!(entry.launch.as_ref().unwrap().required_env.is_empty());
+        }
+        let exa = find("Exa");
+        assert_eq!(exa.url.as_deref(), Some("https://mcp.exa.ai/mcp"));
+        assert!(exa.env_keys.is_empty());
+        let elastic = find("Elasticsearch");
+        assert!(elastic.url.is_none());
+        assert_eq!(
+            elastic.url_hint.as_deref(),
+            Some("https://your-kibana.com/api/agent_builder/mcp")
+        );
+        assert!(elastic.setup_hint.as_deref().unwrap().contains("ApiKey"));
+        assert_eq!(elastic.category, "Databases");
+        let pins: Value = serde_json::from_str(include_str!("../catalog-pins.json")).unwrap();
+        for retired in [
+            "npx:@abhiz123/todoist-mcp-server",
+            "npx:airtable-mcp-server",
+            "npx:@apify/actors-mcp-server",
+            "npx:exa-mcp-server",
+            "npx:@elastic/mcp-server-elasticsearch",
+        ] {
+            assert!(pins.get(retired).is_none(), "{retired} is still pinned");
+        }
     }
 
     #[test]

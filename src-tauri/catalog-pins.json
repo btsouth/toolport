@@ -34,11 +34,6 @@
     "integrity": "sha512-tB9HfyrVHr7if8JMB3/+uWr4Rz9oJ9XsMzRUX+uGPAqTfpqUVz4IeRZ6c9NkKiVLMFSGXsJtnBVEwW2NtUIEAQ==",
     "url": "https://registry.npmjs.org/mongodb-mcp-server/-/mongodb-mcp-server-3.0.5.tgz"
   },
-  "npx:@elastic/mcp-server-elasticsearch": {
-    "version": "0.3.1",
-    "integrity": "sha512-zeANoblVkez9Mn2JDyUC0p5UVOY/uWnEbn2C0X2wGpX0C/wa6/8KHu2VbpQe4Y0zL4noPjVjsxKvSsIUpr2NjA==",
-    "url": "https://registry.npmjs.org/@elastic/mcp-server-elasticsearch/-/mcp-server-elasticsearch-0.3.1.tgz"
-  },
   "uvx:mcp-server-qdrant": {
     "version": "0.8.1",
     "integrity": "sha256-eb7b36105021b431989f5a0f794591e52d48d3a6afb1a033d65fd8a08a68991c",
@@ -48,16 +43,6 @@
     "version": "0.5.1",
     "integrity": "sha256-335d9089d4c87a055b362effa7fd718334ccd88b2545d93c4ed9bc2b738b3ed8",
     "url": "https://files.pythonhosted.org/packages/d6/e7/7c7c375285e480d693d240c4adc92012f8dabdfcaf0b09f5e1e385dec383/redis_mcp_server-0.5.1-py3-none-any.whl"
-  },
-  "npx:airtable-mcp-server": {
-    "version": "1.14.0",
-    "integrity": "sha512-OYUwkrIhXsYRqx39wQ5R7OAM5R0RdDWJRb8CBMLFU8OGPAB1Jmm4oOrLtaH3Qmtd+UG2IAT+nFlFrqfs//2klA==",
-    "url": "https://registry.npmjs.org/airtable-mcp-server/-/airtable-mcp-server-1.14.0.tgz"
-  },
-  "npx:@abhiz123/todoist-mcp-server": {
-    "version": "0.1.0",
-    "integrity": "sha512-jCagjv05QV2Y0ZBw9H2Szf4046AeXGjWzxKrDbG4T21XpRgjBArFqV2hykHAtwXhRNufNauFuH+YL5f+TwfZ2w==",
-    "url": "https://registry.npmjs.org/@abhiz123/todoist-mcp-server/-/todoist-mcp-server-0.1.0.tgz"
   },
   "npx:@modelcontextprotocol/server-slack": {
     "version": "2025.4.25",
@@ -73,11 +58,6 @@
     "version": "2.1.4",
     "integrity": "sha512-a34HBs6os4Ilp0yHPV/j3UrgBQH1uTDLsNA9y5IlO30RCYUFm9QPfC0coh2c7WEDxKcHuWjVsrfuXIJNheu9YA==",
     "url": "https://registry.npmjs.org/@brave/brave-search-mcp-server/-/brave-search-mcp-server-2.1.4.tgz"
-  },
-  "npx:exa-mcp-server": {
-    "version": "3.4.2",
-    "integrity": "sha512-2pqkOuXnABXrwVkB6VyMYA9ywr1aqjBGKlLtcgTBMkWtIn74yY+pMPn8Km2SAGfLeENfWaIHv1L7/kF0b+E5BQ==",
-    "url": "https://registry.npmjs.org/exa-mcp-server/-/exa-mcp-server-3.4.2.tgz"
   },
   "npx:tavily-mcp": {
     "version": "0.2.22",
@@ -98,11 +78,6 @@
     "version": "3.28.2",
     "integrity": "sha512-uF44mMgxoI+6RacXIDnQeHg345VYOcfWQ9bIFJ04jP0g5uSK8FP6NaNX9aeF8ugJXRh2SghOxgNgIzlB7rI4gg==",
     "url": "https://registry.npmjs.org/firecrawl-mcp/-/firecrawl-mcp-3.28.2.tgz"
-  },
-  "npx:@apify/actors-mcp-server": {
-    "version": "0.17.4",
-    "integrity": "sha512-EOzzBSTA3/o/QM1EptJO+ZyoooZ/dlbb8uvI7qjf7MWzcQE+U6kQcFybjQaeCeOBYy+5epxV1jvuPW1CottTsA==",
-    "url": "https://registry.npmjs.org/@apify/actors-mcp-server/-/actors-mcp-server-0.17.4.tgz"
   },
   "npx:@browserbasehq/mcp": {
     "version": "3.0.0",
