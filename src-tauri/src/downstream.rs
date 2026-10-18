@@ -1722,10 +1722,14 @@ fn http_metadata_error(error: &ureq::Error, response_body: bool) -> TransportErr
 
 /// Build an `Authorization` header value from a raw token, adding the `Bearer`
 /// scheme unless the caller supplied a supported scheme. Personal Atlassian API
-/// tokens use `Basic base64(email:token)` rather than Bearer authentication.
+/// tokens use `Basic base64(email:token)` and Elastic API keys use
+/// `ApiKey <key>` rather than Bearer authentication.
 pub fn bearer_header(token: &str) -> String {
     let lower = token.to_ascii_lowercase();
-    if lower.starts_with("bearer ") || lower.starts_with("basic ") {
+    if ["bearer ", "basic ", "apikey "]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme))
+    {
         token.to_string()
     } else {
         format!("Bearer {token}")
@@ -14743,6 +14747,10 @@ for line in sys.stdin:
             "Basic ZW1haWw6dG9rZW4="
         );
         assert_eq!(super::bearer_header("bearer sk-123"), "bearer sk-123");
+        assert_eq!(
+            super::bearer_header("ApiKey ZWxhc3RpYw=="),
+            "ApiKey ZWxhc3RpYw=="
+        );
     }
 
     #[test]
