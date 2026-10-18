@@ -20,9 +20,9 @@
     "url": "https://registry.npmjs.org/@takashito/linode-mcp-server/-/linode-mcp-server-0.4.0.tgz"
   },
   "npx:chrome-devtools-mcp": {
-    "version": "1.10.1",
-    "integrity": "sha512-Klw6HWDqHC/XS1JwZldd2r49aUhbUJN9m9Mvcx4SEueIPXtzuQX+QelxAViobv8YUkDZ7HWDrmViR6LeYK0wAw==",
-    "url": "https://registry.npmjs.org/chrome-devtools-mcp/-/chrome-devtools-mcp-1.10.1.tgz"
+    "version": "1.11.0",
+    "integrity": "sha512-CytJ/5tnzrS+J/74be2P5aCOsS/mmGRHys/Si+IYC4ucrbnWAmES/dYdxGJjeUCECRcoFUilZAysdjlwqUjXIA==",
+    "url": "https://registry.npmjs.org/chrome-devtools-mcp/-/chrome-devtools-mcp-1.11.0.tgz"
   },
   "npx:@modelcontextprotocol/server-postgres": {
     "version": "0.6.2",
@@ -30,9 +30,9 @@
     "url": "https://registry.npmjs.org/@modelcontextprotocol/server-postgres/-/server-postgres-0.6.2.tgz"
   },
   "npx:mongodb-mcp-server": {
-    "version": "3.0.5",
-    "integrity": "sha512-tB9HfyrVHr7if8JMB3/+uWr4Rz9oJ9XsMzRUX+uGPAqTfpqUVz4IeRZ6c9NkKiVLMFSGXsJtnBVEwW2NtUIEAQ==",
-    "url": "https://registry.npmjs.org/mongodb-mcp-server/-/mongodb-mcp-server-3.0.5.tgz"
+    "version": "3.1.0",
+    "integrity": "sha512-sqevTzO/CvrefKDiRmV9CgeNlBq8qLLWoofh5qBJmR+iXSNLexo0RrGkNnomh5LSuJMbSDmrQfUr5oiE1ZiDtg==",
+    "url": "https://registry.npmjs.org/mongodb-mcp-server/-/mongodb-mcp-server-3.1.0.tgz"
   },
   "uvx:mcp-server-qdrant": {
     "version": "0.8.1",
@@ -75,9 +75,9 @@
     "url": "https://registry.npmjs.org/dataforseo-mcp-server/-/dataforseo-mcp-server-3.1.3.tgz"
   },
   "npx:firecrawl-mcp": {
-    "version": "3.28.2",
-    "integrity": "sha512-uF44mMgxoI+6RacXIDnQeHg345VYOcfWQ9bIFJ04jP0g5uSK8FP6NaNX9aeF8ugJXRh2SghOxgNgIzlB7rI4gg==",
-    "url": "https://registry.npmjs.org/firecrawl-mcp/-/firecrawl-mcp-3.28.2.tgz"
+    "version": "3.30.3",
+    "integrity": "sha512-+2azzxc+DeIgVQHVYxN9ihMnrF8JWj+AOFozhxcbUoPUFEeD9mMASBcnsfoEFuUZjWo4b8IQmhnoAiZ7eBRzZw==",
+    "url": "https://registry.npmjs.org/firecrawl-mcp/-/firecrawl-mcp-3.30.3.tgz"
   },
   "npx:@browserbasehq/mcp": {
     "version": "3.0.0",
@@ -90,24 +90,24 @@
     "url": "https://registry.npmjs.org/figma-developer-mcp/-/figma-developer-mcp-0.13.2.tgz"
   },
   "npx:resend-mcp": {
-    "version": "2.25.0",
-    "integrity": "sha512-NyJYWEPRYqTj2O0nhlGvDR6hqJd3+lPEviJnrmCoMh1UbQiZ0ErKDyjwPsaucTOpxgIW+CmBl3I0R4nrZ2NVpg==",
-    "url": "https://registry.npmjs.org/resend-mcp/-/resend-mcp-2.25.0.tgz"
+    "version": "2.27.1",
+    "integrity": "sha512-vLgzbVVWQw1XNzFZcL3VYpMJy6KKrd9jaLNR7VozeFoJ5Gsw0eYJErFKxCDWJv22eLt9XXRJG4B70OCItANjtQ==",
+    "url": "https://registry.npmjs.org/resend-mcp/-/resend-mcp-2.27.1.tgz"
   },
   "npx:@modelcontextprotocol/server-filesystem": {
-    "version": "2026.8.31",
-    "integrity": "sha512-kKaFkyAh6oipvc9+EAbJ552JafnMnOq5nzmzWkp1jJdBhTAAGpmIpWihUG1+rfNhmEFM98gUZDdCHCDD4v6a7Q==",
-    "url": "https://registry.npmjs.org/@modelcontextprotocol/server-filesystem/-/server-filesystem-2026.8.31.tgz"
+    "version": "1.0.0",
+    "integrity": "sha512-2fN6qhpsiPSBAe0ev1qDPk4sCWdULCZQTuYc4ZY7+BDWQ1XCxLB+7dqStF2ZflgG4G/9vTwQsjxh7pjFqrrpcg==",
+    "url": "https://registry.npmjs.org/@modelcontextprotocol/server-filesystem/-/server-filesystem-1.0.0.tgz"
   },
   "uvx:mcp-server-fetch": {
-    "version": "2026.8.18",
-    "integrity": "sha256-6642df733a1032e7f37d0f13849af8a944d46c02420d2c070cc14e0948f8fcc2",
-    "url": "https://files.pythonhosted.org/packages/5a/2d/c8d2e50796d6e3c77fa1932b9b010df36168edb5f5387c98a524ef77f110/mcp_server_fetch-2026.8.18-py3-none-any.whl"
+    "version": "2026.10.10",
+    "integrity": "sha256-d722c48bdc1de3e2a81727853bc490cf55c6c935e2038cdcad3c111b1d85db77",
+    "url": "https://files.pythonhosted.org/packages/cd/67/a0065474431a2482107086e7a98baf3e6a9e33c804fb9c0d9fb0149957ed/mcp_server_fetch-2026.10.10-py3-none-any.whl"
   },
   "uvx:mcp-server-git": {
-    "version": "2026.8.18",
-    "integrity": "sha256-6c32a8e771564122a9bafac373cf871fb3ab540ddc1ba0ee8e9c8c6e9878aef7",
-    "url": "https://files.pythonhosted.org/packages/64/6b/2c03a87808ab787d568f4405ad79f27ea7b0498d9eea5086f01c25b153bc/mcp_server_git-2026.8.18-py3-none-any.whl"
+    "version": "2026.10.10",
+    "integrity": "sha256-5bd3dc5736d67ab01b664363055001b2ce84e945c17af98875e5e04b5823d335",
+    "url": "https://files.pythonhosted.org/packages/d9/a7/d38c6db1df603d4fe4aa95400319384970b27b0afcfa15d7d28de7860e43/mcp_server_git-2026.10.10-py3-none-any.whl"
   },
   "npx:@playwright/mcp": {
     "version": "0.0.83",
@@ -115,18 +115,18 @@
     "url": "https://registry.npmjs.org/@playwright/mcp/-/mcp-0.0.83.tgz"
   },
   "npx:@modelcontextprotocol/server-sequential-thinking": {
-    "version": "2026.8.31",
-    "integrity": "sha512-/EMH++1j2e+VmHwpibw1IUPHxA0tcQY09Yo5/OIPwW/8irEKLAufJNGSZQhCK18n8TUvV6WwZyQOuaDKxe/CeQ==",
-    "url": "https://registry.npmjs.org/@modelcontextprotocol/server-sequential-thinking/-/server-sequential-thinking-2026.8.31.tgz"
+    "version": "1.0.0",
+    "integrity": "sha512-ykTmeS4Eejs+FESDrD73mDBNYCkb+cCZJ1MWuv7/vwucbVgGfEbBL5HVt2nVw0/vNF8jz+o9sO/WmxxfXt0J6w==",
+    "url": "https://registry.npmjs.org/@modelcontextprotocol/server-sequential-thinking/-/server-sequential-thinking-1.0.0.tgz"
   },
   "npx:@modelcontextprotocol/server-memory": {
-    "version": "2026.8.31",
-    "integrity": "sha512-ljj/3S4aGjxdNSQWw6gucKKGnTLdBPWxzapyY/MT2tOVyZwvxChvevXSLPwx59nKJAlVpUVW+cOlnVRXRwiqMQ==",
-    "url": "https://registry.npmjs.org/@modelcontextprotocol/server-memory/-/server-memory-2026.8.31.tgz"
+    "version": "1.0.0",
+    "integrity": "sha512-UDMtMrw2xeI16mcn7O4fesp9Pf3hYh91thuU5KSz0BxKqwnTwEytZKjHfkrqxxmKp0r4QHoiEkMV99UmadmODw==",
+    "url": "https://registry.npmjs.org/@modelcontextprotocol/server-memory/-/server-memory-1.0.0.tgz"
   },
   "uvx:mcp-server-time": {
-    "version": "2026.8.18",
-    "integrity": "sha256-1407583af42dc0163909d855c9ef20114a12b4981c3975033721a7906cdd212a",
-    "url": "https://files.pythonhosted.org/packages/ad/d9/fcc7f85f0cdcfa8da9c650439128dd72be21855a126b745f17cf43f24b11/mcp_server_time-2026.8.18-py3-none-any.whl"
+    "version": "2026.10.10",
+    "integrity": "sha256-32983d5193af219359ccdac46c558bed75f9c930360e7437cc040a73984cc17c",
+    "url": "https://files.pythonhosted.org/packages/a2/ed/a4fed01271866397abcb8ca76f0f47a76e63122142ac177b99cc78e4e53b/mcp_server_time-2026.10.10-py3-none-any.whl"
   }
 }

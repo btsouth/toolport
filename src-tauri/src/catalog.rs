@@ -282,12 +282,12 @@ pub fn curated() -> Vec<CatalogEntry> {
         cmd("AWS", "AWS service APIs through the AWS Labs API MCP server.", "uvx", &["awslabs.aws-api-mcp-server@1.5.6"], &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"], "https://github.com/awslabs/mcp"),
         cmd("Kubernetes", "Inspect and manage Kubernetes clusters via your kubeconfig.", "npx", &["-y", "mcp-server-kubernetes@4.1.9"], &[], "https://github.com/Flux159/mcp-server-kubernetes"),
         cmd("Linode", "Manage Linode (Akamai) cloud: instances, volumes, NodeBalancers, databases, and networking.", "npx", &["-y", "@takashito/linode-mcp-server@0.4.0"], &["LINODE_API_TOKEN"], "https://github.com/takashito/linode-mcp-server"),
-        cmd("Chrome DevTools", "Control and inspect a live Chrome browser: traces, screenshots, network, console.", "npx", &["-y", "chrome-devtools-mcp@1.10.1"], &[], "https://github.com/ChromeDevTools/chrome-devtools-mcp"),
+        cmd("Chrome DevTools", "Control and inspect a live Chrome browser: traces, screenshots, network, console.", "npx", &["-y", "chrome-devtools-mcp@1.11.0"], &[], "https://github.com/ChromeDevTools/chrome-devtools-mcp"),
         // --- Databases ---
         http("Supabase", "Query and manage your Supabase projects.", "https://mcp.supabase.com/mcp", "https://supabase.com/docs/guides/getting-started/mcp"),
         http("Neon", "Serverless Postgres: branches, queries, projects.", "https://mcp.neon.tech/mcp", "https://neon.tech/docs/ai/neon-mcp-server"),
         cmd("PostgreSQL", "Query a Postgres database (requires a connection URL).", "npx", &["-y", "@modelcontextprotocol/server-postgres@0.6.2", "<launch-input>"], &[], "https://github.com/modelcontextprotocol/servers-archived"),
-        cmd("MongoDB", "Query and manage MongoDB databases.", "npx", &["-y", "mongodb-mcp-server@3.0.5"], &["MDB_MCP_CONNECTION_STRING"], "https://github.com/mongodb-js/mongodb-mcp-server"),
+        cmd("MongoDB", "Query and manage MongoDB databases.", "npx", &["-y", "mongodb-mcp-server@3.1.0"], &["MDB_MCP_CONNECTION_STRING"], "https://github.com/mongodb-js/mongodb-mcp-server"),
         cmd("Qdrant", "Vector search and memory for RAG: store and query embeddings in Qdrant.", "uvx", &["mcp-server-qdrant@0.8.1"], &["QDRANT_URL", "QDRANT_API_KEY", "COLLECTION_NAME"], "https://github.com/qdrant/mcp-server-qdrant"),
         cmd("Redis", "Inspect and manage a Redis database.", "uvx", &["--from", "redis-mcp-server==0.5.1", "redis-mcp-server", "--url", "<launch-input>"], &[], "https://github.com/redis/mcp-redis"),
         // --- Project management & docs ---
@@ -315,25 +315,25 @@ pub fn curated() -> Vec<CatalogEntry> {
         cmd("Tavily", "Web search and content extraction built for LLMs.", "npx", &["-y", "tavily-mcp@0.2.22"], &["TAVILY_API_KEY"], "https://github.com/tavily-ai/tavily-mcp"),
         cmd("Perplexity", "Ask Perplexity for cited, up-to-date answers.", "npx", &["-y", "@perplexity-ai/mcp-server@1.3.0"], &["PERPLEXITY_API_KEY"], "https://github.com/perplexityai/modelcontextprotocol"),
         cmd("DataForSEO", "SEO data: SERP tracking, keyword research, and competitor analysis.", "npx", &["-y", "dataforseo-mcp-server@3.1.3"], &["DATAFORSEO_USERNAME", "DATAFORSEO_PASSWORD"], "https://dataforseo.com"),
-        cmd("Firecrawl", "Web scraping and data extraction from websites.", "npx", &["-y", "firecrawl-mcp@3.28.2"], &["FIRECRAWL_API_KEY"], "https://github.com/firecrawl/firecrawl-mcp-server"),
+        cmd("Firecrawl", "Web scraping and data extraction from websites.", "npx", &["-y", "firecrawl-mcp@3.30.3"], &["FIRECRAWL_API_KEY"], "https://github.com/firecrawl/firecrawl-mcp-server"),
         http("Apify", "Run Apify actors for web scraping and automation.", "https://mcp.apify.com", "https://docs.apify.com/platform/integrations/mcp"),
         cmd("Browserbase", "Cloud headless browsers agents can drive.", "npx", &["-y", "@browserbasehq/mcp@3.0.0"], &["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "GEMINI_API_KEY"], "https://github.com/browserbase/mcp-server-browserbase"),
         // --- Email & comms already above; Design ---
         cmd("Figma", "Turn Figma designs into code (Framelink).", "npx", &["-y", "figma-developer-mcp@0.13.2", "--stdio"], &["FIGMA_API_KEY"], "https://github.com/GLips/Figma-Context-MCP"),
         // --- Email ---
-        cmd("Resend", "Send transactional email through Resend.", "npx", &["-y", "resend-mcp@2.25.0"], &["RESEND_API_KEY"], "https://resend.com/docs"),
+        cmd("Resend", "Send transactional email through Resend.", "npx", &["-y", "resend-mcp@2.27.1"], &["RESEND_API_KEY"], "https://resend.com/docs"),
         // --- Self-hosted (user supplies URL) ---
         self_hosted("n8n", "Trigger, manage, and edit n8n workflows via MCP.", "https://your-instance.com/mcp-server/http", "https://n8n.io"),
         self_hosted("Elasticsearch", "Search and analyze your Elasticsearch data through Kibana Agent Builder (Elastic 9.2+ or Serverless).", "https://your-kibana.com/api/agent_builder/mcp", "https://www.elastic.co/docs/explore-analyze/ai-features/agent-builder/mcp-server"),
         self_hosted("Langfuse", "Prompt management and observability. Use /api/public/mcp with Basic auth; see setup docs.", "https://your-langfuse.com/api/public/mcp", "https://langfuse.com/docs/api-and-data-platform/features/mcp-server"),
         // --- Local utilities (no account needed) ---
-        cmd("Filesystem", "Read and write files in directories you allow.", "npx", &["-y", "@modelcontextprotocol/server-filesystem@2026.8.31", "<launch-input>"], &[], "https://github.com/modelcontextprotocol/servers"),
-        cmd("Fetch", "Fetch a URL and return its content as markdown.", "uvx", &["mcp-server-fetch@2026.8.18"], &[], "https://github.com/modelcontextprotocol/servers"),
-        cmd("Git", "Read, search, and manipulate a local Git repo.", "uvx", &["mcp-server-git@2026.8.18"], &[], "https://github.com/modelcontextprotocol/servers"),
+        cmd("Filesystem", "Read and write files in directories you allow.", "npx", &["-y", "@modelcontextprotocol/server-filesystem@1.0.0", "<launch-input>"], &[], "https://github.com/modelcontextprotocol/servers"),
+        cmd("Fetch", "Fetch a URL and return its content as markdown.", "uvx", &["mcp-server-fetch@2026.10.10"], &[], "https://github.com/modelcontextprotocol/servers"),
+        cmd("Git", "Read, search, and manipulate a local Git repo.", "uvx", &["mcp-server-git@2026.10.10"], &[], "https://github.com/modelcontextprotocol/servers"),
         cmd("Playwright", "Drive a real browser for testing and scraping.", "npx", &["-y", "@playwright/mcp@0.0.83"], &[], "https://github.com/microsoft/playwright-mcp"),
-        cmd("Sequential Thinking", "Structured step-by-step reasoning for hard problems.", "npx", &["-y", "@modelcontextprotocol/server-sequential-thinking@2026.8.31"], &[], "https://github.com/modelcontextprotocol/servers"),
-        cmd("Memory", "A knowledge graph the agent reads and writes across sessions.", "npx", &["-y", "@modelcontextprotocol/server-memory@2026.8.31"], &[], "https://github.com/modelcontextprotocol/servers"),
-        cmd("Time", "Current time and timezone conversions.", "uvx", &["mcp-server-time@2026.8.18"], &[], "https://github.com/modelcontextprotocol/servers"),
+        cmd("Sequential Thinking", "Structured step-by-step reasoning for hard problems.", "npx", &["-y", "@modelcontextprotocol/server-sequential-thinking@1.0.0"], &[], "https://github.com/modelcontextprotocol/servers"),
+        cmd("Memory", "A knowledge graph the agent reads and writes across sessions.", "npx", &["-y", "@modelcontextprotocol/server-memory@1.0.0"], &[], "https://github.com/modelcontextprotocol/servers"),
+        cmd("Time", "Current time and timezone conversions.", "uvx", &["mcp-server-time@2026.10.10"], &[], "https://github.com/modelcontextprotocol/servers"),
     ];
     for e in &mut list {
         let template = e
