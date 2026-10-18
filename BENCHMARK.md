@@ -21,20 +21,33 @@ per task per setup, Toolport 2.2.0 in its default mode for each client, REA's ow
 installed as `rea setup` installs it. Input tokens include cache reads and writes,
 summed over the session.
 
-OPENCODE_SECTION
+**OpenCode, DeepSeek V4.1 Flash.** OpenCode 1.19.3 sends every MCP tool definition
+with each request. OpenCode 2.0.32 hides MCP tools behind its own Code Mode catalog.
+Counts use DeepSeek's tokenizer, so compare rows within this table only.
+
+| Setup                        | Solved | Startup tokens | Input per task | Cost per task | Median time |
+| ---------------------------- | -----: | -------------: | -------------: | ------------: | ----------: |
+| REA in OpenCode 1.19.3       |  10/10 |        249,192 |      3,321,215 |        $0.053 |       269 s |
+| REA through Toolport, 1.19.3 |  10/10 |          7,455 |        542,901 |        $0.012 |        84 s |
+| REA in OpenCode 2.0.32       |  10/10 |          4,467 |        756,911 |        $0.016 |       132 s |
+| REA through Toolport, 2.0.32 |  10/10 |          4,453 |        559,096 |        $0.014 |       134 s |
+
+In OpenCode 1.19.3, Toolport used 6.1x fewer input tokens, cost 4.4x less and
+finished 3.2x faster, with every task solved both ways. In 2.0.32 the two were
+close: 26% less input through Toolport, mostly from one of the two tasks.
 
 **Claude Code 2.1.286, Sonnet 5.5.** "Every definition" is Claude Code with
 `ENABLE_TOOL_SEARCH=false`, standing in for a client without tool search. "REA + 11" adds
 playwright, chrome-devtools, github, filesystem, memory, sequential-thinking, notion,
 context7, mongodb, git, fetch and time (375 tools).
 
-| Setup | Solved | Startup tokens | Input per task | Cost per task |
-| ----- | -----: | -------------: | -------------: | ------------: |
-| REA, every definition | 10/10 | 365,912 | 2,052,477 | $0.70 |
-| REA, Claude Code tool search | 10/10 | 19,098 | 187,063 | $0.20 |
-| REA through Toolport | 10/10 | 15,786 | 255,749 | $0.22 |
-| REA + 11, Claude Code tool search | 10/10 | 21,859 | 179,121 | $0.19 |
-| REA + 11 through Toolport | 10/10 | 15,788 | 261,361 | $0.25 |
+| Setup                             | Solved | Startup tokens | Input per task | Cost per task |
+| --------------------------------- | -----: | -------------: | -------------: | ------------: |
+| REA, every definition             |  10/10 |        365,912 |      2,052,477 |         $0.70 |
+| REA, Claude Code tool search      |  10/10 |         19,098 |        187,063 |         $0.20 |
+| REA through Toolport              |  10/10 |         15,786 |        255,749 |         $0.22 |
+| REA + 11, Claude Code tool search |  10/10 |         21,859 |        179,121 |         $0.19 |
+| REA + 11 through Toolport         |  10/10 |         15,788 |        261,361 |         $0.25 |
 
 Every run in every setup solved its task. Against every definition, Toolport used 8.0x
 fewer input tokens. Against Claude Code's own search it used 37% and 46% more: each
