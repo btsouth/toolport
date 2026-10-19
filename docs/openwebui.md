@@ -8,7 +8,7 @@ server you've connected through Toolport, including chained multi-step tool flow
 ## The recipe
 
 **1. Turn on the HTTP endpoint.** In the Toolport app: **Settings ->
-Integrations -> "Open WebUI / HTTP endpoint"**, flip it on, and copy the **URL**
+Connections -> "Open WebUI / HTTP endpoint"**, flip it on, and copy the **URL**
 (`http://localhost:8765`) and the **token** it shows. The app supervises the
 gateway for you and shuts it down when you quit.
 

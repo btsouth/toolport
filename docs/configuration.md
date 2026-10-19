@@ -23,7 +23,7 @@ written automatically when you connect:
   (0 disables it). Optional; default budget applies when unset.
 - `TOOLPORT_HTTP=<port>` (with optional `TOOLPORT_HTTP_HOST`, default `127.0.0.1`,
   and `TOOLPORT_HTTP_TOKEN` for the required bearer token) - run the gateway in
-  HTTP/OpenAPI mode instead of stdio, for Open WebUI and other OpenAPI clients (see [Open WebUI](openwebui.md)). The in-app Settings -> Integrations toggle sets these for you, and the
+  HTTP/OpenAPI mode instead of stdio, for Open WebUI and other OpenAPI clients (see [Open WebUI](openwebui.md)). The in-app Settings -> Connections toggle sets these for you, and the
   gateway refuses to bind without a token or registered HTTP client. For isolated
   local development only, `--insecure-loopback` explicitly permits an unauthenticated
   loopback listener; it never permits an open non-loopback bind.
@@ -32,7 +32,7 @@ written automatically when you connect:
 - `TOOLPORT_GATEWAY_TOPOLOGY` - retired in 2.0. A `legacy` value is ignored and
   recorded once at gateway startup.
 - `TOOLPORT_CODE_MODE=1` - force-enable code mode (`toolport_run_script`) even if Settings
-  has it off. Code mode is **off by default**; opt in under Advanced in Settings. Each
+  has it off. Code mode is **off by default**; opt in under Settings > Tools. Each
   in-script tool call still respects profile scope and human approval; code mode is not a
   security boundary.
 
@@ -44,7 +44,7 @@ default; one host daemon owns the router and shares ordinary downstream
 connections. The 2.0 upgrade drops a stored `gatewayTopology: "legacy"`, and the
 legacy environment override is ignored, with a notice in the gateway log. Existing Shared HTTP client entries
 and their authentication remain unchanged at startup. Connecting, resetting or
-migrating a client explicitly writes the stdio adapter entry. Settings > Integrations
+migrating a client explicitly writes the stdio adapter entry. Settings > Connections
 still provides the HTTP/OpenAPI bridge.
 The adapter retains its in-process fallback when daemon spawning fails and its
 private gateway fallback when the shared daemon is unhealthy. Ambiguous startup

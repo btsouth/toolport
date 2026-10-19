@@ -164,7 +164,7 @@ separately on every push to `main` via `docker-publish.yml`; no tag required.
 On each app launch Toolport **stops obsolete gateway processes** (older versioned
 binaries and stale paths), keeping the current published/resolved gateway. Clients
 that auto-respawn MCP pick up the new binary on the **next tool call** without a
-full agent restart. Settings → Integrations → **Stop old gateways** runs the same
+full agent restart. Settings → Connections → **Stop old gateways** runs the same
 cleanup on demand. The Tauri in-app updater asks idle shared daemons to shut
 down, then stops standalone gateway processes before installation. If a shared
 daemon still has active MCP sessions, installation is refused and the app gives

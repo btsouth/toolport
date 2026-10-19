@@ -430,7 +430,7 @@ headless and Docker configs do not break on upgrade.
   app or a one-time manual URL in the client config, which is what sandboxed
   setups usually want anyway.
 - **Code Mode** (`toolport_run_script`) is **off by default**. Upgrades keep the
-  1.x choice. Enable it under Advanced in Settings, with `"codeMode": true`,
+  1.x choice. Enable it under Settings > Tools, with `"codeMode": true`,
   or with `TOOLPORT_CODE_MODE=1`. It is not a security boundary:
   agents supply JS that can call many tools in one round-trip; each call still
   hits the same scope and approval gates. Shared multi-tenant gateways that do

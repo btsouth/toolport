@@ -328,7 +328,7 @@ Gotcha: when running Toolport from source, build the gateway first with `npm run
 
 The gateway speaks HTTP/OpenAPI natively, so Open WebUI (and any OpenAPI tool
 client) connects straight to Toolport, no bridge or proxy. Flip on **Settings ->
-Integrations -> Open WebUI / HTTP endpoint** in the app (or run
+Connections -> Open WebUI / HTTP endpoint** in the app (or run
 `toolport-gateway --http 8765` after setting `TOOLPORT_HTTP_TOKEN`), then add
 `http://localhost:8765` as an OpenAPI tool server. See
 [docs/openwebui.md](openwebui.md). The same endpoint serves
@@ -365,7 +365,7 @@ For Docker and MCP over HTTP, see [Headless gateway](headless.md).
 Servers have one on/off switch. An off server is hidden from every client. On the
 Clients page, Access can select **All enabled servers** or a named **access set**.
 Access sets narrow server and tool access; manage them and project folder routing
-under **Settings > Advanced**. Folder routing takes precedence over client access,
+under **Settings > Access**. Folder routing takes precedence over client access,
 then `TOOLPORT_PROFILE`, then the default access. Unknown access sets fail closed.
 
 The v3 registry migration backs up the original document and turns on the union
