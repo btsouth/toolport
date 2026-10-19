@@ -73,9 +73,8 @@ fn category_for(name: &str) -> &'static str {
         | "Clerk (Full API)" => "Code & infrastructure",
         "Supabase" | "Neon" | "MongoDB" | "Elasticsearch" | "Qdrant" | "Redis" => "Databases",
         "Context7" | "DeepWiki" | "Microsoft Learn" | "Hugging Face" | "OpenRouter"
-        | "Parallel Search" | "Brave Search" | "Exa" | "Tavily" | "Perplexity" | "DataForSEO" => {
-            "Search & knowledge"
-        }
+        | "Parallel Search" | "Keenable" | "Brave Search" | "Exa" | "Tavily" | "Perplexity"
+        | "DataForSEO" => "Search & knowledge",
         "Firecrawl" | "Apify" | "Browserbase" => "Web & automation",
         "Stripe" | "Stripe (Full API)" | "Notion" | "Composio" | "Linear" | "Atlassian"
         | "Airtable" | "Todoist" | "Resend" | "Figma" | "Postiz" | "Twilio" | "n8n"
@@ -298,6 +297,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         http("Hugging Face", "Models, datasets, and Spaces on Hugging Face.", "https://huggingface.co/mcp", "https://huggingface.co/settings/mcp"),
         http("OpenRouter", "Live model intelligence: list and compare models, prices, and your credits.", "https://mcp.openrouter.ai/mcp", "https://openrouter.ai/blog/announcements/openrouter-mcp-server/"),
         http("Parallel Search", "Live web search and clean content from URLs. No account or API key required.", "https://search.parallel.ai/mcp", "https://docs.parallel.ai/integrations/mcp/search-mcp"),
+        http("Keenable", "Web search with site and date filters, plus page fetch as clean markdown. No account or API key required.", "https://api.keenable.ai/mcp?keenable_title=toolport", "https://docs.keenable.ai/mcp-server"),
         cmd("Brave Search", "Web search via the Brave Search API.", "npx", &["-y", "@brave/brave-search-mcp-server@2.1.4"], &["BRAVE_API_KEY"], "https://github.com/brave/brave-search-mcp-server"),
         http("Exa", "AI-native web search built for agents.", "https://mcp.exa.ai/mcp", "https://github.com/exa-labs/exa-mcp-server"),
         cmd("Tavily", "Web search and content extraction built for LLMs.", "npx", &["-y", "tavily-mcp@0.2.22"], &["TAVILY_API_KEY"], "https://github.com/tavily-ai/tavily-mcp"),

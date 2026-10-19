@@ -43,6 +43,7 @@ const NAME_LOGO: [RegExp, string][] = [
   [/dataforseo/i, "dataforseo"],
   [/deepwiki/i, "deepwiki"],
   [/firecrawl/i, "firecrawl"],
+  [/keenable/i, "keenable"],
   [/langfuse/i, "langfuse"],
   [/linode/i, "linode"],
   [/microsoft/i, "microsoft"],

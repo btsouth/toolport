@@ -13,6 +13,7 @@ describe("serverLogoKey", () => {
     expect(serverLogoKey("Postman")).toBe("postman");
     expect(serverLogoKey("Redis")).toBe("redis");
     expect(serverLogoKey("Jira Production")).toBe("jira");
+    expect(serverLogoKey("Keenable")).toBe("keenable");
   });
 
   it("gives the reference servers an icon only as the leading word", () => {
