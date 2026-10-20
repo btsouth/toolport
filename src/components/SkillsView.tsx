@@ -243,6 +243,20 @@ const NAME_ROOM = 360;
 const NAME_MIN = 200;
 /** The size beside a skill's dots. */
 const SIZE_COLUMN = 64;
+/** A row's own padding and the gaps around its size. */
+const ROW_CHROME = 16 + 2 * 12;
+
+/**
+ * Whether a row's name keeps NAME_MIN beside `count` columns. Below it each row puts its name on
+ * a line above its dots, so many agents in a narrow window never squeeze names out. The GTK
+ * shell's `names_fit` matches.
+ */
+function namesFit(width: number, count: number, size: boolean): boolean {
+  return (
+    width <= 0 ||
+    width >= ROW_CHROME + NAME_MIN + (size ? SIZE_COLUMN : 0) + count * NARROW_COLUMN
+  );
+}
 
 /**
  * Whether the Skills and Rules lists fit beside the detail pane with `count` agent columns at
@@ -259,9 +273,15 @@ const SPLIT_GRID = "grid-cols-[minmax(0,1fr)_minmax(320px,380px)]";
 const SPLIT_ASIDE =
   "sticky top-0 max-h-[calc(100vh-9rem)] self-start overflow-y-auto border-l pl-6";
 
-function useColumnWidth(count: number): [(node: HTMLElement | null) => void, number] {
+function useColumnWidth(
+  count: number,
+): [(node: HTMLElement | null) => void, number, number] {
   const [ref, width] = useWidth();
-  return [ref, width - count * WIDE_COLUMN >= NAME_ROOM ? WIDE_COLUMN : NARROW_COLUMN];
+  return [
+    ref,
+    width - count * WIDE_COLUMN >= NAME_ROOM ? WIDE_COLUMN : NARROW_COLUMN,
+    width,
+  ];
 }
 
 function useWidth(): [(node: HTMLElement | null) => void, number] {
@@ -1467,7 +1487,8 @@ export function SkillsView() {
   );
   const needle = query.trim().toLowerCase();
   const columnAgents = tab === "rules" ? scopedAgents : skillAgents;
-  const [gridRef, column] = useColumnWidth(columnAgents.length);
+  const [gridRef, column, gridWidth] = useColumnWidth(columnAgents.length);
+  const stacked = !namesFit(gridWidth, columnAgents.length, tab !== "rules");
   const [panelRef, panelWidth] = useWidth();
   // One step for both tabs, like the GTK shell, so switching tabs never moves the detail pane.
   const split = sideBySide(panelWidth, Math.max(skillAgents.length, scopedAgents.length));
@@ -1957,12 +1978,20 @@ export function SkillsView() {
                         onClick={() => setSelectedSkill(s.key)}
                         aria-current={skill?.key === s.key ? "true" : undefined}
                         className={cn(
-                          "flex w-full items-center gap-3 rounded-md px-2 py-2 text-left transition-colors hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none",
+                          "flex w-full gap-3 rounded-md px-2 py-2 text-left transition-colors hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none",
+                          // Too narrow for names beside the dots: the name and size on one line
+                          // and the dots under it. The description is left to the detail pane.
+                          stacked ? "flex-col gap-1" : "items-center",
                           skill?.key === s.key && "bg-accent/70 hover:bg-accent/70",
                         )}
                       >
-                        <span className="min-w-0 flex-1">
-                          <span className="flex items-center gap-1.5 text-sm font-medium">
+                        <span
+                          className={cn(
+                            "min-w-0 flex-1",
+                            stacked && "flex items-center gap-3",
+                          )}
+                        >
+                          <span className="flex min-w-0 flex-1 items-center gap-1.5 text-sm font-medium">
                             <span className="truncate">{s.name}</span>
                             {s.descriptionChars > DESCRIPTION_CAP && (
                               <AlertTriangle
@@ -1971,16 +2000,33 @@ export function SkillsView() {
                               />
                             )}
                           </span>
-                          <span className="block truncate text-meta text-muted-foreground">
-                            {s.source === "broken" ? s.path : s.description}
-                          </span>
+                          {stacked ? (
+                            s.source !== "broken" && (
+                              // Ends where the last dot does.
+                              <span
+                                className="shrink-0 text-xs text-muted-foreground tabular-nums"
+                                style={{ paddingRight: (column - 12) / 2 }}
+                              >
+                                {fmtBytes(s.sizeBytes)}
+                              </span>
+                            )
+                          ) : (
+                            <span className="block truncate text-meta text-muted-foreground">
+                              {s.source === "broken" ? s.path : s.description}
+                            </span>
+                          )}
                         </span>
-                        {s.source !== "broken" && (
+                        {!stacked && s.source !== "broken" && (
                           <span className="hidden shrink-0 text-xs text-muted-foreground tabular-nums sm:block">
                             {fmtBytes(s.sizeBytes)}
                           </span>
                         )}
-                        <span className="-my-2 flex shrink-0 self-stretch">
+                        <span
+                          className={cn(
+                            "flex shrink-0",
+                            stacked ? "self-end" : "-my-2 self-stretch",
+                          )}
+                        >
                           {skillAgents.map((agent) => {
                             const at = s.states[agent.id];
                             const state = stateLabel(at?.state);
@@ -2092,7 +2138,10 @@ export function SkillsView() {
                       onClick={() => setSelectedRule(r.key)}
                       aria-current={rule?.key === r.key ? "true" : undefined}
                       className={cn(
-                        "flex w-full items-center gap-3 rounded-md px-2 py-2 text-left transition-colors hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none",
+                        "flex w-full gap-3 rounded-md px-2 py-2 text-left transition-colors hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none",
+                        // Too narrow for names beside the dots: the name above them, and the
+                        // path left to the detail pane.
+                        stacked ? "flex-col gap-1" : "items-center",
                         rule?.key === r.key && "bg-accent/70 hover:bg-accent/70",
                       )}
                     >
@@ -2100,11 +2149,18 @@ export function SkillsView() {
                         <span className="block truncate text-sm font-medium">
                           {r.name}
                         </span>
-                        <span className="block truncate font-mono text-meta text-muted-foreground">
-                          {r.path}
-                        </span>
+                        {!stacked && (
+                          <span className="block truncate font-mono text-meta text-muted-foreground">
+                            {r.path}
+                          </span>
+                        )}
                       </span>
-                      <span className="-my-2 flex shrink-0 self-stretch">
+                      <span
+                        className={cn(
+                          "flex shrink-0",
+                          stacked ? "self-end" : "-my-2 self-stretch",
+                        )}
+                      >
                         {scopedAgents.map((agent) => {
                           const state = r.agents[agent.id]
                             ? t("Loaded")

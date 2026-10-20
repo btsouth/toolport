@@ -112,6 +112,8 @@ const LIST_MARGINS: i32 = 36;
 const NARROW: &str = "max-width: 980px";
 /// The least a skill's name and description keep beside the columns.
 const NAME_MIN: i32 = 200;
+/// A row's own padding and the gaps around its size label.
+const ROW_CHROME: i32 = 16 + 2 * 10 + 6;
 
 /// The page width the Skills and Rules lists need beside the detail pane with `count` agent
 /// columns at their narrowest. Below it the detail pane moves under the list; the fixed 980px
@@ -164,6 +166,8 @@ struct Pane {
     names: (&'static str, &'static str),
     /// The column width the list was last drawn with.
     column: Rc<Cell<i32>>,
+    /// Whether the rows were last drawn with each name on a line above its dots.
+    stacked: Rc<Cell<bool>>,
     /// Every header button and dot by agent, to highlight a hovered or focused column.
     cells: Rc<RefCell<HashMap<String, Vec<gtk::Widget>>>>,
     /// The header row's note naming the hovered column.
@@ -607,6 +611,27 @@ fn state_label(state: Option<State>) -> String {
 }
 
 /// One cell of the agent matrix. Shape and color both carry the state, as in the React view.
+/// A list row for a window too narrow for names beside the dots: the name (and size) on one
+/// line, the dots under it at the same place as the header's logos.
+fn stacked_row(
+    name: &impl IsA<gtk::Widget>,
+    size: Option<&gtk::Label>,
+    dots: &gtk::Box,
+) -> gtk::ListBoxRow {
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    line.append(name);
+    if let Some(size) = size {
+        line.append(size);
+    }
+    dots.set_halign(gtk::Align::End);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    content.add_css_class("toolport-skill-row");
+    content.add_css_class("toolport-skill-row-stacked");
+    content.append(&line);
+    content.append(dots);
+    gtk::ListBoxRow::builder().child(&content).build()
+}
+
 fn state_dot(state: Option<State>, tooltip: &str, width: i32) -> gtk::CenterBox {
     // Named like the React view's role="img" dots; the legend's dots sit beside their own label.
     let cell = gtk::CenterBox::builder()
@@ -777,6 +802,16 @@ impl Pane {
         }
     }
 
+    /// Whether a row's name keeps `NAME_MIN` beside `count` columns. Below it each row puts its
+    /// name on a line above its dots, so many agents in a narrow window never squeeze names out.
+    fn names_fit(&self, count: usize, size_column: bool) -> bool {
+        let width = self.list_width();
+        let size = if size_column { SIZE_COLUMN } else { 0 };
+        let columns = NARROW_COLUMN * i32::try_from(count).unwrap_or(i32::MAX / NARROW_COLUMN);
+        // Unallocated: draw one-line rows; the first allocation redraws if they don't fit.
+        width <= 0.0 || width >= f64::from(ROW_CHROME + NAME_MIN + size) + f64::from(columns)
+    }
+
     /// Pointer hover takes precedence over keyboard focus; leaving it restores the focused
     /// header's name and column instead of erasing a still-active keyboard hint.
     fn hover_column(&self, agent: &str, name: &str, detail: Option<&str>, on: bool) {
@@ -881,13 +916,28 @@ impl Pane {
         let banner = gtk::Box::new(gtk::Orientation::Vertical, 0);
         column.append(&banner);
         // The hovered column's name and state, on a line of its own across the whole list so it
-        // stays readable with many agents. It asks for one character and keeps its height when
-        // empty, so no hover moves anything else.
-        let hint = one_line("", &["caption", "toolport-muted", "toolport-skill-hint"]);
+        // stays readable with many agents. The line's height comes from a placeholder that never
+        // changes, with the hint laid over it: at fractional scales a label measured a few pixels
+        // shorter with text than empty, which moved everything below on every hover.
+        let hint = one_line("", &["caption", "toolport-muted"]);
         hint.set_max_width_chars(1);
-        hint.set_hexpand(true);
         hint.set_opacity(0.0);
-        column.append(&hint);
+        let placeholder = gtk::Label::builder()
+            .label("<b>Ag</b>: Ag")
+            .use_markup(true)
+            .single_line_mode(true)
+            .halign(gtk::Align::Start)
+            .opacity(0.0)
+            .can_target(false)
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .css_classes(["caption"])
+            .build();
+        let hint_line = gtk::Overlay::builder()
+            .child(&placeholder)
+            .css_classes(["toolport-skill-hint"])
+            .build();
+        hint_line.add_overlay(&hint);
+        column.append(&hint_line);
         let head = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         head.add_css_class("toolport-skill-head");
         column.append(&head);
@@ -939,6 +989,7 @@ impl Pane {
                 separator,
                 names: (list_name, detail_name),
                 column: Rc::new(Cell::new(NARROW_COLUMN)),
+                stacked: Rc::default(),
                 cells: Rc::default(),
                 hint: Rc::new(RefCell::new(Some(hint))),
                 hovered: Rc::default(),
@@ -1327,14 +1378,19 @@ impl SkillsPage {
                 page_ref.render();
             });
         }
-        for pane in [&page.skills, &page.rules] {
+        for (pane, size_column) in [(&page.skills, true), (&page.rules, false)] {
             let page_ref = page.clone();
             let pane_ref = pane.clone();
             pane.scroll.hadjustment().connect_changed(move |_| {
                 let count = pane_ref.cells.borrow().len();
-                if count > 0 && pane_ref.fitting_column(count) != pane_ref.column.get() {
+                let column = pane_ref.fitting_column(count);
+                let stacked = !pane_ref.names_fit(count, size_column);
+                if count > 0
+                    && (column != pane_ref.column.get() || stacked != pane_ref.stacked.get())
+                {
                     // Set before scheduling, so allocation changes queue only one redraw.
-                    pane_ref.column.set(pane_ref.fitting_column(count));
+                    pane_ref.column.set(column);
+                    pane_ref.stacked.set(stacked);
                     let page = page_ref.clone();
                     gtk::glib::idle_add_local_once(move || page.render());
                 }
@@ -1959,6 +2015,7 @@ impl SkillsPage {
             }
         }
         pane.column.set(pane.fitting_column(agents.len()));
+        pane.stacked.set(!pane.names_fit(agents.len(), size_column));
         if let Some(hint) = pane.hint.borrow().as_ref() {
             hint.set_text("");
             hint.set_opacity(0.0);
@@ -2180,11 +2237,7 @@ impl SkillsPage {
     }
 
     fn skill_row(&self, skill: &Skill, agents: &[&Agent]) -> gtk::ListBoxRow {
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        content.add_css_class("toolport-skill-row");
-        let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        copy.set_hexpand(true);
-        copy.add_css_class("toolport-skill-row-copy");
+        let pane = &self.skills;
         let name = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let title = one_line(&skill.name, &["toolport-skill-name"]);
         title.set_hexpand(false);
@@ -2197,6 +2250,29 @@ impl SkillsPage {
             )));
             name.append(&warn);
         }
+        let size = gtk::Label::builder()
+            .label(if skill.source == Source::Broken {
+                String::new()
+            } else {
+                fmt_bytes(skill.size_bytes)
+            })
+            .xalign(1.0)
+            .css_classes(["toolport-muted", "caption", "numeric"])
+            .build();
+        let dots = self.skill_dots(skill, agents);
+        if pane.stacked.get() {
+            // The name and size on one line and the dots under it. The description is left to
+            // the detail pane: beside the dots it would be cut to a few letters.
+            name.set_hexpand(true);
+            // Ends where the last dot does.
+            size.set_margin_end((pane.column.get() - 12) / 2);
+            return stacked_row(&name, Some(&size), &dots);
+        }
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        content.add_css_class("toolport-skill-row");
+        let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        copy.set_hexpand(true);
+        copy.add_css_class("toolport-skill-row-copy");
         copy.append(&name);
         copy.append(&one_line(
             if skill.source == Source::Broken {
@@ -2207,18 +2283,14 @@ impl SkillsPage {
             &["toolport-muted", "caption"],
         ));
         content.append(&copy);
-        let size = gtk::Label::builder()
-            .label(if skill.source == Source::Broken {
-                String::new()
-            } else {
-                fmt_bytes(skill.size_bytes)
-            })
-            .width_request(SIZE_COLUMN)
-            .xalign(1.0)
-            .margin_end(6)
-            .css_classes(["toolport-muted", "caption", "numeric"])
-            .build();
+        size.set_width_request(SIZE_COLUMN);
+        size.set_margin_end(6);
         content.append(&size);
+        content.append(&dots);
+        gtk::ListBoxRow::builder().child(&content).build()
+    }
+
+    fn skill_dots(&self, skill: &Skill, agents: &[&Agent]) -> gtk::Box {
         let pane = &self.skills;
         let dots = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         for agent in agents {
@@ -2236,8 +2308,7 @@ impl SkillsPage {
             pane.track_cell(agent, &dot, Some(detail));
             dots.append(&dot);
         }
-        content.append(&dots);
-        gtk::ListBoxRow::builder().child(&content).build()
+        dots
     }
 
     /// `target` is the absolute key the backend allows; `path` is what the user sees and copies.
@@ -2933,17 +3004,6 @@ impl SkillsPage {
     }
 
     fn rule_row(&self, rule: &RuleFile, agents: &[&Agent]) -> gtk::ListBoxRow {
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        content.add_css_class("toolport-skill-row");
-        let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        copy.set_hexpand(true);
-        copy.add_css_class("toolport-skill-row-copy");
-        copy.append(&one_line(&rule.name, &["toolport-skill-name"]));
-        copy.append(&one_line(
-            &rule.path,
-            &["toolport-muted", "caption", "monospace"],
-        ));
-        content.append(&copy);
         let pane = &self.rules;
         let dots = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         for agent in agents {
@@ -2974,6 +3034,23 @@ impl SkillsPage {
             pane.track_cell(agent, &dot, Some(detail));
             dots.append(&dot);
         }
+        let name = one_line(&rule.name, &["toolport-skill-name"]);
+        if pane.stacked.get() {
+            // The path is in the detail pane; beside the dots it would be cut to a few letters.
+            name.set_hexpand(true);
+            return stacked_row(&name, None, &dots);
+        }
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        content.add_css_class("toolport-skill-row");
+        let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        copy.set_hexpand(true);
+        copy.add_css_class("toolport-skill-row-copy");
+        copy.append(&name);
+        copy.append(&one_line(
+            &rule.path,
+            &["toolport-muted", "caption", "monospace"],
+        ));
+        content.append(&copy);
         content.append(&dots);
         gtk::ListBoxRow::builder().child(&content).build()
     }
@@ -3949,6 +4026,17 @@ mod tests {
                     assert_eq!(height(), before, "hover must not resize the header");
                     assert_eq!(width(), wide_before, "hover must not resize the header");
                     let hint = pane.hint.borrow().clone().unwrap();
+                    // Measuring at scale 1 can't catch a few pixels a fractional scale adds, so
+                    // check the hint can't size its line at all: it is laid over a placeholder.
+                    let line = hint
+                        .parent()
+                        .and_downcast::<gtk::Overlay>()
+                        .expect("the hint is laid over its line");
+                    assert_ne!(
+                        line.child().as_ref(),
+                        Some(hint.upcast_ref::<gtk::Widget>()),
+                        "only the placeholder sizes the hover line"
+                    );
                     assert_eq!(hint.text(), "Claude Code: Off in settings.json");
                     assert_eq!(hint.opacity(), 1.0);
                     assert!(pane.cells.borrow()[&agent.id]
@@ -3987,6 +4075,100 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires GTK; explicitly run in the isolated omabox session"]
+    fn many_agents_put_names_above_their_dots_when_narrow() {
+        adw::init().unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("skills-many-agents");
+        let app = adw::Application::builder().build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        // Stacked: names above the dots, every name whole.
+        assert_eq!(names_with_twenty_agents(&app, 760), (true, false));
+        // Wide enough beside the detail pane: one line per row, names still whole.
+        assert_eq!(names_with_twenty_agents(&app, 1600), (false, false));
+    }
+
+    /// Whether the Skills rows are stacked at `width` with 20 agents, and whether the skill's
+    /// name is cut short.
+    fn names_with_twenty_agents(app: &adw::Application, width: i32) -> (bool, bool) {
+        let agents: Vec<Agent> = (0..20)
+            .map(|i| Agent {
+                id: format!("claude-code@{i}"),
+                name: format!("Profile {i}"),
+                connected: true,
+                ..regression_agent()
+            })
+            .collect();
+        let states: serde_json::Map<_, _> = agents
+            .iter()
+            .map(|a| {
+                (
+                    a.id.clone(),
+                    serde_json::json!({"state": "on", "via": "~/.claude"}),
+                )
+            })
+            .collect();
+        let skill: Skill = serde_json::from_value(serde_json::json!({
+            "key": "notes", "name": "release-notes-writer", "description": "Writes release notes",
+            "descriptionChars": 20, "path": "", "folder": "", "source": "yours", "sourceNote": "",
+            "editable": false, "sizeBytes": 2048, "lines": 40, "modifiedSecs": null,
+            "gitRepo": null, "links": [], "states": states, "preview": ""
+        }))
+        .unwrap();
+        let inv = Inventory {
+            agents,
+            skills: vec![skill],
+            rules: vec![],
+            issues: vec![],
+            project: None,
+        };
+        let settle = || {
+            let loop_ = gtk::glib::MainLoop::new(None, false);
+            let stop = loop_.clone();
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+                stop.quit()
+            });
+            loop_.run();
+        };
+        let page = SkillsPage::new(app);
+        let window = adw::ApplicationWindow::builder()
+            .application(app)
+            .default_width(width)
+            .default_height(800)
+            .resizable(false)
+            .content(&page.root)
+            .build();
+        window.present();
+        // Mapping the page starts a scan of the real HOME; drop its result.
+        page.generation.set(page.generation.get().wrapping_add(1));
+        page.inventory.replace(Some(inv));
+        page.render();
+        settle();
+        assert_eq!(
+            page.root.width(),
+            width,
+            "exercise the requested page width"
+        );
+        let mut name = None;
+        let mut stack = vec![page.skills.list.clone().upcast::<gtk::Widget>()];
+        while let Some(widget) = stack.pop() {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                if label.text() == "release-notes-writer" {
+                    name = Some(label.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(next) = child {
+                stack.push(next.clone());
+                child = next.next_sibling();
+            }
+        }
+        let name = name.expect("the skill's row is drawn");
+        let result = (page.skills.stacked.get(), name.layout().is_ellipsized());
+        window.destroy();
+        result
     }
 
     #[test]

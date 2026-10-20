@@ -1359,7 +1359,7 @@ button.toolport-skill-tab:checked {{
   border-bottom: 1px solid @toolport_border;
   padding: 0 8px 6px 8px;
 }}
-.toolport-skill-hint {{ padding: 0 8px 4px 8px; min-height: 16px; }}
+.toolport-skill-hint {{ padding: 0 8px 6px 8px; min-height: 16px; }}
 .toolport-skill-head button.toolport-skill-col {{
   padding: 2px 0;
   margin: 0;
@@ -1388,6 +1388,7 @@ list.toolport-skill-list > row:selected {{ background-color: alpha(@toolport_acc
 list.toolport-skill-list > row.toolport-skill-group-row:hover {{ background: none; }}
 .toolport-skill-row {{ padding: 0 8px; }}
 .toolport-skill-row-copy {{ padding: 12px 0; }}
+.toolport-skill-row-stacked {{ padding: 10px 8px 8px 8px; }}
 .toolport-skill-col-name {{ font-size: 12px; }}
 .toolport-skill-col-hl {{ background-color: alpha(@toolport_accent, 0.08); }}
 .toolport-chip-dot {{ min-width: 8px; min-height: 8px; border-radius: 999px; background-color: currentColor; }}
