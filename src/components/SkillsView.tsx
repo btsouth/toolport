@@ -598,7 +598,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 
 function PanelHeading({ children, aside }: { children: ReactNode; aside?: ReactNode }) {
   return (
-    <div className="mt-5 mb-2 flex items-baseline justify-between gap-2">
+    <div className="mt-6 mb-2 flex items-baseline justify-between gap-2">
       <h3 className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
         {children}
       </h3>

@@ -331,7 +331,7 @@ fn section(text: &str) -> gtk::Label {
 /// A section label with a muted note on the right, like "AGENTS … 7 of 7 load it".
 fn section_with(text: &str, aside: &str) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    row.set_margin_top(6);
+    row.set_margin_top(16);
     row.append(&section(text));
     let note = muted(aside);
     note.set_wrap(false);
@@ -1021,7 +1021,10 @@ impl Pane {
         layout.append(&column);
         let separator = gtk::Separator::new(gtk::Orientation::Vertical);
         layout.append(&separator);
-        let detail = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        // Sections sit 24px apart (8px spacing plus the label's own margin) and 8px above their
+        // content, like the React pane's headings.
+        let detail = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        detail.add_css_class("toolport-skill-detail");
         detail.set_margin_start(20);
         detail.set_margin_end(20);
         detail.set_margin_top(18);
@@ -2398,6 +2401,7 @@ impl SkillsPage {
         can_open: bool,
     ) -> gtk::Box {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.set_margin_top(8);
         let apps = gtk::Box::new(gtk::Orientation::Vertical, 2);
         apps.set_margin_top(4);
         apps.set_margin_bottom(4);
@@ -2654,6 +2658,7 @@ impl SkillsPage {
             } else {
                 let label = muted(&skill.description);
                 label.remove_css_class("toolport-muted");
+                label.add_css_class("toolport-skill-description");
                 // Long descriptions stop after a few lines, like the mockup; Open shows the rest.
                 label.set_lines(6);
                 label.set_ellipsize(gtk::pango::EllipsizeMode::End);

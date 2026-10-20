@@ -1446,8 +1446,10 @@ list.toolport-skill-list > row.toolport-skill-group-row:hover {{ background: non
   border-radius: 12px;
   background-color: @toolport_card;
 }}
+.toolport-skill-detail > .toolport-section-label {{ margin-top: 16px; }}
+.toolport-skill-description {{ line-height: 1.5; }}
 .toolport-skill-agent {{
-  padding: 10px 12px;
+  padding: 12px 16px;
   border-bottom: 1px solid @toolport_border;
 }}
 .toolport-skill-agent:last-child {{ border-bottom: none; }}
