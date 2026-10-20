@@ -265,11 +265,19 @@ function namesFit(width: number, count: number, size: boolean): boolean {
  */
 function sideBySide(width: number, count: number): boolean {
   return (
-    width >= Math.max(981, 16 + NAME_MIN + SIZE_COLUMN + count * NARROW_COLUMN + 24 + 380)
+    width >= 981 &&
+    width - detailWidth(width) >= 16 + NAME_MIN + SIZE_COLUMN + count * NARROW_COLUMN + 24
   );
 }
+/**
+ * The detail pane's width: 30% of the page, between 380 and 520px. It follows the window, never
+ * what the pane shows, so picking a skill can't move the split. The GTK shell's matches.
+ */
+function detailWidth(width: number): number {
+  return Math.min(520, Math.max(380, width * 0.3));
+}
 /** The split layout's classes, for the grid and its detail pane. */
-const SPLIT_GRID = "grid-cols-[minmax(0,1fr)_minmax(320px,380px)]";
+const SPLIT_GRID = "grid-cols-[minmax(0,1fr)_clamp(380px,30%,520px)]";
 const SPLIT_ASIDE =
   "sticky top-0 max-h-[calc(100vh-9rem)] self-start overflow-y-auto border-l pl-6";
 
@@ -663,6 +671,39 @@ function SkillStateChip({
 }
 
 /** An agent's logo on a 28px tile, as in every Agents and By agent row. */
+/**
+ * One agent in an Agents list: logo, name, state and control on one line, and what the agent
+ * reads on full-width lines under the name, so the notes don't share a line with the controls.
+ * The GTK shell's `agent_card` matches.
+ */
+function AgentCard({
+  agent,
+  badge,
+  trailing,
+  children,
+}: {
+  agent: SkillAgent;
+  badge?: ReactNode;
+  trailing?: ReactNode;
+  children?: ReactNode;
+}) {
+  return (
+    <li className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-0.5 px-4 py-3">
+      <LogoTile agent={agent} />
+      <span className="flex min-w-0 items-center gap-2 text-sm font-semibold">
+        <span className="truncate">{agent.name}</span>
+        {badge}
+      </span>
+      <span className="flex items-center gap-2">{trailing}</span>
+      {children && (
+        <span className="col-span-2 col-start-2 min-w-0 text-meta text-muted-foreground">
+          {children}
+        </span>
+      )}
+    </li>
+  );
+}
+
 function LogoTile({ agent }: { agent: SkillAgent }) {
   return (
     <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-muted">
@@ -740,57 +781,55 @@ function AgentStateRow({
   }
   const where = saved?.via ?? t("Not in any folder it reads");
   return (
-    <li className="flex items-center gap-3 px-4 py-3">
-      <LogoTile agent={agent} />
-      <span className="min-w-0 flex-1">
-        <span className="flex items-center gap-2 text-sm font-semibold">
-          <span className="truncate">{agent.name}</span>
-          {!agent.verified && <Badge variant="off">{t("from docs")}</Badge>}
-        </span>
-        <span className="block text-meta break-words text-muted-foreground">
-          {readOnly && !readOnlyReason
-            ? `${where} · ${t("No switch Toolport can write")}`
-            : where}
-        </span>
-        {readOnlyReason && (
-          <span className="block text-meta text-muted-foreground">{readOnlyReason}</span>
-        )}
-      </span>
-      <SkillStateChip state={current} />
-      {switchable && writable && agent.nameOnly && (
-        <DropdownMenu>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={t("More options for {client}", { client: agent.name })}
+    <AgentCard
+      agent={agent}
+      badge={!agent.verified && <Badge variant="off">{t("from docs")}</Badge>}
+      trailing={
+        <>
+          <SkillStateChip state={current} />
+          {switchable && writable && agent.nameOnly && (
+            <DropdownMenu>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={t("More options for {client}", { client: agent.name })}
+                    >
+                      <MoreHorizontal />
+                    </Button>
+                  </DropdownMenuTrigger>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {t("More options for {client}", { client: agent.name })}
+                </TooltipContent>
+              </Tooltip>
+              <DropdownMenuContent align="end" className="w-72">
+                <DropdownMenuLabel>{agent.name}</DropdownMenuLabel>
+                <DropdownMenuCheckboxItem
+                  checked={current === "name-only"}
+                  onCheckedChange={(checked) => pick(checked ? "name-only" : "on")}
                 >
-                  <MoreHorizontal />
-                </Button>
-              </DropdownMenuTrigger>
-            </TooltipTrigger>
-            <TooltipContent>
-              {t("More options for {client}", { client: agent.name })}
-            </TooltipContent>
-          </Tooltip>
-          <DropdownMenuContent align="end" className="w-72">
-            <DropdownMenuLabel>{agent.name}</DropdownMenuLabel>
-            <DropdownMenuCheckboxItem
-              checked={current === "name-only"}
-              onCheckedChange={(checked) => pick(checked ? "name-only" : "on")}
-            >
-              {t("Load name and description only")}
-            </DropdownMenuCheckboxItem>
-            <div className="px-2 pt-1 pb-1.5 text-meta text-muted-foreground">
-              {agent.switchNote}
-            </div>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      )}
-      <span className="flex w-11 shrink-0 justify-end">{slot}</span>
-    </li>
+                  {t("Load name and description only")}
+                </DropdownMenuCheckboxItem>
+                <div className="px-2 pt-1 pb-1.5 text-meta text-muted-foreground">
+                  {agent.switchNote}
+                </div>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+          <span className="flex w-11 shrink-0 justify-end">{slot}</span>
+        </>
+      }
+    >
+      <span className="block break-words">
+        {readOnly && !readOnlyReason
+          ? `${where} · ${t("No switch Toolport can write")}`
+          : where}
+      </span>
+      {readOnlyReason && <span className="block">{readOnlyReason}</span>}
+    </AgentCard>
   );
 }
 
@@ -1034,69 +1073,72 @@ function RuleDetail({
         {agents.map((agent) => {
           const chain = rule.agents[agent.id];
           return (
-            <li key={agent.id} className="flex items-start gap-3 px-4 py-3">
-              <LogoTile agent={agent} />
-              <span className="min-w-0 flex-1">
-                <span className="flex items-center justify-between gap-2">
-                  <span className="truncate text-sm font-semibold">{agent.name}</span>
+            <AgentCard
+              key={agent.id}
+              agent={agent}
+              trailing={
+                <>
                   <SkillStateChip
                     state={chain ? "on" : undefined}
                     label={chain ? t("Loaded") : t("Not loaded")}
                   />
+                  <span className="flex w-11 shrink-0 justify-end">
+                    {chain && (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <span
+                            role="img"
+                            // A focusable fact exposes its explanation to keyboard users.
+                            // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
+                            tabIndex={0}
+                            aria-label={t("No switch Toolport can write")}
+                            className="flex size-7 items-center justify-center rounded-md text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+                          >
+                            <Lock className="size-3" />
+                          </span>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          {t("No switch Toolport can write")}
+                        </TooltipContent>
+                      </Tooltip>
+                    )}
+                  </span>
+                </>
+              }
+            >
+              {chain ? (
+                <span className="flex flex-col gap-0.5">
+                  {chain.map((step, i) => (
+                    <span
+                      key={`${step.kind}:${step.path}:${i}`}
+                      className={cn(
+                        "flex items-start gap-1",
+                        step.kind === "skipped-import" && "text-warning",
+                      )}
+                    >
+                      {step.kind !== "file" && (
+                        <CornerDownRight className="mt-0.5 size-3 shrink-0" />
+                      )}
+                      <span className="min-w-0 break-words">
+                        {step.kind === "file" ? (
+                          <span className="font-mono">{step.path}</span>
+                        ) : step.kind === "link" ? (
+                          t("links to {path}", { path: step.path })
+                        ) : step.kind === "import" ? (
+                          t("@imports {path}", { path: step.path })
+                        ) : (
+                          t("skips @import {path}", { path: step.path })
+                        )}
+                      </span>
+                    </span>
+                  ))}
                 </span>
-                {chain ? (
-                  <span className="mt-0.5 flex flex-col gap-0.5 text-meta text-muted-foreground">
-                    {chain.map((step, i) => (
-                      <span
-                        key={`${step.kind}:${step.path}:${i}`}
-                        className={cn(
-                          "flex items-start gap-1",
-                          step.kind === "skipped-import" && "text-warning",
-                        )}
-                      >
-                        {step.kind !== "file" && (
-                          <CornerDownRight className="mt-0.5 size-3 shrink-0" />
-                        )}
-                        <span className="min-w-0 break-words">
-                          {step.kind === "file" ? (
-                            <span className="font-mono">{step.path}</span>
-                          ) : step.kind === "link" ? (
-                            t("links to {path}", { path: step.path })
-                          ) : step.kind === "import" ? (
-                            t("@imports {path}", { path: step.path })
-                          ) : (
-                            t("skips @import {path}", { path: step.path })
-                          )}
-                        </span>
-                      </span>
-                    ))}
-                  </span>
-                ) : (
-                  <span className="block text-meta text-muted-foreground">
-                    {agent.rulesNote ?? otherRulesNote(agent, rule)}
-                  </span>
-                )}
-              </span>
-              <span className="flex w-11 shrink-0 justify-end">
-                {chain && (
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <span
-                        role="img"
-                        // A focusable fact exposes its explanation to keyboard users.
-                        // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
-                        tabIndex={0}
-                        aria-label={t("No switch Toolport can write")}
-                        className="flex size-7 items-center justify-center rounded-md text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
-                      >
-                        <Lock className="size-3" />
-                      </span>
-                    </TooltipTrigger>
-                    <TooltipContent>{t("No switch Toolport can write")}</TooltipContent>
-                  </Tooltip>
-                )}
-              </span>
-            </li>
+              ) : (
+                <span className="block">
+                  {agent.rulesNote ?? otherRulesNote(agent, rule)}
+                </span>
+              )}
+            </AgentCard>
           );
         })}
       </ul>
@@ -1271,27 +1313,26 @@ function AgentSummary({ inv }: { inv: SkillsInventory }) {
                 : t("{count} rules files", { count: rules }),
           );
           return (
-            <li key={agent.id} className="flex items-center gap-3 px-4 py-3">
-              <LogoTile agent={agent} />
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-sm font-semibold">{agent.name}</span>
-                <span className="block text-meta text-muted-foreground">
-                  {parts.join(" · ")}
-                </span>
-              </span>
-              {broken > 0 ? (
-                <Badge variant="destructive">
-                  {t("{count} broken", { count: broken })}
-                </Badge>
-              ) : !agent.supportsSkills ? null : (
-                <span
-                  title={agent.switchNote}
-                  className="shrink-0 text-meta text-muted-foreground"
-                >
-                  {agent.canToggle ? t("Own switch") : t("No switch")}
-                </span>
-              )}
-            </li>
+            <AgentCard
+              key={agent.id}
+              agent={agent}
+              trailing={
+                broken > 0 ? (
+                  <Badge variant="destructive">
+                    {t("{count} broken", { count: broken })}
+                  </Badge>
+                ) : !agent.supportsSkills ? null : (
+                  <span
+                    title={agent.switchNote}
+                    className="shrink-0 text-meta text-muted-foreground"
+                  >
+                    {agent.canToggle ? t("Own switch") : t("No switch")}
+                  </span>
+                )
+              }
+            >
+              {parts.join(" · ")}
+            </AgentCard>
           );
         })}
       </ul>
@@ -2204,7 +2245,7 @@ export function SkillsView() {
     );
   } else {
     body = (
-      <div className="grid gap-6 @min-[981px]:grid-cols-[minmax(0,1fr)_minmax(320px,380px)]">
+      <div className="grid gap-6 @min-[981px]:grid-cols-[minmax(0,1fr)_clamp(380px,30%,520px)]">
         <section aria-label={t("Needs a look")} className="flex min-w-0 flex-col gap-3">
           {activeIssues.length === 0 ? (
             <EmptyState

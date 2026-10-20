@@ -105,7 +105,9 @@ const NARROW_COLUMN: i32 = 32;
 /// What a row keeps for the name and description before the columns widen.
 const NAME_ROOM: f64 = 360.0;
 const SIZE_COLUMN: i32 = 64;
-const DETAIL_WIDTH: i32 = 380;
+/// The detail pane's width beside the list: 30% of the page, within these bounds.
+const DETAIL_MIN: i32 = 380;
+const DETAIL_MAX: i32 = 520;
 /// The list column's start and end margins.
 const LIST_MARGINS: i32 = 36;
 /// Below this page width the detail pane moves under the list, as the React view does.
@@ -115,12 +117,43 @@ const NAME_MIN: i32 = 200;
 /// A row's own padding and the gaps around its size label.
 const ROW_CHROME: i32 = 16 + 2 * 10 + 6;
 
+/// The detail pane's width on a page `page` wide. It follows the window, never what the pane
+/// shows, so hovering or picking a skill can't move the split. The React view's matches.
+fn detail_width(page: i32) -> i32 {
+    (page * 3 / 10).clamp(DETAIL_MIN, DETAIL_MAX)
+}
+
 /// The page width the Skills and Rules lists need beside the detail pane with `count` agent
 /// columns at their narrowest. Below it the detail pane moves under the list; the fixed 980px
 /// step alone left a list with many agents wider than the window.
 fn side_by_side_width(count: usize) -> i32 {
     let columns = NARROW_COLUMN * i32::try_from(count).unwrap_or(i32::MAX / NARROW_COLUMN);
-    (LIST_MARGINS + 16 + NAME_MIN + SIZE_COLUMN + columns + DETAIL_WIDTH + 1).max(981)
+    let list = LIST_MARGINS + 16 + NAME_MIN + SIZE_COLUMN + columns + 1;
+    let fits = |page: i32| page - detail_width(page) >= list;
+    // The least width whose list keeps `list` beside the pane: near the pane's least, its 30%
+    // range or its most, then down past the pane's rounding.
+    let mut page = [list + DETAIL_MIN, (list * 10 + 6) / 7, list + DETAIL_MAX]
+        .into_iter()
+        .filter(|page| fits(*page))
+        .min()
+        .unwrap_or(list + DETAIL_MAX);
+    while fits(page - 1) {
+        page -= 1;
+    }
+    page.max(981)
+}
+
+/// Size a side pane for the page's width; `stacked` under the list it takes the whole width.
+fn fit_side(bin: &adw::BreakpointBin, side: &gtk::ScrolledWindow, stacked: bool) {
+    if bin.width() <= 0 || stacked {
+        return;
+    }
+    let width = detail_width(bin.width());
+    if side.width_request() != width {
+        // Not during this allocation: it would queue another one inside it.
+        let side = side.clone();
+        gtk::glib::idle_add_local_once(move || side.set_width_request(width));
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -479,6 +512,36 @@ fn logo_tile(id: &str) -> gtk::CenterBox {
     tile
 }
 
+/// One agent in an Agents list: logo, name, state and control on one line, and what the agent
+/// reads on full-width lines under the name, so the notes don't share a line with the controls.
+/// The React view's `AgentCard` matches.
+fn agent_card(
+    id: &str,
+    title: &impl IsA<gtk::Widget>,
+    trailing: &[gtk::Widget],
+    lines: &[gtk::Widget],
+) -> gtk::Grid {
+    let card = gtk::Grid::builder()
+        .column_spacing(12)
+        .row_spacing(2)
+        .css_classes(["toolport-skill-agent"])
+        .build();
+    card.attach(&logo_tile(id), 0, 0, 1, 1);
+    title.set_hexpand(true);
+    title.set_valign(gtk::Align::Center);
+    card.attach(title, 1, 0, 1, 1);
+    let end = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    end.set_valign(gtk::Align::Center);
+    for widget in trailing {
+        end.append(widget);
+    }
+    card.attach(&end, 2, 0, 1, 1);
+    for (row, line) in (1..).zip(lines) {
+        card.attach(line, 1, row, 2, 1);
+    }
+    card
+}
+
 /// The control slot of an agent Toolport can't change: a lock that says why. Focusable so
 /// keyboard users get the tooltip; it is a fact, not a control.
 fn lock(reason: &str) -> gtk::Box {
@@ -787,7 +850,7 @@ impl Pane {
         let side = if bin.current_breakpoint().is_some() {
             0
         } else {
-            DETAIL_WIDTH + 1
+            detail_width(bin.width()) + 1
         };
         f64::from(bin.width() - side - LIST_MARGINS)
     }
@@ -970,7 +1033,7 @@ impl Pane {
         // split the spare width with the list by content size, moving the divider on every hover.
         let detail_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
-            .width_request(DETAIL_WIDTH)
+            .width_request(DETAIL_MIN)
             .hexpand(false)
             .vexpand(true)
             .child(&detail)
@@ -1103,7 +1166,7 @@ impl SkillsPage {
             .build();
         let agent_filter = gtk::DropDown::from_strings(&[]);
         agent_filter.set_valign(gtk::Align::Center);
-        agent_filter.set_tooltip_text(Some(&crate::i18n::tr("Filter by agent")));
+        // No tooltip: the menu names itself, and a tooltip fades out after the pointer leaves.
         agent_filter.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr(
             "Filter by agent",
         ))]);
@@ -1168,7 +1231,7 @@ impl SkillsPage {
         issues_side.set_margin_bottom(20);
         let issues_side_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
-            .width_request(DETAIL_WIDTH)
+            .width_request(DETAIL_MIN)
             .hexpand(false)
             .vexpand(true)
             .child(&issues_side)
@@ -1227,9 +1290,17 @@ impl SkillsPage {
         // The bin applies the last matching breakpoint, so the wider grid step goes first and
         // the 980px step, which also stacks the lists, wins below it.
         adaptive.add_breakpoint(grid_narrow.clone());
-        adaptive.add_breakpoint(narrow);
+        adaptive.add_breakpoint(narrow.clone());
         for pane in [&skills, &rules] {
             pane.bin.replace(Some(adaptive.clone()));
+        }
+        {
+            // Any page width change moves the cards' width too, so their scroller notices it.
+            let (bin, side) = (adaptive.clone(), issues_side_scroll.clone());
+            issues_scroll.hadjustment().connect_changed(move |_| {
+                let stacked = bin.current_breakpoint().as_ref() == Some(&narrow);
+                fit_side(&bin, &side, stacked);
+            });
         }
         // The first scan, a scan that failed with nothing to show, and no agents at all each get
         // a whole-page screen, as in the React view.
@@ -1382,6 +1453,13 @@ impl SkillsPage {
             let page_ref = page.clone();
             let pane_ref = pane.clone();
             pane.scroll.hadjustment().connect_changed(move |_| {
+                if let Some(bin) = pane_ref.bin.borrow().as_ref() {
+                    fit_side(
+                        bin,
+                        &pane_ref.detail_scroll,
+                        bin.current_breakpoint().is_some(),
+                    );
+                }
                 let count = pane_ref.cells.borrow().len();
                 let column = pane_ref.fitting_column(count);
                 let stacked = !pane_ref.names_fit(count, size_column);
@@ -1444,7 +1522,6 @@ impl SkillsPage {
     /// Issue titles, notes and states come from the scan, so a visible page scans again.
     fn retranslate(&self) {
         let filter_label = crate::i18n::tr("Filter by agent");
-        self.agent_filter.set_tooltip_text(Some(&filter_label));
         self.agent_filter
             .update_property(&[gtk::accessible::Property::Label(&filter_label)]);
         for pane in [&self.skills, &self.rules] {
@@ -2731,13 +2808,7 @@ impl SkillsPage {
     /// One row of a skill's Agents list: logo, where it loads from, the status chip and one
     /// 44px control slot (a switch, a lock, or nothing), plus Claude Code's ⋯ menu for "Name
     /// only". The same layout as the React view's `AgentStateRow`.
-    fn agent_row(&self, agent: &Agent, skill: &Skill) -> gtk::Box {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        row.add_css_class("toolport-skill-agent");
-        row.append(&logo_tile(&agent.id));
-        let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        copy.set_hexpand(true);
-        copy.set_valign(gtk::Align::Center);
+    fn agent_row(&self, agent: &Agent, skill: &Skill) -> gtk::Grid {
         let name = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         name.append(&heading(&agent.name));
         if !agent.verified {
@@ -2747,7 +2818,6 @@ impl SkillsPage {
             )));
             name.append(&docs);
         }
-        copy.append(&name);
         let state = skill.states.get(&agent.id);
         let current = state.map(|s| s.state);
         let switchable = matches!(
@@ -2761,25 +2831,28 @@ impl SkillsPage {
             || crate::i18n::tr("Not in any folder it reads"),
             |s| s.via.clone(),
         );
-        if read_only {
+        if read_only && reason.is_none() {
             where_text = format!(
                 "{where_text} · {}",
                 crate::i18n::tr("No switch Toolport can write")
             );
         }
+        let mut lines = Vec::new();
         let via = muted(&where_text);
         via.add_css_class("caption");
-        copy.append(&via);
-        if let Some(reason) = state.and_then(|s| s.read_only_reason.as_deref()) {
+        lines.push(via.upcast());
+        if let Some(reason) = reason {
             let reason = muted(reason);
             reason.add_css_class("caption");
-            copy.append(&reason);
+            lines.push(reason.upcast());
         }
-        row.append(&copy);
-        row.append(&state_chip(current, None));
+        let mut trailing: Vec<gtk::Widget> = vec![state_chip(current, None).upcast()];
         let set = self.state_setter(agent, skill);
         if switchable && writable && agent.name_only {
-            row.append(&self.name_only_menu(agent, current == Some(State::NameOnly), set.clone()));
+            trailing.push(
+                self.name_only_menu(agent, current == Some(State::NameOnly), set.clone())
+                    .upcast(),
+            );
         }
         let slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         slot.set_size_request(44, -1);
@@ -2794,8 +2867,8 @@ impl SkillsPage {
         } else if read_only {
             slot.append(&lock(reason.unwrap_or(&agent.switch_note)));
         }
-        row.append(&slot);
-        row
+        trailing.push(slot.upcast());
+        agent_card(&agent.id, &name, &trailing, &lines)
     }
 
     /// Writes one agent's state for this skill, reporting the result on the page.
@@ -3129,13 +3202,9 @@ impl SkillsPage {
         let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
         list.add_css_class("toolport-skill-agents");
         for agent in agents {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-            row.add_css_class("toolport-skill-agent");
-            row.append(&logo_tile(&agent.id));
-            let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            copy.set_hexpand(true);
-            copy.append(&heading(&agent.name));
-            match rule.agents.get(&agent.id) {
+            let mut lines: Vec<gtk::Widget> = Vec::new();
+            let chain = rule.agents.get(&agent.id);
+            match chain {
                 Some(chain) => {
                     for (index, step) in chain.iter().enumerate() {
                         let text = match step.kind.as_str() {
@@ -3162,12 +3231,8 @@ impl SkillsPage {
                             label.add_css_class("warning");
                         }
                         line.append(&label);
-                        copy.append(&line);
+                        lines.push(line.upcast());
                     }
-                    row.append(&copy);
-                    let loaded = state_chip(Some(State::On), Some(&crate::i18n::tr("Loaded")));
-                    loaded.set_valign(gtk::Align::Start);
-                    row.append(&loaded);
                 }
                 None => {
                     let note = muted(&agent.rules_note.clone().unwrap_or_else(|| {
@@ -3187,22 +3252,27 @@ impl SkillsPage {
                         }
                     }));
                     note.add_css_class("caption");
-                    copy.append(&note);
-                    row.append(&copy);
-                    let state = state_chip(None, Some(&crate::i18n::tr("Not loaded")));
-                    state.set_valign(gtk::Align::Start);
-                    row.append(&state);
+                    lines.push(note.upcast());
                 }
             }
+            let state = if chain.is_some() {
+                state_chip(Some(State::On), Some(&crate::i18n::tr("Loaded")))
+            } else {
+                state_chip(None, Some(&crate::i18n::tr("Not loaded")))
+            };
             let slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             slot.set_size_request(44, -1);
             slot.set_hexpand(false);
             slot.set_halign(gtk::Align::End);
-            if rule.agents.contains_key(&agent.id) {
+            if chain.is_some() {
                 slot.append(&lock(&crate::i18n::tr("No switch Toolport can write")));
             }
-            row.append(&slot);
-            list.append(&row);
+            list.append(&agent_card(
+                &agent.id,
+                &heading(&agent.name),
+                &[state.upcast(), slot.upcast()],
+                &lines,
+            ));
         }
         pane.detail.append(&list);
         if !rule.preview.is_empty() {
@@ -3577,13 +3647,7 @@ fn value_label(text: &str) -> gtk::Label {
         .build()
 }
 
-fn agent_summary(inv: &Inventory, agent: &Agent) -> gtk::Box {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    row.add_css_class("toolport-skill-agent");
-    row.append(&logo_tile(&agent.id));
-    let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    copy.set_hexpand(true);
-    copy.append(&heading(&agent.name));
+fn agent_summary(inv: &Inventory, agent: &Agent) -> gtk::Grid {
     let count = |state: State| {
         inv.skills
             .iter()
@@ -3625,8 +3689,8 @@ fn agent_summary(inv: &Inventory, agent: &Agent) -> gtk::Box {
     });
     let summary = muted(&parts.join(" · "));
     summary.add_css_class("caption");
-    copy.append(&summary);
-    row.append(&copy);
+    let lines = [summary.upcast::<gtk::Widget>()];
+    let title = heading(&agent.name);
     let broken = count(State::Broken);
     let status = if broken > 0 {
         badge(
@@ -3646,11 +3710,9 @@ fn agent_summary(inv: &Inventory, agent: &Agent) -> gtk::Box {
         label.set_tooltip_text(Some(&agent.switch_note));
         label
     } else {
-        return row;
+        return agent_card(&agent.id, &title, &[], &lines);
     };
-    status.set_valign(gtk::Align::Center);
-    row.append(&status);
-    row
+    agent_card(&agent.id, &title, &[status.upcast()], &lines)
 }
 
 #[cfg(test)]
@@ -4206,6 +4268,26 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn side_by_side_width_is_the_least_that_fits_the_wider_pane() {
+        for count in 0..40 {
+            let page = side_by_side_width(count);
+            let columns = NARROW_COLUMN * i32::try_from(count).unwrap();
+            let list = LIST_MARGINS + 16 + NAME_MIN + SIZE_COLUMN + columns + 1;
+            assert!(
+                page - detail_width(page) >= list,
+                "{count} agents fit at {page}"
+            );
+            assert!(
+                page == 981 || page - 1 - detail_width(page - 1) < list,
+                "{count} agents: {page} is the least width"
+            );
+        }
+        assert_eq!(detail_width(900), DETAIL_MIN);
+        assert_eq!(detail_width(1500), 450);
+        assert_eq!(detail_width(3000), DETAIL_MAX);
     }
 
     #[test]

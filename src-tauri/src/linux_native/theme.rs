@@ -1451,6 +1451,8 @@ list.toolport-skill-list > row.toolport-skill-group-row:hover {{ background: non
   border-bottom: 1px solid @toolport_border;
 }}
 .toolport-skill-agent:last-child {{ border-bottom: none; }}
+/* No taller than the switch beside it, so every agent card is one height. */
+menubutton.toolport-row-more > button {{ min-height: 26px; min-width: 26px; padding: 0; }}
 .toolport-skill-logo {{
   min-width: 28px;
   min-height: 28px;
