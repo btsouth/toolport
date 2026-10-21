@@ -284,7 +284,7 @@ export function PersonalSyncView({
     }
   }
   return (
-    <div className="max-w-[760px] space-y-4">
+    <div className="space-y-4">
       {!team && (
         <p className="text-sm text-muted-foreground">
           {t(

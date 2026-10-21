@@ -171,72 +171,6 @@ impl HeaderWrap {
     }
 }
 
-mod form_imp {
-    use super::*;
-    use std::cell::RefCell;
-    #[derive(Default)]
-    pub struct FormColumn {
-        pub child: RefCell<Option<gtk::Widget>>,
-    }
-    #[glib::object_subclass]
-    impl ObjectSubclass for FormColumn {
-        const NAME: &'static str = "ToolportFormColumn";
-        type Type = super::FormColumn;
-        type ParentType = gtk::Widget;
-    }
-    impl ObjectImpl for FormColumn {
-        fn dispose(&self) {
-            if let Some(child) = self.child.take() {
-                child.unparent();
-            }
-        }
-    }
-    impl WidgetImpl for FormColumn {
-        fn request_mode(&self) -> gtk::SizeRequestMode {
-            gtk::SizeRequestMode::HeightForWidth
-        }
-        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
-            let Some(child) = self.child.borrow().clone() else {
-                return (0, 0, -1, -1);
-            };
-            if orientation == gtk::Orientation::Horizontal {
-                let (min, _, _, _) = child.measure(orientation, -1);
-                return (min, 808.max(min), -1, -1);
-            }
-            child.measure(
-                orientation,
-                if for_size < 0 { 808 } else { for_size.min(808) },
-            )
-        }
-        fn size_allocate(&self, width: i32, height: i32, _: i32) {
-            if let Some(child) = self.child.borrow().as_ref() {
-                child.size_allocate(&gtk::Allocation::new(0, 0, width.min(808), height), -1);
-            }
-        }
-        fn snapshot(&self, snapshot: &gtk::Snapshot) {
-            if let Some(child) = self.child.borrow().as_ref() {
-                self.obj().snapshot_child(child, snapshot);
-            }
-        }
-    }
-}
-
-glib::wrapper! {
-    /// A left-aligned form column with at most 760px of content and 24px padding.
-    pub struct FormColumn(ObjectSubclass<form_imp::FormColumn>)
-        @extends gtk::Widget,
-        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
-}
-impl FormColumn {
-    pub(super) fn new(child: &gtk::Box) -> Self {
-        let column: Self = glib::Object::new();
-        child.set_parent(&column);
-        column.imp().child.replace(Some(child.clone().upcast()));
-        column.set_hexpand(true);
-        column
-    }
-}
-
 /// Whether the title and the actions both fit on one line at natural width.
 pub(super) fn fits_one_row(title_nat: i32, actions_nat: i32, width: i32) -> bool {
     actions_nat == 0 || title_nat + COLUMN_GAP + actions_nat <= width
@@ -409,13 +343,6 @@ mod tests {
         let (_, wide, _, _) = wrap.measure(gtk::Orientation::Vertical, 1100);
         let (_, narrow, _, _) = wrap.measure(gtk::Orientation::Vertical, 420);
         assert!(narrow > wide, "actions should wrap below the title");
-        let page = super::super::page_body(14);
-        let column = FormColumn::new(&page);
-        column.allocate(1200, 400, -1, None);
-        assert_eq!(page.width() + page.margin_start() + page.margin_end(), 808);
-        assert_eq!(page.allocation().x(), page.margin_start());
-        column.allocate(650, 400, -1, None);
-        assert_eq!(page.width() + page.margin_start() + page.margin_end(), 650);
         header.set_title("Catalog");
         header.set_subtitle("Add MCP servers from the registry");
         let back = header.set_back("Servers", "Back to servers");

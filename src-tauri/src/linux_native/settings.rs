@@ -830,7 +830,7 @@ l10n::bind_dialog_heading(&error_dialog, msg("Could not start data removal"));
         for (index, section) in pages.iter().enumerate() {
             section.set_visible(index == 0);
         }
-        scroller.set_child(Some(&super::form_column(&page)));
+        scroller.set_child(Some(&page));
         root.append(&scroller);
         let settings_page = Self {
             stop_stale: stop_stale.clone(),

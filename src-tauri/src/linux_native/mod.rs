@@ -3447,12 +3447,6 @@ fn page_body(spacing: i32) -> gtk::Box {
     page
 }
 
-/// Cap the complete form column (including its 24px page padding) at 808px,
-/// leaving at most 760px for fields. The wrapper always hugs the left edge.
-fn form_column(page: &gtk::Box) -> page_header::FormColumn {
-    page_header::FormColumn::new(page)
-}
-
 fn toolport_menu_popover() -> gtk::Popover {
     let popover = gtk::Popover::new();
     popover.add_css_class("toolport-menu");

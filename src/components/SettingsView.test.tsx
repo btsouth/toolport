@@ -98,7 +98,7 @@ const registry: Registry = {
 };
 
 function renderSettings(page: SettingsSubpage = "general") {
-  render(
+  return render(
     <ThemeProvider>
       <SettingsView page={page} registry={registry} onRegistryChange={vi.fn()} />
     </ThemeProvider>,
@@ -224,7 +224,9 @@ describe("SettingsView launch at login", () => {
   it("renders a verified disabled state once the OS read succeeds with false", async () => {
     mockedIsAutostartEnabled.mockResolvedValueOnce(false);
 
-    renderSettings();
+    const { container } = renderSettings();
+    // Settings uses the full width like every other page: no capped column.
+    expect(container.querySelector('[class*="max-w-[760px]"]')).toBeNull();
 
     const control = screen.getByRole("switch", { name: /launch at login/i });
     await waitFor(() => expect(control).toBeEnabled());

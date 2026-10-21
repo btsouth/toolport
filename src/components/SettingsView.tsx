@@ -1111,7 +1111,7 @@ export function SettingsView({
         : t("No old gateway processes found.");
 
   return (
-    <div className="flex max-w-[760px] flex-col gap-8">
+    <div className="flex flex-col gap-8">
       <SectionHeading title={t(SETTINGS_PAGES.find((item) => item.id === page)!.label)}>
         {t(SETTINGS_PAGES.find((item) => item.id === page)!.description)}
       </SectionHeading>
