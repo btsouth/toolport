@@ -6,7 +6,7 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
-## [2.3.0] - Unreleased
+## [2.3.0] - 2026-10-20
 
 Toolport 2.3 gives Servers, Clients and Skills a consistent layout, clearer
 controls and full detail pages in both desktop apps. Connect six new clients,
@@ -19,6 +19,10 @@ current update track. Choose your platform from the
 
 ### Fixed
 
+- The Skills page no longer shifts when you hover a column or pick a skill. With
+  many agents in a narrow or tiled window, each skill's name sits above its row of
+  status dots instead of shrinking to an ellipsis, and the detail pane grows with
+  wide windows.
 - Skills and Rules start with connected client profiles, with all detected agents
   available in the same selector. Codex homes now keep separate skills, rules and
   switches, matching Claude profile handling and the Clients page.
@@ -126,6 +130,9 @@ current update track. Choose your platform from the
   `ApiKey` tokens are sent as they are. Servers you already added keep working as
   before. Package pins are refreshed, including the reference Filesystem, Memory
   and Sequential Thinking servers, whose date-based versions were deprecated.
+- Settings and Sync use the full window width like the other pages. The Access
+  page shows each access set as a card with a switch per server and a button that
+  says how many of its tools the set allows.
 - The catalog no longer offers Slack or PostgreSQL. Both ran archived reference
   servers that npm marks as unsupported. Servers you already added keep working.
 
