@@ -13,9 +13,13 @@ controls and full detail pages in both desktop apps. Connect six new clients,
 find your extra Codex homes automatically, and link missing global rules files
 to the file your other agents already share.
 
-This release is for manual installation. Existing 1.24.x installs stay on their
-current update track. Choose your platform from the
-[release downloads](https://github.com/btsouth/toolport/releases).
+This is also the update for Toolport 1.24.x. Your servers, sign-ins, access sets
+and saved approvals carry over, and safety, discovery and Code Mode keep your 1.x
+choices. Toolport 2 removes Collections, agent rules, agent permissions, agent
+activity hooks, routines and agent control; if you used them, Toolport saves their
+settings to its exports folder. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+before updating.
 
 ### Fixed
 
