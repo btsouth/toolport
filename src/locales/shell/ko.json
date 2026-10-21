@@ -19,6 +19,7 @@
   "{value1} servers need a quick check": "{value1} 서버에 대한 빠른 확인이 필요합니다",
   "{value1} team servers still need review in Teams.": "{value1} 팀 서버는 여전히 Teams에서 검토가 필요합니다.",
   "{value1} tools": "{value1} 도구",
+  "1 tool": "1 도구",
   "/path/to/project": "/path/to/project",
   "→": "→",
   "1 app is still launching an old gateway": "앱 1개가 이전 게이트웨이를 계속 실행합니다",

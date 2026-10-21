@@ -610,7 +610,11 @@ it("shows server permissions immediately for an empty access set", () => {
     </ThemeProvider>,
   );
   expect(screen.getByText("Empty set", { selector: "span" })).toBeVisible();
-  expect(screen.getByRole("checkbox", { name: /GitHub/ })).not.toBeChecked();
+  expect(screen.getByRole("switch", { name: /GitHub/ })).not.toBeChecked();
+  // A server outside the set has nothing to scope.
+  expect(
+    screen.queryByRole("button", { name: /Choose tools for GitHub/ }),
+  ).not.toBeInTheDocument();
 });
 
 describe("Remove Toolport from all clients", () => {

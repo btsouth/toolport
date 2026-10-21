@@ -19,6 +19,7 @@
   "{value1} servers need a quick check": "{value1} Server benötigen eine schnelle Überprüfung",
   "{value1} team servers still need review in Teams.": "{value1} Teamserver müssen in Teams noch überprüft werden.",
   "{value1} tools": "{value1} Tools",
+  "1 tool": "1 Tool",
   "/path/to/project": "/path/to/project",
   "→": "→",
   "1 app is still launching an old gateway": "1 App startet weiterhin ein altes Gateway",

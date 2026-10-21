@@ -7,11 +7,11 @@ import {
   Activity,
   Braces,
   Check,
+  ChevronRight,
   Copy,
   Eye,
   EyeOff,
   FolderOpen,
-  FolderTree,
   Globe,
   Layers,
   Monitor,
@@ -41,6 +41,9 @@ import { SkeletonRows } from "@/components/ui/skeleton";
 import { ErrorCallout } from "@/components/ui/status-card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
+import { ServerLogo } from "@/components/ServerLogo";
 import {
   gatherDiagnostics,
   openDataDir,
@@ -244,93 +247,101 @@ function FolderRouting({
     profiles.find((p) => p.id === ref || p.name === ref)?.name ?? ref;
 
   return (
-    <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
-      <div className="flex items-center gap-2 text-meta">
-        <FolderTree className="size-3.5 shrink-0 text-info" />
-        <span className="font-medium">{t("Project folder routing")}</span>
-        <span className="rounded-full bg-muted px-1.5 py-0.5 text-muted-foreground">
-          {mappings.length}
-        </span>
-        <span className="ml-auto text-muted-foreground">
-          {" "}
-          {t("auto-scope a client by the folder it opens in")}{" "}
-        </span>
-      </div>
-      {mappings.length === 0 && (
-        <EmptyState
-          framed={false}
-          title={translate("No project folders are mapped yet.")}
-        />
-      )}
-      {mappings.length > 0 && (
-        <ul className="mt-2 space-y-1">
-          {mappings.map((m) => (
-            <li key={m.path} className="flex items-center gap-2 text-meta">
-              <code className="truncate rounded bg-muted px-1.5 py-0.5 font-mono text-foreground">
-                {m.path}
-              </code>
-              <span className="shrink-0 text-muted-foreground">{translate("→")}</span>
-              <span className="shrink-0 text-foreground">{label(m.profile)}</span>
-              <button
-                onClick={() => save(mappings.filter((x) => x.path !== m.path))}
-                disabled={busy}
-                aria-label={t("Remove routing for {value1}", { value1: m.path })}
-                className="ml-auto rounded p-0.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-border disabled:opacity-50"
-              >
-                <X className="size-3.5" />
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-      {profiles.length === 0 ? (
-        <p className="mt-2 text-meta text-muted-foreground">
-          {translate("Create an access set first, then map a folder to it here.")}
+    <section className="mt-2 flex flex-col gap-3">
+      <div>
+        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+          {translate("Project folder routing")}
+        </h2>
+        <p className="text-meta text-muted-foreground">
+          {translate(
+            "Automatically use the matching access set when an MCP client reports a project root. The longest matching folder wins.",
+          )}
         </p>
-      ) : (
-        <div className="mt-2 flex items-center gap-2">
-          <input
-            value={path}
-            onChange={(e) => setPath(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") void add();
-            }}
-            placeholder={translate("/path/to/project")}
-            className="min-w-0 flex-1 rounded border bg-background px-2 py-1 font-mono text-meta focus-visible:ring-1 focus-visible:ring-border focus-visible:outline-none"
+      </div>
+      <div className="toolport-list">
+        {profiles.length === 0 ? (
+          <EmptyState
+            framed={false}
+            title={translate(
+              "Create an access set before adding project folder routing.",
+            )}
           />
-          <button
-            type="button"
-            onClick={() => void browse()}
-            disabled={busy}
-            aria-label={t("Browse for a project folder")}
-            title={t("Browse…")}
-            className="flex shrink-0 items-center gap-1 rounded border px-2 py-1 text-xs font-medium hover:bg-muted disabled:opacity-50"
-          >
-            <FolderOpen className="size-3.5" /> {t("Browse")}{" "}
-          </button>
-          <Select value={profile} onValueChange={setProfile}>
-            <SelectTrigger className="h-7 w-32 text-xs">
-              <SelectValue placeholder={translate("Access set")} />
-            </SelectTrigger>
-            <SelectContent>
-              {profiles.map((p) => (
-                <SelectItem key={p.id} value={p.id}>
-                  {p.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <button
-            onClick={() => void add()}
-            disabled={busy || !path.trim() || !profile}
-            className="shrink-0 rounded border px-2 py-1 text-xs font-medium hover:bg-muted disabled:opacity-50"
-          >
-            {" "}
-            {t("Add")}{" "}
-          </button>
-        </div>
-      )}
-    </div>
+        ) : (
+          <>
+            {mappings.length === 0 && (
+              <EmptyState
+                framed={false}
+                title={translate("No project folders are mapped yet.")}
+              />
+            )}
+            {mappings.map((m) => (
+              <div
+                key={m.path}
+                className="flex items-center gap-3 border-b border-border px-4 py-3"
+              >
+                <div className="min-w-0 flex-1">
+                  <p className="truncate font-mono text-sm font-semibold" title={m.path}>
+                    {m.path}
+                  </p>
+                  <p className="text-meta text-muted-foreground">
+                    {translate("Uses {profile_name}", { profile_name: label(m.profile) })}
+                  </p>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  onClick={() => save(mappings.filter((x) => x.path !== m.path))}
+                  disabled={busy}
+                  aria-label={t("Remove routing for {value1}", { value1: m.path })}
+                  title={translate("Remove folder mapping")}
+                >
+                  <Trash2 />
+                </Button>
+              </div>
+            ))}
+            <div className="flex flex-wrap items-center gap-2 px-4 py-3">
+              <input
+                value={path}
+                onChange={(e) => setPath(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void add();
+                }}
+                placeholder={translate("/path/to/project")}
+                className="h-8 min-w-48 flex-1 rounded-md border border-input bg-transparent px-2 font-mono text-meta focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none"
+              />
+              <Button
+                variant="outline"
+                onClick={() => void browse()}
+                disabled={busy}
+                aria-label={t("Browse for a project folder")}
+                title={t("Browse…")}
+              >
+                <FolderOpen /> {t("Browse")}
+              </Button>
+              <Select value={profile} onValueChange={setProfile}>
+                <SelectTrigger className="w-40">
+                  <SelectValue placeholder={translate("Access set")} />
+                </SelectTrigger>
+                <SelectContent>
+                  {profiles.map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                variant="outline"
+                onClick={() => void add()}
+                disabled={busy || !path.trim() || !profile}
+              >
+                {translate("Add folder mapping")}
+              </Button>
+            </div>
+          </>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -362,11 +373,11 @@ function AccessSetCreator({
         placeholder={translate("Access set name")}
         value={name}
         onChange={(e) => setName(e.target.value)}
-        className="rounded border px-2"
+        className="h-8 w-56 min-w-0 rounded-md border border-input bg-transparent px-2 text-sm focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none"
       />
-      <button disabled={busy || !name.trim()} type="submit">
+      <Button variant="outline" disabled={busy || !name.trim()} type="submit">
         {translate("Create access set")}
-      </button>
+      </Button>
     </form>
   );
 }
@@ -492,99 +503,127 @@ function ProfileToolScope({
     }
   }
 
-  const servers = profile.enabledServerIds.filter((id) => serverName.has(id));
-  if (servers.length === 0) return null;
+  async function include(serverId: string, included: boolean) {
+    try {
+      onRegistryChange(await setAccessServer(profile.id, serverId, included));
+    } catch (e) {
+      toastError(`${e}`);
+    }
+  }
 
   return (
-    <div className="mt-1.5 flex flex-col gap-1">
-      {servers.map((serverId) => {
-        const allTools = toolsByServer[serverId];
-        const scoped = scope[serverId];
-        const badge = scoped
-          ? allTools
-            ? t("{value1} of {value2} tools", {
-                value1: scoped.length,
-                value2: allTools.length,
-              })
-            : t("{value1} tools", { value1: scoped.length })
-          : t("all tools");
-        const open = expanded === serverId;
-        return (
-          <div key={serverId} className="rounded border border-border/50 bg-muted/10">
-            <Dialog
-              open={open}
-              onOpenChange={(value) => {
-                if (value) void expand(serverId);
-                else setExpanded(null);
-              }}
+    <>
+      {registry.servers
+        .filter((server) => !isGatewayServer(server))
+        .map((server) => {
+          const serverId = server.id;
+          const included = profile.enabledServerIds.includes(serverId);
+          const allTools = toolsByServer[serverId];
+          const scoped = scope[serverId];
+          const badge = scoped
+            ? allTools
+              ? t("{value1} of {value2} tools", {
+                  value1: scoped.length,
+                  value2: allTools.length,
+                })
+              : scoped.length === 1
+                ? t("1 tool")
+                : t("{value1} tools", { value1: scoped.length })
+            : t("all tools");
+          const open = expanded === serverId;
+          return (
+            <div
+              key={serverId}
+              className="flex items-center gap-3 border-b border-border px-4 py-2.5 last:border-b-0"
             >
-              <DialogTrigger asChild>
-                <button
-                  type="button"
-                  aria-haspopup="dialog"
-                  aria-label={translate("Choose tools for {value1}", {
-                    value1: String(serverName.get(serverId)),
-                  })}
-                  className="flex w-full items-center gap-2 px-2 py-1.5 text-meta hover:bg-muted/30"
+              <ServerLogo name={server.name} transport={server.transport} />
+              <span className="min-w-0 truncate text-sm" title={server.name}>
+                {server.name}
+              </span>
+              {!server.enabled && <Badge variant="off">{translate("Off")}</Badge>}
+              <span className="flex-1" />
+              {included && (
+                <Dialog
+                  open={open}
+                  onOpenChange={(value) => {
+                    if (value) void expand(serverId);
+                    else setExpanded(null);
+                  }}
                 >
-                  <span className="font-medium">
-                    {t("Choose tools for {server}", {
-                      server: serverName.get(serverId) ?? serverId,
-                    })}
-                  </span>
-                  <span
-                    className={`ml-auto ${String(scoped ? "text-info" : "text-muted-foreground")}`}
-                  >
-                    {badge}
-                  </span>
-                </button>
-              </DialogTrigger>
-              <DialogContent>
-                <DialogHeader>
-                  <DialogTitle>
-                    {t("Choose tools for {server}", {
-                      server: serverName.get(serverId) ?? serverId,
-                    })}
-                  </DialogTitle>
-                  <DialogDescription>
-                    {translate("Select which tools this access set exposes.")}
-                  </DialogDescription>
-                </DialogHeader>
-                <div className="max-h-[60vh] overflow-y-auto">
-                  {loadingByServer[serverId] ? (
-                    <SkeletonRows label={translate("Loading tools…")} />
-                  ) : errorByServer[serverId] ? (
-                    <ErrorCallout
-                      title={translate("Couldn't load tools")}
-                      onRetry={() => loadTools(serverId)}
-                    />
-                  ) : allTools && allTools.length > 0 ? (
-                    <div className="flex flex-col gap-1">
-                      {allTools.map((tool) => (
-                        <label key={tool} className="flex items-center gap-2 text-meta">
-                          <input
-                            type="checkbox"
-                            checked={scoped ? scoped.includes(tool) : true}
-                            disabled={busy}
-                            onChange={() => toggleTool(serverId, tool, allTools)}
-                            className="size-3.5"
-                          />
-                          <code className="font-mono text-foreground">{tool}</code>
-                        </label>
-                      ))}
+                  <DialogTrigger asChild>
+                    <button
+                      type="button"
+                      aria-haspopup="dialog"
+                      aria-label={translate("Choose tools for {value1}", {
+                        value1: String(serverName.get(serverId)),
+                      })}
+                      title={translate("Choose tools for {value1}", {
+                        value1: String(serverName.get(serverId)),
+                      })}
+                      className={cn(
+                        "flex h-7 shrink-0 items-center gap-1 rounded-md px-2 text-meta font-medium hover:bg-muted focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none",
+                        scoped ? "text-primary" : "text-muted-foreground",
+                      )}
+                    >
+                      {badge}
+                      <ChevronRight className="size-3.5" />
+                    </button>
+                  </DialogTrigger>
+                  <DialogContent>
+                    <DialogHeader>
+                      <DialogTitle>
+                        {t("Choose tools for {server}", {
+                          server: serverName.get(serverId) ?? serverId,
+                        })}
+                      </DialogTitle>
+                      <DialogDescription>
+                        {translate("Select which tools this access set exposes.")}
+                      </DialogDescription>
+                    </DialogHeader>
+                    <div className="max-h-[60vh] overflow-y-auto">
+                      {loadingByServer[serverId] ? (
+                        <SkeletonRows label={translate("Loading tools…")} />
+                      ) : errorByServer[serverId] ? (
+                        <ErrorCallout
+                          title={translate("Couldn't load tools")}
+                          onRetry={() => loadTools(serverId)}
+                        />
+                      ) : allTools && allTools.length > 0 ? (
+                        <div className="flex flex-col gap-1">
+                          {allTools.map((tool) => (
+                            <label
+                              key={tool}
+                              className="flex items-center gap-2 text-meta"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={scoped ? scoped.includes(tool) : true}
+                                disabled={busy}
+                                onChange={() => toggleTool(serverId, tool, allTools)}
+                                className="size-3.5"
+                              />
+                              <code className="font-mono text-foreground">{tool}</code>
+                            </label>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-meta text-muted-foreground">
+                          {translate("This server exposes no tools.")}
+                        </p>
+                      )}
                     </div>
-                  ) : (
-                    <p className="text-meta text-muted-foreground">
-                      {translate("This server exposes no tools.")}
-                    </p>
-                  )}
-                </div>
-              </DialogContent>
-            </Dialog>
-          </div>
-        );
-      })}
-    </div>
+                  </DialogContent>
+                </Dialog>
+              )}
+              <Switch
+                checked={included}
+                onCheckedChange={(value) => void include(serverId, value)}
+                aria-label={server.name}
+              />
+            </div>
+          );
+        })}
+    </>
   );
 }
 
@@ -1565,176 +1604,148 @@ export function SettingsView({
           <div className="mt-3 flex flex-col gap-2">
             {profiles.length > 0 && (
               <section className="flex flex-col gap-2">
-                <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-                  {translate("Access sets")}
-                </h2>
-                <p className="text-meta text-muted-foreground">
-                  {translate(
-                    "Access sets narrow enabled servers and, for stdio clients, tools. Servers that are off stay hidden from every client.",
-                  )}
-                </p>
-                <p className="text-sm">{translate("Default access")}</p>
-                <Select
-                  value={registry?.defaultAccessProfileId || "@all-enabled"}
-                  onValueChange={async (id) => {
-                    try {
-                      onRegistryChange(
-                        await setDefaultAccess(id === "@all-enabled" ? null : id),
-                      );
-                    } catch (e) {
-                      toastError(`${e}`);
-                    }
-                  }}
-                >
-                  <SelectTrigger aria-label={translate("Default access")}>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="@all-enabled">
-                      {translate("All enabled servers")}
-                    </SelectItem>
-                    {profiles.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>
-                        {p.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                {registry?.defaultAccessLegacyPolicy &&
-                  !registry.defaultAccessProfileId && (
-                    <div className="flex flex-col gap-2 text-meta text-muted-foreground">
-                      <p>
+                <div className="flex flex-wrap items-end justify-between gap-3">
+                  <div className="min-w-60 flex-1">
+                    <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+                      {translate("Access sets")}
+                    </h2>
+                    <p className="text-meta text-muted-foreground">
+                      {translate(
+                        "Access sets narrow enabled servers and, for stdio clients, tools. Servers that are off stay hidden from every client.",
+                      )}
+                    </p>
+                  </div>
+                  <AccessSetCreator onRegistryChange={onRegistryChange} />
+                </div>
+                <div className="toolport-list">
+                  <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-semibold">
+                        {translate("Default access")}
+                      </p>
+                      <p className="text-meta text-muted-foreground">
                         {translate(
-                          "The upgrade retained the default access set's tool restrictions and instructions.",
+                          "Default access for clients without an explicit access set",
                         )}
                       </p>
-                      <button
-                        className="w-fit rounded border px-2 py-1"
-                        onClick={async () => {
-                          try {
-                            onRegistryChange(await setDefaultAccess(null));
-                          } catch (e) {
-                            toastError(`${e}`);
-                          }
-                        }}
-                      >
-                        {translate("Use All enabled servers")}
-                      </button>
                     </div>
-                  )}
-                <AccessSetCreator onRegistryChange={onRegistryChange} />
-                <div className="flex flex-col divide-y rounded-lg border">
-                  {profiles.map((p) => {
-                    const names = p.enabledServerIds
-                      .map((id) => serverName.get(id))
-                      .filter((n): n is string => !!n)
-                      .sort((a, b) => a.localeCompare(b));
-                    const active = p.id === registry?.defaultAccessProfileId;
-                    return (
-                      <div key={p.id} className="flex flex-col gap-1 px-3 py-2.5">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium">{p.name}</span>
-                          {active && (
-                            <span className="rounded-full bg-info/15 px-1.5 py-0.5 text-xs font-medium text-info">
-                              {translate("default")}
-                            </span>
+                    <Select
+                      value={registry?.defaultAccessProfileId || "@all-enabled"}
+                      onValueChange={async (id) => {
+                        try {
+                          onRegistryChange(
+                            await setDefaultAccess(id === "@all-enabled" ? null : id),
+                          );
+                        } catch (e) {
+                          toastError(`${e}`);
+                        }
+                      }}
+                    >
+                      <SelectTrigger aria-label={translate("Default access")}>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="@all-enabled">
+                          {translate("All enabled servers")}
+                        </SelectItem>
+                        {profiles.map((p) => (
+                          <SelectItem key={p.id} value={p.id}>
+                            {p.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  {registry?.defaultAccessLegacyPolicy &&
+                    !registry.defaultAccessProfileId && (
+                      <div className="flex items-center gap-3 px-4 py-3">
+                        <p className="min-w-0 flex-1 text-meta text-muted-foreground">
+                          {translate(
+                            "The upgrade retained the default access set's tool restrictions and instructions.",
                           )}
-                          <span className="ml-auto text-meta text-muted-foreground">
-                            {names.length}{" "}
-                            {names.length === 1
-                              ? translate("server")
-                              : translate("servers")}
-                          </span>
-                        </div>
-                        {registry && (
-                          <div className="flex flex-col gap-2 pl-5">
-                            {registry.servers
-                              .filter((server) => !isGatewayServer(server))
-                              .map((server) => (
-                                <label
-                                  key={server.id}
-                                  className="flex items-center gap-2 text-meta"
-                                >
-                                  <input
-                                    type="checkbox"
-                                    checked={p.enabledServerIds.includes(server.id)}
-                                    onChange={async (e) => {
-                                      try {
-                                        onRegistryChange(
-                                          await setAccessServer(
-                                            p.id,
-                                            server.id,
-                                            e.target.checked,
-                                          ),
-                                        );
-                                      } catch (error) {
-                                        toastError(`${error}`);
-                                      }
-                                    }}
-                                  />
-                                  {server.name}
-                                  {!server.enabled && translate(" (off)")}
-                                </label>
-                              ))}
-                            <button
-                              disabled={
-                                profiles.length <= 1 ||
-                                p.id === registry.defaultAccessProfileId ||
-                                p.id === registry.defaultAccessContextId
-                              }
-                              onClick={async () => {
-                                try {
-                                  onRegistryChange(await deleteProfile(p.id));
-                                } catch (e) {
-                                  toastError(`${e}`);
-                                }
-                              }}
-                            >
-                              {translate("Delete access set")}
-                            </button>
-                          </div>
-                        )}
-                        {names.length === 0 ? (
-                          <p className="pl-5 text-meta text-muted-foreground italic">
-                            {translate("No servers in this access set.")}
-                          </p>
-                        ) : registry ? (
-                          registry && (
-                            <ProfileToolScope
-                              profile={p}
-                              registry={registry}
-                              onRegistryChange={onRegistryChange}
-                            />
-                          )
-                        ) : (
-                          <p className="truncate pl-5 text-meta text-muted-foreground">
-                            {names.join(", ")}
-                          </p>
-                        )}
+                        </p>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={async () => {
+                            try {
+                              onRegistryChange(await setDefaultAccess(null));
+                            } catch (e) {
+                              toastError(`${e}`);
+                            }
+                          }}
+                        >
+                          {translate("Use All enabled servers")}
+                        </Button>
                       </div>
-                    );
-                  })}
+                    )}
                 </div>
+                {profiles.map((p) => {
+                  const count = p.enabledServerIds.filter((id) =>
+                    serverName.has(id),
+                  ).length;
+                  const active = p.id === registry?.defaultAccessProfileId;
+                  return (
+                    <div key={p.id} className="toolport-list">
+                      <div className="flex items-center gap-2 border-b border-border px-4 py-3 last:border-b-0">
+                        <span className="truncate text-sm font-semibold">{p.name}</span>
+                        {active && <Badge variant="info">{translate("default")}</Badge>}
+                        <span className="flex-1 text-meta text-muted-foreground">
+                          {count}{" "}
+                          {count === 1 ? translate("server") : translate("servers")}
+                        </span>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={translate("Delete access set")}
+                          title={translate("Delete access set")}
+                          disabled={
+                            profiles.length <= 1 ||
+                            p.id === registry?.defaultAccessProfileId ||
+                            p.id === registry?.defaultAccessContextId
+                          }
+                          onClick={async () => {
+                            try {
+                              onRegistryChange(await deleteProfile(p.id));
+                            } catch (e) {
+                              toastError(`${e}`);
+                            }
+                          }}
+                        >
+                          <Trash2 />
+                        </Button>
+                      </div>
+                      {registry && (
+                        <ProfileToolScope
+                          profile={p}
+                          registry={registry}
+                          onRegistryChange={onRegistryChange}
+                        />
+                      )}
+                    </div>
+                  );
+                })}
                 <FolderRouting registry={registry} onRegistryChange={onRegistryChange} />
               </section>
             )}
           </div>
 
+          <div className="mt-2">
+            <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+              {translate("Scoped HTTP clients")}
+            </h2>
+            <p className="text-meta text-muted-foreground">
+              {translate(
+                "Each gets its own bearer token and server scope, so one endpoint can serve several clients.",
+              )}
+            </p>
+          </div>
           {bridge?.running && bridge.url ? (
-            <div className="mt-1 flex flex-col gap-2 rounded border bg-muted/20 p-2.5">
-              <div className="flex items-baseline justify-between gap-2">
-                <span className="text-meta font-medium text-muted-foreground">
-                  {translate("Scoped clients")}
-                </span>
-                <span className="text-meta text-muted-foreground">
-                  {translate("each gets its own token and server set")}
-                </span>
-              </div>
-
+            <div className="toolport-list flex flex-col gap-3 px-4 py-3">
               {httpClients.length > 0 && (
-                <ul className="flex flex-col gap-1">
+                <ul className="flex flex-col divide-y divide-border">
                   {httpClients.map((c) => (
-                    <li key={c.id} className="flex items-center gap-2 text-meta">
+                    <li key={c.id} className="flex items-center gap-2 py-2 text-sm">
                       <span className="truncate font-medium">
                         {c.label || translate("(unnamed)")}
                       </span>
@@ -1841,7 +1852,7 @@ export function SettingsView({
               </div>
             </div>
           ) : (
-            <p className="text-sm text-muted-foreground">
+            <p className="toolport-list px-4 py-3 text-meta text-muted-foreground">
               {translate(
                 "Start the HTTP endpoint in Connections to manage scoped clients.",
               )}
