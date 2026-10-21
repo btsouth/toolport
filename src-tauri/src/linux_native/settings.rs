@@ -1188,25 +1188,27 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
             });
         });
         let row = access_text_row(
-            &tr("Default access"),
-            &tr("Default access for clients without an explicit access set"),
+            msg("Default access"),
+            msg("Default access for clients without an explicit access set"),
         );
         row.append(&default);
         defaults.append(&row);
         if registry.default_access_legacy_policy && registry.default_access_profile_id.is_none() {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
             row.add_css_class("toolport-setting-row");
-            row.append(
-                &gtk::Label::builder()
-                    .label(tr(
-                        "The upgrade retained the default access set's tool restrictions and instructions.",
-                    ))
+            let notice = msg(
+                "The upgrade retained the default access set's tool restrictions and instructions.",
+            );
+            row.append(&source_label(
+                notice,
+                gtk::Label::builder()
+                    .label(lookup(notice))
                     .xalign(0.0)
                     .wrap(true)
                     .hexpand(true)
                     .css_classes(["toolport-muted"])
                     .build(),
-            );
+            ));
             let clear = l10n::button("Use All enabled servers");
             clear.set_valign(gtk::Align::Center);
             let page = self.clone();
@@ -3273,21 +3275,23 @@ fn access_group() -> gtk::Box {
     group
 }
 
-/// A row with a title and one line under it; the caller appends the control.
-fn access_text_row(title: &str, detail: &str) -> gtk::Box {
+/// A row with a title and one line under it, following the UI language; the caller appends
+/// the control.
+fn access_text_row(title: &'static str, detail: &'static str) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.add_css_class("toolport-setting-row");
     let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
     copy.set_hexpand(true);
     for (text, class) in [(title, "heading"), (detail, "toolport-muted")] {
-        copy.append(
-            &gtk::Label::builder()
-                .label(text)
+        copy.append(&source_label(
+            text,
+            gtk::Label::builder()
+                .label(lookup(text))
                 .xalign(0.0)
                 .wrap(true)
                 .css_classes([class])
                 .build(),
-        );
+        ));
     }
     row.append(&copy);
     row
