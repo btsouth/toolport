@@ -465,6 +465,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # For the notes: the changelog and the 1.x upgrade text.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Compose and upload latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -498,8 +500,20 @@ jobs:
           fi
 
           sig() { cat "sigs/$1.sig"; }
+          # The update prompt shows `notes` as plain text before installing. Lead with the
+          # first paragraph of this version's changelog section, then the 1.x upgrade
+          # text: 1.24 installs read this same manifest, so every 2.x update must tell
+          # them what changes before they click Install.
+          summary=$(awk -v v="${TAG#v}" '
+            index($0, "## [" v "]") == 1 { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
+            found && NF { printf "%s%s", (started ? " " : ""), $0; started = 1; next }
+            found && started { exit }
+          ' CHANGELOG.md)
+          notes=$(printf '%s\n\n%s' "$summary" "$(cat packaging/updater-notes-from-1x.txt)")
           jq -n \
             --arg version "$TAG" \
+            --arg notes "$notes" \
             --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg win_url "$base/$win"       --arg win_sig "$(sig "$win")" \
             --arg marm_url "$base/$mac_arm"  --arg marm_sig "$(sig "$mac_arm")" \
@@ -507,6 +521,7 @@ jobs:
             --arg lin_url "$base/$lin"       --arg lin_sig "$(sig "$lin")" \
             '{
                version: $version,
+               notes: $notes,
                pub_date: $pub_date,
                platforms: {
                  "windows-x86_64": { signature: $win_sig,  url: $win_url },

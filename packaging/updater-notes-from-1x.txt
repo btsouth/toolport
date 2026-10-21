@@ -1,0 +1,3 @@
+Updating from Toolport 1.24? Your servers, sign-ins, access sets and saved approvals carry over, and safety, discovery and Code Mode keep your 1.x choices. Toolport 2 removes Collections, agent rules, agent permissions and the guard hook, agent activity hooks, routines and agent control. If you used them, Toolport saves their settings to the exports folder in its data folder and leaves the files it wrote in place. Restart your AI clients after updating.
+
+Upgrade guide: https://github.com/btsouth/toolport/blob/main/docs/migration.md
