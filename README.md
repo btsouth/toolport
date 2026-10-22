@@ -6,11 +6,11 @@
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/Xsn27MxdBA)
 [![Glama quality](https://glama.ai/mcp/servers/tsouth89/toolport/badges/score.svg)](https://glama.ai/mcp/servers/tsouth89/toolport)
 
-**Set up your MCP servers once. Use them in every AI client.**
+**Your AI agents' tools, skills and rules. Set up once, on every machine.**
 
-Toolport is a local gateway for MCP, the protocol that gives AI apps access to
-tools like GitHub, Slack, and databases. Connect your servers once, then share
-them across Claude, Cursor, Codex, VS Code, and other clients.
+Toolport is a free desktop app and local gateway for MCP, the protocol that gives
+AI apps tools like GitHub, Linear and databases. Add a server once and Claude Code,
+Codex, Cursor, VS Code and 40+ other agents can all use it.
 
 [Download](https://toolport.app/download) · [Website & demo](https://toolport.app) · [Discord](https://discord.gg/Xsn27MxdBA)
 
@@ -18,16 +18,26 @@ them across Claude, Cursor, Codex, VS Code, and other clients.
 
 ## Why Toolport?
 
-- **Less context overhead.** Agents search for tools when they need them instead
-  of loading every tool definition up front. This helps clients that send every
-  definition on each request, past roughly 10 to 25 tools. Clients with their own
-  tool search, such as Claude Code, Codex and Cursor, already defer definitions.
-  See the [benchmarks](BENCHMARK.md).
-- **One setup for every client.** Add and authenticate each server once. Use
-  access sets to choose which servers each client can reach.
-- **Keys stay local.** Credentials live in your OS keychain, outside client configs.
-- **Control over tool calls.** Disable tools, require approval for destructive
-  calls, and review activity in one place.
+- **One setup for every agent.** Toolport finds the agents on your machine, imports
+  the servers they already have and gives each one a single Toolport entry. Fix a
+  server once and every agent gets the fix. Access sets choose which servers each
+  agent can reach.
+- **Every machine, too.** [Pro](https://toolport.app/pricing) syncs your servers to
+  each computer you sign in on. Secrets stay on each machine.
+- **Skills and rules in one place.** See which skills and rules files (`CLAUDE.md`,
+  `AGENTS.md` and others) each agent actually loads, turn skills on or off per agent,
+  and link agents to the rules file the others already share.
+  See [skills and rules](docs/skills-and-rules.md).
+- **Safe by default.** API keys move out of plain-text configs into your OS keychain.
+  Toolport pins every tool definition and flags changes, such as a tool you approved
+  rewriting its description, plus hidden instructions in descriptions and results.
+  The default Ask level holds destructive calls for your OK. Strict also quarantines
+  changed tools and blocks detected injection. Every call is in Activity. See
+  [security](SECURITY.md).
+- **Lighter on context where it helps.** For agents that send every tool definition on
+  every request, Toolport's search tools can cut input tokens by several times. Claude
+  Code, Codex and Cursor already defer tools, so Toolport's Auto mode gives them the
+  full list (Claude Code up to 800 tools). See the [benchmarks](BENCHMARK.md).
 
 ## Get started
 
@@ -40,8 +50,7 @@ them across Claude, Cursor, Codex, VS Code, and other clients.
 Installers and release notes are also on
 [GitHub Releases](https://github.com/btsouth/toolport/releases).
 On Arch and Omarchy, the [pacman repository](docs/arch-pacman-repo.md) keeps
-Toolport on your normal update path. It stays on 1.24.2 until the staged 2.x
-rollout finishes; use the AppImage for 2.x until then.
+Toolport on your normal update path.
 
 Working with a team? [Toolport Teams](https://toolport.app/teams) shares server
 configuration and policies while each member keeps their own credentials.
