@@ -5,7 +5,15 @@ AI coding agents load more than MCP tools. They also read **skills** (folders wi
 Skills page shows what each installed agent actually loads, where every file
 lives, and where an agent's setup disagrees with what you expect.
 
-Open it from **Skills** in the sidebar. It has three tabs.
+Open it from **Skills** in the sidebar. Skills and Rules start with **Connected to
+Toolport**, showing only the exact client profiles connected to your gateway. Use
+that same agent selector to choose **All detected agents** or one specific profile.
+Skills and rules also work without an MCP connection, so unconnected agents remain
+available there. With no connected clients, the page starts with all detected
+agents. The counts, columns and details follow your selection; **Needs a look**
+continues to check the whole detected setup.
+
+It has three tabs.
 
 - **Skills** lists every skill Toolport found, grouped by where it came from: your
   own folders, your claude.ai account, a system package, a client's built-in set, a
@@ -24,16 +32,20 @@ include the skills and rules files a project adds.
 In a narrow or tiled window, the details move under the list. **Ctrl+F** searches
 the page and **Ctrl+R** scans again.
 
-## Several Claude Code profiles
+## Several Claude Code or Codex profiles
 
 With more than one Claude Code profile, such as `~/.claude` and a `~/.claude2` you
 start through `CLAUDE_CONFIG_DIR`, each profile gets its own column: **Claude Code
 (claude)**, **Claude Code (claude2)** and so on. Each one shows that profile's
 skills, plugins and `CLAUDE.md`, and turning a skill on or off writes that profile's
-own `settings.json`. A `~/.claude*` folder counts as a profile when it holds Claude
-Code's `.claude.json` or `settings.json`, so backups and other tools' folders don't
-appear. Two profile folders with the same name in different places are named by
+own `settings.json`. Profiles match those detected on Clients; backups and other
+tools' folders do not become extra columns. Two profile folders with the same name in different places are named by
 their full path. With one profile, the page shows a single **Claude Code** column.
+
+Codex homes listed on Clients also get separate columns, including extra
+`CODEX_HOME` folders found through your launchers or added as client locations.
+Each reads its own skills, rules and `config.toml`; changing a skill in one profile
+leaves the others alone. Profile identities and connection status match Clients.
 
 ## Opening and removing files
 

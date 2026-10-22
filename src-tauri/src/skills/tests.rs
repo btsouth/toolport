@@ -4203,3 +4203,260 @@ fn reasonix_read_only_identity_keeps_each_state_explanation() {
         assert_ne!(Some(&state.via), state.read_only_reason.as_ref());
     }
 }
+
+fn detected_profile(
+    home: &Home,
+    id: &str,
+    file: &str,
+    connected: bool,
+) -> crate::clients::DetectedClient {
+    crate::clients::DetectedClient {
+        id: id.into(),
+        name: id.into(),
+        uses_connectors: false,
+        location_removable: false,
+        discovery: crate::clients::DiscoveryCapabilities {
+            auto_mode: "full",
+            native_tool_search: None,
+            tools_list_changed: None,
+            cold_full_list_wait_ms: 0,
+            max_tools: None,
+            auto_full_max_tools: None,
+            evidence: "test",
+        },
+        config_path: home.path(file).display().to_string(),
+        config_exists: true,
+        app_present: true,
+        servers: vec![],
+        plugin_servers: vec![],
+        gateway_installed: connected,
+        entry_state: crate::clients::GatewayEntryState::Absent,
+        error: None,
+        claude_profile: None,
+    }
+}
+
+#[test]
+fn client_profiles_keep_exact_skill_rule_and_write_targets() {
+    let home = Home::new();
+    home.write(".claude/settings.json", "{}");
+    home.write(".claude2/settings.json", "{}");
+    home.write(".claude3/settings.json", "{}");
+    home.skill(".agents/skills/shared", "shared", "Shared skill");
+    home.skill("Codex-Work/.codex/skills/private", "private", "Work only");
+    home.write(".codex/config.toml", "# main\n");
+    home.write("Codex-Work/.codex/config.toml", "# work\n");
+    home.write("Codex-Work/.codex/AGENTS.md", "Work rules\n");
+    let clients = vec![
+        detected_profile(&home, "claude-code", ".claude.json", true),
+        detected_profile(&home, "claude-code@claude2", ".claude2/.claude.json", true),
+        detected_profile(&home, "claude-code@claude3", ".claude3/.claude.json", false),
+        detected_profile(&home, "codex", ".codex/config.toml", true),
+        detected_profile(
+            &home,
+            "codex@Codex-Work%2F.codex",
+            "Codex-Work/.codex/config.toml",
+            false,
+        ),
+    ];
+    let mut env = home.env();
+    env.use_clients(&clients);
+    let inv = scan(&env, &only(&["claude-code", "codex"]), None);
+    assert_eq!(inv.agents.len(), 5);
+    assert_eq!(inv.agents.iter().filter(|a| a.connected).count(), 3);
+    let work = "codex@Codex-Work%2F.codex";
+    assert_eq!(
+        skill(&inv, "private")
+            .states
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![work]
+    );
+    assert_eq!(
+        inv.rules
+            .iter()
+            .find(|r| r.preview.contains("Work rules"))
+            .unwrap()
+            .agents
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![work]
+    );
+    let key = skill(&inv, "shared").key.clone();
+    set_state(&env, &inv, work, &key, Wanted::Off, &TestWriter::default()).unwrap();
+    assert_eq!(home.read(".codex/config.toml"), "# main\n");
+    assert!(home
+        .read("Codex-Work/.codex/config.toml")
+        .contains("enabled = false"));
+    let after = scan(&env, &only(&["claude-code", "codex"]), None);
+    assert_eq!(state(&after, "shared", work), Some(State::Off));
+    assert_eq!(state(&after, "shared", "codex"), Some(State::On));
+    assert_eq!(home.read(".claude2/settings.json"), "{}");
+}
+
+#[test]
+fn stale_codex_entries_are_reported_and_fixed_per_home() {
+    let home = Home::new();
+    let missing = home.path("missing/SKILL.md");
+    let config = format!(
+        "[[skills.config]]\npath = {:?}\nenabled = false\n",
+        missing.display().to_string()
+    );
+    home.write(".codex/config.toml", &config);
+    home.write(".codex2/config.toml", &config);
+    let mut env = home.env();
+    env.use_clients(&[
+        detected_profile(&home, "codex", ".codex/config.toml", true),
+        detected_profile(&home, "codex@.codex2", ".codex2/config.toml", false),
+    ]);
+    let inv = scan(&env, &only(&["codex"]), None);
+    assert!(inv.issues.iter().any(|i| i.id == "codex-stale"));
+    assert_eq!(
+        inv.issues
+            .iter()
+            .find(|i| i.id == "codex-stale@.codex2")
+            .unwrap()
+            .agents,
+        vec!["codex@.codex2"]
+    );
+    let writer = TestWriter::default();
+    assert_eq!(
+        apply_fix(&env, &inv, "codex-stale@.codex2", &writer).unwrap(),
+        1
+    );
+    assert_eq!(home.read(".codex/config.toml"), config);
+    assert!(!home.read(".codex2/config.toml").contains("enabled = false"));
+    assert_eq!(apply_fix(&env, &inv, "codex-stale", &writer).unwrap(), 1);
+    assert_eq!(
+        *writer.backups.borrow(),
+        vec![
+            ("codex@.codex2".into(), home.path(".codex2/config.toml")),
+            ("codex".into(), home.path(".codex/config.toml")),
+        ],
+        "each profile keeps its own recovery history"
+    );
+}
+
+#[test]
+fn default_claude_profile_maps_to_skills_folder_without_alias_columns() {
+    let home = Home::new();
+    home.skill(
+        ".claude/skills/default",
+        "default-profile",
+        "Default profile skill",
+    );
+    home.write(".claude/CLAUDE.md", "Default rules");
+    let main = detected_profile(&home, "claude-code", ".claude.json", true);
+    let mut alias = detected_profile(&home, "claude-code@claude", ".claude/.claude.json", false);
+    alias.claude_profile = Some(crate::clients::ClaudeProfile {
+        same_as: Some("claude-code".into()),
+        ..Default::default()
+    });
+    let mut env = home.env();
+    env.use_clients(&[main, alias]);
+    let inv = scan(&env, &only(&["claude-code"]), None);
+    assert_eq!(inv.agents.len(), 1);
+    assert_eq!(inv.agents[0].id, "claude-code");
+    assert!(inv.agents[0].connected);
+    assert_eq!(
+        state(&inv, "default-profile", "claude-code"),
+        Some(State::On)
+    );
+    assert_eq!(inv.rules[0].path, "~/.claude/CLAUDE.md");
+    assert!(inv.rules[0].agents.contains_key("claude-code"));
+}
+
+#[test]
+fn skills_discovers_unsaved_profiles_before_clients_without_adopting_configs() {
+    let home = Home::new();
+    let _data = crate::registry::DataDirTestEnv::new("skills-unsaved-profiles");
+    let _home = crate::clients::TestHome::set(&home.root);
+    let claude = r#"{"mcpServers":{"toolport":{"command":"/old/toolport-gateway","args":[]}}}"#;
+    home.write(".claude.json", claude);
+    home.write(".claude2/.claude.json", claude);
+    home.write(".codex/config.toml", "# main\n");
+    home.write(".codex2/config.toml", "# second\n");
+    home.skill(
+        ".codex2/skills/second",
+        "second-home",
+        "Only the second Codex home",
+    );
+    let data_dir = crate::registry::conduit_dir().unwrap();
+    let locations = data_dir.join("client-locations.json");
+    assert!(!locations.exists());
+    let clients = crate::clients::detect_clients_for_skills();
+    let mut env = home.env();
+    env.use_clients(&clients);
+    let inv = scan(&env, &|id| env.detected_agents.contains(id), None);
+    assert_eq!(
+        inv.agents
+            .iter()
+            .filter(|a| a.id.starts_with("claude-code") && a.connected)
+            .count(),
+        2
+    );
+    assert_eq!(
+        inv.agents
+            .iter()
+            .filter(|a| a.id.starts_with("codex"))
+            .count(),
+        2
+    );
+    assert!(skill(&inv, "second-home")
+        .states
+        .keys()
+        .any(|id| id.starts_with("codex@")));
+    assert_eq!(home.read(".claude.json"), claude);
+    assert_eq!(home.read(".claude2/.claude.json"), claude);
+    assert_eq!(home.read(".codex/config.toml"), "# main\n");
+    assert_eq!(home.read(".codex2/config.toml"), "# second\n");
+    assert!(
+        !locations.exists(),
+        "Skills must not remember or adopt client locations"
+    );
+}
+
+#[test]
+fn claude_configs_sharing_one_skills_folder_have_one_connected_column() {
+    for (main_connected, copy_connected, expected) in [
+        (false, true, "claude-code@claude"),
+        (true, false, "claude-code"),
+        (true, true, "claude-code"),
+        (false, false, "claude-code"),
+    ] {
+        let home = Home::new();
+        home.skill(
+            ".claude/skills/shared",
+            "same-folder",
+            "Shared Claude settings",
+        );
+        let mut env = home.env();
+        env.use_clients(&[
+            detected_profile(&home, "claude-code", ".claude.json", main_connected),
+            detected_profile(
+                &home,
+                "claude-code@claude",
+                ".claude/.claude.json",
+                copy_connected,
+            ),
+        ]);
+        let inv = scan(&env, &only(&["claude-code"]), None);
+        assert_eq!(
+            inv.agents.len(),
+            1,
+            "two MCP configs read the same skill settings"
+        );
+        assert_eq!(inv.agents[0].id, expected);
+        assert_eq!(inv.agents[0].connected, main_connected || copy_connected);
+        assert_eq!(
+            skill(&inv, "same-folder")
+                .states
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![expected]
+        );
+    }
+}

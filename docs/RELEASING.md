@@ -63,11 +63,11 @@ normal Latest release and assume these channels will wait.
 Write the notes under `## [2.0.0]` in `CHANGELOG.md`, add the release date when
 cutting the tag, and keep the first paragraph to a short update summary. Both
 release-body extraction steps read that exact section. The updater manifest
-currently includes version, date and platform artifacts but **no `notes` field**;
-the app displays `update.body` only when supplied. Before enabling the 1.x offer,
-ensure `latest.json` carries the short summary as `notes` and links to the
-[upgrade guide](migration.md). Writing the changelog alone does not populate
-an in-app prompt. Check the published manifest and prompt before promotion.
+carries `notes`, which the app shows as plain text before installing: the first
+paragraph of that section, then the 1.x upgrade text in
+`packaging/updater-notes-from-1x.txt`, which names the removed features and links
+the [upgrade guide](migration.md). 1.24.x installs read the same manifest, so keep
+that text accurate while 1.x users can still update. 2.x became Latest with 2.3.0.
 
 ## Package channels
 

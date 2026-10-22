@@ -371,7 +371,7 @@
   "no rules files": "keine Regeldateien",
   "skips @import {path}": "überspringt @import {path}",
   "{client} now lists {skill} by name only": "{client} listet {skill} jetzt nur mit Namen",
-  "{client}: folders from its docs, not checked on this machine": "{client}: Ordner laut Doku, auf diesem Rechner nicht geprüft",
+  "folders from its docs, not checked on this machine": "Ordner laut Doku, auf diesem Rechner nicht geprüft",
   "{count} broken": "{count} defekt",
   "{count} name only": "{count} nur Name",
   "{count} of {cap} characters": "{count} von {cap} Zeichen",
@@ -406,5 +406,6 @@
   "No switch Toolport can write": "Kein Schalter, den Toolport setzen kann",
   "Filter by agent": "Nach Agent filtern",
   "All agents": "Alle Agenten",
+  "All detected agents": "Alle erkannten Agenten",
   "{state} via {path}": "{state} über {path}"
 }

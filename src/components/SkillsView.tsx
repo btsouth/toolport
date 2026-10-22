@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -78,7 +79,7 @@ import type {
   SkillsInventory,
   SkillWanted,
 } from "@/lib/types";
-import { shortAgentName } from "@/lib/agentNames";
+import { columnNames } from "@/lib/agentNames";
 import { cn, fmtBytes, fmtTs } from "@/lib/utils";
 
 type Tab = "skills" | "rules" | "issues";
@@ -209,7 +210,6 @@ function StateDot({
     <span
       role="img"
       aria-label={label || undefined}
-      title={label || undefined}
       onMouseEnter={onHover && (() => onHover(true))}
       onMouseLeave={onHover && (() => onHover(false))}
       className={cn(
@@ -239,8 +239,60 @@ const WIDE_COLUMN = 56;
 const NARROW_COLUMN = 32;
 /** What a row keeps for the skill's name and description before columns widen. */
 const NAME_ROOM = 360;
+/** The least a skill's name and description keep beside the columns. */
+const NAME_MIN = 200;
+/** The size beside a skill's dots. */
+const SIZE_COLUMN = 64;
+/** A row's own padding and the gaps around its size. */
+const ROW_CHROME = 16 + 2 * 12;
 
-function useColumnWidth(count: number): [(node: HTMLElement | null) => void, number] {
+/**
+ * Whether a row's name keeps NAME_MIN beside `count` columns. Below it each row puts its name on
+ * a line above its dots, so many agents in a narrow window never squeeze names out. The GTK
+ * shell's `names_fit` matches.
+ */
+function namesFit(width: number, count: number, size: boolean): boolean {
+  return (
+    width <= 0 ||
+    width >= ROW_CHROME + NAME_MIN + (size ? SIZE_COLUMN : 0) + count * NARROW_COLUMN
+  );
+}
+
+/**
+ * Whether the Skills and Rules lists fit beside the detail pane with `count` agent columns at
+ * their narrowest. Below it the detail pane moves under the list; the fixed 980px step alone
+ * squeezed the names out with many agents. The GTK shell's `side_by_side_width` matches.
+ */
+function sideBySide(width: number, count: number): boolean {
+  return (
+    width >= 981 &&
+    width - detailWidth(width) >= 16 + NAME_MIN + SIZE_COLUMN + count * NARROW_COLUMN + 24
+  );
+}
+/**
+ * The detail pane's width: 30% of the page, between 380 and 520px. It follows the window, never
+ * what the pane shows, so picking a skill can't move the split. The GTK shell's matches.
+ */
+function detailWidth(width: number): number {
+  return Math.min(520, Math.max(380, width * 0.3));
+}
+/** The split layout's classes, for the grid and its detail pane. */
+const SPLIT_GRID = "grid-cols-[minmax(0,1fr)_clamp(380px,30%,520px)]";
+const SPLIT_ASIDE =
+  "sticky top-0 max-h-[calc(100vh-9rem)] self-start overflow-y-auto border-l pl-6";
+
+function useColumnWidth(
+  count: number,
+): [(node: HTMLElement | null) => void, number, number] {
+  const [ref, width] = useWidth();
+  return [
+    ref,
+    width - count * WIDE_COLUMN >= NAME_ROOM ? WIDE_COLUMN : NARROW_COLUMN,
+    width,
+  ];
+}
+
+function useWidth(): [(node: HTMLElement | null) => void, number] {
   const [width, setWidth] = useState(0);
   const observer = useRef<ResizeObserver | null>(null);
   const ref = useCallback((node: HTMLElement | null) => {
@@ -252,7 +304,7 @@ function useColumnWidth(count: number): [(node: HTMLElement | null) => void, num
     observer.current = new ResizeObserver(([entry]) => setWidth(entry.contentRect.width));
     observer.current.observe(node);
   }, []);
-  return [ref, width - count * WIDE_COLUMN >= NAME_ROOM ? WIDE_COLUMN : NARROW_COLUMN];
+  return [ref, width];
 }
 
 function Legend() {
@@ -303,25 +355,37 @@ function AgentHeader({
 }) {
   const { t } = useI18n();
   const wide = column >= WIDE_COLUMN;
+  const names = columnNames(agents.map((agent) => agent.name));
   const hovered = hover ? agents.find((agent) => agent.id === hover.agent) : undefined;
+  const noteId = useId();
   return (
-    <div className="flex items-end justify-between gap-3 border-b px-2 pb-2">
-      <span className="flex min-w-0 items-baseline gap-2 pb-1">
-        <span className="shrink-0 text-xs font-semibold tracking-wider text-muted-foreground uppercase">
-          {label}
-        </span>
+    <div>
+      {/* The hovered column on a line of its own across the list, so it stays readable with
+          many agents and showing it never moves the header. */}
+      <p className="h-5 truncate px-2 text-meta text-muted-foreground" aria-live="off">
         {hovered && (
-          <span className="truncate text-meta text-muted-foreground">
+          <>
             <span className="font-semibold text-foreground">{hovered.name}</span>
             {hover?.detail && `: ${hover.detail}`}
-          </span>
+          </>
         )}
-      </span>
-      <span className="flex shrink-0">
-        {agents.map((agent) => (
-          <Tooltip key={agent.id}>
-            <TooltipTrigger asChild>
+      </p>
+      <div className="flex items-end justify-between gap-3 border-b px-2 pb-2">
+        <span className="flex min-w-0 items-baseline gap-2 pb-1">
+          <span className="shrink-0 text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+            {label}
+          </span>
+        </span>
+        <span className="flex shrink-0">
+          {agents.map((agent, index) => {
+            const note = agent.verified
+              ? undefined
+              : t("folders from its docs, not checked on this machine");
+            return (
+              // No tooltip: the line above names the hovered or focused column, and a
+              // tooltip trails the pointer across the logos as a second name.
               <button
+                key={agent.id}
                 type="button"
                 aria-pressed={focus === agent.id}
                 aria-label={
@@ -329,14 +393,14 @@ function AgentHeader({
                     ? t("Show only skills {client} finds", { client: agent.name })
                     : t("Show only what {client} loads", { client: agent.name })
                 }
+                aria-describedby={note ? `${noteId}-${index}` : undefined}
                 onClick={() => onFocus(focus === agent.id ? null : agent.id)}
-                onMouseEnter={() => onHover({ agent: agent.id })}
+                onMouseEnter={() => onHover({ agent: agent.id, detail: note })}
                 onMouseLeave={() => onHover(null)}
-                onFocus={() => onHeaderFocus({ agent: agent.id })}
+                onFocus={() => onHeaderFocus({ agent: agent.id, detail: note })}
                 onBlur={() => onHeaderFocus(null)}
                 className={cn(
-                  "relative flex flex-col items-center justify-center gap-1 rounded-md text-xs text-muted-foreground transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
-                  wide ? "py-1.5" : "h-8",
+                  "relative flex flex-col items-center justify-center gap-1 rounded-md py-1.5 text-xs text-muted-foreground transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
                   hover?.agent === agent.id && "bg-primary/8 text-foreground",
                   focus === agent.id &&
                     "bg-primary/12 text-foreground ring-1 ring-primary/60",
@@ -344,9 +408,19 @@ function AgentHeader({
                 style={{ width: column }}
               >
                 <ClientLogo id={agent.id} name={agent.name} size={20} />
-                {wide && (
-                  <span className="max-w-full truncate px-0.5 leading-none">
-                    {shortAgentName(agent.name)}
+                {/* Always there, empty when only logos fit, so the header keeps its height. */}
+                <span
+                  aria-hidden={!wide}
+                  className={cn(
+                    "max-w-full truncate px-0.5 leading-none",
+                    !wide && "invisible",
+                  )}
+                >
+                  {wide ? names[index] : "\u00a0"}
+                </span>
+                {note && (
+                  <span id={`${noteId}-${index}`} className="sr-only">
+                    {note}
                   </span>
                 )}
                 {!agent.verified && (
@@ -358,17 +432,10 @@ function AgentHeader({
                   />
                 )}
               </button>
-            </TooltipTrigger>
-            <TooltipContent>
-              {agent.verified
-                ? agent.name
-                : t("{client}: folders from its docs, not checked on this machine", {
-                    client: agent.name,
-                  })}
-            </TooltipContent>
-          </Tooltip>
-        ))}
-      </span>
+            );
+          })}
+        </span>
+      </div>
     </div>
   );
 }
@@ -531,7 +598,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 
 function PanelHeading({ children, aside }: { children: ReactNode; aside?: ReactNode }) {
   return (
-    <div className="mt-5 mb-2 flex items-baseline justify-between gap-2">
+    <div className="mt-6 mb-2 flex items-baseline justify-between gap-2">
       <h3 className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
         {children}
       </h3>
@@ -604,6 +671,39 @@ function SkillStateChip({
 }
 
 /** An agent's logo on a 28px tile, as in every Agents and By agent row. */
+/**
+ * One agent in an Agents list: logo, name, state and control on one line, and what the agent
+ * reads on full-width lines under the name, so the notes don't share a line with the controls.
+ * The GTK shell's `agent_card` matches.
+ */
+function AgentCard({
+  agent,
+  badge,
+  trailing,
+  children,
+}: {
+  agent: SkillAgent;
+  badge?: ReactNode;
+  trailing?: ReactNode;
+  children?: ReactNode;
+}) {
+  return (
+    <li className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-0.5 px-4 py-3">
+      <LogoTile agent={agent} />
+      <span className="flex min-w-0 items-center gap-2 text-sm font-semibold">
+        <span className="truncate">{agent.name}</span>
+        {badge}
+      </span>
+      <span className="flex items-center gap-2">{trailing}</span>
+      {children && (
+        <span className="col-span-2 col-start-2 min-w-0 text-meta text-muted-foreground">
+          {children}
+        </span>
+      )}
+    </li>
+  );
+}
+
 function LogoTile({ agent }: { agent: SkillAgent }) {
   return (
     <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-muted">
@@ -681,57 +781,55 @@ function AgentStateRow({
   }
   const where = saved?.via ?? t("Not in any folder it reads");
   return (
-    <li className="flex items-center gap-3 px-4 py-3">
-      <LogoTile agent={agent} />
-      <span className="min-w-0 flex-1">
-        <span className="flex items-center gap-2 text-sm font-semibold">
-          <span className="truncate">{agent.name}</span>
-          {!agent.verified && <Badge variant="off">{t("from docs")}</Badge>}
-        </span>
-        <span className="block text-meta break-words text-muted-foreground">
-          {readOnly && !readOnlyReason
-            ? `${where} · ${t("No switch Toolport can write")}`
-            : where}
-        </span>
-        {readOnlyReason && (
-          <span className="block text-meta text-muted-foreground">{readOnlyReason}</span>
-        )}
-      </span>
-      <SkillStateChip state={current} />
-      {switchable && writable && agent.nameOnly && (
-        <DropdownMenu>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={t("More options for {client}", { client: agent.name })}
+    <AgentCard
+      agent={agent}
+      badge={!agent.verified && <Badge variant="off">{t("from docs")}</Badge>}
+      trailing={
+        <>
+          <SkillStateChip state={current} />
+          {switchable && writable && agent.nameOnly && (
+            <DropdownMenu>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={t("More options for {client}", { client: agent.name })}
+                    >
+                      <MoreHorizontal />
+                    </Button>
+                  </DropdownMenuTrigger>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {t("More options for {client}", { client: agent.name })}
+                </TooltipContent>
+              </Tooltip>
+              <DropdownMenuContent align="end" className="w-72">
+                <DropdownMenuLabel>{agent.name}</DropdownMenuLabel>
+                <DropdownMenuCheckboxItem
+                  checked={current === "name-only"}
+                  onCheckedChange={(checked) => pick(checked ? "name-only" : "on")}
                 >
-                  <MoreHorizontal />
-                </Button>
-              </DropdownMenuTrigger>
-            </TooltipTrigger>
-            <TooltipContent>
-              {t("More options for {client}", { client: agent.name })}
-            </TooltipContent>
-          </Tooltip>
-          <DropdownMenuContent align="end" className="w-72">
-            <DropdownMenuLabel>{agent.name}</DropdownMenuLabel>
-            <DropdownMenuCheckboxItem
-              checked={current === "name-only"}
-              onCheckedChange={(checked) => pick(checked ? "name-only" : "on")}
-            >
-              {t("Load name and description only")}
-            </DropdownMenuCheckboxItem>
-            <div className="px-2 pt-1 pb-1.5 text-meta text-muted-foreground">
-              {agent.switchNote}
-            </div>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      )}
-      <span className="flex w-11 shrink-0 justify-end">{slot}</span>
-    </li>
+                  {t("Load name and description only")}
+                </DropdownMenuCheckboxItem>
+                <div className="px-2 pt-1 pb-1.5 text-meta text-muted-foreground">
+                  {agent.switchNote}
+                </div>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+          <span className="flex w-11 shrink-0 justify-end">{slot}</span>
+        </>
+      }
+    >
+      <span className="block break-words">
+        {readOnly && !readOnlyReason
+          ? `${where} · ${t("No switch Toolport can write")}`
+          : where}
+      </span>
+      {readOnlyReason && <span className="block">{readOnlyReason}</span>}
+    </AgentCard>
   );
 }
 
@@ -975,69 +1073,72 @@ function RuleDetail({
         {agents.map((agent) => {
           const chain = rule.agents[agent.id];
           return (
-            <li key={agent.id} className="flex items-start gap-3 px-4 py-3">
-              <LogoTile agent={agent} />
-              <span className="min-w-0 flex-1">
-                <span className="flex items-center justify-between gap-2">
-                  <span className="truncate text-sm font-semibold">{agent.name}</span>
+            <AgentCard
+              key={agent.id}
+              agent={agent}
+              trailing={
+                <>
                   <SkillStateChip
                     state={chain ? "on" : undefined}
                     label={chain ? t("Loaded") : t("Not loaded")}
                   />
+                  <span className="flex w-11 shrink-0 justify-end">
+                    {chain && (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <span
+                            role="img"
+                            // A focusable fact exposes its explanation to keyboard users.
+                            // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
+                            tabIndex={0}
+                            aria-label={t("No switch Toolport can write")}
+                            className="flex size-7 items-center justify-center rounded-md text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+                          >
+                            <Lock className="size-3" />
+                          </span>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          {t("No switch Toolport can write")}
+                        </TooltipContent>
+                      </Tooltip>
+                    )}
+                  </span>
+                </>
+              }
+            >
+              {chain ? (
+                <span className="flex flex-col gap-0.5">
+                  {chain.map((step, i) => (
+                    <span
+                      key={`${step.kind}:${step.path}:${i}`}
+                      className={cn(
+                        "flex items-start gap-1",
+                        step.kind === "skipped-import" && "text-warning",
+                      )}
+                    >
+                      {step.kind !== "file" && (
+                        <CornerDownRight className="mt-0.5 size-3 shrink-0" />
+                      )}
+                      <span className="min-w-0 break-words">
+                        {step.kind === "file" ? (
+                          <span className="font-mono">{step.path}</span>
+                        ) : step.kind === "link" ? (
+                          t("links to {path}", { path: step.path })
+                        ) : step.kind === "import" ? (
+                          t("@imports {path}", { path: step.path })
+                        ) : (
+                          t("skips @import {path}", { path: step.path })
+                        )}
+                      </span>
+                    </span>
+                  ))}
                 </span>
-                {chain ? (
-                  <span className="mt-0.5 flex flex-col gap-0.5 text-meta text-muted-foreground">
-                    {chain.map((step, i) => (
-                      <span
-                        key={`${step.kind}:${step.path}:${i}`}
-                        className={cn(
-                          "flex items-start gap-1",
-                          step.kind === "skipped-import" && "text-warning",
-                        )}
-                      >
-                        {step.kind !== "file" && (
-                          <CornerDownRight className="mt-0.5 size-3 shrink-0" />
-                        )}
-                        <span className="min-w-0 break-words">
-                          {step.kind === "file" ? (
-                            <span className="font-mono">{step.path}</span>
-                          ) : step.kind === "link" ? (
-                            t("links to {path}", { path: step.path })
-                          ) : step.kind === "import" ? (
-                            t("@imports {path}", { path: step.path })
-                          ) : (
-                            t("skips @import {path}", { path: step.path })
-                          )}
-                        </span>
-                      </span>
-                    ))}
-                  </span>
-                ) : (
-                  <span className="block text-meta text-muted-foreground">
-                    {agent.rulesNote ?? otherRulesNote(agent, rule)}
-                  </span>
-                )}
-              </span>
-              <span className="flex w-11 shrink-0 justify-end">
-                {chain && (
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <span
-                        role="img"
-                        // A focusable fact exposes its explanation to keyboard users.
-                        // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
-                        tabIndex={0}
-                        aria-label={t("No switch Toolport can write")}
-                        className="flex size-7 items-center justify-center rounded-md text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
-                      >
-                        <Lock className="size-3" />
-                      </span>
-                    </TooltipTrigger>
-                    <TooltipContent>{t("No switch Toolport can write")}</TooltipContent>
-                  </Tooltip>
-                )}
-              </span>
-            </li>
+              ) : (
+                <span className="block">
+                  {agent.rulesNote ?? otherRulesNote(agent, rule)}
+                </span>
+              )}
+            </AgentCard>
           );
         })}
       </ul>
@@ -1155,7 +1256,7 @@ function IssueCard({
                 issue.fixPaths?.length ? (
                   <div className="space-y-2">
                     <p>{issue.fixNote}</p>
-                    <ul className="space-y-1 rounded-md bg-muted px-3 py-2 font-mono text-xs break-all text-foreground">
+                    <ul className="space-y-1 rounded-md bg-muted px-3 py-2 font-mono text-xs break-words text-foreground">
                       {issue.fixPaths.map((path) => (
                         <li key={path}>{path}</li>
                       ))}
@@ -1212,27 +1313,26 @@ function AgentSummary({ inv }: { inv: SkillsInventory }) {
                 : t("{count} rules files", { count: rules }),
           );
           return (
-            <li key={agent.id} className="flex items-center gap-3 px-4 py-3">
-              <LogoTile agent={agent} />
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-sm font-semibold">{agent.name}</span>
-                <span className="block text-meta text-muted-foreground">
-                  {parts.join(" · ")}
-                </span>
-              </span>
-              {broken > 0 ? (
-                <Badge variant="destructive">
-                  {t("{count} broken", { count: broken })}
-                </Badge>
-              ) : !agent.supportsSkills ? null : (
-                <span
-                  title={agent.switchNote}
-                  className="shrink-0 text-meta text-muted-foreground"
-                >
-                  {agent.canToggle ? t("Own switch") : t("No switch")}
-                </span>
-              )}
-            </li>
+            <AgentCard
+              key={agent.id}
+              agent={agent}
+              trailing={
+                broken > 0 ? (
+                  <Badge variant="destructive">
+                    {t("{count} broken", { count: broken })}
+                  </Badge>
+                ) : !agent.supportsSkills ? null : (
+                  <span
+                    title={agent.switchNote}
+                    className="shrink-0 text-meta text-muted-foreground"
+                  >
+                    {agent.canToggle ? t("Own switch") : t("No switch")}
+                  </span>
+                )
+              }
+            >
+              {parts.join(" · ")}
+            </AgentCard>
           );
         })}
       </ul>
@@ -1270,7 +1370,8 @@ export function SkillsView() {
   const [project, setProject] = useState<string | null>(readProject);
   const [tab, setTab] = useState<Tab>("skills");
   const [query, setQuery] = useState("");
-  const [focus, setFocus] = useState<string | null>(null);
+  const [pickedAgent, setFocus] = useState<string | null>(null);
+  const [connectedOnly, setConnectedOnly] = useState(true);
   const [selectedSkill, setSelectedSkill] = useState<string | null>(null);
   const [selectedRule, setSelectedRule] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(
@@ -1378,44 +1479,85 @@ export function SkillsView() {
     setLoading(false);
   }
 
+  const hasConnected = inv?.agents.some((agent) => agent.connected) ?? false;
+  const focus = inv?.agents.some(
+    (agent) =>
+      agent.id === pickedAgent && (!connectedOnly || !hasConnected || agent.connected),
+  )
+    ? pickedAgent
+    : null;
+  const filteringAgents = Boolean(focus || (connectedOnly && hasConnected));
+  const scopedAgents = useMemo(() => {
+    const agents = inv?.agents ?? [];
+    if (connectedOnly) {
+      return agents.some((agent) => agent.connected)
+        ? agents.filter((agent) => agent.connected)
+        : agents;
+    }
+    return agents;
+  }, [inv, connectedOnly]);
   const skillAgents = useMemo(
-    () => inv?.agents.filter((a) => a.supportsSkills) ?? [],
-    [inv],
+    () => scopedAgents.filter((a) => a.supportsSkills),
+    [scopedAgents],
+  );
+  const allColumnAgents = useMemo(
+    () => inv?.agents.filter((a) => tab === "rules" || a.supportsSkills) ?? [],
+    [inv, tab],
+  );
+  const scopedSkills = useMemo(
+    () =>
+      inv?.skills.filter(
+        (skill) =>
+          !filteringAgents ||
+          (focus
+            ? skill.states[focus]
+            : skillAgents.some((agent) => skill.states[agent.id])),
+      ) ?? [],
+    [inv, filteringAgents, skillAgents, focus],
+  );
+  const scopedRules = useMemo(
+    () =>
+      inv?.rules.filter(
+        (rule) =>
+          !filteringAgents ||
+          (focus
+            ? rule.agents[focus]
+            : scopedAgents.some((agent) => rule.agents[agent.id])),
+      ) ?? [],
+    [inv, filteringAgents, scopedAgents, focus],
   );
   const needle = query.trim().toLowerCase();
-  // The agents with a column on this tab, in the Agents list's order.
-  const columnAgents = useMemo(
-    () => (tab === "rules" ? (inv?.agents ?? []) : skillAgents),
-    [tab, inv, skillAgents],
-  );
-  const [gridRef, column] = useColumnWidth(columnAgents.length);
+  const columnAgents = tab === "rules" ? scopedAgents : skillAgents;
+  const [gridRef, column, gridWidth] = useColumnWidth(columnAgents.length);
+  const stacked = !namesFit(gridWidth, columnAgents.length, tab !== "rules");
+  const [panelRef, panelWidth] = useWidth();
+  // One step for both tabs, like the GTK shell, so switching tabs never moves the detail pane.
+  const split = sideBySide(panelWidth, Math.max(skillAgents.length, scopedAgents.length));
   const [pointerHover, setHover] = useState<ColumnHover>(null);
   const [keyboardColumn, setKeyboardColumn] = useState<ColumnHover>(null);
   const hover = pointerHover ?? keyboardColumn;
 
   const visibleSkills = useMemo(() => {
     if (!inv) return [];
-    return inv.skills.filter(
+    return scopedSkills.filter(
       (s) =>
-        (!focus || s.states[focus]) &&
-        (!needle ||
-          s.name.toLowerCase().includes(needle) ||
-          s.description.toLowerCase().includes(needle) ||
-          s.path.toLowerCase().includes(needle)),
+        !needle ||
+        s.name.toLowerCase().includes(needle) ||
+        s.description.toLowerCase().includes(needle) ||
+        s.path.toLowerCase().includes(needle),
     );
-  }, [inv, focus, needle]);
+  }, [inv, scopedSkills, needle]);
 
   const visibleRules = useMemo(() => {
     if (!inv) return [];
-    return inv.rules.filter(
+    return scopedRules.filter(
       (r) =>
-        (!focus || r.agents[focus]) &&
-        (!needle ||
-          r.name.toLowerCase().includes(needle) ||
-          r.path.toLowerCase().includes(needle) ||
-          r.preview.toLowerCase().includes(needle)),
+        !needle ||
+        r.name.toLowerCase().includes(needle) ||
+        r.path.toLowerCase().includes(needle) ||
+        r.preview.toLowerCase().includes(needle),
     );
-  }, [inv, focus, needle]);
+  }, [inv, scopedRules, needle]);
 
   // The picked skill while the list still shows it; otherwise the first row shown, in the
   // page's group order with collapsed groups skipped, so the details never describe a hidden row.
@@ -1425,7 +1567,8 @@ export function SkillsView() {
       .map((source) => visibleSkills.find((s) => s.source === source))
       .find(Boolean) ??
     null;
-  const rule = inv?.rules.find((r) => r.key === selectedRule) ?? visibleRules[0] ?? null;
+  const rule =
+    visibleRules.find((r) => r.key === selectedRule) ?? visibleRules[0] ?? null;
 
   function switchProject(next: string | null) {
     if (next === projectRef.current) return;
@@ -1553,6 +1696,7 @@ export function SkillsView() {
     if (!found) return;
     setQuery("");
     setFocus(null);
+    setConnectedOnly(false);
     setSelectedSkill(found.key);
     setCollapsed((prev) => {
       const next = new Set(prev);
@@ -1593,14 +1737,14 @@ export function SkillsView() {
     [
       "skills",
       t("Skills"),
-      inv?.skills.filter((s) => s.source !== "broken").length ?? 0,
+      scopedSkills.filter((s) => s.source !== "broken").length,
       false,
     ],
-    ["rules", t("Rules"), inv?.rules.length ?? 0, false],
+    ["rules", t("Rules"), scopedRules.length, false],
     ["issues", t("Needs a look"), activeIssues.length, activeIssues.length > 0],
   ];
 
-  const focusedAgent = columnAgents.find((agent) => agent.id === focus);
+  const focusedAgent = allColumnAgents.find((agent) => agent.id === focus);
   const toolbar = (
     <div className="flex flex-wrap items-center gap-2">
       <DropdownMenu>
@@ -1623,7 +1767,7 @@ export function SkillsView() {
           {project && (
             <>
               <DropdownMenuSeparator />
-              <div className="px-2 py-1.5 font-mono text-meta break-all text-muted-foreground">
+              <div className="px-2 py-1.5 font-mono text-meta break-words text-muted-foreground">
                 {project}
               </div>
             </>
@@ -1644,18 +1788,39 @@ export function SkillsView() {
               ) : (
                 <Filter />
               )}
-              <span className="truncate">{focusedAgent?.name ?? t("All agents")}</span>
+              <span className="truncate">
+                {focusedAgent?.name ??
+                  (connectedOnly && hasConnected
+                    ? t("Connected to Toolport")
+                    : t("All detected agents"))}
+              </span>
               <ChevronDown className="text-muted-foreground" />
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="max-h-96 w-56 overflow-y-auto">
             <DropdownMenuLabel>{t("Filter by agent")}</DropdownMenuLabel>
             <DropdownMenuRadioGroup
-              value={focus ?? ""}
-              onValueChange={(id) => setFocus(id || null)}
+              value={focus ?? (connectedOnly && hasConnected ? "@connected" : "")}
+              onValueChange={(id) => {
+                if (id === "@connected" || !id) {
+                  setConnectedOnly(id === "@connected");
+                  setFocus(null);
+                } else {
+                  if (!inv?.agents.find((agent) => agent.id === id)?.connected)
+                    setConnectedOnly(false);
+                  setFocus(id);
+                }
+              }}
             >
-              <DropdownMenuRadioItem value="">{t("All agents")}</DropdownMenuRadioItem>
-              {columnAgents.map((agent) => (
+              {hasConnected && (
+                <DropdownMenuRadioItem value="@connected">
+                  {t("Connected to Toolport")}
+                </DropdownMenuRadioItem>
+              )}
+              <DropdownMenuRadioItem value="">
+                {t("All detected agents")}
+              </DropdownMenuRadioItem>
+              {allColumnAgents.map((agent) => (
                 <DropdownMenuRadioItem key={agent.id} value={agent.id}>
                   <ClientLogo id={agent.id} name={agent.name} size={16} />
                   {agent.name}
@@ -1806,7 +1971,7 @@ export function SkillsView() {
       items: visibleSkills.filter((s) => s.source === source),
     })).filter((g) => g.items.length > 0);
     body = (
-      <div className="grid gap-6 @min-[981px]:grid-cols-[minmax(0,1fr)_minmax(320px,380px)]">
+      <div className={cn("grid gap-6", split && SPLIT_GRID)}>
         <section ref={gridRef} aria-label={t("Skills")} className="min-w-0">
           {banner}
           <AgentHeader
@@ -1854,12 +2019,20 @@ export function SkillsView() {
                         onClick={() => setSelectedSkill(s.key)}
                         aria-current={skill?.key === s.key ? "true" : undefined}
                         className={cn(
-                          "flex w-full items-center gap-3 rounded-md px-2 py-2 text-left transition-colors hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none",
+                          "flex w-full gap-3 rounded-md px-2 py-2 text-left transition-colors hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none",
+                          // Too narrow for names beside the dots: the name and size on one line
+                          // and the dots under it. The description is left to the detail pane.
+                          stacked ? "flex-col gap-1" : "items-center",
                           skill?.key === s.key && "bg-accent/70 hover:bg-accent/70",
                         )}
                       >
-                        <span className="min-w-0 flex-1">
-                          <span className="flex items-center gap-1.5 text-sm font-medium">
+                        <span
+                          className={cn(
+                            "min-w-0 flex-1",
+                            stacked && "flex items-center gap-3",
+                          )}
+                        >
+                          <span className="flex min-w-0 flex-1 items-center gap-1.5 text-sm font-medium">
                             <span className="truncate">{s.name}</span>
                             {s.descriptionChars > DESCRIPTION_CAP && (
                               <AlertTriangle
@@ -1868,16 +2041,33 @@ export function SkillsView() {
                               />
                             )}
                           </span>
-                          <span className="block truncate text-meta text-muted-foreground">
-                            {s.source === "broken" ? s.path : s.description}
-                          </span>
+                          {stacked ? (
+                            s.source !== "broken" && (
+                              // Ends where the last dot does.
+                              <span
+                                className="shrink-0 text-xs text-muted-foreground tabular-nums"
+                                style={{ paddingRight: (column - 12) / 2 }}
+                              >
+                                {fmtBytes(s.sizeBytes)}
+                              </span>
+                            )
+                          ) : (
+                            <span className="block truncate text-meta text-muted-foreground">
+                              {s.source === "broken" ? s.path : s.description}
+                            </span>
+                          )}
                         </span>
-                        {s.source !== "broken" && (
+                        {!stacked && s.source !== "broken" && (
                           <span className="hidden shrink-0 text-xs text-muted-foreground tabular-nums sm:block">
                             {fmtBytes(s.sizeBytes)}
                           </span>
                         )}
-                        <span className="-my-2 flex shrink-0 self-stretch">
+                        <span
+                          className={cn(
+                            "flex shrink-0",
+                            stacked ? "self-end" : "-my-2 self-stretch",
+                          )}
+                        >
                           {skillAgents.map((agent) => {
                             const at = s.states[agent.id];
                             const state = stateLabel(at?.state);
@@ -1917,7 +2107,7 @@ export function SkillsView() {
         </section>
         <aside
           aria-label={t("Skill details")}
-          className="min-w-0 @min-[981px]:sticky @min-[981px]:top-0 @min-[981px]:max-h-[calc(100vh-9rem)] @min-[981px]:self-start @min-[981px]:overflow-y-auto @min-[981px]:border-l @min-[981px]:pl-6"
+          className={cn("min-w-0", split && SPLIT_ASIDE)}
         >
           {skill ? (
             <SkillDetail
@@ -1940,11 +2130,11 @@ export function SkillsView() {
       .map((scope) => ({ scope, items: visibleRules.filter((r) => r.scope === scope) }))
       .filter((g) => g.items.length > 0);
     body = (
-      <div className="grid gap-6 @min-[981px]:grid-cols-[minmax(0,1fr)_minmax(320px,380px)]">
+      <div className={cn("grid gap-6", split && SPLIT_GRID)}>
         <section ref={gridRef} aria-label={t("Rules")} className="min-w-0">
           {banner}
           <AgentHeader
-            agents={inv.agents}
+            agents={scopedAgents}
             focus={focus}
             onFocus={setFocus}
             label={t("Rules file")}
@@ -1989,7 +2179,10 @@ export function SkillsView() {
                       onClick={() => setSelectedRule(r.key)}
                       aria-current={rule?.key === r.key ? "true" : undefined}
                       className={cn(
-                        "flex w-full items-center gap-3 rounded-md px-2 py-2 text-left transition-colors hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none",
+                        "flex w-full gap-3 rounded-md px-2 py-2 text-left transition-colors hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none",
+                        // Too narrow for names beside the dots: the name above them, and the
+                        // path left to the detail pane.
+                        stacked ? "flex-col gap-1" : "items-center",
                         rule?.key === r.key && "bg-accent/70 hover:bg-accent/70",
                       )}
                     >
@@ -1997,12 +2190,19 @@ export function SkillsView() {
                         <span className="block truncate text-sm font-medium">
                           {r.name}
                         </span>
-                        <span className="block truncate font-mono text-meta text-muted-foreground">
-                          {r.path}
-                        </span>
+                        {!stacked && (
+                          <span className="block truncate font-mono text-meta text-muted-foreground">
+                            {r.path}
+                          </span>
+                        )}
                       </span>
-                      <span className="-my-2 flex shrink-0 self-stretch">
-                        {inv.agents.map((agent) => {
+                      <span
+                        className={cn(
+                          "flex shrink-0",
+                          stacked ? "self-end" : "-my-2 self-stretch",
+                        )}
+                      >
+                        {scopedAgents.map((agent) => {
                           const state = r.agents[agent.id]
                             ? t("Loaded")
                             : t("Not loaded");
@@ -2031,10 +2231,10 @@ export function SkillsView() {
         </section>
         <aside
           aria-label={t("Rules file details")}
-          className="min-w-0 @min-[981px]:sticky @min-[981px]:top-0 @min-[981px]:max-h-[calc(100vh-9rem)] @min-[981px]:self-start @min-[981px]:overflow-y-auto @min-[981px]:border-l @min-[981px]:pl-6"
+          className={cn("min-w-0", split && SPLIT_ASIDE)}
         >
           {rule ? (
-            <RuleDetail rule={rule} agents={inv.agents} project={project} />
+            <RuleDetail rule={rule} agents={scopedAgents} project={project} />
           ) : (
             <p className="py-10 text-center text-sm text-muted-foreground">
               {t("Pick a rules file to see which agents read it.")}
@@ -2045,7 +2245,7 @@ export function SkillsView() {
     );
   } else {
     body = (
-      <div className="grid gap-6 @min-[981px]:grid-cols-[minmax(0,1fr)_minmax(320px,380px)]">
+      <div className="grid gap-6 @min-[981px]:grid-cols-[minmax(0,1fr)_clamp(380px,30%,520px)]">
         <section aria-label={t("Needs a look")} className="flex min-w-0 flex-col gap-3">
           {activeIssues.length === 0 ? (
             <EmptyState
@@ -2109,6 +2309,7 @@ export function SkillsView() {
     <div className="flex flex-col gap-4">
       {header}
       <div
+        ref={panelRef}
         role="tabpanel"
         className="@container"
         id={`skills-panel-${tab}`}

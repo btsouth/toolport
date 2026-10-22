@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -16,7 +16,7 @@ import { applySkillState, skillsFixture } from "@/test/skills-fixture";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 import { toastError } from "@/lib/toast";
 import { SKILLS_REFRESH_EVENT, SKILLS_SEARCH_EVENT } from "@/lib/shortcuts";
-import { shortAgentName } from "@/lib/agentNames";
+import { columnNames, shortAgentName } from "@/lib/agentNames";
 import { SkillsView } from "./SkillsView";
 
 vi.mock("@/lib/api", () => ({
@@ -76,6 +76,84 @@ function renderView() {
 }
 
 describe("SkillsView", () => {
+  it("shows all detected agents when none are connected", async () => {
+    renderView();
+    await screen.findByRole("region", { name: "Skills" });
+    expect(screen.getByRole("button", { name: "Filter by agent" })).toHaveTextContent(
+      "All detected agents",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Filter by agent" }));
+    expect(
+      screen.queryByRole("menuitemradio", { name: "Connected to Toolport" }),
+    ).toBeNull();
+    expect(
+      screen.getByRole("menuitemradio", { name: "All detected agents" }),
+    ).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("defaults to exact connected profiles and offers every detected profile in the same selector", async () => {
+    const inv = skillsFixture();
+    const claude = inv.agents[0];
+    const codex = inv.agents[1];
+    inv.agents = [
+      ...["claude", "claude2", "claude3", "claude-api"].map((name, i) => ({
+        ...claude,
+        id: i ? `claude-code@${name}` : "claude-code",
+        name: `Claude Code (${name})`,
+        connected: i < 2,
+      })),
+      ...["codex", "work", "second", "becca"].map((name, i) => ({
+        ...codex,
+        id: i ? `codex@${name}` : "codex",
+        name: `Codex (${name})`,
+        connected: i === 0,
+      })),
+    ];
+    for (const skill of inv.skills) {
+      for (const agent of inv.agents) {
+        const base = agent.id.startsWith("codex") ? "codex" : "claude-code";
+        if (skill.states[base]) skill.states[agent.id] = { ...skill.states[base] };
+      }
+    }
+    const privateSkill = {
+      ...inv.skills[0],
+      key: "private",
+      name: "work-only",
+      states: { "codex@work": { state: "on" as const, via: "work" } },
+    };
+    inv.skills.push(privateSkill);
+    vi.mocked(skillsInventory).mockResolvedValue(inv);
+    renderView();
+    const list = await screen.findByRole("region", { name: "Skills" });
+    expect(screen.getByRole("button", { name: "Filter by agent" })).toHaveTextContent(
+      "Connected to Toolport",
+    );
+    expect(
+      within(list).getAllByRole("button", { name: /Show only skills .* finds/ }),
+    ).toHaveLength(3);
+    expect(within(list).queryByRole("button", { name: /work-only/ })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Filter by agent" }));
+    await userEvent.click(
+      screen.getByRole("menuitemradio", { name: "All detected agents" }),
+    );
+    expect(
+      within(list).getAllByRole("button", { name: /Show only skills .* finds/ }),
+    ).toHaveLength(8);
+    expect(within(list).getByRole("button", { name: /work-only/ })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("tab", { name: /^Rules/ }));
+    const rules = screen.getByRole("region", { name: "Rules" });
+    expect(
+      within(rules).getAllByRole("button", { name: /Show only what .* loads/ }),
+    ).toHaveLength(8);
+    await userEvent.click(screen.getByRole("button", { name: "Filter by agent" }));
+    await userEvent.click(
+      screen.getByRole("menuitemradio", { name: "Connected to Toolport" }),
+    );
+    expect(
+      within(rules).getAllByRole("button", { name: /Show only what .* loads/ }),
+    ).toHaveLength(3);
+  });
+
   it("shows each skill's state per agent and the first skill's details", async () => {
     renderView();
     const list = await screen.findByRole("region", { name: "Skills" });
@@ -235,7 +313,7 @@ describe("SkillsView", () => {
     ).not.toHaveClass("opacity-40");
     await userEvent.click(screen.getByRole("button", { name: "Filter by agent" }));
     await userEvent.click(
-      await screen.findByRole("menuitemradio", { name: "All agents" }),
+      await screen.findByRole("menuitemradio", { name: "All detected agents" }),
     );
     expect(codexHeader).toHaveAttribute("aria-pressed", "false");
     await userEvent.click(screen.getByRole("button", { name: "Filter by agent" }));
@@ -244,6 +322,27 @@ describe("SkillsView", () => {
       within(list).getByRole("button", { name: "Show only skills Codex finds" }),
     ).toHaveAttribute("aria-pressed", "true");
     expect(within(list).queryByRole("button", { name: /pdf/ })).not.toBeInTheDocument();
+  });
+
+  it("tells keyboard and screen reader users an agent's folders weren't checked", async () => {
+    const inv = skillsFixture();
+    inv.agents = inv.agents.map((a) => (a.id === "grok" ? { ...a, verified: false } : a));
+    vi.mocked(skillsInventory).mockResolvedValue(inv);
+    renderView();
+    const list = await screen.findByRole("region", { name: "Skills" });
+    const header = within(list).getByRole("button", {
+      name: "Show only skills Grok finds",
+    });
+    expect(header).toHaveAccessibleDescription(
+      "folders from its docs, not checked on this machine",
+    );
+    act(() => header.focus());
+    expect(
+      within(list).getByText(
+        (_, el) =>
+          el?.textContent === "Grok: folders from its docs, not checked on this machine",
+      ),
+    ).toBeVisible();
   });
 
   it("keeps the keyboard column named when the pointer leaves", async () => {
@@ -274,6 +373,23 @@ describe("SkillsView", () => {
     expect(shortAgentName("Copilot CLI")).toBe("Copilot");
     expect(shortAgentName("OpenCode")).toBe("OpenCode");
     expect(shortAgentName("Antigravity")).toBe("Antigra…");
+    expect(
+      columnNames([
+        "Claude Code (claude)",
+        "Claude Code (claude2)",
+        "Codex (codex)",
+        "Codex (codex-becca)",
+        "Cursor",
+        "Command Code",
+      ]),
+    ).toEqual(["claude", "claude2", "codex", "becca", "Cursor", "Command"]);
+    expect(
+      columnNames(["Claude Code (claude)", "Codex (codex-work)", "Copilot CLI"]),
+    ).toEqual(["Claude", "Codex", "Copilot"]);
+    expect(columnNames(["Codex (codex-second-account)", "Codex (codex)"])).toEqual([
+      "second-…",
+      "codex",
+    ]);
   });
 
   it("shows how each agent reaches a rules file, including skipped imports", async () => {

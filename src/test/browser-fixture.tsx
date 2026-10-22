@@ -629,6 +629,34 @@ if (connectedImportFixture) {
 } else localStorage.setItem("toolport.onboarded", "1");
 
 let skills = skillsFixture();
+// ?many-agents: a busy machine with several profiles per client, to check the grid
+// stacks under the lists before its columns crowd out the skill names.
+if (new URLSearchParams(location.search).has("many-agents")) {
+  const base = skills.agents;
+  const copies = [
+    ["claude-code@claude2", "Claude Code (claude2)"],
+    ["claude-code@claude3", "Claude Code (claude3)"],
+    ["codex@codex-becca", "Codex (codex-becca)"],
+    ["codex@codex-second", "Codex (codex-second)"],
+    ["codex@codex-work", "Codex (codex-work)"],
+    ["github-copilot-cli", "Copilot CLI"],
+    ["gemini-cli", "Gemini CLI"],
+    ["kiro", "Kiro"],
+    ["amp", "Amp"],
+    ["goose", "Goose"],
+    ["hermes", "Hermes"],
+  ].map(([id, name]) => ({ ...base[id.startsWith("codex") ? 1 : 0], id, name }));
+  skills.agents = [
+    { ...base[0], name: "Claude Code (claude)" },
+    { ...base[1], name: "Codex (codex)" },
+    ...base.slice(2),
+    ...copies,
+  ];
+  for (const skill of skills.skills) {
+    const state = skill.states["claude-code"];
+    if (state) for (const { id } of copies) skill.states[id] = state;
+  }
+}
 if (new URLSearchParams(location.search).has("rules-link")) {
   skills.issues.push({
     id: "rules-missing",

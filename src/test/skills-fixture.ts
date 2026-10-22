@@ -16,6 +16,7 @@ const agent = (
   roots: string[],
   extra: Partial<SkillAgent> = {},
 ): SkillAgent => ({
+  connected: false,
   id,
   name,
   supportsSkills: true,

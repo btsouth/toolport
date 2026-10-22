@@ -98,7 +98,7 @@ const registry: Registry = {
 };
 
 function renderSettings(page: SettingsSubpage = "general") {
-  render(
+  return render(
     <ThemeProvider>
       <SettingsView page={page} registry={registry} onRegistryChange={vi.fn()} />
     </ThemeProvider>,
@@ -224,7 +224,9 @@ describe("SettingsView launch at login", () => {
   it("renders a verified disabled state once the OS read succeeds with false", async () => {
     mockedIsAutostartEnabled.mockResolvedValueOnce(false);
 
-    renderSettings();
+    const { container } = renderSettings();
+    // Settings uses the full width like every other page: no capped column.
+    expect(container.querySelector('[class*="max-w-[760px]"]')).toBeNull();
 
     const control = screen.getByRole("switch", { name: /launch at login/i });
     await waitFor(() => expect(control).toBeEnabled());
@@ -608,7 +610,11 @@ it("shows server permissions immediately for an empty access set", () => {
     </ThemeProvider>,
   );
   expect(screen.getByText("Empty set", { selector: "span" })).toBeVisible();
-  expect(screen.getByRole("checkbox", { name: /GitHub/ })).not.toBeChecked();
+  expect(screen.getByRole("switch", { name: /GitHub/ })).not.toBeChecked();
+  // A server outside the set has nothing to scope.
+  expect(
+    screen.queryByRole("button", { name: /Choose tools for GitHub/ }),
+  ).not.toBeInTheDocument();
 });
 
 describe("Remove Toolport from all clients", () => {

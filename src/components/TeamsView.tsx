@@ -596,7 +596,7 @@ export function TeamsView({
   // the two apart, so answer the question here: not loaded yet is neither state.
   if (registry === null) {
     return (
-      <div className="max-w-[760px]">
+      <div>
         <div className="mb-5 flex items-center gap-2">
           <Users className="size-5 text-muted-foreground" />
           <h2 className="text-base font-semibold">{tr("Toolport Teams")}</h2>
@@ -616,7 +616,7 @@ export function TeamsView({
     );
   }
   return (
-    <div className="max-w-[760px]">
+    <div>
       <div className="mb-5 flex items-center gap-2">
         <Users className="size-5 text-muted-foreground" />
         <h2 className="text-base font-semibold">{tr("Toolport Teams")}</h2>

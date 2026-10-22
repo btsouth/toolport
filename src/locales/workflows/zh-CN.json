@@ -371,7 +371,7 @@
   "no rules files": "无规则文件",
   "skips @import {path}": "跳过 @import {path}",
   "{client} now lists {skill} by name only": "{client} 现在仅按名称列出 {skill}",
-  "{client}: folders from its docs, not checked on this machine": "{client}：文件夹来自其文档，未在本机上核实",
+  "folders from its docs, not checked on this machine": "文件夹来自其文档，未在本机上核实",
   "{count} broken": "{count} 个已损坏",
   "{count} name only": "{count} 个仅名称",
   "{count} of {cap} characters": "{count} / {cap} 个字符",
@@ -406,5 +406,6 @@
   "No switch Toolport can write": "没有 Toolport 可写入的开关",
   "Filter by agent": "按智能体筛选",
   "All agents": "所有智能体",
+  "All detected agents": "所有检测到的智能体",
   "{state} via {path}": "{state}，来自 {path}"
 }

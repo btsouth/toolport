@@ -33,6 +33,10 @@ const PREVIEW_CHARS: usize = 4000;
 /// tests, so scans never depend on process-global env vars.
 #[derive(Debug, Clone)]
 pub struct Env {
+    /// Exact client identities and profile folders from the Clients inventory.
+    profiles: Vec<Profile>,
+    detected_agents: BTreeSet<String>,
+    connected_agents: BTreeSet<String>,
     pub home: PathBuf,
     /// `home` with symlinks resolved, so canonical skill paths still count as inside it.
     pub home_real: PathBuf,
@@ -78,10 +82,21 @@ pub struct Env {
     pub claude_profiles: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+struct Profile {
+    id: String,
+    client_type: String,
+    name: String,
+    folder: PathBuf,
+}
+
 impl Env {
     pub fn from_home(home: &Path) -> Self {
         let config = home.join(".config");
         Env {
+            profiles: Vec::new(),
+            detected_agents: BTreeSet::new(),
+            connected_agents: BTreeSet::new(),
             home: home.to_path_buf(),
             home_real: canon(home).unwrap_or_else(|_| home.to_path_buf()),
             claude: home.join(".claude"),
@@ -210,7 +225,82 @@ impl Env {
             .unwrap_or_else(|| codewhale_config(&home, &env.codewhale, explicit_home));
         env.openclaw = crate::clients::openclaw::dirs(&home, &trimmed);
         env.claude_profiles = claude_profile_dirs(&home, &env.claude);
+        env.use_clients(&crate::clients::detect_clients_for_skills());
         Some(env)
+    }
+
+    fn use_clients(&mut self, clients: &[crate::clients::DetectedClient]) {
+        self.profiles.clear();
+        self.detected_agents.clear();
+        self.connected_agents.clear();
+        for client in clients.iter().filter(|c| c.app_present || c.config_exists) {
+            self.detected_agents.insert(client.id.clone());
+            if client.gateway_installed {
+                self.connected_agents.insert(client.id.clone());
+            }
+            let kind = client.id.split('@').next().unwrap_or(&client.id);
+            if !matches!(kind, "claude-code" | "codex")
+                || client
+                    .claude_profile
+                    .as_ref()
+                    .is_some_and(|p| p.same_as.is_some())
+            {
+                continue;
+            }
+            let path = Path::new(&client.config_path);
+            let Some(parent) = path
+                .parent()
+                .filter(|p| path.is_absolute() && !p.as_os_str().is_empty())
+            else {
+                continue;
+            };
+            let folder = if kind == "claude-code" && path == self.home.join(".claude.json") {
+                self.home.join(".claude")
+            } else {
+                parent.to_path_buf()
+            };
+            let name = client
+                .claude_profile
+                .as_ref()
+                .and_then(|p| p.command.as_deref())
+                .map(|command| {
+                    format!(
+                        "{} ({command})",
+                        if kind == "codex" {
+                            "Codex"
+                        } else {
+                            "Claude Code"
+                        }
+                    )
+                })
+                .unwrap_or_else(|| client.name.clone());
+            let profile = Profile {
+                id: client.id.clone(),
+                client_type: kind.into(),
+                name,
+                folder,
+            };
+            // The default ~/.claude.json and an explicit ~/.claude/.claude.json
+            // both read ~/.claude/settings.json. One settings root gets one column,
+            // regardless of account metadata; retain a connected identity when possible.
+            let same = self.profiles.iter().position(|other| {
+                other.client_type == profile.client_type
+                    && (other.folder == profile.folder
+                        || canon(&other.folder)
+                            .ok()
+                            .zip(canon(&profile.folder).ok())
+                            .is_some_and(|(a, b)| a == b))
+            });
+            if let Some(index) = same {
+                if client.gateway_installed
+                    && !self.connected_agents.contains(&self.profiles[index].id)
+                {
+                    self.profiles[index] = profile;
+                }
+            } else {
+                self.profiles.push(profile);
+            }
+        }
     }
 
     fn agents_skills(&self) -> PathBuf {
@@ -312,6 +402,33 @@ fn profile_label(env: &Env, dir: &Path) -> String {
 fn instances(env: &Env, present: &dyn Fn(&str) -> bool) -> Vec<Instance> {
     let mut out = Vec::new();
     for def in agent_defs() {
+        let profiles: Vec<_> = env
+            .profiles
+            .iter()
+            .filter(|p| p.client_type == def.id)
+            .collect();
+        if !profiles.is_empty() {
+            for profile in profiles {
+                let mut profile_env = env.clone();
+                if profile.client_type == "codex" {
+                    profile_env.codex = profile.folder.clone();
+                } else {
+                    profile_env.claude = profile.folder.clone();
+                }
+                profile_env.profiles.clear();
+                profile_env.claude_profiles.clear();
+                out.push(Instance {
+                    id: profile.id.clone(),
+                    name: profile.name.clone(),
+                    env: profile_env,
+                    def: agent_defs()
+                        .into_iter()
+                        .find(|d| d.id == def.id)
+                        .expect("profile client is defined"),
+                });
+            }
+            continue;
+        }
         let is_claude = def.switch == Switch::ClaudeOverrides;
         if !(present(def.id) || (is_claude && !env.claude_profiles.is_empty())) {
             continue;
@@ -346,6 +463,13 @@ fn instances(env: &Env, present: &dyn Fn(&str) -> bool) -> Vec<Instance> {
 
 /// The column id for a Claude Code profile folder.
 fn claude_id(env: &Env, dir: &Path) -> String {
+    if let Some(profile) = env
+        .profiles
+        .iter()
+        .find(|p| p.client_type == "claude-code" && p.folder == dir)
+    {
+        return profile.id.clone();
+    }
     if env.claude_profiles.is_empty() || dir == env.home.join(".claude") {
         "claude-code".into()
     } else {
@@ -364,6 +488,15 @@ fn claude_id(env: &Env, dir: &Path) -> String {
 
 /// Every Claude Code profile folder this environment reads.
 fn claude_dirs(env: &Env) -> Vec<PathBuf> {
+    let profiles: Vec<_> = env
+        .profiles
+        .iter()
+        .filter(|p| p.client_type == "claude-code")
+        .map(|p| p.folder.clone())
+        .collect();
+    if !profiles.is_empty() {
+        return profiles;
+    }
     if env.claude_profiles.is_empty() {
         vec![env.claude.clone()]
     } else {
@@ -1651,6 +1784,9 @@ pub struct Inventory {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Agent {
+    /// This exact client instance has Toolport configured, independent of other profiles.
+    #[serde(default)]
+    pub connected: bool,
     pub id: String,
     pub name: String,
     /// False for clients without file-based skills.
@@ -3392,7 +3528,7 @@ pub fn scan(env: &Env, present: &dyn Fn(&str) -> bool, project: Option<&Path>) -
     let mut agents = Vec::new();
     // skill key -> record
     let mut skills: BTreeMap<String, Skill> = BTreeMap::new();
-    let mut stale_codex: Vec<String> = Vec::new();
+    let mut stale_codex: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
 
     for inst in &instances {
         let (def, env) = (&inst.def, &inst.env);
@@ -3430,6 +3566,7 @@ pub fn scan(env: &Env, present: &dyn Fn(&str) -> bool, project: Option<&Path>) -
             }
         }
         agents.push(Agent {
+            connected: env.connected_agents.contains(&inst.id),
             id: inst.id.clone(),
             name: inst.name.clone(),
             supports_skills: true,
@@ -3456,8 +3593,12 @@ pub fn scan(env: &Env, present: &dyn Fn(&str) -> bool, project: Option<&Path>) -
         if def.id == "openhands" {
             disabled.off_paths.extend(openhands_disabled_paths(env));
         }
-        if def.switch == Switch::CodexConfig {
-            stale_codex = disabled.stale_paths.clone();
+        if def.switch == Switch::CodexConfig && !disabled.stale_paths.is_empty() {
+            stale_codex.push((
+                inst.id.clone(),
+                codex_config_path(env),
+                disabled.stale_paths.clone(),
+            ));
         }
 
         let openclaw_trusted = if def.id == "openclaw" {
@@ -3766,6 +3907,7 @@ pub fn scan(env: &Env, present: &dyn Fn(&str) -> bool, project: Option<&Path>) -
     for (id, name) in NO_SKILLS {
         if present(id) {
             agents.push(Agent {
+                connected: env.connected_agents.contains(*id),
                 id: (*id).into(),
                 name: (*name).into(),
                 supports_skills: false,
@@ -4409,7 +4551,7 @@ fn find_issues(
     agents: &[Agent],
     skills: &[Skill],
     rules: &[RuleFile],
-    stale_codex: &[String],
+    stale_codex: &[(String, PathBuf, Vec<String>)],
 ) -> Vec<Issue> {
     let mut issues = Vec::new();
     let toggles: BTreeSet<&str> = agents
@@ -4581,28 +4723,32 @@ fn find_issues(
         ));
     }
 
-    if !stale_codex.is_empty() {
+    for (agent, config, stale_paths) in stale_codex {
         let paths = list_names(
-            &stale_codex
+            &stale_paths
                 .iter()
                 .map(|p| env.display(Path::new(p)))
                 .collect::<Vec<_>>(),
         );
-        let file = env.display(&codex_config_path(env));
+        let file = env.display(config);
+        let id = agent
+            .strip_prefix("codex@")
+            .map(|key| format!("codex-stale@{key}"))
+            .unwrap_or_else(|| "codex-stale".into());
         issues.push(issue(
-            "codex-stale",
+            &id,
             "info",
             tr("Codex turns off a skill that isn't there"),
             trf(
                 "{paths} in {file} points at nothing.",
                 &[("paths", &paths), ("file", &file)],
             ),
-            vec!["codex".into()],
+            vec![agent.clone()],
             Vec::new(),
             Some(tr("Remove entry")),
         ));
         if let Some(found) = issues.last_mut() {
-            found.subject = stale_codex.to_vec();
+            found.subject = stale_paths.clone();
         }
     }
 
@@ -5330,8 +5476,12 @@ pub fn apply_fix(
             }
             Ok(done)
         }
-        "codex-stale" => {
-            let path = codex_config_path(env);
+        id if id == "codex-stale" || id.starts_with("codex-stale@") => {
+            let inst = instances(env, &|_| true)
+                .into_iter()
+                .find(|i| i.def.switch == Switch::CodexConfig && issue.agents.contains(&i.id))
+                .ok_or_else(|| tr("Unknown client"))?;
+            let path = codex_config_path(&inst.env);
             let text = read_existing(&path)?;
             let mut doc: toml_edit::DocumentMut = text
                 .parse()
@@ -5354,7 +5504,7 @@ pub fn apply_fix(
                 removed = before - arr.len();
             }
             if removed > 0 {
-                writer.backup("codex", &path)?;
+                writer.backup(&inst.id, &path)?;
                 writer.write(&path, &doc.to_string())?;
             }
             Ok(removed)
@@ -5895,24 +6045,23 @@ pub fn allowed_path(inventory: &Inventory, path: &str) -> bool {
 // Production entry points
 // ---------------------------------------------------------------------------------------------
 
-fn present_clients() -> impl Fn(&str) -> bool {
-    let present: BTreeSet<String> = crate::clients::detect_clients()
-        .into_iter()
-        .filter(|c| c.app_present || c.config_exists)
-        .map(|c| c.id)
-        .collect();
-    move |id: &str| present.contains(id)
-}
-
 pub fn inventory(project: Option<&str>) -> Result<Inventory, String> {
     let env = Env::current().ok_or_else(|| tr("Couldn't find your home folder"))?;
+    Ok(inventory_in(&env, project))
+}
+
+fn inventory_in(env: &Env, project: Option<&str>) -> Inventory {
     let project = project.map(PathBuf::from).filter(|p| p.is_dir());
-    let mut inv = scan(&env, &present_clients(), project.as_deref());
+    let mut inv = scan(
+        env,
+        &|id| env.detected_agents.contains(id),
+        project.as_deref(),
+    );
     let dismissed = read_dismissed();
     for issue in &mut inv.issues {
         issue.dismissed = dismissed.contains(&issue.fingerprint);
     }
-    Ok(inv)
+    inv
 }
 
 /// Toolport's own settings file for this page, in its data folder.
@@ -5956,7 +6105,7 @@ pub fn dismiss_issue(
 pub fn remove_skill(key: &str, project: Option<&str>) -> Result<Removed, String> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let env = Env::current().ok_or_else(|| tr("Couldn't find your home folder"))?;
-    let inv = inventory(project)?;
+    let inv = inventory_in(&env, project);
     let (trashed, links) = remove_skill_files(&env, &inv, key, &DiskWriter)?;
     Ok(Removed {
         trashed: trashed.map(|path| env.display(&path)),
@@ -5977,7 +6126,7 @@ pub fn set_skill_state(
 ) -> Result<Inventory, String> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let env = Env::current().ok_or_else(|| tr("Couldn't find your home folder"))?;
-    let inv = inventory(project)?;
+    let inv = inventory_in(&env, project);
     set_state(&env, &inv, agent, key, wanted, &DiskWriter)?;
     inventory(project)
 }
@@ -5991,7 +6140,7 @@ pub fn fix_issue(
 ) -> Result<Inventory, String> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let env = Env::current().ok_or_else(|| tr("Couldn't find your home folder"))?;
-    let inv = inventory(project)?;
+    let inv = inventory_in(&env, project);
     still_as_seen(&inv, issue_id, fingerprint)?;
     apply_fix(&env, &inv, issue_id, &DiskWriter)?;
     inventory(project)
@@ -6021,8 +6170,8 @@ fn opens_as_text(path: &Path) -> bool {
 
 /// A validated inventory path, and whether to show its folder instead of opening it.
 fn open_target(path: &str, reveal: bool, project: Option<&str>) -> Result<PathBuf, String> {
-    let inv = inventory(project)?;
     let env = Env::current().ok_or_else(|| tr("Couldn't find your home folder"))?;
+    let inv = inventory_in(&env, project);
     let target = expand(&env, path);
     if !allowed_path(&inv, &target.to_string_lossy()) {
         return Err(tr("Toolport only opens skill and rules files it found."));

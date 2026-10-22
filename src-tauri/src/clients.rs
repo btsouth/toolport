@@ -4169,6 +4169,15 @@ pub fn detect_clients() -> Vec<DetectedClient> {
     clients
 }
 
+/// Skills needs every detected profile even before Clients has been opened. Keep
+/// this scan read-only: the display path can adopt gateways and remember locations.
+pub(crate) fn detect_clients_for_skills() -> Vec<DetectedClient> {
+    let mut clients: Vec<_> = machine_defs(true).iter().map(read_client).collect();
+    append_client_scan_errors(&mut clients);
+    claude_profiles::annotate(&mut clients);
+    clients
+}
+
 fn config_error_row(id: &str, name: &str, path: String, error: String) -> DetectedClient {
     DetectedClient {
         id: id.into(),

@@ -5,14 +5,15 @@ import { readFileSync } from "node:fs";
 import process from "node:process";
 import console from "node:console";
 import { pathToFileURL } from "node:url";
-import { parse, stringify } from "yaml";
+import { parse, parseDocument } from "yaml";
 
 export function releaseInstaller(release, tag, repo) {
   if (
     !/^v\d+\.\d+\.\d+$/.test(tag) ||
     release.tag_name !== tag ||
     release.draft ||
-    release.prerelease
+    release.prerelease ||
+    !/^\d{4}-\d{2}-\d{2}T/.test(release.published_at ?? "")
   )
     throw new Error("Only a published stable release can go to winget");
   const version = tag.slice(1);
@@ -25,30 +26,40 @@ export function releaseInstaller(release, tag, repo) {
     !/^sha256:[a-f0-9]{64}$/i.test(assets[0].digest ?? "")
   )
     throw new Error("Release installer URL or SHA256 is missing or ambiguous");
-  return { version, url, sha256: assets[0].digest.slice(7).toUpperCase() };
+  return {
+    version,
+    url,
+    sha256: assets[0].digest.slice(7).toUpperCase(),
+    releaseDate: release.published_at.slice(0, 10),
+  };
 }
 
 export function manifests(templates, installer, bytes) {
   if (createHash("sha256").update(bytes).digest("hex").toUpperCase() !== installer.sha256)
     throw new Error("Downloaded installer does not match release SHA256");
   return templates.map(({ name, content }) => {
-    const doc = parse(content);
-    if (doc.PackageIdentifier !== "Toolport.Toolport")
+    // Edit the parsed document rather than re-serializing plain data, so the
+    // schema header, comments and block scalars keep the template's layout.
+    const doc = parseDocument(content);
+    if (doc.get("PackageIdentifier") !== "Toolport.Toolport")
       throw new Error("Wrong package identifier");
-    doc.PackageVersion = installer.version;
-    if (doc.ManifestType === "installer") {
-      delete doc.ReleaseDate;
-      doc.Installers = [
+    doc.set("PackageVersion", installer.version);
+    if (doc.get("ManifestType") === "installer") {
+      doc.set("ReleaseDate", installer.releaseDate);
+      doc.set("Installers", [
         {
           Architecture: "x64",
           InstallerUrl: installer.url,
           InstallerSha256: installer.sha256,
         },
-      ];
+      ]);
     }
-    if (doc.ManifestType === "defaultLocale")
-      doc.ReleaseNotesUrl = installer.url.replace(/\/download\/([^/]+)\/.*$/, "/tag/$1");
-    return { name, content: stringify(doc) };
+    if (doc.get("ManifestType") === "defaultLocale")
+      doc.set(
+        "ReleaseNotesUrl",
+        installer.url.replace(/\/download\/([^/]+)\/.*$/, "/tag/$1"),
+      );
+    return { name, content: doc.toString({ lineWidth: 0 }) };
   });
 }
 

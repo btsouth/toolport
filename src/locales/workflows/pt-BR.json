@@ -371,7 +371,7 @@
   "no rules files": "nenhum arquivo de regras",
   "skips @import {path}": "ignora @import {path}",
   "{client} now lists {skill} by name only": "O {client} agora lista {skill} só pelo nome",
-  "{client}: folders from its docs, not checked on this machine": "{client}: pastas pela documentação, não verificadas nesta máquina",
+  "folders from its docs, not checked on this machine": "pastas pela documentação, não verificadas nesta máquina",
   "{count} broken": "{count} quebradas",
   "{count} name only": "{count} só o nome",
   "{count} of {cap} characters": "{count} de {cap} caracteres",
@@ -406,5 +406,6 @@
   "No switch Toolport can write": "Sem chave que o Toolport possa gravar",
   "Filter by agent": "Filtrar por agente",
   "All agents": "Todos os agentes",
+  "All detected agents": "Todos os agentes detectados",
   "{state} via {path}": "{state} via {path}"
 }

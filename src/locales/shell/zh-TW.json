@@ -19,6 +19,7 @@
   "{value1} servers need a quick check": "{value1} 個伺服器需要快速檢查",
   "{value1} team servers still need review in Teams.": "{value1} 團隊伺服器仍需要在 Teams 中進行審核。",
   "{value1} tools": "{value1} 工具",
+  "1 tool": "1 工具",
   "/path/to/project": "/path/to/project",
   "→": "→",
   "1 app is still launching an old gateway": "1 個應用程式仍在啟動舊閘道",

@@ -371,7 +371,7 @@
   "no rules files": "ルールファイルなし",
   "skips @import {path}": "@import {path} を読み飛ばします",
   "{client} now lists {skill} by name only": "{client} は {skill} を名前のみで表示するようになりました",
-  "{client}: folders from its docs, not checked on this machine": "{client}: フォルダーはドキュメントに基づくもので、このマシンでは未確認です",
+  "folders from its docs, not checked on this machine": "フォルダーはドキュメントに基づくもので、このマシンでは未確認です",
   "{count} broken": "{count}件が壊れています",
   "{count} name only": "名前のみ {count}",
   "{count} of {cap} characters": "{cap} 文字中 {count} 文字",
@@ -406,5 +406,6 @@
   "No switch Toolport can write": "Toolport で変更できるスイッチはありません",
   "Filter by agent": "エージェントで絞り込む",
   "All agents": "すべてのエージェント",
+  "All detected agents": "検出されたすべてのエージェント",
   "{state} via {path}": "{path} 経由で{state}"
 }

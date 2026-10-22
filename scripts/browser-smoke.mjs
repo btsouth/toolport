@@ -813,6 +813,22 @@ try {
       path: path.join(output, `skills-column-focus-${width}.png`),
     });
   }
+  // With many agents the detail pane moves under the list, and in a narrower window each name
+  // moves above its dots, so no width cuts a name short.
+  await page.goto(`${baseURL}/fixtures/?many-agents`);
+  await page.getByRole("button", { name: "Skills", exact: true }).click();
+  for (const width of [960, 1100, 1330, 1600]) {
+    await page.setViewportSize({ width, height: 900 });
+    const name = page
+      .getByRole("region", { name: "Skills", exact: true })
+      .getByText("release-notes", { exact: true });
+    await expect
+      .poll(() =>
+        name.evaluate((el) => el.clientWidth > 0 && el.scrollWidth <= el.clientWidth),
+      )
+      .toBe(true);
+    await page.screenshot({ path: path.join(output, `skills-many-agents-${width}.png`) });
+  }
   await page.setViewportSize({ width: 1240, height: 900 });
   await page.goto(`${baseURL}/fixtures/?logos`);
   await expect(page.getByText("Dark logo fixture")).toBeVisible();

@@ -25,6 +25,7 @@ const release = {
   tag_name: tag,
   draft: false,
   prerelease: false,
+  published_at: "2026-10-21T04:16:20Z",
   assets: [{ name: "Toolport_2.0.0_x64-setup.exe", browser_download_url: url, digest }],
 };
 const installer = releaseInstaller(release, tag, "btsouth/toolport");
@@ -65,6 +66,7 @@ test("manifest versions, URLs and SHA256 come from the published release", () =>
     { draft: true },
     { prerelease: true },
     { tag_name: "v2.0.1" },
+    { published_at: null },
     { assets: [] },
     { assets: [{ ...release.assets[0], digest: null }] },
     { assets: [{ ...release.assets[0], browser_download_url: url + "wrong" }] },
@@ -73,6 +75,21 @@ test("manifest versions, URLs and SHA256 come from the published release", () =>
       releaseInstaller({ ...release, ...change }, tag, "btsouth/toolport"),
     );
   assert.throws(() => releaseInstaller(release, "v2.0.0-preview.1", "btsouth/toolport"));
+});
+
+test("manifests keep the schema header and template layout winget-pkgs requires", () => {
+  const files = manifests(templates, installer, bytes);
+  for (const [i, file] of files.entries()) {
+    assert.equal(file.content.split("\n")[0], templates[i].content.split("\n")[0]);
+    assert.match(file.content, /^# yaml-language-server: \$schema=https:\/\/aka\.ms\//);
+  }
+  assert.equal(parse(files[1].content).ReleaseDate, "2026-10-21");
+  assert.match(files[1].content, /^ReleaseDate: 2026-10-21$/m);
+  assert.match(files[2].content, /^Description: \|-$/m);
+  assert.equal(
+    parse(files[2].content).Description,
+    parse(templates[2].content).Description,
+  );
 });
 
 test("stale fork is synced before branching, failed PR creation retries the same branch", async () => {

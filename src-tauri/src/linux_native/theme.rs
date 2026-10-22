@@ -1359,6 +1359,7 @@ button.toolport-skill-tab:checked {{
   border-bottom: 1px solid @toolport_border;
   padding: 0 8px 6px 8px;
 }}
+.toolport-skill-hint {{ padding: 0 8px 6px 8px; min-height: 16px; }}
 .toolport-skill-head button.toolport-skill-col {{
   padding: 2px 0;
   margin: 0;
@@ -1387,6 +1388,7 @@ list.toolport-skill-list > row:selected {{ background-color: alpha(@toolport_acc
 list.toolport-skill-list > row.toolport-skill-group-row:hover {{ background: none; }}
 .toolport-skill-row {{ padding: 0 8px; }}
 .toolport-skill-row-copy {{ padding: 12px 0; }}
+.toolport-skill-row-stacked {{ padding: 10px 8px 8px 8px; }}
 .toolport-skill-col-name {{ font-size: 12px; }}
 .toolport-skill-col-hl {{ background-color: alpha(@toolport_accent, 0.08); }}
 .toolport-chip-dot {{ min-width: 8px; min-height: 8px; border-radius: 999px; background-color: currentColor; }}
@@ -1444,11 +1446,15 @@ list.toolport-skill-list > row.toolport-skill-group-row:hover {{ background: non
   border-radius: 12px;
   background-color: @toolport_card;
 }}
+.toolport-skill-detail > .toolport-section-label {{ margin-top: 16px; }}
+.toolport-skill-description {{ line-height: 1.5; }}
 .toolport-skill-agent {{
-  padding: 10px 12px;
+  padding: 12px 16px;
   border-bottom: 1px solid @toolport_border;
 }}
 .toolport-skill-agent:last-child {{ border-bottom: none; }}
+/* No taller than the switch beside it, so every agent card is one height. */
+menubutton.toolport-row-more > button {{ min-height: 26px; min-width: 26px; padding: 0; }}
 .toolport-skill-logo {{
   min-width: 28px;
   min-height: 28px;

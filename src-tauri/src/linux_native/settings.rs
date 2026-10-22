@@ -338,7 +338,7 @@ impl SettingsPage {
             ),
         ));
 
-        let access_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let access_list = gtk::Box::new(gtk::Orientation::Vertical, 12);
         let folder_button = l10n::button("Add folder mapping");
         folder_button.add_css_class("toolport-secondary-action");
         folder_button.set_valign(gtk::Align::Center);
@@ -347,16 +347,17 @@ impl SettingsPage {
             msg("Automatically use the matching access set when an MCP client reports a project root. The longest matching folder wins."),
             &folder_button,
         );
-        let folder_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        folder_list.add_css_class("toolport-settings-group");
+        // Framed like the access set cards above it.
+        let folder_list = access_group();
         folder_list.append(&source_label(
             msg("Checking folder mappings…"),
             source_label(
                 msg("Checking folder mappings…"),
                 gtk::Label::builder()
                     .label(tr("Checking folder mappings…"))
-                    .halign(gtk::Align::Start)
-                    .css_classes(["toolport-muted"])
+                    .halign(gtk::Align::Fill)
+                    .xalign(0.0)
+                    .css_classes(["toolport-muted", "toolport-setting-row"])
                     .build(),
             ),
         ));
@@ -562,8 +563,7 @@ impl SettingsPage {
             msg("Each gets its own bearer token and server scope, so one endpoint can serve several clients."),
             &add_http_client,
         );
-        let http_client_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        http_client_list.add_css_class("toolport-settings-group");
+        let http_client_list = access_group();
         http_client_list.append(&source_label(
             msg("Start the endpoint to manage scoped clients."),
             source_label(
@@ -574,7 +574,7 @@ impl SettingsPage {
                     .xalign(0.0)
                     .wrap(true)
                     .hexpand(true)
-                    .css_classes(["toolport-muted"])
+                    .css_classes(["toolport-muted", "toolport-setting-row"])
                     .build(),
             ),
         ));
@@ -830,7 +830,7 @@ l10n::bind_dialog_heading(&error_dialog, msg("Could not start data removal"));
         for (index, section) in pages.iter().enumerate() {
             section.set_visible(index == 0);
         }
-        scroller.set_child(Some(&super::form_column(&page)));
+        scroller.set_child(Some(&page));
         root.append(&scroller);
         let settings_page = Self {
             stop_stale: stop_stale.clone(),
@@ -1131,25 +1131,39 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
         while let Some(child) = self.access_list.first_child() {
             self.access_list.remove(&child);
         }
-        self.access_list.append(&settings_heading(msg("Access sets"), msg("Narrow enabled servers and tools per client. Servers that are off are hidden everywhere.")));
-        self.access_list.append(&source_label(
-            msg("Default access"),
-            source_label(
-                msg("Default access"),
-                gtk::Label::builder()
-                    .label(tr("Default access"))
-                    .halign(gtk::Align::Start)
-                    .css_classes(["heading"])
-                    .build(),
-            ),
+        // Creating a set is the section's action, beside its heading like Add folder mapping.
+        let creator = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        creator.set_valign(gtk::Align::Center);
+        let name = gtk::Entry::builder()
+            .placeholder_text(tr("Access set name"))
+            .width_chars(22)
+            .build();
+        l10n::bind_placeholder(&name, msg("Access set name"));
+        let add = l10n::button("Create access set");
+        let page = self.clone();
+        let entry = name.clone();
+        let create = move || {
+            let name = entry.text().to_string();
+            page.mutate_access(move || crate::registry_controller::create_profile(&name));
+        };
+        let on_click = create.clone();
+        add.connect_clicked(move |_| on_click());
+        name.connect_activate(move |_| create());
+        creator.append(&name);
+        creator.append(&add);
+        self.access_list.append(&settings_heading_with_action(
+            msg("Access sets"),
+            msg("Narrow enabled servers and tools per client. Servers that are off are hidden everywhere."),
+            &creator,
         ));
+
+        let defaults = access_group();
         let mut labels = vec![tr("All enabled servers")];
         labels.extend(registry.profiles.iter().map(|p| p.name.clone()));
         let default =
             gtk::DropDown::from_strings(&labels.iter().map(String::as_str).collect::<Vec<_>>());
-        default.set_tooltip_text(Some(&tr(
-            "Default access for clients without an explicit access set",
-        )));
+        default.set_valign(gtk::Align::Center);
+        default.update_property(&[gtk::accessible::Property::Label(&tr("Default access"))]);
         default.set_selected(
             registry
                 .profiles
@@ -1173,88 +1187,89 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
                 crate::registry_controller::set_default_access(profile.as_deref())
             });
         });
-        self.access_list.append(&default);
+        let row = access_text_row(
+            msg("Default access"),
+            msg("Default access for clients without an explicit access set"),
+        );
+        row.append(&default);
+        defaults.append(&row);
         if registry.default_access_legacy_policy && registry.default_access_profile_id.is_none() {
-            let clear =
-                l10n::button("Use All enabled servers without the retained tool restrictions");
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+            row.add_css_class("toolport-setting-row");
+            let notice = msg(
+                "The upgrade retained the default access set's tool restrictions and instructions.",
+            );
+            row.append(&source_label(
+                notice,
+                gtk::Label::builder()
+                    .label(lookup(notice))
+                    .xalign(0.0)
+                    .wrap(true)
+                    .hexpand(true)
+                    .css_classes(["toolport-muted"])
+                    .build(),
+            ));
+            let clear = l10n::button("Use All enabled servers");
+            clear.set_valign(gtk::Align::Center);
             let page = self.clone();
             clear.connect_clicked(move |_| {
                 page.mutate_access(|| crate::registry_controller::set_default_access(None))
             });
-            self.access_list.append(&clear);
+            row.append(&clear);
+            defaults.append(&row);
         }
+        self.access_list.append(&defaults);
 
-        let creator = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let name = gtk::Entry::builder()
-            .placeholder_text(tr("Access set name"))
-            .hexpand(true)
-            .build();
-        l10n::bind_placeholder(&name, msg("Access set name"));
-        let add = l10n::button("Create access set");
-        let page = self.clone();
-        let entry = name.clone();
-        add.connect_clicked(move |_| {
-            let name = entry.text().to_string();
-            page.mutate_access(move || crate::registry_controller::create_profile(&name));
-        });
-        creator.append(&name);
-        creator.append(&add);
-        self.access_list.append(&creator);
+        let servers: Vec<_> = registry
+            .servers
+            .iter()
+            .filter(|s| !crate::clients::is_gateway_server(s))
+            .collect();
         for profile in &registry.profiles {
-            let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
-            content.append(
+            let card = access_group();
+            let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            head.add_css_class("toolport-setting-row");
+            head.append(
                 &gtk::Label::builder()
                     .label(&profile.name)
                     .xalign(0.0)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
                     .css_classes(["heading"])
                     .build(),
             );
-            for server in registry
-                .servers
-                .iter()
-                .filter(|s| !crate::clients::is_gateway_server(s))
-            {
-                let included = gtk::CheckButton::with_label(&format!(
-                    "{}{}",
-                    server.name,
-                    if server.enabled {
-                        String::new()
-                    } else {
-                        tr(" (off)")
-                    }
-                ));
-                included.set_active(profile.enabled_server_ids.contains(&server.id));
-                let (pid, sid, page) = (profile.id.clone(), server.id.clone(), self.clone());
-                included.connect_toggled(move |button| {
-                    let (pid, sid, included) = (pid.clone(), sid.clone(), button.is_active());
-                    page.mutate_access(move || {
-                        crate::registry_controller::set_access_server(&pid, &sid, included)
-                    });
-                });
-                content.append(&included);
-                if profile.enabled_server_ids.contains(&server.id) {
-                    let tools = gtk::Button::with_label(&trf(
-                        "Choose tools for {value1}",
-                        &[("value1", &(server.name).to_string())],
-                    ));
-                    let (server, pid, scope, page) = (
-                        server.clone(),
-                        profile.id.clone(),
-                        profile.tool_scope.get(&server.id).cloned(),
-                        self.clone(),
-                    );
-                    tools.connect_clicked(move |_| {
-                        open_access_tool_scope(
-                            server.clone(),
-                            pid.clone(),
-                            scope.clone(),
-                            page.clone(),
-                        )
-                    });
-                    content.append(&tools);
-                }
+            if Some(&profile.id) == registry.default_access_profile_id.as_ref() {
+                head.append(
+                    &gtk::Label::builder()
+                        .label(tr("default"))
+                        .valign(gtk::Align::Center)
+                        .css_classes(["toolport-badge", "caption", "info"])
+                        .build(),
+                );
             }
-            let delete = l10n::button("Delete access set");
+            let count = servers
+                .iter()
+                .filter(|s| profile.enabled_server_ids.contains(&s.id))
+                .count();
+            head.append(
+                &gtk::Label::builder()
+                    .label(format!(
+                        "{count} {}",
+                        if count == 1 {
+                            tr("server")
+                        } else {
+                            tr("servers")
+                        }
+                    ))
+                    .hexpand(true)
+                    .xalign(0.0)
+                    .css_classes(["toolport-muted", "caption"])
+                    .build(),
+            );
+            let delete = gtk::Button::from_icon_name("user-trash-symbolic");
+            delete.add_css_class("flat");
+            delete.set_valign(gtk::Align::Center);
+            delete.set_tooltip_text(Some(&tr("Delete access set")));
+            delete.update_property(&[gtk::accessible::Property::Label(&tr("Delete access set"))]);
             delete.set_sensitive(
                 registry.profiles.len() > 1
                     && Some(&profile.id) != registry.default_access_profile_id.as_ref()
@@ -1265,8 +1280,86 @@ l10n::bind_dialog_body(&dialog, msg("Unchanged configs return to their original 
                 let pid = pid.clone();
                 page.mutate_access(move || crate::registry_controller::delete_profile(&pid));
             });
-            content.append(&delete);
-            self.access_list.append(&content);
+            head.append(&delete);
+            card.append(&head);
+            for server in &servers {
+                let included = profile.enabled_server_ids.contains(&server.id);
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                row.add_css_class("toolport-setting-row");
+                row.append(&super::branding::server_logo(
+                    &server.name,
+                    &server.transport,
+                ));
+                row.append(
+                    &gtk::Label::builder()
+                        .label(&server.name)
+                        .xalign(0.0)
+                        .ellipsize(gtk::pango::EllipsizeMode::End)
+                        .tooltip_text(&server.name)
+                        .build(),
+                );
+                if !server.enabled {
+                    row.append(
+                        &gtk::Label::builder()
+                            .label(tr("Off"))
+                            .valign(gtk::Align::Center)
+                            .css_classes(["toolport-badge", "caption", "off"])
+                            .build(),
+                    );
+                }
+                let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                spacer.set_hexpand(true);
+                row.append(&spacer);
+                if included {
+                    let scope = profile.tool_scope.get(&server.id).cloned();
+                    let tools = gtk::Button::builder()
+                        .valign(gtk::Align::Center)
+                        .css_classes(["flat"])
+                        .build();
+                    let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+                    let label = gtk::Label::new(Some(&match &scope {
+                        Some(list) if list.len() == 1 => tr("1 tool"),
+                        Some(list) => trf("{value1} tools", &[("value1", &list.len().to_string())]),
+                        None => tr("all tools"),
+                    }));
+                    if scope.is_some() {
+                        label.add_css_class("accent");
+                    } else {
+                        label.add_css_class("toolport-muted");
+                    }
+                    content.append(&label);
+                    content.append(&gtk::Image::from_icon_name("pan-end-symbolic"));
+                    tools.set_child(Some(&content));
+                    let choose = trf("Choose tools for {value1}", &[("value1", &server.name)]);
+                    tools.set_tooltip_text(Some(&choose));
+                    tools.update_property(&[gtk::accessible::Property::Label(&choose)]);
+                    let (server, pid, page) = ((*server).clone(), profile.id.clone(), self.clone());
+                    tools.connect_clicked(move |_| {
+                        open_access_tool_scope(
+                            server.clone(),
+                            pid.clone(),
+                            scope.clone(),
+                            page.clone(),
+                        )
+                    });
+                    row.append(&tools);
+                }
+                let switch = gtk::Switch::builder()
+                    .active(included)
+                    .valign(gtk::Align::Center)
+                    .build();
+                switch.update_property(&[gtk::accessible::Property::Label(&server.name)]);
+                let (pid, sid, page) = (profile.id.clone(), server.id.clone(), self.clone());
+                switch.connect_active_notify(move |switch| {
+                    let (pid, sid, included) = (pid.clone(), sid.clone(), switch.is_active());
+                    page.mutate_access(move || {
+                        crate::registry_controller::set_access_server(&pid, &sid, included)
+                    });
+                });
+                row.append(&switch);
+                card.append(&row);
+            }
+            self.access_list.append(&card);
         }
     }
 
@@ -3174,6 +3267,36 @@ fn settings_heading_with_action(
     row
 }
 
+/// A framed group of access rows: the default, or one access set and its servers.
+fn access_group() -> gtk::Box {
+    let group = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    group.add_css_class("toolport-settings-group");
+    group.add_css_class("toolport-switch-group");
+    group
+}
+
+/// A row with a title and one line under it, following the UI language; the caller appends
+/// the control.
+fn access_text_row(title: &'static str, detail: &'static str) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.add_css_class("toolport-setting-row");
+    let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    copy.set_hexpand(true);
+    for (text, class) in [(title, "heading"), (detail, "toolport-muted")] {
+        copy.append(&source_label(
+            text,
+            gtk::Label::builder()
+                .label(lookup(text))
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes([class])
+                .build(),
+        ));
+    }
+    row.append(&copy);
+    row
+}
+
 /// A top-level group of the page: a larger title, one line saying what is in it,
 /// and the box its rows go into.
 fn settings_section(page: &gtk::Box, title: &'static str, summary: &'static str) -> gtk::Box {
@@ -3512,6 +3635,80 @@ mod tests {
             loop_.run();
         }
         window.close();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn access_sets_are_cards_of_server_switches() {
+        let _data = crate::registry::DataDirTestEnv::new("access-set-cards");
+        crate::registry::save(&crate::registry::Registry::default()).unwrap();
+        adw::init().unwrap();
+        crate::i18n::set_language("en").unwrap();
+        let page = SettingsPage::new(
+            super::super::http_bridge::BridgeController::default(),
+            crate::approval_broker::start_native(),
+        );
+        let registry: crate::registry::Registry = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "servers": [
+                {"id": "github", "name": "GitHub", "transport": "stdio", "enabled": true},
+                {"id": "stripe", "name": "Stripe", "transport": "stdio", "enabled": true},
+                {"id": "linear", "name": "Linear", "transport": "stdio", "enabled": false}
+            ],
+            "profiles": [
+                {"id": "work", "name": "Work", "enabledServerIds": ["github", "stripe"],
+                 "toolScope": {"stripe": ["list_customers"]}},
+                {"id": "empty", "name": "Empty", "enabledServerIds": []}
+            ]
+        }))
+        .unwrap();
+        page.render_access_sets(registry);
+        fn walk(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+            out.push(widget.clone());
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                walk(&c, out);
+                child = c.next_sibling();
+            }
+        }
+        let mut widgets = Vec::new();
+        walk(page.access_list.upcast_ref(), &mut widgets);
+        // One switch per server in each set, no checkboxes.
+        let switches: Vec<gtk::Switch> = widgets
+            .iter()
+            .filter_map(|w| w.clone().downcast().ok())
+            .collect();
+        assert_eq!(switches.len(), 6);
+        assert_eq!(switches.iter().filter(|s| s.is_active()).count(), 2);
+        assert!(!widgets.iter().any(|w| w.is::<gtk::CheckButton>()));
+        // Only servers in a set get a tools button, and a narrowed one says how many.
+        let tools: Vec<String> = widgets
+            .iter()
+            .filter_map(|w| w.tooltip_text())
+            .filter(|t| t.starts_with("Choose tools for"))
+            .map(|t| t.to_string())
+            .collect();
+        assert_eq!(
+            tools,
+            ["Choose tools for GitHub", "Choose tools for Stripe"]
+        );
+        let labels: Vec<String> = widgets
+            .iter()
+            .filter_map(|w| w.clone().downcast::<gtk::Label>().ok())
+            .map(|l| l.label().to_string())
+            .collect();
+        assert!(
+            labels.contains(&"1 tool".to_string()) && labels.contains(&"all tools".to_string())
+        );
+        assert!(
+            labels.contains(&"2 servers".to_string()) && labels.contains(&"0 servers".to_string())
+        );
+        // Each set and the default sit in their own framed group.
+        let groups = widgets
+            .iter()
+            .filter(|w| w.has_css_class("toolport-switch-group"))
+            .count();
+        assert_eq!(groups, 3);
     }
 
     #[test]

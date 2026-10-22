@@ -112,7 +112,7 @@ impl TeamsPage {
         page.append(&errors);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         page.append(&content);
-        scroller.set_child(Some(&super::form_column(&page)));
+        scroller.set_child(Some(&page));
         root.append(&scroller);
         let page = Self {
             root,

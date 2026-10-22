@@ -853,6 +853,8 @@ export interface SkillAgentRoot {
 }
 
 export interface SkillAgent {
+  /** This exact profile is connected to Toolport. */
+  connected: boolean;
   id: string;
   name: string;
   supportsSkills: boolean;
