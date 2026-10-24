@@ -6,6 +6,27 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.3.1] - Unreleased
+
+Toolport 2.3.1 keeps every tool visible in Grok Build, shows fewer false
+tool-poisoning warnings, and stops a needless tool refresh when clients start.
+It also adds Keenable to the server catalog and updates TLS certificate checks.
+
+If you are on Toolport 1.24.x, this is also your update to Toolport 2. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+before updating.
+
+### Added
+
+- Keenable, a keyless hosted web search and page fetch server, is in the
+  catalog under Search & knowledge.
+
+### Security
+
+- Updated rustls-webpki and the bundled root certificates so Toolport no longer
+  trusts the distrusted emSign roots (RUSTSEC-2026-0381, RUSTSEC-2026-0382 and
+  RUSTSEC-2026-0383).
+
 ### Fixed
 
 - Fewer false tool-poisoning warnings. Persian and emoji text, the IEX exchange
