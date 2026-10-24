@@ -5212,7 +5212,13 @@ fn protocol_lane_cold_calls_wait_for_catalog_or_report_starting() {
         std::fs::write(&release, "go").unwrap();
         let result = client.call_tool("files__read_item", json!({}));
         if delay == 400 {
-            assert_eq!(text_of(&result), "read_item", "{result}");
+            // The elapsed time tells a spent catalog budget from a wait that ended early.
+            assert_eq!(
+                text_of(&result),
+                "read_item",
+                "{result} after {:?}",
+                started.elapsed()
+            );
             assert_ne!(result["isError"], true);
         } else {
             let text = protocol_lane_error(&result, "has not connected yet");
