@@ -2006,7 +2006,9 @@ impl Router {
                         .and_then(|exposed| self.route_of(exposed))
                         .map(|(_, original)| original)
                         // Sanitizing alone (`get-issue` shown as `get_issue`) keeps the verdict.
-                        .filter(|original| *original != shown && sanitize_segment(original) != shown)
+                        .filter(|original| {
+                            *original != shown && sanitize_segment(original) != shown
+                        })
                         .map(str::to_string);
                     match (definition, gate_name) {
                         (std::borrow::Cow::Borrowed(_), None) => Arc::clone(tool),

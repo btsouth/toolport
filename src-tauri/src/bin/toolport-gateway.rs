@@ -41033,10 +41033,16 @@ mod tests {
         let held = || effective_quarantine(&registry, profile, &AtomicBool::new(false));
 
         let before = vec![tidy(true), read("Read rows.")];
-        assert_eq!(maybe_check_integrity(&registry, &before, profile).unwrap(), None);
+        assert_eq!(
+            maybe_check_integrity(&registry, &before, profile).unwrap(),
+            None
+        );
         // Other drift still only notifies at Ask.
         let reworded = vec![tidy(true), read("Read rows quickly.")];
-        assert_eq!(maybe_check_integrity(&registry, &reworded, profile).unwrap(), None);
+        assert_eq!(
+            maybe_check_integrity(&registry, &reworded, profile).unwrap(),
+            None
+        );
         assert_eq!(held(), Some(BTreeSet::new()));
 
         let downgraded = vec![tidy(false), read("Read rows quickly.")];
@@ -41057,7 +41063,10 @@ mod tests {
             &integrity::quarantine_record_id(&record),
         )
         .unwrap();
-        assert_eq!(maybe_check_integrity(&registry, &downgraded, profile).unwrap(), None);
+        assert_eq!(
+            maybe_check_integrity(&registry, &downgraded, profile).unwrap(),
+            None
+        );
         assert_eq!(held(), Some(BTreeSet::new()));
 
         // Off never holds it.
@@ -41065,8 +41074,14 @@ mod tests {
         let mut reg = Registry::default();
         reg.set_safety_level(registry::SafetyLevel::Off);
         let registry = Arc::new(Mutex::new(reg));
-        assert_eq!(maybe_check_integrity(&registry, &before, off).unwrap(), None);
-        assert_eq!(maybe_check_integrity(&registry, &downgraded, off).unwrap(), None);
+        assert_eq!(
+            maybe_check_integrity(&registry, &before, off).unwrap(),
+            None
+        );
+        assert_eq!(
+            maybe_check_integrity(&registry, &downgraded, off).unwrap(),
+            None
+        );
         assert_eq!(
             effective_quarantine(&registry, off, &AtomicBool::new(false)),
             Some(BTreeSet::new())

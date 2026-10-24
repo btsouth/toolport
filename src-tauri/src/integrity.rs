@@ -10251,9 +10251,17 @@ mod tests {
             tool("db__tidy", "Tidy rows.", json!({"destructiveHint": true})),
             tool("db__sweep", "Sweep rows.", json!({"destructiveHint": true})),
             tool("db__delete_rows", "Delete rows.", json!({})),
-            tool("db__drop_table", "Drop a table.", json!({"destructiveHint": true})),
+            tool(
+                "db__drop_table",
+                "Drop a table.",
+                json!({"destructiveHint": true}),
+            ),
             tool("db__read", "Read rows.", json!({"readOnlyHint": true})),
-            tool("db__export", "Export rows.", json!({"destructiveHint": false})),
+            tool(
+                "db__export",
+                "Export rows.",
+                json!({"destructiveHint": false}),
+            ),
         ];
         assert!(check(profile, &before)
             .unwrap()
@@ -10264,11 +10272,23 @@ mod tests {
             // The hint flips, disappears, or overrides a write-named tool.
             tool("db__tidy", "Tidy rows.", json!({"destructiveHint": false})),
             tool("db__sweep", "Sweep rows.", json!({})),
-            tool("db__delete_rows", "Delete rows.", json!({"destructiveHint": false})),
+            tool(
+                "db__delete_rows",
+                "Delete rows.",
+                json!({"destructiveHint": false}),
+            ),
             // Still destructive, or never held: Ask keeps notifying only.
-            tool("db__drop_table", "Drop any table.", json!({"destructiveHint": true})),
+            tool(
+                "db__drop_table",
+                "Drop any table.",
+                json!({"destructiveHint": true}),
+            ),
             tool("db__read", "Read rows fast.", json!({"readOnlyHint": true})),
-            tool("db__export", "Export rows fast.", json!({"destructiveHint": false})),
+            tool(
+                "db__export",
+                "Export rows fast.",
+                json!({"destructiveHint": false}),
+            ),
         ];
         let events = check(profile, &after).unwrap();
         let held: BTreeSet<_> = events
