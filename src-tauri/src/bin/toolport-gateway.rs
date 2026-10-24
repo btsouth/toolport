@@ -10877,13 +10877,19 @@ fn maybe_check_integrity(
         ));
             eprintln!("toolport: SECURITY tool drift ({change}) {tool}");
         }
-        // Explicit reviews block at every level. Ordinary Ask drift still only notifies.
+        // Explicit reviews block at every level. Ask also holds a destructive tool
+        // that stopped declaring itself destructive, since its calls would otherwise
+        // skip approval. Other Ask drift still only notifies.
         let enforce_drift =
             quarantine_on || (blocking && integrity::baseline_tamper_detected(&events));
-        if enforce_drift || review_required {
+        let held = |event: &Value| {
+            event["review_required"] == true || (blocking && integrity::ask_holds(event))
+        };
+        let ask_hold = blocking && events.iter().any(integrity::ask_holds);
+        if enforce_drift || review_required || ask_hold {
             let required: Vec<_> = events
                 .iter()
-                .filter(|event| enforce_drift || event["review_required"] == true)
+                .filter(|event| enforce_drift || held(event))
                 .cloned()
                 .collect();
             let pending = integrity::quarantine_candidates(tools, &required);
@@ -10896,7 +10902,7 @@ fn maybe_check_integrity(
             if !enforce_drift {
                 let ordinary: Vec<_> = events
                     .iter()
-                    .filter(|event| event["review_required"] != true)
+                    .filter(|event| !held(event))
                     .cloned()
                     .collect();
                 integrity::accept_staged_pins(profile, tools, &ordinary)
@@ -41007,6 +41013,79 @@ mod tests {
             .iter()
             .any(|event| event["change"] == "tamper"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ask_holds_a_destructive_tool_that_stops_declaring_it_until_released() {
+        let _data = DataDirTestEnv::new("ask-gate-downgrade");
+        let profile = Some("ask-gate-downgrade");
+        let tidy = |hint: bool| {
+            json!({"name": "srv__tidy", "description": "Tidy rows.",
+                "inputSchema": {"type": "object"}, "annotations": {"destructiveHint": hint}})
+        };
+        let read = |description: &str| {
+            json!({"name": "srv__read", "description": description,
+                "inputSchema": {"type": "object"}})
+        };
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Ask);
+        let registry = Arc::new(Mutex::new(reg));
+        let held = || effective_quarantine(&registry, profile, &AtomicBool::new(false));
+
+        let before = vec![tidy(true), read("Read rows.")];
+        assert_eq!(
+            maybe_check_integrity(&registry, &before, profile).unwrap(),
+            None
+        );
+        // Other drift still only notifies at Ask.
+        let reworded = vec![tidy(true), read("Read rows quickly.")];
+        assert_eq!(
+            maybe_check_integrity(&registry, &reworded, profile).unwrap(),
+            None
+        );
+        assert_eq!(held(), Some(BTreeSet::new()));
+
+        let downgraded = vec![tidy(false), read("Read rows quickly.")];
+        assert_eq!(
+            maybe_check_integrity(&registry, &downgraded, profile).unwrap(),
+            Some(set_of(&["srv__tidy"]))
+        );
+        assert_eq!(held(), Some(set_of(&["srv__tidy"])));
+        // The pin has moved on, but the durable record keeps the tool held.
+        maybe_check_integrity(&registry, &downgraded, profile).unwrap();
+        assert_eq!(held(), Some(set_of(&["srv__tidy"])));
+
+        // Releasing it accepts the new definition.
+        let record = integrity::quarantine_list(profile).remove(0);
+        integrity::release_record(
+            profile,
+            "srv__tidy",
+            &integrity::quarantine_record_id(&record),
+        )
+        .unwrap();
+        assert_eq!(
+            maybe_check_integrity(&registry, &downgraded, profile).unwrap(),
+            None
+        );
+        assert_eq!(held(), Some(BTreeSet::new()));
+
+        // Off never holds it.
+        let off = Some("off-gate-downgrade");
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Off);
+        let registry = Arc::new(Mutex::new(reg));
+        assert_eq!(
+            maybe_check_integrity(&registry, &before, off).unwrap(),
+            None
+        );
+        assert_eq!(
+            maybe_check_integrity(&registry, &downgraded, off).unwrap(),
+            None
+        );
+        assert_eq!(
+            effective_quarantine(&registry, off, &AtomicBool::new(false)),
+            Some(BTreeSet::new())
+        );
     }
 
     #[test]
