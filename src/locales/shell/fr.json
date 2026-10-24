@@ -45,7 +45,7 @@
   "Ask pauses destructive calls for your approval. Strict also hides destructive tools, pauses risky tool changes, blocks high-confidence injection and asks before untrusted calls. Tool labeling and change history stay on at every level.": "Le niveau Demander suspend les appels destructeurs jusqu'à votre approbation. Le niveau Strict masque aussi les outils destructeurs, suspend les modifications risquées des outils, bloque les injections détectées avec un degré de confiance élevé et demande votre accord avant les appels non fiables. L'étiquetage des outils et l'historique des modifications restent actifs à tous les niveaux.",
   "auto-scope a client by the folder it opens in": "limiter automatiquement l'accès d'un client selon le dossier dans lequel il s'ouvre",
   "Back to clients": "Retour aux clients",
-  "blocked in Strict until you re-approve": "bloqué au niveau Strict jusqu'à votre nouvelle approbation",
+  "kept until you re-approve": "conservé jusqu'à votre nouvelle approbation",
   "Browse": "Parcourir",
   "Browse catalog": "Parcourir le catalogue",
   "Browse for a project folder": "Parcourir les dossiers du projet",

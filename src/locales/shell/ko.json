@@ -45,7 +45,7 @@
   "Ask pauses destructive calls for your approval. Strict also hides destructive tools, pauses risky tool changes, blocks high-confidence injection and asks before untrusted calls. Tool labeling and change history stay on at every level.": "확인 모드는 파괴적인 호출을 승인 대기 상태로 보류합니다. 엄격 모드는 추가로 파괴적인 도구를 숨기고, 위험한 도구 변경을 보류하며, 주입 공격으로 확실하게 판정된 내용을 차단하고, 신뢰할 수 없는 호출 전에 승인을 요청합니다. 도구 라벨링과 변경 내역은 모든 수준에서 유지됩니다.",
   "auto-scope a client by the folder it opens in": "클라이언트가 열리는 폴더를 기준으로 클라이언트 범위 자동 지정",
   "Back to clients": "클라이언트로 돌아가기",
-  "blocked in Strict until you re-approve": "다시 승인할 때까지 엄격 모드에서 차단",
+  "kept until you re-approve": "다시 승인할 때까지 보관",
   "Browse": "찾아보기",
   "Browse catalog": "카탈로그 보기",
   "Browse for a project folder": "프로젝트 폴더 찾기",

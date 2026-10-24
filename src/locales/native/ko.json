@@ -725,7 +725,7 @@
   "Store token": "토큰 저장",
   "Stored credentials": "저장된 자격 증명",
   "Storing token in the system keychain…": "시스템 키체인에 토큰 저장 중…",
-  "Strict blocks retained high-risk definition changes until you explicitly re-approve them.": "엄격 모드는 보관된 고위험 정의 변경을 명시적으로 다시 승인할 때까지 차단합니다.",
+  "Toolport keeps high-risk definition changes here until you re-approve them.": "Toolport는 고위험 정의 변경을 다시 승인할 때까지 여기에 보관합니다.",
   "Succeeded": "성공",
   "Succeeded{value1} · captured locally while live inspection was enabled": "성공{value1} · 실시간 검사가 활성화된 동안 로컬에서 캡처됨",
   "Success rate": "성공률",

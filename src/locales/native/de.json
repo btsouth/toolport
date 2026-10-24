@@ -725,7 +725,7 @@
   "Store token": "Token speichern",
   "Stored credentials": "Gespeicherte Anmeldeinformationen",
   "Storing token in the system keychain…": "Token wird im Systemschlüsselbund gespeichert…",
-  "Strict blocks retained high-risk definition changes until you explicitly re-approve them.": "„Streng“ blockiert gespeicherte risikoreiche Definitionsänderungen, bis Sie diese ausdrücklich erneut genehmigen.",
+  "Toolport keeps high-risk definition changes here until you re-approve them.": "Toolport behält risikoreiche Definitionsänderungen hier, bis Sie sie erneut genehmigen.",
   "Succeeded": "Erfolgreich",
   "Succeeded{value1} · captured locally while live inspection was enabled": "Erfolgreich{value1} · Lokal erfasst, während die Live-Inspektion aktiviert war",
   "Success rate": "Erfolgsquote",

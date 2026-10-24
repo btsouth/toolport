@@ -45,7 +45,7 @@
   "Ask pauses destructive calls for your approval. Strict also hides destructive tools, pauses risky tool changes, blocks high-confidence injection and asks before untrusted calls. Tool labeling and change history stay on at every level.": "「確認」では、破壊的な呼び出しを承認待ちにします。「厳格」では、さらに破壊的なツールを非表示にし、危険なツール変更を保留し、インジェクションと高い確度で判定された内容をブロックし、信頼できない呼び出しの前に承認を求めます。ツールのラベル付けと変更履歴は、すべてのレベルで有効です。",
   "auto-scope a client by the folder it opens in": "開いたフォルダーに応じてクライアントの接続範囲を自動選択",
   "Back to clients": "クライアント一覧へ戻る",
-  "blocked in Strict until you re-approve": "再承認するまで「厳格」でブロック",
+  "kept until you re-approve": "再承認するまで保持",
   "Browse": "参照",
   "Browse catalog": "カタログを見る",
   "Browse for a project folder": "プロジェクトフォルダーを参照",

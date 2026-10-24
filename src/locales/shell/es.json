@@ -45,7 +45,7 @@
   "Ask pauses destructive calls for your approval. Strict also hides destructive tools, pauses risky tool changes, blocks high-confidence injection and asks before untrusted calls. Tool labeling and change history stay on at every level.": "Preguntar detiene las llamadas destructivas para tu aprobación. Estricto también oculta herramientas destructivas, pausa los cambios riesgosos de herramientas, bloquea las inyecciones detectadas con alta confianza y pregunta antes de las llamadas no confiables. El etiquetado de herramientas y el historial de cambios permanecen activos en todos los niveles.",
   "auto-scope a client by the folder it opens in": "limita automáticamente el alcance de un cliente según la carpeta en la que se abre",
   "Back to clients": "Volver a clientes",
-  "blocked in Strict until you re-approve": "bloqueado en Estricto hasta que vuelvas a aprobar",
+  "kept until you re-approve": "se conserva hasta que vuelvas a aprobar",
   "Browse": "Explorar",
   "Browse catalog": "Explorar catálogo",
   "Browse for a project folder": "Buscar carpeta del proyecto",

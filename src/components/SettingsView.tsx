@@ -1489,7 +1489,7 @@ export function SettingsView({
                 <span className="text-meta text-muted-foreground">
                   {quarantineError
                     ? translate("status may be stale")
-                    : translate("blocked in Strict until you re-approve")}
+                    : translate("kept until you re-approve")}
                 </span>
               </div>
               <ul className="flex flex-col gap-1.5">

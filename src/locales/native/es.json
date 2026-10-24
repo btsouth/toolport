@@ -725,7 +725,7 @@
   "Store token": "Almacenar token",
   "Stored credentials": "Credenciales almacenadas",
   "Storing token in the system keychain…": "Almacenando token en el llavero del sistema…",
-  "Strict blocks retained high-risk definition changes until you explicitly re-approve them.": "Estricto bloquea los cambios de definición de alto riesgo retenidos hasta que vuelvas a aprobarlos explícitamente.",
+  "Toolport keeps high-risk definition changes here until you re-approve them.": "Toolport conserva aquí los cambios de definición de alto riesgo hasta que vuelvas a aprobarlos.",
   "Succeeded": "Éxito",
   "Succeeded{value1} · captured locally while live inspection was enabled": "Correcto{value1} · capturado localmente mientras la inspección en vivo estaba habilitada",
   "Success rate": "Tasa de éxito",

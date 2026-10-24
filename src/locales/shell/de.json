@@ -45,7 +45,7 @@
   "Ask pauses destructive calls for your approval. Strict also hides destructive tools, pauses risky tool changes, blocks high-confidence injection and asks before untrusted calls. Tool labeling and change history stay on at every level.": "„Nachfragen“ hält destruktive Aufrufe zur Genehmigung an. „Streng“ blendet zusätzlich destruktive Tools aus, hält riskante Tool-Änderungen an, blockiert mit hoher Sicherheit erkannte Injection-Angriffe und fragt vor nicht vertrauenswürdigen Aufrufen nach. Tool-Kennzeichnung und Änderungsverlauf bleiben auf jeder Stufe aktiv.",
   "auto-scope a client by the folder it opens in": "Automatisches Eingrenzen eines Clients nach dem Ordner, in dem er geöffnet wird",
   "Back to clients": "Zurück zu Clients",
-  "blocked in Strict until you re-approve": "bis zur erneuten Genehmigung in der Einstellung „Strikt“ blockiert",
+  "kept until you re-approve": "bis zur erneuten Genehmigung gespeichert",
   "Browse": "Durchsuchen",
   "Browse catalog": "Katalog durchsuchen",
   "Browse for a project folder": "Projektordner suchen",

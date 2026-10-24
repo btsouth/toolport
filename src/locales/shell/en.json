@@ -45,7 +45,7 @@
   "Ask pauses destructive calls for your approval. Strict also hides destructive tools, pauses risky tool changes, blocks high-confidence injection and asks before untrusted calls. Tool labeling and change history stay on at every level.": "Ask pauses destructive calls for your approval. Strict also hides destructive tools, pauses risky tool changes, blocks high-confidence injection and asks before untrusted calls. Tool labeling and change history stay on at every level.",
   "auto-scope a client by the folder it opens in": "auto-scope a client by the folder it opens in",
   "Back to clients": "Back to clients",
-  "blocked in Strict until you re-approve": "blocked in Strict until you re-approve",
+  "kept until you re-approve": "kept until you re-approve",
   "Browse": "Browse",
   "Browse catalog": "Browse catalog",
   "Browse for a project folder": "Browse for a project folder",

@@ -725,7 +725,7 @@
   "Store token": "Stocker le jeton",
   "Stored credentials": "Identifiants stockés",
   "Storing token in the system keychain…": "Stockage du jeton dans le trousseau du système…",
-  "Strict blocks retained high-risk definition changes until you explicitly re-approve them.": "Le niveau Strict bloque les modifications de définition à haut risque conservées jusqu'à votre réapprobation explicite.",
+  "Toolport keeps high-risk definition changes here until you re-approve them.": "Toolport conserve ici les modifications de définition à haut risque jusqu'à votre nouvelle approbation.",
   "Succeeded": "Réussite",
   "Succeeded{value1} · captured locally while live inspection was enabled": "Réussi{value1} · capturé localement alors que l'inspection en direct était activée",
   "Success rate": "Taux de réussite",

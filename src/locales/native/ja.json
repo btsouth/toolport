@@ -725,7 +725,7 @@
   "Store token": "トークンを保存",
   "Stored credentials": "保存された認証情報",
   "Storing token in the system keychain…": "システムキーチェーンにトークンを保存中…",
-  "Strict blocks retained high-risk definition changes until you explicitly re-approve them.": "「厳格」では、保持されている高リスクの定義変更を、明示的に再承認するまでブロックします。",
+  "Toolport keeps high-risk definition changes here until you re-approve them.": "Toolport は、高リスクの定義変更を再承認するまでここに保持します。",
   "Succeeded": "成功",
   "Succeeded{value1} · captured locally while live inspection was enabled": "成功しました{value1} · ライブ検査が有効になっている間にローカルでキャプチャされました",
   "Success rate": "成功率",

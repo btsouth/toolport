@@ -581,7 +581,7 @@ impl SettingsPage {
 
         let quarantine_heading = settings_heading(
             msg("Quarantined tools"),
-            msg("Strict blocks retained high-risk definition changes until you explicitly re-approve them."),
+            msg("Toolport keeps high-risk definition changes here until you re-approve them."),
         );
         let quarantine_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         quarantine_list.add_css_class("toolport-settings-group");

@@ -45,7 +45,7 @@
   "Ask pauses destructive calls for your approval. Strict also hides destructive tools, pauses risky tool changes, blocks high-confidence injection and asks before untrusted calls. Tool labeling and change history stay on at every level.": "“詢問”會暫停破壞性呼叫，等待核准。“嚴格”還會隱藏破壞性工具、暫停高風險工具變更、阻止高置信度注入，並在不受信任的呼叫前詢問。所有級別都會保留工具標註和變更歷史。",
   "auto-scope a client by the folder it opens in": "依用戶端開啟的資料夾自動確定用戶端範圍",
   "Back to clients": "返回使用者端清單",
-  "blocked in Strict until you re-approve": "在嚴格模式下保持攔截，直到您重新核准",
+  "kept until you re-approve": "保留到您重新核准",
   "Browse": "瀏覽",
   "Browse catalog": "瀏覽目錄",
   "Browse for a project folder": "瀏覽專案資料夾",

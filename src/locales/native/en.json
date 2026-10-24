@@ -725,7 +725,7 @@
   "Store token": "Store token",
   "Stored credentials": "Stored credentials",
   "Storing token in the system keychain…": "Storing token in the system keychain…",
-  "Strict blocks retained high-risk definition changes until you explicitly re-approve them.": "Strict blocks retained high-risk definition changes until you explicitly re-approve them.",
+  "Toolport keeps high-risk definition changes here until you re-approve them.": "Toolport keeps high-risk definition changes here until you re-approve them.",
   "Succeeded": "Succeeded",
   "Succeeded{value1} · captured locally while live inspection was enabled": "Succeeded{value1} · captured locally while live inspection was enabled",
   "Success rate": "Success rate",

@@ -725,7 +725,7 @@
   "Store token": "存储令牌",
   "Stored credentials": "存储的凭证",
   "Storing token in the system keychain…": "正在将令牌保存到系统钥匙串…",
-  "Strict blocks retained high-risk definition changes until you explicitly re-approve them.": "严格模式会拦截已记录的高风险定义变更，直到您明确重新批准。",
+  "Toolport keeps high-risk definition changes here until you re-approve them.": "Toolport 会将高风险定义变更保留在此处，直到您重新批准。",
   "Succeeded": "成功",
   "Succeeded{value1} · captured locally while live inspection was enabled": "成功{value1} · 启用实时检查时本地捕获",
   "Success rate": "成功率",

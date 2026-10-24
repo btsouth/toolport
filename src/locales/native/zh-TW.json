@@ -725,7 +725,7 @@
   "Store token": "儲存權杖",
   "Stored credentials": "儲存的憑證",
   "Storing token in the system keychain…": "正在將權杖儲存到系統鑰匙圈…",
-  "Strict blocks retained high-risk definition changes until you explicitly re-approve them.": "嚴格模式會攔截已記錄的高風險定義變更，直到您明確重新核准。",
+  "Toolport keeps high-risk definition changes here until you re-approve them.": "Toolport 會將高風險定義變更保留在此處，直到您重新核准。",
   "Succeeded": "成功",
   "Succeeded{value1} · captured locally while live inspection was enabled": "成功{value1} · 啟用即時檢查時本機捕獲",
   "Success rate": "成功率",
