@@ -6,6 +6,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Security
+
+- At Ask, a destructive tool whose server drops or flips its `destructiveHint`
+  is now quarantined until you review it. Before, Toolport showed a notice and
+  the tool's calls then ran without asking. A write-named tool such as
+  `delete_rows` that starts claiming `destructiveHint: false` is held the same
+  way.
+
 ### Fixed
 
 - `toolport-gateway --http 0` now binds a free port chosen by the system and

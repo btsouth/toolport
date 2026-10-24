@@ -41016,6 +41016,52 @@ mod tests {
     }
 
     #[test]
+    fn ask_holds_a_destructive_tool_that_stops_declaring_it_until_released() {
+        let _data = DataDirTestEnv::new("ask-gate-downgrade");
+        let profile = Some("ask-gate-downgrade");
+        let tidy = |hint: bool| {
+            json!({"name": "srv__tidy", "description": "Tidy rows.",
+                "inputSchema": {"type": "object"}, "annotations": {"destructiveHint": hint}})
+        };
+        let read = |description: &str| {
+            json!({"name": "srv__read", "description": description,
+                "inputSchema": {"type": "object"}})
+        };
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Ask);
+        let registry = Arc::new(Mutex::new(reg));
+        let held = || effective_quarantine(&registry, profile, &AtomicBool::new(false));
+
+        let before = vec![tidy(true), read("Read rows.")];
+        assert_eq!(maybe_check_integrity(&registry, &before, profile).unwrap(), None);
+        // Other drift still only notifies at Ask.
+        let reworded = vec![tidy(true), read("Read rows quickly.")];
+        assert_eq!(maybe_check_integrity(&registry, &reworded, profile).unwrap(), None);
+        assert_eq!(held(), Some(BTreeSet::new()));
+
+        let downgraded = vec![tidy(false), read("Read rows quickly.")];
+        assert_eq!(
+            maybe_check_integrity(&registry, &downgraded, profile).unwrap(),
+            Some(set_of(&["srv__tidy"]))
+        );
+        assert_eq!(held(), Some(set_of(&["srv__tidy"])));
+        // The pin has moved on, but the durable record keeps the tool held.
+        maybe_check_integrity(&registry, &downgraded, profile).unwrap();
+        assert_eq!(held(), Some(set_of(&["srv__tidy"])));
+
+        // Releasing it accepts the new definition.
+        let record = integrity::quarantine_list(profile).remove(0);
+        integrity::release_record(
+            profile,
+            "srv__tidy",
+            &integrity::quarantine_record_id(&record),
+        )
+        .unwrap();
+        assert_eq!(maybe_check_integrity(&registry, &downgraded, profile).unwrap(), None);
+        assert_eq!(held(), Some(BTreeSet::new()));
+    }
+
+    #[test]
     fn integrity_pending_review_recaptures_missing_rows_at_every_safety_level() {
         let data = DataDirTestEnv::new("pending-review-missing-rows");
         let dir = &data.dir;

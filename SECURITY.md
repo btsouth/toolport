@@ -113,6 +113,9 @@ controls actively gate or block a call before it reaches an upstream server.
   untrusted-provenance servers (shared/registry sources) require an explicit human
   approval. This gate is fail-closed: a denied, timed-out, or unreachable decision
   blocks the call, which returns an error and never routes.
+  At Ask, a destructive tool whose server later drops or flips its
+  `destructiveHint` is quarantined until you review it, so a definition change
+  cannot switch off its approval.
 - **Content screening.** Tool results and resource reads are scanned for
   injection patterns. Findings are recorded in Activity, and results are returned
   exactly as the server sent them, with provenance only in hidden `_meta`. In
