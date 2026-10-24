@@ -1,6 +1,6 @@
 [package]
 name = "conduit"
-version = "2.3.0"
+version = "2.3.1"
 description = "Local MCP gateway: manage all your MCP servers in one place, set up once and shared by every AI client, with tools found on demand for clients that load every definition"
 authors = ["South Forge AI"]
 edition = "2021"
