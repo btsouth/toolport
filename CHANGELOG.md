@@ -6,6 +6,23 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-10-24
+
+Toolport 2.3.1 holds a destructive tool for review at Ask when its server stops
+marking it destructive, so a changed definition can no longer switch off its
+approval. It also keeps every tool visible in Grok Build, shows fewer false
+tool-poisoning warnings, stops a needless tool refresh when clients start, adds
+Keenable to the server catalog and updates TLS certificate checks.
+
+If you are on Toolport 1.24.x, this is also your update to Toolport 2. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+before updating.
+
+### Added
+
+- Keenable, a keyless hosted web search and page fetch server, is in the
+  catalog under Search & knowledge.
+
 ### Security
 
 - At Ask, a destructive tool whose server drops or flips its `destructiveHint`
@@ -13,6 +30,9 @@ Entries before the rename below shipped under the project's former name, Conduit
   the tool's calls then ran without asking. A write-named tool such as
   `delete_rows` that starts claiming `destructiveHint: false` is held the same
   way.
+- Updated rustls-webpki and the bundled root certificates so Toolport no longer
+  trusts the distrusted emSign roots (RUSTSEC-2026-0381, RUSTSEC-2026-0382 and
+  RUSTSEC-2026-0383).
 
 ### Fixed
 
