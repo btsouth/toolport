@@ -262,6 +262,24 @@ fn annotation_downgrade(old: &Pin, tool: &Value) -> bool {
         || (old.dh == Some(true) && read_hint(tool, "destructiveHint") != Some(true))
 }
 
+/// The Ask call gate's verdict for a pinned tool: its `destructiveHint`, or a
+/// write verb in the tool's own name when the hint is absent. Mirrors
+/// [`crate::router::is_destructive`] without the server prefix.
+fn gate_destructive(hint: Option<bool>, name: &str) -> bool {
+    let tool = name.split_once("__").map_or(name, |(_, tool)| tool);
+    hint.unwrap_or_else(|| crate::router::name_looks_destructive(tool))
+}
+
+/// The call gate held this tool before the change and would wave it through after.
+/// Ask holds destructive calls, so a server that drops or flips `destructiveHint`
+/// would otherwise turn off approval for that tool. A legacy pin has no saved hint
+/// and cannot tell what the gate did, so it never counts.
+fn gate_downgrade(old: &Pin, tool: &Value, name: &str) -> bool {
+    (old.dh.is_some() || old.parts.is_some())
+        && gate_destructive(old.dh, name)
+        && !gate_destructive(read_hint(tool, "destructiveHint"), name)
+}
+
 /// Severity of a drift, splitting loud/actionable signal from benign churn:
 /// - `high`: the tool is destructive, a write-verb name matches (even when the
 ///   server set `destructiveHint: false` — SBS-875), or a safety annotation
@@ -1110,7 +1128,12 @@ fn check_inner_with(
                     // overwrites the pin (SOU-305). apply_quarantine stores them on the
                     // quarantine record so the UI can say "readOnlyHint: true → false"
                     // rather than only "a safety annotation dropped".
-                    events.push(changed_event(server, name, sev, old, &pin));
+                    let mut changed = changed_event(server, name, sev, old, &pin);
+                    if !(old.review_on_upgrade || old.review_pending) && gate_downgrade(old, t, name)
+                    {
+                        changed["gate_downgrade"] = json!(true);
+                    }
+                    events.push(changed);
                     scan = true;
                 }
                 None => {
@@ -1935,8 +1958,9 @@ pub fn quarantined_checked(profile: Option<&str>) -> Result<BTreeSet<String>, St
     quarantined_checked_at(&path, profile)
 }
 
-/// Tools quarantined for a lost integrity baseline or an explicit pending review. Unlike ordinary
-/// high-risk drift quarantine, these entries are always enforced: disabling the optional
+/// Tools quarantined for a lost integrity baseline, an explicit pending review, or a
+/// change that would let a destructive tool skip Ask's approval. Unlike ordinary
+/// high-risk drift quarantine, these entries are enforced at Ask: disabling the optional
 /// drift policy must not turn a corrupt baseline into a fail-open catalog.
 pub fn mandatory_quarantined(profile: Option<&str>) -> Result<BTreeSet<String>, String> {
     Ok(mandatory_quarantine_set(&load_quarantine(profile)?))
@@ -2149,7 +2173,11 @@ fn review_quarantine_set(q: &Quarantine) -> BTreeSet<String> {
 
 fn mandatory_quarantine_set(q: &Quarantine) -> BTreeSet<String> {
     q.iter()
-        .filter(|(_, record)| record["change"] == "tamper" || record["review_required"] == true)
+        .filter(|(_, record)| {
+            record["change"] == "tamper"
+                || record["review_required"] == true
+                || record["gate_downgrade"] == true
+        })
         .map(|(tool, _)| tool.clone())
         .collect()
 }
@@ -3092,6 +3120,9 @@ fn apply_quarantine_inner_with(
                 "This older block had no saved definition. Review the captured current definition before approving."
             }
             "poison" => "a poisoned definition was detected",
+            "changed" if e["gate_downgrade"] == true => {
+                "a destructive tool stopped declaring itself destructive"
+            }
             "changed" if is_destructive_named(current, tool) => {
                 "a destructive tool's definition changed"
             }
@@ -3136,6 +3167,9 @@ fn apply_quarantine_inner_with(
             {
                 rec["review_required"] = json!(true);
             }
+            if gate_downgraded(events, tool) {
+                rec["gate_downgrade"] = json!(true);
+            }
             // Concrete annotation prior→new (SOU-305). Optional: older events / poison
             // rows omit these; the UI falls back to `reason` alone.
             for key in ["prev_ro", "new_ro", "prev_dh", "new_dh"] {
@@ -3150,12 +3184,29 @@ fn apply_quarantine_inner_with(
             }
             q.insert(tool.to_string(), rec);
             added = true;
+        } else if gate_downgraded(events, tool) {
+            // A stronger record from Strict stays, but Ask must enforce it now too.
+            if let Some(record) = q.get_mut(tool).filter(|r| r["gate_downgrade"] != true) {
+                record["gate_downgrade"] = json!(true);
+                added = true;
+            }
         }
     }
     if added {
         save(profile, &q)?;
     }
     Ok(added)
+}
+
+fn gate_downgraded(events: &[Value], tool: &str) -> bool {
+    events
+        .iter()
+        .any(|event| event["tool"] == tool && event["gate_downgrade"] == true)
+}
+
+/// Drift Ask must hold even though it only notifies for other changes.
+pub fn ask_holds(event: &Value) -> bool {
+    event["gate_downgrade"] == true
 }
 
 /// Whether the tool named `name` in `current` is destructive (MCP annotations).
@@ -10178,6 +10229,95 @@ mod tests {
         if let Some(p) = quarantine_path(profile) {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    #[test]
+    fn ask_holds_a_destructive_tool_that_stops_declaring_it() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("gate-downgrade");
+        let profile = Some("integrity-gate-downgrade");
+        let tool = |name: &str, description: &str, annotations: Value| {
+            json!({"name": name, "description": description,
+                "inputSchema": {"type": "object"}, "annotations": annotations})
+        };
+        let before = vec![
+            tool("db__tidy", "Tidy rows.", json!({"destructiveHint": true})),
+            tool("db__sweep", "Sweep rows.", json!({"destructiveHint": true})),
+            tool("db__delete_rows", "Delete rows.", json!({})),
+            tool("db__drop_table", "Drop a table.", json!({"destructiveHint": true})),
+            tool("db__read", "Read rows.", json!({"readOnlyHint": true})),
+            tool("db__export", "Export rows.", json!({"destructiveHint": false})),
+        ];
+        assert!(check(profile, &before)
+            .unwrap()
+            .iter()
+            .all(|event| !ask_holds(event)));
+
+        let after = vec![
+            // The hint flips, disappears, or overrides a write-named tool.
+            tool("db__tidy", "Tidy rows.", json!({"destructiveHint": false})),
+            tool("db__sweep", "Sweep rows.", json!({})),
+            tool("db__delete_rows", "Delete rows.", json!({"destructiveHint": false})),
+            // Still destructive, or never held: Ask keeps notifying only.
+            tool("db__drop_table", "Drop any table.", json!({"destructiveHint": true})),
+            tool("db__read", "Read rows fast.", json!({"readOnlyHint": true})),
+            tool("db__export", "Export rows fast.", json!({"destructiveHint": false})),
+        ];
+        let events = check(profile, &after).unwrap();
+        let held: BTreeSet<_> = events
+            .iter()
+            .filter(|event| ask_holds(event))
+            .filter_map(|event| event["tool"].as_str())
+            .collect();
+        assert_eq!(
+            held,
+            BTreeSet::from(["db__delete_rows", "db__sweep", "db__tidy"])
+        );
+
+        assert!(apply_quarantine(profile, &after, &events).unwrap());
+        assert_eq!(
+            mandatory_quarantined(profile).unwrap(),
+            BTreeSet::from([
+                "db__delete_rows".to_string(),
+                "db__sweep".to_string(),
+                "db__tidy".to_string(),
+            ]),
+            "only the tools that would skip approval are enforced at Ask"
+        );
+        assert!(quarantined(profile).unwrap().contains("db__drop_table"));
+        let record = quarantine_list(profile)
+            .into_iter()
+            .find(|record| record["tool"] == "db__tidy")
+            .unwrap();
+        assert_eq!(
+            record["reason"],
+            "a destructive tool stopped declaring itself destructive"
+        );
+        assert_eq!(record["detail"], "destructiveHint: true → false");
+
+        // A stronger record that Strict saved earlier is enforced at Ask after a downgrade.
+        assert!(release(profile, "db__tidy").unwrap());
+        let poison = poison_event("db", "db__tidy", &["test".to_string()], 0.9, None);
+        assert!(apply_quarantine(profile, &after, &[poison]).unwrap());
+        assert!(!mandatory_quarantined(profile).unwrap().contains("db__tidy"));
+        let downgrade: Vec<_> = events
+            .iter()
+            .filter(|event| event["tool"] == "db__tidy")
+            .cloned()
+            .collect();
+        assert!(apply_quarantine(profile, &after, &downgrade).unwrap());
+        assert!(mandatory_quarantined(profile).unwrap().contains("db__tidy"));
+    }
+
+    #[test]
+    fn a_legacy_pin_without_hints_never_counts_as_a_gate_downgrade() {
+        let legacy = Pin::from(PinRepr::Legacy("v1:old".into()));
+        let now = json!({"name": "db__delete_rows", "annotations": {"destructiveHint": false}});
+        assert!(!gate_downgrade(&legacy, &now, "db__delete_rows"));
+        // The server prefix is not the tool's name.
+        let pinned = pin_of(&json!({"name": "post__tidy", "inputSchema": {"type": "object"}}));
+        let now = json!({"name": "post__tidy", "annotations": {"destructiveHint": false}});
+        assert!(!gate_downgrade(&pinned, &now, "post__tidy"));
     }
 
     #[test]

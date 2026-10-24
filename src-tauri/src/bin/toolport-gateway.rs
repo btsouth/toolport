@@ -10877,13 +10877,19 @@ fn maybe_check_integrity(
         ));
             eprintln!("toolport: SECURITY tool drift ({change}) {tool}");
         }
-        // Explicit reviews block at every level. Ordinary Ask drift still only notifies.
+        // Explicit reviews block at every level. Ask also holds a destructive tool
+        // that stopped declaring itself destructive, since its calls would otherwise
+        // skip approval. Other Ask drift still only notifies.
         let enforce_drift =
             quarantine_on || (blocking && integrity::baseline_tamper_detected(&events));
-        if enforce_drift || review_required {
+        let held = |event: &Value| {
+            event["review_required"] == true || (blocking && integrity::ask_holds(event))
+        };
+        let ask_hold = blocking && events.iter().any(integrity::ask_holds);
+        if enforce_drift || review_required || ask_hold {
             let required: Vec<_> = events
                 .iter()
-                .filter(|event| enforce_drift || event["review_required"] == true)
+                .filter(|event| enforce_drift || held(event))
                 .cloned()
                 .collect();
             let pending = integrity::quarantine_candidates(tools, &required);
@@ -10896,7 +10902,7 @@ fn maybe_check_integrity(
             if !enforce_drift {
                 let ordinary: Vec<_> = events
                     .iter()
-                    .filter(|event| event["review_required"] != true)
+                    .filter(|event| !held(event))
                     .cloned()
                     .collect();
                 integrity::accept_staged_pins(profile, tools, &ordinary)
