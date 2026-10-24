@@ -1994,12 +1994,27 @@ impl Router {
             tools
                 .0
                 .iter()
-                .map(|tool| match self.policy_definition(tool) {
-                    std::borrow::Cow::Borrowed(_) => Arc::clone(tool),
-                    std::borrow::Cow::Owned(value) => Arc::new(
-                        ToolDefinition::new(value)
-                            .with_source_input_schema(tool.source_input_schema.clone()),
-                    ),
+                .map(|tool| {
+                    let definition = self.policy_definition(tool);
+                    // Drift checks judge destructiveness by the downstream name, as the
+                    // call gate does, even when an override or alias shows another.
+                    let policy = definition.get("name").and_then(Value::as_str).unwrap_or("");
+                    let shown = policy.split_once("__").map_or(policy, |(_, tool)| tool);
+                    let gate_name = tool
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .and_then(|exposed| self.route_of(exposed))
+                        .map(|(_, original)| original)
+                        .filter(|original| *original != shown)
+                        .map(str::to_string);
+                    match (definition, gate_name) {
+                        (std::borrow::Cow::Borrowed(_), None) => Arc::clone(tool),
+                        (definition, gate_name) => Arc::new(
+                            ToolDefinition::new(definition.into_owned())
+                                .with_source_input_schema(tool.source_input_schema.clone())
+                                .with_gate_name(gate_name),
+                        ),
+                    }
                 })
                 .collect(),
         )
@@ -8271,6 +8286,32 @@ for line in sys.stdin:
         // ...and blocked on a direct call, with the quarantine reason.
         let err = router.route_call("say", json!({})).unwrap_err();
         assert!(err.contains("quarantine"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn policy_catalog_names_the_downstream_tool_for_a_rename() {
+        let mut srv = HashMap::new();
+        srv.insert(
+            "echo".to_string(),
+            ToolOverride {
+                name: Some("say".into()),
+                description: None,
+                unknown_fields: Default::default(),
+            },
+        );
+        let mut router = Router::with_policy(ToolPolicy::default());
+        router.set_overrides(HashMap::from([("srv".to_string(), srv)]));
+        router.add(mock_server("srv"));
+        let catalog = router.policy_catalog(&router.shared_tools());
+        use crate::tool_definitions::ToolCatalog as _;
+        assert_eq!(catalog.gate_name("say"), Some("echo"));
+        let mut plain = Router::with_policy(ToolPolicy::default());
+        plain.add(mock_server("srv"));
+        let catalog = plain.policy_catalog(&plain.shared_tools());
+        assert!(catalog
+            .values()
+            .filter_map(|tool| tool["name"].as_str())
+            .all(|name| catalog.gate_name(name).is_none()));
     }
 
     #[test]

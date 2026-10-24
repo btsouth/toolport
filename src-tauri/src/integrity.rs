@@ -263,10 +263,10 @@ fn annotation_downgrade(old: &Pin, tool: &Value) -> bool {
 }
 
 /// The Ask call gate's verdict for a pinned tool: its `destructiveHint`, or a
-/// write verb in the tool's own name when the hint is absent. Mirrors
-/// [`crate::router::is_destructive`] without the server prefix.
-fn gate_destructive(hint: Option<bool>, name: &str) -> bool {
-    let tool = name.split_once("__").map_or(name, |(_, tool)| tool);
+/// write verb in the downstream tool name when the hint is absent. Mirrors
+/// [`crate::router::is_destructive`] on the router's safety definition.
+fn gate_destructive(hint: Option<bool>, name: &str, gate_name: Option<&str>) -> bool {
+    let tool = gate_name.unwrap_or_else(|| name.split_once("__").map_or(name, |(_, tool)| tool));
     hint.unwrap_or_else(|| crate::router::name_looks_destructive(tool))
 }
 
@@ -274,10 +274,10 @@ fn gate_destructive(hint: Option<bool>, name: &str) -> bool {
 /// Ask holds destructive calls, so a server that drops or flips `destructiveHint`
 /// would otherwise turn off approval for that tool. A legacy pin has no saved hint
 /// and cannot tell what the gate did, so it never counts.
-fn gate_downgrade(old: &Pin, tool: &Value, name: &str) -> bool {
+fn gate_downgrade(old: &Pin, tool: &Value, name: &str, gate_name: Option<&str>) -> bool {
     (old.dh.is_some() || old.parts.is_some())
-        && gate_destructive(old.dh, name)
-        && !gate_destructive(read_hint(tool, "destructiveHint"), name)
+        && gate_destructive(old.dh, name, gate_name)
+        && !gate_destructive(read_hint(tool, "destructiveHint"), name, gate_name)
 }
 
 /// Severity of a drift, splitting loud/actionable signal from benign churn:
@@ -1108,10 +1108,14 @@ fn check_inner_with(
                 // A different fingerprint is only a real change if it came from the same
                 // algorithm version; a version mismatch is our format upgrade, not the
                 // tool's, so re-baseline quietly unless an explicit review is still pending.
+                // A top-level hint is outside the fingerprint, so compare the saved hints too.
                 Some(old)
                     if old.review_on_upgrade
                         || old.review_pending
-                        || (old.fp != pin.fp && fp_version(&old.fp) == fp_version(&pin.fp)) =>
+                        || (fp_version(&old.fp) == fp_version(&pin.fp)
+                            && (old.fp != pin.fp
+                                || (old.parts.is_some()
+                                    && (old.dh != pin.dh || old.ro != pin.ro)))) =>
                 {
                     // Reassert pending reviews even when the fingerprint matches: the
                     // quarantine row may have disappeared since the captured pin was saved.
@@ -1129,7 +1133,8 @@ fn check_inner_with(
                     // quarantine record so the UI can say "readOnlyHint: true → false"
                     // rather than only "a safety annotation dropped".
                     let mut changed = changed_event(server, name, sev, old, &pin);
-                    if !(old.review_on_upgrade || old.review_pending) && gate_downgrade(old, t, name)
+                    if !(old.review_on_upgrade || old.review_pending)
+                        && gate_downgrade(old, t, name, current.gate_name(name))
                     {
                         changed["gate_downgrade"] = json!(true);
                     }
@@ -3138,9 +3143,16 @@ fn apply_quarantine_inner_with(
             // time by Block/Confirm/Require-approval if those are on.
             _ => continue,
         };
-        if q.get(tool)
-            .is_none_or(|record| quarantine_priority(e) > quarantine_priority(record))
-        {
+        // A downgrade replaces an older ordinary record, so the card and its release
+        // show the definition Ask is holding now.
+        let downgraded = gate_downgraded(events, tool);
+        if q.get(tool).is_none_or(|record| {
+            quarantine_priority(e) > quarantine_priority(record)
+                || (downgraded
+                    && record["change"] != "tamper"
+                    && record["review_required"] != true
+                    && record["gate_downgrade"] != true)
+        }) {
             let server = e.get("server").and_then(Value::as_str).unwrap_or("?");
             let (definition, source) = current
                 .pin_values()
@@ -3167,7 +3179,8 @@ fn apply_quarantine_inner_with(
             {
                 rec["review_required"] = json!(true);
             }
-            if gate_downgraded(events, tool) {
+            // A stronger record that replaces a held one keeps it held at Ask.
+            if downgraded || q.get(tool).is_some_and(|r| r["gate_downgrade"] == true) {
                 rec["gate_downgrade"] = json!(true);
             }
             // Concrete annotation prior→new (SOU-305). Optional: older events / poison
@@ -3184,12 +3197,6 @@ fn apply_quarantine_inner_with(
             }
             q.insert(tool.to_string(), rec);
             added = true;
-        } else if gate_downgraded(events, tool) {
-            // A stronger record from Strict stays, but Ask must enforce it now too.
-            if let Some(record) = q.get_mut(tool).filter(|r| r["gate_downgrade"] != true) {
-                record["gate_downgrade"] = json!(true);
-                added = true;
-            }
         }
     }
     if added {
@@ -10295,10 +10302,10 @@ mod tests {
         );
         assert_eq!(record["detail"], "destructiveHint: true → false");
 
-        // A stronger record that Strict saved earlier is enforced at Ask after a downgrade.
+        // An older record that Strict saved is replaced, so the card shows this change.
         assert!(release(profile, "db__tidy").unwrap());
         let poison = poison_event("db", "db__tidy", &["test".to_string()], 0.9, None);
-        assert!(apply_quarantine(profile, &after, &[poison]).unwrap());
+        assert!(apply_quarantine(profile, &after, std::slice::from_ref(&poison)).unwrap());
         assert!(!mandatory_quarantined(profile).unwrap().contains("db__tidy"));
         let downgrade: Vec<_> = events
             .iter()
@@ -10307,17 +10314,70 @@ mod tests {
             .collect();
         assert!(apply_quarantine(profile, &after, &downgrade).unwrap());
         assert!(mandatory_quarantined(profile).unwrap().contains("db__tidy"));
+        let record = quarantine_list(profile)
+            .into_iter()
+            .find(|record| record["tool"] == "db__tidy")
+            .unwrap();
+        assert_eq!(record["change"], "changed");
+        // A stronger record written over a held one stays held.
+        assert!(apply_quarantine(profile, &after, &[poison]).unwrap());
+        assert!(mandatory_quarantined(profile).unwrap().contains("db__tidy"));
+    }
+
+    #[test]
+    fn ask_hold_judges_the_downstream_name_and_top_level_hints() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("gate-downgrade-names");
+        let profile = Some("integrity-gate-downgrade-names");
+        let catalog = |cleanup: Value, report: Value, top: Value| {
+            crate::tool_definitions::SharedTools(vec![
+                // Overrides show `cleanup` for upstream `delete_rows`, `send_report` for `report`.
+                std::sync::Arc::new(
+                    crate::tool_definitions::ToolDefinition::new(cleanup)
+                        .with_gate_name(Some("delete_rows".into())),
+                ),
+                std::sync::Arc::new(
+                    crate::tool_definitions::ToolDefinition::new(report)
+                        .with_gate_name(Some("report".into())),
+                ),
+                std::sync::Arc::new(crate::tool_definitions::ToolDefinition::new(top)),
+            ])
+        };
+        let schema = json!({"type": "object"});
+        let before = catalog(
+            json!({"name": "db__cleanup", "inputSchema": schema}),
+            json!({"name": "db__send_report", "inputSchema": schema}),
+            json!({"name": "db__tidy", "inputSchema": schema, "destructiveHint": true}),
+        );
+        assert!(check(profile, &before).unwrap().is_empty());
+        let after = catalog(
+            json!({"name": "db__cleanup", "inputSchema": schema,
+                "annotations": {"destructiveHint": false}}),
+            json!({"name": "db__send_report", "inputSchema": schema,
+                "annotations": {"destructiveHint": false}}),
+            json!({"name": "db__tidy", "inputSchema": schema}),
+        );
+        let held: BTreeSet<_> = check(profile, &after)
+            .unwrap()
+            .into_iter()
+            .filter(ask_holds)
+            .filter_map(|event| event["tool"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            held,
+            BTreeSet::from(["db__cleanup".to_string(), "db__tidy".to_string()])
+        );
     }
 
     #[test]
     fn a_legacy_pin_without_hints_never_counts_as_a_gate_downgrade() {
         let legacy = Pin::from(PinRepr::Legacy("v1:old".into()));
         let now = json!({"name": "db__delete_rows", "annotations": {"destructiveHint": false}});
-        assert!(!gate_downgrade(&legacy, &now, "db__delete_rows"));
+        assert!(!gate_downgrade(&legacy, &now, "db__delete_rows", None));
         // The server prefix is not the tool's name.
         let pinned = pin_of(&json!({"name": "post__tidy", "inputSchema": {"type": "object"}}));
         let now = json!({"name": "post__tidy", "annotations": {"destructiveHint": false}});
-        assert!(!gate_downgrade(&pinned, &now, "post__tidy"));
+        assert!(!gate_downgrade(&pinned, &now, "post__tidy", None));
     }
 
     #[test]

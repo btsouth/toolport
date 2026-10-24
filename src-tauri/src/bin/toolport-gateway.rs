@@ -41059,6 +41059,18 @@ mod tests {
         .unwrap();
         assert_eq!(maybe_check_integrity(&registry, &downgraded, profile).unwrap(), None);
         assert_eq!(held(), Some(BTreeSet::new()));
+
+        // Off never holds it.
+        let off = Some("off-gate-downgrade");
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Off);
+        let registry = Arc::new(Mutex::new(reg));
+        assert_eq!(maybe_check_integrity(&registry, &before, off).unwrap(), None);
+        assert_eq!(maybe_check_integrity(&registry, &downgraded, off).unwrap(), None);
+        assert_eq!(
+            effective_quarantine(&registry, off, &AtomicBool::new(false)),
+            Some(BTreeSet::new())
+        );
     }
 
     #[test]

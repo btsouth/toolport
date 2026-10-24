@@ -34,6 +34,9 @@ pub struct ToolDefinition {
     /// for client compatibility. Drift pins use this, so a Toolport update that changes the
     /// rewriting never looks like the server changing its tools.
     pub(crate) source_input_schema: Option<String>,
+    /// The downstream tool name the call gate judges, when the catalog shows another
+    /// (an override rename or a shortened alias). Only policy catalogs set it.
+    pub(crate) gate_name: Option<String>,
 }
 impl ToolDefinition {
     pub(crate) fn with_arguments(
@@ -45,10 +48,15 @@ impl ToolDefinition {
             value,
             arguments,
             source_input_schema: None,
+            gate_name: None,
         }
     }
     pub(crate) fn with_source_input_schema(mut self, hash: Option<String>) -> Self {
         self.source_input_schema = hash;
+        self
+    }
+    pub(crate) fn with_gate_name(mut self, name: Option<String>) -> Self {
+        self.gate_name = name;
         self
     }
     pub fn new(value: Value) -> Self {
@@ -57,6 +65,7 @@ impl ToolDefinition {
             value,
             arguments: None,
             source_input_schema: None,
+            gate_name: None,
         }
     }
 }
@@ -187,6 +196,11 @@ pub trait ToolCatalog {
     fn pin_values(&self) -> Box<dyn Iterator<Item = (&Value, Option<&str>)> + '_> {
         Box::new(self.values().map(|tool| (tool, None)))
     }
+    /// The downstream name the call gate judges for the tool named `name`, when it
+    /// differs from the catalog name.
+    fn gate_name(&self, _name: &str) -> Option<&str> {
+        None
+    }
 }
 impl dyn ToolCatalog + '_ {
     pub fn iter(&self) -> Box<dyn Iterator<Item = &Value> + '_> {
@@ -218,6 +232,13 @@ impl ToolCatalog for SharedTools {
                 .iter()
                 .map(|tool| (&tool.value, tool.source_input_schema.as_deref())),
         )
+    }
+    fn gate_name(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .filter(|tool| tool.gate_name.is_some())
+            .find(|tool| tool.value.get("name").and_then(Value::as_str) == Some(name))
+            .and_then(|tool| tool.gate_name.as_deref())
     }
 }
 impl ToolCatalog for Vec<Value> {
