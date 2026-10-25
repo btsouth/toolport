@@ -27,6 +27,9 @@ pub struct CatalogEntry {
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<LaunchConfig>,
+    /// Optional live tool-call deadline copied into the installed server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
     pub url: Option<String>,
     /// Env-var names the server needs (treated as secrets when added).
     pub env_keys: Vec<String>,
@@ -209,6 +212,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         command: None,
         args: vec![],
         launch: None,
+        request_timeout_ms: None,
         url: Some(url.to_string()),
         env_keys: vec![],
         source: "curated".to_string(),
@@ -230,6 +234,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         command: None,
         args: vec![],
         launch: None,
+        request_timeout_ms: None,
         url: None,
         env_keys: vec![],
         source: "curated".to_string(),
@@ -249,6 +254,7 @@ pub fn curated() -> Vec<CatalogEntry> {
             command: Some(command.to_string()),
             args: args.iter().map(|s| s.to_string()).collect(),
             launch: None,
+            request_timeout_ms: None,
             url: None,
             env_keys: env.iter().map(|s| s.to_string()).collect(),
             source: "curated".to_string(),
@@ -409,6 +415,9 @@ pub fn curated() -> Vec<CatalogEntry> {
                 launch.revision = Some(2);
             }
             "agent-qa" => {
+                // Authoring verifies tests before returning; allow the documented
+                // 100-minute MCP budget instead of the 30-second stdio default.
+                e.request_timeout_ms = Some(6_000_000);
                 add_input(
                     "AGENT_QA_CONFIG",
                     "Project configuration file (absolute path)",
@@ -893,6 +902,7 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
                 command: None,
                 args: vec![],
                 launch: None,
+                request_timeout_ms: None,
                 url: Some(url.to_string()),
                 env_keys: vec![],
                 source: "registry".to_string(),
@@ -983,6 +993,7 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
             command: Some(command),
             args,
             launch: None,
+            request_timeout_ms: None,
             url: None,
             env_keys,
             source: "registry".to_string(),
@@ -1481,6 +1492,7 @@ mod tests {
             command: None,
             args: vec![],
             launch: None,
+            request_timeout_ms: None,
             url: Some("https://example.com/mcp".into()),
             env_keys: vec![],
             source: "registry".into(),

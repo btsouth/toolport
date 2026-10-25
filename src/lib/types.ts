@@ -451,6 +451,8 @@ export interface CatalogEntry {
   setupHint?: string;
   /** Placeholder for URL field when self-hosted (opens dialog on add). */
   urlHint?: string;
+  /** Optional live tool-call deadline in milliseconds. */
+  requestTimeoutMs?: number;
 }
 
 // --- Toolport registry (source of truth) ---
