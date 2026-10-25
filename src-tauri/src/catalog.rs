@@ -83,6 +83,7 @@ fn category_for(name: &str) -> &'static str {
         | "Fetch"
         | "Git"
         | "Playwright"
+        | "agent-qa"
         | "Sequential Thinking"
         | "Memory"
         | "Time"
@@ -178,6 +179,10 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
         "Filesystem" => (
             "",
             "Enter one allowed directory in Launch setup. Add more directories as literal arguments if needed.",
+        ),
+        "agent-qa" => (
+            "",
+            "Requires Node.js 24+. Initialize a project and configure its model credentials and browser or mobile dependencies. Enter the absolute path to agent-qa.config.yaml in Launch setup.",
         ),
         // OAuth: authorize in the browser, no manual token.
         "GitHub" | "Vercel" | "Sentry" | "Notion" | "Linear" | "Stripe" | "Postman" | "Trello"
@@ -322,6 +327,8 @@ pub fn curated() -> Vec<CatalogEntry> {
         cmd("Sequential Thinking", "Structured step-by-step reasoning for hard problems.", "npx", &["-y", "@modelcontextprotocol/server-sequential-thinking@1.0.0"], &[], "https://github.com/modelcontextprotocol/servers"),
         cmd("Memory", "A knowledge graph the agent reads and writes across sessions.", "npx", &["-y", "@modelcontextprotocol/server-memory@1.0.0"], &[], "https://github.com/modelcontextprotocol/servers"),
         cmd("Time", "Current time and timezone conversions.", "uvx", &["mcp-server-time@2026.10.10"], &[], "https://github.com/modelcontextprotocol/servers"),
+        // --- Application testing (configured project required) ---
+        cmd("agent-qa", "Natural-language web and mobile testing from vostride with advanced memidex memory and self-improvement.", "npx", &["-y", "agent-qa@0.2.3", "--config", "<launch-input>", "mcp"], &[], "https://vostride.com/docs/agent-qa/quickstart"),
     ];
     for e in &mut list {
         let template = e
@@ -400,6 +407,21 @@ pub fn curated() -> Vec<CatalogEntry> {
                     unknown_fields: Default::default(),
                 });
                 launch.revision = Some(2);
+            }
+            "agent-qa" => {
+                add_input(
+                    "AGENT_QA_CONFIG",
+                    "Project configuration file (absolute path)",
+                    false,
+                );
+                launch.bindings.push(ArgBinding {
+                    index: 3,
+                    parts: vec![ArgPart::Input {
+                        key: "AGENT_QA_CONFIG".into(),
+                        unknown_fields: Default::default(),
+                    }],
+                    unknown_fields: Default::default(),
+                });
             }
             "Browserbase" => {
                 launch.required_env = vec![
