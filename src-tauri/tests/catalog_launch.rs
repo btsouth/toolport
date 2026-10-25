@@ -825,6 +825,7 @@ fn live_public_catalog_connections() {
         "Cloudflare Docs",
         "Parallel Search",
         "Keenable",
+        "deed.page",
         "Context7",
     ] {
         let added = controller::add_catalog_entry(

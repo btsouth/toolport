@@ -87,9 +87,10 @@ and this permission notice appear in all copies.
 
 ## Vendor marks
 
-The Apify, Browserbase, Composio, Context7, DataForSEO, Keenable, Parallel and
-Playwright marks are taken from each project's own website. They are used only
-to identify the corresponding server and remain the property of their owners.
+The Apify, Browserbase, Composio, Context7, DataForSEO, deed.page, Keenable,
+Parallel and Playwright marks are taken from each project's own website. They
+are used only to identify the corresponding server and remain the property of
+their owners.
 
 ## Client vendor marks
 

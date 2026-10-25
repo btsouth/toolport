@@ -14,6 +14,7 @@ describe("serverLogoKey", () => {
     expect(serverLogoKey("Redis")).toBe("redis");
     expect(serverLogoKey("Jira Production")).toBe("jira");
     expect(serverLogoKey("Keenable")).toBe("keenable");
+    expect(serverLogoKey("deed.page")).toBe("deedpage");
   });
 
   it("gives the reference servers an icon only as the leading word", () => {

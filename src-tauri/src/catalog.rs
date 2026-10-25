@@ -65,6 +65,7 @@ fn category_for(name: &str) -> &'static str {
         | "Vercel"
         | "Sentry"
         | "Cloudflare Docs"
+        | "deed.page"
         | "AWS"
         | "Kubernetes"
         | "Linode"
@@ -264,6 +265,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         http("GitHub", "Repos, issues, PRs, and code search.", "https://api.githubcopilot.com/mcp/", "https://github.com/github/github-mcp-server"),
         http("Vercel", "Projects, deployments, and logs on Vercel.", "https://mcp.vercel.com", "https://vercel.com/docs/mcp/vercel-mcp"),
         cmd("Vercel (Full API)", "Toolport overlay: 333 Vercel endpoints including the writes the official MCP omits (env vars, domains/DNS, the deploy lifecycle).", "npx", &["-y", "toolport-mcp-servers@0.3.0", "vercel"], &["VERCEL_TOKEN"], "https://github.com/btsouth/toolport-mcp-servers"),
+        http("deed.page", "Publish HTML or a folder of files to a public URL, then update, roll back, or delete it. No account or API key required.", "https://deed.page/mcp", "https://deed.page/docs"),
         http("Sentry", "Errors, issues, and releases from Sentry.", "https://mcp.sentry.dev/mcp", "https://docs.sentry.io"),
         http("Cloudflare Docs", "Search Cloudflare's documentation.", "https://docs.mcp.cloudflare.com/mcp", "https://developers.cloudflare.com/agents/model-context-protocol/"),
         cmd("Cloudflare (Full API)", "Toolport overlay: 357 Cloudflare control-plane endpoints as named tools (DNS, email routing, zones, WAF, SSL, cache, R2, Access) for per-tool approval.", "npx", &["-y", "toolport-mcp-servers@0.3.0", "cloudflare"], &["CLOUDFLARE_API_TOKEN"], "https://github.com/btsouth/toolport-mcp-servers"),

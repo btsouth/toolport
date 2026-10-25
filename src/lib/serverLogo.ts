@@ -41,6 +41,7 @@ const NAME_LOGO: [RegExp, string][] = [
   [/composio/i, "composio"],
   [/context7/i, "context7"],
   [/dataforseo/i, "dataforseo"],
+  [/deed\.page/i, "deedpage"],
   [/deepwiki/i, "deepwiki"],
   [/firecrawl/i, "firecrawl"],
   [/keenable/i, "keenable"],
