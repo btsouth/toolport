@@ -25,8 +25,11 @@
 //!   object per line. This is what lets a test assert exactly what bytes the
 //!   gateway sent downstream, which is the regression net for the envelope
 //!   transparency work (SOU-444).
-//! - `MOCK_MCP_WIRE_TRACE`: timestamped receive and response-flush events for
-//!   concurrent fixtures, separate from the request transcript.
+//! - `MOCK_MCP_WIRE_TRACE`: a timestamped `started` event from every child,
+//!   plus receive and response-flush events for concurrent fixtures, separate
+//!   from the request transcript. Every event carries the child's pid and
+//!   working directory, so a rooted launch-count failure can name the root an
+//!   unexpected child started in.
 //! - `MOCK_MCP_FAIL_STARTS=<n>` with `MOCK_MCP_START_COUNTER=<path>` — the first
 //!   `n` starts exit before the handshake, like a server launched before the
 //!   network is up. The counter file records every start, so a test can also
@@ -229,6 +232,9 @@ fn trace(cfg: &Config, event: &str, message: &Value) {
     };
     let entry = json!({
         "pid": std::process::id(),
+        "cwd": std::env::current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default(),
         "timeUs": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_micros(),
@@ -1047,6 +1053,8 @@ fn main() {
 fn serve_stdio() {
     fail_start_if_configured();
     let cfg = Config::from_env();
+    // A child that never reads a request still shows up in the trace.
+    trace(&cfg, "started", &Value::Null);
     if let Some(delay) = cfg.start_delay {
         // Separate OS process loading from the catalog delay measured by a test.
         if let Some(release) = &cfg.start_release {

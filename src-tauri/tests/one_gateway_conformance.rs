@@ -638,6 +638,34 @@ fn mock_server_entry(id: &str, transcript: &Path, cwd: Option<&str>) -> ServerEn
     }
 }
 
+/// [`mock_server_entry`] with `MOCK_MCP_WIRE_TRACE` set, so every child logs a
+/// `started` event with its pid and working directory. A rooted launch-count
+/// failure can then say which root an extra `initialize` came from (#925).
+fn traced_mock_server_entry(
+    id: &str,
+    transcript: &Path,
+    trace: &Path,
+    cwd: Option<&str>,
+) -> ServerEntry {
+    let mut entry = mock_server_entry(id, transcript, cwd);
+    entry.env.push(EnvVar {
+        key: "MOCK_MCP_WIRE_TRACE".to_string(),
+        value: Some(trace.display().to_string()),
+        secret: false,
+        unknown_fields: Default::default(),
+    });
+    entry
+}
+
+/// The transcript and wire trace a rooted launch-count assertion prints.
+fn launch_evidence(transcript: &Path, trace: &Path) -> String {
+    format!(
+        "transcript:\n{}\nwire trace:\n{}",
+        std::fs::read_to_string(transcript).unwrap_or_default(),
+        std::fs::read_to_string(trace).unwrap_or_default()
+    )
+}
+
 fn profile(id: &str, enabled: &[&str]) -> Profile {
     Profile {
         id: id.to_string(),
@@ -3302,9 +3330,15 @@ fn matrix_pooling_equal_resource_uris_keep_rooted_subscriptions_separate() {
     let root_a = fixture.add("root-a");
     let root_b = fixture.add("root-b");
     let transcript = dir.join("downstream.jsonl");
+    let trace = dir.join("downstream.wire.jsonl");
     write_registry(
         &dir,
-        vec![mock_server_entry("mock", &transcript, Some("${ROOT}"))],
+        vec![traced_mock_server_entry(
+            "mock",
+            &transcript,
+            &trace,
+            Some("${ROOT}"),
+        )],
         vec![],
     );
     let options = |root| AdapterOptions {
@@ -3374,8 +3408,8 @@ fn matrix_pooling_equal_resource_uris_keep_rooted_subscriptions_separate() {
     assert_eq!(
         transcript_initialize_count(&transcript),
         2,
-        "unexpected rooted downstream initialization\ntranscript:\n{}\nroot A:\n{}\nroot B:\n{}",
-        std::fs::read_to_string(&transcript).unwrap_or_default(),
+        "unexpected rooted downstream initialization\n{}\nroot A:\n{}\nroot B:\n{}",
+        launch_evidence(&transcript, &trace),
         a.diagnostics(),
         b.diagnostics()
     );
@@ -3706,9 +3740,15 @@ fn matrix_pooling_live_root_change_drops_the_old_resource_subscription() {
     let root_a = std::fs::canonicalize(fixture.add("root-a")).expect("root A");
     let root_b = std::fs::canonicalize(fixture.add("root-b")).expect("root B");
     let transcript = dir.join("downstream.jsonl");
+    let trace = dir.join("downstream.wire.jsonl");
     write_registry(
         &dir,
-        vec![mock_server_entry("mock", &transcript, Some("${ROOT}"))],
+        vec![traced_mock_server_entry(
+            "mock",
+            &transcript,
+            &trace,
+            Some("${ROOT}"),
+        )],
         vec![],
     );
     let mut client = spawn_adapter(
@@ -3744,7 +3784,13 @@ fn matrix_pooling_live_root_change_drops_the_old_resource_subscription() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(client.roots_queries.load(Ordering::Relaxed) > queries_before);
-    assert_eq!(transcript_initialize_count(&transcript), 2);
+    assert_eq!(
+        transcript_initialize_count(&transcript),
+        2,
+        "unexpected rooted downstream initialization\n{}\n{}",
+        launch_evidence(&transcript, &trace),
+        client.diagnostics()
+    );
     assert_eq!(
         transcript_method_count(&transcript, "resources/subscribe"),
         1,
