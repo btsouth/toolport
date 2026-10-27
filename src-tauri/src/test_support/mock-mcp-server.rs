@@ -1051,10 +1051,11 @@ fn main() {
 }
 
 fn serve_stdio() {
-    fail_start_if_configured();
     let cfg = Config::from_env();
-    // A child that never reads a request still shows up in the trace.
+    // Before the simulated start failure, so a child that never reads a
+    // request, or exits before the handshake, still shows up in the trace.
     trace(&cfg, "started", &Value::Null);
+    fail_start_if_configured();
     if let Some(delay) = cfg.start_delay {
         // Separate OS process loading from the catalog delay measured by a test.
         if let Some(release) = &cfg.start_release {
