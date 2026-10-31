@@ -994,7 +994,7 @@ fn catalog_server(entry: crate::catalog::CatalogEntry) -> ServerEntry {
         source: Some(format!("catalog:{}", entry.source)),
         disabled_tools: Vec::new(),
         client_credentials: None,
-        request_timeout_ms: None,
+        request_timeout_ms: entry.request_timeout_ms,
         initialize_timeout_ms: None,
         launch: entry.launch,
         unknown_fields: serde_json::Map::new(),
@@ -4636,6 +4636,39 @@ API_KEY = "synthetic-first-origin"
                 assert!(verification.servers.is_empty());
             }
             Err(error) => assert!(error.contains("locate the Toolport gateway"), "{error}"),
+        }
+    }
+
+    #[test]
+    fn catalog_timeout_survives_install_and_registry_reload() {
+        let _fixture = MoveFixture::new(&Registry::default());
+        let entry = crate::catalog::search_curated("agent-qa")
+            .into_iter()
+            .find(|entry| entry.name == "agent-qa")
+            .unwrap();
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["requestTimeoutMs"], 6_000_000);
+        let entry = serde_json::from_value(json).unwrap();
+        let registry = add_catalog_entry(entry).unwrap();
+        let server_id = &registry.servers[0].id;
+        let reloaded = registry::load().unwrap();
+        let server = reloaded
+            .servers
+            .iter()
+            .find(|s| &s.id == server_id)
+            .unwrap();
+        assert_eq!(server.request_timeout_ms, Some(6_000_000));
+        assert!(!server.enabled, "the required config path is still missing");
+
+        for entry in crate::catalog::curated()
+            .into_iter()
+            .filter(|e| e.name != "agent-qa")
+        {
+            assert!(serde_json::to_value(&entry)
+                .unwrap()
+                .get("requestTimeoutMs")
+                .is_none());
+            assert_eq!(catalog_server(entry).request_timeout_ms, None);
         }
     }
 

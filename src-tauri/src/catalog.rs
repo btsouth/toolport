@@ -27,6 +27,9 @@ pub struct CatalogEntry {
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<LaunchConfig>,
+    /// Optional live tool-call deadline copied into the installed server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
     pub url: Option<String>,
     /// Env-var names the server needs (treated as secrets when added).
     pub env_keys: Vec<String>,
@@ -83,6 +86,7 @@ fn category_for(name: &str) -> &'static str {
         | "Fetch"
         | "Git"
         | "Playwright"
+        | "agent-qa"
         | "Sequential Thinking"
         | "Memory"
         | "Time"
@@ -179,6 +183,10 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
             "",
             "Enter one allowed directory in Launch setup. Add more directories as literal arguments if needed.",
         ),
+        "agent-qa" => (
+            "",
+            "Requires Node.js 24+. Initialize a project and configure its model credentials and browser or mobile dependencies. Enter the absolute path to agent-qa.config.yaml in Launch setup.",
+        ),
         // OAuth: authorize in the browser, no manual token.
         "GitHub" | "Vercel" | "Sentry" | "Notion" | "Linear" | "Stripe" | "Postman" | "Trello"
         | "Airtable" | "Todoist" | "Apify" => (
@@ -204,6 +212,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         command: None,
         args: vec![],
         launch: None,
+        request_timeout_ms: None,
         url: Some(url.to_string()),
         env_keys: vec![],
         source: "curated".to_string(),
@@ -225,6 +234,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         command: None,
         args: vec![],
         launch: None,
+        request_timeout_ms: None,
         url: None,
         env_keys: vec![],
         source: "curated".to_string(),
@@ -244,6 +254,7 @@ pub fn curated() -> Vec<CatalogEntry> {
             command: Some(command.to_string()),
             args: args.iter().map(|s| s.to_string()).collect(),
             launch: None,
+            request_timeout_ms: None,
             url: None,
             env_keys: env.iter().map(|s| s.to_string()).collect(),
             source: "curated".to_string(),
@@ -322,6 +333,8 @@ pub fn curated() -> Vec<CatalogEntry> {
         cmd("Sequential Thinking", "Structured step-by-step reasoning for hard problems.", "npx", &["-y", "@modelcontextprotocol/server-sequential-thinking@1.0.0"], &[], "https://github.com/modelcontextprotocol/servers"),
         cmd("Memory", "A knowledge graph the agent reads and writes across sessions.", "npx", &["-y", "@modelcontextprotocol/server-memory@1.0.0"], &[], "https://github.com/modelcontextprotocol/servers"),
         cmd("Time", "Current time and timezone conversions.", "uvx", &["mcp-server-time@2026.10.10"], &[], "https://github.com/modelcontextprotocol/servers"),
+        // --- Application testing (configured project required) ---
+        cmd("agent-qa", "Natural-language web and mobile tests from vostride.", "npx", &["-y", "agent-qa@0.2.3", "--config", "<launch-input>", "mcp"], &[], "https://vostride.com/docs/agent-qa/quickstart"),
     ];
     for e in &mut list {
         let template = e
@@ -400,6 +413,24 @@ pub fn curated() -> Vec<CatalogEntry> {
                     unknown_fields: Default::default(),
                 });
                 launch.revision = Some(2);
+            }
+            "agent-qa" => {
+                // Authoring verifies tests before returning; allow the documented
+                // 100-minute MCP budget instead of the 30-second stdio default.
+                e.request_timeout_ms = Some(6_000_000);
+                add_input(
+                    "AGENT_QA_CONFIG",
+                    "Project configuration file (absolute path)",
+                    false,
+                );
+                launch.bindings.push(ArgBinding {
+                    index: 3,
+                    parts: vec![ArgPart::Input {
+                        key: "AGENT_QA_CONFIG".into(),
+                        unknown_fields: Default::default(),
+                    }],
+                    unknown_fields: Default::default(),
+                });
             }
             "Browserbase" => {
                 launch.required_env = vec![
@@ -871,6 +902,7 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
                 command: None,
                 args: vec![],
                 launch: None,
+                request_timeout_ms: None,
                 url: Some(url.to_string()),
                 env_keys: vec![],
                 source: "registry".to_string(),
@@ -961,6 +993,7 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
             command: Some(command),
             args,
             launch: None,
+            request_timeout_ms: None,
             url: None,
             env_keys,
             source: "registry".to_string(),
@@ -1459,6 +1492,7 @@ mod tests {
             command: None,
             args: vec![],
             launch: None,
+            request_timeout_ms: None,
             url: Some("https://example.com/mcp".into()),
             env_keys: vec![],
             source: "registry".into(),

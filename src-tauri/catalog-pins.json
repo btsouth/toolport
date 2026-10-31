@@ -118,5 +118,10 @@
     "version": "2026.10.10",
     "integrity": "sha256-32983d5193af219359ccdac46c558bed75f9c930360e7437cc040a73984cc17c",
     "url": "https://files.pythonhosted.org/packages/a2/ed/a4fed01271866397abcb8ca76f0f47a76e63122142ac177b99cc78e4e53b/mcp_server_time-2026.10.10-py3-none-any.whl"
+  },
+  "npx:agent-qa": {
+    "version": "0.2.3",
+    "integrity": "sha512-Rg4/P8KLs0ujWt8HTd+9wl3TY0svalH1uL2GOuuUY1Lkz7bCuVPD/jpes2fJBAwMDyEub9bwzljWNGfbbcOCWg==",
+    "url": "https://registry.npmjs.org/agent-qa/-/agent-qa-0.2.3.tgz"
   }
 }

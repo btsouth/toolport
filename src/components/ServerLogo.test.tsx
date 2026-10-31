@@ -3,6 +3,7 @@ import { serverLogoKey } from "@/lib/serverLogo";
 
 describe("serverLogoKey", () => {
   it("maps curated providers and full API variants to their marks", () => {
+    expect(serverLogoKey("agent-qa")).toBe("agent-qa");
     expect(serverLogoKey("Stripe (Full API)")).toBe("stripe");
     expect(serverLogoKey("Cloudflare Docs")).toBe("cloudflare");
     expect(serverLogoKey("Linear")).toBe("linear");
