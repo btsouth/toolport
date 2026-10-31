@@ -296,7 +296,7 @@
   "Dismiss forever": "不再提示",
   "Dismiss this alert": "关闭此警报",
   "Download the new .deb from the release page, then run sudo apt install ./<file>.deb.": "从发布页面下载新的 .deb，然后运行 sudo apt install ./<file>.deb。",
-  "Download the new .rpm from the release page, then run sudo dnf install ./<file>.rpm.": "从发布页面下载新的 .rpm，然后运行 ​​sudo dnf install ./<file>.rpm。",
+  "Download the new .rpm from the release page, then run sudo dnf install ./<file>.rpm.": "从发布页面下载新的 .rpm，然后运行 sudo dnf install ./<file>.rpm。",
   "Droid skills": "Droid 技能",
   "Each client shares the servers and profiles you manage here.": "每个客户端共享您在此处管理的服务器和配置方案。",
   "Each decision applies to this member and the exact content shown. Held servers stay off. Safety floors can tighten immediately.": "每项决定仅适用于此成员和所显示的确切内容。暂缓启用的服务器会保持关闭。最低安全级别则可能立即收紧。",

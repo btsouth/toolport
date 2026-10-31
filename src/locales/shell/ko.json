@@ -215,7 +215,7 @@
   "safety": "안전",
   "Safety": "안전",
   "Safety is set to Ask. Destructive calls need your approval before they run.": "안전 수준이 확인으로 설정되어 있습니다. 파괴적인 호출은 실행 전에 승인이 필요합니다.",
-  "Safety is set to Off. Toolport does not ask before destructive calls. Server sign-in and client permissions may still ask for approval.": "안전이 꺼짐으로 설정되어 있습니다. Toolport은 파괴적인 호출 전에 묻지 않습니다. 서버 로그인 및 클라이언트 권한은 여전히 ​​승인을 요청할 수 있습니다.",
+  "Safety is set to Off. Toolport does not ask before destructive calls. Server sign-in and client permissions may still ask for approval.": "안전이 꺼짐으로 설정되어 있습니다. Toolport은 파괴적인 호출 전에 묻지 않습니다. 서버 로그인 및 클라이언트 권한은 여전히 승인을 요청할 수 있습니다.",
   "Safety is set to Strict. Destructive tools are hidden and untrusted calls need your approval.": "안전 수준이 엄격으로 설정되어 있습니다. 파괴적인 도구는 숨겨지며 신뢰할 수 없는 호출에는 승인이 필요합니다.",
   "Safety level": "안전 수준",
   "Scoped clients": "범위가 지정된 클라이언트",

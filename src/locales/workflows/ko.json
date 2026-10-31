@@ -31,7 +31,7 @@
   "{value1}-managed {value2}": "{value1} 관리형 {value2}",
   "{value1}Back": "{value1}뒤로",
   "<masked secret>": "<마스킹된 비밀 값>",
-  "A Toolport Teams server holds the shared server list and its config. Each person still vaults their own credentials on their own machine.": "Toolport Teams 서버는 공유 서버 목록과 해당 구성을 보유합니다. 각 사람은 여전히 ​​자신의 컴퓨터에 자신의 자격 증명을 보관합니다.",
+  "A Toolport Teams server holds the shared server list and its config. Each person still vaults their own credentials on their own machine.": "Toolport Teams 서버는 공유 서버 목록과 해당 구성을 보유합니다. 각 사람은 여전히 자신의 컴퓨터에 자신의 자격 증명을 보관합니다.",
   "Accept": "수락",
   "Accept {title}": "{title} 수락",
   "Accept only the content you recognize. Each decision applies to this member and the exact change shown.": "귀하가 인식하는 콘텐츠만 수락하세요. 각 결정은 이 구성원과 표시된 정확한 변경 사항에 적용됩니다.",

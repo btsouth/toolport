@@ -8,7 +8,7 @@
   "\nCold catalog": "\nCatálogo frío",
   "\nDispatch: {value0}": "\nDespacho: {value0}",
   "\nExcluded history: {value0} catalog records ({value1} with byte measurements). Session identity and repeat loads cannot be verified.": "\nHistorial excluido: {value0} registros de catálogo ({value1} con medidas de bytes). No se pueden verificar la identidad de la sesión y las cargas repetidas.",
-  "\nOlder estimated records: {value0} legacy tokens and {value1} size-based tokens, excluded.": "\nRegistros estimados más antiguos: {value0} tokens heredados y {value1} tokens basados ​​en tamaño, excluidos.",
+  "\nOlder estimated records: {value0} legacy tokens and {value1} size-based tokens, excluded.": "\nRegistros estimados más antiguos: {value0} tokens heredados y {value1} tokens basados en tamaño, excluidos.",
   "\nRun: {value0}": "\nEjecutar: {value0}",
   "\nWarm catalog": "\nCatálogo cálido",
   "\n{value0} baseline tokens − {value1} catalog response tokens − {value2} search response tokens = {value3} net tokens saved.\n{value4} client sessions; {value5} catalog responses; {value6} search responses.\n{value7} baseline catalog text; {value8} catalog text sent; {value9} search text sent.": "\n{value0} tokens de referencia − {value1} tokens de respuesta del catálogo − {value2} tokens de respuesta de búsqueda = {value3} tokens netos ahorrados.\n{value4} sesiones de cliente; {value5} respuestas del catálogo; {value6} respuestas de búsqueda.\n{value7} texto de referencia del catálogo; {value8} texto del catálogo enviado; {value9} texto de búsqueda enviado.",

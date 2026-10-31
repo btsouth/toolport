@@ -361,7 +361,7 @@
   "Gateway publication incomplete": "Publicação do gateway incompleta",
   "Gemini skills": "Habilidades do Gemini",
   "Get {value0}": "Obtenha {value0}",
-  "Gives this server every variable from your shell, such as AWS, GitHub or kube settings. When off it gets only PATH, HOME and other basics, plus the variables you set.": "Fornece a este servidor todas as variáveis do seu shell, como configurações AWS, GitHub ou kube. Quando desativado, obtém apenas PATH, HOME e outros itens básicos, além das variáveis ​​que você definiu.",
+  "Gives this server every variable from your shell, such as AWS, GitHub or kube settings. When off it gets only PATH, HOME and other basics, plus the variables you set.": "Fornece a este servidor todas as variáveis do seu shell, como configurações AWS, GitHub ou kube. Quando desativado, obtém apenas PATH, HOME e outros itens básicos, além das variáveis que você definiu.",
   "Goose skills": "Habilidades do Goose",
   "Grok built-in": "Integrada ao Grok",
   "Grok folder": "Pasta do Grok",
