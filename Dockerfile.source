@@ -9,6 +9,9 @@ WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config libssl-dev libdbus-1-dev \
     && rm -rf /var/lib/apt/lists/*
+# cargo auditable embeds the crate list in the binary so image scanners
+# (Trivy, Grype, cargo audit bin) can see the gateway's Rust dependencies.
+RUN cargo install cargo-auditable --locked --version 0.7.7
 
 COPY src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/build.rs ./src-tauri/
 # Cargo validates declared example targets even for a gateway-only build.
@@ -21,12 +24,12 @@ RUN mkdir -p src/bin src/test_support && \
     printf 'fn main() {}\n' > src/main.rs && \
     printf 'fn main() {}\n' > src/bin/toolport-gateway.rs && \
     printf 'fn main() {}\n' > src/test_support/mock-mcp-server.rs && \
-    cargo build --release --bin toolport-gateway --no-default-features --features search-static
+    cargo auditable build --release --locked --bin toolport-gateway --no-default-features --features search-static
 
 COPY src-tauri/assets/search ./assets/search
 COPY src-tauri/src ./src
 RUN touch src/lib.rs src/main.rs src/bin/toolport-gateway.rs src/test_support/mock-mcp-server.rs && \
-    cargo build --release --bin toolport-gateway --no-default-features --features search-static
+    cargo auditable build --release --locked --bin toolport-gateway --no-default-features --features search-static
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
