@@ -76,6 +76,8 @@ pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// A single request may legitimately run long (a slow downstream call), so the
 /// HTTP budget is generous; the listen stream is separate and reconnects.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+// Bound replayed handshakes so EOF never waits for the full user-request budget.
+const RECOVERY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A subscription's reply stays open for the life of the subscription, so it has
 /// no overall deadline. The daemon sends a keepalive every 30 seconds; three
 /// missed ones mean it is gone.
@@ -83,6 +85,8 @@ const SUBSCRIPTION_READ_TIMEOUT: Duration = Duration::from_secs(90);
 /// How often the adapter checks that its daemon still answers. Also the check-in
 /// that keeps an attached daemon from idling out.
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
+const IDLE_RECOVERY_MAX_DELAY: Duration = Duration::from_secs(60);
+const IDLE_RECOVERY_HEALTHY_RESET: Duration = Duration::from_secs(60);
 /// A private gateway boots a whole router before it announces itself; a cold
 /// daemon on a loaded runner has taken tens of seconds to do the same.
 const PRIVATE_GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -711,6 +715,18 @@ impl Session {
     /// already has its answer, but an error in its reply fails the replay. A
     /// transport failure marks the daemon lost and is returned as-is.
     fn post(&self, body: &str, forward: bool) -> Result<(), ExchangeError> {
+        self.post_with_timeout(body, forward, self.request_timeout)
+    }
+
+    fn post_with_timeout(
+        &self,
+        body: &str,
+        forward: bool,
+        timeout: Duration,
+    ) -> Result<(), ExchangeError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(ExchangeError::Failed("the adapter is closed".to_string()));
+        }
         let message = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
         let id = message.get("id").filter(|id| !id.is_null());
         let expects_reply = id.is_some() && message.get("method").is_some();
@@ -730,7 +746,7 @@ impl Session {
             None => crate::http_client::agent()
                 .post(&url)
                 .config()
-                .timeout_global(Some(self.request_timeout))
+                .timeout_global(Some(timeout))
                 .build(),
         };
         let mut request = self.with_identity(
@@ -898,6 +914,9 @@ impl Session {
             .recovery
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::SeqCst) {
+            return Err("the adapter is closed".to_string());
+        }
         if stale >= DAEMON_WEDGED {
             let wedged = self
                 .wedged_endpoint
@@ -925,6 +944,9 @@ impl Session {
                 }
             }
         }
+        if self.closed.load(Ordering::SeqCst) {
+            return Err("the adapter is closed".to_string());
+        }
         let lifetime_endpoint = self
             .lifetime_endpoint
             .lock()
@@ -949,7 +971,12 @@ impl Session {
             .ok()
             .and_then(|value| value.clone());
         if let Some(body) = initialize {
-            self.post(&body, false).map_err(reopen)?;
+            self.post_with_timeout(
+                &body,
+                false,
+                self.request_timeout.min(RECOVERY_HANDSHAKE_TIMEOUT),
+            )
+            .map_err(reopen)?;
             if self.session_id().is_none() {
                 return Err(
                     "the host daemon session could not be reopened: no session id was issued"
@@ -963,7 +990,12 @@ impl Session {
             .ok()
             .and_then(|value| value.clone());
         if let Some(body) = initialized {
-            self.post(&body, false).map_err(reopen)?;
+            self.post_with_timeout(
+                &body,
+                false,
+                self.request_timeout.min(RECOVERY_HANDSHAKE_TIMEOUT),
+            )
+            .map_err(reopen)?;
         }
         Ok(())
     }
@@ -1020,7 +1052,20 @@ impl Session {
     /// Close the daemon-side session on client EOF so its per-session state is
     /// released immediately rather than waiting for a lease TTL.
     fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        {
+            // Order EOF against gate replacement and the start of idle recovery.
+            let _gate = self
+                .gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.closed.store(true, Ordering::SeqCst);
+        }
+        // Wait only for recovery, not the read gate held by long-running calls.
+        // If recovery already selected a replacement, close that connection too.
+        let _serial = self
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let descriptor = self.descriptor();
         let _ = self
             .with_identity(
@@ -1362,6 +1407,56 @@ fn report_request_error(session: &Session, request: &serde_json::Value, error: &
 /// A private connection owns this adapter's calls across sessionless MRTR rounds.
 /// The ingress detects process death on this socket, including after a round ended.
 impl Session {
+    /// Recover only while idle; in-flight calls finish on their original session.
+    /// Mark loss even during backoff so foreground calls can recover immediately.
+    /// Return whether a recovery was attempted, regardless of its outcome.
+    fn recover_idle(
+        &self,
+        descriptor: &DaemonDescriptor,
+        health: crate::daemon::Health,
+        retry_due: bool,
+    ) -> bool {
+        let gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::SeqCst) || self.descriptor().endpoint != descriptor.endpoint {
+            return false;
+        }
+        if health == crate::daemon::Health::Gone {
+            self.stale.fetch_max(DAEMON_LOST, Ordering::SeqCst);
+        } else if health != crate::daemon::Health::Answering
+            || self.stale.load(Ordering::SeqCst) != DAEMON_LOST
+        {
+            // An answering replacement may still need its failed handshake, but
+            // an overlapping foreground recovery may already have completed it.
+            return false;
+        }
+        if !retry_due {
+            return false;
+        }
+        let current = Arc::clone(&gate);
+        let Ok(_idle) = current.try_write() else {
+            return false;
+        };
+        drop(gate);
+        if self.closed.load(Ordering::SeqCst) {
+            return false;
+        }
+        if self
+            .stale
+            .compare_exchange(DAEMON_LOST, HEALTHY, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+        if let Err(error) = self.recover(DAEMON_LOST) {
+            self.stale.fetch_max(DAEMON_LOST, Ordering::SeqCst);
+            crate::gatewaylog::append(&error);
+        }
+        true
+    }
+
     fn ensure_lifetime_stream(&self) {
         if let Err(error) = self.open_lifetime_stream() {
             crate::gatewaylog::append(&error);
@@ -1369,6 +1464,9 @@ impl Session {
     }
 
     fn open_lifetime_stream(&self) -> Result<(), String> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let descriptor = self.descriptor();
         let mut endpoint = self
             .lifetime_endpoint
@@ -1469,21 +1567,55 @@ fn spawn_listen_stream(session: Arc<Session>) {
     });
 }
 
-/// The daemon leaves once nothing has reached it for its idle grace. A legacy
-/// session holds its listen stream open, but a modern client has no standing
-/// connection, so the adapter checks in well inside the grace for as long as its
-/// client is attached.
-///
-/// The same check is the liveness test. The daemon answers it outside its
-/// request workers, so silence for [`crate::daemon::SILENT_RETRY_TIMEOUT`]
-/// means it is wedged, and the next request moves to a private gateway. A
-/// daemon that is gone is left to the request path, which re-finds it.
+/// Retry idle recovery with bounded backoff, retaining it across rapid crashes.
+struct IdleRecoveryBackoff {
+    next_attempt: Instant,
+    delay: Duration,
+    healthy_since: Option<Instant>,
+}
+
+impl IdleRecoveryBackoff {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_attempt: now,
+            delay: LIVENESS_INTERVAL,
+            healthy_since: None,
+        }
+    }
+
+    fn retry_due(&self, now: Instant) -> bool {
+        now >= self.next_attempt
+    }
+
+    fn attempted(&mut self, finished: Instant) {
+        self.next_attempt = finished + self.delay;
+        self.delay = (self.delay * 2).min(IDLE_RECOVERY_MAX_DELAY);
+        self.healthy_since = None;
+    }
+
+    fn unhealthy(&mut self) {
+        self.healthy_since = None;
+    }
+
+    fn answering(&mut self, now: Instant) {
+        let healthy_since = self.healthy_since.get_or_insert(now);
+        if now.duration_since(*healthy_since) >= IDLE_RECOVERY_HEALTHY_RESET {
+            self.delay = LIVENESS_INTERVAL;
+            self.next_attempt = now;
+        }
+    }
+}
+
+/// Keep the daemon alive and probe outside its request workers. A gone daemon is
+/// re-found while idle under the session gate; a silent daemon is marked wedged.
+/// Recovery backs off until the same endpoint answers for a sustained interval.
 fn spawn_heartbeat(session: Arc<Session>) {
     let interval =
         (crate::daemon::idle_grace() / 5).clamp(Duration::from_millis(100), LIVENESS_INTERVAL);
     std::thread::spawn(move || {
         let mut answered = Instant::now();
         let mut watched = session.descriptor().endpoint;
+        let mut backoff = IdleRecoveryBackoff::new(answered);
         loop {
             std::thread::sleep(interval);
             if session.closed.load(Ordering::SeqCst) {
@@ -1494,11 +1626,14 @@ fn spawn_heartbeat(session: Arc<Session>) {
             if descriptor.endpoint != watched {
                 watched = descriptor.endpoint.clone();
                 answered = Instant::now();
+                backoff.unhealthy();
             }
-            match crate::daemon::probe_health(&descriptor) {
+            let health = crate::daemon::probe_health(&descriptor);
+            match health {
                 crate::daemon::Health::Silent
                     if answered.elapsed() >= crate::daemon::SILENT_RETRY_TIMEOUT =>
                 {
+                    backoff.unhealthy();
                     crate::gatewaylog::append(&format!(
                         "adapter: daemon pid {} silent for {}s, moving to a private gateway",
                         descriptor.pid,
@@ -1507,8 +1642,21 @@ fn spawn_heartbeat(session: Arc<Session>) {
                     session.mark_wedged(&descriptor.endpoint);
                     answered = Instant::now();
                 }
-                crate::daemon::Health::Silent => {}
-                crate::daemon::Health::Answering | crate::daemon::Health::Gone => {
+                crate::daemon::Health::Silent => backoff.unhealthy(),
+                crate::daemon::Health::Answering
+                    if session.stale.load(Ordering::SeqCst) != DAEMON_LOST =>
+                {
+                    backoff.answering(Instant::now());
+                    answered = Instant::now();
+                }
+                crate::daemon::Health::Gone | crate::daemon::Health::Answering => {
+                    backoff.unhealthy();
+                    if session.recover_idle(&descriptor, health, backoff.retry_due(Instant::now()))
+                    {
+                        // Successful launches also back off until sustained health
+                        // proves that the daemon is no longer in a crash loop.
+                        backoff.attempted(Instant::now());
+                    }
                     answered = Instant::now();
                 }
             }
@@ -1902,26 +2050,46 @@ mod tests {
         }
     }
 
+    type DeletedRequest = (String, Option<String>);
+
     /// A loopback stand-in for the daemon's `/mcp` endpoint that answers each POST
     /// from a script and records what it received.
     struct ScriptedDaemon {
         endpoint: String,
         posted: Arc<Mutex<Vec<Posted>>>,
+        lifetime_requests: Arc<AtomicUsize>,
+        deleted: Arc<Mutex<Vec<DeletedRequest>>>,
     }
 
     impl ScriptedDaemon {
         fn start(script: impl Fn(&Posted) -> Answer + Send + Sync + 'static) -> Self {
+            Self::start_with_identity(script, None)
+        }
+
+        fn start_with_identity(
+            script: impl Fn(&Posted) -> Answer + Send + Sync + 'static,
+            identity: Option<crate::daemon::DaemonIdentity>,
+        ) -> Self {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let endpoint = listener.local_addr().unwrap().to_string();
             let posted = Arc::new(Mutex::new(Vec::new()));
             let script = Arc::new(script);
             let record = Arc::clone(&posted);
+            let lifetime_requests = Arc::new(AtomicUsize::new(0));
+            let lifetime_record = Arc::clone(&lifetime_requests);
+            let deleted = Arc::new(Mutex::new(Vec::new()));
+            let delete_record = Arc::clone(&deleted);
             std::thread::spawn(move || {
                 for stream in listener.incoming().map_while(Result::ok) {
                     let script = Arc::clone(&script);
                     let record = Arc::clone(&record);
+                    let identity = identity.clone();
+                    let lifetime_record = Arc::clone(&lifetime_record);
+                    let delete_record = Arc::clone(&delete_record);
                     std::thread::spawn(move || {
                         let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut request_line = String::new();
+                        reader.read_line(&mut request_line).unwrap();
                         let mut length = 0;
                         let mut session = None;
                         let mut connection = None;
@@ -1942,6 +2110,26 @@ mod tests {
                                     _ => {}
                                 }
                             }
+                        }
+                        if request_line.starts_with("DELETE ") {
+                            delete_record.lock().unwrap().push((request_line, session));
+                            let mut stream = stream;
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
+                            );
+                            return;
+                        }
+                        if request_line.starts_with("GET ") {
+                            let body = if request_line.contains("/adapter/lifetime ") {
+                                lifetime_record.fetch_add(1, Ordering::SeqCst);
+                                String::new()
+                            } else {
+                                serde_json::to_string(&identity.as_ref().unwrap()).unwrap()
+                            };
+                            let mut stream = stream;
+                            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                            return;
                         }
                         let mut body = vec![0; length];
                         reader.read_exact(&mut body).unwrap();
@@ -1967,7 +2155,12 @@ mod tests {
                     });
                 }
             });
-            Self { endpoint, posted }
+            Self {
+                endpoint,
+                posted,
+                lifetime_requests,
+                deleted,
+            }
         }
 
         fn posted(&self, method: &str) -> Vec<Posted> {
@@ -2101,6 +2294,260 @@ mod tests {
     }
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn idle_recovery_backs_off_across_rapid_crashes_and_resets_after_stable_health() {
+        let start = Instant::now();
+        let mut backoff = IdleRecoveryBackoff::new(start);
+        let mut attempts = Vec::new();
+        // Simulate a successful launch at each retry, followed by a short healthy
+        // spell and another crash. Launch success must not reset the delay.
+        for seconds in 0..=196 {
+            let now = start + Duration::from_secs(seconds);
+            if seconds % 5 == 0 {
+                backoff.unhealthy();
+                if backoff.retry_due(now) {
+                    attempts.push(seconds);
+                    backoff.attempted(now);
+                }
+            } else {
+                backoff.answering(now);
+            }
+        }
+        assert_eq!(attempts, [0, 5, 15, 35, 75, 135, 195]);
+        assert_eq!(backoff.delay, IDLE_RECOVERY_MAX_DELAY);
+        // A continuous healthy interval is required; one good probe is not enough.
+        let healthy = start + Duration::from_secs(200);
+        backoff.unhealthy();
+        backoff.answering(healthy);
+        backoff.answering(healthy + IDLE_RECOVERY_HEALTHY_RESET - Duration::from_secs(1));
+        assert_eq!(backoff.delay, IDLE_RECOVERY_MAX_DELAY);
+        backoff.answering(healthy + IDLE_RECOVERY_HEALTHY_RESET);
+        assert_eq!(backoff.delay, LIVENESS_INTERVAL);
+        let recovered = healthy + IDLE_RECOVERY_HEALTHY_RESET;
+        assert!(backoff.retry_due(recovered));
+        // Slow attempts schedule the next retry from completion, not their start.
+        let finished = recovered + Duration::from_secs(20);
+        backoff.attempted(finished);
+        assert!(!backoff.retry_due(finished + LIVENESS_INTERVAL - Duration::from_nanos(1)));
+        assert!(backoff.retry_due(finished + LIVENESS_INTERVAL));
+    }
+
+    #[test]
+    fn eof_waits_for_a_started_handshake_and_deletes_its_new_session() {
+        let _env = crate::registry::DataDirTestEnv::new("adapter-eof-handshake");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let held = Arc::clone(&release);
+        let daemon = ScriptedDaemon::start(move |posted| {
+            assert_eq!(posted.message["method"], "initialize");
+            started_tx.send(()).unwrap();
+            let (lock, ready) = &*held;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = ready.wait(released).unwrap();
+            }
+            Answer::result(posted, serde_json::json!({})).with_session("new-session".into())
+        });
+        let sink = Sink::default();
+        let session = Arc::new(scripted_session(&daemon, &sink, TEST_TIMEOUT));
+        session.remember_handshake(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#);
+        session.remember_handshake(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        *session.session_id.lock().unwrap() = Some("old".into());
+        let recovering = Arc::clone(&session);
+        let worker = std::thread::spawn(move || {
+            let gate = recovering.current_gate();
+            let _exclusive = gate.write().unwrap();
+            recovering.recover(SESSION_REFUSED)
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let closing = Arc::clone(&session);
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            closing.close();
+            closed_tx.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.closed.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "EOF did not arrive");
+            std::thread::yield_now();
+        }
+        assert!(closed_rx.try_recv().is_err());
+        {
+            let (lock, ready) = &*release;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+        assert!(worker.join().unwrap().is_err());
+        closed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        closer.join().unwrap();
+        assert_eq!(daemon.posted("initialize").len(), 1);
+        assert!(daemon.posted("notifications/initialized").is_empty());
+        assert!(daemon
+            .deleted
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(request, session)| request.starts_with("DELETE /mcp ")
+                && session.as_deref() == Some("new-session")));
+        assert!(sink.messages().is_empty());
+    }
+
+    #[test]
+    fn eof_prevents_a_recovery_waiting_for_the_serial_gate() {
+        let env = crate::registry::DataDirTestEnv::new("adapter-eof-recovery");
+        let compat = CompatKey::new("test", env.dir.to_string_lossy());
+        let daemon = ScriptedDaemon::start_with_identity(
+            |posted| Answer::result(posted, serde_json::json!({})).with_session("new".into()),
+            Some(crate::daemon::DaemonIdentity {
+                compat: compat.fingerprint(),
+                protocol: crate::daemon::PROTOCOL_GENERATION,
+                pid: std::process::id(),
+                gateway_version: env!("CARGO_PKG_VERSION").to_string(),
+                telemetry: None,
+            }),
+        );
+        let descriptor = DaemonDescriptor::new(&daemon.endpoint, "test-token", &compat);
+        let rendezvous = Rendezvous::new(&env.dir, compat);
+        crate::daemon::write_descriptor(&rendezvous.descriptor_path(), &descriptor).unwrap();
+        let session = Arc::new(Session::new(rendezvous, descriptor.clone(), None));
+        session.remember_handshake(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#);
+        *session.session_id.lock().unwrap() = Some("old".into());
+        let serial = session.recovery.lock().unwrap();
+        let recovering = Arc::clone(&session);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let gate = recovering.current_gate();
+            let _exclusive = gate.write().unwrap();
+            started_tx.send(()).unwrap();
+            recovering.recover(DAEMON_LOST)
+        });
+        // The worker holds the write gate and can only wait on the serial gate.
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let closing = Arc::clone(&session);
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            closing.close();
+            closed_tx.send(()).unwrap();
+        });
+        while !session.closed.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "EOF did not mark the adapter closed"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            closed_rx.try_recv().is_err(),
+            "close must wait for recovery cleanup"
+        );
+        drop(serial);
+        assert!(worker.join().unwrap().is_err());
+        closed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        closer.join().unwrap();
+        assert!(daemon.posted("initialize").is_empty());
+        assert_eq!(daemon.deleted.lock().unwrap().len(), 2);
+        assert!(session.exchange(&tool_call(2)).is_err());
+        assert!(daemon.posted("tools/call").is_empty());
+    }
+
+    #[test]
+    fn heartbeat_adopts_a_replacement_without_a_client_request() {
+        let env = crate::registry::DataDirTestEnv::new("adapter-idle-recovery");
+        let compat = CompatKey::new("test", env.dir.to_string_lossy());
+        let initializes = AtomicUsize::new(0);
+        let replacement = ScriptedDaemon::start_with_identity(
+            move |posted| match posted.message["method"].as_str() {
+                Some("initialize") if initializes.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    Answer::body(503, serde_json::json!({ "error": "retry initialize" }))
+                }
+                Some("initialize") => Answer::result(
+                    posted,
+                    serde_json::json!({ "protocolVersion": "2024-11-05" }),
+                )
+                .with_session("replacement-session".to_string()),
+                Some("notifications/initialized") => Answer::accepted(),
+                _ => panic!("recovery must not send a user request"),
+            },
+            Some(crate::daemon::DaemonIdentity {
+                compat: compat.fingerprint(),
+                protocol: crate::daemon::PROTOCOL_GENERATION,
+                pid: std::process::id(),
+                gateway_version: env!("CARGO_PKG_VERSION").to_string(),
+                telemetry: None,
+            }),
+        );
+        let old_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let old = DaemonDescriptor::new(
+            old_listener.local_addr().unwrap().to_string(),
+            "old-token",
+            &compat,
+        );
+        drop(old_listener);
+        let rendezvous = Rendezvous::new(&env.dir, compat.clone());
+        let descriptor = DaemonDescriptor::new(&replacement.endpoint, "test-token", &compat);
+        crate::daemon::write_descriptor(&rendezvous.descriptor_path(), &descriptor).unwrap();
+        let mut session = Session::new(rendezvous, old.clone(), None);
+        let sink = Sink::default();
+        session.stdout = Mutex::new(Box::new(sink.clone()));
+        session.request_timeout = TEST_TIMEOUT;
+        session.remember_handshake(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#);
+        session.remember_handshake(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        *session.session_id.lock().unwrap() = Some("old-session".to_string());
+        *session.lifetime_endpoint.lock().unwrap() = Some(old.endpoint.clone());
+
+        // Idle recovery must not displace a gate owned by an in-flight call.
+        let gate = session.current_gate();
+        let in_flight = gate.read().unwrap();
+        assert!(!session.recover_idle(&old, crate::daemon::Health::Gone, true));
+        assert_eq!(session.descriptor().endpoint, old.endpoint);
+        assert!(replacement.posted("initialize").is_empty());
+        assert_eq!(session.stale.load(Ordering::SeqCst), DAEMON_LOST);
+        drop(in_flight);
+        // Backoff still publishes loss without touching the replacement endpoint.
+        assert!(!session.recover_idle(&old, crate::daemon::Health::Gone, false));
+        assert!(replacement.posted("initialize").is_empty());
+        assert_eq!(session.stale.load(Ordering::SeqCst), DAEMON_LOST);
+
+        let session = Arc::new(session);
+        struct StopHeartbeat(Arc<AtomicBool>);
+        impl Drop for StopHeartbeat {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _stop = StopHeartbeat(Arc::clone(&session.closed));
+        spawn_heartbeat(Arc::clone(&session));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while session.stale.load(Ordering::SeqCst) != HEALTHY
+            || session.session_id().as_deref() != Some("replacement-session")
+            || replacement.posted("notifications/initialized").is_empty()
+            || replacement.lifetime_requests.load(Ordering::SeqCst) < 2
+        {
+            assert!(Instant::now() < deadline, "idle recovery did not finish");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(session.descriptor().endpoint, replacement.endpoint);
+        // The fixture closes each lifetime stream; another idle heartbeat must
+        // reopen it on the replacement, with no foreground request or replay.
+        assert!(replacement.lifetime_requests.load(Ordering::SeqCst) >= 2);
+        // Identity is healthy after the first failed initialize. The heartbeat
+        // must retry that handshake without waiting for a foreground request.
+        assert_eq!(replacement.posted("initialize").len(), 2);
+        assert!(sink.messages().is_empty(), "handshake replies stay private");
+        // A delayed probe for the old endpoint must not replay another handshake.
+        assert!(!session.recover_idle(&old, crate::daemon::Health::Gone, true));
+        assert_eq!(replacement.posted("initialize").len(), 2);
+        assert!(!session.recover_idle(
+            &session.descriptor(),
+            crate::daemon::Health::Answering,
+            true,
+        ));
+        assert_eq!(replacement.posted("initialize").len(), 2);
+        assert_eq!(session.stale.load(Ordering::SeqCst), HEALTHY);
+        session.closed.store(true, Ordering::SeqCst);
+    }
 
     #[test]
     fn one_shot_posts_close_the_http_connection() {
