@@ -27,6 +27,21 @@ const placeholders = (value) =>
     .map((match) => match[1])
     .sort()
     .join(",");
+// Zero-width spaces, BOMs and bidi embedding, override and isolate controls have no place
+// in a translation unless the source carries them. Soft hyphens and joiners stay allowed.
+const hiddenCharacters = /[\u200B\uFEFF\u202A-\u202E\u2066-\u2069]/gu;
+const addedHiddenCharacters = (key, value) => {
+  const counts = (text) => {
+    const result = new Map();
+    for (const [character] of text.matchAll(hiddenCharacters))
+      result.set(character, (result.get(character) ?? 0) + 1);
+    return result;
+  };
+  const source = counts(key);
+  return [...counts(value)]
+    .filter(([character, count]) => count > (source.get(character) ?? 0))
+    .map(([character]) => character);
+};
 
 // Auth tokens are credentials; all other token messages describe model usage.
 export function isLlmTokenMessage(key) {
@@ -73,6 +88,10 @@ export function checkMessageIntegrity(key, value) {
   if (JSON.stringify(edges(key)) !== JSON.stringify(edges(value)))
     errors.push("whitespace mismatch");
   if (placeholders(key) !== placeholders(value)) errors.push("invalid placeholders");
+  for (const character of addedHiddenCharacters(key, value))
+    errors.push(
+      `hidden character U+${character.codePointAt(0).toString(16).toUpperCase().padStart(4, "0")}`,
+    );
   for (const literal of protectedLiterals(key)) {
     // A preserved prefix is not the same URL/path (example.com.evil or
     // ~/project-renamed). Protocol-only examples deliberately allow a suffix.

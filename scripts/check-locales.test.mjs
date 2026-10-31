@@ -193,6 +193,30 @@ test("message boundaries preserve intentional source whitespace", () => {
     assert.match(checkMessageIntegrity(key, value).join("\n"), /whitespace mismatch/);
 });
 
+test("translations cannot add hidden characters", () => {
+  // Machine translation leaves zero-width spaces next to code, so a copied command breaks.
+  for (const [key, value, codePoint] of [
+    ["Run sudo dnf install", "\u200B\u200B运行 sudo dnf install", "200B"],
+    ["Open settings", "Abrir\u200B configurações", "200B"],
+    ["Save", "\uFEFFSpeichern", "FEFF"],
+    ["Save", "\u202ESpeichern", "202E"],
+    ["Save", "Speichern\u2066", "2066"],
+    ["Copy \u200Bthis", "Copier \u200Bceci\u200B", "200B"],
+  ])
+    assert.match(
+      checkMessageIntegrity(key, value).join("\n"),
+      new RegExp(`hidden character U\\+${codePoint}\\b`),
+    );
+  // Typography a language needs, and characters the source already carries, stay allowed.
+  for (const [key, value] of [
+    ["Configuration", "Konfigu\u00ADration"],
+    ["Toolport app", "Toolport\u2060-App"],
+    ["Team \u{1F469}\u200D\u{1F4BB}", "Équipe \u{1F469}\u200D\u{1F4BB}"],
+    ["Copy \u200Bthis", "Copier \u200Bceci"],
+  ])
+    assert.deepEqual(checkMessageIntegrity(key, value), []);
+});
+
 test("versions, URLs, code, paths and protocol methods survive translation verbatim", () => {
   const samples = [
     ["Toolport v{version}", "Toolport gegen {version}"],
