@@ -16,10 +16,9 @@ ignore = [
     # `ZipArchive::extract`. zip 4.6.1 comes from tauri-plugin-updater, which
     # calls `extract` only on Windows and only on a download whose minisign
     # signature already matched our updater key, so the archive is our own
-    # release artifact. zip 8.6.0 comes from candle-core, which only reads
-    # entries by name and never calls `extract`. The fix needs zip >=9, which
-    # neither crate allows yet (updater requires ^4, candle ^8.6). Remove when
-    # both move to zip 9.
+    # release artifact. The fix needs zip >=9, which the updater does not allow
+    # yet (it requires ^4). candle-core already uses zip 9. Remove when
+    # tauri-plugin-updater moves to zip 9.
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
