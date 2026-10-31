@@ -128,6 +128,7 @@ fn name_has_word(name: &str, needle: &str) -> bool {
 fn server_logo_key(name: &str) -> Option<&'static str> {
     let name = name.to_lowercase();
     [
+        ("agent-qa", "agent-qa"),
         ("stripe", "stripe"),
         ("github", "github"),
         ("vercel", "vercel"),
@@ -209,6 +210,7 @@ fn server_logo_key(name: &str) -> Option<&'static str> {
 
 pub(super) fn server_logo(name: &str, transport: &str) -> gtk::Image {
     let bytes: Option<&'static [u8]> = match server_logo_key(name) {
+        Some("agent-qa") => Some(include_bytes!("../../icons/server-logos/agent-qa.png")),
         Some("stripe") => Some(include_bytes!("../../icons/server-logos/stripe.png")),
         Some("github") => Some(include_bytes!("../../icons/server-logos/github.png")),
         Some("vercel") => Some(include_bytes!("../../icons/server-logos/vercel.png")),

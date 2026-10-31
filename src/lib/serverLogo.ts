@@ -1,4 +1,5 @@
 const NAME_LOGO: [RegExp, string][] = [
+  [/agent-qa/i, "agent-qa"],
   [/stripe/i, "stripe"],
   [/github/i, "github"],
   [/vercel/i, "vercel"],

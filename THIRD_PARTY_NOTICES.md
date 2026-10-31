@@ -91,6 +91,9 @@ The Apify, Browserbase, Composio, Context7, DataForSEO, Keenable, Parallel and
 Playwright marks are taken from each project's own website. They are used only
 to identify the corresponding server and remain the property of their owners.
 
+The agent-qa mark is taken from [vostride’s official brand asset](https://vostride.com/brand/vostride-colored-logo.svg).
+It is used only to identify the corresponding server and remains the property of vostride.
+
 ## Client vendor marks
 
 The Crush, Jan, Witsy and ZCode client icons are taken from each project's own

@@ -334,7 +334,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         cmd("Memory", "A knowledge graph the agent reads and writes across sessions.", "npx", &["-y", "@modelcontextprotocol/server-memory@1.0.0"], &[], "https://github.com/modelcontextprotocol/servers"),
         cmd("Time", "Current time and timezone conversions.", "uvx", &["mcp-server-time@2026.10.10"], &[], "https://github.com/modelcontextprotocol/servers"),
         // --- Application testing (configured project required) ---
-        cmd("agent-qa", "Natural-language web and mobile testing from vostride with advanced memidex memory and self-improvement.", "npx", &["-y", "agent-qa@0.2.3", "--config", "<launch-input>", "mcp"], &[], "https://vostride.com/docs/agent-qa/quickstart"),
+        cmd("agent-qa", "Natural-language web and mobile tests from vostride.", "npx", &["-y", "agent-qa@0.2.3", "--config", "<launch-input>", "mcp"], &[], "https://vostride.com/docs/agent-qa/quickstart"),
     ];
     for e in &mut list {
         let template = e
