@@ -163,7 +163,7 @@ pub fn begin_run(dir: &Path) -> Option<PreviousExit> {
             else {
                 continue;
             };
-            if marker.process.pid == me || marker.process.is_alive() {
+            if marker.process.is_alive() {
                 continue;
             }
             let _ = std::fs::remove_file(&path);
@@ -228,9 +228,11 @@ pub fn end_run_cleanly(dir: &Path) {
     let _ = std::fs::remove_file(marker_path(dir, std::process::id()));
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod tests {
     use super::*;
+
+    static RUN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn scratch(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -244,6 +246,9 @@ mod tests {
 
     #[test]
     fn a_dead_run_without_a_clean_exit_is_reported_with_its_panic() {
+        let _run = RUN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch("unclean");
         let me = ProcessId::of(std::process::id()).unwrap();
         // A run whose pid is now someone else: same pid, another start time.
@@ -289,6 +294,42 @@ mod tests {
         // A clean exit leaves nothing for the next start to report.
         end_run_cleanly(&dir);
         assert!(!marker_path(&dir, me.pid).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reused_own_pid_is_reported_and_a_live_run_is_preserved() {
+        let _run = RUN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch("reused-pid");
+        let me = ProcessId::of(std::process::id()).unwrap();
+        std::fs::create_dir_all(dir.join(RUNS_DIR)).unwrap();
+        let path = marker_path(&dir, me.pid);
+        std::fs::write(
+            &path,
+            serde_json::to_string(&RunMarker {
+                process: ProcessId {
+                    pid: me.pid,
+                    start: me.start + 1,
+                },
+                started_at_ms: 5,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let exit = begin_run(&dir).expect("a stale start time is a different run");
+        assert_eq!(exit.pid, me.pid);
+        assert_eq!(exit.started_at_ms, 5);
+        let current: RunMarker =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(current.process, me);
+        assert!(
+            begin_run(&dir).is_none(),
+            "the live identity is not an exit"
+        );
+        assert!(path.exists());
+        end_run_cleanly(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

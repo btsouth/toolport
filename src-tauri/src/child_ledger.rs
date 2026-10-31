@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 pub struct ProcessId {
     pub pid: u32,
     /// Platform start time: clock ticks since boot on Linux, microseconds since
-    /// the epoch on macOS. Only ever compared with itself.
+    /// the epoch on macOS, 100-nanosecond intervals since 1601 on Windows.
+    /// Only ever compared with itself.
     pub start: u64,
 }
 
@@ -84,6 +85,10 @@ fn ledger_dir(dir: &Path) -> PathBuf {
 
 /// Start recording this process's children under `dir`.
 pub fn bind_data_dir(dir: &Path) {
+    // Windows uses Job Objects for child cleanup, so keep the ledger disabled.
+    if !cfg!(unix) {
+        return;
+    }
     let Some(owner) = ProcessId::of(std::process::id()) else {
         return;
     };
@@ -295,13 +300,47 @@ pub fn process_start(pid: u32) -> Option<u64> {
     (written == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
 }
 
+#[cfg(windows)]
+pub fn process_start(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE,
+    };
+
+    // SAFETY: The PID yields an owned process handle or null.
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        return None;
+    }
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: The handle is valid and all FILETIME outputs are writable.
+    let ok = unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) };
+    // SAFETY: The handle has synchronization access; a zero timeout never blocks.
+    let running = unsafe { WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT;
+    // SAFETY: Close the owned handle once, including when a query fails.
+    unsafe { CloseHandle(handle) };
+    // A live process has an undefined exit FILETIME; use its signal state.
+    (ok != 0 && running)
+        .then_some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
 /// No way to prove identity here, so nothing is ever recorded or signalled.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn process_start(_pid: u32) -> Option<u64> {
     None
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
 
@@ -328,6 +367,25 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn an_exited_process_with_a_retained_handle_is_not_alive() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(ProcessId::of(pid).is_none());
+        assert!(ProcessId::of(0).is_none());
+        let child_entry = ChildEntry {
+            process: ProcessId::of(std::process::id()).unwrap(),
+            tag: None,
+        };
+        assert!(!kill_orphan_group(&child_entry));
+    }
+
+    #[cfg(unix)]
     fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "toolport-ledger-{}-{}",
@@ -338,6 +396,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn write_ledger(dir: &Path, name: &str, owner: ProcessId, child: ChildEntry) {
         std::fs::write(
             ledger_dir(dir).join(format!("{name}.json")),
@@ -350,6 +409,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
     fn entry(pid: u32, tag: Option<&str>) -> ChildEntry {
         ChildEntry {
             process: ProcessId::of(pid).unwrap(),
@@ -357,6 +417,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_dead_owners_group_is_killed_and_a_live_owners_is_not() {
         use std::os::unix::process::CommandExt;
