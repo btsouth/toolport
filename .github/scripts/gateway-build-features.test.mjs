@@ -23,12 +23,33 @@ test("every production gateway builder includes the model without test hooks", (
     const commands = read(file)
       .replace(/\\\r?\n/g, " ")
       .split("\n")
-      .filter((line) => /cargo build/.test(line));
+      .filter((line) => /cargo (auditable )?build/.test(line));
     assert.ok(commands.length, `${file}: no build command found`);
     for (const command of commands) {
       assert.match(command, /--features [\w,-]*\bsearch-static\b/, file);
       assert.doesNotMatch(command, /test-support/, file);
     }
+  }
+});
+
+test("the shipped Docker gateway embeds its crate list for image scanners", () => {
+  for (const file of ["Dockerfile.source", ".github/workflows/docker-publish.yml"]) {
+    const source = read(file);
+    const commands = source
+      .replace(/\\\r?\n/g, " ")
+      .split("\n")
+      .filter((line) => /cargo (auditable )?build/.test(line));
+    assert.ok(commands.length, `${file}: no build command found`);
+    for (const command of commands) {
+      assert.match(command, /cargo auditable build/, file);
+      // The embedded crate list must describe Cargo.lock, not a fresh resolve.
+      assert.match(command, /--locked\b/, file);
+    }
+    assert.match(
+      source,
+      /cargo install cargo-auditable --locked --version \d+\.\d+\.\d+/,
+      file,
+    );
   }
 });
 
