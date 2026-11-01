@@ -730,7 +730,7 @@
   "Removed {value1}": "{value1} 제거됨",
   "Removed client credentials": "클라이언트 자격 증명이 제거되었습니다.",
   "Removed parameters: {parameters}": "제거된 매개변수: {parameters}",
-  "Rename the tool or replace its description as every client sees it, e.g. to neutralize a misleading or injection-laden description. The call still runs the original server tool.": "도구의 이름을 바꾸거나 모든 클라이언트가 볼 수 있는 설명을 바꾸십시오. 오해의 소지가 있거나 주입이 많은 설명을 무력화합니다. 호출은 여전히 ​​원래 서버 도구를 실행합니다.",
+  "Rename the tool or replace its description as every client sees it, e.g. to neutralize a misleading or injection-laden description. The call still runs the original server tool.": "도구의 이름을 바꾸거나 모든 클라이언트가 볼 수 있는 설명을 바꾸십시오. 오해의 소지가 있거나 주입이 많은 설명을 무력화합니다. 호출은 여전히 원래 서버 도구를 실행합니다.",
   "Replace <launch-input> with a literal argument before saving.": "저장하기 전에 <launch-input>를 리터럴 인수로 바꾸세요.",
   "Reports itself as: {label}": "자신을 다음과 같이 보고합니다: {label}",
   "Reports itself as: {value0}": "자신을 다음과 같이 보고합니다: {value0}",
