@@ -8986,12 +8986,14 @@ fn root_servers_in_scope(
 fn root_launch_keys(specs: &[ServerEntry], root: &str, secrets_generation: u64) -> Vec<LaunchKey> {
     specs
         .iter()
-        .map(|server| LaunchKey {
-            server: server.id.clone(),
-            kind: "stdio",
-            digest: registry::sha256_hex(
-                &effective_server_spec(server, Some(root), secrets_generation).to_string(),
-            ),
+        .map(|server| {
+            let spec = effective_server_spec(server, Some(root), secrets_generation);
+            LaunchKey {
+                server: server.id.clone(),
+                kind: "stdio",
+                digest: registry::sha256_hex(&spec.to_string()),
+                catalog: Some(catalog_cache_digest(&spec)),
+            }
         })
         .collect()
 }
@@ -11643,7 +11645,7 @@ fn cached_server_tools(catalogs: &HashMap<String, Value>, id: &str, spec: &Value
     catalogs
         .get(id)
         .filter(|entry| {
-            // Rooted launches store their full launch digest.
+            // Files written before #1286 keyed on the full launch digest.
             entry["spec"] == catalog_cache_digest(spec)
                 || entry["spec"] == registry::sha256_hex(&spec.to_string())
         })
@@ -11679,7 +11681,7 @@ fn save_server_catalogs_for_launches(router: &Router, profile: Option<&str>, key
                 let spec = keys
                     .iter()
                     .find(|key| key.server == id)
-                    .map(|key| key.digest.clone())
+                    .map(|key| key.catalog.clone().unwrap_or_else(|| key.digest.clone()))
                     .unwrap_or_else(|| {
                         catalog_cache_digest(router.launch_spec(&id).unwrap_or(&Value::Null))
                     });
@@ -24287,6 +24289,25 @@ mod tests {
         moved["url"] = json!("https://elsewhere.invalid/mcp");
         assert!(cached_server_tools(&catalogs, "remote", &moved).is_empty());
 
+        // Rooted views save under their launch keys, which hash the full spec.
+        let key = LaunchKey {
+            server: "remote".into(),
+            kind: "stdio",
+            digest: registry::sha256_hex(&spec.to_string()),
+            catalog: Some(catalog_cache_digest(&spec)),
+        };
+        let rooted = Router::new().with_shared_server_slot(&router.server_slot("remote").unwrap());
+        save_server_catalogs_for_launches(&rooted, Some("root:rotation"), &[key]);
+        assert_eq!(
+            cached_server_tools(
+                &load_server_catalogs(Some("root:rotation")),
+                "remote",
+                &rotated
+            ),
+            tools,
+            "a rotated secret must not discard a rooted server's cached catalog"
+        );
+
         // Files written before this change keyed on the full spec, and plain
         // servers hash exactly as before.
         std::fs::write(
@@ -25056,6 +25077,7 @@ mod tests {
             server: "cache".into(),
             kind: "stdio",
             digest: registry::sha256_hex(&spec.to_string()),
+            catalog: None,
         };
         // Rooted compositions share slots without inheriting their launch_specs map.
         let rooted = Router::new().with_shared_server_slot(&router.server_slot("cache").unwrap());
@@ -27403,6 +27425,7 @@ mod tests {
                 server: "s".into(),
                 kind: "stdio",
                 digest: "fixture".into(),
+                catalog: None,
             }];
             if rooted {
                 host.check_rooted_integrity(&mut router, &scope, &keys);
@@ -35641,6 +35664,7 @@ mod tests {
             server: "cache".into(),
             kind: "stdio",
             digest: "fixture-root-launch".into(),
+            catalog: None,
         };
         {
             let mut pool = state.root_launch_pool.lock().unwrap();
@@ -41717,6 +41741,7 @@ mod tests {
             server: "srv".into(),
             kind: "stdio",
             digest: "fixture".into(),
+            catalog: None,
         }];
         for (profile, hidden) in [(Some(scope.as_str()), true), (None, false)] {
             let data = DataDirTestEnv::new("rooted-hidden-review-retry");
@@ -43308,6 +43333,7 @@ mod tests {
             server: "srv".into(),
             kind: "stdio",
             digest: "fixture".into(),
+            catalog: None,
         }];
         for version in ["v1", "v2"] {
             seed_legacy_review(&data.dir, Some(&scope), version);
@@ -43359,6 +43385,7 @@ mod tests {
             server: "rooted".into(),
             kind: "stdio",
             digest: "fixture".into(),
+            catalog: None,
         }];
         *INTEGRITY_GATE_OBSERVER.lock().unwrap() = Some((
             std::thread::current().id(),

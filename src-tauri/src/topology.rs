@@ -123,6 +123,11 @@ pub struct LaunchKey {
     /// Digest over the launch parameters: command, args, resolved cwd, the NAMES of the
     /// env vars supplied, and the secrets generation. Never the env values.
     pub digest: String,
+    /// Credential-free digest for the per-server catalog cache, when the caller
+    /// knows the full launch spec. A rotated secret must not discard a cached
+    /// catalog (issue #1286); pooling still uses `digest`.
+    #[serde(skip)]
+    pub catalog: Option<String>,
 }
 
 impl LaunchKey {
@@ -159,6 +164,7 @@ impl LaunchKey {
             server: server.to_string(),
             kind: "stdio",
             digest: sha256_hex(&material),
+            catalog: None,
         }
     }
 
@@ -170,6 +176,7 @@ impl LaunchKey {
             server: server.to_string(),
             kind: "remote",
             digest: sha256_hex(&material),
+            catalog: None,
         }
     }
 }
