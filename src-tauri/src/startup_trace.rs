@@ -8,6 +8,36 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 static TRACE: OnceLock<u128> = OnceLock::new();
 static NEXT_SPAN: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_SINK: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Opt in only the current unit-test thread; workers never inherit its sink.
+#[cfg(test)]
+pub(crate) struct TestSinkGuard {
+    previous: Option<std::path::PathBuf>,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+impl TestSinkGuard {
+    pub(crate) fn set(dir: &std::path::Path) -> Self {
+        let previous = TEST_SINK.with(|sink| sink.replace(Some(dir.join("gateway.log"))));
+        Self {
+            previous,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestSinkGuard {
+    fn drop(&mut self) {
+        let _ = TEST_SINK.try_with(|sink| sink.replace(self.previous.take()));
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Stage {
     AdapterStart,
@@ -102,18 +132,19 @@ impl Span {
             self.started.elapsed().as_millis(),
             std::process::id(),
         );
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
+        if let Some(path) = TEST_SINK
+            .try_with(|sink| sink.borrow().clone())
+            .ok()
+            .flatten()
         {
-            if let Some(dir) = crate::registry::test_data_dir_override() {
-                crate::gatewaylog::queue_at(&dir.join("gateway.log"), &line);
-            } else {
-                // Fixture binaries have an explicit directory; integration-test
-                // parents using pure APIs need no diagnostic filesystem side effect.
-                #[cfg(all(not(test), feature = "test-support"))]
-                if crate::brand::env_var("TOOLPORT_DATA_DIR", "CONDUIT_DATA_DIR").is_some() {
-                    crate::gatewaylog::append(&line);
-                }
-            }
+            crate::gatewaylog::queue_at(&path, &line);
+        }
+        #[cfg(all(not(test), feature = "test-support"))]
+        if let Some(dir) = crate::brand::env_var("TOOLPORT_DATA_DIR", "CONDUIT_DATA_DIR") {
+            // Match registry's explicit-directory interpretation without borrowing
+            // an unrelated integration test's process-global override.
+            crate::gatewaylog::queue_at(&std::path::PathBuf::from(dir).join("gateway.log"), &line);
         }
         #[cfg(not(any(test, feature = "test-support")))]
         crate::gatewaylog::append(&line);
@@ -148,7 +179,7 @@ mod tests {
     #[test]
     fn diagnostic_without_a_test_directory_does_not_resolve_one() {
         let _lock = crate::registry::data_dir_test_lock();
-        assert!(crate::registry::test_data_dir_override().is_none());
+        assert!(TEST_SINK.with(|sink| sink.borrow().is_none()));
         let result: Result<(), ()> = Span::start(Stage::Discovery).finish(Err(()));
         assert!(result.is_err());
         drop(Span::start(Stage::FirstInput));
@@ -166,6 +197,7 @@ mod tests {
                 .as_nanos()
         ));
         let data = crate::registry::DataDirOverride::set(&dir);
+        let sink = TestSinkGuard::set(&dir);
         let mut spans = Vec::new();
         for success in [true, false] {
             let span = Span::start(Stage::InitializeResponse);
@@ -178,10 +210,25 @@ mod tests {
         let span = Span::start(Stage::FirstInput);
         spans.push((span.id, "aborted"));
         drop(span);
+        // An unrelated test thread does not own this process-global override.
+        std::thread::spawn(|| {
+            Span::start(Stage::Discovery).end(true);
+            drop(Span::start(Stage::TcpConnect));
+        })
+        .join()
+        .unwrap();
+        drop(sink);
+        Span::start(Stage::Discovery).end(true);
+        drop(Span::start(Stage::FirstInput));
         assert!(crate::telemetry::flush_for_test(
             std::time::Duration::from_secs(5)
         ));
         let log = std::fs::read_to_string(dir.join("gateway.log")).unwrap();
+        assert_eq!(
+            log.lines().count(),
+            spans.len() * 2,
+            "an unrelated thread must not write into this test's log"
+        );
         for (id, result) in spans {
             let marker = format!(" span={id} ");
             let records: Vec<_> = log.lines().filter(|line| line.contains(&marker)).collect();

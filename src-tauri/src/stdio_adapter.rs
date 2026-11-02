@@ -2179,6 +2179,7 @@ mod tests {
     fn initialize_null_id_errors_are_forwarded_and_traced_as_errors() {
         for status in [400, 200] {
             let env = crate::registry::DataDirTestEnv::new("startup-null-id-error");
+            let _sink = crate::startup_trace::TestSinkGuard::set(&env.dir);
             let reply = serde_json::json!({
                 "jsonrpc": "2.0", "id": null,
                 "error": { "code": -32600, "message": "fixture initialization error" }

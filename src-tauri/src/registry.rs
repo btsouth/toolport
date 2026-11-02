@@ -3127,18 +3127,6 @@ static DATA_DIR_OVERRIDE_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 static DATA_DIR_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
-
-/// Optional sink for diagnostic-only test records. Never resolves a real directory.
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn test_data_dir_override() -> Option<PathBuf> {
-    if !DATA_DIR_OVERRIDE_ACTIVE.load(Ordering::SeqCst) {
-        return None;
-    }
-    DATA_DIR_OVERRIDE
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-}
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 static DATA_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
