@@ -6,6 +6,49 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.3.2] - 2026-11-02
+
+Toolport 2.3.2 lets idle clients recover on their own after the shared gateway
+stops, and keeps OAuth servers' cached tools across token refreshes. It also
+fixes process checks on Windows, adds agent-qa to the server catalog and updates
+dependencies with security fixes.
+
+If you are on Toolport 1.24.x, this is also your update to Toolport 2. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+before updating.
+
+### Added
+
+- agent-qa, for natural-language web and mobile testing, is in the catalog under
+  Local tools. Thanks @pranshuchittora. (#1283)
+- `gateway.log` now records how long each stage of a stdio client's connection
+  took, so a client that hits its startup deadline shows what it was waiting
+  for. It records fixed stage names and timings, never credentials or request
+  contents. Thanks @1llum1n4t1s. (#1299)
+- The gateway container image now lists its Rust crates, so image scanners can
+  see them. Thanks @TechLuddite. (#1292)
+
+### Security
+
+- Updated tokio for RUSTSEC-2026-0386. Thanks @TechLuddite. (#1294)
+- Updated plist so quick-xml moves past RUSTSEC-2026-0194 and RUSTSEC-2026-0195.
+  Thanks @TechLuddite. (#1293)
+- Updated candle so the gateway uses zip 9 instead of a version with open
+  advisories. (#1295)
+
+### Fixed
+
+- An idle stdio client now recovers its session and notifications after the
+  shared gateway stops, without waiting for its next request. Restarts back off
+  from 5 seconds up to 60 seconds. Thanks @1llum1n4t1s. (#1289)
+- OAuth servers keep their cached tool list when their token refreshes. Before,
+  almost every cold start missed the cache. (#1296)
+- On Windows, a process that has exited no longer counts as running because
+  another process still holds a handle to it. Daemon run tracking and unclean
+  exit reports now work on Windows too. Thanks @1llum1n4t1s. (#1288, #1290)
+- Translations no longer contain hidden zero-width characters, and CI now rejects
+  them. Thanks @TechLuddite. (#1291)
+
 ## [2.3.1] - 2026-10-24
 
 Toolport 2.3.1 holds a destructive tool for review at Ask when its server stops
