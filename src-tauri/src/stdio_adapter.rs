@@ -978,8 +978,10 @@ impl Session {
 
     /// Start a private gateway and point this session at it.
     fn use_private_gateway(&self, wedged: &DaemonDescriptor) -> Result<(), String> {
+        // A private gateway boots a whole router, so it keeps its own readiness
+        // window. The budget still observes `stopping`, which keeps EOF prompt.
         let budget = crate::daemon::RecoveryBudget::new(
-            self.request_timeout.min(RECOVERY_HANDSHAKE_TIMEOUT),
+            self.request_timeout.min(PRIVATE_GATEWAY_READY_TIMEOUT),
             &self.stopping,
         );
         let (child, descriptor) = start_private_gateway_with_budget(
@@ -1025,11 +1027,14 @@ impl Session {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             let current = self.descriptor();
-            if wedged.as_ref() != Some(&current) {
+            if wedged.as_ref() == Some(&current) {
+                self.use_private_gateway(&current)?;
+            } else if self.session_id().is_some() {
                 // An overlapping recovery already moved this client.
                 return Ok(());
             }
-            self.use_private_gateway(&current)?;
+            // Otherwise a recovery moved this client but failed its handshake,
+            // so the session still has to be reopened below.
         } else if stale >= DAEMON_LOST {
             let known = self.descriptor();
             match self.rendezvous.ensure_known_with_budget(
@@ -1057,7 +1062,11 @@ impl Session {
             self.request_timeout.min(RECOVERY_HANDSHAKE_TIMEOUT),
             &self.stopping,
         );
-        self.open_lifetime_stream_with_budget(Some(&lifetime))?;
+        // Best effort, like the heartbeat that retries it: a missing lifetime
+        // stream must not fail the request that triggered this recovery.
+        if let Err(error) = self.open_lifetime_stream_with_budget(Some(&lifetime)) {
+            crate::gatewaylog::append(&error);
+        }
         // Discovery and stream setup must not consume the handshake's own cap.
         let budget = crate::daemon::RecoveryBudget::new(
             self.request_timeout.min(RECOVERY_HANDSHAKE_TIMEOUT),
@@ -2703,6 +2712,70 @@ mod tests {
         session.stale.store(SESSION_REFUSED, Ordering::SeqCst);
         assert!(session.exchange(&tool_call(3)).is_err());
         assert!(daemon.posted("initialize").is_empty());
+    }
+
+    fn replaying_session(daemon: &ScriptedDaemon, sink: &Sink, timeout: Duration) -> Session {
+        let session = scripted_session(daemon, sink, timeout);
+        *session.handshake_initialize.lock().unwrap() =
+            Some(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string());
+        session
+    }
+
+    fn moved_off_descriptor() -> DaemonDescriptor {
+        let compat = CompatKey::new("test", "moved-off");
+        DaemonDescriptor::new("127.0.0.1:1", "old-token", &compat)
+    }
+
+    #[test]
+    fn failed_handshake_after_leaving_a_wedged_daemon_is_retried() {
+        let _env = crate::registry::DataDirTestEnv::new("adapter-wedged-retry");
+        let daemon = ScriptedDaemon::start(|posted| {
+            Answer::result(posted, serde_json::json!({})).with_session("new".into())
+        });
+        let sink = Sink::default();
+        let session = replaying_session(&daemon, &sink, TEST_TIMEOUT);
+        // The private gateway started, then `initialize` failed: this client has
+        // already moved, but it has no session on its new descriptor.
+        *session.wedged_endpoint.lock().unwrap() = Some(moved_off_descriptor());
+        assert!(session.session_id().is_none());
+
+        session.recover(DAEMON_WEDGED).unwrap();
+
+        assert_eq!(session.session_id().as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn overlapping_recovery_keeps_a_session_it_already_opened() {
+        let _env = crate::registry::DataDirTestEnv::new("adapter-wedged-overlap");
+        let daemon = ScriptedDaemon::start(|posted| {
+            Answer::result(posted, serde_json::json!({})).with_session("new".into())
+        });
+        let sink = Sink::default();
+        let session = replaying_session(&daemon, &sink, TEST_TIMEOUT);
+        *session.wedged_endpoint.lock().unwrap() = Some(moved_off_descriptor());
+        *session.session_id.lock().unwrap() = Some("current".to_string());
+
+        session.recover(DAEMON_WEDGED).unwrap();
+
+        assert_eq!(session.session_id().as_deref(), Some("current"));
+        assert!(daemon.posted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_does_not_fail_when_the_lifetime_stream_cannot_open() {
+        let _env = crate::registry::DataDirTestEnv::new("adapter-lifetime-best-effort");
+        let daemon = ScriptedDaemon::start(|posted| {
+            Answer::result(posted, serde_json::json!({})).with_session("new".into())
+        });
+        let sink = Sink::default();
+        let session = replaying_session(&daemon, &sink, Duration::from_millis(500));
+        // A heartbeat holding this lock outlasts recovery's budget for the stream.
+        let _held = session.lifetime_endpoint.lock().unwrap();
+
+        session.recover(SESSION_REFUSED).unwrap();
+
+        assert_eq!(session.session_id().as_deref(), Some("new"));
+        assert_eq!(daemon.lifetime_requests.load(Ordering::SeqCst), 0);
     }
 
     #[test]
