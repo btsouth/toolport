@@ -551,7 +551,10 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rust-build-timings-${{ matrix.os }}-${{ matrix.group }}
-          path: src-tauri/target/cargo-timings/*.html
+          path: |
+            src-tauri/target/cargo-timings/*.html
+            .verify/client-conformance-failures/
+          include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
 

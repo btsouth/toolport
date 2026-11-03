@@ -1555,6 +1555,198 @@ fn matrix_lifecycle_adapter_eof_releases_the_session_and_lets_the_daemon_exit() 
 }
 
 #[test]
+fn matrix_lifecycle_eof_drains_pipelined_requests() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("eof-pipeline");
+    write_registry(&dir, vec![], vec![]);
+    let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+    client.initialize("eof-pipeline");
+    for id in 100..116 {
+        client.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"}));
+    }
+    client.close_stdin();
+    let mut replies = std::collections::HashSet::new();
+    while replies.len() < 16 {
+        let response = client.next_message();
+        let Some(id) = response["id"].as_i64() else {
+            continue;
+        };
+        assert!((100..116).contains(&id));
+        assert!(replies.insert(id), "duplicate reply: {response}");
+        assert!(
+            response.get("error").is_none(),
+            "queued reply at EOF: {response}"
+        );
+        assert!(response["result"]["tools"].is_array());
+    }
+    client.wait_exit(Duration::from_secs(20));
+}
+
+#[test]
+fn matrix_lifecycle_idle_recovery_delivers_fresh_catalog_notification() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("idle-recovery-notification");
+    let transcript = dir.join("fresh.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("fresh", &transcript, None)],
+        vec![],
+    );
+    let client_id = "matrix-idle-recovery";
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            client_id: Some(client_id),
+            startup_catalog_servers: &["fresh"],
+            ..AdapterOptions::default()
+        },
+    );
+    client.initialize(client_id);
+    client.wait_for_tool("__grow", Duration::from_secs(30));
+    assert!(!client
+        .tool_names()
+        .iter()
+        .any(|name| name == "fresh__greet"));
+
+    let session_records = || -> Vec<Value> {
+        std::fs::read_to_string(dir.join("audit.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|row| {
+                row["kind"] == "session" && row["client"] == format!("adapter:{client_id}")
+            })
+            .collect()
+    };
+    wait_until(
+        || {
+            session_records()
+                .iter()
+                .any(|row| row["phase"] == "start" && row["reason"] == "initialize")
+        },
+        "the original adapter session audit record",
+        Duration::from_secs(15),
+    );
+    let original_sessions: Vec<String> = session_records()
+        .iter()
+        .filter_map(|row| row["sessionId"].as_str().map(str::to_string))
+        .collect();
+    let original = wait_for_descriptor(&dir, Duration::from_secs(10));
+    let old_pid = original["pid"].as_u64().expect("original daemon pid");
+    assert_ne!(old_pid, u64::from(std::process::id()));
+    assert_ne!(old_pid, u64::from(client.child.id()));
+    let identity = probe_identity(
+        original["endpoint"].as_str().expect("endpoint"),
+        original["token"].as_str().expect("token"),
+    )
+    .expect("authenticate the fixture daemon before stopping it");
+    assert_eq!(identity["pid"], old_pid);
+    assert_eq!(identity["compat"], original["compat"]);
+
+    // No client request is sent after this point until the fresh notification.
+    kill_daemons(&dir);
+    wait_until(
+        || !pid_alive(old_pid),
+        "the original fixture daemon to exit",
+        Duration::from_secs(20),
+    );
+    let mut replacement_pid = None;
+    wait_until(
+        || {
+            let Some(descriptor) = first_descriptor(&dir) else {
+                return false;
+            };
+            let Some(pid) = descriptor["pid"].as_u64() else {
+                return false;
+            };
+            let log = std::fs::read_to_string(dir.join("gateway.log")).unwrap_or_default();
+            let announced = log.lines().any(|line| {
+                line.contains(&format!("pid={pid} role=daemon"))
+                    && line.contains(
+                        "background build: initial catalog announced; servers=[\"fresh\"]",
+                    )
+            });
+            let records = session_records();
+            let new_records: Vec<&Value> = records
+                .iter()
+                .filter(|row| {
+                    row["sessionId"]
+                        .as_str()
+                        .is_some_and(|id| !original_sessions.iter().any(|original| original == id))
+                })
+                .collect();
+            // Without an adapter lifetime holder, the gateway records each
+            // handshake POST as a sessionless request, including initialize.
+            let reinitialized = new_records
+                .iter()
+                .any(|row| row["phase"] == "start" && row["reason"] == "initialize")
+                || new_records
+                    .iter()
+                    .filter(|row| row["phase"] == "start" && row["reason"] == "sessionless_request")
+                    .filter(|start| {
+                        new_records.iter().any(|end| {
+                            end["sessionId"] == start["sessionId"]
+                                && end["phase"] == "close"
+                                && end["reason"] == "request_complete"
+                        })
+                    })
+                    .count()
+                    >= 2;
+            if pid != old_pid && announced && reinitialized {
+                replacement_pid = Some(pid);
+                true
+            } else {
+                false
+            }
+        },
+        "an idle replacement daemon and reinitialized adapter session",
+        Duration::from_secs(60),
+    );
+    assert_ne!(replacement_pid, Some(old_pid));
+
+    // Both startup builds adopt the mock before announcing their initial
+    // catalogs. They announce only tools/list_changed; the mock has not grown.
+    // A separate client triggers a prompt change without writing to the idle
+    // client, whose server scope remains unchanged across daemon replacement.
+    let mut producer = spawn_adapter(&dir, &AdapterOptions::default());
+    producer.initialize("matrix-idle-recovery-producer");
+    let grow = producer.wait_for_tool("__grow", Duration::from_secs(30));
+    producer.call_tool(&grow, json!({}));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let notification = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "no fresh prompt notification\n{}",
+            client.diagnostics()
+        );
+        let message = client
+            .observed_message(remaining)
+            .unwrap_or_else(|| panic!("no fresh prompt notification\n{}", client.diagnostics()));
+        assert!(
+            message.get("id").is_none(),
+            "unexpected response: {message}"
+        );
+        if message["method"] == "notifications/prompts/list_changed" {
+            break message;
+        }
+    };
+    assert_eq!(notification["jsonrpc"], "2.0");
+    assert!(notification.get("id").is_none());
+    client.wait_for_tool_where(
+        "the newly grown tool after idle recovery",
+        |name| name == "fresh__greet",
+        Duration::from_secs(30),
+    );
+    client.close_stdin();
+    client.wait_exit(Duration::from_secs(20));
+}
+
+#[test]
 fn matrix_lifecycle_a_stale_descriptor_does_not_stall_startup() {
     let _guard = CASE_LOCK
         .lock()
