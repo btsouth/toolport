@@ -13,7 +13,9 @@ done
 if [ "$mode" = arch ]; then
   pacman -U --noconfirm /packages/upgrade.pkg.tar.zst
 elif [ "$mode" = fedora ]; then
-  rpm -U --replacepkgs /packages/new.rpm
+  # Fedora 45's rpm requires a signature by default and CI builds are unsigned.
+  # Digests are still verified, and `dnf install` covers the documented path.
+  rpm -U --replacepkgs --define '_pkgverify_level digest' /packages/new.rpm
 else
   dpkg -i /packages/new.deb
 fi

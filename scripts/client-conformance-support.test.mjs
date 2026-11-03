@@ -13,7 +13,134 @@ import {
   stop,
   stopTree,
   wireMetadata,
+  deadlineMs,
+  coldRecoveryDeadlineMs,
+  catalog,
+  coldRecoveryCatalog,
 } from "./client-conformance-support.mjs";
+
+test("ordinary catalog keeps 20 seconds and fast cold recovery creates no observation", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const timeouts = [];
+  const client = {
+    spell: (name) => name,
+    list: async (timeout) => {
+      timeouts.push(timeout);
+      return [{ name: "echo" }];
+    },
+  };
+  await catalog(client, "echo");
+  let observed = false;
+  await coldRecoveryCatalog(client, "echo", () => {
+    observed = true;
+  });
+  t.mock.timers.tick(coldRecoveryDeadlineMs);
+  assert.equal(deadlineMs, 20_000);
+  assert(timeouts[0] > 0 && timeouts[0] <= deadlineMs);
+  assert(timeouts[1] > deadlineMs && timeouts[1] <= coldRecoveryDeadlineMs);
+  assert.equal(observed, false);
+});
+
+test("cold catalog notification and re-list share the original end deadline", async (t) => {
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  const timeouts = [];
+  const client = {
+    spell: (name) => name,
+    list: async (timeout) => {
+      timeouts.push(timeout);
+      if (timeouts.length === 1) {
+        now = 50_000;
+        return [];
+      }
+      return [{ name: "echo" }];
+    },
+    notification: async (_method, timeout) => {
+      assert.equal(timeout, 30_000);
+      now = 55_000;
+    },
+  };
+  await catalog(client, "echo", coldRecoveryDeadlineMs);
+  assert.deepEqual(timeouts, [80_000, 25_000]);
+});
+
+test("20 second observation waits for the same request and finishes I/O before cleanup", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  let complete;
+  const reply = new Promise((resolve) => {
+    complete = resolve;
+  });
+  let releaseObservation;
+  const writing = new Promise((resolve) => {
+    releaseObservation = resolve;
+  });
+  let calls = 0;
+  const states = [];
+  const pending = coldRecoveryCatalog(
+    {
+      spell: (name) => name,
+      list: () => {
+        calls++;
+        return reply;
+      },
+    },
+    "echo",
+    async (state) => {
+      states.push(state);
+      if (state.phase === "pending") await writing;
+    },
+  );
+  now = 20_000;
+  t.mock.timers.tick(deadlineMs);
+  await new Promise(setImmediate);
+  assert.equal(states[0].phase, "pending");
+  now = 21_000;
+  complete([{ name: "echo" }]);
+  let settled = false;
+  void pending.then(() => {
+    settled = true;
+  });
+  await new Promise(setImmediate);
+  assert.equal(settled, false);
+  releaseObservation();
+  const result = await pending;
+  assert.equal(calls, 1);
+  assert.equal(result.elapsedMs, 21_000);
+  assert.deepEqual(states, [
+    { phase: "pending", elapsedMs: 20_000 },
+    { phase: "completed", elapsedMs: 21_000, pendingElapsedMs: 20_000 },
+  ]);
+});
+
+test("cold recovery still fails at its own deadline without another request", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let calls = 0;
+  const states = [];
+  const pending = coldRecoveryCatalog(
+    {
+      spell: (name) => name,
+      list: (timeout) => {
+        calls++;
+        return new Promise((_resolve, reject) =>
+          setTimeout(() => reject(new Error("cold RPC deadline")), timeout),
+        );
+      },
+    },
+    "echo",
+    (state) => {
+      states.push(state.phase);
+    },
+  );
+  const failed = assert.rejects(pending, /cold RPC deadline/);
+  t.mock.timers.tick(deadlineMs);
+  await new Promise(setImmediate);
+  t.mock.timers.tick(coldRecoveryDeadlineMs - deadlineMs);
+  await failed;
+  assert.equal(calls, 1);
+  assert.deepEqual(states, ["pending", "failed"]);
+});
 
 test("client inventory includes every definition and excludes unrelated fixture IDs", () => {
   const source = `

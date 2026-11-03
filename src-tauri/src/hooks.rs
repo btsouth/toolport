@@ -156,7 +156,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-
     fn our_command() -> String {
         format!("\"/opt/Toolport/toolport-gateway\" {HOOK_MARKER} tool")
     }

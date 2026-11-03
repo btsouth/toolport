@@ -20,6 +20,109 @@ export const profiles = JSON.parse(
   await readFile(path.join(repo, "test/client-conformance/profiles.json"), "utf8"),
 ).profiles;
 export const deadlineMs = 20_000;
+// One intentional restart: probe rechecks 8s + election 20s + descriptor lock 5s
+// + ready 10s + lifetime headers 6s + handshake 10s, plus normal RPC 20s.
+// Round 79s to 80s. Ordinary RPCs retain 20s; this is only a fixture budget.
+export const coldRecoveryDeadlineMs = 80_000;
+
+export async function catalog(client, expected, timeoutMs = deadlineMs) {
+  const deadline = performance.now() + timeoutMs;
+  const tools = await client.list(Math.max(1, deadline - performance.now()));
+  if (tools.some((tool) => tool.name === client.spell(expected))) return tools;
+  return changedCatalog(client, expected, deadline);
+}
+
+export async function changedCatalog(
+  client,
+  expected,
+  deadline = performance.now() + deadlineMs,
+) {
+  while (performance.now() < deadline) {
+    await client.notification(
+      "notifications/tools/list_changed",
+      deadline - performance.now(),
+    );
+    const tools = await client.list(Math.max(1, deadline - performance.now()));
+    if (tools.some((tool) => tool.name === client.spell(expected))) return tools;
+  }
+  assert.fail(`${client.profile.id}: missing ${expected} after notifications`);
+}
+
+export async function coldRecoveryCatalog(
+  client,
+  expected,
+  onObservation = async () => {},
+) {
+  const started = performance.now();
+  // Dispatch immediately. Observation never resends or waits for idle recovery.
+  const pending = catalog(client, expected, coldRecoveryDeadlineMs);
+  let observation;
+  let observationError;
+  let pendingElapsedMs;
+  const observe = (state) =>
+    Promise.resolve()
+      .then(() => onObservation(state))
+      .catch((error) => {
+        observationError ??= error;
+      });
+  const timer = setTimeout(() => {
+    pendingElapsedMs = Math.round(performance.now() - started);
+    observation = observe({ phase: "pending", elapsedMs: pendingElapsedMs });
+  }, deadlineMs);
+  let phase = "failed";
+  let result;
+  let requestError;
+  try {
+    const tools = await pending;
+    phase = "completed";
+    result = { tools, elapsedMs: Math.round(performance.now() - started) };
+  } catch (error) {
+    requestError = error;
+  } finally {
+    clearTimeout(timer);
+    const elapsedMs = Math.round(performance.now() - started);
+    if (observation) {
+      await observation;
+      await observe({ phase, elapsedMs, pendingElapsedMs });
+    }
+  }
+  if (phase === "failed") {
+    if (observationError)
+      console.error("cold recovery diagnostics failed:", observationError);
+    throw requestError;
+  }
+  if (observationError) throw observationError;
+  return result;
+}
+
+export async function writeFixtureDiagnostics(fixture, observation) {
+  const dir = path.join(repo, ".verify/client-conformance-failures");
+  await mkdir(dir, { recursive: true });
+  for (const name of ["gateway.log", "downstream.jsonl"]) {
+    try {
+      const raw = await readFile(path.join(fixture.data, name), "utf8");
+      await writeFile(path.join(dir, `${fixture.id}-${name}`), raw.slice(-65_536));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  if (observation) {
+    // Exclude descriptors, PIDs, endpoints, tokens, and reply bodies.
+    await writeFile(
+      path.join(dir, `${fixture.id}-cold-recovery.json`),
+      JSON.stringify(
+        {
+          profile: fixture.id,
+          phase: observation.phase,
+          elapsedMs: observation.elapsedMs,
+          pendingElapsedMs: observation.pendingElapsedMs,
+        },
+        null,
+        2,
+      ),
+    );
+  }
+}
 
 export function clientInventoryFromSource(source) {
   const definitions = source.match(/^fn defs\(\) -> Vec<ClientDef> \{([\s\S]*?)^\}/m);

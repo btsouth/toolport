@@ -1,12 +1,59 @@
 //! Fixed-field, best-effort timing for low-frequency connection work.
+//!
+//! Off unless a stdio adapter turns it on. The same discovery code also serves the
+//! desktop HTTP proxy, which re-runs it for every request and lease renewal.
+use std::cell::Cell;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     OnceLock,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 static TRACE: OnceLock<u128> = OnceLock::new();
 static NEXT_SPAN: AtomicU64 = AtomicU64::new(1);
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    static QUIET: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Trace this process's connection startup. Only stdio adapters call this.
+pub(crate) fn enable() {
+    ENABLED.store(true, Ordering::Relaxed);
+}
+
+/// Silence spans on this thread until the guard drops, for repeated work such as
+/// rediscovering a lost daemon.
+pub(crate) fn quiet() -> QuietGuard {
+    QuietGuard {
+        previous: QUIET.with(|quiet| quiet.replace(true)),
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+pub(crate) struct QuietGuard {
+    previous: bool,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for QuietGuard {
+    fn drop(&mut self) {
+        let _ = QUIET.try_with(|quiet| quiet.set(self.previous));
+    }
+}
+
+fn recording() -> bool {
+    if QUIET.try_with(Cell::get).unwrap_or(true) {
+        return false;
+    }
+    #[cfg(test)]
+    let enabled = TEST_SINK
+        .try_with(|sink| sink.borrow().is_some())
+        .unwrap_or(false);
+    #[cfg(not(test))]
+    let enabled = ENABLED.load(Ordering::Relaxed);
+    enabled
+}
 
 #[cfg(test)]
 thread_local! {
@@ -96,6 +143,7 @@ pub(crate) struct Span {
     id: u64,
     started: Instant,
     finished: bool,
+    silent: bool,
 }
 impl Span {
     pub(crate) fn start(stage: Stage) -> Self {
@@ -104,6 +152,7 @@ impl Span {
             id: NEXT_SPAN.fetch_add(1, Ordering::Relaxed),
             started: Instant::now(),
             finished: false,
+            silent: !recording(),
         };
         span.emit(Outcome::Pending);
         span
@@ -117,6 +166,9 @@ impl Span {
         self.finished = true;
     }
     fn emit(&self, outcome: Outcome) {
+        if self.silent {
+            return;
+        }
         let trace = *TRACE.get_or_init(|| {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -210,6 +262,14 @@ mod tests {
         let span = Span::start(Stage::FirstInput);
         spans.push((span.id, "aborted"));
         drop(span);
+        // A quiet section writes nothing, and recording resumes after it.
+        {
+            let _quiet = quiet();
+            Span::start(Stage::Discovery).end(true);
+            let open_across_quiet = Span::start(Stage::Spawn);
+            drop(_quiet);
+            open_across_quiet.end(true);
+        }
         // An unrelated test thread does not own this process-global override.
         std::thread::spawn(|| {
             Span::start(Stage::Discovery).end(true);

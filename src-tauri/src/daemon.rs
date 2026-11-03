@@ -89,8 +89,9 @@ pub struct DaemonDescriptor {
     /// Random bearer both sides hold; only a process that can read the data
     /// directory can obtain it.
     pub token: String,
-    /// Daemon PID. Informational only: correctness never depends on a PID or an
-    /// open port, only on the authenticated handshake.
+    /// Advertised PID, replaced in memory by the authenticated identity's PID.
+    /// Existence never proves a live daemon; definitive death is negative evidence
+    /// only for an exact previously authenticated descriptor after connect timeout.
     pub pid: u32,
     /// [`CompatKey::fingerprint`] of the daemon.
     pub compat: String,
@@ -285,7 +286,7 @@ pub enum Health {
 
 /// One bounded liveness check against a daemon this process already trusts.
 pub fn probe_health(descriptor: &DaemonDescriptor) -> Health {
-    match attempt_identity_probe(descriptor) {
+    match identity_probe_with_deadlines(descriptor, PROBE_TIMEOUT, true, Some(descriptor), false) {
         Ok(_) => Health::Answering,
         Err(ProbeFailure::Silent) => Health::Silent,
         Err(ProbeFailure::Answered(_) | ProbeFailure::Unreachable) => Health::Gone,
@@ -555,28 +556,78 @@ pub(crate) fn attempt_identity_probe(
     identity_probe_with_timeout(descriptor, PROBE_TIMEOUT)
 }
 
-fn identity_probe_with_timeout(
+pub(crate) fn identity_probe_with_timeout(
     descriptor: &DaemonDescriptor,
     timeout: Duration,
 ) -> Result<DaemonIdentity, ProbeFailure> {
-    identity_probe_with_agent(descriptor, timeout, crate::http_client::agent())
+    identity_probe_with_deadlines(descriptor, timeout, false, None, false)
 }
 
-fn identity_probe_with_agent(
+pub(crate) fn identity_probe_for_recovery(
     descriptor: &DaemonDescriptor,
     timeout: Duration,
-    agent: ureq::Agent,
+) -> Result<DaemonIdentity, ProbeFailure> {
+    identity_probe_with_deadlines(descriptor, timeout, true, None, false)
+}
+
+fn classify_identity_error(
+    descriptor: &DaemonDescriptor,
+    known: Option<&DaemonDescriptor>,
+    error: crate::http_client::Error,
+) -> ProbeFailure {
+    let connect_timeout = match &error {
+        crate::http_client::Error::Transport(transport) => {
+            if let Some(connect) = crate::http_client::connect_error(transport) {
+                match connect {
+                    ureq::Error::Timeout(_) => true,
+                    ureq::Error::Io(error) => matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ),
+                    _ => false,
+                }
+            } else {
+                matches!(transport, ureq::Error::Timeout(ureq::Timeout::Connect))
+            }
+        }
+        _ => false,
+    };
+    // A disk PID is not trusted. Only negative evidence for this exact, previously
+    // authenticated process can turn an unestablished TCP connection into loss.
+    if connect_timeout && known == Some(descriptor) && !process_exists(descriptor.pid) {
+        return ProbeFailure::Unreachable;
+    }
+    classify_probe_error(error)
+}
+
+fn identity_probe_with_deadlines(
+    descriptor: &DaemonDescriptor,
+    timeout: Duration,
+    recovery: bool,
+    known: Option<&DaemonDescriptor>,
+    startup: bool,
 ) -> Result<DaemonIdentity, ProbeFailure> {
     let url = format!("http://{}{}", descriptor.endpoint, IDENTITY_PATH);
-    let response = agent
+    let agent = if startup {
+        crate::http_client::startup_agent()
+    } else {
+        crate::http_client::agent()
+    };
+    let request = agent
         .get(&url)
         .set_header("Authorization", &format!("Bearer {}", descriptor.token))
         .config()
-        .timeout_global(Some(timeout))
+        .timeout_global(Some(timeout));
+    let request = if recovery {
+        request.timeout_connect(Some(timeout))
+    } else {
+        request
+    };
+    let response = request
         .build()
         .call()
         .retain_status_body()
-        .map_err(classify_probe_error)?;
+        .map_err(|error| classify_identity_error(descriptor, known, error))?;
     response
         .into_body()
         .with_config()
@@ -621,6 +672,59 @@ pub struct Rendezvous {
     compat: CompatKey,
 }
 
+/// Cancellation shared by recovery stages, with an optional per-stage deadline.
+pub(crate) struct RecoveryBudget<'a> {
+    deadline: Option<Instant>,
+    cancelled: &'a std::sync::atomic::AtomicBool,
+}
+
+impl<'a> RecoveryBudget<'a> {
+    pub(crate) fn new(timeout: Duration, cancelled: &'a std::sync::atomic::AtomicBool) -> Self {
+        Self {
+            deadline: Some(Instant::now() + timeout),
+            cancelled,
+        }
+    }
+
+    pub(crate) fn cancellable(cancelled: &'a std::sync::atomic::AtomicBool) -> Self {
+        Self {
+            deadline: None,
+            cancelled,
+        }
+    }
+
+    fn limited(&self, timeout: Duration) -> Self {
+        let deadline = Instant::now() + timeout;
+        Self {
+            deadline: Some(self.deadline.map_or(deadline, |outer| outer.min(deadline))),
+            cancelled: self.cancelled,
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> Result<Duration, String> {
+        if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("the adapter is closing".into());
+        }
+        let Some(deadline) = self.deadline else {
+            return Ok(Duration::MAX);
+        };
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| "the host daemon recovery deadline expired".into())
+    }
+
+    fn lock(&self, path: &Path) -> Result<registry::FileLock, String> {
+        loop {
+            match registry::lock_at_for(path, self.remaining()?.min(READY_POLL)) {
+                Ok(lock) => return Ok(lock),
+                Err(error) if error.starts_with("The registry is locked") => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
 impl Rendezvous {
     pub fn new(data_dir: impl Into<PathBuf>, compat: CompatKey) -> Self {
         Self {
@@ -641,13 +745,32 @@ impl Rendezvous {
         &self,
         spawn: impl FnMut() -> Result<(), String>,
     ) -> Result<DaemonDescriptor, EnsureError> {
-        crate::startup_trace::Span::start(crate::startup_trace::Stage::Discovery)
-            .finish(self.ensure_inner(spawn))
+        self.ensure_with_budget(spawn, None)
     }
 
-    fn ensure_inner(
+    pub(crate) fn ensure_with_budget(
+        &self,
+        spawn: impl FnMut() -> Result<(), String>,
+        budget: Option<&RecoveryBudget<'_>>,
+    ) -> Result<DaemonDescriptor, EnsureError> {
+        self.ensure_known_with_budget(spawn, budget, None)
+    }
+
+    pub(crate) fn ensure_known_with_budget(
+        &self,
+        spawn: impl FnMut() -> Result<(), String>,
+        budget: Option<&RecoveryBudget<'_>>,
+        known: Option<&DaemonDescriptor>,
+    ) -> Result<DaemonDescriptor, EnsureError> {
+        crate::startup_trace::Span::start(crate::startup_trace::Stage::Discovery)
+            .finish(self.ensure_known_inner(spawn, budget, known))
+    }
+
+    fn ensure_known_inner(
         &self,
         mut spawn: impl FnMut() -> Result<(), String>,
+        budget: Option<&RecoveryBudget<'_>>,
+        known: Option<&DaemonDescriptor>,
     ) -> Result<DaemonDescriptor, EnsureError> {
         let path = self.descriptor_path();
         // A descriptor may appear while we wait for the election lock. If it
@@ -657,7 +780,7 @@ impl Rendezvous {
         for _ in 0..2 {
             let observed_before_lock =
                 read_descriptor(&path).filter(|descriptor| descriptor.claims_compat(&self.compat));
-            match self.probe_for_reuse(&path) {
+            match self.probe_for_reuse_with_budget(&path, budget, known)? {
                 Probe::Live(descriptor) => return Ok(descriptor),
                 // A silent daemon may still be alive: reuse is unproven, and
                 // clearing or spawning beside it is the double-election defect.
@@ -667,9 +790,13 @@ impl Rendezvous {
 
             // Elect: `lock_at` appends `.lock` and creates parent directories.
             let lock_base = election_lock_base(&self.data_dir, &self.compat);
-            let election =
-                crate::startup_trace::Span::start(crate::startup_trace::Stage::ElectionLock)
-                    .finish(registry::lock_at_for(&lock_base, ELECTION_TIMEOUT))?;
+            let election_span =
+                crate::startup_trace::Span::start(crate::startup_trace::Stage::ElectionLock);
+            let election = election_span.finish(if let Some(budget) = budget {
+                budget.limited(ELECTION_TIMEOUT).lock(&lock_base)
+            } else {
+                registry::lock_at_for(&lock_base, ELECTION_TIMEOUT)
+            })?;
 
             // If another contender published while we waited, leave the lock
             // before probing it. A slow identity response must not make the
@@ -678,7 +805,7 @@ impl Rendezvous {
                 read_descriptor(&path).filter(|descriptor| descriptor.claims_compat(&self.compat));
             if current.is_some() && current != observed_before_lock {
                 drop(election);
-                match self.probe_for_reuse(&path) {
+                match self.probe_for_reuse_with_budget(&path, budget, known)? {
                     Probe::Live(descriptor) => return Ok(descriptor),
                     Probe::Silent(descriptor) => {
                         return Err(EnsureError::Unresponsive(descriptor));
@@ -690,11 +817,11 @@ impl Rendezvous {
             // Recheck under the lock: another contender may have started the
             // daemon while we waited. Silence needs the same patience as the
             // fast path, but must not hold the election lock during that wait.
-            match self.probe(&path) {
+            match self.probe_with_budget(&path, budget, known, false)? {
                 Probe::Live(descriptor) => return Ok(descriptor),
                 Probe::Silent(_) => {
                     drop(election);
-                    match self.probe_for_reuse(&path) {
+                    match self.probe_for_reuse_with_budget(&path, budget, known)? {
                         Probe::Live(descriptor) => return Ok(descriptor),
                         Probe::Silent(descriptor) => {
                             return Err(EnsureError::Unresponsive(descriptor));
@@ -707,36 +834,57 @@ impl Rendezvous {
 
             // We are the winner. Drop any stale pointer first so readiness
             // polling cannot mistake it for the daemon we are about to start.
-            // Only discovery records this wait; routine descriptor cleanup stays quiet.
+            if let Some(budget) = budget {
+                budget.remaining()?;
+            }
             let lock_span =
                 crate::startup_trace::Span::start(crate::startup_trace::Stage::DescriptorLock);
-            if let Ok(_lock) =
+            if let Some(budget) = budget {
+                let _descriptor_lock =
+                    lock_span.finish(budget.limited(DESCRIPTOR_LOCK_TIMEOUT).lock(&path))?;
+                budget.remaining()?;
+                clear_descriptor_locked(&path);
+            } else if let Ok(_descriptor_lock) =
                 lock_span.finish(registry::lock_at_for(&path, DESCRIPTOR_LOCK_TIMEOUT))
             {
                 clear_descriptor_locked(&path);
             }
+            if let Some(budget) = budget {
+                budget.remaining()?;
+            }
             crate::startup_trace::Span::start(crate::startup_trace::Stage::Spawn).finish(spawn())?;
+            // Once spawned, retain the existing readiness window under election.
+            // EOF must not release it early and let another adapter double-spawn.
+            let not_cancelled = std::sync::atomic::AtomicBool::new(false);
+            let startup_budget = budget.map(|_| RecoveryBudget::new(READY_TIMEOUT, &not_cancelled));
 
             // Wait for readiness while still holding the lock, so no second
             // contender spawns a daemon of its own. Until the daemon is ready,
             // silence and refusals both just mean "not answering yet", so every
             // non-live outcome keeps polling inside the budget.
-            let ready_span =
-                crate::startup_trace::Span::start(crate::startup_trace::Stage::Readiness);
-            let deadline = Instant::now() + READY_TIMEOUT;
-            while Instant::now() < deadline {
-                if let Probe::Live(descriptor) = self.probe(&path) {
-                    return ready_span.finish(Ok(descriptor));
-                }
-                std::thread::sleep(READY_POLL);
-            }
-            return ready_span.finish(Err("the daemon did not become ready before the deadline"
-                .to_string()
-                .into()));
+            return crate::startup_trace::Span::start(crate::startup_trace::Stage::Readiness)
+                .finish(self.wait_until_ready(&path, startup_budget.as_ref(), known))
+                .map_err(EnsureError::from);
         }
         Err("the daemon descriptor changed repeatedly during startup"
             .to_string()
             .into())
+    }
+
+    fn wait_until_ready(
+        &self,
+        path: &Path,
+        budget: Option<&RecoveryBudget<'_>>,
+        known: Option<&DaemonDescriptor>,
+    ) -> Result<DaemonDescriptor, String> {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Probe::Live(descriptor) = self.probe_with_budget(path, budget, known, false)? {
+                return Ok(descriptor);
+            }
+            std::thread::sleep(READY_POLL);
+        }
+        Err("the daemon did not become ready before the deadline".to_string())
     }
 
     /// Read, claim-check, then prove with the authenticated handshake. A
@@ -744,54 +892,68 @@ impl Rendezvous {
     /// live daemon"; a silent endpoint is not ([`Probe::Silent`]). One refusal
     /// is thin evidence for destroying a pointer, so the unreachable case
     /// rechecks once before declaring it stale.
-    fn probe(&self, path: &Path) -> Probe {
-        self.probe_with_trace(path, false)
-    }
-
-    fn probe_with_trace(&self, path: &Path, startup: bool) -> Probe {
-        let Some(descriptor) = read_descriptor(path) else {
-            return Probe::Gone;
+    fn probe_with_budget(
+        &self,
+        path: &Path,
+        budget: Option<&RecoveryBudget<'_>>,
+        known: Option<&DaemonDescriptor>,
+        startup: bool,
+    ) -> Result<Probe, String> {
+        let attempt = |descriptor: &DaemonDescriptor| {
+            let timeout = match budget {
+                Some(budget) => budget.remaining()?.min(PROBE_TIMEOUT),
+                None => PROBE_TIMEOUT,
+            };
+            Ok::<_, String>(identity_probe_with_deadlines(
+                descriptor,
+                timeout,
+                budget.is_some(),
+                known,
+                startup,
+            ))
+        };
+        let Some(mut descriptor) = read_descriptor(path) else {
+            return Ok(Probe::Gone);
         };
         if !descriptor.claims_compat(&self.compat) {
-            return Probe::Gone;
+            return Ok(Probe::Gone);
         }
-        let attempt = || {
-            identity_probe_with_agent(
-                &descriptor,
-                PROBE_TIMEOUT,
-                if startup {
-                    crate::http_client::startup_agent()
-                } else {
-                    crate::http_client::agent()
-                },
-            )
-        };
-        match attempt() {
-            Ok(identity) if identity.is_compatible_with(&self.compat) => Probe::Live(descriptor),
+        Ok(match attempt(&descriptor)? {
+            Ok(identity) if identity.is_compatible_with(&self.compat) => {
+                descriptor.pid = identity.pid;
+                Probe::Live(descriptor)
+            }
             Ok(_) | Err(ProbeFailure::Answered(_)) => Probe::Gone,
-            Err(ProbeFailure::Unreachable) => match attempt() {
+            Err(ProbeFailure::Unreachable) => match attempt(&descriptor)? {
                 Ok(identity) if identity.is_compatible_with(&self.compat) => {
+                    descriptor.pid = identity.pid;
                     Probe::Live(descriptor)
                 }
                 Err(ProbeFailure::Silent) => Probe::Silent(descriptor),
                 _ => Probe::Gone,
             },
             Err(ProbeFailure::Silent) => Probe::Silent(descriptor),
-        }
+        })
     }
 
     /// The fast-path probe with bounded patience: give a live-but-slow daemon
     /// the whole [`SILENT_RETRY_TIMEOUT`] to answer before concluding
     /// anything about its pointer.
-    fn probe_for_reuse(&self, path: &Path) -> Probe {
+    fn probe_for_reuse_with_budget(
+        &self,
+        path: &Path,
+        budget: Option<&RecoveryBudget<'_>>,
+        known: Option<&DaemonDescriptor>,
+    ) -> Result<Probe, String> {
         let deadline = Instant::now() + SILENT_RETRY_TIMEOUT;
-        let mut first = true;
+        // Only a startup's first connection is traced, not each retry or recovery.
+        let mut startup = budget.is_none();
         loop {
-            let probe = self.probe_with_trace(path, first);
-            first = false;
+            let probe = self.probe_with_budget(path, budget, known, startup)?;
+            startup = false;
             match probe {
                 Probe::Silent(_) if Instant::now() < deadline => {}
-                outcome => return outcome,
+                outcome => return Ok(outcome),
             }
             std::thread::sleep(READY_POLL);
         }
@@ -930,6 +1092,226 @@ mod tests {
 
     fn compat(version: &str, dir: &Path) -> CompatKey {
         CompatKey::new(version, dir.display().to_string())
+    }
+
+    fn spawn_exiting_child() -> std::process::Child {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd.exe")
+                .args(["/C", "exit", "/B", "0"])
+                .spawn()
+                .unwrap()
+        }
+        #[cfg(not(windows))]
+        {
+            std::process::Command::new("sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn only_a_known_dead_process_turns_connect_timeout_into_loss() {
+        let mut child = spawn_exiting_child();
+        child.wait().unwrap();
+        assert!(!process_exists(child.id()));
+        let key = CompatKey::new("test", "known-dead-process");
+        let mut descriptor = DaemonDescriptor::new("127.0.0.1:9", "known", &key);
+        descriptor.pid = child.id();
+        let connect_timeout =
+            || crate::http_client::Error::Transport(ureq::Error::Timeout(ureq::Timeout::Connect));
+        assert!(matches!(
+            classify_identity_error(&descriptor, Some(&descriptor), connect_timeout()),
+            ProbeFailure::Unreachable
+        ));
+        for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+            let raw =
+                crate::http_client::Error::Transport(ureq::Error::Io(std::io::Error::from(kind)));
+            assert!(matches!(
+                classify_identity_error(&descriptor, Some(&descriptor), raw),
+                ProbeFailure::Silent
+            ));
+            let wrapped =
+                crate::http_client::Error::Transport(crate::http_client::mark_connect_failure(
+                    ureq::Error::Io(std::io::Error::from(kind)),
+                ));
+            assert!(matches!(
+                classify_identity_error(&descriptor, Some(&descriptor), wrapped),
+                ProbeFailure::Unreachable
+            ));
+        }
+        assert!(matches!(
+            classify_identity_error(&descriptor, None, connect_timeout()),
+            ProbeFailure::Silent
+        ));
+        let mut other = descriptor.clone();
+        other.token = "different-daemon".into();
+        assert!(matches!(
+            classify_identity_error(&descriptor, Some(&other), connect_timeout()),
+            ProbeFailure::Silent
+        ));
+        let read_timeout =
+            crate::http_client::Error::Transport(ureq::Error::Timeout(ureq::Timeout::RecvBody));
+        assert!(matches!(
+            classify_identity_error(&descriptor, Some(&descriptor), read_timeout),
+            ProbeFailure::Silent
+        ));
+        for status in ["503 Service Unavailable", "429 Too Many Requests"] {
+            descriptor.endpoint = start_status_responder(status);
+            assert_eq!(probe_health(&descriptor), Health::Silent);
+        }
+        descriptor.pid = std::process::id();
+        assert!(matches!(
+            classify_identity_error(&descriptor, Some(&descriptor), connect_timeout()),
+            ProbeFailure::Silent
+        ));
+    }
+
+    #[test]
+    fn successful_identity_corrects_only_the_in_memory_pid() {
+        let env = crate::registry::DataDirTestEnv::new("authenticated-pid");
+        let key = compat("test", &env.dir);
+        let authenticated = start_listener(&env.dir, &key);
+        let mut child = spawn_exiting_child();
+        child.wait().unwrap();
+        assert!(!process_exists(child.id()));
+        let mut disk = authenticated.clone();
+        disk.pid = child.id();
+        let path = descriptor_path(&env.dir, &key);
+        write_descriptor(&path, &disk).unwrap();
+        let recovered = Rendezvous::new(&env.dir, key)
+            .ensure(|| panic!("authenticated live daemon must be reused"))
+            .unwrap();
+        assert_eq!(recovered, authenticated);
+        assert_eq!(read_descriptor(&path), Some(disk.clone()));
+        assert_eq!(probe_health(&recovered), Health::Answering);
+        let timeout =
+            crate::http_client::Error::Transport(ureq::Error::Timeout(ureq::Timeout::Connect));
+        assert!(matches!(
+            classify_identity_error(&disk, Some(&recovered), timeout),
+            ProbeFailure::Silent
+        ));
+    }
+
+    #[test]
+    fn recovery_budget_bounds_election_and_stops_before_startup() {
+        let env = crate::registry::DataDirTestEnv::new("recovery-budget-election");
+        let key = compat("test", &env.dir);
+        let rendezvous = Rendezvous::new(&env.dir, key.clone());
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let election =
+            registry::lock_at_for(&election_lock_base(&env.dir, &key), Duration::from_secs(1))
+                .unwrap();
+        let budget = RecoveryBudget::new(Duration::from_millis(80), &cancelled);
+        let started = Instant::now();
+        let result = rendezvous.ensure_with_budget(|| panic!("must not spawn"), Some(&budget));
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(election);
+        cancelled.store(true, Ordering::SeqCst);
+        let budget = RecoveryBudget::new(Duration::from_secs(10), &cancelled);
+        assert!(rendezvous
+            .ensure_with_budget(|| panic!("must not spawn after EOF"), Some(&budget))
+            .is_err());
+    }
+
+    #[test]
+    fn cancellable_discovery_preserves_each_lock_limit_and_cancellation() {
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let control = RecoveryBudget::cancellable(&cancelled);
+        let before = Instant::now();
+        let election = control.limited(ELECTION_TIMEOUT);
+        let descriptor = control.limited(DESCRIPTOR_LOCK_TIMEOUT);
+        let after = Instant::now();
+        assert!(election.deadline.unwrap() >= before + ELECTION_TIMEOUT);
+        assert!(election.deadline.unwrap() <= after + ELECTION_TIMEOUT);
+        assert!(descriptor.deadline.unwrap() >= before + DESCRIPTOR_LOCK_TIMEOUT);
+        assert!(descriptor.deadline.unwrap() <= after + DESCRIPTOR_LOCK_TIMEOUT);
+        let short = RecoveryBudget::new(Duration::from_millis(80), &cancelled);
+        assert_eq!(short.limited(ELECTION_TIMEOUT).deadline, short.deadline);
+        cancelled.store(true, Ordering::SeqCst);
+        assert_eq!(election.remaining().unwrap_err(), "the adapter is closing");
+        assert_eq!(
+            descriptor.remaining().unwrap_err(),
+            "the adapter is closing"
+        );
+    }
+
+    #[test]
+    fn cancellable_discovery_reaches_the_existing_silence_fallback() {
+        let env = crate::registry::DataDirTestEnv::new("recovery-silence-window");
+        let key = compat("test", &env.dir);
+        let descriptor = DaemonDescriptor::new(start_stalled_listener(), "silent", &key);
+        write_descriptor(&descriptor_path(&env.dir, &key), &descriptor).unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let control = RecoveryBudget::cancellable(&cancelled);
+        let started = Instant::now();
+        let result = Rendezvous::new(&env.dir, key).ensure_with_budget(
+            || panic!("must not spawn beside a silent daemon"),
+            Some(&control),
+        );
+        assert_eq!(result.unwrap_err(), EnsureError::Unresponsive(descriptor));
+        assert!(started.elapsed() >= SILENT_RETRY_TIMEOUT);
+    }
+
+    #[test]
+    fn recovery_budget_includes_a_silent_identity_probe() {
+        let env = crate::registry::DataDirTestEnv::new("recovery-budget-probe");
+        let key = compat("test", &env.dir);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let descriptor =
+            DaemonDescriptor::new(listener.local_addr().unwrap().to_string(), "silent", &key);
+        write_descriptor(&descriptor_path(&env.dir, &key), &descriptor).unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let budget = RecoveryBudget::new(Duration::from_millis(80), &cancelled);
+        let started = Instant::now();
+        let result = Rendezvous::new(&env.dir, key).ensure_with_budget(
+            || panic!("must not spawn beside a silent daemon"),
+            Some(&budget),
+        );
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cancelled_startup_retains_election_until_its_daemon_is_ready() {
+        let env = crate::registry::DataDirTestEnv::new("recovery-startup-election");
+        let key = compat("test", &env.dir);
+        let dir = env.dir.clone();
+        let worker_key = key.clone();
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let first_spawns = Arc::clone(&spawns);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            let cancelled = std::sync::atomic::AtomicBool::new(false);
+            let budget = RecoveryBudget::new(Duration::from_millis(80), &cancelled);
+            Rendezvous::new(&dir, worker_key.clone()).ensure_with_budget(
+                || {
+                    first_spawns.fetch_add(1, Ordering::SeqCst);
+                    let delayed_dir = dir.clone();
+                    let delayed_key = worker_key.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(200));
+                        start_listener(&delayed_dir, &delayed_key);
+                    });
+                    cancelled.store(true, Ordering::SeqCst);
+                    started_tx.send(()).unwrap();
+                    Ok(())
+                },
+                Some(&budget),
+            )
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second = Rendezvous::new(&env.dir, key.clone())
+            .ensure(|| {
+                spawns.fetch_add(1, Ordering::SeqCst);
+                start_listener(&env.dir, &key);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.join().unwrap().unwrap(), second);
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
     }
 
     #[test]

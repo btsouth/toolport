@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { readFile, mkdir, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import {
   Fixture,
@@ -11,6 +11,10 @@ import {
   failed,
   textOf,
   deadlineMs,
+  catalog,
+  changedCatalog,
+  coldRecoveryCatalog,
+  writeFixtureDiagnostics,
   stop,
   waitExit,
 } from "./client-conformance-support.mjs";
@@ -39,46 +43,12 @@ async function withFixture(profile, full, run) {
   try {
     await run(active, active.client(profile));
   } catch (error) {
-    const dir = path.join(repo, ".verify/client-conformance-failures");
-    await mkdir(dir, { recursive: true });
-    for (const name of ["gateway.log", "downstream.jsonl"]) {
-      try {
-        const raw = await readFile(path.join(active.data, name), "utf8");
-        await writeFile(path.join(dir, `${profile.id}-${name}`), raw.slice(-65_536));
-      } catch (e) {
-        if (e.code !== "ENOENT") throw e;
-      }
-    }
+    await writeFixtureDiagnostics(active);
     throw error;
   } finally {
     await active.close();
     active = undefined;
   }
-}
-
-async function catalog(client, expected) {
-  const deadline = performance.now() + deadlineMs;
-  const tools = await client.list();
-  if (tools.some((t) => t.name === client.spell(expected))) return tools;
-  return changedCatalog(client, expected, deadline);
-}
-
-async function changedCatalog(
-  client,
-  expected,
-  deadline = performance.now() + deadlineMs,
-) {
-  // Startup and grow can each emit a valid event. Re-list for every event
-  // under one deadline until the changed entry arrives.
-  while (performance.now() < deadline) {
-    await client.notification(
-      "notifications/tools/list_changed",
-      deadline - performance.now(),
-    );
-    const refreshed = await client.list(Math.max(1, deadline - performance.now()));
-    if (refreshed.some((t) => t.name === client.spell(expected))) return refreshed;
-  }
-  assert.fail(`${client.profile.id}: missing ${expected} after notifications`);
 }
 
 async function baseline(profile) {
@@ -263,13 +233,17 @@ async function replay(profile) {
     );
     await fixture.killDaemon();
     assert(failed(await inflight));
-    await catalog(client, "mock__echo");
+    const recovery = await coldRecoveryCatalog(client, "mock__echo", (state) =>
+      writeFixtureDiagnostics(fixture, state),
+    );
     success(await client.call("mock__echo", { text: "after daemon restart" }));
     const sleeps = (await fixture.records()).filter(
       (r) => r.method === "tools/call" && r.params.name === "sleep",
     );
     assert.equal(sleeps.length, 2, "inflight call was replayed or never dispatched");
-    pass(`${profile.id}: daemon restart mid-session without replay`);
+    pass(
+      `${profile.id}: daemon restart mid-session without replay (${recovery.elapsedMs} ms)`,
+    );
   });
 }
 
