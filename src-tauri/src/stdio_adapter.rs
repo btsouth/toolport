@@ -112,6 +112,12 @@ pub fn adapter_requested(args: &[String]) -> bool {
 }
 
 /// Why daemon preparation failed and whether a standalone gateway is safe.
+/// The client's own `initialize`, kept open until its full reply has been relayed.
+struct InitializeTrace {
+    span: crate::startup_trace::Span,
+    rpc_error: bool,
+}
+
 struct PreparationFailure {
     detail: String,
     /// Only a failed OS spawn proves no daemon was launched by this attempt.
@@ -122,6 +128,11 @@ struct PreparationFailure {
 }
 
 fn prepare_stdio_adapter() -> Result<(Rendezvous, DaemonDescriptor), PreparationFailure> {
+    crate::startup_trace::Span::start(crate::startup_trace::Stage::AdapterStart)
+        .finish(prepare_stdio_adapter_inner())
+}
+
+fn prepare_stdio_adapter_inner() -> Result<(Rendezvous, DaemonDescriptor), PreparationFailure> {
     let dir = registry::conduit_dir().ok_or_else(|| PreparationFailure {
         detail: "no data directory could be resolved".to_string(),
         safe_to_fallback: false,
@@ -170,6 +181,7 @@ fn finish_stdio_adapter(
 /// Run an explicit stdio adapter; an unavailable daemon ends this process, and
 /// a wedged one gets this client a private gateway.
 pub fn run_stdio_adapter() -> ! {
+    crate::startup_trace::enable();
     match prepare_stdio_adapter() {
         Ok((rendezvous, descriptor)) => finish_stdio_adapter(rendezvous, descriptor, None),
         Err(error) if error.unresponsive => {
@@ -204,6 +216,7 @@ pub fn run_stdio_adapter() -> ! {
 /// daemon. Once a descriptor is ready, all later failures stay in adapter mode
 /// so a call cannot be retried against a second, in-process router.
 pub fn run_selected_stdio_adapter() {
+    crate::startup_trace::enable();
     match prepare_stdio_adapter() {
         Ok((rendezvous, descriptor)) => {
             crate::gatewaylog::append("topology: role=stdio-adapter source=stdio-topology");
@@ -304,6 +317,14 @@ fn start_private_gateway(why: &str) -> Result<(std::process::Child, DaemonDescri
 }
 
 fn start_private_gateway_with_budget(
+    why: &str,
+    budget: Option<&crate::daemon::RecoveryBudget<'_>>,
+) -> Result<(std::process::Child, DaemonDescriptor), String> {
+    crate::startup_trace::Span::start(crate::startup_trace::Stage::PrivateStart)
+        .finish(start_private_gateway_inner(why, budget))
+}
+
+fn start_private_gateway_inner(
     why: &str,
     budget: Option<&crate::daemon::RecoveryBudget<'_>>,
 ) -> Result<(std::process::Child, DaemonDescriptor), String> {
@@ -794,10 +815,38 @@ impl Session {
         descriptor: DaemonDescriptor,
         sent_session: Option<String>,
     ) -> Result<(), ExchangeError> {
+        let mut trace = None;
+        let result =
+            self.post_message(body, forward, timeout, descriptor, sent_session, &mut trace);
+        if let Some(InitializeTrace { span, rpc_error }) = trace {
+            span.end(result.is_ok() && !rpc_error);
+        }
+        result
+    }
+
+    fn post_message(
+        &self,
+        body: &str,
+        forward: bool,
+        timeout: Duration,
+        descriptor: DaemonDescriptor,
+        sent_session: Option<String>,
+        trace: &mut Option<InitializeTrace>,
+    ) -> Result<(), ExchangeError> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(ExchangeError::Failed("the adapter is closed".to_string()));
         }
         let message = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+        // Only the client's own initialize counts as startup, not a recovery's replay.
+        let initialize = forward && message["method"] == "initialize";
+        if initialize {
+            *trace = Some(InitializeTrace {
+                span: crate::startup_trace::Span::start(
+                    crate::startup_trace::Stage::InitializeResponse,
+                ),
+                rpc_error: false,
+            });
+        }
         let id = message.get("id").filter(|id| !id.is_null());
         let expects_reply = id.is_some() && message.get("method").is_some();
         let subscription = match (message["method"].as_str(), id) {
@@ -813,10 +862,12 @@ impl Session {
             )
             .post(&url),
             None => {
-                let request = crate::http_client::agent()
-                    .post(&url)
-                    .config()
-                    .timeout_global(Some(timeout));
+                let agent = if initialize {
+                    crate::http_client::startup_agent()
+                } else {
+                    crate::http_client::agent()
+                };
+                let request = agent.post(&url).config().timeout_global(Some(timeout));
                 // Private handshake replay shares the recovery deadline, including TCP.
                 let request = if forward {
                     request
@@ -842,11 +893,22 @@ impl Session {
         if let Some(session) = &sent_session {
             request = request.set_header("Mcp-Session-Id", session);
         }
-        let response = match request.send(body).retain_status_body() {
+        let headers_span = initialize.then(|| {
+            crate::startup_trace::Span::start(crate::startup_trace::Stage::InitializeHeaders)
+        });
+        let response = request.send(body).retain_status_body();
+        let response = match headers_span {
+            Some(span) => span.finish(response),
+            None => response,
+        };
+        let response = match response {
             Ok(response) => response,
             // The daemon answered, just not with 2xx. It is alive, so this is not a
             // reason to re-rendezvous; the body is the error the caller should see.
             Err(crate::http_client::Error::Status(code, response)) => {
+                if let Some(trace) = trace.as_mut() {
+                    trace.rpc_error = true;
+                }
                 let body = response.into_body().read_to_string().unwrap_or_default();
                 // A modern protocol error comes with a 4xx status and a JSON-RPC
                 // body. That body is the answer, and the client needs it intact:
@@ -917,6 +979,12 @@ impl Session {
                     .is_some_and(SubscriptionGuard::cancelled)
             },
             |frame| {
+                if let Some(trace) = trace.as_mut() {
+                    // Trace the error even when the server cannot identify the request.
+                    // Forwarding and replay validation keep their existing ID rules.
+                    trace.rpc_error |= serde_json::from_str::<serde_json::Value>(frame)
+                        .is_ok_and(|message| message.get("error").is_some());
+                }
                 replied |= !is_sse || is_reply_to(frame, id);
                 if forward {
                     self.write_message(frame)
@@ -1037,11 +1105,16 @@ impl Session {
             // so the session still has to be reopened below.
         } else if stale >= DAEMON_LOST {
             let known = self.descriptor();
-            match self.rendezvous.ensure_known_with_budget(
-                spawn_daemon,
-                Some(&discovery),
-                Some(&known),
-            ) {
+            let found = {
+                // Retried with backoff for as long as the daemon stays away.
+                let _quiet = crate::startup_trace::quiet();
+                self.rendezvous.ensure_known_with_budget(
+                    spawn_daemon,
+                    Some(&discovery),
+                    Some(&known),
+                )
+            };
+            match found {
                 Ok(descriptor) => {
                     if let Ok(mut guard) = self.descriptor.lock() {
                         *guard = descriptor;
@@ -1478,7 +1551,11 @@ fn proxy_stdio(
     private: Option<std::process::Child>,
 ) -> Result<(), String> {
     let session = Arc::new(Session::new(rendezvous, descriptor, private));
-    session.ensure_lifetime_stream();
+    if let Err(error) = crate::startup_trace::Span::start(crate::startup_trace::Stage::LifetimeOpen)
+        .finish(session.open_lifetime_stream())
+    {
+        crate::gatewaylog::append(&error);
+    }
     spawn_listen_stream(Arc::clone(&session));
     spawn_heartbeat(Arc::clone(&session));
 
@@ -1497,7 +1574,18 @@ fn proxy_stdio(
 
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
-    while let Some(frame) = read_bounded_line(&mut reader, MAX_FRAME_BYTES)? {
+    let mut first_input = Some(crate::startup_trace::Span::start(
+        crate::startup_trace::Stage::FirstInput,
+    ));
+    loop {
+        let frame = read_bounded_line(&mut reader, MAX_FRAME_BYTES);
+        if let Some(span) = first_input.take() {
+            // Stdin closing before any request is not a first input.
+            span.end(matches!(frame, Ok(Some(_))));
+        }
+        let Some(frame) = frame? else {
+            break;
+        };
         let line = match frame {
             ClientFrame::Oversized => {
                 write_error(
@@ -3425,6 +3513,73 @@ mod tests {
         assert_eq!(replacement.posted("initialize").len(), 2);
         assert_eq!(session.stale.load(Ordering::SeqCst), HEALTHY);
         session.closed.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn initialize_null_id_errors_are_forwarded_and_traced_as_errors() {
+        for status in [400, 200] {
+            let env = crate::registry::DataDirTestEnv::new("startup-null-id-error");
+            let _sink = crate::startup_trace::TestSinkGuard::set(&env.dir);
+            let reply = serde_json::json!({
+                "jsonrpc": "2.0", "id": null,
+                "error": { "code": -32600, "message": "fixture initialization error" }
+            });
+            let response = reply.clone();
+            let daemon = ScriptedDaemon::start(move |_| Answer::body(status, response.clone()));
+            let sink = Sink::default();
+            let session = scripted_session(&daemon, &sink, TEST_TIMEOUT);
+            let request = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+
+            // A forwarded protocol error is still a completed exchange, sent once.
+            session
+                .post(request, session.descriptor(), session.session_id())
+                .unwrap();
+            assert_eq!(sink.messages(), vec![reply]);
+            assert_eq!(daemon.posted("initialize").len(), 1);
+            assert_eq!(session.stale.load(Ordering::SeqCst), HEALTHY);
+            assert!(crate::telemetry::flush_for_test(Duration::from_secs(5)));
+            let log = std::fs::read_to_string(env.dir.join("gateway.log")).unwrap();
+            let terminal: Vec<_> = log
+                .lines()
+                .filter(|line| line.contains("stage=initialize_response event=end"))
+                .collect();
+            assert!(
+                terminal.iter().any(|line| line.contains("result=error")),
+                "HTTP {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_replayed_initialize_is_not_traced_as_startup() {
+        let env = crate::registry::DataDirTestEnv::new("startup-replay-quiet");
+        let _sink = crate::startup_trace::TestSinkGuard::set(&env.dir);
+        let daemon = ScriptedDaemon::start(|_| {
+            Answer::body(
+                200,
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+            )
+        });
+        let sink = Sink::default();
+        let session = scripted_session(&daemon, &sink, TEST_TIMEOUT);
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+
+        session
+            .post_with_timeout(
+                request,
+                false,
+                TEST_TIMEOUT,
+                session.descriptor(),
+                session.session_id(),
+            )
+            .unwrap();
+
+        assert_eq!(daemon.posted("initialize").len(), 1);
+        assert!(crate::telemetry::flush_for_test(Duration::from_secs(5)));
+        assert_eq!(
+            std::fs::read_to_string(env.dir.join("gateway.log")).unwrap_or_default(),
+            ""
+        );
     }
 
     #[test]

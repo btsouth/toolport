@@ -286,7 +286,7 @@ pub enum Health {
 
 /// One bounded liveness check against a daemon this process already trusts.
 pub fn probe_health(descriptor: &DaemonDescriptor) -> Health {
-    match identity_probe_with_deadlines(descriptor, PROBE_TIMEOUT, true, Some(descriptor)) {
+    match identity_probe_with_deadlines(descriptor, PROBE_TIMEOUT, true, Some(descriptor), false) {
         Ok(_) => Health::Answering,
         Err(ProbeFailure::Silent) => Health::Silent,
         Err(ProbeFailure::Answered(_) | ProbeFailure::Unreachable) => Health::Gone,
@@ -560,14 +560,14 @@ pub(crate) fn identity_probe_with_timeout(
     descriptor: &DaemonDescriptor,
     timeout: Duration,
 ) -> Result<DaemonIdentity, ProbeFailure> {
-    identity_probe_with_deadlines(descriptor, timeout, false, None)
+    identity_probe_with_deadlines(descriptor, timeout, false, None, false)
 }
 
 pub(crate) fn identity_probe_for_recovery(
     descriptor: &DaemonDescriptor,
     timeout: Duration,
 ) -> Result<DaemonIdentity, ProbeFailure> {
-    identity_probe_with_deadlines(descriptor, timeout, true, None)
+    identity_probe_with_deadlines(descriptor, timeout, true, None, false)
 }
 
 fn classify_identity_error(
@@ -605,9 +605,15 @@ fn identity_probe_with_deadlines(
     timeout: Duration,
     recovery: bool,
     known: Option<&DaemonDescriptor>,
+    startup: bool,
 ) -> Result<DaemonIdentity, ProbeFailure> {
     let url = format!("http://{}{}", descriptor.endpoint, IDENTITY_PATH);
-    let request = crate::http_client::agent()
+    let agent = if startup {
+        crate::http_client::startup_agent()
+    } else {
+        crate::http_client::agent()
+    };
+    let request = agent
         .get(&url)
         .set_header("Authorization", &format!("Bearer {}", descriptor.token))
         .config()
@@ -752,6 +758,16 @@ impl Rendezvous {
 
     pub(crate) fn ensure_known_with_budget(
         &self,
+        spawn: impl FnMut() -> Result<(), String>,
+        budget: Option<&RecoveryBudget<'_>>,
+        known: Option<&DaemonDescriptor>,
+    ) -> Result<DaemonDescriptor, EnsureError> {
+        crate::startup_trace::Span::start(crate::startup_trace::Stage::Discovery)
+            .finish(self.ensure_known_inner(spawn, budget, known))
+    }
+
+    fn ensure_known_inner(
+        &self,
         mut spawn: impl FnMut() -> Result<(), String>,
         budget: Option<&RecoveryBudget<'_>>,
         known: Option<&DaemonDescriptor>,
@@ -774,11 +790,13 @@ impl Rendezvous {
 
             // Elect: `lock_at` appends `.lock` and creates parent directories.
             let lock_base = election_lock_base(&self.data_dir, &self.compat);
-            let election = if let Some(budget) = budget {
-                budget.limited(ELECTION_TIMEOUT).lock(&lock_base)?
+            let election_span =
+                crate::startup_trace::Span::start(crate::startup_trace::Stage::ElectionLock);
+            let election = election_span.finish(if let Some(budget) = budget {
+                budget.limited(ELECTION_TIMEOUT).lock(&lock_base)
             } else {
-                registry::lock_at_for(&lock_base, ELECTION_TIMEOUT)?
-            };
+                registry::lock_at_for(&lock_base, ELECTION_TIMEOUT)
+            })?;
 
             // If another contender published while we waited, leave the lock
             // before probing it. A slow identity response must not make the
@@ -799,7 +817,7 @@ impl Rendezvous {
             // Recheck under the lock: another contender may have started the
             // daemon while we waited. Silence needs the same patience as the
             // fast path, but must not hold the election lock during that wait.
-            match self.probe_with_budget(&path, budget, known)? {
+            match self.probe_with_budget(&path, budget, known, false)? {
                 Probe::Live(descriptor) => return Ok(descriptor),
                 Probe::Silent(_) => {
                     drop(election);
@@ -819,17 +837,22 @@ impl Rendezvous {
             if let Some(budget) = budget {
                 budget.remaining()?;
             }
+            let lock_span =
+                crate::startup_trace::Span::start(crate::startup_trace::Stage::DescriptorLock);
             if let Some(budget) = budget {
-                let _descriptor_lock = budget.limited(DESCRIPTOR_LOCK_TIMEOUT).lock(&path)?;
+                let _descriptor_lock =
+                    lock_span.finish(budget.limited(DESCRIPTOR_LOCK_TIMEOUT).lock(&path))?;
                 budget.remaining()?;
                 clear_descriptor_locked(&path);
-            } else {
-                clear_descriptor(&path);
+            } else if let Ok(_descriptor_lock) =
+                lock_span.finish(registry::lock_at_for(&path, DESCRIPTOR_LOCK_TIMEOUT))
+            {
+                clear_descriptor_locked(&path);
             }
             if let Some(budget) = budget {
                 budget.remaining()?;
             }
-            spawn()?;
+            crate::startup_trace::Span::start(crate::startup_trace::Stage::Spawn).finish(spawn())?;
             // Once spawned, retain the existing readiness window under election.
             // EOF must not release it early and let another adapter double-spawn.
             let not_cancelled = std::sync::atomic::AtomicBool::new(false);
@@ -839,22 +862,29 @@ impl Rendezvous {
             // contender spawns a daemon of its own. Until the daemon is ready,
             // silence and refusals both just mean "not answering yet", so every
             // non-live outcome keeps polling inside the budget.
-            let deadline = Instant::now() + READY_TIMEOUT;
-            while Instant::now() < deadline {
-                if let Probe::Live(descriptor) =
-                    self.probe_with_budget(&path, startup_budget.as_ref(), known)?
-                {
-                    return Ok(descriptor);
-                }
-                std::thread::sleep(READY_POLL);
-            }
-            return Err("the daemon did not become ready before the deadline"
-                .to_string()
-                .into());
+            return crate::startup_trace::Span::start(crate::startup_trace::Stage::Readiness)
+                .finish(self.wait_until_ready(&path, startup_budget.as_ref(), known))
+                .map_err(EnsureError::from);
         }
         Err("the daemon descriptor changed repeatedly during startup"
             .to_string()
             .into())
+    }
+
+    fn wait_until_ready(
+        &self,
+        path: &Path,
+        budget: Option<&RecoveryBudget<'_>>,
+        known: Option<&DaemonDescriptor>,
+    ) -> Result<DaemonDescriptor, String> {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Probe::Live(descriptor) = self.probe_with_budget(path, budget, known, false)? {
+                return Ok(descriptor);
+            }
+            std::thread::sleep(READY_POLL);
+        }
+        Err("the daemon did not become ready before the deadline".to_string())
     }
 
     /// Read, claim-check, then prove with the authenticated handshake. A
@@ -867,6 +897,7 @@ impl Rendezvous {
         path: &Path,
         budget: Option<&RecoveryBudget<'_>>,
         known: Option<&DaemonDescriptor>,
+        startup: bool,
     ) -> Result<Probe, String> {
         let attempt = |descriptor: &DaemonDescriptor| {
             let timeout = match budget {
@@ -878,6 +909,7 @@ impl Rendezvous {
                 timeout,
                 budget.is_some(),
                 known,
+                startup,
             ))
         };
         let Some(mut descriptor) = read_descriptor(path) else {
@@ -914,8 +946,12 @@ impl Rendezvous {
         known: Option<&DaemonDescriptor>,
     ) -> Result<Probe, String> {
         let deadline = Instant::now() + SILENT_RETRY_TIMEOUT;
+        // Only a startup's first connection is traced, not each retry or recovery.
+        let mut startup = budget.is_none();
         loop {
-            match self.probe_with_budget(path, budget, known)? {
+            let probe = self.probe_with_budget(path, budget, known, startup)?;
+            startup = false;
+            match probe {
                 Probe::Silent(_) if Instant::now() < deadline => {}
                 outcome => return Ok(outcome),
             }

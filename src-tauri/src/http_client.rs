@@ -26,9 +26,22 @@ pub fn agent() -> ureq::Agent {
     )
 }
 
+/// The ordinary policy, with TCP-only timing for connection setup requests.
+pub(crate) fn startup_agent() -> ureq::Agent {
+    ureq::Agent::with_parts(
+        config_builder!().build(),
+        ConnectPhaseConnector {
+            startup: true,
+            ..Default::default()
+        },
+        DirectResolver,
+    )
+}
+
 /// Remember connection failures before HTTP dispatch, when retry is safe.
 #[derive(Debug, Default)]
 struct ConnectPhaseConnector {
+    startup: bool,
     tcp: ureq::unversioned::transport::TcpConnector,
     tls: ureq::unversioned::transport::RustlsConnector,
 }
@@ -91,34 +104,40 @@ impl ureq::unversioned::transport::Connector for ConnectPhaseConnector {
             run_connector: details.run_connector.clone(),
         };
         let connect_started = std::time::Instant::now();
-        self.tcp
-            .connect(&tcp_details, chained)
-            .and_then(|tcp| {
-                let elapsed = connect_started.elapsed();
-                let mut tls_details = ConnectionDetails {
-                    addrs: details.addrs.clone(),
-                    current_time: details.current_time.clone(),
-                    run_connector: details.run_connector.clone(),
-                    ..*details
-                };
-                if let ureq::unversioned::transport::time::Duration::Exact(budget) =
-                    details.timeout.after
-                {
-                    let remaining = budget.saturating_sub(elapsed);
-                    if remaining.is_zero() && details.needs_tls() {
-                        return Err(ureq::Error::Timeout(details.timeout.reason));
-                    }
-                    tls_details.timeout.after =
-                        ureq::unversioned::transport::time::Duration::Exact(remaining);
+        let span = self
+            .startup
+            .then(|| crate::startup_trace::Span::start(crate::startup_trace::Stage::TcpConnect));
+        let tcp = self.tcp.connect(&tcp_details, chained);
+        let tcp = match span {
+            Some(span) => span.finish(tcp),
+            None => tcp,
+        };
+        tcp.and_then(|tcp| {
+            let elapsed = connect_started.elapsed();
+            let mut tls_details = ConnectionDetails {
+                addrs: details.addrs.clone(),
+                current_time: details.current_time.clone(),
+                run_connector: details.run_connector.clone(),
+                ..*details
+            };
+            if let ureq::unversioned::transport::time::Duration::Exact(budget) =
+                details.timeout.after
+            {
+                let remaining = budget.saturating_sub(elapsed);
+                if remaining.is_zero() && details.needs_tls() {
+                    return Err(ureq::Error::Timeout(details.timeout.reason));
                 }
-                self.tls.connect(&tls_details, tcp)
+                tls_details.timeout.after =
+                    ureq::unversioned::transport::time::Duration::Exact(remaining);
+            }
+            self.tls.connect(&tls_details, tcp)
+        })
+        .map(|transport| {
+            transport.map(|inner| MetadataTransport {
+                inner: Box::new(inner),
             })
-            .map(|transport| {
-                transport.map(|inner| MetadataTransport {
-                    inner: Box::new(inner),
-                })
-            })
-            .map_err(mark_connect_failure)
+        })
+        .map_err(mark_connect_failure)
     }
 }
 

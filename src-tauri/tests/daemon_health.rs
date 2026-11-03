@@ -681,6 +681,18 @@ fn a_wedged_daemon_moves_clients_to_their_own_gateways() {
     attached.finish();
     // Each private gateway ends with its adapter.
     let log = std::fs::read_to_string(fixture.dir.join("gateway.log")).unwrap_or_default();
+    let private_starts: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("startup: ") && line.contains("stage=private_start "))
+        .collect();
+    assert_eq!(private_starts.len(), 4, "{}", log_tail(&fixture.dir));
+    assert_eq!(
+        private_starts
+            .iter()
+            .filter(|line| line.contains("event=end result=ok "))
+            .count(),
+        2
+    );
     let private_pids: Vec<u64> = log
         .lines()
         .filter_map(|line| line.split("role=private-gateway pid=").nth(1))

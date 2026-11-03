@@ -64,6 +64,7 @@ pub mod session_store;
 pub mod shaping;
 pub mod sharing_controller;
 pub mod skills;
+pub(crate) mod startup_trace;
 pub mod stdio_adapter;
 pub mod team_activity;
 pub mod team_sync_status;
