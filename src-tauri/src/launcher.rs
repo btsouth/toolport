@@ -58,6 +58,10 @@ pub fn direct_spawn_disabled() -> bool {
     crate::brand::env_flag("TOOLPORT_NO_DIRECT_SPAWN", "CONDUIT_NO_DIRECT_SPAWN")
 }
 
+/// Invocation -> resolution, including the negative result: a server that cannot
+/// be rewritten must not re-walk the npx cache on every respawn.
+type Cache = Mutex<HashMap<(String, Vec<String>), Option<DirectSpawn>>>;
+
 /// Rewrite `command`/`args` to a direct `node` invocation, or `None` to spawn as-is.
 ///
 /// Expects an already-[`normalize_invocation`](crate::downstream::normalize_invocation)d
@@ -67,24 +71,48 @@ pub fn resolve_direct(command: &str, args: &[String]) -> Option<DirectSpawn> {
     if direct_spawn_disabled() {
         return None;
     }
-    /// Invocation -> resolution, including the negative result: a server that cannot
-    /// be rewritten must not re-walk the npx cache on every respawn.
-    type Cache = Mutex<HashMap<(String, Vec<String>), Option<DirectSpawn>>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (command.to_string(), args.to_vec());
-    if let Some(hit) = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-    {
-        return hit.clone();
+    memoized(cache, key, || resolve_direct_uncached(command, args))
+}
+
+/// Whether a remembered spawn can still run. The npm cache and node installs can
+/// change under a long-lived process, and spawning a deleted script fails at once
+/// on every retry, without ever reaching the `npx` that could restore it.
+fn still_on_disk(direct: &DirectSpawn) -> bool {
+    Path::new(&direct.command).is_file()
+        && direct
+            .args
+            .first()
+            .is_some_and(|script| Path::new(script).is_file())
+}
+
+fn memoized(
+    cache: &Cache,
+    key: (String, Vec<String>),
+    resolve: impl FnOnce() -> Option<DirectSpawn>,
+) -> Option<DirectSpawn> {
+    let stale = {
+        let cached = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match cached.get(&key) {
+            Some(Some(direct)) if !still_on_disk(direct) => true,
+            Some(hit) => return hit.clone(),
+            None => false,
+        }
+    };
+    let resolved = resolve();
+    // After a stale hit with nothing to replace it, this spawn falls back to `npx`,
+    // which reinstalls the package. Keep the stale entry so every spawn until then
+    // looks again, and the first one after the reinstall goes direct.
+    if !stale || resolved.is_some() {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, resolved.clone());
     }
-    let resolved = resolve_direct_uncached(command, args);
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key, resolved.clone());
     resolved
 }
 
@@ -960,6 +988,62 @@ mod tests {
         )
         .unwrap();
         assert!(resolve_fixture("npx", &s(&["srv"]), &fx2.roots(), &fx2.node()).is_none());
+    }
+
+    #[test]
+    fn a_remembered_spawn_is_dropped_when_its_files_are_deleted() {
+        let fx = Fixture::new("stale");
+        let node = fx.node();
+        let spawn_for = |script: &Path| DirectSpawn {
+            command: node.to_string_lossy().into_owned(),
+            args: vec![script.to_string_lossy().into_owned(), "stripe".into()],
+            bin_dir: None,
+        };
+        let script = fx.root.join("cli.js");
+        std::fs::write(&script, "// entry").unwrap();
+        let cache = Cache::default();
+        let key = || ("npx".to_string(), s(&["-y", "srv"]));
+
+        let first = memoized(&cache, key(), || Some(spawn_for(&script)));
+        assert_eq!(first, Some(spawn_for(&script)));
+        let unused = || panic!("a spawn whose files exist must not resolve again");
+        assert_eq!(memoized(&cache, key(), unused), first);
+
+        // The npm cache was wiped: this spawn has to fall back to npx.
+        std::fs::remove_file(&script).unwrap();
+        assert_eq!(memoized(&cache, key(), || None), None);
+        // Another spawn before npx has finished must not settle on the fallback.
+        assert_eq!(memoized(&cache, key(), || None), None);
+
+        // npx reinstalled it, so the next spawn goes direct again.
+        let restored = fx.root.join("restored.js");
+        std::fs::write(&restored, "// entry").unwrap();
+        assert_eq!(
+            memoized(&cache, key(), || Some(spawn_for(&restored))),
+            Some(spawn_for(&restored))
+        );
+    }
+
+    #[test]
+    fn a_remembered_spawn_is_dropped_when_node_is_deleted() {
+        let fx = Fixture::new("stale-node");
+        let script = fx.root.join("cli.js");
+        std::fs::write(&script, "// entry").unwrap();
+        let spawn = DirectSpawn {
+            command: fx.root.join("gone-node").to_string_lossy().into_owned(),
+            args: vec![script.to_string_lossy().into_owned()],
+            bin_dir: None,
+        };
+        assert!(!still_on_disk(&spawn));
+    }
+
+    #[test]
+    fn a_remembered_fallback_does_not_walk_the_cache_again() {
+        let cache = Cache::default();
+        let key = || ("npx".to_string(), s(&["-y", "srv"]));
+        assert_eq!(memoized(&cache, key(), || None), None);
+        let unused = || panic!("a remembered fallback must not resolve again");
+        assert_eq!(memoized(&cache, key(), unused), None);
     }
 
     /// A downloaded package's `bin` is untrusted input; it must not be able to point

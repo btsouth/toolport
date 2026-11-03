@@ -506,7 +506,8 @@ fn build_window(
     }
     {
         // Ctrl+F searches the Skills page when it is open, and the servers list elsewhere;
-        // Ctrl+R scans skills again, as in the React app.
+        // Ctrl+R scans skills again, as in the React app, and rechecks servers on
+        // the Servers page, as its refresh button's tooltip says.
         let find = gtk::gio::SimpleAction::new("find", None);
         let (stack_ref, skills, app_ref) = (stack.clone(), skills_page.clone(), app.clone());
         find.connect_activate(move |_, _| {
@@ -519,15 +520,18 @@ fn build_window(
         app.add_action(&find);
         app.set_accels_for_action("app.search-servers", &[]);
         app.set_accels_for_action("app.find", &["<Primary>f"]);
-        let rescan = gtk::gio::SimpleAction::new("rescan-skills", None);
-        let (stack_ref, skills) = (stack.clone(), skills_page.clone());
-        rescan.connect_activate(move |_, _| {
-            if stack_ref.visible_child_name().as_deref() == Some("skills") {
-                skills.refresh();
-            }
-        });
-        app.add_action(&rescan);
-        app.set_accels_for_action("app.rescan-skills", &["<Primary>r"]);
+        let refresh = gtk::gio::SimpleAction::new("refresh-page", None);
+        let (stack_ref, skills, servers) =
+            (stack.clone(), skills_page.clone(), server_page.clone());
+        refresh.connect_activate(
+            move |_, _| match stack_ref.visible_child_name().as_deref() {
+                Some("skills") => skills.refresh(),
+                Some("servers") => servers.probe_servers(health::ProbeReason::Refresh),
+                _ => {}
+            },
+        );
+        app.add_action(&refresh);
+        app.set_accels_for_action("app.refresh-page", &["<Primary>r"]);
     }
     split.set_sidebar(Some(&adw::NavigationPage::new(&sidebar, "Navigation")));
     let content_with_notice = gtk::Box::new(gtk::Orientation::Vertical, 0);

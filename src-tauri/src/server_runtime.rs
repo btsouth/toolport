@@ -262,10 +262,14 @@ pub fn probe_registered(server_id: &str) -> Result<ProbeResult, String> {
     Ok(probe_one_bounded(&server))
 }
 
+/// The servers the Servers page shows as on. Default access only limits what
+/// clients without their own access set can see, so it must not narrow this list:
+/// a server left out would stay on "Checking..." with no way to finish.
 pub fn enabled_servers(registry: &crate::registry::Registry) -> Vec<ServerEntry> {
     registry
-        .enabled_servers()
-        .into_iter()
+        .servers
+        .iter()
+        .filter(|server| registry.enabled_here(&server.id))
         .filter(|server| !crate::clients::is_gateway_server(server))
         .cloned()
         .collect()
@@ -399,6 +403,37 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "enabled");
+    }
+
+    #[test]
+    fn enabled_servers_ignores_a_default_access_set_that_leaves_servers_out() {
+        let mut registry = crate::registry::Registry::default();
+        let mut first = server();
+        first.id = "first".into();
+        first.enabled = true;
+        let mut second = server();
+        second.id = "second".into();
+        second.enabled = true;
+        let mut off = server();
+        off.id = "off".into();
+        registry.servers.extend([first, second, off]);
+        let work = registry.add_profile("Work");
+        registry.set_access_server(&work, "first", true).unwrap();
+        registry.set_default_access(Some(&work)).unwrap();
+        assert_eq!(registry.enabled_servers().len(), 1);
+
+        let ids = |registry: &crate::registry::Registry| {
+            enabled_servers(registry)
+                .into_iter()
+                .map(|server| server.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&registry), ["first", "second"]);
+
+        let empty = registry.add_profile("Empty");
+        registry.set_default_access(Some(&empty)).unwrap();
+        assert!(registry.enabled_servers().is_empty());
+        assert_eq!(ids(&registry), ["first", "second"]);
     }
 
     #[test]

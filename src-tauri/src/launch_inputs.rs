@@ -18,8 +18,13 @@ impl ResolvedArgs {
         // Keep all post-resolution errors opaque for bound invocations; setup
         // and vault failures are reported before this point with input labels.
         if self.has_binding {
-            return "downstream server failed after launch; check its command and setup values"
-                .into();
+            return match exit_status_prefix(&message) {
+                Some(exit) => {
+                    format!("{exit} after launch; check its command and setup values")
+                }
+                None => "downstream server failed after launch; check its command and setup values"
+                    .into(),
+            };
         }
         let mut values = self.sensitive.clone();
         values.sort_by_key(|value| std::cmp::Reverse(value.len()));
@@ -29,6 +34,29 @@ impl ResolvedArgs {
             .filter(|s| !s.is_empty())
             .fold(message, |m, s| m.replace(&s, "<redacted>"))
     }
+}
+
+/// The part of a child exit message that Toolport wrote itself: that it exited and
+/// any exit status, never the stderr that follows. Without it, every failure of a
+/// server with a secret reads the same and a crash cannot be told from a bad setup
+/// value. A process killed by a signal has no status.
+fn exit_status_prefix(message: &str) -> Option<&str> {
+    const START: &str = "downstream server exited";
+    let rest = message.strip_prefix(START)?;
+    let status_len = match rest.strip_prefix(" (status ") {
+        Some(status) => {
+            let (code, _) = status.split_once(')')?;
+            let digits = code.strip_prefix('-').unwrap_or(code);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            " (status ".len() + code.len() + 1
+        }
+        None => 0,
+    };
+    let after = &rest[status_len..];
+    (after.starts_with(":\n") || after.starts_with(" without stderr output."))
+        .then(|| &message[..START.len() + status_len])
 }
 
 /// What a person calls a launch input. Inputs created from pasted arguments
@@ -240,6 +268,34 @@ mod tests {
         assert_eq!(args.args[2], "AC123/s3cr3t");
         assert!(!args.redact("failed AC123/s3cr3t".into()).contains("s3cr3t"));
         assert!(!args.redact("truncated cr3t".into()).contains("cr3t"));
+        assert_eq!(
+            args.redact("downstream server exited (status 1):\nbad key s3cr3t".into()),
+            "downstream server exited (status 1) after launch; check its command and setup values"
+        );
+        assert_eq!(
+            args.redact(
+                "downstream server exited (status -5) without stderr output. Check it.".into()
+            ),
+            "downstream server exited (status -5) after launch; check its command and setup values"
+        );
+        assert_eq!(
+            args.redact("downstream server exited:\nkilled with s3cr3t".into()),
+            "downstream server exited after launch; check its command and setup values"
+        );
+        // Anything other than Toolport's exact wording stays opaque.
+        for message in [
+            "downstream server exited (status 1) s3cr3t",
+            "downstream server exited s3cr3t:\nbad",
+            "downstream server exited: s3cr3t",
+            "downstream server exited (status s3cr3t):\nbad",
+            "downstream server exited (status ):\nbad",
+            "s3cr3t downstream server exited (status 1):\nbad",
+        ] {
+            assert_eq!(
+                args.redact(message.into()),
+                "downstream server failed after launch; check its command and setup values"
+            );
+        }
         assert!(resolve_args_with(&server, |_, _| Ok(None))
             .unwrap_err()
             .contains("API Secret"));
