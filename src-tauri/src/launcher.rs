@@ -104,15 +104,14 @@ fn memoized(
         }
     };
     let resolved = resolve();
-    let mut cached = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if stale && resolved.is_none() {
-        // This spawn falls back to `npx`, which reinstalls the package. Forget the
-        // entry so the next spawn can find that copy and go direct again.
-        cached.remove(&key);
-    } else {
-        cached.insert(key, resolved.clone());
+    // After a stale hit with nothing to replace it, this spawn falls back to `npx`,
+    // which reinstalls the package. Keep the stale entry so every spawn until then
+    // looks again, and the first one after the reinstall goes direct.
+    if !stale || resolved.is_some() {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, resolved.clone());
     }
     resolved
 }
@@ -1012,6 +1011,8 @@ mod tests {
 
         // The npm cache was wiped: this spawn has to fall back to npx.
         std::fs::remove_file(&script).unwrap();
+        assert_eq!(memoized(&cache, key(), || None), None);
+        // Another spawn before npx has finished must not settle on the fallback.
         assert_eq!(memoized(&cache, key(), || None), None);
 
         // npx reinstalled it, so the next spawn goes direct again.
