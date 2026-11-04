@@ -87,6 +87,7 @@ export function needsInstallers(event, files) {
         [
           "package.json",
           "package-lock.json",
+          "scripts/patch-appimage.sh",
           "scripts/prepare-sidecar.mjs",
           "scripts/test-windows-installer.py",
           "scripts/test-nsis-hooks.sh",
@@ -131,7 +132,7 @@ export function requireResults(needs) {
   const installers = needs.changes.outputs?.installers;
   if (installers !== "true" && installers !== "false")
     throw new Error("Installer selection is missing or invalid");
-  for (const job of ["windows-installer", "macos-payload"]) {
+  for (const job of ["windows-installer", "macos-payload", "linux-appimage"]) {
     const expected = installers === "true" ? "success" : "skipped";
     if (needs[job]?.result !== expected)
       throw new Error(`${job}: expected ${expected}, got ${needs[job]?.result}`);
