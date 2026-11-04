@@ -2,7 +2,16 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { watch } from "node:fs";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
+import { connect } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -451,11 +460,46 @@ export class Fixture {
     await this.killOwnedPid(pid);
     return pid;
   }
+  // Windows reuses a PID within seconds, so a recorded PID whose process already ended can
+  // belong to another fixture or test. Only signal one that still proves it's ours.
+  async daemonIsOurs(descriptor) {
+    const port = Number(
+      String(descriptor.endpoint ?? "")
+        .split(":")
+        .pop(),
+    );
+    if (process.platform !== "win32" || !port) return true;
+    return new Promise((resolve) => {
+      const socket = connect(port, "127.0.0.1");
+      socket.setTimeout(2_000);
+      const finish = (listening) => {
+        socket.destroy();
+        resolve(listening);
+      };
+      socket.once("connect", () => finish(true));
+      socket.once("timeout", () => finish(false));
+      socket.once("error", () => finish(false));
+    });
+  }
+  async mockIsOurs(pid) {
+    if (process.platform !== "win32") return true;
+    try {
+      // The mock holds this file open for life, so it can only be deleted once the mock ended.
+      await unlink(path.join(this.data, `mock.pid.${pid}.alive`));
+      return false;
+    } catch (error) {
+      if (["EBUSY", "EPERM", "EACCES"].includes(error.code)) return true;
+      // Nothing recorded this PID's liveness, as when a test wrote the file by hand.
+      if (error.code === "ENOENT") return true;
+      throw error;
+    }
+  }
   async close() {
     await Promise.all(this.clients.map((c) => stop(c.child)));
     // Stop the producers first, then consume every published mock/wiretap PID.
-    for (const descriptor of await this.descriptors())
-      await this.killOwnedPid(descriptor.pid);
+    for (const descriptor of await this.descriptors()) {
+      if (await this.daemonIsOurs(descriptor)) await this.killOwnedPid(descriptor.pid);
+    }
     for (const name of ["wiretap.pid", "mock.pid"]) {
       let pids;
       try {
@@ -464,8 +508,10 @@ export class Fixture {
         if (error.code === "ENOENT") continue;
         throw error;
       }
-      for (const pid of new Set(pids.trim().split(/\s+/).filter(Boolean).map(Number)))
+      for (const pid of new Set(pids.trim().split(/\s+/).filter(Boolean).map(Number))) {
+        if (name === "mock.pid" && !(await this.mockIsOurs(pid))) continue;
         await this.killOwnedPid(pid);
+      }
     }
     await rm(this.home, {
       recursive: true,

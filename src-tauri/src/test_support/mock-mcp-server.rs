@@ -1034,6 +1034,20 @@ fn serve_concurrent(cfg: Config, state: State) {
 fn main() {
     if let Ok(path) = std::env::var("MOCK_MCP_PID_FILE") {
         use std::io::Write;
+        // Windows reuses a pid within seconds, so a pid alone can't say this process is still
+        // alive. No other process can delete this file until the handle dies with this one.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let alive = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .share_mode(0)
+                .open(format!("{path}.{}.alive", std::process::id()))
+                .expect("create the mock's liveness marker");
+            std::mem::forget(alive);
+        }
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
