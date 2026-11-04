@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { availableParallelism } from "node:os";
 import path from "node:path";
 import {
   Fixture,
@@ -26,10 +27,16 @@ assert.deepEqual(
   [...inventory].sort(),
   "client inventory changed; research and add its profile",
 );
-let active;
+const active = new Set();
+const starting = new Set();
+let stopping = false;
+let nextDiagnostics = 0;
 for (const signal of ["SIGINT", "SIGTERM"])
-  process.once(signal, () => {
-    (active?.close() || Promise.resolve()).finally(() => process.exit(1));
+  process.once(signal, async () => {
+    stopping = true;
+    await Promise.allSettled([...starting]);
+    await Promise.allSettled([...active].map((fixture) => fixture.close()));
+    process.exit(1);
   });
 let checks = 0;
 const pass = (message) => {
@@ -39,16 +46,47 @@ const pass = (message) => {
 const success = (reply) => assert(!failed(reply), JSON.stringify(reply).slice(0, 2_000));
 
 async function withFixture(profile, full, run) {
-  active = await Fixture.create(profile.id, { full });
+  const creating = Fixture.create(profile.id, { full }).then((created) => {
+    active.add(created);
+    return created;
+  });
+  starting.add(creating);
+  const fixture = await creating.finally(() => starting.delete(creating));
+  // The signal handler closes every active fixture, including this one.
+  if (stopping) return;
+  // A profile and its variants share an id, and may fail at the same time.
+  fixture.diagnosticsKey = `${profile.id}-${++nextDiagnostics}`;
   try {
-    await run(active, active.client(profile));
+    await run(fixture, fixture.client(profile));
   } catch (error) {
-    await writeFixtureDiagnostics(active);
+    await writeFixtureDiagnostics(fixture);
     throw error;
   } finally {
-    await active.close();
-    active = undefined;
+    await fixture.close();
+    active.delete(fixture);
   }
+}
+
+// Every fixture has its own home, daemon and downstream, and most of a scenario is
+// waiting on them. Stop starting new scenarios after the first failure.
+async function inParallel(items, run) {
+  const queue = [...items];
+  const errors = [];
+  // Windows starts processes more slowly, and width 8 overloaded its 4 vCPU runner.
+  const width =
+    process.platform === "win32" ? 4 : Math.min(8, availableParallelism() * 2);
+  await Promise.all(
+    Array.from({ length: width }, async () => {
+      while (queue.length > 0 && errors.length === 0 && !stopping) {
+        try {
+          await run(queue.shift());
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+    }),
+  );
+  if (errors.length > 0) throw errors[0];
 }
 
 async function baseline(profile) {
@@ -248,14 +286,14 @@ async function replay(profile) {
 }
 
 try {
-  for (const profile of profiles) await baseline(profile);
+  await inParallel(profiles, baseline);
   const captures = profiles
     .filter((p) => p.initialize)
     .flatMap((profile) => [
       profile,
       ...(profile.variants || []).map((variant) => ({ ...profile, ...variant })),
     ]);
-  for (const profile of captures) await replay(profile);
+  await inParallel(captures, replay);
   const codex = profiles.find((p) => p.id === "codex");
   const claude = profiles.find((p) => p.id === "claude-code");
   await withFixture(codex, true, async (fixture, first) => {
