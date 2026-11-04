@@ -113,6 +113,58 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  linux-appimage:
+    name: Linux AppImage validation
+    needs: changes
+    if: needs.changes.outputs.installers == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    # Same CI-only overrides as the Windows and macOS installer jobs. The patch
+    # script and payload assertion are the ones the release runs, so a Tauri or
+    # linuxdeploy change that breaks them fails on the PR instead of on a tag.
+    env:
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - name: Install Linux build dependencies
+        run: scripts/ci-apt-install.sh libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev squashfs-tools
+      - name: Give the runner headroom (the app crate links WebKitGTK)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/share/swift 2>/dev/null || true
+          sudo fallocate -l 8G /mnt/ci-swap && sudo chmod 600 /mnt/ci-swap && sudo mkswap /mnt/ci-swap && sudo swapon /mnt/ci-swap || true
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+          key: linux-appimage
+          cache-bin: "false"
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - run: npm ci
+      - name: Build the AppImage without release signing or publishing
+        run: npx tauri build --config src-tauri/tauri.bundle.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --bundles appimage -- --bin conduit
+      - name: Unbundle wayland and make the X11 backend overridable
+        shell: bash
+        run: |
+          shopt -s nullglob
+          images=(src-tauri/target/release/bundle/appimage/*.AppImage)
+          if [ ${#images[@]} -ne 1 ]; then
+            echo "::error::expected exactly one AppImage, found ${#images[@]}"
+            exit 1
+          fi
+          bash scripts/patch-appimage.sh "${images[0]}"
+      - name: Check every AppImage file
+        run: node .github/scripts/package-contents.mjs src-tauri/target/release/bundle/appimage/*.AppImage
+
   linux-packages:
     name: GTK deb and rpm install tests
     needs: changes
@@ -677,6 +729,7 @@ jobs:
       - linux-packages
       - windows-installer
       - macos-payload
+      - linux-appimage
       - chaos
       - installer-script
       - installer-script-bash

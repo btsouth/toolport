@@ -87,6 +87,8 @@ export function needsInstallers(event, files) {
         [
           "package.json",
           "package-lock.json",
+          "scripts/ci-apt-install.sh",
+          "scripts/patch-appimage.sh",
           "scripts/prepare-sidecar.mjs",
           "scripts/test-windows-installer.py",
           "scripts/test-nsis-hooks.sh",
@@ -131,7 +133,7 @@ export function requireResults(needs) {
   const installers = needs.changes.outputs?.installers;
   if (installers !== "true" && installers !== "false")
     throw new Error("Installer selection is missing or invalid");
-  for (const job of ["windows-installer", "macos-payload"]) {
+  for (const job of ["windows-installer", "macos-payload", "linux-appimage"]) {
     const expected = installers === "true" ? "success" : "skipped";
     if (needs[job]?.result !== expected)
       throw new Error(`${job}: expected ${expected}, got ${needs[job]?.result}`);
@@ -151,9 +153,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         throw new Error("Invalid source revision");
       // The first push has no before commit. Select checks conservatively.
       if (refs[0] !== "0".repeat(40)) {
-        files = execFileSync("git", ["diff", "--name-only", "-z", ...refs], {
-          encoding: "utf8",
-        })
+        files = execFileSync(
+          "git",
+          ["diff", "--name-only", "--no-renames", "-z", ...refs],
+          {
+            encoding: "utf8",
+          },
+        )
           .split("\0")
           .filter(Boolean);
       }

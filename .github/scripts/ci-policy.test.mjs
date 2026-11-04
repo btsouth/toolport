@@ -59,6 +59,7 @@ function results(selected, packages = "true", installers = "true") {
       "linux-packages",
       "windows-installer",
       "macos-payload",
+      "linux-appimage",
       "installer-script",
       "installer-script-bash",
       "pinned-install-urls",
@@ -72,7 +73,8 @@ function results(selected, packages = "true", installers = "true") {
       job,
       {
         result:
-          ["windows-installer", "macos-payload"].includes(job) && installers === "false"
+          ["windows-installer", "macos-payload", "linux-appimage"].includes(job) &&
+          installers === "false"
             ? "skipped"
             : job === "linux-packages" && packages === "false"
               ? "skipped"
@@ -190,6 +192,8 @@ test("installers only run for packaging inputs on PRs and pushes", () => {
       "package.json",
       "package-lock.json",
       "scripts/prepare-sidecar.mjs",
+      "scripts/ci-apt-install.sh",
+      "scripts/patch-appimage.sh",
       "scripts/test-windows-installer.py",
       "scripts/test-nsis-hooks.sh",
       ".github/scripts/package-contents.mjs",
