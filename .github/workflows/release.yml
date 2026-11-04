@@ -166,8 +166,10 @@ jobs:
       # recompile from the tagged source, while the third-party deps (the bulk of the
       # compile) are restored. That is the from-scratch guarantee for OUR code plus the
       # speedup for everyone else's. Do NOT replace this with a plain actions/cache of
-      # `target/`. `key` distinguishes the two macOS targets (same runner OS); rust-cache
-      # already keys on the OS, so windows/linux (empty target) stay separate on their own.
+      # `target/`. The target in `shared-key` distinguishes the two macOS targets (same
+      # runner OS); rust-cache already keys on the OS, so windows/linux (empty target) stay
+      # separate on their own. A tag can only restore caches saved on main, so nothing saves
+      # here: release-cache.yml builds the same legs on main with no secrets and saves them.
       # cache-bin: false keeps ~/.cargo/bin (which rust-cache caches by default) OUT of this
       # cache: the Windows signer `trusted-signing-cli` lives there and is cached explicitly
       # below, and a cache-restored signing binary would both defeat that step's version key
@@ -175,7 +177,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: src-tauri
-          key: ${{ matrix.target }}
+          shared-key: release-${{ matrix.target }}
           cache-bin: "false"
           save-if: false
 
