@@ -6,6 +6,34 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.3.3] - 2026-11-03
+
+Toolport 2.3.3 fixes the Servers page getting stuck on Initializing or Installing,
+and local servers going Unreachable after the npm cache is cleared. It also updates
+the in-app updater.
+
+If you are on Toolport 1.24.x, this is also your update to Toolport 2. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+before updating.
+
+### Security
+
+- Updated the Tauri updater so it no longer depends on zip 4 (RUSTSEC-2026-0429).
+  (#1303)
+
+### Fixed
+
+- The Servers page now checks every enabled server. Before, it only checked servers
+  in the Default access set, so the rest stayed on Initializing or Installing and
+  Refresh could not finish. (#1305, #1306)
+- Clearing the npm cache no longer breaks running npx servers. The gateway kept
+  launching a path it remembered, and every start failed until it restarted. It now
+  falls back to npx, which reinstalls the package. (#1306)
+- Servers with a secret now report their exit status when they stop, instead of one
+  generic error. Their output stays hidden. (#1306)
+- Ctrl+R rechecks servers on the GTK Servers page, as the refresh button says. (#1306)
+- Programs started from the AppImage no longer pick up its bundled GIO modules. (#1308)
+
 ## [2.3.2] - 2026-11-02
 
 Toolport 2.3.2 lets idle clients recover on their own after the shared gateway
