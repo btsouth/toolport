@@ -19,7 +19,8 @@ on:
       - .github/workflows/release-cache.yml
   # GitHub removes a cache nobody has read for 7 days, and releases can be further
   # apart than that. Reading it twice a week keeps it, and a new stable Rust gets
-  # built here rather than in a release. An exact hit skips the build.
+  # built here rather than in a release. An exact hit skips the build, except on
+  # pull requests, which need to run a changed build.
   schedule:
     - cron: "17 6 * * 1,4"
   workflow_dispatch:
@@ -79,15 +80,15 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install Linux build dependencies
-        if: matrix.os == 'ubuntu-22.04' && steps.cache.outputs.cache-hit != 'true'
+        if: matrix.os == 'ubuntu-22.04' && (github.event_name == 'pull_request' || steps.cache.outputs.cache-hit != 'true')
         run: scripts/ci-apt-install.sh libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev squashfs-tools
 
       - name: Install dependencies
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: github.event_name == 'pull_request' || steps.cache.outputs.cache-hit != 'true'
         run: npm ci
 
       - name: Give the Linux runner headroom
-        if: matrix.os == 'ubuntu-22.04' && steps.cache.outputs.cache-hit != 'true'
+        if: matrix.os == 'ubuntu-22.04' && (github.event_name == 'pull_request' || steps.cache.outputs.cache-hit != 'true')
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/share/swift 2>/dev/null || true
           sudo fallocate -l 10G /mnt/conduit-swap && sudo chmod 600 /mnt/conduit-swap \
@@ -95,7 +96,7 @@ jobs:
 
       # Same build as release.yml, minus signing and updater artifacts, which need secrets.
       - name: Build installer
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: github.event_name == 'pull_request' || steps.cache.outputs.cache-hit != 'true'
         run: npx tauri build --config src-tauri/tauri.bundle.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --bundles ${{ matrix.bundles }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }} -- --bin conduit
         env:
           CONDUIT_SIDECAR_TARGET: ${{ matrix.target }}
