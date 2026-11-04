@@ -1112,10 +1112,22 @@ fn kill_daemons(dir: &Path) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        // Windows reuses a pid within seconds, so a descriptor left by a daemon that already
+        // ended could name another test's process. Only a listening endpoint proves it's ours.
         #[cfg(windows)]
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .status();
+        {
+            let listening = descriptor["endpoint"]
+                .as_str()
+                .and_then(|endpoint| endpoint.parse().ok())
+                .is_some_and(|address| {
+                    std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_ok()
+                });
+            if listening {
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .status();
+            }
+        }
     }
 }
 
