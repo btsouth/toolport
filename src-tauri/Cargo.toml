@@ -213,6 +213,11 @@ required-features = ["test-support"]
 name = "integrity-report"
 required-features = ["test-support"]
 
+# The search tests hash the 67 MB model file once per process. Unoptimized, that takes
+# over a second, and nextest gives every test its own process.
+[profile.dev.package.sha2]
+opt-level = 3
+
 # Transformer kernels must remain usable in debug gateways and parity tests.
 # Keep application code debuggable; these profiles do not change assertions.
 [profile.dev.package.candle-core]
