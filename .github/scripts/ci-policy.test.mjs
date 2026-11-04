@@ -192,6 +192,7 @@ test("installers only run for packaging inputs on PRs and pushes", () => {
       "package.json",
       "package-lock.json",
       "scripts/prepare-sidecar.mjs",
+      "scripts/ci-apt-install.sh",
       "scripts/patch-appimage.sh",
       "scripts/test-windows-installer.py",
       "scripts/test-nsis-hooks.sh",
