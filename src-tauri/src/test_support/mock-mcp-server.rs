@@ -1039,15 +1039,14 @@ fn main() {
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            if let Ok(alive) = std::fs::OpenOptions::new()
+            let alive = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
                 .write(true)
                 .share_mode(0)
                 .open(format!("{path}.{}.alive", std::process::id()))
-            {
-                std::mem::forget(alive);
-            }
+                .expect("create the mock's liveness marker");
+            std::mem::forget(alive);
         }
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)

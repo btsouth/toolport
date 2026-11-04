@@ -477,7 +477,7 @@ export class Fixture {
         resolve(listening);
       };
       socket.once("connect", () => finish(true));
-      socket.once("timeout", () => finish(true));
+      socket.once("timeout", () => finish(false));
       socket.once("error", () => finish(false));
     });
   }
