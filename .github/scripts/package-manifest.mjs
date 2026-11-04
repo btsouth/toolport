@@ -141,7 +141,9 @@ export function assertManifest(paths, kind) {
           path,
         ) ||
         // Tauri CLI 2.12's linuxdeploy leaves usr/share/pixmaps behind empty.
-        /^(?:usr|usr\/bin|usr\/lib|usr\/lib64|usr\/share|usr\/share\/pixmaps)$/.test(path) ||
+        /^(?:usr|usr\/bin|usr\/lib|usr\/lib64|usr\/share|usr\/share\/pixmaps)$/.test(
+          path,
+        ) ||
         /^(?:usr\/)?lib(?:64)?\/(?:[^/]+\/)*(?:lib[^/]+\.so(?:\.[0-9]+)*|ld-linux[^/]+\.so(?:\.[0-9]+)*|WebKit(?:Web|Network|GPU)Process)$/.test(
           path,
         ) ||
