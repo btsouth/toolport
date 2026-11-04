@@ -1,0 +1,102 @@
+name: Release build cache
+
+# Release runs start from a tag, and a tag can only restore caches saved on main.
+# Without this workflow every release compiles all dependencies cold. This builds
+# the same legs on main, unsigned and with no secrets, so release.yml restores a
+# warm dependency cache. rust-cache never saves workspace crates, so the release
+# still compiles our own code from the tagged source.
+on:
+  push:
+    branches: [main]
+    paths:
+      - src-tauri/Cargo.lock
+      - "src-tauri/**/Cargo.toml"
+      - src-tauri/tauri.conf.json
+      - src-tauri/tauri.bundle.conf.json
+      - .github/workflows/release-cache.yml
+  pull_request:
+    paths:
+      - .github/workflows/release-cache.yml
+  # GitHub removes a cache nobody has read for 7 days, and releases can be further
+  # apart than that. Reading it twice a week keeps it, and a new stable Rust gets
+  # built here rather than in a release. An exact hit skips the build, except on
+  # pull requests, which need to run a changed build.
+  schedule:
+    - cron: "17 6 * * 1,4"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    name: Warm ${{ matrix.os }} ${{ matrix.target }} release cache
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # Same legs as release.yml's build job.
+      matrix:
+        include:
+          - os: windows-latest
+            bundles: nsis
+          - os: macos-latest
+            bundles: app
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            bundles: app
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            bundles: appimage
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24
+          cache: npm
+
+      # Same toolchain step as release.yml, so the cache's rustc hash matches.
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Add the macOS Rust target
+        if: matrix.target
+        run: rustup target add ${{ matrix.target }}
+
+      # Must match release.yml's rust-cache step.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        id: cache
+        with:
+          workspaces: src-tauri
+          shared-key: release-${{ matrix.target }}
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-22.04' && (github.event_name == 'pull_request' || steps.cache.outputs.cache-hit != 'true')
+        run: scripts/ci-apt-install.sh libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev squashfs-tools
+
+      - name: Install dependencies
+        if: github.event_name == 'pull_request' || steps.cache.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - name: Give the Linux runner headroom
+        if: matrix.os == 'ubuntu-22.04' && (github.event_name == 'pull_request' || steps.cache.outputs.cache-hit != 'true')
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/share/swift 2>/dev/null || true
+          sudo fallocate -l 10G /mnt/conduit-swap && sudo chmod 600 /mnt/conduit-swap \
+            && sudo mkswap /mnt/conduit-swap && sudo swapon /mnt/conduit-swap || true
+
+      # Same build as release.yml, minus signing and updater artifacts, which need secrets.
+      - name: Build installer
+        if: github.event_name == 'pull_request' || steps.cache.outputs.cache-hit != 'true'
+        run: npx tauri build --config src-tauri/tauri.bundle.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --bundles ${{ matrix.bundles }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }} -- --bin conduit
+        env:
+          CONDUIT_SIDECAR_TARGET: ${{ matrix.target }}
