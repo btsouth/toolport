@@ -381,6 +381,11 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/share/swift 2>/dev/null || true
           sudo fallocate -l 8G /mnt/ci-swap && sudo chmod 600 /mnt/ci-swap && sudo mkswap /mnt/ci-swap && sudo swapon /mnt/ci-swap || true
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: nextest@0.9.151
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -397,7 +402,7 @@ jobs:
       # targets too, so use --test '*' to keep the groups disjoint.
       - name: Rust tests (${{ matrix.group }})
         # Notification fixtures register a mock endpoint on this private bus.
-        run: dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --features test-support,search-static ${{ matrix.targets }}
+        run: dbus-run-session -- cargo nextest run --manifest-path src-tauri/Cargo.toml --profile ci --features test-support,search-static ${{ matrix.targets }}
 
       - name: Build headless gateway for smoke tests
         if: matrix.group == 'integration'
@@ -480,6 +485,11 @@ jobs:
         if: matrix.os == 'ubuntu-22.04'
         run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: nextest@0.9.151
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -498,13 +508,13 @@ jobs:
 
       - name: Rust tests (${{ matrix.group }}, no desktop)
         if: matrix.os != 'windows-latest'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static ${{ matrix.targets }}
+        run: cargo nextest run --manifest-path src-tauri/Cargo.toml --profile ci --no-default-features --features test-support,search-static ${{ matrix.targets }}
 
       # Reuse the local Windows helper so a stale debug gateway cannot lock the
       # executable while Cargo rebuilds it.
       - name: Rust tests (Windows, no desktop)
         if: matrix.os == 'windows-latest'
-        run: powershell -ExecutionPolicy Bypass -File scripts/test-rust-windows.ps1 -NoDefaultFeatures -TestGroup ${{ matrix.group }}
+        run: powershell -ExecutionPolicy Bypass -File scripts/test-rust-windows.ps1 -NoDefaultFeatures -TestGroup ${{ matrix.group }} -Nextest
 
       - name: Build headless gateway for cross-platform smoke
         if: matrix.os != 'ubuntu-22.04' && matrix.group == 'integration'
@@ -553,6 +563,7 @@ jobs:
           name: rust-build-timings-${{ matrix.os }}-${{ matrix.group }}
           path: |
             src-tauri/target/cargo-timings/*.html
+            src-tauri/target/nextest/ci/junit.xml
             .verify/client-conformance-failures/
           include-hidden-files: true
           if-no-files-found: ignore

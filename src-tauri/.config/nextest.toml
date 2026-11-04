@@ -1,0 +1,32 @@
+# nextest runs every test in its own process, so the in-process CASE_LOCK in these
+# files no longer serializes anything. These groups keep their one-at-a-time rule.
+[test-groups]
+one-gateway-conformance = { max-threads = 1 }
+daemon-health = { max-threads = 1 }
+daemon-crash-recovery = { max-threads = 1 }
+
+# Without /proc this case counts daemons machine-wide, so nothing else may run with it.
+[[profile.default.overrides]]
+platform = 'cfg(not(target_os = "linux"))'
+filter = "binary_id(conduit::one_gateway_conformance) and test(=matrix_cold_start_twenty_simultaneous_adapters_elect_exactly_one_daemon)"
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
+filter = "binary_id(conduit::one_gateway_conformance)"
+test-group = "one-gateway-conformance"
+
+[[profile.default.overrides]]
+filter = "binary_id(conduit::daemon_health)"
+test-group = "daemon-health"
+
+[[profile.default.overrides]]
+filter = "binary_id(conduit::daemon_crash_recovery)"
+test-group = "daemon-crash-recovery"
+
+[profile.ci]
+# Report every failure in a run. No retries: a flaky test should stay visible.
+fail-fast = false
+retries = 0
+
+[profile.ci.junit]
+path = "junit.xml"

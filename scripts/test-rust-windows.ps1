@@ -1,6 +1,7 @@
 param(
   [switch]$NoDefaultFeatures,
   [switch]$BuildOnly,
+  [switch]$Nextest,
   [ValidateSet("all", "core", "integration")]
   [string]$TestGroup = "all"
 )
@@ -20,8 +21,8 @@ if ($resolvedGateway) {
     }
 }
 
-$cargoArgs = @(
-  "test",
+$runner = if ($Nextest -and -not $BuildOnly) { @("nextest", "run", "--profile", "ci") } else { @("test") }
+$cargoArgs = @($runner) + @(
   "--features", "test-support,search-static",
   "--manifest-path", (Join-Path $repoRoot "src-tauri\Cargo.toml")
 )

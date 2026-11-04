@@ -253,7 +253,7 @@ describe("CI required merge gate (SBS-874)", () => {
     // The Linux suite is split into disjoint groups that together cover
     // everything `npm run test:rust` runs (--lib --bins --tests).
     expect(runScripts(jobs["build-test"]).join("\n")).toContain(
-      "dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --features test-support,search-static ${{ matrix.targets }}",
+      "dbus-run-session -- cargo nextest run --manifest-path src-tauri/Cargo.toml --profile ci --features test-support,search-static ${{ matrix.targets }}",
     );
     const groups = (jobs["build-test"].strategy?.matrix?.include ?? []) as {
       targets: string;

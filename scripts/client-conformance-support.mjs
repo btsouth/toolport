@@ -98,10 +98,11 @@ export async function coldRecoveryCatalog(
 export async function writeFixtureDiagnostics(fixture, observation) {
   const dir = path.join(repo, ".verify/client-conformance-failures");
   await mkdir(dir, { recursive: true });
+  const key = fixture.diagnosticsKey ?? fixture.id;
   for (const name of ["gateway.log", "downstream.jsonl"]) {
     try {
       const raw = await readFile(path.join(fixture.data, name), "utf8");
-      await writeFile(path.join(dir, `${fixture.id}-${name}`), raw.slice(-65_536));
+      await writeFile(path.join(dir, `${key}-${name}`), raw.slice(-65_536));
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
@@ -109,7 +110,7 @@ export async function writeFixtureDiagnostics(fixture, observation) {
   if (observation) {
     // Exclude descriptors, PIDs, endpoints, tokens, and reply bodies.
     await writeFile(
-      path.join(dir, `${fixture.id}-cold-recovery.json`),
+      path.join(dir, `${key}-cold-recovery.json`),
       JSON.stringify(
         {
           profile: fixture.id,
