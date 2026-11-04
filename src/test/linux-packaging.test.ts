@@ -115,6 +115,18 @@ describe("AppImage GDK_BACKEND is a default, not an override", () => {
     },
   );
 
+  it.skipIf(!gnuSed)(
+    "turns the commented-out line from Tauri CLI 2.12 into the same default",
+    () => {
+      const out = applyScriptSed(
+        "# export GDK_BACKEND=x11 # Monitor this closely. AppImage used to crash on Wayland!",
+      );
+      expect(out).toBe(
+        'export GDK_BACKEND="${GDK_BACKEND:-x11}" # Monitor this closely. AppImage used to crash on Wayland!',
+      );
+    },
+  );
+
   it.skipIf(!gnuSed)("leaves an unrelated GDK_BACKEND assignment alone", () => {
     expect(applyScriptSed("export GDK_BACKEND=wayland")).toBe(
       "export GDK_BACKEND=wayland",
@@ -122,6 +134,9 @@ describe("AppImage GDK_BACKEND is a default, not an override", () => {
     // Not anchored to a substring of a longer value.
     expect(applyScriptSed("export GDK_BACKEND=x11,wayland")).toBe(
       "export GDK_BACKEND=x11,wayland",
+    );
+    expect(applyScriptSed("# export GDK_BACKEND=x11,wayland")).toBe(
+      "# export GDK_BACKEND=x11,wayland",
     );
   });
 
