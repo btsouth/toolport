@@ -39,6 +39,7 @@ pub use locations::{
 mod moved;
 mod mutation;
 mod restore;
+mod toml_preservation;
 pub(crate) use restore::after_capture_conflict as record_config_capture_conflict;
 pub(crate) use restore::after_rollback as record_config_rollback;
 pub(crate) mod nanobot;
@@ -5575,6 +5576,7 @@ fn ensure_toml_table(item: &mut toml_edit::Item) -> &mut toml_edit::Table {
 }
 
 fn toml_mcp_servers_mut(doc: &mut toml_edit::DocumentMut) -> &mut toml_edit::Table {
+    toml_preservation::expand_container(doc);
     ensure_toml_table(&mut doc["mcp_servers"])
 }
 
@@ -6620,25 +6622,73 @@ fn write_opencode_json(path: &Path, servers: &[ServerEntry]) -> Result<(), Strin
 fn write_toml(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
     let mut doc = load_toml_document(path)?;
     let keep_header = toml_keeps_servers_header(&doc);
-    // Carry the old header's comments and blank lines onto the rebuilt table.
-    let decor = doc
-        .get("mcp_servers")
-        .and_then(|item| item.as_table())
-        .map(|table| table.decor().clone());
-    let mut servers_table = toml_edit::Table::new();
-    if let Some(decor) = decor {
-        *servers_table.decor_mut() = decor;
+    let removed: Vec<_> = toml_mcp_servers_mut(&mut doc)
+        .iter()
+        .filter(|(name, _)| !servers.iter().any(|server| server.name == *name))
+        .map(|(name, _)| name.to_string())
+        .collect();
+    toml_preservation::remove(&mut doc, &removed);
+    for server in servers {
+        let unchanged = doc
+            .get("mcp_servers")
+            .and_then(|table| table.get(&server.name))
+            .is_some_and(|item| toml_server_matches(item, server));
+        if !unchanged {
+            toml_preservation::put(
+                &mut doc,
+                &server.name,
+                toml_value_to_item(&entry_to_toml(server)),
+            );
+        }
     }
-    if !servers.is_empty() && !keep_header {
-        // Implicit so we emit `[mcp_servers.name]` rather than a `[mcp_servers]`
-        // wrapper, the same shape Codex already ships.
-        servers_table.set_implicit(true);
-    }
-    for s in servers {
-        servers_table.insert(&s.name, toml_value_to_item(&entry_to_toml(s)));
-    }
-    doc["mcp_servers"] = toml_edit::Item::Table(servers_table);
+    toml_mcp_servers_mut(&mut doc).set_implicit(!servers.is_empty() && !keep_header);
     atomic_write(path, &doc.to_string())
+}
+
+// 登録形式で扱う値だけを比較し、未知の設定や元の書式は変更対象にしない。
+fn toml_server_matches(item: &toml_edit::Item, server: &ServerEntry) -> bool {
+    let expected = entry_to_toml(server);
+    let string = |key: &str| item.get(key).and_then(|value| value.as_str());
+    let args: Vec<_> = item
+        .get("args")
+        .and_then(|value| value.as_array())
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let env: std::collections::BTreeMap<_, _> = item
+        .get("env")
+        .and_then(|value| value.as_table_like())
+        .map(|table| {
+            table
+                .iter()
+                .filter_map(|(key, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (key.to_string(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let expected_env: std::collections::BTreeMap<_, _> = expected
+        .get("env")
+        .and_then(|value| value.as_table())
+        .map(|table| {
+            table
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    string("command") == server.command.as_deref()
+        && string("url") == server.url.as_deref()
+        && args == server.args
+        && env == expected_env
 }
 
 // --- Goose: YAML config.yaml with a top-level `extensions` map ---
@@ -7890,22 +7940,34 @@ fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), Str
     let mut doc = load_toml_document(path)?;
     let keep_header = toml_keeps_servers_header(&doc);
     let servers = toml_mcp_servers_mut(&mut doc);
-    let remove: Vec<_> = servers
+    let mut remove: Vec<_> = servers
         .iter()
         .filter(|(name, value)| {
             gateway_edit_matches(name, value.get("command").and_then(|value| value.as_str()))
         })
+        .filter(|(name, _)| entry.is_none() || *name != GATEWAY_ENTRY_NAME)
         .map(|(name, _)| name.to_string())
         .collect();
-    for name in remove {
-        servers.remove(&name);
-    }
     if let Some(entry) = entry {
-        servers.insert(
+        if !servers.contains_key(GATEWAY_ENTRY_NAME) && !remove.is_empty() {
+            let alias = remove.remove(0);
+            toml_preservation::rename(
+                &mut doc,
+                &alias,
+                GATEWAY_ENTRY_NAME,
+                toml_value_to_item(&entry_to_toml(entry)),
+            );
+        }
+    }
+    toml_preservation::remove(&mut doc, &remove);
+    if let Some(entry) = entry {
+        toml_preservation::put(
+            &mut doc,
             GATEWAY_ENTRY_NAME,
             toml_value_to_item(&entry_to_toml(entry)),
         );
     }
+    let servers = toml_mcp_servers_mut(&mut doc);
     if servers.is_empty() || keep_header {
         // Keep an explicit empty table so uninstall still leaves `mcp_servers`
         // present, matching the previous toml::Value insert-if-missing path.
@@ -10101,7 +10163,7 @@ mod tests {
         assert_eq!(claude_config_dir_from(Some("~/work/claude".into())), None);
     }
 
-    fn sample_gateway(profile: Option<&str>, client_id: &str) -> ServerEntry {
+    pub(super) fn sample_gateway(profile: Option<&str>, client_id: &str) -> ServerEntry {
         let mut env = vec![EnvVar {
             key: crate::brand::CLIENT_ID.to_string(),
             value: Some(client_id.to_string()),
@@ -10541,7 +10603,7 @@ mod tests {
         }
     }
 
-    fn temp_path(label: &str) -> PathBuf {
+    pub(super) fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("conduit-w-{}-{}.cfg", std::process::id(), label))
     }
 

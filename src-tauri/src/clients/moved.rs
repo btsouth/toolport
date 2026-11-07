@@ -288,9 +288,7 @@ pub(super) fn remove_selected(format: Format, path: &Path, names: &[String]) -> 
         }
         Container::Toml => {
             let mut doc = load_toml_document(path)?;
-            for name in names {
-                toml_mcp_servers_mut(&mut doc).remove(name);
-            }
+            toml_preservation::remove(&mut doc, names);
             atomic_write(path, &doc.to_string())
         }
         Container::YamlMap(key) | Container::YamlList(key) => {
@@ -626,7 +624,15 @@ fn extract(format: Format, text: &str) -> Result<Vec<Moved>, String> {
                 }
                 let mut table = toml_edit::Table::new();
                 table.set_implicit(true);
-                table.insert(name, item.clone());
+                let mut item = item.clone();
+                if let Some(table) = item.as_table_mut() {
+                    table.decor_mut().set_prefix("");
+                }
+                let mut key = servers.key(name).unwrap().clone();
+                if item.is_value() {
+                    key.leaf_decor_mut().set_prefix("");
+                }
+                table.insert_formatted(&key, item);
                 let mut single = toml_edit::DocumentMut::new();
                 single.insert("mcp_servers", toml_edit::Item::Table(table));
                 out.push(Moved {
@@ -752,12 +758,14 @@ fn insert_missing(
         }
         Container::Toml => {
             let mut doc = load_toml_document(path)?;
-            let servers = toml_mcp_servers_mut(&mut doc);
             for entry in entries {
                 let Raw::Toml { text } = &entry.raw else {
                     continue;
                 };
-                if has_name(servers.iter().map(|(name, _)| name), &entry.name) {
+                if has_name(
+                    toml_mcp_servers_mut(&mut doc).iter().map(|(name, _)| name),
+                    &entry.name,
+                ) {
                     continue;
                 }
                 let single = text
@@ -769,7 +777,7 @@ fn insert_missing(
                 else {
                     continue;
                 };
-                servers.insert(&entry.name, item.clone());
+                toml_preservation::put(&mut doc, &entry.name, item.clone());
                 names.push(entry.name.clone());
             }
             if names.is_empty() {

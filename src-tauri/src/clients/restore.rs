@@ -634,12 +634,25 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
     match format {
         Format::TomlMcpServers => {
             let mut doc = load_toml_document(path)?;
-            let original = record
+            let mut original = record
                 .original
                 .as_deref()
                 .unwrap_or("")
                 .parse::<toml_edit::DocumentMut>()
                 .map_err(|e| e.to_string())?;
+            let written_doc = written_text
+                .unwrap_or("")
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|e| e.to_string())?;
+            let retained = toml_preservation::retained_prefix(&original, &written_doc, &doc);
+            for name in retained {
+                let servers = toml_mcp_servers_mut(&mut original);
+                if let Some(table) = servers.get_mut(&name).and_then(|item| item.as_table_mut()) {
+                    table.decor_mut().set_prefix("");
+                } else if let Some(mut key) = servers.key_mut(&name) {
+                    key.leaf_decor_mut().set_prefix("");
+                }
+            }
             let desired = latest.get(key).and_then(Value::as_object);
             let existing = doc
                 .get(key)
@@ -651,29 +664,28 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let servers = toml_mcp_servers_mut(&mut doc);
-            for name in existing {
-                if desired.is_none_or(|map| !map.contains_key(&name)) {
-                    servers.remove(&name);
-                }
-            }
+            let removed: Vec<_> = existing
+                .into_iter()
+                .filter(|name| desired.is_none_or(|map| !map.contains_key(name)))
+                .collect();
+            toml_preservation::remove(&mut doc, &removed);
             if let Some(desired) = desired {
                 for (name, value) in desired {
                     if mutation::value(format, current.as_deref())?[key].get(name) != Some(value) {
                         if let Some(item) = moved::toml_entry(client_id, path, name)? {
-                            servers.insert(name, item);
+                            toml_preservation::put(&mut doc, name, item);
                         } else if mutation::value(format, record.original.as_deref())?[key]
                             .get(name)
                             == Some(value)
                         {
                             if let Some(item) = original.get(key).and_then(|table| table.get(name))
                             {
-                                servers.insert(name, item.clone());
+                                toml_preservation::put(&mut doc, name, item.clone());
                             }
                         } else {
                             let value: toml::Value =
                                 serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-                            servers.insert(name, toml_value_to_item(&value));
+                            toml_preservation::put(&mut doc, name, toml_value_to_item(&value));
                         }
                     }
                 }
