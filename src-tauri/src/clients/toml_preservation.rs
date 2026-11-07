@@ -443,6 +443,94 @@ mod tests {
             Some(123)
         );
     }
+
+    #[test]
+    fn followup_eof_comment_terminates_before_appended_gateway_header() {
+        let fixture = Fixture::new("eof-comment-line");
+        let path = fixture.0.join("config.toml");
+        let gateway = super::super::tests::sample_gateway(None, "codex");
+        for newline in ["\n", "\r\n"] {
+            for ending in ["", "\n", "\r\n"] {
+                let input = BLOCK.trim_end_matches('\n').replace('\n', newline) + ending;
+                std::fs::write(&path, input).unwrap();
+                edit_toml_gateway(&path, Some(&gateway)).unwrap();
+                let output = read_config_file(&path).unwrap();
+                let parsed: toml::Value = toml::from_str(&output).unwrap();
+                assert_block(&output);
+                assert_eq!(
+                    parsed["mcp_servers"]["toolport"]["command"].as_str(),
+                    Some("toolport-gateway")
+                );
+                assert_eq!(
+                    parsed["mcp_servers"]["prunlet"]["command"].as_str(),
+                    Some("prunlet")
+                );
+            }
+        }
+        let mut doc: DocumentMut = "model = 'keep'\n \t".parse().unwrap();
+        super::put(
+            &mut doc,
+            "toolport",
+            toml_value_to_item(&entry_to_toml(&gateway)),
+        );
+        let output = doc.to_string();
+        assert!(output.contains("\n \t[mcp_servers.toolport]"), "{output}");
+        assert!(!output.contains("\n \t\n"), "{output}");
+        let _: toml::Value = toml::from_str(&output).unwrap();
+        for newline in ["\n", "\r\n"] {
+            let mut doc: DocumentMut = BLOCK.trim_end_matches('\n').parse().unwrap();
+            let mut item = toml_value_to_item(&entry_to_toml(&gateway));
+            item.as_table_mut()
+                .unwrap()
+                .decor_mut()
+                .set_prefix(format!("{newline}# incoming comment\n"));
+            super::put(&mut doc, "toolport", item);
+            let output = doc.to_string();
+            assert!(
+                output
+                    .replace("\r\n", "\n")
+                    .contains("# END PRUNLET MCP\n# incoming comment\n"),
+                "{output}"
+            );
+            let _: toml::Value = toml::from_str(&output).unwrap();
+        }
+    }
+
+    #[test]
+    fn followup_whitespace_only_prefix_is_not_transferred_or_retained_as_evidence() {
+        for inline in [false, true] {
+            for prefix in ["\n\n", "\n# retained boundary\n"] {
+                let input = if inline {
+                    format!("[mcp_servers]\nprunlet = {{command = 'prunlet'}}\n{prefix}toolport = {{command = 'old'}}\nother = {{command = 'other'}}\n")
+                } else {
+                    format!("[mcp_servers.prunlet]\ncommand = 'prunlet'\n{prefix}[mcp_servers.toolport]\ncommand = 'old'\n[profiles.work]\nmodel = 'keep'\n")
+                };
+                let original: DocumentMut = input.parse().unwrap();
+                let mut doc = original.clone();
+                let transfers = remove(&mut doc, &["toolport".into()]);
+                assert_eq!(transfers.is_empty(), !prefix.contains('#'));
+                assert_eq!(
+                    doc.to_string().matches("# retained boundary").count(),
+                    usize::from(prefix.contains('#'))
+                );
+                if !prefix.contains('#') {
+                    assert!(super::retained_prefix(&original, &doc, &doc).is_empty());
+                }
+                let stable = doc.to_string();
+                for _ in 0..3 {
+                    let gateway = super::super::tests::sample_gateway(None, "codex");
+                    super::put(
+                        &mut doc,
+                        "toolport",
+                        toml_value_to_item(&entry_to_toml(&gateway)),
+                    );
+                    doc = doc.to_string().parse().unwrap();
+                    remove(&mut doc, &["toolport".into()]);
+                    assert_eq!(doc.to_string(), stable);
+                }
+            }
+        }
+    }
 }
 use toml_edit::{DocumentMut, Item, Table};
 
@@ -536,7 +624,7 @@ pub(super) fn put(doc: &mut DocumentMut, name: &str, mut item: Item) {
                 table.set_position(maximum + 1 + ranks[index]);
                 index += 1;
             });
-            let trailing = doc.trailing().as_str().unwrap_or("").to_string();
+            let mut trailing = doc.trailing().as_str().unwrap_or("").to_string();
             if !trailing.is_empty() {
                 let prefix = table
                     .decor()
@@ -544,6 +632,17 @@ pub(super) fn put(doc: &mut DocumentMut, name: &str, mut item: Item) {
                     .and_then(|raw| raw.as_str())
                     .unwrap_or("")
                     .to_string();
+                // EOFコメントと見出しが同じ物理行にならない分だけ終端する。
+                if !trailing.ends_with('\n')
+                    && trailing
+                        .rsplit('\n')
+                        .next()
+                        .is_some_and(|line| line.contains('#'))
+                    && !prefix.starts_with('\n')
+                    && !prefix.starts_with("\r\n")
+                {
+                    trailing.push('\n');
+                }
                 table.decor_mut().set_prefix(format!("{trailing}{prefix}"));
                 doc.set_trailing("");
             }
@@ -708,7 +807,7 @@ pub(super) fn retained_prefix(
     remove(&mut replay, &missing)
         .into_iter()
         .filter(|transfer| {
-            if transfer.prefix.is_empty() {
+            if !transfer.prefix.contains('#') {
                 return false;
             }
             let mut destination = transfer.destination.clone();
@@ -774,7 +873,12 @@ pub(super) fn remove(doc: &mut DocumentMut, names: &[String]) -> Vec<PrefixTrans
                 continue;
             };
             if let Some(table) = item.as_table() {
-                if let Some(prefix) = table.decor().prefix().and_then(|raw| raw.as_str()) {
+                if let Some(prefix) = table
+                    .decor()
+                    .prefix()
+                    .and_then(|raw| raw.as_str())
+                    .filter(|prefix| prefix.contains('#'))
+                {
                     prefixes.push((
                         table.position().unwrap_or(usize::MAX),
                         name.clone(),
@@ -788,6 +892,9 @@ pub(super) fn remove(doc: &mut DocumentMut, names: &[String]) -> Vec<PrefixTrans
                     .and_then(|raw| raw.as_str())
                     .unwrap_or("")
                     .to_string();
+                if !prefix.contains('#') {
+                    continue;
+                }
                 let next = order
                     .iter()
                     .skip_while(|key| *key != name)
