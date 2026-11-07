@@ -458,7 +458,7 @@ pub(super) fn toml_entry(
     client_id: &str,
     path: &Path,
     name: &str,
-) -> Result<Option<toml_edit::Item>, String> {
+) -> Result<Option<(toml_edit::Key, toml_edit::Item)>, String> {
     let Some(record) = load(client_id)? else {
         return Ok(None);
     };
@@ -474,10 +474,7 @@ pub(super) fn toml_entry(
     let doc = text
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| e.to_string())?;
-    Ok(doc
-        .get("mcp_servers")
-        .and_then(|table| table.get(name))
-        .cloned())
+    Ok(toml_preservation::raw_entry(&doc, name))
 }
 
 /// Recorded native entries (synced formats) for `path`, by server name.
@@ -550,7 +547,8 @@ pub(super) fn restore(
         return Ok(None);
     }
     let backup = || backup_file(client_id, path);
-    let (names, backup) = insert_missing(container(format), path, &record.entries, backup)?;
+    let (names, backup) =
+        insert_missing(client_id, container(format), path, &record.entries, backup)?;
     Ok(Some(Restored { names, backup }))
 }
 
@@ -624,15 +622,7 @@ fn extract(format: Format, text: &str) -> Result<Vec<Moved>, String> {
                 }
                 let mut table = toml_edit::Table::new();
                 table.set_implicit(true);
-                let mut item = item.clone();
-                if let Some(table) = item.as_table_mut() {
-                    table.decor_mut().set_prefix("");
-                }
-                let mut key = servers.key(name).unwrap().clone();
-                if item.is_value() {
-                    key.leaf_decor_mut().set_prefix("");
-                }
-                table.insert_formatted(&key, item);
+                table.insert_formatted(servers.key(name).unwrap(), item.clone());
                 let mut single = toml_edit::DocumentMut::new();
                 single.insert("mcp_servers", toml_edit::Item::Table(table));
                 out.push(Moved {
@@ -705,6 +695,7 @@ fn has_name<'a>(mut existing: impl Iterator<Item = &'a str>, name: &str) -> bool
 /// Insert each recorded entry whose name (ignoring case) the config no longer
 /// has. Writes nothing, and takes no backup, when every name is already there.
 fn insert_missing(
+    client_id: &str,
     container: Container,
     path: &Path,
     entries: &[Moved],
@@ -758,6 +749,8 @@ fn insert_missing(
         }
         Container::Toml => {
             let mut doc = load_toml_document(path)?;
+            let provenance = restore::toml_prefix_provenance(client_id, path)?;
+            let evidence_doc = doc.clone();
             for entry in entries {
                 let Raw::Toml { text } = &entry.raw else {
                     continue;
@@ -771,13 +764,20 @@ fn insert_missing(
                 let single = text
                     .parse::<toml_edit::DocumentMut>()
                     .map_err(|e| format!("could not read the recorded {}: {e}", entry.name))?;
-                let Some(item) = single
-                    .get("mcp_servers")
-                    .and_then(|item| item.get(&entry.name))
+                let Some((mut key, mut item)) = toml_preservation::raw_entry(&single, &entry.name)
                 else {
                     continue;
                 };
-                toml_preservation::put(&mut doc, &entry.name, item.clone());
+                if let Some((original, written)) = &provenance {
+                    toml_preservation::dedup_raw_prefix(
+                        original,
+                        written,
+                        &evidence_doc,
+                        &mut key,
+                        &mut item,
+                    );
+                }
+                toml_preservation::put_raw(&mut doc, key, item);
                 names.push(entry.name.clone());
             }
             if names.is_empty() {

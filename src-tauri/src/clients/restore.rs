@@ -502,6 +502,37 @@ pub(super) fn needs_moved(client_id: &str, path: &Path) -> Result<bool, String> 
     }))
 }
 
+pub(super) fn toml_prefix_provenance(
+    client_id: &str,
+    path: &Path,
+) -> Result<Option<(toml_edit::DocumentMut, toml_edit::DocumentMut)>, String> {
+    let Some(record) = load(client_id, path)? else {
+        return Ok(None);
+    };
+    if !matches!(record.format, Format::TomlMcpServers) {
+        return Ok(None);
+    }
+    let written = if record.disconnected {
+        record
+            .disconnect_before
+            .as_deref()
+            .or(record.last_written.as_deref())
+    } else {
+        record.last_written.as_deref()
+    };
+    let original = record
+        .original
+        .as_deref()
+        .unwrap_or("")
+        .parse()
+        .map_err(|e: toml_edit::TomlError| e.to_string())?;
+    let written = written
+        .unwrap_or("")
+        .parse()
+        .map_err(|e: toml_edit::TomlError| e.to_string())?;
+    Ok(Some((original, written)))
+}
+
 pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool, String> {
     let Some(record) = load(client_id, path)? else {
         return Ok(false);
@@ -634,7 +665,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
     match format {
         Format::TomlMcpServers => {
             let mut doc = load_toml_document(path)?;
-            let mut original = record
+            let original = record
                 .original
                 .as_deref()
                 .unwrap_or("")
@@ -644,15 +675,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
                 .unwrap_or("")
                 .parse::<toml_edit::DocumentMut>()
                 .map_err(|e| e.to_string())?;
-            let retained = toml_preservation::retained_prefix(&original, &written_doc, &doc);
-            for name in retained {
-                let servers = toml_mcp_servers_mut(&mut original);
-                if let Some(table) = servers.get_mut(&name).and_then(|item| item.as_table_mut()) {
-                    table.decor_mut().set_prefix("");
-                } else if let Some(mut key) = servers.key_mut(&name) {
-                    key.leaf_decor_mut().set_prefix("");
-                }
-            }
+            let evidence_doc = doc.clone();
             let desired = latest.get(key).and_then(Value::as_object);
             let existing = doc
                 .get(key)
@@ -672,15 +695,32 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
             if let Some(desired) = desired {
                 for (name, value) in desired {
                     if mutation::value(format, current.as_deref())?[key].get(name) != Some(value) {
-                        if let Some(item) = moved::toml_entry(client_id, path, name)? {
-                            toml_preservation::put(&mut doc, name, item);
+                        if let Some((mut entry_key, mut item)) =
+                            moved::toml_entry(client_id, path, name)?
+                        {
+                            toml_preservation::dedup_raw_prefix(
+                                &original,
+                                &written_doc,
+                                &evidence_doc,
+                                &mut entry_key,
+                                &mut item,
+                            );
+                            toml_preservation::put_raw(&mut doc, entry_key, item);
                         } else if mutation::value(format, record.original.as_deref())?[key]
                             .get(name)
                             == Some(value)
                         {
-                            if let Some(item) = original.get(key).and_then(|table| table.get(name))
+                            if let Some((mut entry_key, mut item)) =
+                                toml_preservation::raw_entry(&original, name)
                             {
-                                toml_preservation::put(&mut doc, name, item.clone());
+                                toml_preservation::dedup_raw_prefix(
+                                    &original,
+                                    &written_doc,
+                                    &evidence_doc,
+                                    &mut entry_key,
+                                    &mut item,
+                                );
+                                toml_preservation::put_raw(&mut doc, entry_key, item);
                             }
                         } else {
                             let value: toml::Value =
