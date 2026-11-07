@@ -547,7 +547,7 @@ mod tests {
         let gateway = super::super::tests::sample_gateway(None, "codex");
         mutation::run("fixture", &path, Format::TomlMcpServers, || {
             moved::record("fixture", Format::TomlMcpServers, &path)?;
-            write_toml(&path, &[gateway.clone()])
+            write_toml(&path, std::slice::from_ref(&gateway))
         })
         .unwrap();
         let mut edited: DocumentMut = read_config_file(&path).unwrap().parse().unwrap();
@@ -611,7 +611,7 @@ mod tests {
                             if !added {
                                 moved::record("fixture", Format::TomlMcpServers, &path)?;
                             }
-                            write_toml(&path, &[gateway.clone()])
+                            write_toml(&path, std::slice::from_ref(&gateway))
                         })
                         .unwrap();
                         let connected: DocumentMut =
@@ -626,7 +626,7 @@ mod tests {
                         std::fs::write(&path, edited.to_string()).unwrap();
                         mutation::run("fixture", &path, Format::TomlMcpServers, || {
                             moved::record("fixture", Format::TomlMcpServers, &path)?;
-                            write_toml(&path, &[gateway.clone()])
+                            write_toml(&path, std::slice::from_ref(&gateway))
                         })
                         .unwrap();
                         let mut edited: DocumentMut = read_config_file(&path)
