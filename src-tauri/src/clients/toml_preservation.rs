@@ -601,7 +601,7 @@ mod tests {
                                 format!("{prefix}\n[mcp_servers.'native']\ncommand = '{command}'\n[mcp_servers.'native'.env]\nTOKEN = '{command}'\n[mcp_servers.'native'.metadata]\nrevision = '{command}'\n")
                             };
                             format!(
-                                "model = 'before'\n{native}\n[profiles.work]\nmodel = 'profile'\n"
+                                "model = 'before'\n{native}# END LATEST\n[profiles.work]\nmodel = 'profile'\n"
                             )
                         };
                         let initial = if added {
@@ -621,7 +621,7 @@ mod tests {
                         let connected: DocumentMut =
                             read_config_file(&path).unwrap().parse().unwrap();
                         let mut edited: DocumentMut =
-                            config("# latest boundary", "latest").parse().unwrap();
+                            config("# BEGIN LATEST", "latest").parse().unwrap();
                         super::put(
                             &mut edited,
                             "toolport",
@@ -653,10 +653,26 @@ mod tests {
                         .unwrap();
                         let restored = read_config_file(&path).unwrap();
                         assert_eq!(
-                            restored.matches("# latest boundary").count(),
+                            restored.matches("# BEGIN LATEST").count(),
                             1,
                             "{inline}-{added}-{keep_destination}-{direct}: {restored}"
                         );
+                        if keep_destination {
+                            assert_eq!(restored.matches("# END LATEST").count(), 1);
+                            let begin = restored.find("# BEGIN LATEST").unwrap();
+                            let native = restored
+                                .find(if inline {
+                                    "'native' ="
+                                } else {
+                                    "[mcp_servers.'native']"
+                                })
+                                .unwrap();
+                            let end = restored.find("# END LATEST").unwrap();
+                            assert!(
+                                begin < native && native < end,
+                                "{inline}-{added}-{keep_destination}-{direct}: {restored}"
+                            );
+                        }
                         let parsed: toml::Value = toml::from_str(&restored).unwrap();
                         assert_eq!(
                             parsed["mcp_servers"]["native"]["command"].as_str(),
@@ -992,6 +1008,159 @@ mod tests {
             );
             assert_eq!(parsed["profiles"]["work"]["extra"].as_str(), Some("keep"));
         }
+    }
+    #[test]
+    fn added_entries_with_proven_prefixes_restore_in_transfer_order() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("added-prefix-order");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for inline in [false, true] {
+            for direct in [false, true] {
+                let path = fixture.0.join(format!("{inline}-{direct}.toml"));
+                std::fs::write(&path, "model = 'before'\n[profiles.work]\nkeep = true\n").unwrap();
+                let gateway = super::super::tests::sample_gateway(None, "codex");
+                mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                    write_toml(&path, std::slice::from_ref(&gateway))
+                })
+                .unwrap();
+                let connected: DocumentMut = read_config_file(&path).unwrap().parse().unwrap();
+                let native = if inline {
+                    "[mcp_servers]\n# BEGIN ADDED\n'zebra' = {command = 'zebra'}\n# between entries\n'alpha' = {command = 'alpha', metadata = {keep = true}}\n# END ADDED\n"
+                } else {
+                    "# BEGIN ADDED\n[mcp_servers.zebra]\ncommand = 'zebra'\n# between entries\n[mcp_servers.alpha]\ncommand = 'alpha'\nmetadata = {keep = true}\n# END ADDED\n"
+                };
+                let mut edited: DocumentMut =
+                    format!("model = 'before'\n{native}[profiles.work]\nkeep = true\n")
+                        .parse()
+                        .unwrap();
+                super::put(
+                    &mut edited,
+                    "toolport",
+                    connected["mcp_servers"]["toolport"].clone(),
+                );
+                std::fs::write(&path, edited.to_string()).unwrap();
+                mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                    moved::record("fixture", Format::TomlMcpServers, &path)?;
+                    write_toml(&path, std::slice::from_ref(&gateway))
+                })
+                .unwrap();
+                std::fs::write(
+                    &path,
+                    read_config_file(&path)
+                        .unwrap()
+                        .replace("model = 'before'", "model = 'user-edit'"),
+                )
+                .unwrap();
+                mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                    if direct {
+                        moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                    } else {
+                        assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                let output = read_config_file(&path).unwrap();
+                let begin = output.find("# BEGIN ADDED").unwrap();
+                let zebra = output
+                    .find(if inline {
+                        "'zebra' ="
+                    } else {
+                        "[mcp_servers.zebra]"
+                    })
+                    .unwrap();
+                let between = output.find("# between entries").unwrap();
+                let alpha = output
+                    .find(if inline {
+                        "'alpha' ="
+                    } else {
+                        "[mcp_servers.alpha]"
+                    })
+                    .unwrap();
+                let end = output.find("# END ADDED").unwrap();
+                assert!(
+                    begin < zebra && zebra < between && between < alpha && alpha < end,
+                    "{output}"
+                );
+                assert_eq!(output.matches("# BEGIN ADDED").count(), 1);
+                assert_eq!(output.matches("# END ADDED").count(), 1);
+                let parsed: toml::Value = toml::from_str(&output).unwrap();
+                assert_eq!(
+                    parsed["mcp_servers"]["alpha"]["metadata"]["keep"].as_bool(),
+                    Some(true)
+                );
+                assert_eq!(parsed["model"].as_str(), Some("user-edit"));
+            }
+        }
+    }
+
+    #[test]
+    fn separately_added_prefixless_entry_is_not_guessed_into_an_earlier_boundary() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("separate-prefixless-move");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        let path = fixture.0.join("config.toml");
+        let gateway = super::super::tests::sample_gateway(None, "codex");
+        std::fs::write(&path, "model = 'before'\n[profiles.work]\nkeep = true\n").unwrap();
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            write_toml(&path, std::slice::from_ref(&gateway))
+        })
+        .unwrap();
+        let connected: DocumentMut = read_config_file(&path).unwrap().parse().unwrap();
+        let mut edited: DocumentMut = "model = 'before'\n# BEGIN ADDED\n[mcp_servers.native]\ncommand = 'native'\n# END ADDED\n[profiles.work]\nkeep = true\n".parse().unwrap();
+        super::put(
+            &mut edited,
+            "toolport",
+            connected["mcp_servers"]["toolport"].clone(),
+        );
+        std::fs::write(&path, edited.to_string()).unwrap();
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            moved::record("fixture", Format::TomlMcpServers, &path)?;
+            write_toml(&path, std::slice::from_ref(&gateway))
+        })
+        .unwrap();
+        let mut edited: DocumentMut = read_config_file(&path).unwrap().parse().unwrap();
+        let mut extra = gateway.clone();
+        extra.name = "extra".into();
+        extra.command = Some("extra".into());
+        extra.env.clear();
+        super::put(
+            &mut edited,
+            "extra",
+            toml_value_to_item(&entry_to_toml(&extra)),
+        );
+        std::fs::write(&path, edited.to_string()).unwrap();
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            moved::record("fixture", Format::TomlMcpServers, &path)?;
+            write_toml(&path, std::slice::from_ref(&gateway))
+        })
+        .unwrap();
+        std::fs::write(
+            &path,
+            read_config_file(&path)
+                .unwrap()
+                .replace("model = 'before'", "model = 'user-edit'"),
+        )
+        .unwrap();
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+            Ok(())
+        })
+        .unwrap();
+        let output = read_config_file(&path).unwrap();
+        let native = output.find("[mcp_servers.native]").unwrap();
+        let end = output.find("# END ADDED").unwrap();
+        let extra = output.find("[mcp_servers.extra]").unwrap();
+        assert!(
+            output.find("# BEGIN ADDED").unwrap() < native && native < end && end < extra,
+            "{output}"
+        );
+        let parsed: toml::Value = toml::from_str(&output).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["extra"]["command"].as_str(),
+            Some("extra")
+        );
+        assert_eq!(parsed["profiles"]["work"]["keep"].as_bool(), Some(true));
     }
 }
 use toml_edit::{DocumentMut, Item, Table};
@@ -1683,7 +1852,9 @@ pub(super) fn restore_raw_entries(
                 continue;
             }
         }
-        if let Some(anchor) = original_anchor(&layout, &remaining, &evidence, key.get()) {
+        let anchor = original_anchor(&layout, &remaining, &evidence, key.get())
+            .or_else(|| raw_prefix_location(original, written, &evidence, key, item));
+        if let Some(anchor) = anchor {
             groups.entry(anchor).or_default().push(index);
         }
     }
@@ -1719,6 +1890,18 @@ pub(super) fn restore_raw_entries(
                 .any(|(_, destination)| destination != actual)
         {
             continue;
+        }
+        if locations.len() == indices.len() {
+            // 各entryの転送prefixを証明できる場合は、移送decor内の実順序を優先する。
+            let decor = destination_prefix(&evidence, actual).unwrap();
+            indices.sort_by_key(|index| {
+                let prefix = entry_prefix(&entries[*index].0, &entries[*index].1);
+                decor
+                    .match_indices(prefix)
+                    .find(|(offset, _)| *offset == 0 || decor.as_bytes()[offset - 1] == b'\n')
+                    .unwrap()
+                    .0
+            });
         }
         for (index, _) in &locations {
             let prefix = entry_prefix(&entries[*index].0, &entries[*index].1);
