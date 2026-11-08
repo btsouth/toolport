@@ -43,6 +43,349 @@ mod tests {
     const BLOCK: &str = "# BEGIN PRUNLET MCP\n[mcp_servers.prunlet]\ncommand = 'prunlet'\nargs = ['mcp']\nstartup_timeout_sec = 600\n# END PRUNLET MCP\n";
 
     #[test]
+    fn parent_prefix_inherited_by_child_returns_to_each_source() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("parent-to-child-inheritance");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for direct in [false, true] {
+            for edited in [false, true] {
+                let path = fixture.0.join(format!("{direct}-{edited}.toml"));
+                std::fs::write(&path, "theme = 'before'\n[mcp_servers.b]\ncommand = 'b'\n# A parent\n[mcp_servers.a]\ncommand = 'a'\n# B child\n[mcp_servers.b.env]\nB = 'keep'\n# A parent\n[profiles.x]\nkeep = true\n").unwrap();
+                let gateway = super::super::tests::sample_gateway(None, "codex");
+                for name in ["a", "b"] {
+                    mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                        moved::record_selected(
+                            "fixture",
+                            Format::TomlMcpServers,
+                            &path,
+                            &[name.into()],
+                        )?;
+                        moved::remove_selected(Format::TomlMcpServers, &path, &[name.into()])?;
+                        edit_toml_gateway(&path, Some(&gateway))
+                    })
+                    .unwrap();
+                }
+                let mut text = read_config_file(&path)
+                    .unwrap()
+                    .replace("'before'", "'edited'");
+                if edited {
+                    text = text.replace("# B child", "# B child edited");
+                }
+                std::fs::write(&path, text).unwrap();
+                mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                    if direct {
+                        moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                    } else {
+                        assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                let output = read_config_file(&path).unwrap();
+                assert!(
+                    output.contains("# A parent\n[mcp_servers.a]"),
+                    "{direct}-{edited}: {output}"
+                );
+                assert!(
+                    output.contains("# B child\n[mcp_servers.b.env]"),
+                    "{direct}-{edited}: {output}"
+                );
+                assert!(
+                    output.contains("# A parent\n[profiles.x]"),
+                    "{direct}-{edited}: {output}"
+                );
+                if edited {
+                    assert!(output.contains("# B child edited"), "{output}");
+                } else {
+                    assert_eq!(
+                        output.matches("# A parent").count(),
+                        2,
+                        "{direct}: {output}"
+                    );
+                    assert_eq!(output.matches("# B child").count(), 1, "{direct}: {output}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn child_prefix_inherited_by_another_child_returns_once_to_each_source() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("child-to-child-inheritance");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for direct in [false, true] {
+            for edited in [false, true] {
+                let path = fixture.0.join(format!("{direct}-{edited}.toml"));
+                std::fs::write(&path, "theme = 'before'\n[mcp_servers.a]\ncommand = 'a'\n[mcp_servers.b]\ncommand = 'b'\n# A child\n[mcp_servers.a.env]\nA = 'keep'\n# B child\n[mcp_servers.b.env]\nB = 'keep'\n# A child\n[profiles.x]\nkeep = true\n").unwrap();
+                let gateway = super::super::tests::sample_gateway(None, "codex");
+                for name in ["a", "b"] {
+                    mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                        moved::record_selected(
+                            "fixture",
+                            Format::TomlMcpServers,
+                            &path,
+                            &[name.into()],
+                        )?;
+                        moved::remove_selected(Format::TomlMcpServers, &path, &[name.into()])?;
+                        edit_toml_gateway(&path, Some(&gateway))
+                    })
+                    .unwrap();
+                }
+                let mut text = read_config_file(&path)
+                    .unwrap()
+                    .replace("'before'", "'edited'");
+                if edited {
+                    text = text.replace("# B child", "# B child edited");
+                }
+                std::fs::write(&path, text).unwrap();
+                mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                    if direct {
+                        moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                    } else {
+                        assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                let output = read_config_file(&path).unwrap();
+                assert!(
+                    output.contains("# A child\n[mcp_servers.a.env]"),
+                    "{direct}-{edited}: {output}"
+                );
+                assert!(
+                    output.contains("# B child\n[mcp_servers.b.env]"),
+                    "{direct}-{edited}: {output}"
+                );
+                assert!(
+                    output.contains("# A child\n[profiles.x]"),
+                    "{direct}-{edited}: {output}"
+                );
+                if edited {
+                    assert!(output.contains("# B child edited"), "{output}");
+                } else {
+                    assert_eq!(output.matches("# A child").count(), 2, "{direct}: {output}");
+                    assert_eq!(output.matches("# B child").count(), 1, "{direct}: {output}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn restored_descendant_comment_is_not_duplicated_after_move() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("descendant-transfer");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for direct in [false, true] {
+            for eof in [false, true] {
+                let path = fixture.0.join(format!("{direct}-{eof}.toml"));
+                let tail = if eof {
+                    ""
+                } else {
+                    "[profiles.work]\nmodel = 'before'\n"
+                };
+                std::fs::write(&path, format!("theme = 'before'\n[mcp_servers.native]\ncommand = 'native'\n# child boundary\n[mcp_servers.native.env]\nTOKEN = 'keep'\n{tail}")).unwrap();
+                let gateway = super::super::tests::sample_gateway(None, "codex");
+                mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                    moved::record_selected(
+                        "fixture",
+                        Format::TomlMcpServers,
+                        &path,
+                        &["native".into()],
+                    )?;
+                    moved::remove_selected(Format::TomlMcpServers, &path, &["native".into()])?;
+                    edit_toml_gateway(&path, Some(&gateway))
+                })
+                .unwrap();
+                std::fs::write(
+                    &path,
+                    read_config_file(&path)
+                        .unwrap()
+                        .replace("'before'", "'edited'"),
+                )
+                .unwrap();
+                mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                    if direct {
+                        moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                    } else {
+                        assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                let output = read_config_file(&path).unwrap();
+                assert_eq!(
+                    output.matches("# child boundary").count(),
+                    1,
+                    "{direct}-{eof}: {output}"
+                );
+                assert!(
+                    output.contains("# child boundary\n[mcp_servers.native.env]"),
+                    "{output}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn descendant_witness_survives_later_capture_without_claiming_equal_comments() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("descendant-inherited");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for direct in [false, true] {
+            let path = fixture.0.join(format!("{direct}.toml"));
+            std::fs::write(&path, "theme = 'before'\n[mcp_servers.native]\ncommand = 'native'\n# child boundary\n[mcp_servers.native.env]\nTOKEN = 'keep'\n[mcp_servers.other]\ncommand = 'other'\n# child boundary\n[profiles.work]\nkeep = true\n").unwrap();
+            let gateway = super::super::tests::sample_gateway(None, "codex");
+            for name in ["native", "other"] {
+                mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                    moved::record_selected(
+                        "fixture",
+                        Format::TomlMcpServers,
+                        &path,
+                        &[name.into()],
+                    )?;
+                    moved::remove_selected(Format::TomlMcpServers, &path, &[name.into()])?;
+                    edit_toml_gateway(&path, Some(&gateway))
+                })
+                .unwrap();
+            }
+            std::fs::write(
+                &path,
+                read_config_file(&path)
+                    .unwrap()
+                    .replace("'before'", "'edited'"),
+            )
+            .unwrap();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                if direct {
+                    moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                } else {
+                    assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                }
+                Ok(())
+            })
+            .unwrap();
+            let output = read_config_file(&path).unwrap();
+            assert_eq!(
+                output.matches("# child boundary").count(),
+                2,
+                "{direct}: {output}"
+            );
+            assert!(
+                output.contains("# child boundary\n[mcp_servers.native.env]"),
+                "{output}"
+            );
+            assert!(
+                output.contains("# child boundary\n[profiles.work]"),
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn edited_descendant_destination_does_not_consume_user_comment() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("descendant-edited");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        let path = fixture.0.join("config.toml");
+        std::fs::write(&path, "theme = 'before'\n[mcp_servers.native]\ncommand = 'native'\n# child boundary\n[mcp_servers.native.env]\nTOKEN = 'keep'\n[profiles.work]\nkeep = true\n").unwrap();
+        let gateway = super::super::tests::sample_gateway(None, "codex");
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            moved::record_selected("fixture", Format::TomlMcpServers, &path, &["native".into()])?;
+            moved::remove_selected(Format::TomlMcpServers, &path, &["native".into()])?;
+            edit_toml_gateway(&path, Some(&gateway))
+        })
+        .unwrap();
+        let edited = read_config_file(&path)
+            .unwrap()
+            .replace("# child boundary", "# child boundary edited")
+            .replace("'before'", "'edited'");
+        std::fs::write(&path, edited).unwrap();
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+            Ok(())
+        })
+        .unwrap();
+        let output = read_config_file(&path).unwrap();
+        assert!(
+            output.contains("# child boundary\n[mcp_servers.native.env]"),
+            "{output}"
+        );
+        assert!(
+            output.contains("# child boundary edited\n[profiles.work]"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn independently_relocated_entries_restore_at_their_live_destinations() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("distinct-live-destinations");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for direct in [false, true] {
+            let path = fixture.0.join(format!("{direct}.toml"));
+            let a = "# A boundary\n[mcp_servers.a]\ncommand = 'a'\n";
+            let b = "# B boundary\n[mcp_servers.b]\ncommand = 'b'\n";
+            let one = "[profiles.one]\nkeep = true\n";
+            let two = "[profiles.two]\nkeep = true\n";
+            std::fs::write(&path, format!("theme = 'before'\n{a}{b}{one}{two}")).unwrap();
+            let gateway = super::super::tests::sample_gateway(None, "codex");
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                edit_toml_gateway(&path, Some(&gateway))
+            })
+            .unwrap();
+            let text = read_config_file(&path)
+                .unwrap()
+                .replace(&format!("{a}{b}{one}"), &format!("{a}{one}{b}"));
+            std::fs::write(&path, text).unwrap();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                let names = vec!["a".into(), "b".into()];
+                moved::record_selected("fixture", Format::TomlMcpServers, &path, &names)?;
+                moved::remove_selected(Format::TomlMcpServers, &path, &names)
+            })
+            .unwrap();
+            std::fs::write(
+                &path,
+                read_config_file(&path)
+                    .unwrap()
+                    .replace("'before'", "'edited'"),
+            )
+            .unwrap();
+            mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                if direct {
+                    moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                } else {
+                    assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                }
+                Ok(())
+            })
+            .unwrap();
+            let output = read_config_file(&path).unwrap();
+            assert_eq!(
+                output.matches("# A boundary").count(),
+                1,
+                "{direct}: {output}"
+            );
+            assert_eq!(
+                output.matches("# B boundary").count(),
+                1,
+                "{direct}: {output}"
+            );
+            assert!(
+                output.find("[mcp_servers.a]") < output.find("[profiles.one]"),
+                "{output}"
+            );
+            assert!(
+                output.find("[profiles.one]") < output.find("[mcp_servers.b]"),
+                "{output}"
+            );
+            assert!(
+                output.find("[mcp_servers.b]") < output.find("[profiles.two]"),
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
     fn restored_unowned_conduit_keeps_its_boundary_after_gateway_rename() {
         let _lock = crate::registry::data_dir_test_lock();
         let fixture = Fixture::new("unowned-conduit-boundary");
@@ -285,6 +628,7 @@ mod tests {
                 id: "new".into(),
                 prefix_hash: crate::registry::sha256_hex(prefix),
                 inherited: vec![],
+                children: vec![],
             }),
             live: vec![super::LivePrefix {
                 source_id: "new".into(),
@@ -3186,6 +3530,17 @@ pub(super) struct TomlCapture {
     pub prefix_hash: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inherited: Vec<PrefixInheritance>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<ChildCapture>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct ChildCapture {
+    pub id: String,
+    pub source: PrefixDestination,
+    pub prefix_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherited: Vec<PrefixInheritance>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -3349,6 +3704,20 @@ fn prefix_locations(doc: &DocumentMut) -> Vec<(PrefixDestination, String)> {
         doc.trailing().as_str().unwrap_or("").to_string(),
     ));
     locations
+}
+
+pub(super) fn descendant_prefixes(
+    doc: &DocumentMut,
+    name: &str,
+) -> Vec<(PrefixDestination, String)> {
+    prefix_locations(doc)
+        .into_iter()
+        .filter(|(destination, prefix)| {
+            matches!(destination, PrefixDestination::Table(path)
+            if path.len() > 2 && path[0].0 == "mcp_servers" && path[1].0 == name)
+                && prefix.contains('#')
+        })
+        .collect()
 }
 
 fn entry_prefix<'a>(key: &'a toml_edit::Key, item: &'a Item) -> &'a str {
@@ -3711,7 +4080,7 @@ pub(super) fn restore_raw_entries_with_provenance(
     original: &DocumentMut,
     written: &DocumentMut,
     doc: &mut DocumentMut,
-    entries: Vec<(toml_edit::Key, Item)>,
+    mut entries: Vec<(toml_edit::Key, Item)>,
     provenance: &[TomlProvenance],
 ) {
     super::toml_mcp_servers_mut(doc);
@@ -3760,6 +4129,196 @@ pub(super) fn restore_raw_entries_with_provenance(
         })
         .map(|(key, _)| key.get().to_string())
         .collect();
+    // Child prefixes have independent identities and may land at a different
+    // boundary from their parent. Only a complete live witness authorizes removal.
+    let mut child_live = Vec::new();
+    let mut parent_live = Vec::new();
+    let mut child_sources = std::collections::HashMap::new();
+    let mut identity_counts = std::collections::HashMap::<&str, usize>::new();
+    for meta in provenance {
+        if let Some(capture) = &meta.capture {
+            *identity_counts.entry(&capture.id).or_default() += 1;
+            for child in &capture.children {
+                *identity_counts.entry(&child.id).or_default() += 1;
+            }
+        }
+    }
+    for (index, (key, item)) in entries.iter().enumerate() {
+        if !missing.iter().any(|name| name == key.get()) {
+            continue;
+        }
+        let Some(meta) = provenance.get(index) else {
+            continue;
+        };
+        let Some(capture) = &meta.capture else {
+            continue;
+        };
+        let parent_prefix = entry_prefix(key, item);
+        if identity_counts.get(capture.id.as_str()) == Some(&1)
+            && crate::registry::sha256_hex(parent_prefix) == capture.prefix_hash
+        {
+            if let Some(live) = meta.live.iter().find(|live| {
+                live.source_id == capture.id
+                    && live.source_range == (0..parent_prefix.len())
+                    && valid_live(&evidence, live) == Some(parent_prefix)
+            }) {
+                parent_live.push((
+                    capture.id.clone(),
+                    live.destination.clone(),
+                    live.range.clone(),
+                ));
+                child_sources.insert(
+                    capture.id.clone(),
+                    (
+                        index,
+                        source_destination(key.get(), item),
+                        parent_prefix.to_string(),
+                        capture.inherited.clone(),
+                    ),
+                );
+            }
+        }
+        let mut raw = DocumentMut::new();
+        super::toml_mcp_servers_mut(&mut raw).insert_formatted(key, item.clone());
+        for child in &capture.children {
+            if identity_counts.get(child.id.as_str()) != Some(&1)
+                || !matches!(&child.source, PrefixDestination::Table(path)
+                    if path.len() > 2 && path[0].0 == "mcp_servers" && path[1].0 == key.get())
+            {
+                continue;
+            }
+            let Some(prefix) = destination_prefix(&raw, &child.source) else {
+                continue;
+            };
+            if crate::registry::sha256_hex(prefix) != child.prefix_hash {
+                continue;
+            }
+            let Some(live) = meta.live.iter().find(|live| {
+                live.source_id == child.id
+                    && live.source_range == (0..prefix.len())
+                    && valid_live(&evidence, live) == Some(prefix)
+            }) else {
+                continue;
+            };
+            child_live.push((
+                child.id.clone(),
+                live.destination.clone(),
+                live.range.clone(),
+            ));
+            child_sources.insert(
+                child.id.clone(),
+                (
+                    index,
+                    child.source.clone(),
+                    prefix.to_string(),
+                    child.inherited.clone(),
+                ),
+            );
+        }
+    }
+    // Overlapping child spans are shared only when a captured inheritance edge
+    // proves their source coordinates and bytes. Equal text alone is insufficient.
+    let explains = |a: &(String, PrefixDestination, std::ops::Range<usize>),
+                    b: &(String, PrefixDestination, std::ops::Range<usize>)| {
+        let Some((_, _, prefix, inherited)) = child_sources.get(&a.0) else {
+            return false;
+        };
+        let Some((_, _, source, _)) = child_sources.get(&b.0) else {
+            return false;
+        };
+        inherited.iter().any(|edge| {
+            edge.source_id == b.0
+                && edge.range.start < edge.range.end
+                && prefix
+                    .get(edge.range.clone())
+                    .zip(source.get(edge.source_range.clone()))
+                    .is_some_and(|(x, y)| x == y)
+                && a.2.start.checked_add(edge.range.start)
+                    == b.2.start.checked_add(edge.source_range.start)
+                && a.2
+                    .start
+                    .checked_add(edge.range.end)
+                    .is_some_and(|end| end >= a.2.end.min(b.2.end))
+                && a.2
+                    .start
+                    .checked_add(edge.range.start)
+                    .is_some_and(|start| start <= a.2.start.max(b.2.start))
+        })
+    };
+    let mut conflicts: std::collections::HashSet<_> = child_live
+        .iter()
+        .enumerate()
+        .flat_map(|(i, a)| {
+            child_live
+                .iter()
+                .enumerate()
+                .skip(i + 1)
+                .filter_map(move |(j, b)| {
+                    let overlap = a.1 == b.1 && a.2.start < b.2.end && b.2.start < a.2.end;
+                    let ab = explains(a, b);
+                    let ba = explains(b, a);
+                    (overlap && ab == ba).then_some([i, j])
+                })
+        })
+        .flatten()
+        .collect();
+    // A real capture can only inherit an earlier capture. Cyclic metadata has
+    // no such ordering, so it cannot authorize removing any of its spans.
+    let all_witnesses: Vec<_> = child_live.iter().chain(&parent_live).collect();
+    for start in 0..child_live.len() {
+        let mut seen = std::collections::HashSet::new();
+        let mut pending = vec![start];
+        while let Some(current) = pending.pop() {
+            for next in 0..all_witnesses.len() {
+                if current == next
+                    || all_witnesses[current].1 != all_witnesses[next].1
+                    || !explains(all_witnesses[current], all_witnesses[next])
+                {
+                    continue;
+                }
+                if next == start {
+                    conflicts.insert(start);
+                } else if seen.insert(next) {
+                    pending.push(next);
+                }
+            }
+        }
+    }
+    child_live = child_live
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, value)| (!conflicts.contains(&i)).then_some(value))
+        .collect();
+    let all_child_live = child_live.clone();
+    let mut cuts = std::collections::BTreeMap::<
+        (usize, PrefixDestination),
+        Vec<(std::ops::Range<usize>, String, String)>,
+    >::new();
+    for a in &child_live {
+        let (index, path, prefix, inherited) = &child_sources[&a.0];
+        for b in child_live.iter().chain(&parent_live) {
+            if a.0 == b.0 || a.1 != b.1 || !explains(a, b) {
+                continue;
+            }
+            let source = &child_sources[&b.0].2;
+            for edge in inherited.iter().filter(|edge| edge.source_id == b.0) {
+                if a.2.start.checked_add(edge.range.start)
+                    == b.2.start.checked_add(edge.source_range.start)
+                    && edge.range.start < edge.range.end
+                    && prefix
+                        .get(edge.range.clone())
+                        .zip(source.get(edge.source_range.clone()))
+                        .is_some_and(|(a, b)| a == b)
+                {
+                    cuts.entry((*index, path.clone())).or_default().push((
+                        edge.range.clone(),
+                        a.0.clone(),
+                        b.0.clone(),
+                    ));
+                }
+            }
+        }
+    }
     let mut remaining = layout.clone();
     remove(&mut remaining, &missing);
     let order: std::collections::HashMap<_, _> = layout
@@ -3808,6 +4367,29 @@ pub(super) fn restore_raw_entries_with_provenance(
             .iter()
             .filter_map(|index| owners.get(index).cloned())
             .collect();
+        if locations
+            .first()
+            .is_some_and(|first| locations.iter().any(|location| location != first))
+        {
+            // Independent, verified relocations must not invalidate one another.
+            // A prefixless sibling remains at its original structural anchor
+            // when there is no unique live destination to associate it with.
+            for index in indices {
+                if live_owners.contains(&index) {
+                    actual_groups
+                        .entry(owners[&index].clone())
+                        .or_default()
+                        .push(index);
+                } else if !entry_prefix(&entries[index].0, &entries[index].1).contains('#')
+                    && raw_entry(&layout, entries[index].0.get()).is_some()
+                {
+                    actual_groups.entry(anchor.clone()).or_default().push(index);
+                } else {
+                    preserve_raw.insert(index);
+                }
+            }
+            continue;
+        }
         let Some(actual) = locations.first() else {
             // An original entry without comments still has a structural position.
             // Requiring a transfer owner would append it beyond its closing marker.
@@ -3866,6 +4448,7 @@ pub(super) fn restore_raw_entries_with_provenance(
     }
     let mut plans = Vec::new();
     let mut handled = std::collections::HashSet::new();
+    let mut assigned_child_ids = std::collections::HashSet::new();
     for (actual, mut indices) in actual_groups {
         indices.sort_by_key(|index| {
             order
@@ -4114,7 +4697,61 @@ pub(super) fn restore_raw_entries_with_provenance(
             continue;
         }
         let decor = destination_prefix(&evidence, &actual).unwrap();
+        // When a child span was captured inside another entry, its inheritance
+        // edge must explain every overlap before the bytes can be reassigned.
+        let accepted_children: Vec<_> = child_live
+            .iter()
+            .filter(|(id, destination, range)| {
+                destination == &actual
+                    && spans.iter().all(|(index, span)| {
+                        if span.start >= range.end || range.start >= span.end {
+                            return true;
+                        }
+                        let Some(capture) = provenance
+                            .get(*index)
+                            .and_then(|meta| meta.capture.as_ref())
+                        else {
+                            return false;
+                        };
+                        let Some(parent) = parent_live.iter().find(|live| {
+                            live.0 == capture.id && live.1 == actual && live.2 == *span
+                        }) else {
+                            return false;
+                        };
+                        let child = (id.clone(), destination.clone(), range.clone());
+                        explains(parent, &child) != explains(&child, parent)
+                    })
+            })
+            .map(|(id, _, range)| (id.clone(), range.clone()))
+            .collect();
+        let child_spans: Vec<_> = accepted_children
+            .iter()
+            .map(|(_, range)| range.clone())
+            .collect();
+        assigned_child_ids.extend(accepted_children.iter().map(|(id, _)| id.clone()));
+        child_live.retain(|(id, _, _)| !assigned_child_ids.contains(id));
         let mut assigned = Vec::new();
+        for (id, destination, range) in &all_child_live {
+            if destination != &actual
+                || !accepted_children.iter().any(|(accepted, _)| accepted == id)
+            {
+                continue;
+            }
+            let child = (id.clone(), destination.clone(), range.clone());
+            let parent_first = merge_prefix_spans(
+                parent_live
+                    .iter()
+                    .filter(|parent| {
+                        parent.1 == actual
+                            && spans.values().any(|span| span == &parent.2)
+                            && explains(&child, parent)
+                    })
+                    .map(|parent| parent.2.clone())
+                    .collect(),
+            );
+            assigned.extend(unassigned_prefix_spans(range, &parent_first));
+        }
+        let mut assigned = merge_prefix_spans(assigned);
         let mut batch = Vec::new();
         for index in sorted {
             let (mut key, mut item) = entries[index].clone();
@@ -4136,9 +4773,110 @@ pub(super) fn restore_raw_entries_with_provenance(
         }
         plans.push((
             actual,
-            merge_prefix_spans(spans.into_values().collect()),
+            merge_prefix_spans(spans.into_values().chain(child_spans).collect()),
             batch,
         ));
+    }
+    let mut remaining_child =
+        std::collections::BTreeMap::<PrefixDestination, Vec<std::ops::Range<usize>>>::new();
+    let remaining_witnesses = child_live.clone();
+    for (_, destination, range) in child_live {
+        remaining_child.entry(destination).or_default().push(range);
+    }
+    for (destination, ranges) in remaining_child {
+        for range in merge_prefix_spans(ranges) {
+            if plans.iter().any(|(actual, spans, _)| {
+                actual == &destination
+                    && spans
+                        .iter()
+                        .any(|span| span.start < range.end && range.start < span.end)
+            }) {
+                continue;
+            }
+            let accepted_range = range.clone();
+            if let Some((_, spans, _)) = plans
+                .iter_mut()
+                .find(|(actual, _, _)| actual == &destination)
+            {
+                spans.push(range);
+                *spans = merge_prefix_spans(std::mem::take(spans));
+            } else {
+                plans.push((destination.clone(), vec![range], Vec::new()));
+            }
+            assigned_child_ids.extend(
+                remaining_witnesses
+                    .iter()
+                    .filter(|live| {
+                        live.1 == destination
+                            && accepted_range.start <= live.2.start
+                            && accepted_range.end >= live.2.end
+                    })
+                    .map(|live| live.0.clone()),
+            );
+        }
+    }
+    // Do not change saved child decor unless both overlapping witnesses are
+    // included in the final destination plans; otherwise retain every copy.
+    let scheduled: std::collections::HashSet<_> = all_child_live
+        .iter()
+        .chain(&parent_live)
+        .filter(|live| {
+            let parent_index = parent_live
+                .iter()
+                .any(|parent| parent.0 == live.0)
+                .then(|| child_sources[&live.0].0);
+            if parent_index.is_none() && !assigned_child_ids.contains(&live.0) {
+                return false;
+            }
+            plans.iter().any(|(destination, spans, batch)| {
+                destination == &live.1
+                    && spans
+                        .iter()
+                        .any(|span| span.start <= live.2.start && span.end >= live.2.end)
+                    && parent_index.is_none_or(|index| {
+                        batch
+                            .iter()
+                            .any(|(key, _)| key.get() == entries[index].0.get())
+                    })
+            })
+        })
+        .map(|live| live.0.as_str())
+        .collect();
+    for ((index, path), edges) in cuts {
+        let ranges = merge_prefix_spans(
+            edges
+                .into_iter()
+                .filter_map(|(range, a, b)| {
+                    (scheduled.contains(a.as_str()) && scheduled.contains(b.as_str()))
+                        .then_some(range)
+                })
+                .collect(),
+        );
+        if ranges.is_empty() {
+            continue;
+        }
+        let update = |key: &toml_edit::Key, item: &mut Item| {
+            let mut raw = DocumentMut::new();
+            super::toml_mcp_servers_mut(&mut raw).insert_formatted(key, item.clone());
+            let Some(prefix) = destination_prefix(&raw, &path) else {
+                return;
+            };
+            let mut prefix = prefix.to_string();
+            for range in ranges.iter().rev() {
+                prefix.replace_range(range.clone(), "");
+            }
+            set_destination_prefix(&mut raw, &path, prefix);
+            *item = raw_entry(&raw, key.get()).unwrap().1;
+        };
+        let (key, item) = &mut entries[index];
+        update(key, item);
+        for (_, _, batch) in &mut plans {
+            for (batch_key, batch_item) in batch {
+                if batch_key.get() == key.get() {
+                    update(batch_key, batch_item);
+                }
+            }
+        }
     }
     // All plans use frozen evidence coordinates. Update each destination once
     // before insertion so an earlier removal cannot invalidate a later span.

@@ -234,19 +234,14 @@ pub(super) fn observe_toml_removal(
             decor_hash: crate::registry::sha256_hex(decor),
         });
     }
-    for transfer in transfers {
-        if toml_preservation::raw_entry(before, &transfer.source_name).is_none_or(|(_, item)| {
-            toml_preservation::source_destination(&transfer.source_name, &item) != transfer.source
-        }) {
+    for entry in &record.entries {
+        let entry_transfers: Vec<_> = transfers
+            .iter()
+            .filter(|t| t.source_name == entry.name)
+            .collect();
+        if entry_transfers.is_empty() {
             continue;
         }
-        let Some(entry) = record
-            .entries
-            .iter()
-            .find(|entry| entry.name == transfer.source_name)
-        else {
-            continue;
-        };
         let Raw::Toml {
             text,
             capture: Some(capture),
@@ -260,7 +255,7 @@ pub(super) fn observe_toml_removal(
         // A saved capture alone is insufficient: the current mutation must have
         // captured this exact raw entry, and each capture can issue evidence once.
         // Otherwise a re-added entry could reuse an old prefix's identity.
-        if !mutation::consume_toml_capture(path, &capture.id) || actual_text != *text {
+        if actual_text != *text || !mutation::consume_toml_capture(path, &capture.id) {
             continue;
         }
         let Ok(raw) = text.parse::<toml_edit::DocumentMut>() else {
@@ -269,24 +264,46 @@ pub(super) fn observe_toml_removal(
         let Some((key, item)) = toml_preservation::raw_entry(&raw, &entry.name) else {
             continue;
         };
-        let prefix = toml_preservation::capture_prefix(&key, &item);
-        if prefix != transfer.prefix || crate::registry::sha256_hex(prefix) != capture.prefix_hash {
-            continue;
+        let parent = toml_preservation::source_destination(&entry.name, &item);
+        for transfer in entry_transfers {
+            let (id, prefix, hash) = if transfer.source == parent {
+                (
+                    &capture.id,
+                    toml_preservation::capture_prefix(&key, &item),
+                    &capture.prefix_hash,
+                )
+            } else {
+                let Some(child) = capture
+                    .children
+                    .iter()
+                    .find(|child| child.source == transfer.source)
+                else {
+                    continue;
+                };
+                let Some(prefix) = toml_preservation::destination_prefix(&raw, &child.source)
+                else {
+                    continue;
+                };
+                (&child.id, prefix, &child.prefix_hash)
+            };
+            if prefix != transfer.prefix || crate::registry::sha256_hex(prefix) != *hash {
+                continue;
+            }
+            let Some(decor) = toml_preservation::destination_prefix(after, &transfer.destination)
+            else {
+                continue;
+            };
+            if decor.get(transfer.landing.clone()) != Some(prefix) {
+                continue;
+            }
+            live.push(toml_preservation::LivePrefix {
+                source_id: id.clone(),
+                source_range: 0..prefix.len(),
+                destination: transfer.destination.clone(),
+                range: transfer.landing.clone(),
+                decor_hash: crate::registry::sha256_hex(decor),
+            });
         }
-        let Some(decor) = toml_preservation::destination_prefix(after, &transfer.destination)
-        else {
-            continue;
-        };
-        if decor.get(transfer.landing.clone()) != Some(prefix) {
-            continue;
-        }
-        live.push(toml_preservation::LivePrefix {
-            source_id: capture.id.clone(),
-            source_range: 0..prefix.len(),
-            destination: transfer.destination.clone(),
-            range: transfer.landing.clone(),
-            decor_hash: crate::registry::sha256_hex(decor),
-        });
     }
     record.live_prefixes = live;
     atomic_write(
@@ -476,23 +493,46 @@ pub(super) fn record_selected(
                 // A later move may capture comments transferred from an earlier
                 // entry. Record that relationship only while the source remains
                 // absent and the recorded ranges and destination decor still match.
-                let inherited = record.live_prefixes.iter().filter_map(|live| {
-                    if live.destination != destination { return None; }
-                    let source = record.entries.iter().find(|source| matches!(&source.raw, Raw::Toml { capture: Some(c), .. } if c.id == live.source_id))?;
+                let inherited_for = |destination: &toml_preservation::PrefixDestination,
+                                     prefix: &str| {
+                    record.live_prefixes.iter().filter_map(|live| {
+                    if &live.destination != destination { return None; }
+                    let source = record.entries.iter().find(|source| matches!(&source.raw, Raw::Toml { capture: Some(c), .. } if c.id == live.source_id || c.children.iter().any(|child| child.id == live.source_id)))?;
                     if doc.get("mcp_servers").and_then(|s| s.get(&source.name)).is_some() { return None; }
                     let Raw::Toml { text: source_text, capture: Some(source_capture) } = &source.raw else { return None; };
                     let source_doc: toml_edit::DocumentMut = source_text.parse().ok()?;
                     let (source_key, source_item) = toml_preservation::raw_entry(&source_doc, &source.name)?;
-                    let source_prefix = toml_preservation::capture_prefix(&source_key, &source_item);
-                    if crate::registry::sha256_hex(source_prefix) != source_capture.prefix_hash { return None; }
+                    let (source_prefix, source_hash) = if source_capture.id == live.source_id {
+                        (toml_preservation::capture_prefix(&source_key, &source_item), &source_capture.prefix_hash)
+                    } else {
+                        let child = source_capture.children.iter().find(|child| child.id == live.source_id)?;
+                        (toml_preservation::destination_prefix(&source_doc, &child.source)?, &child.prefix_hash)
+                    };
+                    if crate::registry::sha256_hex(source_prefix) != *source_hash { return None; }
                     let observed = toml_preservation::valid_live(doc, live)?;
                     if source_prefix.get(live.source_range.clone())? != observed || prefix.get(live.range.clone())? != observed { return None; }
                     Some(toml_preservation::PrefixInheritance { range: live.range.clone(), source_id: live.source_id.clone(), source_range: live.source_range.clone() })
-                }).collect();
+                }).collect()
+                };
+                let inherited = inherited_for(&destination, prefix);
+                let mut children = Vec::new();
+                for (source, prefix) in toml_preservation::descendant_prefixes(&single, &entry.name)
+                {
+                    let mut child_id = [0u8; 16];
+                    getrandom::getrandom(&mut child_id)
+                        .map_err(|e| format!("Could not generate capture ID: {e}"))?;
+                    children.push(toml_preservation::ChildCapture {
+                        id: child_id.iter().map(|b| format!("{b:02x}")).collect(),
+                        inherited: inherited_for(&source, &prefix),
+                        source,
+                        prefix_hash: crate::registry::sha256_hex(&prefix),
+                    });
+                }
                 *capture = Some(toml_preservation::TomlCapture {
                     id: id.iter().map(|b| format!("{b:02x}")).collect(),
                     prefix_hash: crate::registry::sha256_hex(prefix),
                     inherited,
+                    children,
                 });
                 fresh_captures.push(capture.as_ref().unwrap().id.clone());
             }
