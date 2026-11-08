@@ -43,6 +43,87 @@ mod tests {
     const BLOCK: &str = "# BEGIN PRUNLET MCP\n[mcp_servers.prunlet]\ncommand = 'prunlet'\nargs = ['mcp']\nstartup_timeout_sec = 600\n# END PRUNLET MCP\n";
 
     #[test]
+    fn restored_unowned_conduit_keeps_its_boundary_after_gateway_rename() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("unowned-conduit-boundary");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for inline in [false, true] {
+            for eof in [false, true] {
+                for edit_comment in [false, true] {
+                    let path = fixture
+                        .0
+                        .join(format!("{inline}-{eof}-{edit_comment}.toml"));
+                    let entry = if inline {
+                        "[mcp_servers]\n# BEGIN CONDUIT\n'conduit' = {command = 'custom', settings = {keep = true}}\n# END CONDUIT\n"
+                    } else {
+                        "# BEGIN CONDUIT\n[mcp_servers.conduit]\ncommand = 'custom'\n[mcp_servers.conduit.settings]\nkeep = true\n# END CONDUIT\n"
+                    };
+                    let tail = if eof {
+                        ""
+                    } else {
+                        "[profiles.work]\nmodel = 'before'\n"
+                    };
+                    std::fs::write(&path, format!("theme = 'before'\n{entry}{tail}")).unwrap();
+                    let gateway = super::super::tests::sample_gateway(None, "codex");
+                    mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                        edit_toml_gateway(&path, Some(&gateway))
+                    })
+                    .unwrap();
+                    let mut edited = read_config_file(&path)
+                        .unwrap()
+                        .replace("'before'", "'user-edit'");
+                    if edit_comment {
+                        edited = edited.replace("# BEGIN CONDUIT", "# BEGIN CONDUIT user-edited");
+                    }
+                    std::fs::write(&path, edited).unwrap();
+                    mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                        assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                        Ok(())
+                    })
+                    .unwrap();
+                    let text = read_config_file(&path).unwrap();
+                    assert_eq!(
+                        text.matches("# BEGIN CONDUIT").count(),
+                        1,
+                        "{inline}-{eof}: {text}"
+                    );
+                    assert_eq!(
+                        text.matches("# END CONDUIT").count(),
+                        1,
+                        "{inline}-{eof}: {text}"
+                    );
+                    if edit_comment {
+                        assert!(text.contains("# BEGIN CONDUIT user-edited"), "{text}");
+                    }
+                    let begin = text.find("# BEGIN CONDUIT").unwrap();
+                    let alias = text
+                        .find(if inline {
+                            "'conduit' ="
+                        } else {
+                            "[mcp_servers.conduit]"
+                        })
+                        .unwrap();
+                    let end = text.find("# END CONDUIT").unwrap();
+                    assert!(begin < alias && alias < end, "{inline}-{eof}: {text}");
+                    let parsed: toml::Value = toml::from_str(&text).unwrap();
+                    assert_eq!(
+                        parsed["mcp_servers"]["conduit"]["settings"]["keep"].as_bool(),
+                        Some(true)
+                    );
+                    assert!(parsed["mcp_servers"].get("toolport").is_none());
+                    assert_eq!(parsed["theme"].as_str(), Some("user-edit"));
+                    if !eof {
+                        assert_eq!(
+                            parsed["profiles"]["work"]["model"].as_str(),
+                            Some("user-edit")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn malformed_registration_values_do_not_match_inventory() {
         let mut gateway = super::super::tests::sample_gateway(None, "codex");
         gateway.args.clear();
@@ -2981,6 +3062,42 @@ fn gateway_rename_layout(original: &DocumentMut, written: &DocumentMut) -> Docum
         servers.get(first).unwrap().clone(),
     );
     layout
+}
+
+// Reuse the actual renamed slot only when the recorded writer proves this alias
+// was its source. This carries the live header decor, including user edits, back
+// with the entry and avoids treating equal text elsewhere as provenance.
+pub(super) fn restore_renamed_slot(
+    original: &DocumentMut,
+    written: &DocumentMut,
+    current: &mut DocumentMut,
+    name: &str,
+    item: &Item,
+) {
+    let layout = gateway_rename_layout(original, written);
+    if raw_entry(original, name).is_none()
+        || raw_entry(&layout, name).is_some()
+        || raw_entry(current, name).is_some()
+    {
+        return;
+    }
+    let Some((_, written_gateway)) = raw_entry(written, super::GATEWAY_ENTRY_NAME) else {
+        return;
+    };
+    let Some((_, live_gateway)) = raw_entry(current, super::GATEWAY_ENTRY_NAME) else {
+        return;
+    };
+    if item.is_table() != written_gateway.is_table()
+        || live_gateway.is_table() != written_gateway.is_table()
+    {
+        return;
+    }
+    rename(current, super::GATEWAY_ENTRY_NAME, name, item.clone());
+    let servers = super::toml_mcp_servers_mut(current);
+    let (mut original_key, _) = raw_entry(original, name).unwrap();
+    *original_key.leaf_decor_mut() = servers.key(name).unwrap().leaf_decor().clone();
+    let restored = servers.get(name).unwrap().clone();
+    servers.insert_formatted(&original_key, restored);
 }
 
 pub(super) fn rename(doc: &mut DocumentMut, old: &str, new: &str, item: Item) {
