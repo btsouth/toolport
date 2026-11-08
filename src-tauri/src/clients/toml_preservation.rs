@@ -1709,6 +1709,201 @@ mod tests {
         }
     }
     #[test]
+    fn prefixless_original_entries_return_before_block_end() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("prefixless-original-anchors");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for inline in [false, true] {
+            for direct in [false, true] {
+                for eof in [false, true] {
+                    for mode in 0..3 {
+                        let path = fixture
+                            .0
+                            .join(format!("{inline}-{direct}-{eof}-{mode}.toml"));
+                        let native = if inline {
+                            "[mcp_servers]\n# BEGIN\nfirst = {command = 'first'}\nsecond = {command = 'second', metadata = {keep = true}}\nthird = {command = 'third'}\n# END\n"
+                        } else {
+                            "# BEGIN\n[mcp_servers.first]\ncommand = 'first'\n[mcp_servers.second]\ncommand = 'second'\nmetadata = {keep = true}\n[mcp_servers.third]\ncommand = 'third'\n# END\n"
+                        };
+                        let profile = if eof {
+                            ""
+                        } else {
+                            "[profiles.work]\nkeep = true\nname = 'before'\n"
+                        };
+                        std::fs::write(&path, format!("model = 'before'\n{native}{profile}"))
+                            .unwrap();
+                        let names = match mode {
+                            0 => vec!["second".into()],
+                            1 => vec!["second".into(), "third".into()],
+                            _ => vec!["first".into(), "second".into()],
+                        };
+                        let gateway = super::super::tests::sample_gateway(None, "codex");
+                        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                            moved::record_selected(
+                                "fixture",
+                                Format::TomlMcpServers,
+                                &path,
+                                &names,
+                            )?;
+                            moved::remove_selected(Format::TomlMcpServers, &path, &names)?;
+                            edit_toml_gateway(&path, Some(&gateway))
+                        })
+                        .unwrap();
+                        let edited = read_config_file(&path)
+                            .unwrap()
+                            .replace("model = 'before'", "model = 'user-edit'")
+                            .replace("name = 'before'", "name = 'user-edit'");
+                        std::fs::write(&path, edited).unwrap();
+                        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                            if direct {
+                                moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                            } else {
+                                assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                        let output = read_config_file(&path).unwrap();
+                        let marker = |name| {
+                            if inline {
+                                format!("{name} =")
+                            } else {
+                                format!("[mcp_servers.{name}]")
+                            }
+                        };
+                        let positions: Vec<_> = [
+                            "# BEGIN".to_string(),
+                            marker("first"),
+                            marker("second"),
+                            marker("third"),
+                            "# END".to_string(),
+                        ]
+                        .iter()
+                        .map(|needle| output.find(needle).unwrap())
+                        .collect();
+                        assert!(
+                            positions.windows(2).all(|pair| pair[0] < pair[1]),
+                            "{inline}-{direct}-{eof}-{mode}: {output}"
+                        );
+                        assert_eq!(output.matches("# BEGIN").count(), 1, "{output}");
+                        assert_eq!(output.matches("# END").count(), 1, "{output}");
+                        let parsed: toml::Value = toml::from_str(&output).unwrap();
+                        assert_eq!(parsed["model"].as_str(), Some("user-edit"));
+                        assert_eq!(
+                            parsed["mcp_servers"]["second"]["metadata"]["keep"].as_bool(),
+                            Some(true)
+                        );
+                        if !eof {
+                            assert_eq!(parsed["profiles"]["work"]["keep"].as_bool(), Some(true));
+                            assert_eq!(
+                                parsed["profiles"]["work"]["name"].as_str(),
+                                Some("user-edit")
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn prefixless_original_anchor_preserves_latest_removed_generation() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("prefixless-newest-generation");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        for inline in [false, true] {
+            for direct in [false, true] {
+                let path = fixture.0.join(format!("{inline}-{direct}.toml"));
+                let original = if inline {
+                    "model = 'before'\n[mcp_servers]\n# BEGIN\nfirst = {command = 'first'}\nsecond = {command = 'old'}\nthird = {command = 'third'}\n# END\n[profiles.work]\nkeep = true\n"
+                } else {
+                    "model = 'before'\n# BEGIN\n[mcp_servers.first]\ncommand = 'first'\n[mcp_servers.second]\ncommand = 'old'\n[mcp_servers.third]\ncommand = 'third'\n# END\n[profiles.work]\nkeep = true\n"
+                };
+                std::fs::write(&path, original).unwrap();
+                let gateway = super::super::tests::sample_gateway(None, "codex");
+                mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                    moved::record_selected(
+                        "fixture",
+                        Format::TomlMcpServers,
+                        &path,
+                        &["second".into()],
+                    )?;
+                    moved::remove_selected(Format::TomlMcpServers, &path, &["second".into()])?;
+                    edit_toml_gateway(&path, Some(&gateway))
+                })
+                .unwrap();
+                let current = read_config_file(&path).unwrap();
+                let edited = if inline {
+                    current.replace(
+                        "third =",
+                        "second = {command = 'latest', metadata = {new = true}}\nthird =",
+                    )
+                } else {
+                    current.replace("[mcp_servers.third]", "[mcp_servers.second]\ncommand = 'latest'\nmetadata = {new = true}\n[mcp_servers.third]")
+                };
+                std::fs::write(&path, edited).unwrap();
+                mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                    moved::record_selected(
+                        "fixture",
+                        Format::TomlMcpServers,
+                        &path,
+                        &["second".into()],
+                    )?;
+                    moved::remove_selected(Format::TomlMcpServers, &path, &["second".into()])
+                })
+                .unwrap();
+                std::fs::write(
+                    &path,
+                    read_config_file(&path)
+                        .unwrap()
+                        .replace("model = 'before'", "model = 'user-edit'"),
+                )
+                .unwrap();
+                mutation::run("fixture", &path, Format::TomlMcpServers, || {
+                    if direct {
+                        moved::restore("fixture", Format::TomlMcpServers, &path)?;
+                    } else {
+                        assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                let output = read_config_file(&path).unwrap();
+                let label = |name| {
+                    if inline {
+                        format!("{name} =")
+                    } else {
+                        format!("[mcp_servers.{name}]")
+                    }
+                };
+                let positions: Vec<_> = [
+                    "# BEGIN".to_string(),
+                    label("first"),
+                    label("second"),
+                    label("third"),
+                    "# END".to_string(),
+                ]
+                .iter()
+                .map(|needle| output.find(needle).unwrap())
+                .collect();
+                assert!(
+                    positions.windows(2).all(|pair| pair[0] < pair[1]),
+                    "{output}"
+                );
+                let parsed: toml::Value = toml::from_str(&output).unwrap();
+                assert_eq!(
+                    parsed["mcp_servers"]["second"]["command"].as_str(),
+                    Some("latest")
+                );
+                assert_eq!(
+                    parsed["mcp_servers"]["second"]["metadata"]["new"].as_bool(),
+                    Some(true)
+                );
+                assert_eq!(parsed["model"].as_str(), Some("user-edit"));
+                assert_eq!(parsed["profiles"]["work"]["keep"].as_bool(), Some(true));
+            }
+        }
+    }
+    #[test]
     fn stale_capture_is_not_reissued_by_uncaptured_generic_removal() {
         let _lock = crate::registry::data_dir_test_lock();
         let fixture = Fixture::new("stale-generation-generic-removal");
@@ -2618,6 +2813,41 @@ fn original_anchor(
         .or(Some(PrefixDestination::Eof))
 }
 
+// 新gatewayの追加で原本のEOFコメントが見出しへ移った場合、そこを位置の境界にする。
+// コメントは変更せず、構造位置と書込み後のdecor全体が維持された場合だけ追従する。
+fn eof_gateway_anchor(
+    original: &DocumentMut,
+    written: &DocumentMut,
+    current: &DocumentMut,
+) -> Option<PrefixDestination> {
+    let footer = original.trailing().as_str()?;
+    if !footer.contains('#')
+        || original
+            .get("mcp_servers")
+            .and_then(|s| s.get(super::GATEWAY_ENTRY_NAME))
+            .is_some()
+    {
+        return None;
+    }
+    let gateway = written.get("mcp_servers")?.get(super::GATEWAY_ENTRY_NAME)?;
+    if !gateway.is_table()
+        || !gateway
+            .get("command")
+            .and_then(Item::as_str)
+            .is_some_and(super::command_is_gateway_binary)
+    {
+        return None;
+    }
+    let destination = source_destination(super::GATEWAY_ENTRY_NAME, gateway);
+    let written_prefix = destination_prefix(written, &destination)?;
+    if !written_prefix.starts_with(footer)
+        || destination_prefix(current, &destination)? != written_prefix
+    {
+        return None;
+    }
+    Some(destination)
+}
+
 fn insert_before_anchor(
     doc: &mut DocumentMut,
     anchor: &PrefixDestination,
@@ -2880,6 +3110,25 @@ pub(super) fn restore_raw_entries_with_provenance(
             .filter_map(|index| owners.get(index).cloned())
             .collect();
         let Some(actual) = locations.first() else {
+            // コメント転送が不要な原本entryは、所有spanがなくても構造位置で戻す。
+            let mut placeable = Vec::new();
+            for index in indices {
+                let (key, item) = &entries[index];
+                if !entry_prefix(key, item).contains('#') && raw_entry(&layout, key.get()).is_some()
+                {
+                    placeable.push(index);
+                } else {
+                    preserve_raw.insert(index);
+                }
+            }
+            if !placeable.is_empty() {
+                let actual = if matches!(anchor, PrefixDestination::Eof) {
+                    eof_gateway_anchor(original, written, &evidence).unwrap_or(anchor)
+                } else {
+                    anchor
+                };
+                actual_groups.entry(actual).or_default().extend(placeable);
+            }
             continue;
         };
         let eof_redirect = matches!(anchor, PrefixDestination::Eof)
@@ -2887,7 +3136,24 @@ pub(super) fn restore_raw_entries_with_provenance(
         if (actual != &anchor && !eof_redirect)
             || locations.iter().any(|destination| destination != actual)
         {
-            preserve_raw.extend(indices);
+            let mut placeable = Vec::new();
+            for index in indices {
+                let (key, item) = &entries[index];
+                if !entry_prefix(key, item).contains('#') && raw_entry(&layout, key.get()).is_some()
+                {
+                    placeable.push(index);
+                } else {
+                    preserve_raw.insert(index);
+                }
+            }
+            if !placeable.is_empty() {
+                let actual = if matches!(anchor, PrefixDestination::Eof) {
+                    eof_gateway_anchor(original, written, &evidence).unwrap_or(anchor)
+                } else {
+                    anchor
+                };
+                actual_groups.entry(actual).or_default().extend(placeable);
+            }
             continue;
         }
         actual_groups
@@ -2950,7 +3216,20 @@ pub(super) fn restore_raw_entries_with_provenance(
                         || (b.start <= a.start && b.end >= a.end))
             })
         }) {
-            preserve_raw.extend(indices);
+            let mut prefixless = Vec::new();
+            for index in indices {
+                let (key, item) = &entries[index];
+                if !entry_prefix(key, item).contains('#') && raw_entry(&layout, key.get()).is_some()
+                {
+                    handled.insert(index);
+                    prefixless.push((key.clone(), item.clone()));
+                } else {
+                    preserve_raw.insert(index);
+                }
+            }
+            if !prefixless.is_empty() {
+                plans.push((actual, Vec::new(), prefixless));
+            }
             continue;
         }
         // 明示された継承を座標へ変換する。文面一致は因果の根拠にしない。
@@ -3011,7 +3290,11 @@ pub(super) fn restore_raw_entries_with_provenance(
             spans.extend(added);
         }
         let owner_union = merge_prefix_spans(spans.values().cloned().collect());
-        if owner_union.is_empty() {
+        if owner_union.is_empty()
+            && indices
+                .iter()
+                .any(|index| entry_prefix(&entries[*index].0, &entries[*index].1).contains('#'))
+        {
             preserve_raw.extend(indices);
             continue;
         }
@@ -3145,6 +3428,9 @@ pub(super) fn restore_raw_entries_with_provenance(
     }
     // 全計画は初期evidence座標。挿入に先立って各actualを一度だけ更新する。
     for (actual, spans, _) in &plans {
+        if spans.is_empty() {
+            continue;
+        }
         let mut updated = destination_prefix(&evidence, actual).unwrap().to_string();
         for span in spans.iter().rev() {
             updated.replace_range(span.clone(), "");
