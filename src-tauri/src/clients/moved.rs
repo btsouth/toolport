@@ -184,12 +184,14 @@ pub(super) fn observe_toml_removal(
     let Some(client_id) = mutation::client_id(path) else {
         return Ok(());
     };
-    let Some(mut record) = load(&client_id)? else {
+    // This evidence is optional, so an unreadable record must not block the write.
+    let Ok(Some(mut record)) = load(&client_id) else {
         return Ok(());
     };
     if record.config_path != path.display().to_string() {
         return Ok(());
     }
+    let unchanged = serde_json::to_string(&record.live_prefixes).ok();
     let mut live = Vec::new();
     for old in &record.live_prefixes {
         let Some(bytes) = toml_preservation::valid_live(before, old) else {
@@ -306,6 +308,9 @@ pub(super) fn observe_toml_removal(
         }
     }
     record.live_prefixes = live;
+    if serde_json::to_string(&record.live_prefixes).ok() == unchanged {
+        return Ok(());
+    }
     atomic_write(
         &record_path(&client_id)?,
         &serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?,
@@ -323,12 +328,14 @@ pub(super) fn observe_toml_relocation(
     let Some(client_id) = mutation::client_id(path) else {
         return Ok(());
     };
-    let Some(mut record) = load(&client_id)? else {
+    // This evidence is optional, so an unreadable record must not block the write.
+    let Ok(Some(mut record)) = load(&client_id) else {
         return Ok(());
     };
     if record.config_path != path.display().to_string() {
         return Ok(());
     }
+    let unchanged = serde_json::to_string(&record.live_prefixes).ok();
     record.live_prefixes.retain_mut(|live| {
         // Only an actual MCP server table rename moves descendant paths; EOF
         // transfers and unrelated tables must never rewrite a nested witness.
@@ -380,6 +387,9 @@ pub(super) fn observe_toml_relocation(
         live.decor_hash = crate::registry::sha256_hex(new_decor);
         true
     });
+    if serde_json::to_string(&record.live_prefixes).ok() == unchanged {
+        return Ok(());
+    }
     atomic_write(
         &record_path(&client_id)?,
         &serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?,

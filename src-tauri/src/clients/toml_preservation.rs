@@ -43,6 +43,78 @@ mod tests {
     const BLOCK: &str = "# BEGIN PRUNLET MCP\n[mcp_servers.prunlet]\ncommand = 'prunlet'\nargs = ['mcp']\nstartup_timeout_sec = 600\n# END PRUNLET MCP\n";
 
     #[test]
+    fn transport_switch_drops_the_other_transports_settings() {
+        let mut doc: DocumentMut = "[mcp_servers.x]\ncommand = 'srv'\nargs = ['--stdio']\ncwd = '/tmp'\nenv_vars = ['HOME']\nstartup_timeout_sec = 30 # keep\n# credentials\n[mcp_servers.x.env]\nTOKEN = 'abc'\n[profiles.work]\nkeep = true\n".parse().unwrap();
+        let mut entry = super::super::tests::sample_gateway(None, "codex");
+        entry.command = None;
+        entry.env.clear();
+        entry.url = Some("https://example.com/mcp".into());
+        super::update_entry(&mut doc, "x", &entry);
+        let output = doc.to_string();
+        let parsed: toml::Value = toml::from_str(&output).unwrap();
+        let x = parsed["mcp_servers"]["x"].as_table().unwrap();
+        assert_eq!(
+            x["url"].as_str(),
+            Some("https://example.com/mcp"),
+            "{output}"
+        );
+        for key in ["command", "args", "cwd", "env_vars", "env"] {
+            assert!(!x.contains_key(key), "{key} left in {output}");
+        }
+        assert_eq!(x["startup_timeout_sec"].as_integer(), Some(30));
+        assert!(
+            output.contains("startup_timeout_sec = 30 # keep"),
+            "{output}"
+        );
+        assert_eq!(parsed["profiles"]["work"]["keep"].as_bool(), Some(true));
+
+        doc["mcp_servers"]["x"]["bearer_token_env_var"] = toml_edit::value("TOKEN");
+        let mut entry = super::super::tests::sample_gateway(None, "codex");
+        entry.env.clear();
+        entry.command = Some("srv".into());
+        super::update_entry(&mut doc, "x", &entry);
+        let output = doc.to_string();
+        let parsed: toml::Value = toml::from_str(&output).unwrap();
+        let x = parsed["mcp_servers"]["x"].as_table().unwrap();
+        assert_eq!(x["command"].as_str(), Some("srv"), "{output}");
+        for key in ["url", "bearer_token_env_var"] {
+            assert!(!x.contains_key(key), "{key} left in {output}");
+        }
+        assert_eq!(x["startup_timeout_sec"].as_integer(), Some(30));
+    }
+
+    #[test]
+    fn unreadable_move_record_does_not_block_gateway_edits() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("corrupt-move-record");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        let path = fixture.0.join("config.toml");
+        std::fs::write(
+            &path,
+            "[mcp_servers.native]\ncommand = 'native'\n# next\n[profiles.work]\nkeep = true\n",
+        )
+        .unwrap();
+        mutation::run("codex", &path, Format::TomlMcpServers, || {
+            moved::record_selected("codex", Format::TomlMcpServers, &path, &["native".into()])?;
+            moved::remove_selected(Format::TomlMcpServers, &path, &["native".into()])
+        })
+        .unwrap();
+        let record = backup_dir("codex").unwrap().join("moved-servers.json");
+        assert!(record.exists());
+        std::fs::write(&record, "{ not json").unwrap();
+        let gateway = super::super::tests::sample_gateway(None, "codex");
+        for entry in [Some(&gateway), None] {
+            mutation::run("codex", &path, Format::TomlMcpServers, || {
+                edit_toml_gateway(&path, entry)
+            })
+            .unwrap();
+        }
+        let output = read_config_file(&path).unwrap();
+        assert!(output.contains("# next\n[profiles.work]"), "{output}");
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "{ not json");
+    }
+
+    #[test]
     fn alias_restore_keeps_edited_array_table_header_decor() {
         let _lock = crate::registry::data_dir_test_lock();
         let fixture = Fixture::new("alias-array-header-edit");
@@ -3461,6 +3533,26 @@ pub(super) fn update_entry(doc: &mut DocumentMut, name: &str, entry: &super::Ser
         return;
     };
     let desired = generated.as_table_like().unwrap();
+    // Codex refuses stdio keys on a URL server and HTTP keys on a command
+    // server, so switching transports drops the other side's settings.
+    let stale: &[&str] = if desired.contains_key("url") && table.contains_key("command") {
+        &["command", "args", "env", "env_vars", "cwd"]
+    } else if desired.contains_key("command") && table.contains_key("url") {
+        &[
+            "url",
+            "bearer_token",
+            "bearer_token_env_var",
+            "http_headers",
+            "env_http_headers",
+        ]
+    } else {
+        &[]
+    };
+    for key in stale {
+        if !desired.contains_key(key) {
+            table.remove(key);
+        }
+    }
     for field in ["command", "args", "url", "env"] {
         let equal = match (table.get(field), desired.get(field)) {
             (None, None) => true,
@@ -4494,6 +4586,10 @@ fn insert_before_anchor(
                         servers.insert_formatted(&key, item);
                     }
                 }
+                servers.insert_formatted(&key, item);
+            }
+            // Never report entries as restored without writing them.
+            for (key, item) in batch.take().unwrap_or_default() {
                 servers.insert_formatted(&key, item);
             }
             return;
