@@ -195,12 +195,9 @@ pub(super) fn observe_toml_removal(
         let Some(bytes) = toml_preservation::valid_live(before, old) else {
             continue;
         };
-        let moved = transfers.iter().find(|transfer| {
-            toml_preservation::raw_entry(before, &transfer.source_name).is_some_and(|(_, item)| {
-                toml_preservation::source_destination(&transfer.source_name, &item)
-                    == old.destination
-            })
-        });
+        let moved = transfers
+            .iter()
+            .find(|transfer| transfer.source == old.destination);
         let (destination, range) = if let Some(transfer) = moved {
             let Some(end) = transfer.landing.start.checked_add(old.range.end) else {
                 continue;
@@ -238,6 +235,11 @@ pub(super) fn observe_toml_removal(
         });
     }
     for transfer in transfers {
+        if toml_preservation::raw_entry(before, &transfer.source_name).is_none_or(|(_, item)| {
+            toml_preservation::source_destination(&transfer.source_name, &item) != transfer.source
+        }) {
+            continue;
+        }
         let Some(entry) = record
             .entries
             .iter()

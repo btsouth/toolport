@@ -730,7 +730,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
                 &provenance,
             );
             toml_preservation::remove(&mut doc, &removed);
-            if latest.get(key).is_none() {
+            if latest.get(key).is_none() && !super::toml_keeps_servers_header(&doc) {
                 doc.remove(key);
             }
             atomic_write(path, &doc.to_string())?;

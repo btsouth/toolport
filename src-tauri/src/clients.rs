@@ -6673,31 +6673,28 @@ fn write_toml(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
 // settings and the original formatting outside the update's scope.
 fn toml_server_matches(item: &toml_edit::Item, server: &ServerEntry) -> bool {
     let expected = entry_to_toml(server);
-    let string = |key: &str| item.get(key).and_then(|value| value.as_str());
-    let args: Vec<_> = item
-        .get("args")
-        .and_then(|value| value.as_array())
-        .map(|array| {
+    let string_matches = |key: &str, expected: Option<&str>| match item.get(key) {
+        None => expected.is_none(),
+        Some(value) => value.as_str().is_some_and(|value| Some(value) == expected),
+    };
+    let args = match item.get("args") {
+        None => Some(Vec::new()),
+        Some(value) => value.as_array().and_then(|array| {
             array
                 .iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
+                .map(|value| value.as_str().map(str::to_string))
                 .collect()
-        })
-        .unwrap_or_default();
-    let env: std::collections::BTreeMap<_, _> = item
-        .get("env")
-        .and_then(|value| value.as_table_like())
-        .map(|table| {
+        }),
+    };
+    let env: Option<std::collections::BTreeMap<_, _>> = match item.get("env") {
+        None => Some(Default::default()),
+        Some(value) => value.as_table_like().and_then(|table| {
             table
                 .iter()
-                .filter_map(|(key, value)| {
-                    value
-                        .as_str()
-                        .map(|value| (key.to_string(), value.to_string()))
-                })
+                .map(|(key, value)| Some((key.to_string(), value.as_str()?.to_string())))
                 .collect()
-        })
-        .unwrap_or_default();
+        }),
+    };
     let expected_env: std::collections::BTreeMap<_, _> = expected
         .get("env")
         .and_then(|value| value.as_table())
@@ -6710,10 +6707,10 @@ fn toml_server_matches(item: &toml_edit::Item, server: &ServerEntry) -> bool {
                 .collect()
         })
         .unwrap_or_default();
-    string("command") == server.command.as_deref()
-        && string("url") == server.url.as_deref()
-        && args == server.args
-        && env == expected_env
+    string_matches("command", server.command.as_deref())
+        && string_matches("url", server.url.as_deref())
+        && args.as_ref() == Some(&server.args)
+        && env.as_ref() == Some(&expected_env)
 }
 
 // --- Goose: YAML config.yaml with a top-level `extensions` map ---

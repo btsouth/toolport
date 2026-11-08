@@ -42,6 +42,213 @@ mod tests {
 
     const BLOCK: &str = "# BEGIN PRUNLET MCP\n[mcp_servers.prunlet]\ncommand = 'prunlet'\nargs = ['mcp']\nstartup_timeout_sec = 600\n# END PRUNLET MCP\n";
 
+    #[test]
+    fn malformed_registration_values_do_not_match_inventory() {
+        let mut gateway = super::super::tests::sample_gateway(None, "codex");
+        gateway.args.clear();
+        gateway.env.clear();
+        for field in [
+            "args = [17]",
+            "args = 17",
+            "env = { BAD = 17 }",
+            "env = 17",
+            "url = 17",
+        ] {
+            let mut doc = DocumentMut::new();
+            super::update_entry(&mut doc, "toolport", &gateway);
+            assert!(toml_server_matches(
+                &doc["mcp_servers"]["toolport"],
+                &gateway
+            ));
+            let bad: DocumentMut = field.parse().unwrap();
+            let key = field.split_once(' ').unwrap().0;
+            doc["mcp_servers"]["toolport"][key] = bad[key].clone();
+            assert!(
+                !toml_server_matches(&doc["mcp_servers"]["toolport"], &gateway),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn updates_keep_empty_fields_and_existing_key_decor() {
+        let mut gateway = super::super::tests::sample_gateway(None, "codex");
+        gateway.args.clear();
+        gateway.env.clear();
+        gateway.command = Some("new-command".into());
+        let mut doc: DocumentMut = "[mcp_servers.toolport]\n# command key\n'command' = 'old'\nargs = [ # empty args\n]\n[mcp_servers.toolport.env] # env header\n# END OTHER\n".parse().unwrap();
+        super::update_entry(&mut doc, "toolport", &gateway);
+        let text = doc.to_string();
+        for expected in [
+            "# command key",
+            "'command'",
+            "# empty args",
+            "# env header",
+            "# END OTHER",
+        ] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+    }
+
+    #[test]
+    fn changed_values_keep_key_spelling_and_empty_env_header() {
+        let mut gateway = super::super::tests::sample_gateway(None, "codex");
+        gateway.command = Some("new".into());
+        gateway.env = vec![EnvVar {
+            key: "TOKEN".into(),
+            value: Some("new".into()),
+            secret: false,
+            unknown_fields: Default::default(),
+        }];
+        let mut doc: DocumentMut = "[mcp_servers.toolport]\n# command key\n'command' = 'old'\n[mcp_servers.toolport.env] # keep header\n# token key\n'TOKEN' = 'old'\n".parse().unwrap();
+        super::update_entry(&mut doc, "toolport", &gateway);
+        let text = doc.to_string();
+        for expected in ["# command key", "'command'", "# token key", "'TOKEN'"] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+        gateway.env.clear();
+        super::update_entry(&mut doc, "toolport", &gateway);
+        let text = doc.to_string();
+        assert!(
+            text.contains("[mcp_servers.toolport.env] # keep header"),
+            "{text}"
+        );
+        assert!(!text.contains("TOKEN"), "{text}");
+    }
+
+    #[test]
+    fn restore_keeps_header_decor_added_after_install() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("restore-user-header");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        let path = fixture.0.join("config.toml");
+        std::fs::write(&path, "theme = 'dark'\n").unwrap();
+        let gateway = super::super::tests::sample_gateway(None, "codex");
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            edit_toml_gateway(&path, Some(&gateway))
+        })
+        .unwrap();
+        let edited = read_config_file(&path).unwrap().replace(
+            "[mcp_servers.toolport]",
+            "[mcp_servers] # user header\n[mcp_servers.toolport]",
+        );
+        std::fs::write(&path, edited).unwrap();
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+            Ok(())
+        })
+        .unwrap();
+        let text = read_config_file(&path).unwrap();
+        assert!(text.contains("[mcp_servers] # user header"), "{text}");
+        text.parse::<DocumentMut>().unwrap();
+    }
+
+    #[test]
+    fn alias_rename_layout_retains_original_child_position() {
+        let original: DocumentMut = "[mcp_servers.conduit]\ncommand='toolport-gateway'\n[profiles.one]\nx=1\n[mcp_servers.conduit.env]\nX='old'\n[profiles.two]\nx=2\n".parse().unwrap();
+        let mut written = original.clone();
+        let old = super::raw_entry(&original, "conduit").unwrap().1;
+        super::rename(&mut written, "conduit", "toolport", old);
+        let gateway = super::super::tests::sample_gateway(None, "codex");
+        super::update_entry(&mut written, "toolport", &gateway);
+        let layout = super::gateway_rename_layout(&original, &written);
+        let pos = |doc: &DocumentMut, server: &str| {
+            doc["mcp_servers"][server]["env"]
+                .as_table()
+                .unwrap()
+                .position()
+        };
+        assert_eq!(pos(&layout, "toolport"), pos(&original, "conduit"));
+    }
+
+    #[test]
+    fn removed_descendant_prefixes_follow_their_own_document_positions() {
+        let mut doc: DocumentMut = "[mcp_servers.gateway]\ncommand='gateway'\n[profiles.one]\nx=1\n# END NATIVE\n[mcp_servers.gateway.env]\nX='1'\n[profiles.two]\nx=2\n".parse().unwrap();
+        let transfers = remove(&mut doc, &["gateway".into()]);
+        let text = doc.to_string();
+        assert!(text.contains("# END NATIVE\n[profiles.two]"), "{text}");
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(
+            transfers[0].source,
+            super::PrefixDestination::Table(vec![
+                ("mcp_servers".into(), None),
+                ("gateway".into(), None),
+                ("env".into(), None)
+            ])
+        );
+    }
+
+    #[test]
+    fn latest_live_destination_overrides_original_anchor() {
+        let original: DocumentMut = "# NATIVE\n[mcp_servers.native]\ncommand='old'\n[profiles.one]\nx=1\n[profiles.two]\nx=2\n".parse().unwrap();
+        let written: DocumentMut = "# NATIVE\n[profiles.one]\nx=1\n[profiles.two]\nx=2\n"
+            .parse()
+            .unwrap();
+        let mut current: DocumentMut = "[profiles.one]\nx=1\n# NATIVE\n[profiles.two]\nx=2\n"
+            .parse()
+            .unwrap();
+        let raw: DocumentMut = "# NATIVE\n[mcp_servers.native]\ncommand='old'\n"
+            .parse()
+            .unwrap();
+        let entry = super::raw_entry(&raw, "native").unwrap();
+        let prefix = "# NATIVE\n";
+        let destination =
+            super::PrefixDestination::Table(vec![("profiles".into(), None), ("two".into(), None)]);
+        let meta = super::TomlProvenance {
+            capture: Some(super::TomlCapture {
+                id: "new".into(),
+                prefix_hash: crate::registry::sha256_hex(prefix),
+                inherited: vec![],
+            }),
+            live: vec![super::LivePrefix {
+                source_id: "new".into(),
+                source_range: 0..prefix.len(),
+                destination,
+                range: 0..prefix.len(),
+                decor_hash: crate::registry::sha256_hex(prefix),
+            }],
+        };
+        super::restore_raw_entries_with_provenance(
+            &original,
+            &written,
+            &mut current,
+            vec![entry],
+            &[meta],
+        );
+        let text = current.to_string();
+        assert_eq!(text.matches("# NATIVE").count(), 1, "{text}");
+        assert!(
+            text.find("[profiles.one]") < text.find("[mcp_servers.native]"),
+            "{text}"
+        );
+        assert!(
+            text.find("[mcp_servers.native]") < text.find("[profiles.two]"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn changed_capture_without_live_witness_keeps_independent_equal_comments() {
+        let original: DocumentMut = "[mcp_servers.native]\ncommand='old'\n[profiles.one]\nx=1\n"
+            .parse()
+            .unwrap();
+        let written: DocumentMut = "# SAME\n[profiles.one]\nx=1\n".parse().unwrap();
+        let mut current = written.clone();
+        let raw: DocumentMut = "# SAME\n[mcp_servers.native]\ncommand='new'\n"
+            .parse()
+            .unwrap();
+        let entry = super::raw_entry(&raw, "native").unwrap();
+        super::restore_raw_entries_with_provenance(
+            &original,
+            &written,
+            &mut current,
+            vec![entry],
+            &[super::TomlProvenance::default()],
+        );
+        let text = current.to_string();
+        assert_eq!(text.matches("# SAME").count(), 2, "{text}");
+    }
+
     fn assert_block(text: &str) {
         let normalized = text.replace("\r\n", "\n");
         assert!(normalized.contains(BLOCK), "{text}");
@@ -195,7 +402,7 @@ mod tests {
         for name in [&gateway.name, "conduit"] {
             let input = format!("[mcp_servers.{name}]\ncommand = 'toolport-gateway' # command comment\nstartup_timeout_sec = 600\n[mcp_servers.{name}.metadata]\ncustom = 'keep' # metadata comment\n");
             std::fs::write(&path, &input).unwrap();
-            if name == &gateway.name {
+            if name == gateway.name {
                 write_toml(&path, std::slice::from_ref(&gateway)).unwrap();
             } else {
                 edit_toml_gateway(&path, Some(&gateway)).unwrap();
@@ -885,8 +1092,10 @@ mod tests {
             super::dedup_raw_prefix(&original, &written, &written, &mut key, &mut item);
             super::put_raw(&mut restored, key, item);
         }
-        assert_eq!(restored.to_string().matches("# first boundary").count(), 1);
-        assert_eq!(restored.to_string().matches("# second boundary").count(), 1);
+        // Equal text at a unique location is not a transfer witness for entries
+        // absent from the original snapshot; retain both independent copies.
+        assert_eq!(restored.to_string().matches("# first boundary").count(), 2);
+        assert_eq!(restored.to_string().matches("# second boundary").count(), 2);
         let repeated: DocumentMut =
             "# first boundary\n# first boundary\n[profiles.work]\nmodel = 'keep'\n"
                 .parse()
@@ -2467,6 +2676,8 @@ pub(super) fn update_entry(doc: &mut DocumentMut, name: &str, entry: &super::Ser
     for field in ["command", "args", "url", "env"] {
         let equal = match (table.get(field), desired.get(field)) {
             (None, None) => true,
+            (Some(a), None) if field == "args" => a.as_array().is_some_and(|a| a.is_empty()),
+            (Some(a), None) if field == "env" => a.as_table_like().is_some_and(|a| a.is_empty()),
             (Some(a), Some(b)) if field == "env" => {
                 let values = |item: &Item| {
                     item.as_table_like().map(|t| {
@@ -2542,6 +2753,19 @@ pub(super) fn update_entry(doc: &mut DocumentMut, name: &str, entry: &super::Ser
             }
         }
         if field == "env" {
+            if desired.get(field).is_none() {
+                if let Some(old) = table.get_mut(field).and_then(Item::as_table_mut) {
+                    let decorated = [old.decor().prefix(), old.decor().suffix()]
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|s| s.as_str())
+                        .any(|s| s.contains('#'));
+                    if decorated && !old.is_implicit() {
+                        old.clear();
+                        continue;
+                    }
+                }
+            }
             if let (Some(old), Some(new)) = (
                 table.get_mut(field).and_then(Item::as_table_like_mut),
                 desired.get(field).and_then(Item::as_table_like),
@@ -2568,7 +2792,11 @@ pub(super) fn update_entry(doc: &mut DocumentMut, name: &str, entry: &super::Ser
                     ) {
                         *next.decor_mut() = previous.decor().clone();
                     }
-                    old.insert(key, replacement);
+                    if let Some(slot) = old.get_mut(key) {
+                        *slot = replacement;
+                    } else {
+                        old.insert(key, replacement);
+                    }
                 }
                 continue;
             }
@@ -2581,7 +2809,11 @@ pub(super) fn update_entry(doc: &mut DocumentMut, name: &str, entry: &super::Ser
             ) {
                 *new.decor_mut() = old.decor().clone();
             }
-            table.insert(field, value);
+            if let Some(slot) = table.get_mut(field) {
+                *slot = value;
+            } else {
+                table.insert(field, value);
+            }
         } else {
             table.remove(field);
         }
@@ -2741,7 +2973,7 @@ fn gateway_rename_layout(original: &DocumentMut, written: &DocumentMut) -> Docum
         &mut layout,
         first,
         super::GATEWAY_ENTRY_NAME,
-        gateway.clone(),
+        servers.get(first).unwrap().clone(),
     );
     layout
 }
@@ -2817,6 +3049,7 @@ pub(super) enum PrefixDestination {
 // An observation from an actual removal, with byte offsets in the resulting decor.
 pub(super) struct PrefixTransfer {
     pub source_name: String,
+    pub source: PrefixDestination,
     pub prefix: String,
     pub destination: PrefixDestination,
     pub expected_destination_prefix: String,
@@ -3034,14 +3267,8 @@ fn raw_prefix_location(
             return None;
         }
     } else {
-        // For entries added or moved again after the first snapshot, require a
-        // unique complete-prefix match at the corresponding decor location.
-        if prefix_locations(original)
-            .iter()
-            .any(|(_, decor)| line_prefix_matches(decor, prefix) != 0)
-        {
-            return None;
-        }
+        // New or changed captures require an observed live transfer, not text equality.
+        return None;
     }
     let mut witness = None;
     for (destination, decor) in prefix_locations(written) {
@@ -3378,6 +3605,7 @@ pub(super) fn restore_raw_entries_with_provenance(
                 .map(|destination| (index, destination))
         })
         .collect();
+    let mut live_owners = std::collections::HashSet::new();
     for (index, (key, item)) in entries.iter().enumerate() {
         let Some(meta) = provenance.get(index) else {
             continue;
@@ -3395,6 +3623,7 @@ pub(super) fn restore_raw_entries_with_provenance(
                 && valid_live(&evidence, live) == Some(prefix)
         }) {
             owners.insert(index, live.destination.clone());
+            live_owners.insert(index);
         }
     }
     let mut layout = gateway_rename_layout(original, written);
@@ -3482,7 +3711,10 @@ pub(super) fn restore_raw_entries_with_provenance(
         };
         let eof_redirect = matches!(anchor, PrefixDestination::Eof)
             && matches!(actual, PrefixDestination::Table(path) if path.len() == 2 && path[0].0 == "mcp_servers" && original.get("mcp_servers").and_then(|table| table.get(&path[1].0)).is_none());
-        if (actual != &anchor && !eof_redirect)
+        // A live witness supersedes the original boundary for the entire group,
+        // including prefixless siblings whose order depends on that boundary.
+        let verified_relocation = indices.iter().any(|index| live_owners.contains(index));
+        if (actual != &anchor && !eof_redirect && !verified_relocation)
             || locations.iter().any(|destination| destination != actual)
         {
             let mut placeable = Vec::new();
@@ -3541,9 +3773,13 @@ pub(super) fn restore_raw_entries_with_provenance(
                     })
                     .map(|live| live.range.clone())
             });
-            if let Some(span) =
-                observed.or_else(|| proven_prefix_span(written, &evidence, &actual, prefix))
-            {
+            let legacy = raw_entry(original, entries[*index].0.get())
+                .is_some_and(|(key, item)| entry_prefix(&key, &item) == prefix);
+            if let Some(span) = observed.or_else(|| {
+                legacy
+                    .then(|| proven_prefix_span(written, &evidence, &actual, prefix))
+                    .flatten()
+            }) {
                 spans.insert(*index, span);
             }
         }
@@ -3553,7 +3789,11 @@ pub(super) fn restore_raw_entries_with_provenance(
             .filter_map(|index| {
                 spans.get(index).cloned().or_else(|| {
                     let prefix = entry_prefix(&entries[*index].0, &entries[*index].1);
-                    proven_prefix_span(written, &evidence, &actual, prefix)
+                    raw_entry(original, entries[*index].0.get()).and_then(|(key, item)| {
+                        (entry_prefix(&key, &item) == prefix)
+                            .then(|| proven_prefix_span(written, &evidence, &actual, prefix))
+                            .flatten()
+                    })
                 })
             })
             .collect();
@@ -3942,18 +4182,29 @@ pub(super) fn remove(doc: &mut DocumentMut, names: &[String]) -> Vec<PrefixTrans
                 continue;
             };
             if let Some(table) = item.as_table() {
-                if let Some(prefix) = table
-                    .decor()
-                    .prefix()
-                    .and_then(|raw| raw.as_str())
-                    .filter(|prefix| prefix.contains('#'))
-                {
-                    prefixes.push((
-                        table.position().unwrap_or(usize::MAX),
-                        name.clone(),
-                        prefix.to_string(),
-                    ));
-                }
+                let mut subtree = table.clone();
+                visit(&mut subtree, &mut |child| {
+                    if let Some(prefix) = child
+                        .decor()
+                        .prefix()
+                        .and_then(|raw| raw.as_str())
+                        .filter(|prefix| prefix.contains('#'))
+                    {
+                        let position = child.position().unwrap_or(usize::MAX);
+                        let mut path = vec![("mcp_servers".into(), None), (name.clone(), None)];
+                        if position != table.position().unwrap_or(usize::MAX) {
+                            if let Some(rest) = table_path(table, position) {
+                                path.extend(rest);
+                            }
+                        }
+                        prefixes.push((
+                            position,
+                            name.clone(),
+                            prefix.to_string(),
+                            PrefixDestination::Table(path),
+                        ));
+                    }
+                });
             } else {
                 let prefix = servers
                     .key(name)
@@ -3974,6 +4225,10 @@ pub(super) fn remove(doc: &mut DocumentMut, names: &[String]) -> Vec<PrefixTrans
                 if let Some(next) = next {
                     transfers.push(PrefixTransfer {
                         source_name: name.clone(),
+                        source: PrefixDestination::InlineKey(
+                            vec![("mcp_servers".into(), None)],
+                            name.clone(),
+                        ),
                         prefix: prefix.clone(),
                         destination: PrefixDestination::InlineKey(
                             vec![("mcp_servers".into(), None)],
@@ -3991,6 +4246,10 @@ pub(super) fn remove(doc: &mut DocumentMut, names: &[String]) -> Vec<PrefixTrans
                         servers.position().unwrap_or(usize::MAX),
                         name.clone(),
                         prefix,
+                        PrefixDestination::InlineKey(
+                            vec![("mcp_servers".into(), None)],
+                            name.clone(),
+                        ),
                     ));
                 }
             }
@@ -4009,9 +4268,9 @@ pub(super) fn remove(doc: &mut DocumentMut, names: &[String]) -> Vec<PrefixTrans
             servers.remove(name);
         }
     }
-    prefixes.sort_by_key(|(position, _, _)| *position);
+    prefixes.sort_by_key(|(position, _, _, _)| *position);
     let mut destinations = std::collections::BTreeMap::<Option<usize>, String>::new();
-    for (position, name, prefix) in prefixes {
+    for (position, name, prefix, source) in prefixes {
         let mut next = None;
         visit(doc.as_table_mut(), &mut |table| {
             if !table.is_implicit() || !table.get_values().is_empty() {
@@ -4029,6 +4288,7 @@ pub(super) fn remove(doc: &mut DocumentMut, names: &[String]) -> Vec<PrefixTrans
             .unwrap_or(PrefixDestination::Eof);
         transfers.push(PrefixTransfer {
             source_name: name,
+            source,
             prefix: prefix.clone(),
             destination,
             expected_destination_prefix: String::new(),
