@@ -330,22 +330,53 @@ pub(super) fn observe_toml_relocation(
         return Ok(());
     }
     record.live_prefixes.retain_mut(|live| {
-        if &live.destination != from {
+        // Only an actual MCP server table rename moves descendant paths; EOF
+        // transfers and unrelated tables must never rewrite a nested witness.
+        let destination = if &live.destination == from {
+            to.clone()
+        } else if let (
+            toml_preservation::PrefixDestination::Table(old_root),
+            toml_preservation::PrefixDestination::Table(new_root),
+            toml_preservation::PrefixDestination::Table(path),
+        ) = (from, to, &live.destination)
+        {
+            if old_root.len() != 2
+                || new_root.len() != 2
+                || old_root[0] != ("mcp_servers".into(), None)
+                || new_root[0] != old_root[0]
+                || old_root[1].1.is_some()
+                || new_root[1].1.is_some()
+                || old_root[1].0 == new_root[1].0
+                || path.len() <= old_root.len()
+                || !path.starts_with(old_root)
+            {
+                return true;
+            }
+            let mut renamed = new_root.clone();
+            renamed.extend_from_slice(&path[old_root.len()..]);
+            toml_preservation::PrefixDestination::Table(renamed)
+        } else {
             return true;
-        }
+        };
         let Some(bytes) = toml_preservation::valid_live(before, live) else {
             return false;
         };
-        let Some(old_decor) = toml_preservation::destination_prefix(before, from) else {
+        let Some(old_decor) = toml_preservation::destination_prefix(before, &live.destination)
+        else {
             return false;
         };
-        let Some(new_decor) = toml_preservation::destination_prefix(after, to) else {
+        let Some(new_decor) = toml_preservation::destination_prefix(after, &destination) else {
             return false;
         };
-        if !new_decor.starts_with(old_decor) || new_decor.get(live.range.clone()) != Some(bytes) {
+        let valid_decor = if &live.destination == from {
+            new_decor.starts_with(old_decor)
+        } else {
+            new_decor == old_decor
+        };
+        if !valid_decor || new_decor.get(live.range.clone()) != Some(bytes) {
             return false;
         }
-        live.destination = to.clone();
+        live.destination = destination;
         live.decor_hash = crate::registry::sha256_hex(new_decor);
         true
     });

@@ -709,16 +709,18 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
                             {
                                 // A removed gateway may still occupy this exact
                                 // alias slot from the recorded Connect rename.
-                                if removed.iter().any(|removed| removed == GATEWAY_ENTRY_NAME) {
-                                    toml_preservation::restore_renamed_slot(
-                                        &original,
-                                        &written_doc,
-                                        &mut doc,
-                                        name,
-                                        &item,
-                                    );
+                                let restored_slot =
+                                    removed.iter().any(|removed| removed == GATEWAY_ENTRY_NAME)
+                                        && toml_preservation::restore_renamed_slot(
+                                            &original,
+                                            &written_doc,
+                                            &mut doc,
+                                            name,
+                                            &item,
+                                        );
+                                if !restored_slot {
+                                    restore_entries.push((entry_key, item));
                                 }
-                                restore_entries.push((entry_key, item));
                             }
                         } else {
                             let value: toml::Value =

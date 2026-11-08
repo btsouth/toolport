@@ -43,6 +43,137 @@ mod tests {
     const BLOCK: &str = "# BEGIN PRUNLET MCP\n[mcp_servers.prunlet]\ncommand = 'prunlet'\nargs = ['mcp']\nstartup_timeout_sec = 600\n# END PRUNLET MCP\n";
 
     #[test]
+    fn alias_restore_keeps_edited_array_table_header_decor() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("alias-array-header-edit");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        let path = fixture.0.join("config.toml");
+        std::fs::write(&path, "theme = 'before'\n[mcp_servers.conduit]\ncommand = 'conduit-gateway'\n# original key\ncustom = 'keep' # original custom\n# original array\n[[mcp_servers.conduit.backends]] # original suffix\nname = 'first' # original value\n[[mcp_servers.conduit.backends]]\nname = 'second'\n[profiles.work]\nkeep = true\n").unwrap();
+        let gateway = super::super::tests::sample_gateway(None, "codex");
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            edit_toml_gateway(&path, Some(&gateway))
+        })
+        .unwrap();
+        let text = read_config_file(&path)
+            .unwrap()
+            .replace("'before'", "'edited'")
+            .replace("# original array", "# edited array")
+            .replace("# original suffix", "# edited suffix")
+            .replace("# original value", "# edited value")
+            .replace("# original key", "# edited key")
+            .replace("# original custom", "# edited custom");
+        std::fs::write(&path, text).unwrap();
+        mutation::run("fixture", &path, Format::TomlMcpServers, || {
+            assert!(restore::apply("fixture", Format::TomlMcpServers, &path)?);
+            Ok(())
+        })
+        .unwrap();
+        let output = read_config_file(&path).unwrap();
+        assert!(output.contains("# edited value"), "{output}");
+        assert!(
+            output.contains("# edited key") && output.contains("# edited custom"),
+            "{output}"
+        );
+        assert!(
+            output.contains("# edited array\n[[mcp_servers.conduit.backends]] # edited suffix"),
+            "{output}"
+        );
+        let parsed: toml::Value = toml::from_str(&output).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["conduit"]["backends"][0]["name"].as_str(),
+            Some("first")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["conduit"]["backends"][1]["name"].as_str(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn child_witness_follows_renamed_gateway_subtable() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let fixture = Fixture::new("alias-child-witness");
+        let _data = crate::registry::DataDirOverride::set(fixture.0.join("data"));
+        let gateway = super::super::tests::sample_gateway(None, "codex");
+        let mut owned = gateway.clone();
+        owned.command = Some("conduit-gateway".into());
+        owned.env.clear();
+        let mut registry = crate::registry::Registry::default();
+        registry.set_client_managed_entry("codex", ManagedEntry::from_gateway_entry(&owned));
+        crate::registry::save(&registry).unwrap();
+        for direct in [false, true] {
+            for edited in [false, true] {
+                let path = fixture.0.join(format!("{direct}-{edited}.toml"));
+                std::fs::write(&path, "theme = 'before'\n[mcp_servers.native]\ncommand = 'native'\n# native child\n[mcp_servers.native.env]\nTOKEN = 'keep'\n[mcp_servers.conduit.env]\nOTHER = 'keep'\n[mcp_servers.conduit]\ncommand = 'conduit-gateway'\n# native child\n[profiles.work]\nkeep = true\n").unwrap();
+                mutation::run("codex", &path, Format::TomlMcpServers, || {
+                    moved::record_selected(
+                        "codex",
+                        Format::TomlMcpServers,
+                        &path,
+                        &["native".into()],
+                    )?;
+                    moved::remove_selected(Format::TomlMcpServers, &path, &["native".into()])?;
+                    edit_toml_gateway(&path, Some(&gateway))
+                })
+                .unwrap();
+                let observed: DocumentMut = read_config_file(&path).unwrap().parse().unwrap();
+                let (key, item, _) = moved::toml_entry("codex", &path, "native")
+                    .unwrap()
+                    .unwrap();
+                let meta = moved::toml_provenance("codex", &path, &[(key, item)]).unwrap();
+                let child = &meta[0].capture.as_ref().unwrap().children[0];
+                let live = meta[0]
+                    .live
+                    .iter()
+                    .find(|live| live.source_id == child.id)
+                    .unwrap();
+                assert_eq!(
+                    live.destination,
+                    super::PrefixDestination::Table(vec![
+                        ("mcp_servers".into(), None),
+                        ("toolport".into(), None),
+                        ("env".into(), None)
+                    ])
+                );
+                assert_eq!(super::valid_live(&observed, live), Some("# native child\n"));
+                let mut text = observed.to_string().replace("'before'", "'edited'");
+                if edited {
+                    text = text.replacen("# native child", "# native child edited", 1);
+                }
+                std::fs::write(&path, text).unwrap();
+                mutation::run("codex", &path, Format::TomlMcpServers, || {
+                    if direct {
+                        moved::restore("codex", Format::TomlMcpServers, &path)?;
+                    } else {
+                        assert!(restore::apply("codex", Format::TomlMcpServers, &path)?);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                let output = read_config_file(&path).unwrap();
+                assert!(
+                    output.contains("# native child\n[mcp_servers.native.env]"),
+                    "{output}"
+                );
+                assert!(
+                    output.contains("# native child\n[profiles.work]"),
+                    "{output}"
+                );
+                if edited {
+                    assert!(output.contains("# native child edited"), "{output}");
+                } else {
+                    assert_eq!(
+                        output.matches("# native child").count(),
+                        2,
+                        "{direct}: {output}"
+                    );
+                }
+                output.parse::<DocumentMut>().unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn restored_blocks_follow_user_reordered_live_spans() {
         let _lock = crate::registry::data_dir_test_lock();
         let fixture = Fixture::new("reordered-complete-blocks");
@@ -3644,31 +3775,175 @@ pub(super) fn restore_renamed_slot(
     current: &mut DocumentMut,
     name: &str,
     item: &Item,
-) {
+) -> bool {
     let layout = gateway_rename_layout(original, written);
     if raw_entry(original, name).is_none()
         || raw_entry(&layout, name).is_some()
         || raw_entry(current, name).is_some()
     {
-        return;
+        return false;
     }
     let Some((_, written_gateway)) = raw_entry(written, super::GATEWAY_ENTRY_NAME) else {
-        return;
+        return false;
     };
     let Some((_, live_gateway)) = raw_entry(current, super::GATEWAY_ENTRY_NAME) else {
-        return;
+        return false;
     };
     if item.is_table() != written_gateway.is_table()
         || live_gateway.is_table() != written_gateway.is_table()
     {
-        return;
+        return false;
     }
-    rename(current, super::GATEWAY_ENTRY_NAME, name, item.clone());
+    let mut restored_item = item.clone();
+    // Restore the saved values while keeping independently edited descendant
+    // header decor at the corresponding path of the renamed alias.
+    if let (Some(saved), Some(written), Some(live)) = (
+        restored_item.as_table_mut(),
+        written_gateway.as_table(),
+        live_gateway.as_table(),
+    ) {
+        fn carry_edited(saved: &mut Table, written: &Table, live: &Table) {
+            fn semantic(table: &Table) -> Option<toml::Value> {
+                let mut doc = DocumentMut::new();
+                doc.insert("entry", Item::Table(table.clone()));
+                toml::from_str(&doc.to_string()).ok()
+            }
+            fn carry_decor(saved: &mut Table, written: &Table, live: &Table) {
+                let text = |raw: Option<&toml_edit::RawString>| {
+                    raw.and_then(|raw| raw.as_str()).unwrap_or("").to_string()
+                };
+                let written_prefix = text(written.decor().prefix());
+                let live_prefix = text(live.decor().prefix());
+                if written_prefix != live_prefix {
+                    saved.decor_mut().set_prefix(live_prefix);
+                }
+                let written_suffix = text(written.decor().suffix());
+                let live_suffix = text(live.decor().suffix());
+                if written_suffix != live_suffix {
+                    saved.decor_mut().set_suffix(live_suffix);
+                }
+            }
+            // An unchanged semantic subtree can retain all live syntax, including
+            // quoted keys and comments inside values. Keep the saved positions;
+            // mixing live child positions with the restored parent breaks order.
+            if semantic(saved).is_some_and(|value| {
+                Some(value.clone()) == semantic(written) && Some(value) == semantic(live)
+            }) {
+                let mut positions = Vec::new();
+                visit(saved, &mut |table| positions.push(table.position()));
+                let mut replacement = live.clone();
+                let mut live_count = 0;
+                visit(&mut replacement, &mut |_| live_count += 1);
+                if live_count != positions.len() {
+                    return;
+                }
+                *saved = replacement;
+                let mut index = 0;
+                visit(saved, &mut |table| {
+                    if let Some(position) = positions[index] {
+                        table.set_position(position);
+                    }
+                    index += 1;
+                });
+                return;
+            }
+            let mut formatted_values = Vec::new();
+            for (mut name, item) in saved.iter_mut() {
+                let live_key = live.key(name.get()).cloned();
+                let (Some(written), Some(live)) = (written.get(name.get()), live.get(name.get()))
+                else {
+                    continue;
+                };
+                if item.is_value() && written.is_value() && live.is_value() {
+                    let value = |item: &Item| {
+                        let mut doc = DocumentMut::new();
+                        doc.insert("value", item.clone());
+                        toml::from_str::<toml::Value>(&doc.to_string()).ok()
+                    };
+                    if value(item).is_some_and(|saved| {
+                        Some(saved.clone()) == value(written) && Some(saved) == value(live)
+                    }) {
+                        *item = live.clone();
+                        if let Some(key) = &live_key {
+                            *name.leaf_decor_mut() = key.leaf_decor().clone();
+                            *name.dotted_decor_mut() = key.dotted_decor().clone();
+                            formatted_values.push((key.clone(), item.clone()));
+                        }
+                    }
+                    continue;
+                }
+                if let (Some(saved), Some(written), Some(live)) =
+                    (item.as_table_mut(), written.as_table(), live.as_table())
+                {
+                    carry_decor(saved, written, live);
+                    carry_edited(saved, written, live);
+                } else if let (Some(saved), Some(written), Some(live)) = (
+                    item.as_array_of_tables_mut(),
+                    written.as_array_of_tables(),
+                    live.as_array_of_tables(),
+                ) {
+                    if saved.len() != written.len() || written.len() != live.len() {
+                        continue;
+                    }
+                    // Array indices identify entries only when their semantic
+                    // values still match in all three generations.
+                    if !(0..saved.len()).all(|i| {
+                        semantic(saved.get(i).unwrap()).is_some_and(|value| {
+                            Some(value.clone()) == semantic(written.get(i).unwrap())
+                                && Some(value) == semantic(live.get(i).unwrap())
+                        })
+                    }) {
+                        continue;
+                    }
+                    for i in 0..saved.len() {
+                        let (saved, written, live) = (
+                            saved.get_mut(i).unwrap(),
+                            written.get(i).unwrap(),
+                            live.get(i).unwrap(),
+                        );
+                        carry_decor(saved, written, live);
+                        carry_edited(saved, written, live);
+                    }
+                }
+            }
+            for (key, value) in formatted_values {
+                saved.insert_formatted(&key, value);
+            }
+        }
+        carry_edited(saved, written, live);
+    } else if let (Some(saved), Some(written), Some(live)) = (
+        restored_item.as_inline_table_mut(),
+        written_gateway.as_inline_table(),
+        live_gateway.as_inline_table(),
+    ) {
+        // Inline entries have no table headers, but unchanged values and their
+        // formatted keys still carry user syntax that must survive the rename.
+        let names: Vec<_> = saved.iter().map(|(name, _)| name.to_string()).collect();
+        for name in names {
+            let (Some(old), Some(written), Some(value)) =
+                (saved.get(&name), written.get(&name), live.get(&name))
+            else {
+                continue;
+            };
+            let semantic = |value: &toml_edit::Value| {
+                let mut doc = DocumentMut::new();
+                doc.insert("value", Item::Value(value.clone()));
+                toml::from_str::<toml::Value>(&doc.to_string()).ok()
+            };
+            if semantic(old).is_some_and(|old| {
+                Some(old.clone()) == semantic(written) && Some(old) == semantic(value)
+            }) {
+                saved.insert_formatted(live.key(&name).unwrap(), value.clone());
+            }
+        }
+    }
+    rename(current, super::GATEWAY_ENTRY_NAME, name, restored_item);
     let servers = super::toml_mcp_servers_mut(current);
     let (mut original_key, _) = raw_entry(original, name).unwrap();
     *original_key.leaf_decor_mut() = servers.key(name).unwrap().leaf_decor().clone();
     let restored = servers.get(name).unwrap().clone();
     servers.insert_formatted(&original_key, restored);
+    true
 }
 
 pub(super) fn rename(doc: &mut DocumentMut, old: &str, new: &str, item: Item) {
